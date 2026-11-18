@@ -389,6 +389,53 @@ def test_a_turned_states_forked_documents_are_as_exact_as_each_alone():
                          f'xla {TURNED} a forked call\'s documents', seeds=32)
 
 
+TURNED_LONG = 512
+"""A long turned row's tokens: its documents' angles each a few hundred tokens' turns."""
+
+LONG_DOCUMENTS = ((0, 150, 330), (0, 210, 400))
+"""Each long row's documents' first tokens: three documents of 110 to 210 tokens a row."""
+
+
+def short_memory_draw(seed: int, forked: bool):
+    """`draw`'s (`entered_draw`'s where `forked`, its entry writes too) operands of `TURNED_LONG` tokens for
+    `TURNED`, each token's log decay in (-3, -2), a memory keeping a few tokens, and cotangents."""
+    if forked:
+        operands, seeded = entered_draw(TURNED, seed, entries=True, length=TURNED_LONG)
+    else:
+        (operands,) = draw(TURNED, packed=False, seed=seed, length=TURNED_LONG)
+        seeded = cotangents(operands, seed)
+    rng = np.random.default_rng([seed, 7419])
+    log_decay = hosted(rng.uniform(-3.0, -2.0, operands.log_decay.shape))
+    return dataclasses.replace(operands, log_decay=log_decay), seeded
+
+
+@pytest.mark.parametrize('layout', ['one sequence', 'packed', 'forked'])
+def test_a_turned_states_long_documents_under_a_short_memory_are_as_exact_as_the_recurrence(layout):
+    """A state that turns its key pairs (`Hooks.turns`) over long documents (`TURNED_LONG` tokens,
+    `LONG_DOCUMENTS`) under a decay keeping a few tokens (`short_memory_draw`), through the portable math,
+    against the recurrence a token at a time (each document alone from its table slot's memory where
+    forked): output, final memory and every operand's gradient from float64 (check 1). Every document reads
+    in frames from its root's first token and the final memory is turned back by the row's last token's,
+    so a recent write takes two roundings of a whole turn the recurrence's takes none of: read so where a
+    row's last token's frame had been read, the final memory was 1.9 times the recurrence's error (row
+    7419)."""
+    if layout == 'forked':
+        assert_forked_on_par('xla', TURNED, functools.partial(short_memory_draw, forked=True),
+                             f'xla {TURNED} long forked documents under a short memory', seeds=32,
+                             documents=LONG_DOCUMENTS)
+        return
+
+    def turned(operands, starts=None):
+        return chunk_on('xla', TURNED, dataclasses.replace(operands, starts=starts), chunk_size=CHUNK)
+
+    def tokens(operands, starts=None):
+        return token_by_token(TURNED, dataclasses.replace(operands, starts=starts))
+
+    assert_packed_on_par(turned, tokens, functools.partial(short_memory_draw, forked=False),
+                         f'{TURNED} long documents under a short memory', packed=layout == 'packed',
+                         documents=LONG_DOCUMENTS, length=TURNED_LONG, seeds=32)
+
+
 def _forked_rows(operands, rows: tuple, length: int):
     """`operands`' first row's first `length` tokens as a forked call of `rows`: each a row's documents' first
     tokens, table slots and stored slots (`Chunk.loads`, `Chunk.stores`), over `GIVEN` given memories and
@@ -449,11 +496,11 @@ HELD = 2
 """The stored slots a row's table holds (`Chunk.held`)."""
 
 
-def entered_draw(hooks, seed: int, entries: bool = False):
-    """`draw`'s packed operands over a table of `GIVEN` memories a row, with `entries` an entry write a
-    document (`Chunk.entry_key`: two terms a document, a weight a value head), and cotangents of the output
-    and the row's last memory."""
-    (operands,) = draw(hooks, packed=True, seed=seed)
+def entered_draw(hooks, seed: int, entries: bool = False, length: int = LENGTH):
+    """`draw`'s packed operands of `length` tokens over a table of `GIVEN` memories a row, with `entries` an
+    entry write a document (`Chunk.entry_key`: two terms a document, a weight a value head), and cotangents
+    of the output and the row's last memory."""
+    (operands,) = draw(hooks, packed=True, seed=seed, length=length)
     keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 9), 6)
     given = 0.3 * jax.random.normal(keys[0], (ROWS, GIVEN, *operands.state.shape[1:]))
     out = jax.random.normal(keys[1], operands.value.shape)
@@ -479,10 +526,11 @@ def entry_write(operands, row: int, document: int):
     return operands.entry_weight[row, document][:, None, None] * written
 
 
-def entering_documents(operands):
-    """`operands` with `draw`'s packed documents a forked call's, each entering its `FORKED` table slot."""
+def entering_documents(operands, documents=DOCUMENTS):
+    """`operands` with `documents` (each row's first tokens, `DOCUMENTS` where not given) a forked call's,
+    each entering its `FORKED` table slot."""
     starts = jnp.zeros(operands.value.shape[:2], bool)
-    for row, begins in enumerate(DOCUMENTS):
+    for row, begins in enumerate(documents):
         starts = starts.at[row, jnp.asarray(begins)].set(True)
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
     return dataclasses.replace(operands, starts=starts, loads=loads, stores=stores, held=HELD)
@@ -495,9 +543,10 @@ def _neutral(hooks: recurrence.Hooks, name: str) -> float:
     return -1e30 if formed else 0.0
 
 
-def document_by_document(hooks, operands, run=None):
+def document_by_document(hooks, operands, run=None, documents=DOCUMENTS):
     """Each document of `operands` a sequence of its own through `run(hooks, piece)` (`token_by_token`
-    where None), in the row's order from its `FORKED` table slot's memory (a given one, or the final an
+    where None), `documents` its rows' first tokens (`DOCUMENTS` where not given), in the row's order from
+    its `FORKED` table slot's memory (a given one, or the final an
     earlier document stored, with its entry write added where `operands` give one), its outputs back in
     place, and each row's last memory. The rows' k-th documents run as one call, a row each over the longest
     document's tokens, each padded after its own with tokens that leave its memory as it is
@@ -508,13 +557,13 @@ def document_by_document(hooks, operands, run=None):
     run = token_by_token if run is None else run
     named = [name for name in ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z', 'turn')
              if getattr(operands, name) is not None]
-    bounds = [tuple(zip(begins, (*begins[1:], operands.value.shape[1]), strict=True)) for begins in DOCUMENTS]
+    bounds = [tuple(zip(begins, (*begins[1:], operands.value.shape[1]), strict=True)) for begins in documents]
     longest = max(end - begin for row in bounds for begin, end in row)
-    tables = [list(operands.state[row]) + [None] * HELD for row in range(len(DOCUMENTS))]
-    pieces = [[] for _ in DOCUMENTS]
+    tables = [list(operands.state[row]) + [None] * HELD for row in range(len(documents))]
+    pieces = [[] for _ in documents]
     finals = []
 
-    for document in range(len(DOCUMENTS[0])):
+    for document in range(len(documents[0])):
         states = []
         for row, (loads, _) in enumerate(FORKED):
             load = loads[document]
@@ -522,7 +571,7 @@ def document_by_document(hooks, operands, run=None):
             if operands.entry_key is not None:
                 state = state + entry_write(operands, row, document)
             states.append(state)
-        spans = [(row, *bounds[row][document]) for row in range(len(DOCUMENTS))]
+        spans = [(row, *bounds[row][document]) for row in range(len(documents))]
         piece = dataclasses.replace(
             operands, **{name: stacked_documents(getattr(operands, name), spans, longest,
                                                  _neutral(hooks, name)) for name in named},
@@ -607,25 +656,27 @@ def test_fla_refuses_a_forked_call_named_or_handed_to_it():
     assert handed.value.refusals == [recurrence_chunk.PORT_FORKED]
 
 
-def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alone: bool = False) -> None:
+def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alone: bool = False,
+                         documents=DOCUMENTS) -> None:
     """A forked call on `kernel` (`entering_documents` of `draw`'s operands; `Chunk.loads`: a request's
     questions entering its shared part's final memory, a chain's each its predecessor's): its output, the
     row's last memory and every operand's gradient, the given memories' included, against each document a
     sequence of its own from its table slot's memory in the row's order (`document_by_document`), through
     `kernel`'s call where `alone`, else the recurrence a token at a time, which in float64 is their truth
-    (check 1)."""
+    (check 1); `documents` its rows' first tokens (`DOCUMENTS` where not given)."""
     def ours(operands):
-        out, final = chunk_on(kernel, hooks, entering_documents(operands), chunk_size=CHUNK)
+        out, final = chunk_on(kernel, hooks, entering_documents(operands, documents), chunk_size=CHUNK)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
     def own(hooks, piece):
         return chunk_on(kernel, hooks, piece, chunk_size=CHUNK)
 
     def theirs(operands):
-        out, final = document_by_document(hooks, operands, own if alone else None)
+        out, final = document_by_document(hooks, operands, own if alone else None, documents)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
-    wide = jax.jit(with_gradients(lambda operands: document_by_document(hooks, operands)))
+    wide = jax.jit(with_gradients(lambda operands: document_by_document(hooks, operands,
+                                                                        documents=documents)))
 
     def widened(leaf):
         floating = jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating)
