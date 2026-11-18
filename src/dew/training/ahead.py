@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     from dew.data.pipeline import Dataset
     from dew.state import TrainState
     from dew.training._fit import FitArguments, FitPlan, Start
+    from dew.training.compiler import HostStartup
     from dew.training.planning import Planned
     from dew.training.trainer import Trainer
 
@@ -1463,6 +1464,32 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), capacity, topology=topology),
         refusals=report.refused_launches(), sampled=sampled, starts=starts)
+
+
+def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> HostStartup:
+    """Compile the programs `trainer`'s host step calls (`Layout(host=("variables",))`) for the GPUs its mesh
+    is built over (compile-only GPUs of a generation, or a host's own topology's, `host_gpus`), over its
+    fresh state's and `batch`'s shapes as its run's startup does (`StepCompiler._compile_host`), its CPU
+    companion this process's CPUs: JAX's persistent cache, keyed by what each program lowers to under its
+    options and target, then holds each, and the run's startup on those GPUs reads them, compiling none
+    (training.md's warm start; Main's choice for row 7908: no file, the shared cache). What the pass
+    compiled, by backend (`HostStartup`)."""
+    if not trainer.host_master:
+        raise ValueError("prepare_host_step prepares a step that keeps its variables on the host "
+                         "(Layout(host=('variables',))); compile a device step ahead with compile_ahead")
+    devices = list(trainer.device_mesh.devices.flat)
+    generations = {gpu_target(device.device_kind).generation for device in devices}
+    if {device.platform for device in devices} != {"gpu"} or len(generations) != 1:
+        raise ValueError("prepare_host_step compiles for the compile-only GPUs of one generation a trainer's "
+                         f"mesh is built over; this mesh holds {sorted({d.device_kind for d in devices})}")
+    (generation,) = generations
+    stated = built_target(generation, devices[0].core_count, stated_limit(devices))
+    start = trainer._started()
+    trainer.phase_passes.at(batch)
+    with (assumed(stated, portable=not set(devices) <= _HOSTS_GPUS), report.certifying(devices[0]),
+          trainer.phase_passes.scoped(trainer, trainer._compiler)):
+        return trainer._compiler.prepared_host(trainer._stepping(), start.abstract,
+                                               step_batch(trainer, batch))
 
 
 def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
