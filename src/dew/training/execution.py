@@ -35,7 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew.batch import FROZEN, at_path, merge, placed_at, select, thaw
+from dew.batch import FROZEN, PROBES, at_path, merge, placed_at, select, thaw
 from dew.distributed.batches import batch_shardings
 from dew.distributed.host import transfer
 from dew.inference.banks import (
@@ -53,10 +53,11 @@ from dew.inference.banks import (
 from dew.mesh import batch_axes
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.backbones.layer_names import layer_index
+from dew.nn.inspection import unscaled, unscaling
 from dew.nn.kernels.options import Option, owned_program, program
 from dew.nn.sharding import rows_spec
 from dew.training.memory import compiled_if_it_fits, device_tokens, step_compiler_options
-from dew.training.transaction import Realization, placed_as_rows
+from dew.training.transaction import Realization, discovered_probes, placed_as_rows, refuse_unread_probes
 
 if TYPE_CHECKING:
     from dew.data.pipeline import DeviceStep
@@ -202,19 +203,42 @@ def _after(device: tuple[DeviceStep, ...], loss, variables, batch, execution):
     return loss(variables, batch, execution)
 
 
-def _forward(loss, primal, frozen, store, batch, execution, *, layout):
+def _forward(loss, primal, frozen, store, batch, execution, scale=None, *, layout):
     """`loss` of the moving leaves `primal` beside the `frozen` ones, the
     store's other collections, the batch and the step's clock and keys, with
     its pullback. Compiled once for its objective (`HostExecution`), it hands
     back a pullback whose static part is the same program each realization,
-    so `_trainable_cotangent` traces once rather than once an attempt."""
+    so `_trainable_cotangent` traces once rather than once an attempt. A step
+    that watches its outputs' cotangents (`Step.watched`) differentiates its
+    watched modules' probes beside the moving leaves, laid out as its model
+    calls read them (`discovered_probes`), its pullback giving both, each
+    probe's cotangent read unscaled by the loss `scale` the backward is
+    seeded with, an argument of the program (`dew.nn.inspection.unscaled`)."""
     treedef, held = layout
 
-    def evaluate(trainable):
+    def merged(trainable):
         moved, kept = iter(trainable), iter(frozen)
-        merged = treedef.unflatten([next(kept) if known else next(moved) for known in held])
-        return loss({**store, "params": merged}, batch, execution)
-    return jax.vjp(evaluate, primal, has_aux=True)
+        return treedef.unflatten([next(kept) if known else next(moved) for known in held])
+
+    watched = execution.watched
+    if watched is None or not watched.cotangents:
+        return jax.vjp(lambda trainable: loss({**store, "params": merged(trainable)}, batch, execution),
+                       primal, has_aux=True)
+    probes = discovered_probes(loss, {**store, "params": merged(primal)}, batch, execution)
+
+    def evaluate(trainable, probes):
+        return loss({**store, "params": merged(trainable), PROBES: probes}, batch, execution)
+    with unscaled(scale):
+        stats, back, aux = jax.vjp(evaluate, primal, probes, has_aux=True)
+    refuse_unread_probes(probes, aux)
+    return stats, back, aux
+
+
+def _probed_cotangent(back, cotangent, *, sites, paths, layout):
+    """`_trainable_cotangent` of a watching step's pullback, and its probes' cotangents beside it, one
+    backward for both (`_forward`)."""
+    return (_trainable_cotangent(back, cotangent, sites=sites, paths=paths, layout=layout),
+            back(cotangent)[1])
 
 
 def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
@@ -523,26 +547,37 @@ class HostExecution:
         moving = tuple(tuple(entry.key for entry in path) for path, _ in
                        jax.tree_util.tree_leaves_with_path(variables["params"]))
         primal, frozen, rest, batch, here, layout = self.inputs(variables, batch, step, moved=moved)
+        watched = step.watched
+        # A watching step's loss scale, which its probes unscale their cotangents by, crosses with it
+        # (`_forward`); a step that watches none reads none, its program the one an uninspected run runs.
+        scale = None
+        if watched is not None and watched.cotangents and (held := unscaling()) is not None:
+            scale = moved._moved(held, self.accelerator)
         with jax.set_mesh(self.accelerator):
             options = self.step_options(variables, batch)
-            stats, back, aux = self.forward(options)(primal, frozen, rest, batch, here, layout=layout)
+            stats, back, aux = self.forward(options)(primal, frozen, rest, batch, here, scale, layout=layout)
         stats, aux = moved._moved((stats, aux), self.cpu)
         if aux.variables is not None:
             with jax.set_mesh(self.cpu):
                 aux = dataclasses.replace(aux, variables=self.unstack(aux.variables))
 
-        def pullback(cotangent):
-            # A shared owner is one bank input, so native reverse mode already
-            # sums every use's contribution into it.
-            with jax.set_mesh(self.accelerator):
-                # The pullback runs its int8 dots here, apart from the forward's program, with an
-                # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
-                pulled = program(_trainable_cotangent, step=options,
-                                 static_argnames=("sites", "paths", "layout"))
-                gradient = pulled(back, moved._moved(cotangent, self.accelerator), sites=self.own,
-                                  paths=moving, layout=layout)
-            return moved._moved(gradient, self.cpu)
-        return Realization(stats, aux, pullback)
+        def pulled_by(cotangent_of):
+            def pulled(cotangent):
+                # A shared owner is one bank input, so native reverse mode already
+                # sums every use's contribution into it.
+                with jax.set_mesh(self.accelerator):
+                    # The pullback runs its int8 dots here, apart from the forward's program, with an
+                    # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
+                    compiled = program(cotangent_of, step=options,
+                                       static_argnames=("sites", "paths", "layout"))
+                    found = compiled(back, moved._moved(cotangent, self.accelerator), sites=self.own,
+                                     paths=moving, layout=layout)
+                return moved._moved(found, self.cpu)
+            return pulled
+
+        probed = (None if watched is None or not watched.cotangents
+                  else pulled_by(_probed_cotangent))
+        return Realization(stats, aux, pulled_by(_trainable_cotangent), probed)
 
 
 def banked_frozen(objective, variables, stack, release=None):

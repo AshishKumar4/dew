@@ -1473,11 +1473,11 @@ class Trainer(Generic[Loss, Effects]):
         drops a step not finite whole, a scaled one as its scale backs off or one whose optimizer holds
         updates back (`holds_back`, its groups' inner one under DiLoCo), stops at no single such step."""
         from dew.held_updates import holds_back
-
-        held = abstract.opt_state if abstract.inner is None else abstract.inner.opt_state
         saved = current if checkpoints is not None and checkpoints.latest is not None else None
-        return Interval.resumed(run.stop_control, last_saved=saved, kept_paths=leaf_paths(checked(abstract)),
-                                skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held))
+        skip = self.skip_nonfinite or self.dynamic_scale or holds_back((abstract.inner or abstract).opt_state)
+        first = Interval.resumed(run.stop_control, last_saved=saved, kept_paths=leaf_paths(checked(abstract)),
+                                 skips_nonfinite=skip)
+        return self._compiler.counting(first, host=self.host_master)  # its host steps' misses counted in it
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:

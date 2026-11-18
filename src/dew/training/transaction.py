@@ -275,22 +275,37 @@ def probed_loss(objective: Objective, variables: Variables, batch: Batch, step: 
     loss's aux. The probes are laid out as the objective's model calls nest their modules, which a trace
     of its loss that discovers them (`discovering`) sows, nothing computed; a probe no model call reads,
     its collection dropped on the way, is refused."""
-    with discovering():
-        _, discovered = jax.eval_shape(lambda: objective._loss(variables, batch, step))
-    probes = probes_of(discovered.inspected or {})
-    if not probes:
-        raise ValueError("no watched module's output reaches the objective's loss for its cotangent to be "
-                         "summarized; name modules its model calls run (Inspection.modules)")
+    probes = discovered_probes(objective._loss, variables, batch, step)
 
     def loss(trainable, probes):
         return objective._loss({**variables, "params": trainable, PROBES: probes}, batch, step)
     stats, back, aux = jax.vjp(loss, variables["params"], probes, has_aux=True)
+    refuse_unread_probes(probes, aux)
+    return stats, back, aux
+
+
+def discovered_probes(loss: Callable, variables: Variables, batch: Batch, step: Step) -> dict:
+    """The zero cotangent probes `loss` over `variables`, `batch` and `step` reads, laid out as its model
+    calls nest their watched modules (`dew.nn.inspection.discovering`, nothing computed): what a probed
+    loss differentiates beside the parameters (`probed_loss`; a host step's, `dew.training.execution`).
+    Refused where no watched module's output reaches the loss."""
+    with discovering():
+        _, discovered = jax.eval_shape(lambda: loss(variables, batch, step))
+    probes = probes_of(discovered.inspected or {})
+    if not probes:
+        raise ValueError("no watched module's output reaches the objective's loss for its cotangent to be "
+                         "summarized; name modules its model calls run (Inspection.modules)")
+    return probes
+
+
+def refuse_unread_probes(probes: dict, aux: Aux) -> None:
+    """Refuse a probe no model call read (`probes_of` of the loss's sown collection): its collection was
+    dropped on its way to the watched module."""
     unread = sorted(set(leaves_by_path(probes)) - set(leaves_by_path(probes_of(aux.inspected or {}))))
     if unread:
         raise ValueError(f"the objective's model calls do not pass the step's cotangent probes "
                          f"(variables[{PROBES!r}]) to the watched modules at {unread}; pass every "
                          f"collection of the variables the objective is given through to its model")
-    return stats, back, aux
 
 
 def watched_activations(watched: Watched, aux: Aux) -> dict[str, jax.Array]:
@@ -1836,7 +1851,7 @@ class Transaction:
                                  probed)
             moving, held = apart(state, frozen)
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
-                                                    tokens)
+                                                    tokens, probed)
             return together(advanced, held), loss, aux, committed
         return run
 

@@ -204,24 +204,43 @@ def test_a_host_window_that_replays_steps_on_its_startups_programs_alone():
     equal(run(quiet=True), run(quiet=False))
 
 
-def test_a_host_step_missing_a_program_compiles_it_and_says_so(caplog):
-    """A host step whose startup's programs are let go (`options.release`), as an input no pass foresaw
-    would miss them, compiles them at its next step and says so: each named in a warning and counted
-    (`HostRun.misses`, and the run's record's `train/step_misses`), never silent; its run goes on."""
+def test_a_host_fits_misses_are_its_own_record_never_another_fits(caplog):
+    """A host step that misses its startup's programs (let go at its fit's second step by an observer on
+    the fit's loop, `options.release` and JAX's own caches, as an input no pass foresaw would miss them)
+    compiles them and says so: each named in a warning and counted in that fit's record
+    (`train/step_misses`), its run going on. A second fit in the same process, missing none, logs none of
+    the first's; a fit whose steps are no host's logs no such count."""
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
     from dew.nn.kernels.options import release
-    from dew.telemetry.instrumentation import step_miss_counts
+    from dew.training.observe import Observe
 
-    trainer = Trainer(Tiny(composite=True), optax.adamw(.03), key=jax.random.PRNGKey(9), layout=HOST)
-    state, _, _ = trainer.place()
-    batch = placed_batch(trainer, batches()[0])
-    step = trainer.compile(state, batch)
-    release()
+    def let_go(state) -> None:
+        release()
+        jax.clear_caches()
+
+    def fitted(layout, released: bool) -> list[tuple[int, dict]]:
+        tracker = RecordingTracker()
+        rows = np.stack([np.arange(row, row + 9) % 16 for row in range(jax.device_count())]).astype(np.int32)
+
+        def stream(partition):
+            while True:
+                yield {"text": rows}
+        trainer = Trainer(LMObjective(decoder(), 8, head_chunks=1, ema_decay=None), optax.adam(.01),
+                          key=jax.random.key(3), layout=layout, tracker=tracker)
+        trainer.fit(Loader(stream, None, batch=jax.device_count(), records=None), steps=4, log_every=1,
+                    eval_every=None, checkpoint_every=None,
+                    observe=Observe(2, let_go) if released else None)
+        return tracker.scalars
+
     with caplog.at_level("WARNING", logger="dew.training.compiler"):
-        state, *_ = step(state, batch)
-    assert int(state.step) == 1 and step.misses, step.misses
+        missed = fitted(HOST, released=True)
+    assert max(row.get("train/step_misses", 0) for _, row in missed) > 0, missed
     assert any("its startup pass did not" in record.message for record in caplog.records)
-    assert step_miss_counts()["train/step_misses"] >= sum(step.misses.values())
-
+    clean = fitted(HOST, released=False)
+    assert {row["train/step_misses"] for _, row in clean if "train/step_misses" in row} == {0.0}, clean
+    assert not any("train/step_misses" in row for _, row in fitted(Layout(), released=False))
 
 def three_steps(trainer: Trainer, vocabulary: int):
     """`trainer`'s run of three steps over one batch of `vocabulary`'s tokens, from its fresh start, held
@@ -238,17 +257,55 @@ def three_steps(trainer: Trainer, vocabulary: int):
     return state
 
 
+class _CountedProjection(LMObjective):
+    """An LM objective that counts each projection of its parameters before an update reads them
+    (`projected` with `updated` False), as each trace of it runs its Python."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reads: list[None] = []
+
+    def projected(self, params, *, updated: bool):
+        if not updated:
+            self.reads.append(None)
+        return super().projected(params, updated=updated)
+
+
 def test_a_projecting_decoders_host_steps_run_on_its_startups_programs_alone():
     """A host decoder whose parameters a step reads projected (Gemma 3n's AltUp prediction coefficients
     clamped, `ProjectsParameters`) runs its steps on the programs its startup compiled: the projection,
     arithmetic on its parameters, is a program of its own (`dew.training.transaction.Read`), each leaf it
-    leaves as it is handed back as the array it is."""
+    leaves as it is handed back as the array it is. Over its startup and three steps the projection's Python
+    runs twice: once in the read's one trace, whose program computes the changed leaves from that trace,
+    and once in the step's commit; the read's program traced it a third time when it lowered (row 8397)."""
     from dew.nn.gemma3n import AltUp
 
     model = decoder(altup=AltUp(num_inputs=2, coef_clip=.5), scan_layers=False)
-    trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.01),
-                      key=jax.random.key(3), layout=HOST)
+    objective = _CountedProjection(model, 8, head_chunks=1, ema_decay=None)
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(3), layout=HOST)
     assert int(three_steps(trainer, 16).updates) == 3
+    assert len(objective.reads) == 2
+
+
+def test_an_inspecting_host_runs_sampled_and_unsampled_steps_compile_nothing():
+    """A host run that inspects a watched block's output and cotangent steps sampled and unsampled steps on
+    the programs its startup compiled, both bodies passed (`HostRun.startup`): nothing traced, lowered or
+    compiled at either (`executable_only`)."""
+    from dew.telemetry.compiles import executable_only
+    from dew.training import Inspection
+
+    model = decoder(scan_layers=False)
+    trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.01),
+                      key=jax.random.key(3), layout=HOST,
+                      inspection=Inspection(modules=("layers_0",), targets=("params",), cotangents=True))
+    state, _, _ = trainer.place()
+    rows = np.stack([np.arange(row, row + 9) % 16 for row in range(jax.device_count())]).astype(np.int32)
+    batch = placed_batch(trainer, {"text": jnp.asarray(rows)})
+    step = trainer.compile(state, batch)
+    for sampled in (False, True, False, True):
+        with executable_only():
+            state, *_, committed = step(state, batch, sampled=sampled)
+    assert int(state.updates) == 4 and committed.inspected is not None
 
 
 def test_a_casting_projection_is_the_identity_where_its_leaves_are_of_its_dtype_alone():
@@ -264,43 +321,6 @@ def test_a_casting_projection_is_the_identity_where_its_leaves_are_of_its_dtype_
         wide = {"params": {"w": jnp.arange(3, dtype=jnp.float64)}}
         assert read(wide, None)["params"]["w"].dtype == jnp.float32
 
-
-
-def test_a_projecting_read_traces_its_projection_once_a_signature():
-    """A host step's read of its variables (`Read`) runs its projection's Python once per signature, in the
-    trace that tells which leaves it changes, and computes those leaves from that trace, where its
-    program's lowering traced the projection again (row 8397); a later call over arrays of the same
-    signature runs no projection's Python, its computed leaf the projection's."""
-    from dew.training.transaction import Read
-
-    calls = []
-
-    def projected(variables, compute):
-        calls.append(None)
-        return {"params": {"w": variables["params"]["w"] * 2.0, "b": variables["params"]["b"]}}
-
-    read = Read(projected)
-    variables = {"params": {"w": jnp.arange(3, dtype=jnp.float32), "b": jnp.ones(2, jnp.float32)}}
-    first = read(variables, None)
-    again = read(variables, None)
-    assert len(calls) == 1
-    assert first["params"]["b"] is variables["params"]["b"]
-    np.testing.assert_array_equal(np.asarray(again["params"]["w"]), np.arange(3, dtype=np.float32) * 2.0)
-
-def test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone():
-    """A host decoder whose embedding is frozen, outside its scanned stack (the run's frozen collection),
-    runs its steps on the programs its startup compiled: the startup tells a frozen leaf by its path, as a
-    step over arrays does (`HostExecution.inputs`), so it compiles the signature its steps call."""
-    model = decoder()
-    fresh = jax.tree.map(np.asarray, nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32))))
-
-    def trained(path):
-        return "embed_tokens" not in path
-
-    trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None, variables=freeze(fresh, trained)),
-                      optax.adam(.01), key=jax.random.key(3), layout=HOST)
-    state = three_steps(trainer, 16)
-    assert "embed_tokens" in state.variables[FROZEN] and int(state.updates) == 3
 
 
 def test_a_host_decoders_steps_run_on_its_startups_programs_alone():

@@ -176,6 +176,18 @@ def without_ynn(fn, **jit_options):
     return compiled
 
 
+def as_recorded[Arm: Callable](fn: Arm, pilots: range | None = None) -> Arm:
+    """`fn`, marked an arm whose values are read from recordings (`indexed_recording`'s and a recorded
+    sizing's), the mark the gate reads (`getattr(fn, "recorded", False)`): it holds its recorded seeds alone,
+    so no paired sizing or orbit draws past them, and it is run as given, never rewritten; with `pilots`, the
+    seeds past its verdict's it holds too, a sizing's (`getattr(fn, "pilots", None)`). Marked in place, `fn`
+    itself returned, its kind kept (a function, a partial, an arm's object)."""
+    vars(fn)["recorded"] = True
+    if pilots is not None:
+        vars(fn)["pilots"] = pilots
+    return fn
+
+
 def as_given(fn, programs: Callable | None = None):
     """`fn`, an arm the gate runs as it is given and never compiles: a torch or NumPy reference, or a Dew
     arm that runs whole programs of its own (a trainer's fit, a placement on a mesh and the program
