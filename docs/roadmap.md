@@ -66,7 +66,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
 - Stacks, scans and looped models. [1568]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [5625]
 
 ## Training and parallelism
 
