@@ -211,9 +211,10 @@ class Read:
     """`read` (`Transaction.read`: the narrow copies merged, the parameters projected) as a host step reads
     its variables, tracing and compiling nothing at a step: its first call, over the variables' shapes (a
     run's startup pass, `options.collecting`), traces it once and keeps which of its results are its inputs as
-    given (a leaf no projection changes), the program computing the others alone (`_unforwarded`, compiled
-    there): each later call over arrays runs that program, if any leaf is computed, and hands the others
-    back as the arrays they are, no copy of a parameter the projection leaves as it is."""
+    given (a leaf no projection changes), the program computing the others alone from that one trace
+    (`_unforwarded`, compiled there, `read` traced no second time): each later call over arrays runs that
+    program, if any leaf is computed, and hands the others back as the arrays they are, no copy of a
+    parameter the projection leaves as it is."""
 
     def __init__(self, read: Callable):
         self.read = read
@@ -232,7 +233,7 @@ class Read:
             forwarded = tuple(given.index(out) if isinstance(out, jcore.Var) and out in given else None
                               for out in traced.jaxpr.outvars)
             computed = tuple(index is None for index in forwarded)
-            program = owned_program(functools.partial(_unforwarded, self.read, computed)) if any(
+            program = owned_program(functools.partial(_unforwarded, traced, computed)) if any(
                 computed) else None
             plan = self.plans[key] = (forwarded, jax.tree.structure(shapes), program)
         forwarded, read_structure, program = plan
@@ -241,10 +242,12 @@ class Read:
                                             for index in forwarded])
 
 
-def _unforwarded(read: Callable, computed: tuple[bool, ...], variables, compute) -> tuple:
-    """`read`'s results that are no input as given (`Read`), in their order."""
-    return tuple(leaf for leaf, made in zip(jax.tree.leaves(read(variables, compute)), computed, strict=True)
-                 if made)
+def _unforwarded(traced: jcore.Jaxpr, computed: tuple[bool, ...], variables, compute) -> tuple:
+    """The results of `traced`, a read's one trace (`Read`; a Jaxpr carries its constants on JAX 0.12),
+    that are no input as given, in their order: its equations evaluated over the inputs' leaves, the read's
+    Python run no second time."""
+    read = jcore.jaxpr_as_fun(traced)(*jax.tree.leaves((variables, compute)))
+    return tuple(leaf for leaf, made in zip(read, computed, strict=True) if made)
 
 
 def outcome_of(step: jax.Array, clock: jax.Array | None, microstep: jax.Array, advanced: jax.Array,
