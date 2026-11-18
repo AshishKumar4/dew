@@ -23,9 +23,9 @@ TOKENS = "__dew_real_tokens"
 
 
 def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Batch, *, count_model: bool,
-                                 at_counts: Sequence[Objective[Loss, Effects]] | None = None) -> Batch:
+                                 counts: Sequence[Objective[Loss, Effects]] | None = None) -> Batch:
     """Count the source's host rows, preserving its checkpoint and model inputs. A run that draws its looped
-    model's pass count per microbatch (`dew.training.phase_passes.SampledPasses`) states `at_counts`, its
+    model's pass count per microbatch (`dew.training.phase_passes.SampledPasses`) states `counts`, its
     objective at each count from 1 to its cap: a row's work then stands at each, `[rows, cap]`, and each
     microbatch counts its own rows' at the count it runs (`step_counts`)."""
     if not count_model and not objective.counts_tokens:
@@ -50,8 +50,8 @@ def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Ba
             training = counted_at.training_flops(None, held) if real.any() else 0.0
             return np.where(real, training / max(int(real.sum()), 1), 0).astype(np.float32)
 
-        counted[TRAINING_FLOPS] = (spread(objective) if at_counts is None
-                                   else np.stack([spread(each) for each in at_counts], axis=1))
+        counted[TRAINING_FLOPS] = (spread(objective) if counts is None
+                                   else np.stack([spread(each) for each in counts], axis=1))
     return counted
 
 
@@ -66,7 +66,7 @@ def uncounted(batch: Batch, counts: int | None = None) -> Batch:
 
 def step_counts(batch: Batch, part: Batch | None = None, passes: int | None = None) -> dict[str, jax.Array]:
     """Global device-side sums, returned with the step's other scalar metrics: the batch's work, or where its
-    program runs a sampled pass count's `passes` (`prepare_counts`'s `at_counts`), its microbatch `part`'s
+    program runs a sampled pass count's `passes` (`prepare_counts`'s `counts`), its microbatch `part`'s
     rows' work at that count, which the step's whole sums over its microbatches (`whole_step`)."""
     work = {}
     if TRAINING_FLOPS in batch:

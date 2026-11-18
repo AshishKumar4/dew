@@ -323,6 +323,11 @@ class Interval:
         if streak is not None:
             checked_finite(on_host(streak, step), step, display, skips=self.skips_nonfinite)
 
+    def branched(self) -> Interval:
+        """A fresh interval for a branch off the run (a cooldown's), its tokens before its log this one's and
+        its dispatched microbatches this one's, which a sampled pass count draws on from."""
+        return Interval(time.time(), None, tokens_before_log=self.real_tokens, microbatches=self.microbatches)
+
     @classmethod
     def resumed(cls, control: dict, *, last_saved: int | None, skips_nonfinite: bool = False) -> Interval:
         """An interval from now on, its token clock and its consumed examples read off a checkpoint's

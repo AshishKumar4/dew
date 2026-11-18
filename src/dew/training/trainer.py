@@ -154,7 +154,7 @@ from dew.training._fit import (
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Counted
-from dew.training.compiler import Compiled, CompiledStep, DrawingStep, StepCompiler, freshly_held
+from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -569,14 +569,13 @@ class Trainer(Generic[Loss, Effects]):
         objective anew reads the step its equal traced (`dew.training._candidates.candidate_for`; row 3873):
         the objective's own (`Objective.trace_key`, its EMA among it) at its current rung, the optimizer's
         config and the updates or examples it was built for, the reader's device steps, and every setting the
-        step reads, a sampled pass count's law among them (its window's QK calls folded, `compact_qk`). The
-        links it traces under are the candidate's key's (`trace_context`, their measured figures), its spreads
-        replayed where it is kept (`Candidate.spread`), so the links the last compile decided key nothing (row
-        6022: every refit on a tensor- or sequence-split mesh traced its step again). None where a value
-        states none of it: an objective that states no trace, an optimizer given built, a custom step, a
-        device step or a setting compared by identity (`frozen_value`), a loss scale given built, stated
-        links, or a run that measures its kernels' configs as it lowers. `objective` and `compiler` are those
-        the step is built from and climbs on (`_stepping`)."""
+        step reads. The links it traces under are the candidate's key's (`trace_context`, their measured
+        figures), its spreads replayed where it is kept (`Candidate.spread`), so the links the last compile
+        decided key nothing (row 6022: every refit on a tensor- or sequence-split mesh traced its step again).
+        None where a value states none of it: an objective that states no trace, an optimizer given built, a
+        custom step, a device step or a setting compared by identity (`frozen_value`), a loss scale given
+        built, stated links, or a run that measures its kernels' configs as it lowers. `objective` and
+        `compiler` are those the step is built from and climbs on (`_stepping`)."""
         from dew.objectives.base import UNKEYED, frozen_value, stated_trace
 
         stated = stated_trace(objective)
@@ -1108,9 +1107,7 @@ class Trainer(Generic[Loss, Effects]):
         with self.phase_passes.scoped(self, self._compiler):
             compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials))
         assert compiled.step is not None
-        if self.phase_passes.sampled is not None:  # each other count's step at its cap's plan
-            return self._compiler.sampled_step(self, self._stepping, compiled, state, batch)
-        return compiled.step
+        return self._compiler.drawing(self, self._stepping, compiled, state, batch)
 
     @ruled
     def _planned_unplaced(self, start: Start, batch: Batch) -> None:
@@ -1411,8 +1408,7 @@ class Trainer(Generic[Loss, Effects]):
                     check_inputs(self, device)
                 known, began = len(compiled), time.perf_counter()
                 with run.startup.phase("compile", "compiling the step", when=not known):
-                    train_step, measured_flops, state = self._compiled_for(compiled, state, device, run,
-                                                                           interval)
+                    train_step, flops, state = self._compiled_for(compiled, state, device, run, interval)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
                     signature = batch_signature(device)
                     run.reads[signature] = step_reads(self.executable, signature)
@@ -1450,7 +1446,7 @@ class Trainer(Generic[Loss, Effects]):
                 position = run.train.source_state if ahead is None else ahead
                 run.current, seen = run.current + 1, seen + 1
                 self._display.step(run.current)
-                counted_step(interval, run, self.objective.row_tokens, batch, device, measured_flops, loss,
+                counted_step(interval, run, self.objective.row_tokens, batch, device, flops, loss,
                              finite, committed, aux)
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
@@ -2001,8 +1997,7 @@ class Trainer(Generic[Loss, Effects]):
         # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
         # as the run's do (`_scheduled`), read off the devices where its steps may have reached what it
         # reads next (`FitPlan.committed`); the stages it begins are its own, the run's kept as they were.
-        counted = Interval(time.time(), None, tokens_before_log=interval.real_tokens,
-                           microbatches=interval.microbatches)
+        counted = interval.branched()
         branched.clock = TokenClock(*counted.clocked(state.pending_tokens))
         starts = self._shape.stage_starts
         cooled, done, cut = state, 0, False
@@ -2261,14 +2256,12 @@ class Trainer(Generic[Loss, Effects]):
             # since this thread prepares it ahead of the step that takes the count.
             objective = self._step_objective(batch)
             try:
-                return prepare_counts(objective, batch, count_model=True,
-                                      at_counts=self.phase_passes.counted_at())
+                return prepare_counts(objective, batch, count_model=True, counts=self.phase_passes.counted())
             except MissingFlopsCount as missing:
                 self._refusal = str(missing)
                 _log.debug("train/mfu is not reported for %s: %s", type(self.objective).__name__, missing)
         counted = prepare_counts(self.objective, batch, count_model=False)
-        sampled = self.phase_passes.sampled
-        return counted if self._refusal is None else uncounted(counted, sampled and sampled.cap)
+        return counted if self._refusal is None else uncounted(counted, self.phase_passes.drawn_cap())
 
     def _compiled_for(self, compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]],
                       state: TrainState, batch: Batch, run: FitRun, interval: Interval,
@@ -2283,8 +2276,7 @@ class Trainer(Generic[Loss, Effects]):
         another program, compiled as one: an executable refuses it. A step that begins a ramp's or a
         schedule's stage gets its state with the window a rejection left part filled dropped (`_staged`), the
         state an AutoPGLE trial steps on too. A compile reports at `reported`, a cooldown branch's at the
-        run's step, else at the state's. A step that draws its pass counts per microbatch draws its call's
-        at the microbatches `interval` counted (`DrawingStep.drawn`), its FLOPs theirs.
+        run's step, else at the state's; a step drawing its pass counts draws them at `interval`'s.
         """
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
@@ -2328,10 +2320,7 @@ class Trainer(Generic[Loss, Effects]):
             self._unproven = True
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        step, flops = compiled[signature]
-        if isinstance(step, DrawingStep) and (sampled := self.phase_passes.sampled) is not None:
-            flops = step.drawn(sampled, self.key, interval, run.current)
-        return step, flops, trials.state
+        return (*self._compiler.drawn(compiled[signature], self.key, interval, run.current), trials.state)
 
     def _saved_checkpoint(
         self,

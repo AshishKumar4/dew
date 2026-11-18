@@ -128,9 +128,14 @@ class PhasePasses[L, E]:
         (`StepSettings.sampled_passes`); None for any other run."""
         return None if self.sampled is None else self.current
 
-    def counted_at(self) -> list[Objective[L, E]] | None:
+    def drawn_cap(self) -> int | None:
+        """The cap of the pass count a run draws per microbatch, a batch's counted work's width
+        (`prepare_counts`); None for any other run."""
+        return None if self.sampled is None else self.sampled.cap
+
+    def counted(self) -> list[Objective[L, E]] | None:
         """The run's objective at each count from 1 to its cap where it draws one per microbatch, whose work
-        a batch counts at each (`prepare_counts`'s `at_counts`); None for any other run."""
+        a batch counts at each (`prepare_counts`'s `counts`); None for any other run."""
         return None if self.sampled is None else [self.objective_for(count)
                                                   for count in range(1, self.sampled.cap + 1)]
 

@@ -291,7 +291,7 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     host = {"text": np.asarray(token_batch()["text"])}
     sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, split=2)
     counted = prepare_counts(sampled.objective, host, count_model=True,
-                             at_counts=sampled.phase_passes.counted_at())
+                             counts=sampled.phase_passes.counted())
     for count in range(1, CAP + 1):
         alone = phased_trainer(model.with_passes(count), 0, None)
         np.testing.assert_array_equal(counted[TRAINING_FLOPS][:, count - 1],

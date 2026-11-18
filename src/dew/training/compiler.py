@@ -573,6 +573,24 @@ class StepCompiler[L, E]:
         keep()
         return planned, compiled
 
+    def drawing(self, holder: Holding[L, E], stepping: Callable[[], Stepping], compiled: Compiled,
+                state: TrainState, batch: Batch) -> CompiledStep:
+        """`compiled`'s step, or where the run draws its pass count per microbatch (`PhasePasses.sampled`)
+        its every count's step at its cap's plan (`sampled_step`)."""
+        assert compiled.step is not None
+        if self.phase_passes.sampled is None:
+            return compiled.step
+        return self.sampled_step(holder, stepping, compiled, state, batch)
+
+    def drawn(self, held: tuple[CompiledStep, StepFlops | None], key: jax.Array, interval: Interval,
+              step: int) -> tuple[CompiledStep, StepFlops | None]:
+        """A compiled step and its FLOPs (`held`), a drawing step's (`DrawingStep`) its next call's counts
+        drawn at the microbatches `interval` counted, its FLOPs theirs."""
+        compiled, flops = held
+        if isinstance(compiled, DrawingStep) and (sampled := self.phase_passes.sampled) is not None:
+            flops = compiled.drawn(sampled, key, interval, step)
+        return compiled, flops
+
     def sampled_step(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Compiled,
                      state: TrainState, batch: Batch) -> DrawingStep:
         """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`) over `batch`:
