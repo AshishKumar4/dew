@@ -1454,13 +1454,9 @@ def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, fo
     P = jax.sharding.PartitionSpec
     walked = ()
     if forked is not None:
-        # The documents' slots a row's (their added slots too, where given), the entry write's key, value and
-        # weight its terms' heads, and a turned call's load rotation (`Forked.turning`, `[B, D, Hv, A]`) its
-        # rows' and heads', in `Forked.walked`'s order (row 7973).
+        # The table's memories a row's and head's, and the documents' operands as `Forked` places them.
         memory = P(four[0], None, four[2], None, None)
-        walked = (resets,) * (3 + (forked.adds is not None)) + (
-            (P(four[0], None, None, four[2], None),) * 2 + (three,) if forked.entry is not None else ()) + (
-            (P(four[0], None, four[2], None),) * 2 if forked.turning is not None else ())
+        walked = forked.specs(four[0], four[2])
     optional = [(state, memory), (starts, resets), (firsts, resets), (skip, P(four[2]))]
     operands = (query, key, value, g, beta, *(x for x, _ in optional if x is not None),
                 *(() if forked is None else forked.walked))
@@ -1704,12 +1700,20 @@ def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work
     def kernel(x, B, C, a, carried, documents):
         return _chunk_scan(x, B, C, a, carried, documents, chunk_size, platform, held)
 
+    specs, out_specs = ssd_specs(scaled.shape, documents)
+    scanned, final = manual_map(kernel, specs, out_specs)(scaled, B, C, a, carried, documents)
+    return scanned[:, :length] + skip, final
+
+
+def ssd_specs(shape: tuple[int, ...], documents=None) -> tuple[tuple, tuple]:
+    """The TPU scan's per-shard placements (`manual_map`) over chunk-scan operands of `shape` `[B, T, H, P]`
+    (`ssd_operands`'): its operands' `(x, B, C, a, memory, documents)` and its outputs' `(scanned, memory)`,
+    each shard its own rows and heads; `_ssd_tpu`'s launch and the TPU scan's contract's."""
     # The groups are expanded, so any split of the heads divides them.
-    rows, split = grouped_heads(scaled.shape, scaled.shape[2])
+    rows, split = grouped_heads(shape, shape[2])
     four, state = P(rows, None, split, None), P(rows, split, None, None)
     specs = (four, four, four, P(rows, None, split), state, _tpu_specs(documents, rows, split))
-    scanned, final = manual_map(kernel, specs, (four, state))(scaled, B, C, a, carried, documents)
-    return scanned[:, :length] + skip, final
+    return specs, (four, state)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2081,7 +2085,7 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, load
         if forked is not None:
             operands = (x, dt, A, B, C, D, state, *walked)
             specs = (three, three, P(None, None), three, three, P(None), P(rows, None, None, None),
-                     *(P(rows, None),) * len(walked))
+                     *forked.specs(rows, None))
             return manual_map(template, specs, (three, three))(*operands)
         held = state if state is not None else jnp.zeros((x.shape[0], x.shape[-1], A.shape[-1]), x.dtype)
         operands = (x, dt, A, B, C, D, held, *([] if starts is None else [starts]))

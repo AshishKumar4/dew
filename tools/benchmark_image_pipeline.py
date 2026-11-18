@@ -23,6 +23,7 @@ import platform
 import statistics
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,7 +37,7 @@ from PIL import Image
 
 from dew.data import TFDS, Loading, images, presets
 from dew.data.compile import compile
-from dew.data.dataset import DataPartition
+from dew.data.dataset import Closeable, DataPartition
 from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 from dew.data.image_codec import decode_image
 from dew.data.images import resize_image
@@ -202,7 +203,8 @@ def pipeline_timing(config, backend, crop_scale):
             durations.append(time.perf_counter() - started)
             cpu_times.append(time.process_time() - cpu_started)
     finally:
-        stream.close()
+        if isinstance(stream, Closeable):
+            stream.close()
     samples = config.steps * config.batch
     return {"images_per_second": samples / statistics.median(durations),
             "wall_seconds": durations, "host_cpu_seconds": cpu_times,
@@ -237,6 +239,7 @@ def training_timing(config, backend):
     with DevicePrefetchIterator(source, trainer.device_mesh,
                                 prepare=functools.partial(step_batch, trainer)) as batches:
         step = trainer.compile(state, augmented(next(batches)))
+        loss = jnp.asarray(jnp.nan)
         for _ in range(config.warmup):
             state, loss, _, _, _, _ = step(state, augmented(next(batches)))
         jax.block_until_ready(state)
@@ -252,6 +255,13 @@ def training_timing(config, backend):
             "wall_seconds": durations, "final_loss": float(loss),
             "model": "SimpleDiT patch=16 width=32 layers=1 heads=4 fp32/HIGHEST",
             "updates": int(state.updates)}
+
+
+def image_bytes(record) -> bytes:
+    """A Flowers record's encoded image, which a skipped decoder leaves as bytes."""
+    if not isinstance(record, Mapping) or not isinstance(record.get("image"), bytes):
+        raise ValueError(f"a Flowers record holds no encoded image: {type(record).__name__}")
+    return record["image"]
 
 
 def recorded_config(config: Config) -> dict:
@@ -273,7 +283,7 @@ def main(config):
         for mode in PIPELINES}
     source = TFDS("oxford_flowers102", path=config.flowers, split="all",
                   decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
-    encoded = [source[index]["image"] for index in range(min(config.images, len(source)))]
+    encoded = [image_bytes(source[index]) for index in range(min(config.images, len(source)))]
     if not encoded:
         raise ValueError("the Flowers corpus contains no images")
     cpu = platform.processor()
@@ -303,7 +313,9 @@ def main(config):
             for backend in ("host", "device")
         }
         for mode, peak in peaks.items():
-            report["pipeline"][f"device_{mode}"]["peak_device_bytes"] = None if None in peak else max(peak)
+            held = [value for value in peak if value is not None]
+            report["pipeline"][f"device_{mode}"]["peak_device_bytes"] = (
+                max(held) if len(held) == len(peak) else None)
         if config.training:
             report["training"] = {backend: training_timing(config, backend) for backend in ("host", "device")}
     text = json.dumps(report, indent=2)

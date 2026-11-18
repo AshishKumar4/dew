@@ -11,7 +11,7 @@ from contract_support import EDGES, assert_contract, normal_draw
 from dew.diffusion.schedules.flow import time_shift
 
 
-def positive_draw(seed: int, shape: tuple, scale: float) -> jax.Array:
+def positive_draw(seed: int | list[int], shape: tuple, scale: float) -> jax.Array:
     """A float32 variance a row, positive, at `scale`: a draw's magnitude, at least a tenth of the scale."""
     rng = np.random.default_rng(seed)
     return jnp.asarray((np.abs(rng.standard_normal(shape)) + 0.1) * scale, jnp.float32)
@@ -30,8 +30,15 @@ def test_a_time_shift_holds_every_order(edge):
     def plain(t):
         return 3.0 * t / (1 + 2.0 * t)
 
+    def draw(seed):
+        """A seed's times in (0, 1], direction and cotangent (the mesh order's check 1)."""
+        drawn = np.random.default_rng([2644, seed])
+        times = jnp.asarray(drawn.uniform(1e-3, 1.0, (9,)), jnp.float32)
+        return (times,), (jnp.asarray(drawn.standard_normal(9), jnp.float32),), jnp.asarray(
+            drawn.standard_normal(9), jnp.float32)
+
     assert_contract(lambda t: time_shift(3.0, t), (t,), (direction,), cotangent, f"a time shift {edge}",
-                    truth_fn=plain, plain_fn=plain)
+                    truth_fn=plain, plain_fn=plain, draw=draw if edge == "normal" else None)
 
 
 def half_squared_over(value, mean, variance):
@@ -57,8 +64,17 @@ def test_a_transitions_quadratic_term_holds_every_order(edge):
     direction = (*normal_draw(2285, (3, 4), (3, 4), scale=EDGES[edge]),
                  positive_draw(2286, (3,), EDGES[edge]))
     (cotangent,) = normal_draw(2287, (3,))
+    def draw(seed):
+        """A seed's value, mean, variance, direction and cotangent at unit scale (the mesh order's
+        check 1)."""
+        drawn, centre = normal_draw([2283, seed], (3, 4), (3, 4))
+        along = (*normal_draw([2285, seed], (3, 4), (3, 4)), positive_draw([2286, seed], (3,), 1.0))
+        return ((drawn.at[0].set(centre[0]), centre, positive_draw([2284, seed], (3,), 1.0)), along,
+                normal_draw([2287, seed], (3,))[0])
+
     assert_contract(flow._half_mahalanobis, (value, mean, variance), direction, cotangent,
-                    f"a transition's quadratic term {edge}", truth_fn=half_squared_over)
+                    f"a transition's quadratic term {edge}", truth_fn=half_squared_over,
+                    draw=draw if edge == "normal" else None)
 
     unit = jnp.ones((1,), jnp.float32)
     # A tangent far from its operands' scale among them: a value and mean of 2**-120 under 2**10
@@ -104,8 +120,17 @@ def test_a_transitions_kl_holds_every_order(edge):
     def kl(mean, reference, variance):
         return flow.GaussianTransition(mean, variance).kl(reference)
 
+    def draw(seed):
+        """A seed's mean, reference, variance, direction and cotangent at unit scale (the mesh order's
+        check 1)."""
+        centre, held = normal_draw([2288, seed], (3, 4), (3, 4))
+        along = (*normal_draw([2290, seed], (3, 4), (3, 4)), positive_draw([2291, seed], (3,), 1.0))
+        drawn = (centre, held, positive_draw([2289, seed], (3,), 1.0))
+        return drawn, along, normal_draw([2292, seed], (3,))[0]
+
     assert_contract(kl, (mean, reference, variance), direction, cotangent, f"a transition's KL {edge}",
-                    truth_fn=half_squared_over, plain_fn=half_squared_over)
+                    truth_fn=half_squared_over, plain_fn=half_squared_over,
+                    draw=draw if edge == "normal" else None)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -123,5 +148,13 @@ def test_a_guided_prediction_holds_every_order(edge):
     def affine(conditional, unconditional, scale):
         return unconditional + scale[:, None] * (conditional - unconditional)
 
+    def draw(seed):
+        """A seed's predictions, direction and cotangent at unit scale, its rows' scales as fixed (the mesh
+        order's check 1)."""
+        drawn, unguided = normal_draw([2298, seed], (4, 5), (4, 5))
+        along = (*normal_draw([2299, seed], (4, 5), (4, 5)), *normal_draw([2300, seed], (4,)))
+        return (drawn, unguided, scale), along, normal_draw([2301, seed], (4, 5))[0]
+
     assert_contract(guidance.guide, (conditional, unconditional, scale), direction, cotangent,
-                    f"a guided prediction {edge}", truth_fn=affine, plain_fn=affine)
+                    f"a guided prediction {edge}", truth_fn=affine, plain_fn=affine,
+                    draw=draw if edge == "normal" else None)

@@ -51,7 +51,7 @@ import dew
 from dew.artifacts import uint8_pixels
 from dew.inference import TextToImage
 from dew.nn.kernels.options import program
-from dew.quantization import Quantization
+from dew.quantization import Quantization, QuantizedDtype
 from dew.sampling import CFG, DPMSolverMultistep
 from dew.telemetry.benchmark import samples
 
@@ -90,8 +90,14 @@ def spec(config: Config) -> Quantization:
     patterns = (".*",)
     if config.float:
         patterns = (f"^(?!.*(?:{'|'.join(map(re.escape, config.float))})).*",)
-    return Quantization(dtype=config.precision.removesuffix("w"), weight_only=config.precision.endswith("w"),
-                        patterns=patterns)
+    match config.precision:
+        case "int8" | "int8w":
+            dtype: QuantizedDtype = "int8"
+        case "fp8" | "fp8w":
+            dtype = "fp8"
+        case _:
+            raise ValueError("a run at precision none quantizes nothing")
+    return Quantization(dtype=dtype, weight_only=config.precision.endswith("w"), patterns=patterns)
 
 
 def nbytes(tree) -> int:
@@ -114,6 +120,8 @@ def forward(pipe: TextToImage) -> dict:
 
     compiled = program(step).executable(variables, x, t)
     memory = compiled.memory_analysis()
+    if memory is None:
+        raise ValueError("the backend states no memory analysis of the forward")
     times = samples(compiled, variables, x, t, warmup=1, repeats=5)
     return {"weights_mib": round(nbytes(variables["params"]) / 2**20, 1),
             "forward_ms": round(1e3 * statistics.median(times), 2),
@@ -133,8 +141,11 @@ def sample(pipe: TextToImage, key: int | jax.Array) -> tuple[np.ndarray, dict[st
     NaN), a pixel-space model's walk included, read back as its real rows
     without the padding that fills the devices (`Images.host`)."""
     images = pipe(list(PROMPTS), key=key, steps=STEPS, solver=DPMSolverMultistep(), guidance=GUIDANCE).host()
-    found = {"latents": nonfinite(images.latents), "pixels": nonfinite(images.images)}
-    return uint8_pixels(images.images), found
+    pixels = images.decoded()
+    if images.latents is None:
+        raise ValueError("the task kept no latents")
+    found = {"latents": nonfinite(images.latents), "pixels": nonfinite(pixels)}
+    return uint8_pixels(pixels), found
 
 
 def quality(pipe: TextToImage) -> dict:
@@ -158,7 +169,10 @@ def main(config: Config) -> None:
     if Path(config.model).is_dir():
         pipe = TextToImage.from_run(config.model, dtype=config.dtype)
     else:
-        pipe = dew.pipeline(config.model, revision=config.revision, dtype=config.dtype)
+        loaded = dew.pipeline(config.model, revision=config.revision, dtype=config.dtype)
+        if not isinstance(loaded, TextToImage):
+            raise TypeError(f"{config.model} serves a {type(loaded).__name__}, not text to image")
+        pipe = loaded
     row = {"device": jax.devices()[0].device_kind, "dtype": config.dtype, "precision": config.precision,
            "float": list(config.float)}
     try:

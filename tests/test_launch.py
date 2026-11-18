@@ -429,19 +429,20 @@ def test_a_bare_launch_runs_one_process_per_gpu_of_this_machine():
 
 
 def test_the_oom_kills_a_cgroup_counted_are_read_and_a_sigkill_after_one_names_the_kernel(tmp_path):
-    """A cgroup v2 host's OOM kills are read off the process's cgroup's `memory.events`, none where the host
-    keeps no such count; a rank's SIGKILL while the launcher's cgroup counted one more names the kernel's
-    OOM killer and the memory that ran out, where a bare SIGKILL read as a scheduler's (row 6003: a pool
-    packed past its host's memory read as a preemption)."""
-    from dew._cli.launch import _exit_text, oom_kills
+    """A cgroup v2 host's OOM kills are read off the process's cgroup's `memory.events` by the one cgroup
+    reader (`dew.data.cgroups`), none where a level keeps no such count; a rank's SIGKILL while the
+    launcher's cgroup counted one more names the kernel's OOM killer and the memory that ran out, where a
+    bare SIGKILL read as a scheduler's (row 6003: a pool packed past its host's memory read as a
+    preemption)."""
+    from dew._cli.launch import _exit_text
+    from dew.data import cgroups
 
     membership, root = tmp_path / "cgroup", tmp_path / "fs"
     (root / "job" / "step").mkdir(parents=True)
     membership.write_text("0::/job/step\n")
     (root / "job" / "step" / "memory.events").write_text("low 0\nhigh 0\nmax 4\noom 2\noom_kill 3\n")
-    assert oom_kills(membership, root) == 3
-    membership.write_text("12:memory:/job/step\n")
-    assert oom_kills(membership, root) is None
+    assert cgroups.oom_kills(cgroups.own(root, membership)) == 3
+    assert cgroups.oom_kills(root) is None
     # Said apart only for a SIGKILL with a kill counted: a SIGTERM's, or a SIGKILL with none, reads as before.
     assert _exit_text(-signal.SIGKILL, 1) != _exit_text(-signal.SIGKILL, 0)
     assert _exit_text(-signal.SIGTERM, 1) == _exit_text(-signal.SIGTERM, 0)

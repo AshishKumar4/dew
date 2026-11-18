@@ -221,10 +221,13 @@ def main() -> None:
         if compiled is None:
             compiled = trainer.compile(state, batch)
             compile_seconds = time.monotonic() - start
+            executable = trainer.executable
+            if executable is None:
+                raise ValueError("the trainer compiled no step")
             if rank == 0:
-                print(json.dumps(compiled_step(trainer.executable)), flush=True)
+                print(json.dumps(compiled_step(executable)), flush=True)
             if args.compile_only:
-                args.out.with_suffix(".hlo.txt").write_text(trainer.executable.as_text())
+                args.out.with_suffix(".hlo.txt").write_text(executable.as_text())
                 return
             start = time.monotonic()
         state, loss, _, _, _, _ = compiled(state, batch)

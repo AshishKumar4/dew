@@ -1163,15 +1163,28 @@ class KVStore:
         # A dense cache's rows its own, no table: its row indices stand in for one (unread).
         table = self._absolute(self._get(TABLE)) if paged else jnp.zeros((query.shape[0], 0), jnp.int32)
         arrays = (query, pools[0], pools[-1], lengths, table, *given, *sunk, *bounded, *scales)
-        queries = logical_spec(DECODE_QUERY, query.shape)
-        # A spec leaves off trailing whole dimensions.
-        rows, heads = (*queries, None, None)[:2]
-        # A pool's key heads lead, a dense cache's rows (`[rows, capacity, heads, D]`, scales `[rows, heads,
-        # capacity]`).
-        pooled, scaled = (P(heads), P(heads)) if paged else (P(rows, None, heads), P(rows, heads))
-        specs = (queries, pooled, pooled, P(rows), P(rows), *(P(rows) for _ in given),
-                 *(P(heads) for _ in sunk), *(scaled for _ in bounded), *(scaled for _ in scales))
+        specs, queries = decode_specs(query.shape, paged=paged, starts=bool(given), sinks=bool(sunk),
+                                      held=len(bounded) + len(scales))
         return manual_map(local, specs, queries)(*arrays)
+
+
+def decode_specs(shape: tuple[int, ...], *, paged: bool, starts: bool = False, sinks: bool = False,
+                 held: int = 0) -> tuple[tuple, P]:
+    """The specs a decode step's per-shard launch (`KVStore.decode`'s `manual_map`) takes its operands in,
+    `(query, key, value, lengths, table, starts?, sinks?, *held)`, and its output's: the query `[rows,
+    heads, D]` by its logical axes (`DECODE_QUERY`), a pool its key heads (a dense cache `[rows, capacity,
+    heads, D]` its rows and heads), lengths, table and starts their rows, the sinks their heads, and the
+    `held` arrays laid as a pool's scales (`[KV, P, page]`, a dense cache's `[rows, heads, capacity]`); the
+    query's `shape`."""
+    queries = logical_spec(DECODE_QUERY, shape)
+    # A spec leaves off trailing whole dimensions.
+    rows, heads = (*queries, None, None)[:2]
+    # A pool's key heads lead, a dense cache's rows (`[rows, capacity, heads, D]`, scales `[rows, heads,
+    # capacity]`).
+    pooled, scaled = (P(heads), P(heads)) if paged else (P(rows, None, heads), P(rows, heads))
+    specs = (queries, pooled, pooled, P(rows), P(rows), *(P(rows),) * starts, *(P(heads),) * sinks,
+             *(scaled,) * held)
+    return specs, queries
 
 
 DECODE_QUERY = ("activation_batch", "activation_heads", None)

@@ -341,6 +341,11 @@ def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     names = [*slots, *vars(value)] if hasattr(value, "__dict__") else slots
     if not names:
         return None
+    unset = [name for name in names if not hasattr(value, name)]
+    if unset:
+        # A slot its object leaves unset (a trace's equation context) holds no value to state.
+        raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} leaves "
+                            f"{', '.join(sorted(unset))} unset, which has no form an identity can state")
     return ["object", again(type(value), at=at),
             [[name, again(getattr(value, name), at=f"{at}.{name}")] for name in sorted(names)]]
 

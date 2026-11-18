@@ -267,9 +267,12 @@ def signature_digest(signature: Hashable) -> str:
 
 
 
-def _custom_step_refusal(step, record: bool, inspection) -> None:
-    """Refuse what a custom step cannot serve (ValueError): records of its Steps, or an inspection of an
-    update it commits."""
+def _custom_step_refusal(step, record: bool, inspection, rollout: Rollout | None,
+                         sampled: SampledPasses | None) -> None:
+    """Refuse what a custom step cannot serve (records of its Steps, an inspection of its update), and a
+    rollout beside per-microbatch pass counts, sampling at the cap what each trains at its own (row 8272)."""
+    if rollout is not None and sampled is not None:
+        raise ValueError("a rollout samples one policy a step, not sampled_passes' count a microbatch")
     if record and step is not None:
         raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                          "build them with Step(record=True)")
@@ -377,7 +380,7 @@ class Trainer(Generic[Loss, Effects]):
         self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
-        _custom_step_refusal(step, record, inspection)
+        _custom_step_refusal(step, record, inspection, rollout, sampled_passes)
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
@@ -1107,7 +1110,7 @@ class Trainer(Generic[Loss, Effects]):
         with self.phase_passes.scoped(self, self._compiler):
             compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials))
         assert compiled.step is not None
-        return self._compiler.drawing(self, self._stepping, compiled, state, batch)
+        return self._compiler.drawing(self, self._stepping, compiled, state, batch, self.key)
 
     @ruled
     def _planned_unplaced(self, start: Start, batch: Batch) -> None:
@@ -1333,10 +1336,8 @@ class Trainer(Generic[Loss, Effects]):
             metrics=metrics, preview=preview and self.tracker is not None, best=selection, stop=plateau,
             suites=suites, pause=pause, scored_to=None if scored_to is None else os.fspath(scored_to),
             held_best=restore_best and self.checkpoints is None, restore_best=restore_best, observe=observe,
-            summaries=tuple(summaries), startup=startup,
-            declared=declared, branches=() if cooldowns is None else cooldowns.branches(
-                steps, tokens, self.accumulation, self._shape.examples),
-        )
+            summaries=tuple(summaries), startup=startup, declared=declared, branches=() if cooldowns is None
+            else cooldowns.branches(steps, tokens, self.accumulation, self._shape.examples))
 
     def scheduled(self, updates: int | None) -> None:
         """Build the configured optimizer (an `OptimConfig`) for `updates` updates, as `fit` and
@@ -1923,9 +1924,8 @@ class Trainer(Generic[Loss, Effects]):
                     examples=self._consumed(interval))
                 run.scored = frozenset(plan.suites if names is None else names)
                 run.other += run.evaluation.elapsed_seconds
-        scores = (
-            {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
-        )
+        evaluated = run.evaluation
+        scores = {} if evaluated is None or evaluated.step != current else dict(evaluated.scores)
         # Before the step's save, so a preemption inside the branch saves this step to run it again; at
         # the run's last step, after its final save (`_wind_down`). The points share one length and
         # decay, so those due together are one branch.
@@ -2320,7 +2320,7 @@ class Trainer(Generic[Loss, Effects]):
             self._unproven = True
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        return (*self._compiler.drawn(compiled[signature], self.key, interval, run.current), trials.state)
+        return (*self._compiler.drawn(compiled[signature], interval, run.current), trials.state)
 
     def _saved_checkpoint(
         self,

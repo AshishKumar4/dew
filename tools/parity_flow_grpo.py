@@ -56,7 +56,7 @@ def author_transition(reference, inputs: dict, dtype) -> dict[str, np.ndarray]:
     density and that density's velocity gradient, and its KL to the reference shifted by
     REFERENCE_SHIFT, by the names tests/test_flow_grpo.py reads."""
     import torch
-    from diffusers import FlowMatchEulerDiscreteScheduler
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
     from reference_error import torch_with_gradients
 
     scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
@@ -65,6 +65,8 @@ def author_transition(reference, inputs: dict, dtype) -> dict[str, np.ndarray]:
     # scheduler's own round trip through its timesteps moves a sigma by an ulp, a different input. From
     # NumPy, since the float64 run's `torch.tensor` is widened and would hold SIGMAS unrounded.
     scheduler.sigmas = torch.from_numpy(np.asarray((*SIGMAS, 0.0), np.float32)).to(dtype)
+    if not isinstance(scheduler.timesteps, torch.Tensor):
+        raise TypeError("the scheduler set no timesteps")
     timesteps = scheduler.timesteps.repeat(REPEATS)
     host = torch.empty(0, dtype=dtype).numpy().dtype
 

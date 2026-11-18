@@ -76,6 +76,24 @@ def test_a_dynamic_scale_step_is_accepted_on_its_gradient_finite():
     assert not np.all(np.isfinite(np.asarray(state.variables["params"]["w"])))
 
 
+@pytest.mark.parametrize("split", [1, 2])
+def test_a_scaled_steps_state_report_names_the_leaf_its_committed_state_holds(split):
+    """A scaled step whose update overflows its state reports its committed state's first leaf not finite
+    and how many are not, as the state it leaves holds them, whatever microbatches it steps in: a step of
+    two parts reports its last part's, where the two parts' reports were summed and named another leaf
+    (row 8269)."""
+    from dew.training.transaction import checked
+
+    trainer = Trainer(ScaledObjective(), optax.sgd(1e30), key=jax.random.key(0), dynamic_scale=True,
+                      split=split)
+    state = trainer.initial_state()
+    huge = {"scale": jnp.full((split * jax.device_count(),), 5e9, jnp.float32)}
+    state, _, _, _, accepted, committed = trainer.compile(state, huge)(state, huge)
+    assert bool(accepted)
+    finite = [bool(np.all(np.isfinite(np.asarray(leaf)))) for leaf in jax.tree.leaves(checked(state))]
+    assert np.asarray(committed.unfinite_state).tolist() == [finite.index(False), finite.count(False)]
+
+
 @pytest.mark.parametrize("accum", [1, 2])
 def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     """A dynamic scale's accepted steps are the unscaled run's, bit for bit, and a rejected one leaves

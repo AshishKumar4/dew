@@ -116,6 +116,13 @@ class Images(Generic[ArrayT]):
         """Return this process's real rows as host arrays, without the padding added to fill the devices."""
         return jax.tree.map(lambda leaf: host_rows(leaf, self.rows), self)
 
+    def decoded(self) -> ArrayT:
+        """The decoded images, refused where the samples kept only their latents (a call with
+        `decode=False`)."""
+        if self.images is None:
+            raise ValueError("these samples kept only their latents; call the task with decode=True")
+        return self.images
+
     def pil(self) -> list[PILImage]:
         """Return this process's real rows of an NHWC image batch as PIL images.
 
@@ -125,12 +132,11 @@ class Images(Generic[ArrayT]):
         `[N, H, W, 3]` or `[N, H, W, 1]` images."""
         from PIL import Image
 
-        if self.images is None:
-            raise ValueError("these samples kept only their latents; call the task with decode=True")
-        if self.images.ndim != 4 or self.images.shape[-1] not in (1, 3):
+        images = self.decoded()
+        if images.ndim != 4 or images.shape[-1] not in (1, 3):
             raise ValueError(f"pil() takes [N, H, W, 3] or [N, H, W, 1] images, not samples of shape "
-                             f"{self.images.shape}")
-        pixels = uint8_pixels(host_rows(self.images, self.rows))
+                             f"{images.shape}")
+        pixels = uint8_pixels(host_rows(images, self.rows))
         return [Image.fromarray(row[..., 0] if row.shape[-1] == 1 else row) for row in pixels]
 
 

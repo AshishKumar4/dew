@@ -368,6 +368,85 @@ def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_w
     np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
 
 
+def test_a_program_compiled_over_a_zero_tangents_shape_runs_for_its_host_value():
+    """A program compiled within `collecting` over a float0 shape (a zero tangent's, which a pullback reads
+    for an integer statistic) runs for the host value JAX hands such a tangent back as, tracing nothing
+    (`executable_only`): no device holds a float0, so a call knows it by its shape alone."""
+    from dew.nn.kernels.options import collecting, owned_program
+    from dew.telemetry.compiles import executable_only
+
+    program = owned_program(lambda values, zero: values + 1)
+    placed = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    with collecting():
+        program(jax.ShapeDtypeStruct((4,), jnp.float32, sharding=placed),
+                jax.ShapeDtypeStruct((3,), jax.dtypes.float0))
+    with executable_only():
+        answered = program(jax.device_put(np.zeros(4, np.float32), placed), np.zeros((3,), jax.dtypes.float0))
+    np.testing.assert_array_equal(np.asarray(answered), np.ones(4))
+
+
+def test_a_program_holds_at_most_its_bound_kept_and_compiled_over_shapes_together():
+    """A program called over more distinct shapes than it keeps (its `CACHED`, three here), some of them
+    compiled over shapes first (`collecting`), holds no more executables than its bound across its kept
+    and its shaped stores together: one eviction policy (`_bounded`)."""
+    from dew.nn.kernels.options import collecting, owned_program
+
+    program = owned_program(lambda values: values + 1)
+    program.CACHED = 3
+    with collecting():
+        for size in (1, 2):
+            program(jax.ShapeDtypeStruct((size,), jnp.float32))
+    for size in range(3, 8):
+        program(jnp.zeros((size,), jnp.float32))
+    assert len(program._executables) + len(program._shaped) <= 3
+    # The latest kept, which the bound never lets go: called again, it compiles nothing.
+    with Compiles(None) as compiles:
+        program(jnp.zeros((7,), jnp.float32))
+    assert compiles.count == 0
+
+
+def test_each_collection_in_a_process_holds_every_program_it_called():
+    """Two collections in one process over the same shapes (two equivalent runs compiled ahead) each hold
+    every program their calls reached, the second's taken from the first's compile, not left out: each
+    file its loader reads (`AheadOfTime.starts`) is whole."""
+    from dew.nn.kernels.options import collecting, owned_program
+
+    program = owned_program(lambda values: values * 3 - 1)
+    placed = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    shape = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=placed)
+    held = []
+    for _ in range(2):
+        with collecting() as collected:
+            program(shape)
+        held.append(collected)
+    first, second = held
+    assert len(first) == 1 and second.keys() == first.keys()
+
+
+def test_a_program_compiled_over_shapes_while_collecting_runs_for_arrays_alike_tracing_nothing():
+    """A program called within `collecting` over shapes runs for a later call over arrays alike in shape,
+    dtype and placement with nothing traced, lowered or compiled (`executable_only` allows none): how a run
+    whose startup compiles its host step's programs over its state's shapes steps on them. Arrays placed
+    otherwise than the shapes stated miss it: that call compiles its own program, placed where they are."""
+    from dew.nn.kernels.options import collecting, owned_program
+    from dew.telemetry.compiles import executable_only
+
+    devices = jax.devices()
+    placed = jax.sharding.SingleDeviceSharding(devices[0])
+    program = owned_program(lambda values: values * 2 + 1)
+    with collecting():
+        program(jax.ShapeDtypeStruct((4,), jnp.float32, sharding=placed))
+    with executable_only():
+        answered = program(jax.device_put(np.arange(4, dtype=np.float32), placed))
+    np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
+    elsewhere = jax.sharding.SingleDeviceSharding(devices[-1])
+    with Compiles(None) as compiles:
+        moved = program(jax.device_put(np.arange(4, dtype=np.float32), elsewhere))
+    assert [program.kind for program in compiles.programs].count("compiled") == 1
+    assert moved.sharding == elsewhere
+    np.testing.assert_array_equal(np.asarray(moved), np.arange(4) * 2 + 1)
+
+
 @pytest.mark.parametrize("asked", ["midway", "at its end", "scored to"])
 def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs_its_fit_runs(
         asked, tmp_path):

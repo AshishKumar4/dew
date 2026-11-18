@@ -18,22 +18,37 @@ from pathlib import Path
 DURATIONS = Path("tests/test_durations.json")
 """Each test's least seconds, by its node id: a number, its least warm time, where only runs whose programs
 the shared compilation cache held have timed it; [warm, cold] once a run that compiled its programs has,
-its least time so beside the least warm one (`entry`). Every cut and weight reads an entry's cost
-(`cost`)."""
+its least time so beside the least warm one; and [warm, cold or null, peak] once a task that ran it has
+measured its memory, the resident peak in bytes of the newest task that ran it (`entry`), a bound of its
+own above (row 6003). Every cut and weight reads an entry's cost (`cost`), every size its peak (`peak`)."""
 
 
-def entry(warm: float, cold: float | None) -> float | list[float]:
+type Entry = float | list[float | None]
+"""A durations record's entry (`DURATIONS`)."""
+
+
+def entry(warm: float, cold: float | None, peak: int | None = None) -> Entry:
     """A durations record's entry of a test timed `warm` at least warm and `cold` at least cold (None:
-    never timed cold)."""
+    never timed cold), its newest task's resident peak `peak` bytes (None: none measured)."""
+    if peak is not None:
+        return [round(warm, 3), None if cold is None else round(cold, 3), int(peak)]
     return round(warm, 3) if cold is None else [round(warm, 3), round(cold, 3)]
 
 
-def warm_cold(held: float | list[float]) -> tuple[float, float | None]:
+def warm_cold(held: Entry) -> tuple[float, float | None]:
     """An entry's least warm seconds and least cold ones, None where no cold run has timed it."""
-    return (float(held[0]), float(held[1])) if isinstance(held, list) else (float(held), None)
+    if not isinstance(held, list):
+        return float(held), None
+    return float(held[0]), None if held[1] is None else float(held[1])
 
 
-def cost(held: float | list[float]) -> float:
+def peak(held: Entry) -> int | None:
+    """An entry's resident peak in bytes, the newest task's that ran its test; None where none was
+    measured."""
+    return int(held[2]) if isinstance(held, list) and len(held) > 2 and held[2] is not None else None
+
+
+def cost(held: Entry) -> float:
     """What a test costs a task that runs it, by its entry: its cold time where one is recorded, else its
     warm one. Cuts and weights read this whatever the cache holds, so a cut is one function of the
     record, the same in the plan and in the task that recomputes its group (split.py), and a group runs
@@ -564,3 +579,57 @@ def groups(seconds: list[float], count: int) -> list[range]:
     bounds = [*starts(weights, low), len(weights)]
     bounds += [len(weights)] * (count + 1 - len(bounds))
     return [range(bounds[index], bounds[index + 1]) for index in range(count)]
+
+
+KEPT_AT = "@"
+"""What joins a kept row's file to where its green run is kept in a plan entry's tests (ci.py's
+`reusable`): `tests/test_a.py@<class>:<key>`, or a group's, `tests/test_a.py#2/3@<class>:<key>`, which
+the task reads (ci.py's `kept_of`)."""
+
+GROUP_AT = "#"
+"""What joins a kept row's file to its group in its token (`KEPT_AT`), as a row's name does (ci.py's
+`row`)."""
+
+
+def entries(path: Path = DURATIONS) -> dict[str, Entry]:
+    """The durations record's entries as kept, each test's least warm and least cold seconds and its peak
+    (`entry`)."""
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+LARGE_FROM = 5 * 2**30
+"""A file's peak (`heavy_files`) past which its tasks run on a large container: half the memory a medium's
+tasks run under (armada's `tasksMemoryOf`, its 12 GiB less the 2 GiB the container keeps), so no two such
+tasks share a medium, which armada packs light tasks into by each task's own measures alone, and a regrouped
+file's new task has none (row 6003: a group's four ranks peaked at 7.17 GiB, and two packed on a medium had a
+rank killed). Through armada's own per-entry `size`; a large task armada still packs only by its measures."""
+
+
+PEAK_MOVES = 0.25
+"""How far a test's newest task peak must move from its recorded one, as a part of it, for the record to take
+it (`moved_peak`): a task's exact bytes differ every run, and a peak taken each run rewrites nearly every
+entry each fold (train 1039's review F5)."""
+
+
+def moved_peak(held: int | None, measured: int) -> int:
+    """The peak to record for a test whose recorded one is `held` (None: none) and whose newest task peaked at
+    `measured`: the newest where it moved by more than `PEAK_MOVES` or across `LARGE_FROM`, which sizes the
+    test's tasks (`heavy_files`); else the recorded one, unchanged."""
+    if held is None or (held > LARGE_FROM) != (measured > LARGE_FROM):
+        return measured
+    return held if held * (1 - PEAK_MOVES) <= measured <= held * (1 + PEAK_MOVES) else measured
+
+
+def heavy_files(path: Path = DURATIONS) -> set[str]:
+    """The test files any of whose tests' recorded peaks (`peak`) passes `LARGE_FROM`: their tasks'
+    size large, whatever group a cut gives each test."""
+    return {node.partition("::")[0] for node, held in entries(path).items()
+            if (measured := peak(held)) is not None and measured > LARGE_FROM}
+
+
+def sized(entry: dict, heavy: set[str]) -> dict:
+    """`entry`, on a large container where it runs a file of `heavy` (`heavy_files`): a file's group, its
+    whole row, or a check-1 site's map task or judge, any task that runs its tests rather than looking a
+    kept row up (`KEPT_AT`)."""
+    runs = {token for token in entry["tests"].split() if KEPT_AT not in token}
+    return {**entry, "size": "large"} if runs & heavy else entry

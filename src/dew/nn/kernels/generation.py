@@ -1202,12 +1202,17 @@ def runtime_facts(target: GpuTarget, device, *, read: Callable[[int, int], int |
     multiprocessors, its block's shared memory, its clock, memory bandwidth and L2 cache from the CUDA
     driver (`_driver_facts`, read by `read`, `dew._devices.gpu_attribute` by default), read free at
     runtime, its family's facts its capability's (`architecture`). A GPU the table does not name so
-    keeps every resource a kernel's requirements and cost read."""
+    keeps every resource a kernel's requirements and cost read. A compile-only GPU (`compile_only_gpus`, a
+    serialized topology's) states its multiprocessors and shared memory itself and has no ordinal the
+    driver knows (its `local_hardware_id` None): nothing of it is asked of the driver, which on a host whose
+    GPUs are hidden loads with no device to answer (rows 6717, 7924: a build with CUDA_VISIBLE_DEVICES=""
+    refused with "CUDA driver error 100")."""
     if read is None:
         from dew._devices import gpu_attribute
         read = gpu_attribute
+    ordinal = device.local_hardware_id
     facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device),
-             **dict(_driver_facts(device.local_hardware_id, read))}
+             **(dict(_driver_facts(ordinal, read)) if ordinal is not None else {})}
     return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None})
 
 
