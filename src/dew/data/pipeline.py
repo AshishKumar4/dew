@@ -784,15 +784,6 @@ def examples_limit(stages: Sequence[object]) -> int | None:
     return at - 1 if at is not None and at > 0 and isinstance(stages[at - 1], Limit) else None
 
 
-def counting_only(stages: Sequence[object]) -> frozenset[int]:
-    """The place among `stages` of a mark with no bound (a run counting its passes,
-    `dew.data.bounds._counted`), which changes no record the read makes and none of its order, so no plan
-    or order states it: a run counting its passes resumes one saved without it, and its own is resumed by
-    one that counts none."""
-    at = examples_bound(stages)
-    return frozenset() if at is None or examples_limit(stages) is not None else frozenset({at})
-
-
 def examples_bound(stages: Sequence[object]) -> int | None:
     """Where a run bounded in examples marks the source examples it reads (`MarkConsumed`), the stage
     after the bound's limit (`dew.data.bounds._bounded`): its index in `stages`, None for a read the run

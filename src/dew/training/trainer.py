@@ -1572,9 +1572,6 @@ class Trainer(Generic[Loss, Effects]):
                 raise
             position = None
             self._restarting(run, tuple(changed.differs))
-        if self._counting:
-            # A checkpoint saved before its run counted its passes: their count read off its position.
-            Interval.counted_before(run.stop_control, position)
         return (start.resume, position, lambda begun=None: self._placed(start, positioned=False)[:2],
                 start.abstract, None)
 

@@ -7,13 +7,13 @@ import dataclasses
 import json
 from pathlib import Path
 
+import pytest
 from run_kinds import decision, scalars, trained
 
 from dew import _position
 from dew.batch import CONSUMED_COUNT, EXAMPLES_CONSUMED
 from dew.data.dataset import DataPartition
 from dew.training._fit import consumption_counted
-from dew.training.interval import CONSUMED_EXAMPLES, Interval
 
 PLAIN = Path(__file__).with_name("fixtures") / "plans" / "decision-plain-main-b2d94d559.json"
 """A decision run's plan identity and batch fields, bounded in four steps with no cadence that reads its
@@ -78,21 +78,6 @@ def test_a_run_whose_cadences_read_no_pass_compiles_as_before_and_a_counting_one
     assert sorted(name for name in stepped if name != CONSUMED_COUNT) == held["fields"]
 
 
-def test_a_checkpoint_saved_before_its_run_counted_reads_its_count_off_a_global_position():
-    """A checkpoint with no count of the examples its run consumed (`CONSUMED_EXAMPLES`), saved before its
-    run counted its passes, is given its global position's records, the source examples its one order
-    read; a per-share position states none, and its run counts from where it resumes."""
-    control: dict = {}
-    Interval.counted_before(control, _position.encode(_position.Global(records=37, order="o", plan=None)))
-    assert control == {CONSUMED_EXAMPLES: 37}
-    kept = {CONSUMED_EXAMPLES: 5}
-    Interval.counted_before(kept, _position.encode(_position.Global(records=37, order="o", plan=None)))
-    assert kept == {CONSUMED_EXAMPLES: 5}
-    shared: dict = {}
-    Interval.counted_before(shared, json.dumps({_position.PLAN: {}, "iterator": {}}).encode())
-    assert shared == {}
-
-
 def _identity_map(rows):
     return rows
 
@@ -149,19 +134,24 @@ def test_a_streamed_read_its_workers_deal_counts_its_passes_and_reads_as_one_cou
             stream.close()
 
 
-def test_a_position_saved_counting_or_not_resumes_in_a_read_doing_the_other():
-    """A streamed read's position saved by a run counting its passes resumes in one counting none, and the
-    other way round, onto the batches the run that saved it reads next: the count adds no stage to its
-    read's state, nor to its plan or order (`counting_only`), where a counting bound's limit held state of
-    its own the other run's read could not restore (the theme's review, F2)."""
-    for saving, resuming in ((False, True), (True, False)):
+def test_a_position_saved_counting_resumes_counting_and_is_a_changed_plan_to_a_read_counting_none():
+    """A streamed read's position saved by a run counting its passes resumes in one counting them onto the
+    batches the run that saved it reads next; to the same chain counting none, either way round, it is a
+    plan that changed (`PlanChanged`), its mark a step of the plan and of its reader's state, which a
+    relaxed resume reads from its start, where restoring it in the other read failed in Grain's own
+    restore (KeyError 'next_index_in_buffer', the theme's review, F2)."""
+    for saving, resuming in ((True, True), (True, False), (False, True)):
         saved, after = _loader(_chain("streamed"), counting=saving), _loader(_chain("streamed"),
                                                                               counting=resuming)
         first, second = saved.train(DataPartition()), after.train(DataPartition())
         try:
             _ids(first, 3)
-            second.set_state(first.get_state())
-            assert _ids(second, 4) == _ids(first, 4)
+            if saving == resuming:
+                second.set_state(first.get_state())
+                assert _ids(second, 4) == _ids(first, 4)
+            else:
+                with pytest.raises(_position.PlanChanged):
+                    second.set_state(first.get_state())
         finally:
             first.close()
             second.close()
@@ -179,8 +169,8 @@ def test_a_read_whose_count_would_change_its_rows_counts_no_pass_and_reads_as_be
     from dew.data.pipeline import Pipeline
 
     documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(12)]
-    packed = Pipeline(Memory(documents)).shuffle(seed=1).pack(8, fields=("id",)).shuffle(seed=2).read(
-        "memory").batch(2)
+    packed = Pipeline(Memory(documents)).shuffle(seed=1).pack(8, fields=("id",)).shuffle(
+        seed=2, window=4).read("memory").batch(2)
     native = Pipeline(Memory(documents)).pack(8, fields=("id",)).grain(
         _identity_map, identity="identity@1").read("indexed").batch(2)
     for chain in (packed, native):

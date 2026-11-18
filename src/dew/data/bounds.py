@@ -72,7 +72,9 @@ def _counted(pipeline: Pipeline) -> Pipeline:
     (`_one_example_until`, `MarkConsumed` alone): a run bounded in steps whose cadence reads its passes
     (`dew.data.compile`'s `count_passes`), which bounds nothing, so its order, its repeats, its batch and
     every row it makes are those of the read counting none, the mark adding the count each row carries.
-    Placed only where `_countable` says so."""
+    The mark is a step of its plan, as it is of its reader's saved state (a Grain operator of its own): a
+    position saved by a read counting otherwise is a plan that changed (`PlanChanged`), which a relaxed
+    resume reads from its start and an exact one refuses. Placed only where `_countable` says so."""
     at = _placement(pipeline, passes=True, counting=True)
     assert isinstance(at, int), at
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], Map(MarkConsumed()),

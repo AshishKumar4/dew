@@ -150,7 +150,6 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     children,
-    counting_only,
     examples_bound,
     record_stage,
     runs,
@@ -1108,11 +1107,8 @@ def _compiled(
     )
     sources = [source for _, source in _leaves(original)]
     # The plan of this read, whole: its manifest, its facts, its members' digests, its caches and its rules.
-    stated = written(tuple(_steps(original)))
-    # A bound that bounds nothing, which only marks what a run counting its passes consumes, is no step.
-    uncounted = counting_only(stated)
-    described = [stage for at, stage in enumerate(stated)
-                 if not isinstance(stage, (Workers, Prefetch)) and at not in uncounted]
+    described = [stage for stage in written(tuple(_steps(original)))
+                 if not isinstance(stage, (Workers, Prefetch))]
     def planned() -> Plan:
         """The plan, its steps described under the field rule in force (`dew.data.plan.described_under`),
         which a position saved under an earlier version is compared with (`Plan.under`)."""
