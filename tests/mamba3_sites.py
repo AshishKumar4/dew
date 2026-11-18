@@ -119,7 +119,7 @@ def recurrent(x, dt, A, B, C, lam, theta, starts):
 
 def truth(arrays: dict, leaves: tuple[str, ...] = LEAVES) -> dict[str, jax.Array]:
     """A site's float64 truth: `dew_form` over `recurrent` in float64 (the caller's `enable_x64`)."""
-    widened = {name: np.asarray(value, np.float64) if np.issubdtype(np.asarray(value).dtype, np.floating)
+    widened = {name: jnp.asarray(value, jnp.float64) if jnp.issubdtype(jnp.asarray(value).dtype, jnp.floating)
                else value for name, value in arrays.items()}
     return dew_form(recurrent, widened, leaves)
 
