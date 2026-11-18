@@ -29,7 +29,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
-from dew.batch import Variables, merge, part
+from dew.batch import Variables, merge, part, sows_appended
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 from dew.nn.inspection import QK
 from dew.nn.protocols import StagedStacks
@@ -103,9 +103,9 @@ WRITTEN = ('cache', ROUTER_COLLECTION, QK, INDEXER_COLLECTION)
 """The collections a decoder block writes: its decode cache, and what its
 router, its attention and its sparse indexer sow, which a looped pass keeps
 apart per pass (`PassView`), but for what they observe of the block's weights
-(`OBSERVED`)."""
+(`BY_CALL`)."""
 
-OBSERVED = (ROUTER_COLLECTION, QK)
+BY_CALL = (ROUTER_COLLECTION, QK)
 """What a block's routers and attention sow of its weights' use: the experts each token chose and the
 attention logits' maxima, which a router's balancing bias and QK-Clip read at the weights' own path. A
 loop's every pass and exit coda calls the same weights, so each sows at its layers' own names, after the
@@ -318,25 +318,6 @@ class Loop:
                              f"exit gate weighs, got {self.exit_threshold} with exit_gate={self.exit_gate}")
 
 
-def sows_appended(held: Mapping, sown: Mapping) -> dict:
-    """A collection's `held` entries with a call's `sown` ones appended (`_appended`): what a loop's pass
-    sows after the calls before it (`PassView`, `looping.PassStack`)."""
-    return {**held, **{name: _appended(held.get(name), value) for name, value in sown.items()}}
-
-
-def _appended(held, sown):
-    """`held` with `sown` appended at each leaf: a sown tuple extends the held one, a mapping merges
-    key by key, and any other value replaces the held one, as a sow's reduction does."""
-    if isinstance(sown, Mapping):
-        merged: dict[str, object] = dict(held or {})
-        for name, value in sown.items():
-            merged[name] = _appended(merged.get(name), value)
-        return merged
-    if isinstance(sown, tuple):
-        return (*(held or ()), *sown)
-    return sown
-
-
 @dataclasses.dataclass
 class SharedPassView:
     """The passes of a `Loop` with `shared_cache` over its block's own cache entries, which every
@@ -352,7 +333,7 @@ class SharedPassView:
     layers: tuple[int, int]
     entering: Mapping | None = None
     observed: dict = dataclasses.field(default_factory=dict)
-    """What the step sowed of the block's weights' use before the pass (`OBSERVED`), which the pass's own
+    """What the step sowed of the block's weights' use before the pass (`BY_CALL`), which the pass's own
     sows follow (`outside`)."""
 
     def first(self, variables: Mapping[str, Mapping]) -> dict:
@@ -360,11 +341,11 @@ class SharedPassView:
         return self._observing(variables)
 
     def _observing(self, variables: Mapping[str, Mapping]) -> dict:
-        """`variables` with what the pass observes (`OBSERVED`) held back: it sows it afresh, entering
+        """`variables` with what the pass observes (`BY_CALL`) held back: it sows it afresh, entering
         none, as a pipeline's scan writes only the collections that enter it empty."""
         self.observed = {collection: dict(tree) for collection, tree in variables.items()
-                         if collection in OBSERVED}
-        return {collection: {} if collection in OBSERVED else tree for collection, tree in variables.items()}
+                         if collection in BY_CALL}
+        return {collection: {} if collection in BY_CALL else tree for collection, tree in variables.items()}
 
     def _apart(self, name: str) -> bool:
         """Whether `name` is the entry of layers outside the block."""
@@ -393,7 +374,7 @@ class PassView:
     layer) and hides every other layer's, and keeps the tree it was given;
     `outside` puts the pass's entries back beside the others'. A name that
     is not a layer's is every pass's, and what the pass observes of its
-    weights (`OBSERVED`) it sows at their own names, after every earlier
+    weights (`BY_CALL`) it sows at their own names, after every earlier
     call's. Flax calls `inside` before `outside` within one trace
     (`nn.map_variables`), which is what holding the tree relies on.
     """
@@ -419,16 +400,16 @@ class PassView:
         back = self.first - self.offset
         # What the pass observes it sows afresh, entering none, as a pipeline's scan writes only the
         # collections that enter it empty; `outside` appends it after the calls before.
-        return {collection: {} if collection in OBSERVED else
+        return {collection: {} if collection in BY_CALL else
                 {self._moved(name, back): value for name, value in tree.items() if self._ours(name)}
                 for collection, tree in self.held.items()}
 
     def outside(self, variables: Mapping[str, Mapping]) -> dict:
-        out = {collection: tree if collection in OBSERVED else
+        out = {collection: tree if collection in BY_CALL else
                {name: value for name, value in tree.items() if not self._ours(name)}
                for collection, tree in self.held.items()}
         for collection, tree in variables.items():
-            if collection in OBSERVED:
+            if collection in BY_CALL:
                 out[collection] = sows_appended(out.get(collection, {}), tree)
                 continue
             out.setdefault(collection, {}).update(

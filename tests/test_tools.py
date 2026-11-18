@@ -2357,11 +2357,16 @@ def test_the_data_benchmark_rates_its_training_window_over_the_whole_mesh_as_the
     rates = tool.rated(2.0, 2, 16, compiled, work, 8, peak=peak)
     assert rates["model_mfu_bf16_peak"] == work / 8 / 2 / (2.0 / 2) / peak
     assert rates["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
-    assert rates["unsized_kernels_per_step"] == 0
+    assert (rates["unsized_kernels_per_step"], rates["hlo_utilization_bound"]) == (0, "")
     uncounted = tool.rated(2.0, 2, 16, StepFlops(2.0e12, 4.0e12, 6.0), None, 8, peak=peak)
     assert uncounted["model_mfu_bf16_peak"] is None
     assert uncounted["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
     assert uncounted["unsized_kernels_per_step"] == 3.0
+    assert uncounted["hlo_utilization_bound"] == "_lower_bound"
+    # A loop counted at its stated bound: an upper bound, named so (train 1025's F3).
+    bounded = tool.rated(2.0, 2, 16, StepFlops(2.0e12, 4.0e12, 0.0, 1.0e12), None, 8, peak=peak)
+    assert bounded["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
+    assert bounded["hlo_utilization_bound"] == "_upper_bound"
 
 
 @pytest.mark.mesh

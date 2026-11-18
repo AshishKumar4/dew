@@ -272,20 +272,22 @@ def _own_truth(prepared, followed, result, inputs, truth):
     return result.judged, _followed_truth(prepared, followed, result, inputs)
 
 
-def _truth_program(fn):
+def _truth_program(fn, device=None):
     """`fn`, a check's float64 truth, as the gate runs it, unrewritten (`arm_arithmetic.unrewritten`):
     compiled, once a signature, so the truth runs as one float64 program on the device's FP64 units rather
     than one eager dispatch an equation, every primitive at its own float64 semantics (`Truth`). A truth the
-    gate runs as given (`as_given`: NumPy, torch, a recording, a host loop), one compiled already (a jit,
-    `dew_programs`), or none, as it is; a window loop's by its own. A truth with host work inside that does
-    not state it fails at its trace, loudly, and passes `as_given`."""
+    gate runs as given (`as_given`: NumPy, torch, a recording, a host loop), one of Dew's own programs
+    (`dew_programs`), or none, as it is (`_holds_program`); one compiled already (a jit) as it is too, but on
+    a named `device` (a GPU run's sizing's, the host's: `_qualified`), where it is that device's program
+    as a plain one is, and one placed already stays where it is; a window loop's by its own. A truth with host
+    work inside that does not state it fails at its trace, loudly, and passes `as_given`."""
     if isinstance(fn, Truth):
-        return fn
-    if fn is None or _given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"):
-        return unrewritten(fn)
+        return fn if device is None or fn.device is not None else Truth(fn.fn, device)
     if isinstance(fn, _Windowed):
-        return _Windowed(_truth_program(fn.fn))
-    return Truth(fn)
+        return _Windowed(_truth_program(fn.fn, device))
+    if fn is None or not _holds_program(fn) or (device is None and hasattr(fn, "lower")):
+        return unrewritten(fn)
+    return Truth(fn, device)
 
 
 def with_gradients(fn, *, has_aux: bool = False):
@@ -519,11 +521,12 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
 
 
 def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn,
-                  terms, also, orders) -> None:
+                  terms, also, orders, plain: bool) -> None:
     """`assert_as_exact`'s site prepared into `store` (`truths_ahead.compiled_truths`): every program its
     truths and terms take (`_ahead`), at each shape the draws of its stages take, compiled for the devices its
     run computes on, and its truth held to float64 on its first draw's shapes (`_of_float64`); and each of its
-    arms' (`_compile_arms`); no truth computed and no arm run. A truth the gate runs as given or replays (a
+    arms' (`_compile_arms`), at a qualification run's sizing draws too where its verdict is the `plain` pair's
+    (`_qualified`); no truth computed and no arm run. A truth the gate runs as given or replays (a
     recording) has no program."""
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
                            library_row=None, library_leaves=(), also=also, terms=terms)
@@ -542,7 +545,7 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
             _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
         store.compile_site(label, programs, held)
     # A qualification run sizes a plain site first (`_qualified`), on its sizing draws through its arms.
-    sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and not (also or terms) else range(0)
+    sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and plain else range(0)
     _compile_arms(store, {"dew": (dew_fn, False), "reference": (reference_fn, True),
                           **{f"further {name}": (fn, True) for name, fn in also.items()}},
                   draw, label, seeds=seeds, orders=orders, sizing=sizing)
@@ -698,19 +701,6 @@ def _sizing_seeds(reference_fn) -> range:
     where it takes none (`_paired_most`)."""
     most = _paired_most(reference_fn)
     return range(0) if most is None else range(SIZING_FROM, SIZING_FROM + 2 * most)
-
-
-def _host_truth(fn, device):
-    """A truth (a truth function or a reference, `_truth_program`'s) placed on `device` (a GPU run's sizing's,
-    the host's): a plain or jitted function its program there (`Truth`), a window loop's its own placed,
-    one already placed, run as given, or running Dew's own programs as it is."""
-    if isinstance(fn, _Windowed):
-        return _Windowed(_host_truth(fn.fn, device))
-    if isinstance(fn, Truth):
-        return fn if fn.device is not None else Truth(fn.fn, device)
-    if fn is None or _given(fn) or getattr(fn, "dew_programs", False):
-        return fn
-    return Truth(fn, device)
 
 
 def _stored_arms(store: CompiledTruths, label: str, dew_fn, reference_fn, also: Mapping, compiled: tuple):
@@ -1117,25 +1107,25 @@ def _first_timed(timed: dict, rows_at: Callable, seed):
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
            label: str = "", examples: bool = False, conditioning=None, timed: dict | None = None,
-           followed=None):
-    """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
-    `truth_fn` on them (by default `reference_fn` on them widened, unrewritten). With `reference_seeds`,
-    the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
-    row of float64 zero is paired only where the two truths are the same values (an orbit's draws).
-    With `orders`, each arm also runs at every other order of its own draw (`orders(inputs)` past its
-    first, the draw itself), held to that draw's one truth: each arm's worst row is its worst over the
-    orders, measured rows of float64 zero included, and its values finite at every one; its errors and
-    its rows of float64 zero are the draw's own order's. With `library_fn`, the library arm runs beside
-    the reference on Dew's own inputs, held to Dew's truth, and the draws are judged against the larger
-    of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once. With
-    `also`, further references run beside it on Dew's own inputs, each held to Dew's truth, Dew and the
-    truth evaluated once for them all: the reference's draws, then each further reference's, a list. With
-    `terms_fn`, the truth is that program's with each output's terms (`float64_terms`), every row sized by
-    the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own terms program
-    (`_SiteTerms`), the truth is as without and its terms that program's, on the same widened inputs. With
-    `conditioning` (dew.parity's `Conditioning`), every arm's leaves are read as residuals in units of the
-    reference's rounding at its truth's inputs (`Weighed.weighed`). With `followed`, each arm is held to
-    the truth of its own decisions (`_draw_truth`, `_followed_truth`)."""
+           followed=None) -> list[_Draws]:
+    """Every leaf's errors (`_Draws`) over `seeds`, a list (the reference's, each further one's after):
+    both functions run on `draw(seed)`'s inputs, truth `truth_fn` on them (by default `reference_fn` on
+    them widened, unrewritten). With `reference_seeds`, the reference runs on those draws instead, each
+    held to its own draw's truth (`null_runs`), and a row of float64 zero is paired only where the two
+    truths are the same values (an orbit's draws). With `orders`, each arm also runs at every other order
+    of its own draw (`orders(inputs)` past its first, the draw itself), held to that draw's one truth: each
+    arm's worst row is its worst over the orders, measured rows of float64 zero included, and its values
+    finite at every one; its errors and its rows of float64 zero are the draw's own order's. With
+    `library_fn`, the library arm runs beside the reference on Dew's own inputs, held to Dew's truth, and
+    the draws are judged against the larger of the two on `library_leaves` (`_Draws.against_larger`), Dew
+    and the truth evaluated once. With `also`, further references run beside it on Dew's own inputs, each
+    held to Dew's truth, Dew and the truth evaluated once for them all, each further reference's draws
+    after the reference's. With `terms_fn`, the truth is that program's with each output's terms
+    (`float64_terms`), every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with
+    a site's own terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the
+    same widened inputs. With `conditioning` (dew.parity's `Conditioning`), every arm's leaves are read as
+    residuals in units of the reference's rounding at its truth's inputs (`Weighed.weighed`). With
+    `followed`, each arm is held to the truth of its own decisions (`_draw_truth`, `_followed_truth`)."""
     if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
@@ -1233,7 +1223,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     drawn = [_drawn_from(names, widths, evidence[at_arm], per_example[at_arm] if examples else None,
                         per_example_rows[at_arm] if examples else None) for at_arm in range(len(arms))]
     first = drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
-    return [first, *drawn[len(arms) - len(also):]] if also else first
+    return [first, *drawn[len(arms) - len(also):]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1440,18 +1430,21 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     (tests/certified.py)."""
     terms = terms if followed is None else _followed_site(label, truth_fn, orders, library_fn, terms,
                                                           conditioning, examples)
+    # Its verdict the plain pair's, the one a qualification run sizes (`_qualified`, and the sizing draws a
+    # prepare compiles its arms at, `_compile_site`): no library arm, further reference, terms of its own or
+    # weighed check beside Dew and its reference.
+    plain = not (library_fn or also or terms or conditioning)
     store = COMPILED.get()
     if store is not None and (conditioning is not None or library_fn is not None):
         raise ValueError(f"{label}: a weighed or library site reads its reference's own rounding and arms "
                          "at its truth's inputs, which no program compiled ahead holds")
     if store is not None and store.prepare:
         _compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms,
-                      also=also, orders=orders)
+                      also=also, orders=orders, plain=plain)
         return
     if os.environ.get(QUALIFY) and not (drawing() or judging()):
         _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
-                   examples=examples, plain=not (library_fn or also or terms or conditioning),
-                   followed=followed)
+                   examples=examples, plain=plain, followed=followed)
     with judged(label):
         _judged_site(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                      library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
@@ -1559,8 +1552,8 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
         if store is not None:
             # Its sizing draws' truths the host's: a truth function's, else its reference's widened, the
             # original reference's, never the stored arm's, which holds no float64 program.
-            truth_fn = _host_truth(truth_fn if truth_fn is not None else reference_fn,
-                                   jax.local_devices(backend="cpu")[0])
+            truth_fn = _truth_program(truth_fn if truth_fn is not None else reference_fn,
+                                      jax.local_devices(backend="cpu")[0])
             if store.holds(label):
                 # Its arms the programs its prepare compiled at the sizing draws' shapes too
                 # (`_compile_arms`'s `sizing`), never compiled here.
@@ -1632,11 +1625,11 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
         def drawn(start, stop):
             assert not judging(), f"{label}: a judge draws nothing of its own, its draws are its pool's"
             if (start, stop) not in ranges:
-                draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
-                               library_fn=library_fn, library_leaves=library_leaves, also=further,
-                               terms_fn=terms_fn, label=label, examples=examples,
-                               conditioning=conditioning_now(), timed=first, followed=followed)
-                ranges[start, stop] = draws if further else [draws]
+                ranges[start, stop] = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn,
+                                             orders=orders, library_fn=library_fn,
+                                             library_leaves=library_leaves, also=further, terms_fn=terms_fn,
+                                             label=label, examples=examples,
+                                             conditioning=conditioning_now(), timed=first, followed=followed)
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
         return drawn
@@ -1702,11 +1695,11 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
     _refuse_numpy_arms(draw, changed_fn, original_fn)
     changed_fn, original_fn = _arms(changed_fn, original_fn)
     truth_fn = _truth_program(truth_fn)
-    draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
+    [draws] = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
         further = range(seeds, staged_units(seeds))
-        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label))
+        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label)[0])
         moved, kept, unresolved = _moved(draws, 2)
     if not moved:
         found = (f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
@@ -1796,7 +1789,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     def drawn(start_at: int, stop: int):
         return _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + start_at, first + stop),
                       truth_fn, orders=orders, label=label, examples=examples and dew_fn is not None,
-                      conditioning=weighing, followed=followed)
+                      conditioning=weighing, followed=followed)[0]
 
     return _sized_count(drawn, label, start=start, most=most, paired=dew_fn is not None)
 
@@ -1860,7 +1853,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
                               truth_fn, orders=orders,
                               reference_seeds=None if paired else range(base + span + start,
                                                                         base + span + stop),
-                              library_fn=library_fn, library_leaves=library_leaves, conditioning=weighing)
+                              library_fn=library_fn, library_leaves=library_leaves, conditioning=weighing)[0]
             return _staged(drawn, count, label, two_stage=two_stage)
 
         over, unresolved, stage = judged(None, seeds)

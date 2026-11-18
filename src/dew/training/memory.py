@@ -9,6 +9,7 @@ splits the step's batch until the step fits everywhere
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import logging
 import math
@@ -21,7 +22,7 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
-from dew._devices import COMPILE_ONLY_SHARE, device_memory, fresh_pool, gpu_free_bytes, xla_flag
+from dew._devices import device_memory, fresh_pool, gpu_free_bytes, stated_share, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
@@ -421,7 +422,7 @@ def needed(device, resident: int, beside: int, temporaries: int) -> int:
     pool of GPUs is sized by."""
 
     def headroom(memory: int) -> int:
-        spare = _admitted([device], [fresh_pool(memory, resident, COMPILE_ONLY_SHARE.get(device))], beside,
+        spare = _admitted([device], [fresh_pool(memory, resident, stated_share(device))], beside,
                           temporaries)
         assert spare is not None
         return spare
@@ -793,3 +794,94 @@ def moved[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     return True
 
 
+
+
+DENSE = {"bfloat16": "bf16", "float8_e4m3fn": "fp8", "float8_e5m2": "fp8"}
+"""The dense peak (`GpuTarget.peaks`, by its datasheet's name) a step computing in each dtype runs its
+products at; a dtype no datasheet rates (float32 among them) prices nothing."""
+
+
+@dataclasses.dataclass(frozen=True)
+class StepPrice:
+    """A plan's step in seconds on its devices, priced from its compile (`device_price`, `streamed_price`):
+    `compute`, its device's hardware FLOPs (a remat's recompute counted where it runs) over the part's dense
+    peak; `link`, the bytes a step that streams its parameters from the host moves over the host link, at
+    the link's rate (`GpuTarget.host_link_rate`); `host`, its update's bytes over the host's memory, the
+    optimizer's on the host. The overlap rule: a streamed step fetches each layer's rows while it computes
+    the last, forward and backward alike, so its link costs only what it runs past the compute; the update
+    runs after the backward, beside nothing (`seconds`). Datasheet peaks, both sides alike: what ranks the
+    two plans, not what either takes."""
+
+    compute: float
+    link: float = 0.0
+    host: float = 0.0
+
+    @property
+    def seconds(self) -> float:
+        return max(self.compute, self.link) + self.host
+
+    def record(self) -> dict[str, JSON]:
+        return {"compute": self.compute, "link": self.link, "host": self.host, "seconds": self.seconds}
+
+
+class Unpriced(ValueError):
+    """A plan no step price ranks (`StepPrice`): its part states no dense peak for its dtype or no host link,
+    or its compile states no FLOPs. Said by name where the plans are chosen (`streamed_plan`)."""
+
+
+def dense_rate(target, dtype) -> float:
+    """The dense FLOPs a second `target`'s part runs a step computing in `dtype` at (`DENSE`); refused
+    (`Unpriced`) where its datasheet rates none."""
+    name = DENSE.get(jnp.dtype(dtype).name)
+    rate = None if name is None else target.peaks.get(name)
+    if rate is None:
+        raise Unpriced(f"{target.device_kind} states no dense peak for {jnp.dtype(dtype).name} "
+                       "(`GpuTarget.dense_peaks`)")
+    return rate
+
+
+def device_price(flops, target, dtype) -> StepPrice:
+    """A plan's step on its devices alone (`StepPrice`): its compiled program's hardware FLOPs, a rung's
+    recompute among them, over the dense rate."""
+    if flops is None:
+        raise Unpriced("the step's compile states no FLOPs (a loop of unstated length)")
+    return StepPrice(flops.hardware / dense_rate(target, dtype))
+
+
+def streamed_price(flops, target, dtype, parameters: int, updated: int, host_rate: float, *,
+                   read_once: int = 0) -> StepPrice:
+    """A step that streams its `parameters` bytes, a device's shards, from the host each step
+    (`Layout(host=("variables",))`): its device's program's FLOPs (`device_price`); over the link, every
+    layer's rows fetched for the forward and again for the backward, which recomputes the forward from
+    them, and the gradient back (three times the parameters' bytes), and `read_once` bytes more the forward
+    reads and nothing differentiates (an EMA reference's weights); on the host, the update reading and
+    writing its process's `updated` bytes (its parameters, their gradient and the optimizer's state) at
+    `host_rate` (`host_memory_rate`)."""
+    link = target.host_link_rate
+    if link is None:
+        raise Unpriced(f"no host-link rate stated for {target.device_kind} (`GpuTarget.host_links`)")
+    return dataclasses.replace(device_price(flops, target, dtype), link=(3 * parameters + read_once) / link,
+                               host=2 * updated / host_rate)
+
+
+def host_memory_rate() -> float:
+    """This host's memory in bytes a second, read once a process: the least of three copies of a 256 MiB
+    array's time, a read and a write of each byte. A host's memory is no GPU part's (the GPU's table states
+    its link, `GpuTarget.host_links`), so it is measured where the run is."""
+    return _host_memory_rate()
+
+
+@functools.cache
+def _host_memory_rate() -> float:
+    import time
+
+    import numpy as np
+
+    source = np.ones(2 ** 25, np.float64)
+    target = np.empty_like(source)
+    seconds = []
+    for _ in range(3):
+        began = time.perf_counter()
+        np.copyto(target, source)
+        seconds.append(time.perf_counter() - began)
+    return 2 * source.nbytes / min(seconds)

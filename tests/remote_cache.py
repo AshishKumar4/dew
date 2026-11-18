@@ -70,18 +70,22 @@ from pathlib import Path
 FAILURES = 3
 TIMEOUT_SECONDS = 30.0
 DRAIN_SECONDS = 120.0
-_R2 = importlib.util.spec_from_file_location(
-    "armada_r2", Path(__file__).resolve().parents[1] / "tools" / "armada" / "r2.py")
-r2 = importlib.util.module_from_spec(_R2)
-_R2.loader.exec_module(r2)  # the Worker's one client and its contract (tools/armada/r2.py)
-_HOST = importlib.util.spec_from_file_location(
-    "armada_host", Path(__file__).resolve().parents[1] / "tools" / "armada" / "host.py")
-HOST = importlib.util.module_from_spec(_HOST)
-_HOST.loader.exec_module(HOST)  # the host's CPU class, which keys a bundle (tools/armada/host.py)
-_WATCHED = importlib.util.spec_from_file_location(
-    "armada_watched", Path(__file__).resolve().parents[1] / "tools" / "armada" / "watched.py")
-WATCHED = importlib.util.module_from_spec(_WATCHED)
-_WATCHED.loader.exec_module(WATCHED)  # inotify's one reader (tools/armada/watched.py's `Writes`)
+
+
+def _armada(name: str):
+    """tools/armada's module `name`, loaded by its path (the suite imports no `tools` package)."""
+    spec = importlib.util.spec_from_file_location(
+        f"armada_{name}", Path(__file__).resolve().parents[1] / "tools" / "armada" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+r2 = _armada("r2")  # the Worker's one client and its contract (tools/armada/r2.py)
+HOST = _armada("host")  # the host's CPU class, which keys a bundle (tools/armada/host.py)
+WATCHED = _armada("watched")  # inotify's one reader (tools/armada/watched.py's `Writes`)
+GRADING = _armada("grading")  # which test file a node is of (tools/armada/grading.py's `owning`)
+
 MAX_BYTES = r2.MAX_BYTES
 """The largest bundle sent or read: the Worker's bound (tools/armada/r2.json)."""
 CHUNKS = 32
@@ -414,7 +418,7 @@ def bundle(node: str, group: str | None, worker: str | None) -> str:
     """The bundle of test `node`'s file in its execution partition: a split file's group
     (tools/armada/split.py's `G/N`) and an xdist worker compile apart, so each keeps its own."""
     parts = (group and group.replace("/", "-of-"), worker)
-    return "/".join([node.split("::")[0], *(part for part in parts if part)])
+    return "/".join([GRADING.owning(node), *(part for part in parts if part)])
 
 
 def seeded(directory: Path, key: str, value: bytes) -> bool:

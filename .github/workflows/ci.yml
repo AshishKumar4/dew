@@ -47,8 +47,11 @@ env:
   # killed test may report none), and which leaves a run ungraded where a judge's map tasks never ran for want
   # of capacity, never red (armada 0da5300). The pin is armada's main, never a branch off an older pin:
   # dew-ops runs the pinned client too (its `pack` stages a hub-only commit for a TPU run), and 0da5300, cut
-  # from bc61de0, had none (2026-11-16: every hub-only Colab run failed after booking from 23:39Z).
-  ARMADA: github:AshishKumar4/armada#e7c1f7a4884bd94a4267cdb9f6ab42a3b17f60b1
+  # from bc61de0, had none (2026-11-16: every hub-only Colab run failed after booking from 23:39Z). And
+  # which asks again, within one outage budget, a refusal that made nothing, keeps a run's deadline its one
+  # end, sizes a task by the cap it runs under and keys a pinned job's environment by its pin (armada 41bff47,
+  # the 2026-11-18 audit's cleanup).
+  ARMADA: github:AshishKumar4/armada#41bff47070001cd8451fc8323f656222de32fd3b
 
 jobs:
   # A commit this workflow passed on another push, or one the land queue

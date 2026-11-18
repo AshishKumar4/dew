@@ -35,6 +35,7 @@ from dew.batch import (
     probed,
     real_places,
     shifted_span,
+    sows_appended,
     thaw,
     token_layout,
     token_positions,
@@ -49,7 +50,7 @@ from dew.inference.tasks import (
 )
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
-from dew.nn.inspection import INSPECTED, QK, observed_maxima
+from dew.nn.inspection import INSPECTED, QK
 from dew.nn.precision import at_least_fp32, weighted_total
 from dew.nn.progress import progressed
 from dew.nn.protocols import BankedStacks, BlockDenoiser, CacheCapacity, Lacks, LayerScalars
@@ -185,9 +186,9 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
     no gradient.
 
     A step whose optimizer clips by the attention logit maxima (`Step.qk_stats`, a QK-Clip) gets the
-    maxima of the attention its passes run through the trained projections, merged by module path
-    (`observed_maxima`): a module several passes observe keeps their elementwise maximum, and one only
-    the encoder reaches keeps its own (`Aux.qk_stats`).
+    maxima of the attention its passes run through the trained projections by module path, a module
+    several passes observe holding each pass's call after the last's (`dew.batch.sows_appended`), which
+    the clip reads at their largest, and one only the encoder reaches its own (`Aux.qk_stats`).
     """
 
     saved_task = BlockGeneration
@@ -515,7 +516,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         states, second_sown = denoise(sc_logits, "denoiser")
         qk = None
         if step.qk_stats:
-            qk = observed_maxima(mutated[QK], first_sown[QK], second_sown[QK])
+            qk = sows_appended(sows_appended(mutated[QK], first_sown[QK]), second_sown[QK])
         # The encoder's pass and the denoiser's that carries the gradient, as the step watches them.
         inspected = None if step.watched is None else {
             "encoder": mutated.get(INSPECTED, {}), "denoiser": second_sown.get(INSPECTED, {})}

@@ -426,7 +426,7 @@ def the_mosaic_forward_is_as_exact_as_its_reference(case: str, dtype) -> None:
 
 
 UNSEEN = generation.GpuTarget("sm87", "NVIDIA Jetson AGX Orin", 163 * 1024, multiprocessors=16,
-                              clock_hz=1.3e9, memory_bandwidth=204.8e9)
+                              clock_hz=1.3e9, memory_bandwidth=204.8e9, host_links={})
 """A GPU the facts table names no row of: Jetson AGX Orin's Ampere (mma.sync's family), 163 KB of shared
 memory a block, 16 multiprocessors, its clock and its memory's bandwidth, as its device reports them."""
 
