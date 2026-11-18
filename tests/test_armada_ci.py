@@ -323,14 +323,14 @@ def test_a_task_fetches_only_the_pins_its_environment_lacks_within_its_deadline(
     pin = tmp_path / "tests/fixtures/x/recorded.npz.fetched.json"
     pin.parent.mkdir(parents=True)
     pin.write_text(json.dumps({"sha256": "a" * 64, "bytes": 1, "revision": "r", "repo": "o/r", "path": "p"}))
-    ci.digests.fetched_absent("3.12", 600.0)
+    ci.session.fetched_absent("3.12", 600.0, ci.digests.fetched.absent(tmp_path))
     assert (tmp_path / "fetches").read_text() == "fetch --absent\n"
-    ci.digests.fetched_absent("3.12", 600.0)
+    ci.session.fetched_absent("3.12", 600.0, ci.digests.fetched.absent(tmp_path))
     assert (tmp_path / "fetches").read_text() == "fetch --absent\n"
     (tmp_path / f"tests/fixtures/fetched/{'a' * 64}.npz").unlink()
     (tmp_path / "tools/fetched_fixtures.py").write_text("import time\ntime.sleep(30)\n")
     with pytest.raises(subprocess.TimeoutExpired):
-        ci.digests.fetched_absent("3.12", 1.0)
+        ci.session.fetched_absent("3.12", 1.0, ci.digests.fetched.absent(tmp_path))
 
 
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):

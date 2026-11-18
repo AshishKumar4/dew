@@ -2477,10 +2477,10 @@ def main() -> int:
         print(json.dumps({"include": plan(args.target, json.loads(args.timings.read_text())
                                           if args.timings.is_file() else {}, census=args.census)}))
         return 0
-    deadline = args.deadline - digests.fetched_absent(args.python, args.deadline)  # before a run reads them
+    args.deadline -= session.fetched_absent(args.python, args.deadline, digests.fetched.absent(Path.cwd()))
     if args.split == COLLECT:
-        return collect(args.python, args.tests.split(), args.out, deadline)
-    return task(args.python, args.tests.split(), args.split, args.out, deadline, args.cache,
+        return collect(args.python, args.tests.split(), args.out, args.deadline)
+    return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
                 coverage=args.coverage, census=args.census == "1")
 
 

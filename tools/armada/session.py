@@ -12,6 +12,8 @@ import functools
 import json
 import os
 import re
+import subprocess
+import time
 from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
 
@@ -633,3 +635,17 @@ def sized(entry: dict, heavy: set[str]) -> dict:
     kept row up (`KEPT_AT`)."""
     runs = {token for token in entry["tests"].split() if KEPT_AT not in token}
     return {**entry, "size": "large"} if runs & heavy else entry
+
+
+def fetched_absent(python: str, deadline: float, lacking: Mapping[str, object]) -> float:
+    """The fixtures this commit pins and its environment's store lacks (`lacking`, fetched_fixtures' `absent`)
+    fetched, within `deadline` seconds, and the seconds that took, which the task's own deadline loses
+    (ci.py's `main`): the environment holds the pins of the commit it was built at, and its key reads no
+    pin (tools/armada/install.sh). Where it lacks none, as for a commit that moves no pin, nothing is
+    started. A fetch that fails or outlasts `deadline` raises, the task red with its reason, before any
+    test or collection reads a fixture it lacks."""
+    began = time.monotonic()
+    if lacking:
+        subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch", "--absent"],
+                       check=True, timeout=deadline)
+    return time.monotonic() - began
