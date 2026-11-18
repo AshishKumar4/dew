@@ -745,7 +745,8 @@ class Keeping:
         except Unestablished as refusal:
             self.refused[named] = str(refusal)
             return
-        if not communicators.loaded_here(executable):
+        loaded = communicators.loaded_program(executable)
+        if loaded is None:
             # Compiled for devices this process has not loaded (a compile-only GPU's), refused before it is
             # serialized: no program of its default backend.
             self.refused[named] = "it was compiled for devices this process has not loaded (a compile-only " \
@@ -758,7 +759,7 @@ class Keeping:
             # program, which no executable serializes.
             self.refused[named] = f"its executable does not serialize: {refusal}"
             return
-        ran = executable.runtime_executable().local_devices()
+        ran = loaded.devices
         if not set(ran) <= set(jax.devices()):
             # The file's target is the process's default backend's (`save`), which this program is none of.
             self.refused[named] = f"it runs on {sorted({device.platform for device in ran})} devices, " \
