@@ -204,7 +204,7 @@ def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
     runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
     compiles with its step (`dew.training.ahead`)."""
     return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss,
-                                           shown=frozenset(objective.shown)), *objective.towers())
+                                           shown=frozenset(objective.shown)))
 
 
 def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],

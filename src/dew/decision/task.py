@@ -1167,7 +1167,7 @@ class Decide(SavedRunTask, InItsForm):
         backbone and head and a configured context encoder, which reads every quantized tower the model
         holds; listing the backbone and head alone left an int8 encoder out of the int8 GEMM guard."""
         model = self.model
-        logits = program(type(model).logits, model, static_argnums=(0,))
+        logits = program(type(model).logits, static_argnums=(0,))
         return logits(model, variables, inputs, media=media)
 
     def tournament(self, state: JSON, questions: Mapping[str, Question], *,

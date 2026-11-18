@@ -1117,7 +1117,7 @@ def generate(model: nn.Module, params: Variables,
         refuse_unassigned(model.kv_cache, plan.count, capacity)
     from dew.nn.projections import pending
 
-    compiled = program(_checked, model, static_argnames=("model", "trips", "pad_id", "n", "packing"),
+    compiled = program(_checked, static_argnames=("model", "trips", "pad_id", "n", "packing"),
                        in_shardings=(None, plan.sharding, plan.sharding, None, None, None, None, None),
                        out_shardings=(None, plan.sharding))
     # A tree a loader owns arrives packed; one borrowed from a live objective packs in the call.
