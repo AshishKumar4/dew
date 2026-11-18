@@ -761,7 +761,7 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
         return jax.tree.map(lambda leaf, sharding: None if leaf is None else jax.ShapeDtypeStruct(
             leaf.shape, leaf.dtype, sharding=sharding), half, shardings, is_leaf=lambda leaf: leaf is None)
 
-    program = _compiled(automatic(resident), automatic(carried), rows, compiler_options(model) or None)
+    program = _compiled(automatic(resident), automatic(carried), rows, compiler_options() or None)
     arguments = (model, params, pad_id, placement, steps, abstract(resident), abstract(carried), None,
                  transforms, stopping, grammar, progress)
     # Tuned first: a program a block hands (`dew.training.ahead.kept`) is the one its tuned lowering is, which

@@ -36,6 +36,7 @@ from google.protobuf.message import DecodeError
 from google.protobuf.unknown_fields import UnknownFieldSet
 from jax._src.thunky import thunky
 from jax.extend.mlir import ir
+from jax.extend.mlir.dialects import stablehlo
 
 from dew import _cache, communicators
 from dew._devices import deterministic_ops_requested, deviceless, xla_flag
@@ -1041,9 +1042,11 @@ def targeted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     compile makes under the same key; one only read for its memory or text (a plan offline, a validation,
     a step compiled into a file, a probe) skips the autotuner (`xla_gpu_autotune_level` 0, its own key,
     which no device's run reads) and keeps XLA's sorts as they fall back, its memory the same (a frontier
-    search's every probe and rung, 142 s to 99 s on armada, 11-02). A run's own XLA_FLAGS setting keeps
-    `options` as given. Every program compiled here takes it, a run's step and every program it compiles
-    ahead alike."""
+    search's every probe and rung, 142 s to 99 s on armada, 11-02). A program holding a dot XLA's Triton
+    GEMM computes wrong on the compile's own target (`triton_wrong`) compiles its GEMMs on cuBLAS, on a
+    device or for one alike, read from the program and its device alone, opening no backend. A run's own
+    XLA_FLAGS setting keeps `options` as given. Every program compiled here takes it, a run's step and
+    every program it compiles ahead alike."""
     from jax._src.interpreters import pxla
 
     lowering = lowered._lowering
@@ -1051,6 +1054,9 @@ def targeted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     if devices is None or next(iter(devices)).platform != "gpu":
         return options
     device = next(iter(devices))
+    if (xla_flag("xla_gpu_enable_triton_gemm") is None
+            and triton_wrong(lowered, generation.device_target(device))):
+        options = {**(options or {}), "xla_gpu_enable_triton_gemm": False}
     if offline(devices):
         return options if xla_flag("xla_gpu_autotune_level") is not None else {
             **(options or {}), "xla_gpu_autotune_level": 0}
@@ -1060,6 +1066,44 @@ def targeted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
         return {**(options or {}), "xla_gpu_experimental_autotune_cache_mode": AUTOTUNE_CACHE_READ,
                 "xla_gpu_require_complete_aot_autotune_results": True}
     return options
+
+
+def triton_wrong(lowered: jax.stages.Lowered, target: generation.GpuTarget) -> bool:
+    """Whether XLA's Triton GEMM computes one of `lowered`'s own dots (a kernel's products are its custom
+    call's) wrong on `target`, as the program states each dot, whatever stated it:
+    a product of an int8 operand, which it computes as two or four times the product (openxla/xla#51016)
+    on every GPU measured (`GpuTarget.int8_triton_gemm`); with CUDA 13 cuBLAS refuses some int8 shapes
+    (on an A100 a contraction of 16 or 48), and then the program does not compile rather than compute
+    wrong;
+    or fp32 operands at IEEE fp32 products (a precision of `HIGHEST` on both, or an algorithm of fp32
+    operands one product a term, the F32_F32_F32 preset), which it sums farther from float64 than cuBLAS,
+    whose sum a float32 reference is (`dew.nn.precision.FP32_PRODUCTS`), as JAX lowers each dot at the
+    precision it resolved: the run's default, a model's, an operation's own."""
+    wrong = False
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        nonlocal wrong
+        if op.name != "stablehlo.dot_general":
+            return ir.WalkResult.ADVANCE
+        types = [ir.RankedTensorType(operand.type).element_type for operand in list(op.operands)[:2]]
+        if any(isinstance(each, ir.IntegerType) and ir.IntegerType(each).width == 8 for each in types):
+            wrong = not target.int8_triton_gemm
+        elif all(isinstance(each, ir.F32Type) for each in types):
+            attributes = op.attributes
+            if "precision_config" in attributes:
+                config = [str(each) for each in ir.ArrayAttr(attributes["precision_config"])]
+                wrong = config == ["#stablehlo<precision HIGHEST>"] * 2
+            if not wrong and "algorithm" in attributes:
+                algorithm = stablehlo.DotAlgorithm(attributes["algorithm"])
+                wrong = (all(isinstance(side, ir.F32Type)
+                             for side in (algorithm.lhs_precision_type, algorithm.rhs_precision_type))
+                         and algorithm.num_primitive_operations == 1)
+        return ir.WalkResult.INTERRUPT if wrong else ir.WalkResult.ADVANCE
+
+    module = lowered.compiler_ir("stablehlo")
+    assert module is not None, "a lowered program states its StableHLO module"
+    module.operation.walk(visit)
+    return wrong
 
 
 def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]]
