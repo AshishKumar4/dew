@@ -753,7 +753,12 @@ class Keeping:
             self.refused[named] = f"its executable does not serialize: {refusal}"
             return
         runtime = executable.runtime_executable()
-        assert runtime is not None, "a program compiled on this process's devices is loaded"
+        if not isinstance(runtime, xla_client.LoadedExecutable):
+            # Compiled for devices this process has not loaded (a compile-only GPU's,
+            # `dew.nn.kernels.generation.compile_only_gpus`): no program of its default backend.
+            self.refused[named] = "it was compiled for devices this process has not loaded (a compile-only " \
+                                  "target's), outside the process's default backend"
+            return
         ran = runtime.local_devices()
         if not set(ran) <= set(jax.devices()):
             # The file's target is the process's default backend's (`save`), which this program is none of.
