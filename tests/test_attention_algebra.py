@@ -611,6 +611,19 @@ def test_a_lazy_walks_kept_anchor_is_on_par_with_the_exact_maximum(family, base)
                         f"a lazy walk {family} ({base}), {run}", seeds=LAZY_SEEDS)
 
 
+def _raw_softmax(spec):
+    """A raw fold's softmax at each row's exact maximum over every tile's raw logits, their differences
+    taken by the scale (`Forward.raw`): its weights narrowed to the values' dtype for their product (fp32
+    sums), its denominator fp32."""
+    def softmax(logits, values):
+        joined = jnp.concatenate(list(logits), axis=-1)
+        weights = jnp.exp((joined - jnp.max(joined, axis=-1, keepdims=True)) * spec.scale)
+        summed = jnp.matmul(weights.astype(values.dtype), jnp.concatenate(list(values), axis=0),
+                            preferred_element_type=jnp.float32)
+        return summed / jnp.sum(weights, axis=-1, keepdims=True)
+    return softmax
+
+
 def test_a_raw_folds_kept_anchor_holds_its_weights_within_the_margins_binades():
     """A raw fold's walk (`Forward.raw`: its logits the raw products, at a scale of 1.92 left past a query's
     power of 1/8, each exponent their difference times it) over tiles whose raw maxima rise by 31, values
@@ -626,16 +639,10 @@ def test_a_raw_folds_kept_anchor_holds_its_weights_within_the_margins_binades():
         logits, values = _lazy_draw(lambda tile: 31.0 * min(tile, 1))(seed)
         return logits, (values.astype(jnp.float32) * 2.0 ** 60).astype(jnp.bfloat16)
 
-    def exact(logits, values):
-        joined = jnp.concatenate(list(logits), axis=-1)
-        weights = jnp.exp((joined - jnp.max(joined, axis=-1, keepdims=True)) * spec.scale)
-        summed = jnp.matmul(weights.astype(values.dtype), jnp.concatenate(list(values), axis=0),
-                            preferred_element_type=jnp.float32)
-        return summed / jnp.sum(weights, axis=-1, keepdims=True)
-
     walk = _lazy_walk(spec)
     for program, run in ((jax.jit(walk), "jitted"), (as_given(walk), "op by op")):
-        assert_as_exact(program, as_given(exact), draw, f"a raw fold's lazy walk, {run}", seeds=LAZY_SEEDS)
+        assert_as_exact(program, as_given(_raw_softmax(spec)), draw, f"a raw fold's lazy walk, {run}",
+                        seeds=LAZY_SEEDS)
 
 
 def test_a_raw_folds_lazy_anchor_moves_where_the_maximum_passes_it_by_more_than_the_margin():
@@ -657,16 +664,10 @@ def test_a_raw_folds_lazy_anchor_moves_where_the_maximum_passes_it_by_more_than_
         values = jax.random.uniform(streams[1], (2, 32, 16), jnp.float32, 1, 2).astype(jnp.float16)
         return logits, values
 
-    def exact(logits, values):
-        joined = jnp.concatenate(list(logits), axis=-1)
-        weights = jnp.exp((joined - jnp.max(joined, axis=-1, keepdims=True)) * spec.scale)
-        summed = jnp.matmul(weights.astype(values.dtype), jnp.concatenate(list(values), axis=0),
-                            preferred_element_type=jnp.float32)
-        return summed / jnp.sum(weights, axis=-1, keepdims=True)
-
     walk = _lazy_walk(spec)
     for program, run in ((jax.jit(walk), "jitted"), (as_given(walk), "op by op")):
-        assert_as_exact(program, as_given(exact), draw, f"a raw fold's moved anchor, {run}", seeds=LAZY_SEEDS)
+        assert_as_exact(program, as_given(_raw_softmax(spec)), draw, f"a raw fold's moved anchor, {run}",
+                        seeds=LAZY_SEEDS)
 
 
 ANCHORED_SEEDS = 8
