@@ -536,16 +536,17 @@ def pinned_classes() -> list[str]:
 def reusable(python: str, rows: list[tuple[str, str]], common: str,
              missed: dict[str, int]) -> dict[tuple[str, str], str]:
     """The rows of `rows` (each a file and its group, "" for the whole file) that ran green on exactly these
-    inputs (`common`, and each file's own, `fresh`) on any class the tasks run on (`pinned_classes`), which a
-    task of theirs could land on, read at plan time with the cache's read token (`READ_TOKEN`): a task of
-    their own would only look each up and exit. A heavy file's groups are rows like any other, each looked up
-    by its own (2026-10-30: the plan looked up whole files alone, and a docs-only change's 1,034 green groups
-    of heavy files each booted a container to read its record). Each with where its green run is kept
-    (`green_key`'s class and key, `session.KEPT_AT`'s token), which the plan hands the task that holds it,
-    so no run of another commit replacing a row's last record between plan and task can hide it (2026-10-30: a kept task
-    found 23 of its 259 files and ran the rest). None where the plan has no token or no class (the maintainer,
-    2026-10-28: a lane run with most files unchanged booted a container a task; 2026-10-29: the suite pinned
-    to 25/17 and 26/17). Why each other row was not, counted in `missed` (`green_record`'s word)."""
+    inputs (`common`, and each file's own, `fresh`) on any class the tasks run on (`pinned_classes`),
+    which a task of theirs could land on, read at plan time with the cache's read token (`READ_TOKEN`): a
+    task of their own would only look each up and exit. A heavy file's groups are rows like any other,
+    each looked up by its own (2026-10-30: the plan looked up whole files alone, and a docs-only change's
+    1,034 green groups of heavy files each booted a container to read its record). Each with where its
+    green run is kept (`green_key`'s class and key, `session.KEPT_AT`'s token), which the plan hands the
+    task that holds it, so no run of another commit replacing a row's last record between plan and task
+    can hide it (2026-10-30: a kept task found 23 of its 259 files and ran the rest). None where the plan
+    has no token or no class (the maintainer, 2026-10-28: a lane run with most files unchanged booted a
+    container a task; 2026-10-29: the suite pinned to 25/17 and 26/17). Why each other row was not,
+    counted in `missed` (`green_record`'s word)."""
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return {}
