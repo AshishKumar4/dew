@@ -53,6 +53,7 @@ from dew.config.earlier import earlier_run
 from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.config.trainer import (
+    PASSES,
     SourceOptions as SourceOptions,
     SourceOptionsKeywords,
     TrainerConfig as TrainerConfig,
@@ -1264,7 +1265,16 @@ class RunConfig:
         return fitted(dataset, validation, objective=objective, seed=self.data_seed,
                       resume=trainer.data_resume,
                       examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps,
-                      tokens=trainer.tokens)
+                      tokens=trainer.tokens, count_passes=self.reads_passes())
+
+    def reads_passes(self) -> bool:
+        """Whether a cadence of the run reads its data's passes (`epoch`, or the default `passes`): its
+        evaluation's, its checkpoints' or a split's (`val_every`), which a run bounded otherwise than in
+        epochs or examples counts (`dew.data.compile`'s `count_passes`); a run whose cadences read none
+        compiles its data as it would without them."""
+        trainer = self.trainer
+        return any(value in ("epoch", PASSES) for value in (
+            trainer.eval_every, trainer.checkpoint_every, *self.val_every.values()))
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
