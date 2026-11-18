@@ -218,6 +218,27 @@ class RemoteCache:
         written = self.written.setdefault(self.file, [])
         written += sorted(fresh - set(written))
 
+    def mark(self) -> tuple[str | None, int]:
+        """Where the current bundle's compiled programs stand now (`compiled_since`), read through the watch
+        its account already keeps (`_moved_on`)."""
+        if not self.available:
+            return None, 0
+        with self.state:
+            self._moved_on()
+            return self.file, len(self.written.get(self.file, [])) if self.file else 0
+
+    def compiled_since(self, mark: tuple[str | None, int]) -> int | None:
+        """The programs compiled since `mark` (`mark`) under the same bundle: a program the shared cache did
+        not hold, so the test that ran meanwhile ran cold; None where it is not known (no shared cache,
+        the bundle moved on, the watch lost events)."""
+        if not self.available or mark[0] is None:
+            return None
+        with self.state:
+            self._moved_on()
+            if self.file != mark[0] or mark[0] in self.blind:
+                return None
+            return len(self.written.get(mark[0], [])) - mark[1]
+
     def opened(self, file: str) -> None:
         """Bundle `file` in the local cache, and the programs compiled from here on its."""
         if not self.available:

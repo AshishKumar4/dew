@@ -136,13 +136,32 @@ def pytest_collectstart(collector):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    """Each file's programs join its bundle of the shared cache, written back after each run of its
-    tests, every program they used so far."""
+    """Each file's programs join its bundle of the shared cache, written back after each run of its tests,
+    every program they used so far; where a shared cache is installed, each test's programs compiled from
+    its setup on (`remote_cache.RemoteCache.mark`) are counted at its teardown
+    (`pytest_runtest_teardown`)."""
     if _remote is not None:
         _remote.opened(bundle(item))
+        item.stash[_COMPILE_MARK] = _remote.mark()
     yield
     if _remote is not None and (nextitem is None or bundle(nextitem) != bundle(item)):
         _remote.closed(bundle(item))
+
+
+_COMPILE_MARK = pytest.StashKey[tuple]()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """A test's programs compiled that the shared cache did not hold, from its setup through its teardown, as
+    its JUnit property `compiled` (where known): a test that compiled ran cold, its seconds a cold run's,
+    which CI's durations record keeps apart (tools/armada/ci.py `compiled_cold`, row 7939). None is
+    recorded where no shared cache is installed, so a local run's JUnit is as it was."""
+    yield
+    if _remote is not None and (mark := item.stash.get(_COMPILE_MARK, None)) is not None:
+        compiled = _remote.compiled_since(mark)
+        if compiled is not None:
+            item.user_properties.append(("compiled", compiled))
 
 
 @pytest.hookimpl(tryfirst=True)

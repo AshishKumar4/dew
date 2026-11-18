@@ -771,7 +771,14 @@ def own_tests(name: str, tests: dict[str, float]) -> dict[str, float]:
 
 
 def durations_record(path: Path = session.DURATIONS) -> dict[str, float]:
-    """The durations record (`session.DURATIONS`, or the one at `path`): each test's node id and seconds."""
+    """The durations record (`session.DURATIONS`, or the one at `path`): each test's node id and its cost
+    (`session.cost`)."""
+    return session.costs(path)
+
+
+def durations_entries(path: Path = session.DURATIONS) -> dict[str, float | list[float]]:
+    """The durations record's entries as kept, each test's least warm and least cold seconds
+    (`session.entry`)."""
     return json.loads(path.read_text()) if path.is_file() else {}
 
 
@@ -1699,6 +1706,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "tests": {**{node: seconds for node, seconds in done_before.items()
                                   if grading.holds(name, node)},
                                **{grading.node_of(case): float(case.get("time") or 0) for case in own}},
+                     # The tests that compiled a program the shared cache lacked (`compiled_cold`): their
+                     # seconds are a cold run's, which the durations record keeps apart (`folded_entries`).
+                     **({"cold": cold} if (cold := compiled_cold(own)) else {}),
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
                      # A judge's, beside its pooling, what its map tasks' records say they paid
                      # (`site_costs`).
@@ -2257,6 +2267,43 @@ def raised(record: dict[str, float], held: list[dict], marked: dict) -> dict[str
     return taken
 
 
+def compiled_cold(cases: list) -> list[str]:
+    """Of a file's JUnit `cases`, the node ids of those that compiled a program the shared compilation
+    cache did not hold (each case's property `compiled`, tests/conftest.py's count from
+    tests/remote_cache.py's watch, set only where a shared cache was installed)."""
+    return sorted(grading.node_of(case) for case in cases
+                  if any(item.get("name") == "compiled" and int(item.get("value") or 0) > 0
+                         for item in case.iter("property")))
+
+
+def folded_entries(record: dict[str, float | list[float]], verdict: dict, target: float) -> dict:
+    """The durations `record`'s entries with main's CI `verdict` folded in (`session.entry`): each test's
+    warm time as `folded` keeps the record, a run in which it compiled a program the shared cache lacked
+    (a row's `cold`) timing it no warm time; its cold time the least of the green runs so, raised by a
+    red or cut-off row's past it, as `raised` raises an entry. A test the warm record drops loses its
+    cold time with it: one record, so no test is timed cold that the record no longer holds (Main,
+    2026-11-18, row 7939)."""
+    warm = {node: session.warm_cold(held)[0] for node, held in record.items()}
+    cold = {node: found for node, held in record.items()
+            if (found := session.warm_cold(held)[1]) is not None}
+    # The warm fold sees each cold-timed test at its warm record, where it has one: a cold run moves no warm
+    # time. A test no warm run has timed takes its cold time as its warm one, which a warm run lowers.
+    calm = {**verdict, "rows": [
+        {**row_, "tests": {node: warm[node] if node in row_.get("cold", ()) and node in warm else seconds
+                           for node, seconds in row_.get("tests", {}).items()}}
+        for row_ in verdict["rows"]]}
+    kept = folded(warm, calm, target)
+    for held in verdict_rows(verdict).values():
+        for row_ in held:
+            green = row_["exitCode"] == 0
+            for node in row_.get("cold", ()):
+                if node in kept and (seconds := row_.get("tests", {}).get(node)) is not None:
+                    before = cold.get(node)
+                    cold[node] = (seconds if before is None else min(before, seconds) if green
+                                  else max(before, seconds))
+    return {node: session.entry(seconds, cold.get(node)) for node, seconds in kept.items()}
+
+
 def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, float]:
     """The durations `record` with main's CI `verdict` (`armada verdict <sha> --json`) folded in, one test
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
@@ -2419,10 +2466,10 @@ def main() -> int:
         return 1 if wrong or not nodes else 0
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
-        before, verdict = durations_record(), json.loads(args.verdict.read_text())
+        before, verdict = durations_entries(), json.loads(args.verdict.read_text())
         # The record main's CI cut its files by, read before its times change it (`cuts.refolded`).
         cut_by = {name: own_tests(name, tests) for name, tests in parted_record().items()}
-        recorded = folded(before, verdict, target)
+        recorded = folded_entries(before, verdict, target)
         if recorded != before:
             session.DURATIONS.write_text(json.dumps(recorded, indent=0) + "\n")
         after = {name: own_tests(name, tests) for name, tests in parted_record().items()}

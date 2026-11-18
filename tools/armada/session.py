@@ -16,6 +16,39 @@ from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
 
 DURATIONS = Path("tests/test_durations.json")
+"""Each test's least seconds, by its node id: a number, its least warm time, where only runs whose programs
+the shared compilation cache held have timed it; [warm, cold] once a run that compiled its programs has,
+its least time so beside the least warm one (`entry`). Every cut and weight reads an entry's cost
+(`cost`)."""
+
+
+def entry(warm: float, cold: float | None) -> float | list[float]:
+    """A durations record's entry of a test timed `warm` at least warm and `cold` at least cold (None:
+    never timed cold)."""
+    return round(warm, 3) if cold is None else [round(warm, 3), round(cold, 3)]
+
+
+def warm_cold(held: float | list[float]) -> tuple[float, float | None]:
+    """An entry's least warm seconds and least cold ones, None where no cold run has timed it."""
+    return (float(held[0]), float(held[1])) if isinstance(held, list) else (float(held), None)
+
+
+def cost(held: float | list[float]) -> float:
+    """What a test costs a task that runs it, by its entry: its cold time where one is recorded, else its
+    warm one. Cuts and weights read this whatever the cache holds, so a cut is one function of the
+    record, the same in the plan and in the task that recomputes its group (split.py), and a group runs
+    within its share cold as warm (Main, 2026-11-18, row 7939: 14 cells recorded at 0.2-18.8 s warm,
+    packed in one group, took 25-100 s each cold and set a run's 1,107 s wall; a cut by the cache's
+    state would change its groups' bundles each run)."""
+    warm, cold = warm_cold(held)
+    return warm if cold is None else max(warm, cold)
+
+
+def costs(path: Path) -> dict[str, float]:
+    """The durations record at `path` (`DURATIONS`, or a GPU tier's own), each test's cost (`cost`)."""
+    if not path.is_file():
+        return {}
+    return {node: cost(held) for node, held in json.loads(path.read_text()).items()}
 CUTS = Path("tests/test_cuts.json")
 """Each split test file's cut as main's CI last ran it, kept while the file's groups hold (`stored_cuts`): the
 node id each group after the first begins at, so a group's name means the same tests from run to run whatever
