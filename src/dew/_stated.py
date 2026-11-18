@@ -22,8 +22,10 @@ from pathlib import Path
 
 import jax
 import numpy as np
+from jax._src.named_sharding import UNSPECIFIED
 from jax.experimental.layout import Format, Layout
 from jaxlib import xla_client
+from jaxlib._jax import PjitFunction
 
 from dew import _hashing, _sources
 from dew._records import JSON
@@ -190,8 +192,6 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
                         "identity can state")
 
 
-_JITTED = type(jax.jit(len))
-"""The type of a function `jax.jit` wraps (`PjitFunction`)."""
 
 
 def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
@@ -199,7 +199,7 @@ def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     wraps (`_jitted`); None for any other."""
     if isinstance(value, jax.Array):
         return _jax_array(value, at, again)
-    if isinstance(value, _JITTED):
+    if isinstance(value, PjitFunction):
         return _jitted(value, at, again)
     return None
 
@@ -210,10 +210,20 @@ def _jitted(value, at: str, again: Callable[..., JSON]) -> JSON:
     shardings and layouts, their trees, `keep_unused`, `inline`, a backend or device, compiler options),
     each stated as its value is: two wrappings of one function under other options trace other
     programs."""
-    info = value._jit_info
-    options = {name: again(getattr(info, name), at=f"{at} (jit option {name})")
+    recorded = value._jit_info
+    options = {name: _jit_option(getattr(recorded, name), f"{at} (jit option {name})", again)
                for name in sorted(_JIT_OPTIONS)}
     return ["jit", again(value.__wrapped__, at=at), options]
+
+
+def _jit_option(value, at: str, again: Callable[..., JSON]) -> JSON:
+    """One option a jit records, a tuple of shardings or layouts entry by entry, JAX's mark of a sharding
+    the call left to JAX (`UNSPECIFIED`) as that."""
+    if value is UNSPECIFIED:
+        return "unspecified"
+    if isinstance(value, tuple):
+        return [_jit_option(each, f"{at}[{index}]", again) for index, each in enumerate(value)]
+    return again(value, at=at)
 
 
 _JIT_OPTIONS = frozenset({"static_argnums", "static_argnames", "donate_argnums", "donate_argnames",
