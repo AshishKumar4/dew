@@ -756,6 +756,57 @@ def scalar_ssd(dtype=jnp.float32):
                             saturation=SATURATION)
 
 
+def _scaled_first_read(scale, query, memory):
+    def read(h, q, b, v, g):
+        del b, v, g
+        return scale * (q @ h)
+
+    forms = scan.derive_scan(scan.Scan(scalar_step, read, SCALAR_SSD, walked="time",
+                                       state=(memory.shape, memory.dtype), reads="before"),
+                             saturation=SATURATION)
+    chunk = {"q": query, "b": jnp.zeros((1, memory.shape[0]), memory.dtype),
+             "v": jnp.zeros((1, memory.shape[1]), memory.dtype), "g": jnp.zeros((1,), memory.dtype)}
+    return forms.replay(chunk, memory)[0]
+
+
+def test_a_magnifying_reader_keeps_a_representable_query_cotangent():
+    """A small cotangent meets the memory before a magnifying reader scale."""
+    query = jnp.full((1, 1), 2.0 ** -64, jnp.float32)
+    memory = jnp.full((1, 1), 2.0 ** 64, jnp.float32)
+    cotangent = jnp.full((1, 1), 2.0 ** -64, jnp.float32)
+    gradient = jax.jit(jax.grad(lambda q: jnp.sum(
+        _scaled_first_read(np.float32(2.0 ** 64), q, memory) * cotangent)))(query)
+    np.testing.assert_array_equal(np.asarray(gradient), np.full((1, 1), 2.0 ** 64, np.float32))
+
+
+@pytest.mark.parametrize("scale", [np.float64(1e100), np.float64(0.1)],
+                         ids=["magnifying", "shrinking"])
+def test_a_reader_literal_preserves_its_float64_promotion(scale):
+    """A strong float64 scale widens a float32 reader before its product with the memory."""
+    with jax.enable_x64(new_val=True):
+        query = jnp.full((1, 1), 2.0, jnp.float32)
+        memory = jnp.ones((1, 1), jnp.float64)
+        output = jax.jit(lambda q: _scaled_first_read(scale, q, memory))(query)
+        assert output.dtype == jnp.float64
+        # Multiplication by two is exact for both literals, with no nontrivial sum.
+        np.testing.assert_array_equal(np.asarray(output), np.full((1, 1), 2.0 * scale, np.float64))
+
+
+def test_equal_reader_scales_keep_their_own_dtypes_and_query_cotangents():
+    """Equal float32 and float64 scales keep their promotion and return float32 query cotangents."""
+    with jax.enable_x64(new_val=True):
+        query = jnp.full((1, 1), 2.0, jnp.float32)
+        memory = jnp.ones((1, 1), jnp.float32)
+        for dtype in (np.float32, np.float64):
+            scale = dtype(0.5)
+            output = jax.jit(lambda q: _scaled_first_read(scale, q, memory))(query)
+            assert output.dtype == dtype
+            np.testing.assert_array_equal(np.asarray(output), np.ones((1, 1), dtype))
+            gradient = jax.jit(jax.grad(lambda q: jnp.sum(_scaled_first_read(scale, q, memory))))(query)
+            assert gradient.dtype == jnp.float32
+            np.testing.assert_array_equal(np.asarray(gradient), np.full((1, 1), 0.5, np.float32))
+
+
 def ones_chunk(g, dtype=jnp.float32):
     """A chunk of unit readers, keys and writes at log decays `g`."""
     tokens = g.shape[0]
