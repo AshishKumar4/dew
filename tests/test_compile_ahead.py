@@ -2150,6 +2150,35 @@ def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_
     assert (built.target.generation, built.target.multiprocessors) == ("sm90", 132)
 
 
+
+def test_programs_compiled_ahead_for_a_generation_are_untuned_and_refused_where_a_compile_tunes(
+        tmp_path, monkeypatch):
+    """Named programs compiled for a generation's canonical GPUs (`compile_programs` with no topology) are
+    XLA's untuned programs, which their file says (`AheadPrograms.tuned`), and a process whose own compile
+    tunes refuses to load them (row 8422: untuned convolutions left cuDNN's runtime heuristic to pick a
+    non-deterministic algorithm), where one compiled tuned, or one under the autotuner's level 0, loads.
+    Over a node's own topology the compile takes the GPU kind's tuned choices or is refused, naming the
+    program, where no run has tuned one yet. A program of this host's own target stands for the GPU
+    host's here."""
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.ahead import AheadPrograms, BuildTarget, compile_programs
+
+    square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+    built = compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm90")
+    assert not built.tuned
+    here = jax.devices()[:1]
+    with pytest.raises(ValueError):
+        AheadPrograms(BuildTarget.of(here), {}, tuned=False).loaded()
+    assert AheadPrograms(BuildTarget.of(here), {}, tuned=True).loaded() == {}
+    serialized = tmp_path / "topology.bin"
+    serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm90", 1))).serialize())
+    with pytest.raises(ValueError):
+        compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm90", topology=serialized)
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
+    assert AheadPrograms(BuildTarget.of(here), {}, tuned=False).loaded() == {}
+
 def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
     """A device's own target, what a program compiled ahead is checked against, is the one `gpu_target`
     resolves for it unassumed: an H100 PCIe its own kind and peaks with the multiprocessors it reports, and an

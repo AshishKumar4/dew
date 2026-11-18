@@ -669,6 +669,12 @@ class AheadPrograms:
     """The programs a process compiled at Dew's compile point, each by its fingerprint (`KeptProgram`,
     `keeping`): a process of their target runs each for a call that lowers to that program under those
     options (`kept`); None for a file of named programs alone."""
+    tuned: bool = True
+    """Whether their compile took the GPU kind's tuned choices, as the device's own compile makes them
+    (`report.autotuned`): one on a device, or for a node's topology within `report.for_devices`; a compile
+    for a generation's canonical GPUs is XLA's untuned program (`compile_programs`), which `loaded`
+    refuses where the process's own compile would tune (row 8422: untuned convolutions left cuDNN's runtime
+    heuristic to pick a non-deterministic algorithm)."""
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
@@ -686,9 +692,15 @@ class AheadPrograms:
         """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices, the ones
         it was compiled for: each called with the arguments it was compiled for runs it. Refused, naming what
         differs, where those devices, this JAX, its XLA flags or its host are not the target they were built
-        for; each is admitted as a compiled program is (`dew.communicators.admit`)."""
+        for, and where they are untuned and this process's own compile would tune (`tuned`,
+        `report.autotuned`); each is admitted as a compiled program is (`dew.communicators.admit`)."""
         devices = jax.devices()[:self.target.devices]
         self.target.held(devices)
+        if not self.tuned and report.autotuned(devices):
+            raise ValueError(f"these programs were compiled for {self.target.generation}'s canonical GPUs, "
+                             "untuned (XLA's defaults where a device's compile tunes its convolutions and "
+                             "GEMMs): compile them for this node's topology (compile_programs' topology, "
+                             "$DEW_NODE_TOPOLOGY), or run with the autotuner off (xla_gpu_autotune_level 0)")
         return {name: program.loaded(devices) for name, program in self.programs.items()}
 
 
@@ -887,7 +899,7 @@ def lowering_for(generation: str, multiprocessors: int | None = None) -> Iterato
 
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
                      generation: str, multiprocessors: int | None = None, *,
-                     compiled: Compile = owned_program) -> AheadPrograms:
+                     compiled: Compile = owned_program, topology: str | Path | None = None) -> AheadPrograms:
     """`programs`, each a function and its arguments' shapes, dtypes and weak types (each a
     `ShapeDtypeStruct` or an abstract value), by its name, compiled ahead for
     one GPU of the CUDA `generation`, of the `multiprocessors` it states (`built_target`), on any host holding
@@ -900,9 +912,16 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     (`selection.Unlowerable`: cuDNN's, whose plan holds to its GPU's model). Each is lowered in turn and all
     compile at once (`report.compiled_at_once`). `compiled(function, out_shardings=)` makes each program
     lowered: Dew's compile point (`owned_program`), or the compile the program's run takes where that is
-    another (check 1's arms, `jax.jit`)."""
+    another (check 1's arms, `jax.jit`). Over a node's own `topology` (`host_gpus`, a job's prepare) the
+    compile takes every tuned choice the GPU kind's runs left beside the compilation cache
+    (`report.for_devices`), a choice none has tuned refused, named; over the generation's canonical GPUs
+    it is XLA's untuned program, which its file says (`AheadPrograms.tuned`) and a tuning process refuses
+    to load (row 8422)."""
     target = built_target(generation, multiprocessors)
-    placed = jax.sharding.NamedSharding(_gpu_mesh(generation, multiprocessors), jax.sharding.PartitionSpec())
+    gpus = (compile_only_gpus(generation, multiprocessors=multiprocessors) if topology is None
+            else host_gpus(generation, topology, 1))
+    mesh = jax.sharding.Mesh(np.asarray(gpus[:1]), ("devices",))
+    placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
     lowerings = []
     for name, (function, arguments) in programs.items():
         shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed,
@@ -918,8 +937,14 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
                 raise refused.refusing(name) from refused
         lowerings.append((lowered(), None, lowered))
     # Through Dew's compile point, as a run compiles them, at once (`report.compiled_at_once`): a launch
-    # whose kernel spills there is derived again at its next config.
-    executables = report.compiled_at_once(lowerings)
+    # whose kernel spills there is derived again at its next config; for a node, tuned or refused.
+    with report.for_devices() if topology is not None else contextlib.nullcontext():
+        tuned = report.autotuned(gpus[:1])
+        try:
+            executables = report.compiled_at_once(lowerings)
+        except report.Untuned as untuned:
+            raise ValueError("a program is not preparable for this node until a run on its GPU has tuned "
+                             f"it, leaving its choices beside the compilation cache: {untuned}") from untuned
     built = {}
     for name, compiled in zip(programs, executables, strict=True):
         try:
@@ -928,7 +953,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
             raise ValueError(f"program {name!r} cannot be compiled ahead (an array it closed over is a "
                              "constant of its program, which no executable serializes: pass it as an "
                              f"argument): {refused}") from refused
-    return AheadPrograms(BuildTarget.built(target, 1), built)
+    return AheadPrograms(BuildTarget.built(target, 1), built, tuned=tuned)
 
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
