@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from contract_support import assert_contract, normal_float32
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
 from ssd_support import ssd_orbit, stepwise_scan
 
@@ -440,8 +441,9 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
     """A forked call's entry write (`Chunk.entry_key`) and its adjoint in the TPU kernel, at powers of two (a
     key, a value and a weight of 2^`key`, 2^`value`, 2^`weight` on one term, the final memory's cotangent
     2^`final`, the outputs' none, unless `cancelled`): every output and gradient float64's exactly wherever
-    float64's is a normal float32 (each a sum of equal powers of two, no rounding), through unit writes and
-    readers, no inputs and no decay. Formed in one order, a partial product left fp32's range where the whole
+    float64's is a normal float32 (each a sum of equal powers of two, no rounding; `normal_float32`), and
+    every order of the call finite there (`assert_contract`), through unit writes and readers, no inputs and
+    no decay. Formed in one order, a partial product left fp32's range where the whole
     is in it: keys and values of 2^80 under a weight of 2^-100 wrote inf where the write is 2^60, keys of
     2^-80 under the same weight zero where it is 2^-80, and a value of 2^100 against a memory's gradient of
     2^56 gave the keys' and the weight's gradients inf (base reviews 200f6ca65, 7047162e7). `cancelled`, the
@@ -467,12 +469,13 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
         exact = jax.tree.leaves(jax.jit(run(documents_one_by_one))(*wide))
-    finfo = jnp.finfo(jnp.float32)
     for ours, theirs in zip(mine, exact, strict=True):
         theirs = np.asarray(theirs)
-        size = np.abs(theirs)
-        normal = (size == 0) | ((size >= float(finfo.tiny)) & (size <= float(finfo.max)))
+        normal = normal_float32(theirs)
         np.testing.assert_array_equal(np.asarray(ours, np.float64)[normal], theirs[normal])
+    # Every order finite wherever float64's is a normal float32 (the contract's seams).
+    assert_contract(without_ynn(documents_on_the_kernel), operands, operands, seeded,
+                    "the TPU kernel's forked call at fp32's edge", truth_fn=documents_one_by_one)
 
 
 @pytest.mark.tpu(reason="the recurrence matrix's TPU cells run on the TPU tier's own TPU")
