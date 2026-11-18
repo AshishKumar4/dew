@@ -355,7 +355,8 @@ def training_window(args: argparse.Namespace, model, network, optimizer, device,
     import numpy as np
     import torch
     from common import TorchTracedWindow, warmup_cosine
-    from qwen35 import SCHEDULE, inputs
+    from qwen35 import SCHEDULE
+    from qwen35 import inputs
     from torch._dynamo.utils import counters
 
     config = model.backbone.config

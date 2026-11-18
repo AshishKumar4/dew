@@ -29,7 +29,9 @@ from unittest.mock import patch
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
+import diffusers
 import jax
+import jax.numpy as jnp
 import mpmath as mp
 import numpy as np
 import torch

@@ -136,6 +136,7 @@ def _peft_version() -> str:
 @contextlib.contextmanager
 def _tiny_sd():
     """The `sd` pipeline of the bundle, in torch, for the duration of the block."""
+    import transformers
     from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
     from reference_releases import require
     from transformers import CLIPTextModel, CLIPTokenizer
