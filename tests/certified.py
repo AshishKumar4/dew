@@ -886,6 +886,8 @@ def _reductions() -> dict:
     from dew.nn.precision import _renormalized, compensated_add
     from dew.objectives.lm import chunked
 
+    # `_renormalized` is `compensated_add`'s arithmetic step for step (the his' TwoSum, then the total's
+    # with the drop and both los summed), its operands read alike, so its pairs round as the pair sum's.
     return {compensated_add: _pair_held, _renormalized: _pair_held, chunked._online_softmax: _softmax_held,
             chunked._online_softmax_predicted: _softmax_held}
 
