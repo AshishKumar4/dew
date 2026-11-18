@@ -1641,8 +1641,10 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
     `(n + 2) 2^-24` of the terms' absolute sum over `n` terms, and a dropped term lies more than 2^126 below
     the largest, under that bound. Its tangent is its terms' own, each factor's direction times its term's
     other factors, summed as a plain sum (`_aligned_tangent`): its bits carry none, so differentiated as
-    formed every factor's was zero; a reverse mode's sums are its transpose's, plain too. Elementwise and over
-    a 2-D array's axes, so a Pallas TPU kernel forms it in place."""
+    formed every factor's was zero. Its tangents and gradients carry a plain product's range, not its
+    value's: a forked call's gradient at fp32's edge can still overflow there, which a kernel's own adjoint
+    summing aligned (`ssd`'s TPU forked scan) does not. Elementwise and over a 2-D array's axes, so a Pallas
+    TPU kernel forms it in place."""
     shape = tuple(len(term) for term in terms)
     return _aligned(shape, axis, *(jnp.asarray(factor, jnp.float32) for term in terms for factor in term))
 
