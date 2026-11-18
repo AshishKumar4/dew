@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tiny_models
+from contract_support import normal_float32
 from delta_rule_support import stacked_documents
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec as P
@@ -449,6 +450,26 @@ def vanishing_entered_draw(seed: int):
     """`entered_draw`'s turned operands, entry writes included, the decays at `VANISHED` vanishing."""
     operands, seeded = entered_draw(TURNED, seed, entries=True)
     return vanishing(operands), seeded
+
+
+def test_a_turned_forked_calls_cancelling_entry_write_keeps_every_gradient_finite():
+    """A turned forked call whose documents' entry writes cancel (two terms of one key `(2^80, 0, ...)`,
+    values of 2^80 and -2^80, a weight of one: each write zero): its output and every gradient finite
+    wherever float64's is a normal float32, where the turns' gradient formed the write's terms one at a time
+    and summed them, inf - inf (base review 2354cbaf7 F1); `chunked_launch.entry_write` sums them aligned."""
+    operands, seeded = entered_draw(TURNED, 0, entries=True)
+    key = jnp.zeros_like(operands.entry_key).at[..., 0].set(2.0 ** 80)
+    value = jnp.zeros_like(operands.entry_value).at[:, :, 0].set(2.0 ** 80).at[:, :, 1].set(-(2.0 ** 80))
+    operands = dataclasses.replace(operands, entry_key=key, entry_value=value,
+                                   entry_weight=jnp.ones_like(operands.entry_weight))
+    ours = jax.jit(with_gradients(lambda given: chunk_on('xla', TURNED, entering_documents(given),
+                                                         chunk_size=CHUNK)))(operands, seeded)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
+        exact = jax.jit(with_gradients(lambda given: document_by_document(TURNED, given)))(*wide)
+    for made, truth in zip(jax.tree.leaves(ours), jax.tree.leaves(exact), strict=True):
+        held = normal_float32(np.asarray(truth))
+        assert np.all(np.isfinite(np.asarray(made)[held]))
 
 
 @pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],
