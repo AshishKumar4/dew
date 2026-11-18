@@ -118,6 +118,32 @@ def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
         model_flows.judge(flow, {}, kind)
 
 
+def test_a_packed_flows_training_moves_its_parameters_and_never_its_banks():
+    """A flow whose experts are packed NVFP4 banks (`Flow.packed`, row 8492) trains its parameters alone: two
+    SGD steps over its training step's gradients, on the CPU's portable route, move its parameters and leave
+    every bank's words and scales bit for bit as drawn, the banks frozen beside them as a packed load holds
+    them (`model_flows.packed_variables`)."""
+    from dew.quantization import QUANTIZATION
+
+    flow = next(flow for flow in model_flows.FLOWS if isinstance(flow, model_flows.Flow) and flow.packed)
+    flow = dataclasses.replace(flow, rows=1, length=32, prefill=24)
+    drawn = flow.taken(flow.model.init(jax.random.key(0), *flow.initialized()))
+    # The flow's own training step (`programs_of`'s), its Dew arm's named kernel a GPU's alone.
+    step = jax.jit(flow.program("train", flow.model))
+    ids = np.random.default_rng(0).integers(0, flow.vocab, (flow.rows, flow.length), np.int32)
+    trained = drawn
+    for _ in range(2):
+        _, gradients = step(trained, ids)
+        assert jax.tree.structure(gradients) == jax.tree.structure(trained["params"])
+        moved = jax.tree.map(lambda held, gradient: held - 0.1 * gradient, trained["params"], gradients)
+        assert any(not np.array_equal(np.asarray(held), np.asarray(after)) for held, after in
+                   zip(jax.tree.leaves(trained["params"]), jax.tree.leaves(moved), strict=True))
+        trained = {**trained, "params": moved}
+        for held, kept in zip(jax.tree.leaves(drawn[QUANTIZATION]), jax.tree.leaves(trained[QUANTIZATION]),
+                              strict=True):
+            assert np.array_equal(np.asarray(kept), np.asarray(held))
+
+
 @pytest.mark.parametrize("lane", [True, False], ids=["the lane's", "a user's"])
 def test_a_flow_holds_in_a_process_of_its_variant_alone(lane):
     """A flow holds only in a process opened under its variant's XLA flags and matmul precision
