@@ -707,7 +707,7 @@ def test_an_own_pair_at_fp32s_edge_reads_as_float64_does(case):
     values = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 0, 0, 0].set(1.0)
     log_decay = jnp.zeros((1, 2, 1, width), jnp.float32).at[0, 1, 0, 0].set(decay * np.log(2.0))
     operands = Chunk(queries.astype(jnp.bfloat16), keys.astype(jnp.bfloat16), values.astype(jnp.bfloat16),
-                     log_decay=log_decay, beta=jnp.ones((1, 2, 1), jnp.float32).at[0, 1, 0].set(2.0 ** gate))
+                     state=jnp.zeros((1, 1, width, width), jnp.float32), log_decay=log_decay, beta=jnp.ones((1, 2, 1), jnp.float32).at[0, 1, 0].set(2.0 ** gate))
     ours = np.asarray(chunk_on('mosaic_gpu', hooks, operands, chunk_size=CHUNK)[0], np.float64)
     with jax.enable_x64(new_val=True):
         truth = np.asarray(token_by_token(hooks, jax.tree.map(
