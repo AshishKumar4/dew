@@ -8,6 +8,7 @@ import dataclasses
 import functools
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -448,17 +449,33 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
         finding.rule for finding in computing.value.findings]
 
 
-def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags():
-    """A GPU tier part's prepare (`DEW_TIER_PREPARE`, on the node's CPU) is configured under the XLA flags
-    its run is (`lane_environment.configure_lane`'s cuda lane), so the programs it compiles load where the
-    run holds them to its own (`dew.training.ahead.BuildTarget.held`: the prepare's CPU lane's devices and
-    scheduler beside the run's deterministic GPU ops refused test_gpu_numerics' vocabulary cell)."""
+@pytest.mark.parametrize("held", ["0", "0,1"], ids=["one GPU", "two GPUs"])
+def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags(held):
+    """A GPU tier part's prepare (`DEW_TIER_PREPARE`, on the node's CPU, which hides its GPUs from it) is
+    configured under the XLA flags
+    that decide what its run's programs compute (`lane_environment.configure_lane`'s cuda lane,
+    `dew.training.ahead.computation_flags`), whatever GPUs its run holds, so the programs it compiles load
+    where the run holds them to its own (`BuildTarget.held`: the prepare's CPU lane's devices and scheduler
+    beside the run's deterministic GPU ops refused test_gpu_numerics' vocabulary cell); and its CPU client
+    opens, with a host device (one configured for a GPU of none failed every GPU part's prepare: "Could not
+    determine process_index").
+
+    The prepare's environment is the one its node and lane give it, mirrored, as Dew reads nothing of dew-ops
+    (dew-ops reads Dew's `tier_wire`, never the reverse): dew-ops' session hides every GPU from every job's
+    prepare (dewops/node/session.py's prepare environment, `"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS":
+    "cpu"`, line 2388 at ops 945f3032f), and the lane's prepare names itself (tools/armada/ci.py,
+    `gpu_prepared`: `JAX_PLATFORMS` cpu and `tier_wire.PREPARE`)."""
     import lane_environment
 
-    node = {"CUDA_VISIBLE_DEVICES": "0"}
-    prepare = lane_environment.configured({**node, "JAX_PLATFORMS": "cpu", "DEW_TIER_PREPARE": "1"})
-    run = lane_environment.configured({**node, "JAX_PLATFORMS": "cuda"})
-    assert prepare["XLA_FLAGS"] == run["XLA_FLAGS"]
+    from dew.training.ahead import computation_flags
+
+    prepare = lane_environment.configured(
+        {"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu", "DEW_TIER_PREPARE": "1"})
+    run = lane_environment.configured({"CUDA_VISIBLE_DEVICES": held, "JAX_PLATFORMS": "cuda"})
+    assert computation_flags(prepare["XLA_FLAGS"]) == computation_flags(run["XLA_FLAGS"])
+    opened = subprocess.run([sys.executable, "-c", "import jax; print(len(jax.devices('cpu')))"],
+                            env={**os.environ, **prepare}, capture_output=True, text=True, timeout=300)
+    assert (opened.returncode, opened.stdout.split()[-1:]) == (0, ["1"]), opened.stderr[-2000:]
 
 
 def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
