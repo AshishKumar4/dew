@@ -348,7 +348,7 @@ def _github(store, monkeypatch, releases: list[dict], private: bool = False, exi
         if arguments[:3] == ("api", "--paginate", "--slurp"):
             return json.dumps([releases])
         if arguments[:3] == ("workflow", "run", "upload.yml"):
-            given = dict(argument.split("=", 1) for argument in arguments[5::2])
+            given = dict(argument.split("=", 1) for argument in arguments[6::2])
             data = (uploads or {}).get(given["url"])
             if data is None or hashlib.sha256(data).hexdigest() != given["sha256"]:
                 return ""
@@ -373,11 +373,11 @@ def _bucket(store, monkeypatch) -> dict[str, bytes]:
     held: dict[str, bytes] = {}
 
     class Client:
-        def upload_file(self, path, bucket, key, ExtraArgs):  # noqa: N803 - boto3's own keyword
+        def upload_file(self, path, bucket, key, ExtraArgs):
             assert bucket == "outputs" and ExtraArgs["Metadata"]["sha256"] == key.split("/")[1]
             held[key] = Path(path).read_bytes()
 
-        def generate_presigned_url(self, method, Params, ExpiresIn):  # noqa: N803 - boto3's own keywords
+        def generate_presigned_url(self, method, Params, ExpiresIn):
             assert method == "get_object" and ExpiresIn == store.STAGED_SECONDS
             return f"https://outputs/{Params['Key']}"
 
