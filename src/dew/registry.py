@@ -1850,7 +1850,7 @@ def member_fields(member: type | Callable[..., Configured]) -> Iterator[tuple[st
         yield name, default, annotation
 
 
-def default_record(name: str, declared: Configured, annotation: Annotation) -> JSON:
+def default_record(name: str, declared: object, annotation: Annotation) -> JSON:
     """A member's default `declared` as a record holds it: a dtype by its
     name, a matmul precision by its level, anything else as `to_record`
     writes it. TypeError or ValueError for a value no record carries."""
@@ -1870,13 +1870,21 @@ def recorded_defaults(member: type | Callable[..., Configured], stated: Mapping[
     """The record of each field or argument `member` defaults that `stated`
     leaves out: as `recorded` holds it, or else as the class defaults it now.
     A default no record carries (a callable, say) is left to the class, and
-    a recorded one the class no longer takes is refused."""
-    defaults, named = {}, set()
+    a recorded one the class no longer takes is refused. A recorded default
+    is held as its record whether it arrives as one or as the value a read
+    rebuilt from one (a function a record names, `from_record`), so a run
+    read back holds the defaults it was written with."""
+    defaults, kept, named = {}, {}, set()
     # One record: a module two defaults share is written once.
     with recording():
         for name, declared, annotation in member_fields(member):
             named.add(name)
-            if name in stated or name in recorded or declared is dataclasses.MISSING:
+            if name in stated:
+                continue
+            if name in recorded:
+                kept[name] = default_record(name, recorded[name], annotation)
+                continue
+            if declared is dataclasses.MISSING:
                 continue
             try:
                 defaults[name] = default_record(name, declared, annotation)
@@ -1885,7 +1893,7 @@ def recorded_defaults(member: type | Callable[..., Configured], stated: Mapping[
     unknown = sorted(set(recorded) - named)
     if unknown:
         raise ValueError(f"{member.__name__} takes no {unknown}, which the record defaults")
-    return {**defaults, **{name: value for name, value in recorded.items() if name not in stated}}
+    return {**defaults, **kept}
 
 
 def built_arguments(member: type | Callable[..., Configured], fields: Mapping[str, object],
