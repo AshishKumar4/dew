@@ -355,5 +355,5 @@ def test_a_recordings_units_merge_into_one_fixture_naming_each_devices_sites(tmp
         "devices": {"H100": ["gdn"], "A100": ["kda"]}}
     with pytest.raises(ValueError, match="another provenance"):
         worker.merged_units([first, unit("c.npz", "H100", ["x.out"], revision="2")], Path("f.npz"), "MIT")
-    with pytest.raises(ValueError, match="records gdn.out again"):
+    with pytest.raises(ValueError, match=r"records gdn\.out again"):
         worker.merged_units([first, unit("d.npz", "H100", ["gdn.out"])], Path("f.npz"), "MIT")
