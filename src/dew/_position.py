@@ -204,11 +204,7 @@ def saved_plan(position: bytes) -> Mapping[str, object] | None:
     place = decode(position)
     if place is not None:
         return place.plan
-    try:
-        held = json.loads(position)
-    except (ValueError, UnicodeDecodeError):
-        return None
-    match held:
+    match json.loads(position):
         case {"dew_data_plan": Mapping() as plan}:
             return plan
         case {"dew_replicated_position": {"dew_data_plan": Mapping() as plan}}:
