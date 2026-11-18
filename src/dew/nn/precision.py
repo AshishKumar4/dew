@@ -466,9 +466,12 @@ def _exp_value(base2: bool, x) -> jax.Array:
     return summed * _power_of_two(half) * _power_of_two(n - half)
 
 
-def _power_of_two(n) -> jax.Array:
-    """`2^n`, fp32, of an integral `n` within fp32's normal exponents, set in its exponent bits."""
-    return jax.lax.bitcast_convert_type((n.astype(jnp.int32) + 127) << 23, jnp.float32)
+def _power_of_two(n, dtype=jnp.float32) -> jax.Array:
+    """`2^n` in `dtype` (fp32 or float64), of an integral `n` within its normal exponents, set in its
+    exponent bits."""
+    limits = jnp.finfo(dtype)
+    unsigned = jnp.dtype(f"int{limits.bits}")
+    return jax.lax.bitcast_convert_type((n.astype(unsigned) + (limits.maxexp - 1)) << limits.nmant, dtype)
 
 
 def _exp_jvp(base2: bool, primals, tangents) -> tuple[jax.Array, jax.Array]:
@@ -1611,26 +1614,26 @@ def vanishing(dtype, base2: bool = False) -> float:
     return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
 
 
-def _pow2(exponent: jax.Array) -> jax.Array:
-    """`2^exponent` for a float32 array of whole numbers within float32's normal exponents ([-126, 127]),
-    from its bits."""
-    return jax.lax.bitcast_convert_type((exponent.astype(jnp.int32) + 127) << 23, jnp.float32)
-
-
 def _binades(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """A float32 `x` as its significand in [1, 2) (its sign kept; a subnormal's below one, zero's zero) and
-    its binary exponent as a float32 whole number, a subnormal's the least normal binade's: exactly
-    `x = significand 2^exponent`."""
-    bits = jax.lax.bitcast_convert_type(x, jnp.int32)
-    biased = (bits >> 23) & 0xFF
-    significand = jax.lax.bitcast_convert_type((bits & -0x7F800001) | 0x3F800000, jnp.float32)
-    lifted = x * _pow2(jnp.full(x.shape, 126.0, jnp.float32))
+    """A float `x` (fp32 or float64) as its significand in [1, 2) (its sign kept; a subnormal's below one,
+    zero's zero) and its binary exponent as a whole number of its dtype, a subnormal's the least normal
+    binade's: exactly `x = significand 2^exponent`."""
+    limits = jnp.finfo(x.dtype)
+    signed = jnp.dtype(f"int{limits.bits}")
+    bias, width = limits.maxexp - 1, limits.nmant
+    bits = jax.lax.bitcast_convert_type(x, signed)
+    biased = (bits >> width) & (2 * limits.maxexp - 1)
+    # Its sign and its significand's bits kept, its exponent's set to the bias: its significand in [1, 2).
+    kept = np.array(-(1 << (limits.bits - 1)) | ((1 << width) - 1), signed)
+    significand = jax.lax.bitcast_convert_type((bits & kept) | (bias << width), x.dtype)
+    lifted = x * _power_of_two(jnp.full(x.shape, bias - 1, signed), x.dtype)
     return (jnp.where(biased == 0, lifted, significand),
-            (jnp.maximum(biased, 1) - 127).astype(jnp.float32))
+            (jnp.maximum(biased, 1) - bias).astype(x.dtype))
 
 
 def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
-    """The float32 sum of `terms`, each the broadcast product of its factors, summed over `axis` of each
+    """The sum of `terms` in float32 or float64 (their widest, at least float32), each the broadcast product
+    of its factors, summed over `axis` of each
     product too where given (kept): every product formed as its factors' significands' (each below two)
     times a power of two, aligned to the largest's binade before the sum and scaled back after in steps each
     within float32's normal exponents, so a sum in range is its value though its terms leave float32's
@@ -1646,7 +1649,8 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
     summing aligned (`ssd`'s TPU forked scan) does not. Elementwise and over a 2-D array's axes, so a Pallas
     TPU kernel forms it in place."""
     shape = tuple(len(term) for term in terms)
-    return _aligned(shape, axis, *(jnp.asarray(factor, jnp.float32) for term in terms for factor in term))
+    dtype = jnp.result_type(jnp.float32, *(factor for term in terms for factor in term))
+    return _aligned(shape, axis, *(jnp.asarray(factor, dtype) for term in terms for factor in term))
 
 
 def _regrouped(shape: tuple[int, ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
@@ -1668,15 +1672,23 @@ def _aligned_value(shape: tuple[int, ...], axis, *flat: jax.Array) -> jax.Array:
     def reduced(x, op):
         return x if axis is None else op(x, axis=axis, keepdims=True)
 
-    top = functools.reduce(jnp.maximum, [reduced(jnp.where(significand != 0, exponent, -1024.0), jnp.max)
+    dtype = flat[0].dtype
+    limits = jnp.finfo(dtype)
+    least, most = limits.minexp, limits.maxexp - 1
+    # The largest term's binade, a sum of no nonzero term's zero: no term then aligned past it.
+    top = functools.reduce(jnp.maximum, [reduced(jnp.where(significand != 0, exponent, -jnp.inf), jnp.max)
                                          for significand, exponent in products])
-    total = sum(reduced(jnp.where(exponent - top >= -126.0,
-                                  significand * _pow2(jnp.maximum(exponent - top, -126.0)), 0.0), jnp.sum)
-                for significand, exponent in products)
-    top = jnp.where(top < -900.0, 0.0, top)
-    first = jnp.clip(top, -126.0, 127.0)
-    second = jnp.clip(top - first, -126.0, 127.0)
-    return total * _pow2(first) * _pow2(second) * _pow2(jnp.clip(top - first - second, -126.0, 127.0))
+    top = jnp.where(jnp.isfinite(top), top, 0.0)
+    # Each term's shift to the largest's binade, at most none; one past the normal exponents dropped.
+    total = sum(reduced(jnp.where(
+        (significand != 0) & (exponent - top >= least),
+        significand * _power_of_two(jnp.clip(exponent - top, least, 0.0), dtype), 0.0), jnp.sum)
+        for significand, exponent in products)
+    first = jnp.clip(top, least, most)
+    second = jnp.clip(top - first, least, most)
+    third = jnp.clip(top - first - second, least, most)
+    return (total * _power_of_two(first, dtype) * _power_of_two(second, dtype)
+            * _power_of_two(third, dtype))
 
 
 def _aligned_tangent(shape: tuple[int, ...], axis, primals, tangents):
