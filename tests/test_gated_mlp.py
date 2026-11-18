@@ -226,8 +226,8 @@ def assert_same_program(one, other) -> None:
                 elif isinstance(value, opened):
                     same(value, theirs.params[key])
                 else:
-                    # A rule a trace wraps afresh (a custom derivative's, its program the equation's own bodies,
-                    # compared above) is the same rule where it reads as the same, of the same kind.
+                    # A rule a trace wraps afresh (a custom derivative's, its program the equation's own
+                    # bodies, compared above) is the same rule where it reads as the same, of the same kind.
                     other_value = theirs.params[key]
                     assert value == other_value or (type(value) is type(other_value)
                                                     and str(value) == str(other_value)), (key, mine, theirs)
