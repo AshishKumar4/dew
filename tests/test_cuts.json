@@ -1324,9 +1324,6 @@
 "tests/test_decision_recipe.py::test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads",
 "tests/test_decision_recipe.py::test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to_its_end"
 ],
-"tests/test_decision_schema_stream.py": [
-"tests/test_decision_schema_stream.py::test_a_schema_read_in_context_leaves_the_row_and_its_spans_index_the_context"
-],
 "tests/test_decision_serving.py": [
 "tests/test_decision_serving.py::test_a_request_jev_would_refuse_gets_a_422_with_its_reason[{not json]",
 "tests/test_decision_serving.py::test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_held",
@@ -1506,9 +1503,6 @@
 "tests/test_decoder_remat.py::test_recomputed_pipeline_preserves_updates_and_sown_values[True-dense]",
 "tests/test_decoder_remat.py::test_recomputed_pipeline_preserves_updates_and_sown_values[True-sparse]",
 "tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[False-dense]"
-],
-"tests/test_decoding_strategies.py": [
-"tests/test_decoding_strategies.py::test_an_undefined_distribution_raises_instead_of_returning_a_token"
 ],
 "tests/test_deepest_rings.py": [
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention backward 64-sm86]",
@@ -2037,9 +2031,6 @@
 "tests/test_inference.py::test_every_route_generates_through_the_same_packed_projections",
 "tests/test_inference.py::test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images"
 ],
-"tests/test_inference_sampling.py": [
-"tests/test_inference_sampling.py::test_cached_generation_records_the_transformers_filtered_distribution[sampling0]"
-],
 "tests/test_inference_tasks.py": [
 "tests/test_inference_tasks.py::test_a_task_moves_onto_a_mesh_with_the_variables_it_holds"
 ],
@@ -2252,6 +2243,9 @@
 "tests/test_kimi_linear.py": [
 "tests/test_kimi_linear.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference"
 ],
+"tests/test_kv_cache.py": [
+"tests/test_kv_cache.py::test_a_quantized_caches_scales_and_codes_are_its_formats_quotients[float8_e4m3fn]"
+],
 "tests/test_layer_stack.py": [
 "tests/test_layer_stack.py::test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop",
 "tests/test_layer_stack.py::test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop",
@@ -2298,9 +2292,6 @@
 ],
 "tests/test_live_bridge.py": [
 "tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
-],
-"tests/test_llama4.py": [
-"tests/test_llama4.py::test_a_paged_cache_draws_what_the_dense_cache_draws[paged]"
 ],
 "tests/test_lm_objective.py": [
 "tests/test_lm_objective.py::test_evaluation_correctness_is_the_same_full_forward_argmax",
@@ -2351,7 +2342,7 @@
 ],
 "tests/test_loop_phases_decision.py": [
 "tests/test_loop_phases_decision.py::test_a_decision_runs_first_phase_is_a_one_pass_runs_over_its_first_source",
-"tests/test_loop_phases_decision.py::test_a_phased_decision_run_resumes_with_its_loops_passes_recomputed",
+"tests/test_loop_phases_decision.py::test_a_phased_run_with_a_theta_per_pass_keeps_its_rows_through_its_phases_and_resumes",
 "tests/test_loop_phases_decision.py::test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_boundary",
 "tests/test_loop_phases_decision.py::test_a_phased_runs_later_phases_are_named_from_the_first_batch_its_loop_read",
 "tests/test_loop_phases_decision.py::test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_counts_its_flops[1-passes]",
@@ -2628,9 +2619,6 @@
 ],
 "tests/test_moe_biased_exchange.py": [
 "tests/test_moe_biased_exchange.py::test_biased_router_updates_pool_across_two_real_cpu_processes"
-],
-"tests/test_moe_decoder.py": [
-"tests/test_moe_decoder.py::test_the_expert_shards_train_the_same_model"
 ],
 "tests/test_moe_exchange.py": [
 "tests/test_moe_exchange.py::test_capacity_drops_compute_maxtexts_experts[short-exchange-expert2-fsdp2]",
@@ -2935,9 +2923,6 @@
 "tests/test_prefix_blocks.py::test_a_served_prompt_carrying_its_groups_scores_what_it_scores_alone[blocks-over-a-prefix-run]",
 "tests/test_prefix_blocks.py::test_a_served_prompt_carrying_its_groups_scores_what_it_scores_alone[blocks]",
 "tests/test_prefix_blocks.py::test_a_served_prompt_carrying_its_groups_scores_what_it_scores_alone[scattered-in-pieces]"
-],
-"tests/test_presets.py": [
-"tests/test_presets.py::test_lm_lays_one_document_a_row_padded_where_its_segments_are_one"
 ],
 "tests/test_pretrained_sources.py": [
 "tests/test_pretrained_sources.py::test_a_releases_task_reads_back_and_writes_the_bytes_its_export_wrote",
@@ -3368,9 +3353,6 @@
 "tests/test_routing_replay.py::test_replay_on_banked_weights_scores_as_on_the_plain_tree[host]",
 "tests/test_routing_replay.py::test_the_gate_keeps_its_gradient_under_replay"
 ],
-"tests/test_run_artifact.py": [
-"tests/test_run_artifact.py::test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained"
-],
 "tests/test_run_budgets.py": [
 "tests/test_run_budgets.py::test_a_bounded_streamed_read_of_stated_shards_hands_out_each_example_once_a_pass_whatever_its_workers[7-memory-2]",
 "tests/test_run_budgets.py::test_a_clocked_run_whose_last_examples_make_no_rows_ends_at_its_bound[1]",
@@ -3728,9 +3710,6 @@
 ],
 "tests/test_ssd_kernel.py": [
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk-resets]"
-],
-"tests/test_stage_blocks.py": [
-"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[jepa-stage2_sequence2]"
 ],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
