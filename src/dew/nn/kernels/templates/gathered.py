@@ -4,6 +4,7 @@ copies (Hopper's) or by TMA's four-row gathers (`Committed`, tcgen05's load warp
 (`scattered_rows`), an output's rows each written where a permutation says, each through `inline_mgpu`'s
 lane-level code (Pallas's warpgroup semantics reach no thread's own copy, address or mbarrier)."""
 
+import contextlib
 import dataclasses
 import functools
 
@@ -265,82 +266,69 @@ def scattered_rows(smem, out: stores.Scattered, row_start, first, stored, column
 
 
 def _scattered_pieces(smem, table, dest, first, stored) -> None:
-    """`scattered_rows`' lane-level copy: the warpgroup's threads met (the share staged by all of them),
-    then each of the share's 16-byte pieces, thread `t` taking pieces `t`, `t + 128`, ..., read from shared
-    memory and written to its row's place in `dest` where its row is stored (`first` <= r < `first +
-    stored`, its table entry not negative), the threads met again before the buffer is written."""
-    i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
+    """`scattered_rows`' lane-level copy (`row_pieces`): each stored row to its table entry's row of
+    `dest`, none where the entry is negative."""
+    i32 = mgpu_ir.IntegerType.get_signless(32)
     index = mgpu_ir.IndexType.get()
-    element = mgpu_ir.MemRefType(smem.type).element_type
-    rows, width = mgpu_ir.MemRefType(smem.type).shape
-    lanes = 16 * 8 // mgpu_utils.bitwidth(element)
-    per_row = width // lanes
-    pieces = rows * per_row
-    [row_stride, column_stride], _ = mgpu_ir.MemRefType(dest.type).get_strides_and_offset()
-    vector = mgpu_ir.VectorType.get((4,), i32)
-    source = mgpu_utils.memref_ptr(smem)
-    base = mgpu_llvm.addrspacecast(mgpu_llvm.PointerType.get(address_space=1), mgpu_utils.memref_ptr(dest))
-    thread = mgpu_arith.remui(mgpu_arith.index_cast(i32, mgpu_gpu.thread_id(mgpu_gpu.Dimension.x)),
-                              mgpu_utils.c(128, i32))
-    mgpu_utils.warpgroup_barrier()
-    end = mgpu_arith.addi(first, stored)
-    for turn in range(-(-pieces // 128)):
-        piece = mgpu_arith.addi(thread, mgpu_utils.c(128 * turn, i32))
-        row = mgpu_arith.divui(piece, mgpu_utils.c(per_row, i32))
-        lane = mgpu_arith.remui(piece, mgpu_utils.c(per_row, i32))
-        inside = mgpu_arith.andi(
-            mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, piece, mgpu_utils.c(pieces, i32)),
-            mgpu_arith.andi(mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.sge, row, first),
-                            mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, row, end)))
-        branch = mgpu_scf.IfOp(inside)
-        with mgpu_ir.InsertionPoint(branch.then_block):
-            token = mgpu_memref.load(table, [mgpu_arith.index_cast(index, row)])
-            nonnegative = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.sge, token, mgpu_utils.c(0, i32))
-            stored_here = mgpu_scf.IfOp(nonnegative)
-            with mgpu_ir.InsertionPoint(stored_here.then_block):
-                offset = mgpu_arith.addi(mgpu_arith.muli(row, mgpu_utils.c(width, i32)),
-                                         mgpu_arith.muli(lane, mgpu_utils.c(lanes, i32)))
-                value = mgpu_llvm.load(vector, mgpu_utils.getelementptr(source, [offset], element))
-                place = mgpu_arith.addi(
-                    mgpu_arith.muli(mgpu_arith.extsi(i64, token), mgpu_utils.c(row_stride, i64)),
-                    mgpu_arith.muli(mgpu_arith.extui(i64, mgpu_arith.muli(lane, mgpu_utils.c(lanes, i32))),
-                                    mgpu_utils.c(column_stride, i64)))
-                mgpu_llvm.store(value, mgpu_utils.getelementptr(base, [place], element))
-                mgpu_scf.YieldOp([])
-            mgpu_scf.YieldOp([])
-    mgpu_utils.warpgroup_barrier()
+
+    def placed(row):
+        token = mgpu_memref.load(table, [mgpu_arith.index_cast(index, row)])
+        return token, mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.sge, token, mgpu_utils.c(0, i32))
+
+    row_pieces(smem, dest, first, stored, placed, swizzle=swizzling.UNSWIZZLED)
 
 
 def swizzled_pieces(smem, dest, start, first, stored, *, swizzle: int) -> None:
-    """`stores.swizzled_rows_out`' lane-level copy: the warpgroup's threads met (the tile staged by all of
-    them), then each of its 16-byte pieces, thread `t` taking pieces `t`, `t + 128`, ..., read from shared
-    memory where the staging's swizzle put it (a tile of 8 rows by `swizzle` bytes after another, row-major,
-    each piece's 16-byte column XORed by its row's place in the swizzle's span:
-    `swizzling.staged_address`) and written to `dest` at row `start + r` where its row is stored (`first` <=
-    r < `first + stored`), the threads met again before the buffer is written."""
+    """`stores.swizzled_rows_out`' lane-level copy (`row_pieces`): each stored row `r` of a tile staged at
+    `swizzle` bytes to row `start + r` of `dest`."""
+    row_pieces(smem, dest, first, stored, lambda row: (mgpu_arith.addi(start, row), None), swizzle=swizzle)
+
+
+def row_pieces(smem, dest, first, stored, placed, *, swizzle: int) -> None:
+    """A staged tile's rows `first` to `first + stored` written to `dest` by the warpgroup's threads: the
+    threads met (the tile staged by all of them), then each of its 16-byte pieces, thread `t` taking pieces
+    `t`, `t + 128`, ... in a loop of its own over the turns (each turn's addresses live within it: unrolled,
+    a 64 x 320 forward's spilled 1440 bytes on an A100), read where the staging put it
+    (`swizzling.staged_address`: plain, or a swizzle's 8-row tiles with each 16-byte piece XORed by its row's
+    place) and written to `dest`'s row `placed(r)` gives with its predicate (None for every stored row), the
+    threads met again before the buffer is written."""
     i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
     element = mgpu_ir.MemRefType(smem.type).element_type
     bits = mgpu_utils.bitwidth(element)
     shape = tuple(mgpu_ir.MemRefType(smem.type).shape)
-    rows, width = shape[0] * shape[2], shape[1] * shape[3]
+    rows, width = (shape[0] * shape[2], shape[1] * shape[3]) if len(shape) == 4 else shape
     row_bytes = width * bits // 8
     per_row = row_bytes // 16
     pieces = rows * per_row
-    [row_stride, column_stride], _ = mgpu_ir.MemRefType(dest.type).get_strides_and_offset()
+    [row_stride, column_stride], _offset = mgpu_ir.MemRefType(dest.type).get_strides_and_offset()
     vector = mgpu_ir.VectorType.get((4,), i32)
     byte = mgpu_ir.IntegerType.get_signless(8)
     source = mgpu_utils.memref_ptr(smem)
     base = mgpu_llvm.addrspacecast(mgpu_llvm.PointerType.get(address_space=1), mgpu_utils.memref_ptr(dest))
     thread = mgpu_arith.remui(mgpu_arith.index_cast(i32, mgpu_gpu.thread_id(mgpu_gpu.Dimension.x)),
                               mgpu_utils.c(128, i32))
+
     def c(value: int):
         return mgpu_utils.c(value, i32)
 
+    def staged(row, column_bytes):
+        # `swizzling.staged_address`, traced.
+        if swizzle == swizzling.UNSWIZZLED:
+            return mgpu_arith.addi(mgpu_arith.muli(row, c(row_bytes)), column_bytes)
+        tile = mgpu_arith.muli(
+            mgpu_arith.addi(mgpu_arith.muli(mgpu_arith.divui(row, c(swizzling.TILE_ROWS)),
+                                            c(row_bytes // swizzle)),
+                            mgpu_arith.divui(column_bytes, c(swizzle))),
+            c(swizzling.TILE_ROWS * swizzle))
+        in_tile = mgpu_arith.muli(mgpu_arith.remui(row, c(swizzling.TILE_ROWS)), c(swizzle))
+        within = mgpu_arith.remui(column_bytes, c(swizzle))
+        offset = mgpu_arith.addi(mgpu_arith.addi(tile, in_tile), within)
+        return mgpu_arith.xori(offset, mgpu_arith.shli(mgpu_arith.andi(
+            mgpu_arith.shrui(offset, c(7)), c(swizzle // 16 - 1)), c(4)))
+
     mgpu_utils.warpgroup_barrier()
     end = mgpu_arith.addi(first, stored)
-    # A loop of its own over the turns, not unrolled: each turn's addresses live within it, as the tile's
-    # accumulators were stored before it (unrolled, its turns' addresses held beside them spilled an A100's
-    # 64 x 320 forward 1440 bytes).
+
     @mgpu_utils.fori(c(-(-pieces // 128)), ())
     def _turns(turn, carry):
         piece = mgpu_arith.addi(thread, mgpu_arith.muli(turn, c(128)))
@@ -352,25 +340,21 @@ def swizzled_pieces(smem, dest, start, first, stored, *, swizzle: int) -> None:
                             mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, row, end)))
         branch = mgpu_scf.IfOp(inside)
         with mgpu_ir.InsertionPoint(branch.then_block):
-            # The piece's byte in the staging (`swizzling.staged_address`).
-            column_bytes = mgpu_arith.muli(lane, c(16))
-            tile = mgpu_arith.muli(
-                mgpu_arith.addi(mgpu_arith.muli(mgpu_arith.divui(row, c(swizzling.TILE_ROWS)),
-                                                c(row_bytes // swizzle)),
-                                mgpu_arith.divui(column_bytes, c(swizzle))),
-                c(swizzling.TILE_ROWS * swizzle))
-            in_tile = mgpu_arith.muli(mgpu_arith.remui(row, c(swizzling.TILE_ROWS)), c(swizzle))
-            within = mgpu_arith.remui(column_bytes, c(swizzle))
-            offset = mgpu_arith.addi(mgpu_arith.addi(tile, in_tile), within)
-            offset = mgpu_arith.xori(offset, mgpu_arith.shli(mgpu_arith.andi(
-                mgpu_arith.shrui(offset, c(7)), c(swizzle // 16 - 1)), c(4)))
-            value = mgpu_llvm.load(vector, mgpu_utils.getelementptr(source, [offset], byte))
-            place = mgpu_arith.addi(
-                mgpu_arith.muli(mgpu_arith.extsi(i64, mgpu_arith.addi(start, row)),
-                                mgpu_utils.c(row_stride, i64)),
-                mgpu_arith.muli(mgpu_arith.extui(i64, mgpu_arith.muli(lane, c(128 // bits))),
-                                mgpu_utils.c(column_stride, i64)))
-            mgpu_llvm.store(value, mgpu_utils.getelementptr(base, [place], element))
+            target, admitted = placed(row)
+            written = mgpu_scf.IfOp(admitted) if admitted is not None else None
+            scope = (contextlib.nullcontext() if written is None
+                     else mgpu_ir.InsertionPoint(written.then_block))
+            with scope:
+                column_bytes = mgpu_arith.muli(lane, c(16))
+                address = mgpu_utils.getelementptr(source, [staged(row, column_bytes)], byte)
+                value = mgpu_llvm.load(vector, address)
+                place = mgpu_arith.addi(
+                    mgpu_arith.muli(mgpu_arith.extsi(i64, target), mgpu_utils.c(row_stride, i64)),
+                    mgpu_arith.muli(mgpu_arith.extui(i64, mgpu_arith.muli(lane, c(128 // bits))),
+                                    mgpu_utils.c(column_stride, i64)))
+                mgpu_llvm.store(value, mgpu_utils.getelementptr(base, [place], element))
+                if written is not None:
+                    mgpu_scf.YieldOp([])
             mgpu_scf.YieldOp([])
         return carry
 
