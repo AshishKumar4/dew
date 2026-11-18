@@ -87,6 +87,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     fuses,
     held_walked,
     holders,
+    forward_reduces,
     hook_reduces,
     launch_scope,
     layouts,
@@ -871,9 +872,11 @@ class MosaicForward(_Mainloop[Tiles]):
         # (`reducing`).
         arguments = ba.arguments
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
-        return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
-            family, config.consumers, self.score_reduces or self.output_mod is not None,
-            magnitudes=cached and self.scales_in_kernel(ba)), products=self._products(ba, config)))
+        reduced = reducing(family, config.consumers, self.score_reduces or self.output_mod is not None,
+                           magnitudes=cached and self.scales_in_kernel(ba))
+        return resources.shared_bytes(family, launch_scope(family, allocations, reduced,
+                                                           reduces=forward_reduces(family, reduced),
+                                                           products=self._products(ba, config)))
 
     def _products(self, ba: tokamax.BoundArguments, config: Tiles) -> tuple:
         """The launch's products at `config` as its program scopes them (`forward_products`): its logits a

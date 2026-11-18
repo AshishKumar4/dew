@@ -77,6 +77,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     approximate,
     bundle_of,
     held_params,
+    forward_reduces,
     hook_reduces,
     indexed_views,
     issued_into,
@@ -788,7 +789,8 @@ class _Layout(NamedTuple):
         read, refs = refs[:self.reads], refs[self.reads:]
         written, refs = refs[:self.outputs], refs[self.outputs:]
         (q_smem, row_smem, *stages), (q_loaded, schedule, *verdicts) = refs[:self.arrays], refs[self.arrays:]
-        decided = mosaic.Decided(*verdicts, verdicts[0].shape[0]) if self.decides else None
+        decided = (None if not self.decides else mosaic.Decided(*verdicts, verdicts[0].shape[0]) if verdicts
+                   else mosaic.Decided(None, None, 1))
         relay = stages.pop() if self.relays else None
         converted = (stages[-2], stages[-1]) if self.converts else None
         stages = stages[:-2] if self.converts else stages
@@ -1943,7 +1945,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                           certified=steps if certified else 0, flags=flags,
                           in_place=read.into is not None)
     # The query loads' and turns' barriers last, a decided walk's verdicts and their barrier after them.
-    layout = _Layout(treedef.num_leaves, treedef.unflatten, len(out_type), len(scoped) - 2 - 2 * decides,
+    verdicts = len(family.decided_scratch(tiles.consumers)) if decides else 0
+    layout = _Layout(treedef.num_leaves, treedef.unflatten, len(out_type), len(scoped) - 2 - verdicts,
                      peaks or (reuse and not training),
                      relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None,
                      bool(after), decides)
@@ -1960,16 +1963,14 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by,
                                 in_key=value_columns is not None)
     grid = (heads, queries // pair * splits, batch)
+    reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
+                       magnitudes=spec.headroom and not peaks and read.hooked.magnitudes is None)
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,
                          approx_math=spec.approximate, name=name, cost=cost, model_flops=model,
-                         registers=registers,
-                         reducing_warpgroups=reducing(family, consumers,
-                                                      hook_reduces(hooks) or hooks.output_mod is not None,
-                                                      magnitudes=(spec.headroom and not peaks
-                                                                  and read.hooked.magnitudes is None))
-                         )(query, key, value, *leaves)
+                         registers=registers, reducing_warpgroups=reduced,
+                         reduces=forward_reduces(family, reduced))(query, key, value, *leaves)
 
 
 def _per_role(family: mosaic.Family, consumers: int, consumer: Callable) -> Callable:

@@ -232,13 +232,14 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               prefetched: Callable | None = None, registers: int | None = None,
+               prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster, and no
         # view prefetched ahead of a wait (a GPU's dependent launch); its compiler holds its values, no
         # register budget (`budgets_registers`).
         del approx_math, reducing_warpgroups, resident, model_flops, registers, producer, shared, moves
+        del reduces
         if prefetched is not None:
             raise NotImplementedError("a TPU program is launched after the last; nothing is prefetched ahead")
         _one(consumers, clustered=cluster > 1)

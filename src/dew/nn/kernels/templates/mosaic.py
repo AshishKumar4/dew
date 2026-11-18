@@ -595,7 +595,9 @@ class Decided:
     """A walk its program's consumers decide to take again, over the same steps, after the walk before it
     (`Transport.stream`'s `again`, `Family.walk_own`'s `counted`): each consumer's verdict a word of its own
     (`words`, `Transport.decided_scratch`'s) published at a barrier of the consumers' arrivals, which the
-    producer and every consumer wait on, so all of them read the same words and walk again, or none does."""
+    producer and every consumer wait on, so all of them read the same words and walk again, or none does.
+    A program of one warpgroup, which no producer serves (`ConsumerFed`'s one consumer, cp.async's), decides
+    alone: its verdict its own, no word or barrier (`words` None)."""
 
     words: Any
     barrier: Any
@@ -604,6 +606,8 @@ class Decided:
     def stated(self, wg, verdict: jax.Array) -> jax.Array:
         """Consumer `wg`'s `verdict` (a scalar, uniform over its warpgroup) published, and whether any
         consumer's takes the walk again (`taken`)."""
+        if self.words is None:
+            return verdict
         self.words[wg] = verdict.astype(jnp.int32)
         plgpu.barrier_arrive(self.barrier)
         return self.taken()
@@ -721,6 +725,12 @@ class Issuer[Accumulator](abc.ABC):
         registers."""
         del rows, depth
         return 0
+
+    @property
+    def rows_whole(self) -> bool:
+        """Whether each warp of a consumer holds whole rows of its products' tiles, so a reduction along a
+        row (a forward's maxima and sums) stays within a warp, needing no reduction scratch."""
+        return True
 
     def row_shifted(self, tile, shift, *, period: int, interpret: bool) -> jax.Array:
         """`tile` (a register tile in the accumulator's layout, `tile_of`'s) with each row `i` holding row
@@ -1593,7 +1603,7 @@ class Transport[Allocated, Opened](abc.ABC):
                cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               prefetched: Callable | None = None, registers: int | None = None,
+               prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
@@ -1613,8 +1623,10 @@ class Transport[Allocated, Opened](abc.ABC):
         tracing it (`resources.register_model`, its
         producer lowered to `producer` where the family has one, `roles`, and its residency bounded by the
         `shared` bytes it stages where stated; `report.Launch.kernels`), which the compile point checks its
-        kernel against; and whether its program moves registers between its roles where the launch states
-        it (`moves`; else its model decides, `resources.moves_registers`)."""
+        kernel against; whether its program moves registers between its roles where the launch states
+        it (`moves`; else its model decides, `resources.moves_registers`); and whether its arithmetic reduces
+        across warps (`reduces`: a forward whose warps hold whole rows, `Issuer.rows_whole`, does not),
+        reserving the family's reduction scratch (`reduction_scratch`) where it does."""
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
@@ -1813,7 +1825,10 @@ class Transport[Allocated, Opened](abc.ABC):
 
     def decided_scratch(self, consumers: int) -> dict:
         """The scoped allocations a decided walk's verdicts take (`Decided`): a word each of `consumers`
-        consumers and the barrier they publish them at."""
+        consumers and the barrier they publish them at; none where one consumer alone walks the program's
+        rings, no producer beside it (`feeds_itself`)."""
+        if consumers == 1 and self.feeds_itself:
+            return {}
         return {"words": plgpu.SMEM((consumers,), jnp.int32),
                 "barrier": plgpu.Barrier(num_arrivals=consumers)}
 
@@ -2248,7 +2263,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               prefetched: Callable | None = None, registers: int | None = None,
+               prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
         # Its programs read a table from global memory as any operand.
@@ -2264,7 +2279,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                                                            programs=resident, shared=shared, moves=moves)),
                       # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
-                      reduction_scratch=(self.reduction_scratch
+                      reduction_scratch=((self.reduction_scratch if reduces else 0)
                                          + self.warpgroup_reduction_scratch * reducing_warpgroups))
 
     def program_scoped(self, body, *allocations, streams):

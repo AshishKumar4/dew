@@ -641,6 +641,15 @@ def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, scaled: boo
     return 0
 
 
+def forward_reduces(family: mosaic.Family, reducing_warpgroups: int) -> bool:
+    """Whether a forward launch's arithmetic reduces across warps, reserving its family's reduction scratch
+    (`Family.kernel`'s `reduces`, `resources.Scope.reduces`): where its warps split its rows' columns
+    (`Issuer.rows_whole`: mma.sync's warps along the keys), or a warpgroup of it reduces implicitly
+    (`reducing`). Its rows' maxima and sums each warp's own otherwise, and its flags and verdicts its
+    warpgroup's votes: sm120's forward at width 256 fits whole without the 2,048 bytes."""
+    return not family.rows_whole or reducing_warpgroups > 0
+
+
 def hook_reduces(hooks: Hooks | None) -> bool:
     """Whether the score hook may reduce across warps (`reducing`): traced, never run, on a tile with its
     pullback, it forms or reads a value but a scalar or a whole tile (a unit row, `k_pos[:1, :]`, ledger
