@@ -358,15 +358,17 @@ def _span(span_ref, length: int, chunk: int, aligned: bool) -> Span:
 class Forked:
     """A forked call's documents as its walks read them (`recurrence_chunk.Chunk.loads`): each document's
     first slot (`firsts` `[B, D]`, `S` past a row's last), the table slot it enters and the stored slot it
-    leaves its final in (`loads`, `stores` `[B, D]`), the stored slots' count (`held`), and its entry write,
+    leaves its final in (`loads`, `stores` `[B, D]`), the stored slots' count (`held`), its entry write,
     where the call gives one (`entry`, its `[B, D, Hv, Dk, Dv]` never formed: each walk forms a chunk's
-    own)."""
+    own), and the second slot each document adds to the one it enters, where the call gives them (`adds`
+    `[B, D]`, `Chunk.adds`)."""
 
     firsts: jax.Array
     loads: jax.Array
     stores: jax.Array
     entry: tuple | None
     held: int = dataclasses.field(metadata={'static': True})
+    adds: jax.Array | None = None
 
     @classmethod
     def of(cls, operands, starts, firsts, work) -> "Forked":
@@ -382,16 +384,20 @@ class Forked:
         if operands.entry_key is not None:
             entry = tuple(jnp.asarray(t, work) for t in
                           (operands.entry_key, operands.entry_value, operands.entry_weight))
-        return cls(begins, loads, jnp.asarray(operands.stores, jnp.int32), entry, operands.held)
+        adds = None if operands.adds is None else jnp.asarray(operands.adds, jnp.int32)
+        return cls(begins, loads, jnp.asarray(operands.stores, jnp.int32), entry, operands.held, adds)
 
     @property
     def walked(self) -> tuple:
-        """The operands a walk takes beside the call's (`carrying`): the documents' slots and entry write."""
-        return (self.firsts, self.loads, self.stores, *(() if self.entry is None else self.entry))
+        """The operands a walk takes beside the call's (`carrying`): the documents' slots, their added slots
+        and entry write."""
+        return (self.firsts, self.loads, self.stores, *(() if self.adds is None else (self.adds,)),
+                *(() if self.entry is None else self.entry))
 
-    def carrying(self, firsts, loads, stores, *entry) -> "Forked":
+    def carrying(self, firsts, loads, stores, *rest) -> "Forked":
         """This call's documents from the operands a product's walk was handed (`walked`)."""
-        return Forked(firsts, loads, stores, entry or None, self.held)
+        adds, entry = (rest[0], rest[1:]) if self.adds is not None else (None, rest)
+        return Forked(firsts, loads, stores, entry or None, self.held, adds)
 
     def tokens(self, length: int) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Each of a call's `length` tokens' part in its walk, `[B, S]` int each, the documents walked in
@@ -525,6 +531,14 @@ class ForkedChunks:
         owner = jnp.clip(jnp.searchsorted(firsts + sizes, jnp.arange(count), side="right"), 0,
                          row.shape[0] - 1)
         return cls(loads, stores, taken, row[owner])
+
+    def added(self, forked: Forked) -> jax.Array | None:
+        """Each chunk's added slot (`recurrence_chunk.Chunk.adds`), the document it takes up's, zero for none:
+        `[NC]`; None where the call adds none."""
+        if forked.adds is None:
+            return None
+        return jnp.where(self.taken >= 0, jnp.asarray(forked.adds, jnp.int32).reshape(-1)[
+            jnp.maximum(self.taken, 0)], 0)
 
     def entries(self, forked: Forked):
         """Each chunk's entry write (`recurrence_chunk.Chunk.entry_key`), the document it takes up's, zero for

@@ -732,9 +732,9 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
         # most one in size (`unit_keys`) make what the decayed row loses below normal in the exact term too.
         bands, decayed, following = carried
         keys, decays = shifted(e)
-        decayed, column = tuple(row * following for row in decayed), (lane == e) & (token % sub >= e)
-        return (tuple(band + jnp.where(column, jnp.sum(row * keys, axis=1)[:, None], 0.0)
-                      for band, row in zip(bands, decayed, strict=True)), decayed, decays)
+        pair, column = pair * following, (lane == e) & (token % sub >= e)
+        return (tuple(band + jnp.where(column, jnp.sum(row * keys * pair, axis=1)[:, None], 0.0)
+                      for band, row in zip(bands, rows, strict=True)), pair, decays)
 
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
     if unit_keys:

@@ -352,6 +352,12 @@ Every memory is entered, so no gradient's row is float64 zero, whose terms the g
 draw."""
 
 
+ADDS = ((0, 0, 1), (0, 0, 2))
+"""Each row's documents' added slots (`Chunk.adds`): the first row's last document adding its row's given
+memory to its parent's final, the second row's the first document's final to its predecessor's (row
+7662)."""
+
+
 def documents_draw(seed: int):
     """Two rows of three documents (`DOCUMENTS`) of a forked call (`FORKED`) over one given memory a row,
     each document's entry write (`recurrence_chunk.Chunk.entry_key`: two terms of a state's keys `[N]` and
@@ -368,15 +374,16 @@ def documents_draw(seed: int):
     return (x, b, c, a, given, *entry), seeded
 
 
-def documents_on_the_kernel(x, b, c, a, given, key, value, weight):
+def documents_on_the_kernel(x, b, c, a, given, key, value, weight, added: bool = False):
     """The kernel over a forked call, its documents walked in place, each taking its table slot's memory up
-    at its first token with its entry write added (`recurrence_chunk._tpu_documents`): the output and the
-    row's last memory."""
+    at its first token, where `added` its `ADDS` slot's too (`Chunk.adds`), with its entry write added
+    (`recurrence_chunk._tpu_documents`): the output and the row's last memory."""
     from dew.nn.kernels.chunked_launch import Forked
     from dew.nn.kernels.recurrence_chunk import _tpu_documents
 
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
-    forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, (key, value, weight), 2)
+    forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, (key, value, weight), 2,
+                    jnp.asarray(ADDS, jnp.int32) if added else None)
     length = x.shape[1]
     # The table's memories as a chunk's call holds them, `[N, P]`, the SSD's transposed.
     documents = _tpu_documents(jnp.swapaxes(given, -1, -2), forked, length, 64, jnp.float32, (16, 16))
@@ -388,10 +395,10 @@ def documents_on_the_kernel(x, b, c, a, given, key, value, weight):
     return y[:, :length], final
 
 
-def documents_one_by_one(x, b, c, a, given, key, value, weight):
+def documents_one_by_one(x, b, c, a, given, key, value, weight, added: bool = False):
     """Each document a sequence of its own, a step at a time (`stepwise_scan`), in the row's order from its
-    table slot's memory (a given one, or the final an earlier document stored) with its entry write
-    added."""
+    table slot's memory (a given one, or the final an earlier document stored), its `ADDS` slot's added
+    where `added`, with its entry write added."""
     rows, lasts = [], []
     ends = np.concatenate([np.asarray(DOCUMENTS), np.full((2, 1), x.shape[1])], axis=1)
     for row in range(x.shape[0]):
@@ -400,6 +407,8 @@ def documents_one_by_one(x, b, c, a, given, key, value, weight):
         for index, (first, end) in enumerate(zip(ends[row, :-1], ends[row, 1:], strict=True)):
             span = slice(int(first), int(end))
             entering = table[loads[index] - 1] if loads[index] else jnp.zeros_like(given[row, 0])
+            if added and ADDS[row][index]:
+                entering = entering + table[ADDS[row][index] - 1]
             entering = entering + weight[row, index][:, None, None] * jnp.einsum(
                 'rhp,rhn->hpn', value[row, index], key[row, index])
             y, final = stepwise_scan(x[row:row + 1, span], b[row:row + 1, span], c[row:row + 1, span],
@@ -412,6 +421,16 @@ def documents_one_by_one(x, b, c, a, given, key, value, weight):
     return jnp.stack(rows), jnp.stack(lasts)
 
 
+def _documents_arm(scan, added: bool = False):
+    """A forked call's arm (`documents_on_the_kernel`, `documents_one_by_one`), where `added` each document
+    adding its `ADDS` slot: its output, the row's last state and every operand's gradient by name."""
+    def run(operands, seeded):
+        output, *gradients = with_gradients(lambda *o: scan(*o, added=added))(*operands, seeded)
+        return dict(zip(("output", "final", "x", "B", "C", "A dt", "given", "entry keys", "entry values",
+                         "entry weights"), (*output, *gradients[:8]), strict=True))
+    return run
+
+
 def test_documents_entering_their_own_states_scan_as_each_alone():
     """The TPU kernel over a forked call (a request's questions over its shared prefix's state, a chain's
     each over its predecessor's, `Chunk.loads`): its documents walked in place, each taking its table slot's
@@ -419,16 +438,19 @@ def test_documents_entering_their_own_states_scan_as_each_alone():
     table keeping the finals its documents store; its output, the row's last state and every operand's
     gradient, the given states' and the entry writes' included, as each
     document scanned alone a step at a time in the row's order, from float64 (check 1)."""
-    def under(scan):
-        def run(operands, seeded):
-            output, *gradients = with_gradients(lambda *o: scan(*o))(*operands, seeded)
-            return dict(zip(("output", "final", "x", "B", "C", "A dt", "given", "entry keys", "entry values",
-                             "entry weights"), (*output, *gradients[:8]), strict=True))
-        return run
+    assert_as_exact(without_ynn(_documents_arm(documents_on_the_kernel)),
+                    jax.jit(_documents_arm(documents_one_by_one)), documents_draw,
+                    "the TPU kernel's forked call", seeds=24)
 
-    mine = without_ynn(under(documents_on_the_kernel))
-    theirs = jax.jit(under(documents_one_by_one))
-    assert_as_exact(mine, theirs, documents_draw, "the TPU kernel's forked call", seeds=24)
+
+def test_documents_adding_a_slot_scan_as_each_alone():
+    """The TPU kernel over a forked call whose documents each add a second table slot to the memory they take
+    up (`Chunk.adds`, `ADDS`: a given memory, and a final stored two documents before): its output, the
+    row's last state and every operand's gradient, the given states' included, as each document scanned
+    alone from the two memories summed, from float64 (check 1)."""
+    assert_as_exact(without_ynn(_documents_arm(documents_on_the_kernel, added=True)),
+                    jax.jit(_documents_arm(documents_one_by_one, added=True)), documents_draw,
+                    "the TPU kernel's forked call adding a slot", seeds=24)
 
 
 @pytest.mark.parametrize(("key", "value", "weight", "final", "cancelled"),

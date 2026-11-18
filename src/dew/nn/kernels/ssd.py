@@ -238,18 +238,25 @@ def _windowed(x, b, c, a, origin, through):
     return (x * held, b * held, c * held, jnp.where((steps >= origin) & (steps <= through), a, 0.0)), inside
 
 
-def _opened(given_ref, table, entry, load, document, zero):
-    """The memory a document opening at a token enters: its one-based table slot's (`given_ref`'s first,
-    then the stored `table`'s; zero at slot zero), its entry write added where the call gives one (`entry`:
-    each document's keys `[R, N]`, values `[P, R]` and weight `[1, 1]`, a term's three factors at a time,
-    `_product`)."""
+def _slot(given_ref, table, at, zero):
+    """The memory at one-based table slot `at`: `given_ref`'s first, then the stored `table`'s; zero at slot
+    zero."""
     count = given_ref.shape[0]
     taken = zero
     for slot in range(count):
-        taken = jnp.where(load == slot + 1, given_ref[slot], taken)
+        taken = jnp.where(at == slot + 1, given_ref[slot], taken)
     if table is not None:
         for slot in range(table.shape[0]):
-            taken = jnp.where(load == count + slot + 1, table[slot], taken)
+            taken = jnp.where(at == count + slot + 1, table[slot], taken)
+    return taken
+
+
+def _opened(given_ref, table, entry, load, add, document, zero):
+    """The memory a document opening at a token enters: its one-based table slot's (`_slot`) and the slot
+    it adds (`add`, `Chunk.adds`: zero, none), its entry write added where the call gives one (`entry`: each
+    document's keys `[R, N]`, values `[P, R]` and weight `[1, 1]`, a term's three factors at a time,
+    `precision.twice_scaled`)."""
+    taken = _slot(given_ref, table, load, zero) + _slot(given_ref, table, add, zero)
     if entry is None:
         return taken
     key, value, weight = (ref[document] for ref in entry)
@@ -258,8 +265,8 @@ def _opened(given_ref, table, entry, load, document, zero):
     return taken + aligned_sum([(weight, value[:, r:r + 1], key[r:r + 1, :]) for r in range(key.shape[0])])
 
 
-def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, a_ref, state_ref, given_ref,
-                        *refs, held: int, entered: bool, keep: bool):
+def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_ref, c_ref, a_ref, state_ref,
+                        given_ref, *refs, held: int, entered: bool, keep: bool):
     """A forked call's chunk (`_forked_forward`), its documents walked in place: the chunk's segments in turn,
     a segment a document's tokens within it, each from the memory entering it, the chunk's own where its
     document continued from the chunk before, else its document's, taken up from its table at its first token
@@ -289,8 +296,8 @@ def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, a
         after = _segment_after(loads_ref, origin, count)
         through = after - 1
         load = loads_ref[0, origin]
-        memory = jnp.where(load < 0, carried, _opened(given_ref, table, entry, load, begun_ref[0, origin],
-                                                      jnp.zeros_like(carried)))
+        memory = jnp.where(load < 0, carried, _opened(given_ref, table, entry, load, adds_ref[0, origin],
+                                                      begun_ref[0, origin], jnp.zeros_like(carried)))
         operands, inside = _windowed(x, b, c, a, origin, through)
         out, left = _chunk_forward(*operands, memory)
         if table is not None:
@@ -305,8 +312,8 @@ def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, a
     final_ref[...] = leaving
 
 
-def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, a_ref, entered_ref, dy_ref,
-                         dfinal_ref, given_ref, *refs, held: int, entered: bool):
+def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_ref, c_ref, a_ref, entered_ref,
+                         dy_ref, dfinal_ref, given_ref, *refs, held: int, entered: bool):
     """`_tpu_forked_forward` read backwards, the chunks in reverse and each chunk's segments last first, the
     table the forward's last (`table`: each slot stored once, before every document that loads it): a
     segment's gradients from its window (`_chunk_backward`), the state it left's its slot's gradient where it
@@ -345,9 +352,9 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, 
         k = segments - 1 - i
         origin = origin_of(k)
         through = _segment_after(loads_ref, origin, count) - 1
-        load = loads_ref[0, origin]
+        load, add = loads_ref[0, origin], adds_ref[0, origin]
         document = begun_ref[0, origin]
-        memory = jnp.where(load < 0, start, _opened(given_ref, table, entry, load, document,
+        memory = jnp.where(load < 0, start, _opened(given_ref, table, entry, load, add, document,
                                                     jnp.zeros_like(start)))
         dleft = jnp.where(through == count - 1, dnext, 0.0)
         if dtable is not None:
@@ -361,11 +368,13 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, x_ref, b_ref, c_ref, 
         within = (steps >= origin) & (steps <= through)
         wx, wb, wc, wa, dmemory = _chunk_backward(*operands, memory, jnp.where(inside, dy, 0.0), dleft)
         count_given = given_ref.shape[0]
-        for slot in range(count_given):
-            dgiven[slot] = dgiven[slot] + jnp.where(load == slot + 1, dmemory, 0.0)
-        if dtable is not None:
-            for slot in range(held):
-                dtable[slot] = dtable[slot] + jnp.where(load == count_given + slot + 1, dmemory, 0.0)
+        # The slot a document loads and the one it adds (zero, none) each take its memory's gradient.
+        for at in (load, add):
+            for slot in range(count_given):
+                dgiven[slot] = dgiven[slot] + jnp.where(at == slot + 1, dmemory, 0.0)
+            if dtable is not None:
+                for slot in range(held):
+                    dtable[slot] = dtable[slot] + jnp.where(at == count_given + slot + 1, dmemory, 0.0)
         if entry is not None and dentry is not None:
             # Formed only where the segment opens its document: a continuation's memory gradient is the
             # chunk's, against which a term's products left fp32's range where the document's are in it,
@@ -528,7 +537,7 @@ def _forward(x, b, c, a, state, chunk_size: int, platform: str, *, keep_entered:
     if forked is not None:
         tokens, given, entry = _forked_blocks(forked, heads, chunk_size)
         operands = (*tokens, *operands, given, *entry)
-        in_specs = ((_tokens_spec(chunks, chunk_size),) * 3 + in_specs
+        in_specs = ((_tokens_spec(chunks, chunk_size),) * 4 + in_specs
                     + tuple(_whole(part.shape[2:]) for part in (given, *entry)))
         if held:
             out_shape.append(jax.ShapeDtypeStruct((batch, heads, held, head_dim, state_size), jnp.float32))
@@ -565,7 +574,7 @@ def _backward(x, b, c, a, states, dy, dfinal, chunk_size: int, platform: str, fo
         tokens, given, entry = _forked_blocks(forked, heads, chunk_size)
         stored = () if table is None else (table,)
         operands = (*tokens, *operands, given, *stored, *entry)
-        in_specs = ((_tokens_spec(chunks, chunk_size, reverse=True),) * 3 + in_specs
+        in_specs = ((_tokens_spec(chunks, chunk_size, reverse=True),) * 4 + in_specs
                     + tuple(_whole(part.shape[2:]) for part in (given, *stored, *entry)))
         for part in (given, *stored, *entry):
             out_shape.append(jax.ShapeDtypeStruct(part.shape, jnp.float32))
