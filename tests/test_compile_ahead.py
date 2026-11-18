@@ -2094,3 +2094,21 @@ def test_cudnn_attentions_gates_read_the_capability_of_the_gpus_a_program_is_tra
         assert cudnn.check_compute_capability("9.0") == (capability >= (9, 0))
         assert cudnn.is_cuda_compute_capability_equal("10.0") == (capability == (10, 0))
     assert not cudnn.check_compute_capability("8.0")
+
+
+@COMPILES_ON_CPU
+def test_a_program_compiled_for_a_compile_only_gpu_is_refused_by_the_keeper_not_crashed_on():
+    """A program a process compiles at Dew's compile point for a compile-only GPU (`gpus`), as a GPU cell's
+    prepare does on its host's CPU, is no program of the process's default backend: the keeper
+    (`keeping`) refuses it by name, its executable never loaded, where reading its loaded devices raised
+    AttributeError and failed the A100 tier's recurrence cells (rows 7323, 7866, 7867)."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.options import owned_program
+    from dew.training.ahead import keeping
+
+    placed = jax.ShapeDtypeStruct((3,), jnp.float32, sharding=NamedSharding(
+        Mesh(np.asarray(gpus("sm80")), ("data",)), PartitionSpec()))
+    with keeping() as programs:
+        owned_program(lambda values: values * 2).executable(placed)
+    assert programs.kept == {} and len(programs.refused) == 1
