@@ -2314,7 +2314,7 @@ def lazy_margin(spec: Forward, weights, bound: float = 1.0) -> float | None:
     binades = lazy_binades(spec.natural, compensated=spec.compensated, weights=weights, bound=bound)
     if binades is None:
         return None
-    return float(binades * LN2 / spec.naturalized(1.0))
+    return float(binades * LN2 / spec.naturalized(jnp.float32(1.0)))
 
 
 def lazy_anchor(margin: float | None) -> Callable | None:
