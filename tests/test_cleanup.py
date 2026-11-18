@@ -79,14 +79,14 @@ def test_a_group_whose_leader_was_reaped_is_signalled_only_where_its_owner_start
     with started(leader_with_child("")) as unowned:
         stranded = child_of(unowned)
         unowned.wait()
-        assert stop(unowned) == []
+        assert stop([unowned]) == []
         assert running(stranded)
         os.kill(stranded, signal.SIGKILL)
     owned = start([sys.executable, "-c", leader_with_child("")], stdout=subprocess.PIPE, text=True)
     try:
         held = child_of(owned)
         owned.wait()
-        assert stop(owned) == []
+        assert stop([owned]) == []
         assert not running(held)
     finally:
         owned.stdout.close()
@@ -108,7 +108,7 @@ def test_a_groups_lifeline_ends_when_the_last_process_its_leader_left_ends():
         while lifelines() > before and time.monotonic() < deadline:
             time.sleep(0.05)
         assert lifelines() == before
-        assert stop(owned) == []
+        assert stop([owned]) == []
     finally:
         owned.stdout.close()
 
@@ -259,7 +259,7 @@ def test_a_start_interrupted_before_its_command_runs_leaves_nothing_behind(tmp_p
             except Interrupted:
                 interrupted += 1
             else:
-                stop(started)
+                stop([started])
                 continue
             finally:
                 armed["on"] = False
@@ -307,7 +307,7 @@ def test_a_start_interrupted_as_a_descriptor_opens_leaves_it_closed(opened, nth)
         threading.setprofile(profile)
         with pytest.raises(Interrupted):
             try:
-                stop(start(["sleep", "600"]))
+                stop([start(["sleep", "600"])])
             finally:
                 sys.setprofile(None)
                 threading.setprofile(None)
