@@ -552,11 +552,12 @@ class FitRun:
 
         return read
 
-    def opened(self, source: Iterator[Batch], examples: int | None) -> None:
-        """Take where the training stream `source` says it ends (`stream_ends`)
-        and whether the run reads it as a pool on the examples clock (`pooled`, bounded to `examples`)."""
+    def opened(self, source: Iterator[Batch], examples: int | None, *, counting: bool = False) -> None:
+        """Take where the training stream `source` says it ends (`stream_ends`) and whether the run reads it
+        as a pool that counts the examples it consumes (`pooled`): on the examples clock (bounded to
+        `examples`) or `counting` its passes."""
         self.ends = stream_ends(source)
-        self.pooled = pooled(examples)
+        self.pooled = pooled(examples, counting=counting)
 
     def agrees(self, *, first: bool) -> bool:
         """Whether a read of the training stream is agreed over the pool (`agreed_next`): its `first`,
@@ -692,20 +693,27 @@ def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool)
             "or leave eval_every unset")
 
 
-def consumption_counted(batch: Batch, *, clocked: bool, marks_rows: bool = True) -> Batch:
+def consumption_counted(batch: Batch, *, clocked: bool, counting: bool = False,
+                        marks_rows: bool = True) -> Batch:
     """A clocked run's `batch` with the examples it consumes counted on the host (`ConsumedCount`) as it is
     prepared; one a step after the bound rebuilt without its count is refused, as the run would stay at
     its start, and each marks its real rows (`VALID_ROWS`) where it `marks_rows`, as a step's batch does;
-    a rollout's read keeps its rows as read. A run on another clock, one bounded in examples whose plan
-    counts its steps ahead, keeps no count: none rides to its step."""
-    if not clocked:
+    a rollout's read keeps its rows as read. A run `counting` its passes (`dew.data.compile`'s
+    `count_passes`) counts them on the host alone, its batch's column dropped, so its step reads the batch a
+    run counting none would. A run on another clock, one bounded in examples whose plan counts its steps
+    ahead, keeps no count: none rides to its step."""
+    if not clocked and not counting:
         return batch if EXAMPLES_CONSUMED not in batch else {
             name: value for name, value in batch.items() if name != EXAMPLES_CONSUMED}
     if EXAMPLES_CONSUMED not in batch:
         raise ValueError("a step after the examples bound dropped the batch's count of the examples it "
                          f"consumes ({EXAMPLES_CONSUMED!r}), which this run's progress reads: a native Grain "
                          "step that rebuilds its records keeps no count")
-    counted_batch = {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
+    count = ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))
+    if not clocked:
+        return {**{name: value for name, value in batch.items() if name != EXAMPLES_CONSUMED},
+                CONSUMED_COUNT: count}
+    counted_batch = {**batch, CONSUMED_COUNT: count}
     if VALID_ROWS not in batch and marks_rows:
         # A clocked read ends at its bound, in a short batch filled and marked: each of its batches marks
         # its real rows, so every one is the same tree, the run's one program.
@@ -739,10 +747,11 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     return batch
 
 
-def pooled(examples: int | None) -> bool:
-    """Whether a run on the examples clock (bounded to `examples`) is a pool's, whose shares end apart
-    (`FitRun.pooled`)."""
-    return examples is not None and jax.process_count() > 1
+def pooled(examples: int | None, *, counting: bool = False) -> bool:
+    """Whether a run that counts the examples it consumes, on the examples clock (bounded to `examples`,
+    its shares ending apart) or `counting` its passes (`dew.data.compile`'s `count_passes`), is a pool's,
+    whose every process's count is the pool's (`FitRun.pooled`, `pooled_read`)."""
+    return (examples is not None or counting) and jax.process_count() > 1
 
 
 def pooled_read(run: FitRun, stream: Iterator[Batch], *, phase: str = "training read",
@@ -751,8 +760,12 @@ def pooled_read(run: FitRun, stream: Iterator[Batch], *, phase: str = "training 
     its stream has run out and another share's reads on (`emptied`), from the run's first read on; None
     once every share's has run out. Each read counts the examples the whole pool's batches consume, each
     share's once, by its first reader (`DataPartition.reader`), whose readers hold the same rows, so every
-    process's clock is the pool's; one round of the coordination service a read (`agreed_reads`). A
-    `peek` reads the stream's first batch on the host, which counts nothing: the read that takes it does.
+    process's clock is the pool's; one round of the coordination service a read (`agreed_reads`), taken
+    here, on the loop's thread, which orders every round (evaluation's, checkpoints'), never on the prefetch
+    worker, which reads and counts its own share alone (`consumption_counted`), so a rank whose prefetch
+    runs ahead and one whose runs behind take their rounds in one order; the round runs while the step
+    before runs on the devices, its batch already read. A `peek` reads the stream's first batch on the
+    host, which counts nothing: the read that takes it does.
     An emptied batch holds as many rows as the others' batches of the step, a ramp's stage's included."""
     partition, empty = run.partition, run.emptied
     assert partition is not None and empty is not None

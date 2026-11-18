@@ -283,6 +283,9 @@ class Trainer(Generic[Loss, Effects]):
 
     _examples: int | None = None  # the bound of a run on the examples clock (`TrainState.consumed`)
 
+    _counting = False
+    """Whether its read counts its passes on the host for a cadence of them (`reading`), set as it reads."""
+
     def __init__(
         self,
         objective: Objective[Loss, Effects],
@@ -520,6 +523,10 @@ class Trainer(Generic[Loss, Effects]):
             self._shape, device=loader.device, prefetch=prefetch, rows=loader.batches or (loader.batch,),
             examples=clocked(examples, steps, bound_ends=loader.bound_ends,
                              custom_progress=self.step is not None and progress))
+        # A read that counts its passes for a cadence of them (`Loader.pass_examples` with no epochs bound,
+        # `dew.data.compile`'s `count_passes`), counted on the host alone: no part of the step's program.
+        self._counting = (self._shape.examples is None and loader.epochs is None
+                          and loader.pass_examples is not None)
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
@@ -1811,10 +1818,11 @@ class Trainer(Generic[Loss, Effects]):
             # corpus, and none reads a record before all agree it is one.
             agreed_same("training data", lambda: (
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
-        run.opened(source, self._shape.examples)
+        run.opened(source, self._shape.examples, counting=self._counting)
         run.marked = marked(run.partition, self._counted_batch)
         counted = run.marked if self.rollout is None else functools.partial(
-            consumption_counted, clocked=self._shape.examples is not None, marks_rows=False)
+            consumption_counted, clocked=self._shape.examples is not None, counting=self._counting,
+            marks_rows=False)
         inputs = self.objective.inputs
         # What the stream states it hands each step, a rollout's batches aside, which make their own rows.
         produced = None if self.rollout is not None else Produced.of(plan.dataset, run.partition)
@@ -2238,7 +2246,7 @@ class Trainer(Generic[Loss, Effects]):
         A count asked of the objective directly stays strict. A phased run's batch is counted at its
         phase's model (`phase_passes`).
         """
-        batch = consumption_counted(batch, clocked=self._shape.examples is not None)
+        batch = consumption_counted(batch, clocked=self._shape.examples is not None, counting=self._counting)
         if self._refusal is None:
             # The model the batch's step runs: its phase's pass count (`phase_passes`), read off the batch,
             # since this thread prepares it ahead of the step that takes the count.

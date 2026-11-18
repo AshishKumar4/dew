@@ -142,6 +142,7 @@ from dew.data.pipeline import (
     consumed_by,
     drawn_of,
     examples_bound,
+    examples_limit,
     joined,
     member_of,
     member_record,
@@ -195,8 +196,7 @@ def _streamed_take(pipeline: Pipeline, read: str) -> bool:
         return False
     if any(_streamed_take(child, read) for child in children(pipeline)):
         return True
-    marked = examples_bound(pipeline.stages)
-    bound = None if marked is None else marked - 1
+    bound = examples_limit(pipeline.stages)
     batched = _until(pipeline.stages, (BatchStage,))
     return any(isinstance(stage, Limit) and at != bound for at, stage in enumerate(pipeline.stages[:batched]))
 
@@ -1626,8 +1626,7 @@ class _Build:
         one_reader = partition.count == 1 and _workers(pipeline, self.loading) < 2
         if self.global_order or not self.training or one_reader:
             return None
-        marked = examples_bound(pipeline.stages)
-        return None if marked is None else marked - 1
+        return examples_limit(pipeline.stages)
 
     def dealt_examples(self, pipeline: Pipeline, partition: DataPartition, consumed: int) -> int | None:
         """The bound's examples (`bound_at`) where the root deals them to the shares as it deals its source:
@@ -1724,7 +1723,7 @@ class _Build:
             if index < ran:
                 continue
             streamed = not isinstance(rows, pygrain.MapDataset)
-            taken = isinstance(stage, Limit) and index + 1 != examples_bound(pipeline.stages)
+            taken = isinstance(stage, Limit) and index != examples_limit(pipeline.stages)
             if index < carried and (isinstance(stage, Native) or taken) and streamed:
                 # What a Grain step drops from a stream leaves no marker, and a take of a stream counts
                 # what every worker reads (`_streamed_take`): the workers hand on before either.
