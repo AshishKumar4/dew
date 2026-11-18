@@ -401,6 +401,7 @@ dew.config.DecoderRunConfig
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
   loop_implicit: bool = False
+  loop_theta_per_pass: bool = False
   loop_exit_gate: bool = False
   loop_exit_threshold: float | None = None
 dew.config.MetricConfig
@@ -544,6 +545,7 @@ dew.config.lm.LMRunConfig
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
   loop_implicit: bool = False
+  loop_theta_per_pass: bool = False
   loop_exit_gate: bool = False
   loop_exit_threshold: float | None = None
   tokenizer: str = 'byte'
@@ -665,6 +667,7 @@ dew.decision.config.DecisionRunConfig
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
   loop_implicit: bool = False
+  loop_theta_per_pass: bool = False
   loop_exit_gate: bool = False
   loop_exit_threshold: float | None = None
   pretrained: str = 'convaiinnovations/laya'
