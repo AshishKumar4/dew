@@ -159,10 +159,9 @@ def test_the_gemm_kernels_run_on_this_gpu():
           for depth in (128, 512)),
         Cell("the template takes a gpt-oss width as exactly as XLA",
              grouped_gemm.the_template_takes_a_gpt_oss_width_as_exactly_as_xla, fault=PARTIAL_TILE),
-        *(Cell(f"the template runs widths no tile divides: {depth}x{width}",
-               functools.partial(gemm_widths.unaligned_widths_run_on_the_template, depth, width,
-                                 interpret=False), fault=PARTIAL_TILE)
-          for depth, width in gemm_widths.WIDTHS),
+        Cell("the template runs widths no tile divides",
+             functools.partial(gemm_widths.unaligned_widths_run_on_the_template, gemm_widths.WIDTHS,
+                               interpret=False), fault=PARTIAL_TILE),
         *(Cell(f"a pair's cooperative tile holds check 1 with its hooks: {case}",
                functools.partial(gemm_template.a_cooperative_tile_holds_check_1_with_its_hooks, case,
                                  gemm_template.PAIRED), "sm90", fault=CLUSTER)
