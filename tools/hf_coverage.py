@@ -325,7 +325,7 @@ def table(results: Sequence[Load]) -> str:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("census", "classify", "loads"))
     parser.add_argument("out", type=Path)
     parser.add_argument("models", type=int, nargs="?", default=3000, help="census: models a tag and order")

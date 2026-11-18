@@ -153,7 +153,7 @@ def prompts(vocab_limit: int, length: int, seed: int) -> np.ndarray:
 def main() -> int:
     from reference_error import as_given, assert_as_exact
 
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--steps", type=int, default=1536)
     parser.add_argument("--prompt", type=int, default=64)
