@@ -21,12 +21,17 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation
 from dew.nn.kv_cache import (
     BOUND,
+    CURSOR,
+    DOCUMENTS,
+    TABLE,
     TPU_PAGED_SUPPORTS,
     KVCache,
     KVSpec,
     KVStore,
     _gather_pages,
     _gathered_attention,
+    default_page_table,
+    gather_cache_rows,
     gpu_paged,
     hadamard,
     overflowed,
@@ -724,3 +729,43 @@ def test_a_vector_below_the_formats_scale_quantizes_finitely(quantized):
     np.testing.assert_array_equal(np.asarray(scale)[:2], [1.0, 1.0])
     np.testing.assert_array_equal(restored[:2], 0.0)
     assert np.asarray(scale)[2] != 1.0
+
+
+def test_a_paged_stores_regrouped_rows_share_their_parents_written_pages_and_write_their_own():
+    """A paged store regrouped by `rows` (`gather_cache_rows`: a beam's branches, a parent's rows repeated,
+    one dropped) reads, for each new row, its parent's tokens below its cursor; the pages its parent
+    wrote whole are shared, the same pages in every child's table; the page its next token lands in is its
+    own, its parent's for the first child (no copy) and a free page holding the parent's tokens for the
+    rest, so a token each row then writes at its cursor reaches that row alone (row 8034)."""
+    size, columns, pages = 2, 4, 10
+    cursor = jnp.asarray([5, 3], jnp.int32)
+    held = jnp.arange(pages * size, dtype=jnp.float32).reshape(1, pages, size, 1) + 100
+    store = {TABLE: default_page_table(2, columns, pages, 1), CURSOR: cursor, "cached_key": held,
+             "cached_value": -held, BOUND: jnp.ones((1, pages, size)), DOCUMENTS: jnp.ones((1, pages, size),
+                                                                                         jnp.int32)}
+    rows = jnp.asarray([0, 0, 1, 0], jnp.int32)
+    regrouped = gather_cache_rows({"layer": store}, rows)["layer"]
+    table, keys = np.asarray(regrouped[TABLE]), np.asarray(regrouped["cached_key"])
+
+    def slots(table, pool, row, count):
+        return [float(pool[0, table[row, slot // size], slot % size, 0]) for slot in range(count)]
+
+    old = np.asarray(store[TABLE])
+    for row, parent in enumerate(np.asarray(rows)):
+        count = int(cursor[parent])
+        assert slots(table, keys, row, count) == slots(old, np.asarray(held), parent, count), row
+        np.testing.assert_array_equal(table[row, :count // size], old[parent, :count // size])
+    np.testing.assert_array_equal(np.asarray(regrouped[CURSOR]), np.asarray(cursor)[np.asarray(rows)])
+    tails = [table[row, int(cursor[parent]) // size] for row, parent in enumerate(np.asarray(rows))]
+    assert tails[0] == old[0, 2] and tails[2] == old[1, 1], "a first child keeps its parent's page"
+    written = {int(page) for row, parent in enumerate(np.asarray(rows))
+               for page in table[row, :int(cursor[parent]) // size]}
+    assert len(set(tails)) == len(tails) and not written & set(tails)
+    np.testing.assert_array_equal(np.asarray(regrouped["cached_value"]), -keys)
+
+    for row, parent in enumerate(np.asarray(rows)):
+        slot = int(cursor[parent])
+        keys[0, table[row, slot // size], slot % size, 0] = -row - 1
+    for row, parent in enumerate(np.asarray(rows)):
+        count = int(cursor[parent])
+        assert slots(table, keys, row, count + 1) == [*slots(old, np.asarray(held), parent, count), -row - 1]
