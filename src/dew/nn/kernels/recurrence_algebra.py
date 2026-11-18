@@ -699,12 +699,15 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     diagonal, chunk_kda_fwd_intra_token_parallel). `rows` the products' rows `[C, BK]` fp32, each against the
     block's keys; `shifted(e)` its keys and each token's own decay `(keys, decays)` (`token_decays`), each row
     `i` holding token `i - e`'s, any finite value where `i - e` leaves its sub-chunk (masked). A pair's decay
-    is the product of its tokens' own, formed across the offsets as the token recurrence forms it (`pair_e =
-    pair_(e - 1) a_(i - e + 1)`, at most `sub - 1` roundings, every factor at most one), each term the row
-    times the key, then times the decay, in a rolled loop over the offsets, each offset's keys and decays read
-    once for every product; a row before its offset is selected out of its band's column once its terms are
-    summed, not term by term (its sum any value, a select's, never a product's: selected on every term, the
-    mask was a quarter of a B200's own pairs' issues, an emulated B200 at b6a888850b2). Each term's decay
+    is the product of its tokens' own, formed across the offsets as the token recurrence forms it, folded into
+    each product's row (`r_e = r_(e - 1) a_(i - e + 1)`, at most `sub - 1` roundings, every factor at most
+    one), each term the decayed row times the key, in a rolled loop over the offsets, each offset's keys and
+    decays read once for every product: a multiply an element and a product's a fused multiply-add, where
+    the decay's own product and each term's two multiplies were an emulated B200's own-pair issues (Kimi
+    Linear's recurrence_intra_own, 54% of its issues in this sum, M-JS-120; row 7299); a row before its
+    offset is selected out of its band's column once its terms are summed, not term by term (its sum any
+    value, a select's, never a product's: selected on every term, the mask was a quarter of a B200's own
+    pairs' issues, an emulated B200 at b6a888850b2). Each term's decay
     from the separated prefix instead (`decay`: two differences, a
     clip, a power of two and an exp2), a B200's Kimi Linear training spent 0.96 ms of an emulated 2.86 in this
     form and its transpose, each issue-bound (an emulated B200 at 8aab1729e65). Summed over a chunk's key
@@ -715,14 +718,14 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     token = jax.lax.broadcasted_iota(jnp.int32, lane.shape, 0)
 
     def offset(e, carried):
-        bands, pair, following = carried
+        bands, decayed, following = carried
         keys, decays = shifted(e)
-        pair, column = pair * following, (lane == e) & (token % sub >= e)
-        return (tuple(band + jnp.where(column, jnp.sum(row * keys * pair, axis=1)[:, None], 0.0)
-                      for band, row in zip(bands, rows, strict=True)), pair, decays)
+        decayed, column = tuple(row * following for row in decayed), (lane == e) & (token % sub >= e)
+        return (tuple(band + jnp.where(column, jnp.sum(row * keys, axis=1)[:, None], 0.0)
+                      for band, row in zip(bands, decayed, strict=True)), decayed, decays)
 
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
-    return list(jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), one, one))[0])
+    return list(jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), tuple(rows), one))[0])
 
 
 def token_decays(prefix: tuple, earlier: tuple, *, sub: int = SUB) -> jax.Array:
