@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from fla_sites import LEAVES, the_template_is_as_exact_as_fla
+from fla_sites import FLOOR_GATES, LEAVES, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU
 from map_judge import sharded
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
@@ -334,6 +334,18 @@ def compiled_gradient(hooks, name: str) -> list[dict]:
 
 
 @COMPILES_ON_CPU
+@pytest.mark.check1_shards(seeds=64, per_task=8)
+def test_kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla_interpreted():
+    """Kimi delta attention's 16-bit gradient through the template, interpreted, under decays at its floor and
+    write gates down to 2^-60 (fla_sites' `FLOOR_GATES`): its output, final memory and every operand's
+    gradient on par with recorded fla-core's from float64 (check 1), its own pairs folded against its unit
+    keys (`mainloop.Call.unit_keys`). The template held 47 to 75 times the exact fp32 recurrence's error
+    there, as on plain draws, which only fla's judges (rows 7906, 7299)."""
+    mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
+    the_template_is_as_exact_as_fla(mosaic, FLOOR_GATES, LEAVES,
+                                    'the template, Kimi delta attention under tiny gates at the floor')
+
+
 def test_a_gradients_kernels_are_each_certified_as_its_program_lowers():
     """The gated delta net's bf16 gradient compiled for a compile-only H100 as a start compiles it
     (`compiled_gradient`): every Mosaic GPU kernel its program runs, its training forward's and its fast
