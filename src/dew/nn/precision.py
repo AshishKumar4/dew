@@ -1304,7 +1304,12 @@ def two_sum(left, right):
     one value (`uncontracted`): a compiler that fused the multiply making an operand into the sum (an FMA,
     XLA's CPU and GPU contract one) would add its exact product where the steps after read its rounded
     one, counting that rounding twice."""
-    left, right = uncontracted(left, right)
+    return _two_sum(*uncontracted(left, right))
+
+
+def _two_sum(left, right):
+    """`two_sum`'s arithmetic over operands no multiply makes in the same fusion: a compensated pair's
+    halves, made by additions alone, and values read as one value each (`uncontracted`)."""
     total = left + right
     part = total - left
     return total, (left - (total - part)) + (right - part)
@@ -1703,8 +1708,19 @@ def compensated_add(left, right):
     XLA reassociates no float arithmetic unless fast math is on; with it,
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
-    total, dropped = two_sum(left_hi, right_hi)
-    return two_sum(total, dropped + left_lo + right_lo)
+    return _renormalized((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
+
+
+@_protected
+def _renormalized(left, right):
+    """`compensated_add`'s arithmetic over pairs whose his no multiply makes in the same fusion (each read as
+    one value, `uncontracted`, or a compensated reduction's accumulator, made by additions alone): the his'
+    TwoSum, then the pair's own, whose operands are additions' (`_two_sum`, no barrier of its own: one in a
+    reduction's computation splits the fusions around the program, row 7953). A lo is read once, so a
+    multiply contracted into its addition reads it once too."""
+    (left_hi, left_lo), (right_hi, right_lo) = left, right
+    total, dropped = _two_sum(left_hi, right_hi)
+    return _two_sum(total, dropped + left_lo + right_lo)
 
 
 @_protected
@@ -1736,9 +1752,10 @@ def _compensated(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     """The sum of `values` over `axes` its compensated pair rounds once, its tangent the plain sum's: a
     protected span (`_compensated_sum`, `dew.nn.derivatives.declared_tangent`), whose compensation the
     algebra pass must not cancel."""
-    wide = values.astype(at_least_fp32(values.dtype))
+    # Each value read as one (`uncontracted`) where it is made: the reduction's pairs are its additions'.
+    (wide,) = uncontracted(values.astype(at_least_fp32(values.dtype)))
     zero = jnp.zeros((), wide.dtype)
-    hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
+    hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), _renormalized, axes)
     return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
 
 
