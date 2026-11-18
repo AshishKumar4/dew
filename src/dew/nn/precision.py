@@ -131,6 +131,7 @@ __all__ = [
     "spread",
     "sqrt_or_zero",
     "stochastic_bf16",
+    "summed_once",
     "twice_scaled",
     "two_product",
     "two_sum",
@@ -1316,7 +1317,8 @@ def uncontracted(*values):
     reading the exact product at one place and the rounded one at another (a two_product's product added in a
     compensated sum, its residual then counted twice). An optimization barrier, which no fusion crosses, on
     the value where it is made, so every reader sees the one rounded value (`two_sum`'s operands,
-    `two_product`'s product).
+    `two_product`'s product); a caller whose plain float32 arithmetic leaned on the contractions a barrier
+    splits around it takes its sum compensated (`summed_once`, row 7979).
 
     In a Pallas TPU kernel's body (`launches.interpreting` False, a launch compiled for a TPU,
     `generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier (post108 to
@@ -1820,6 +1822,41 @@ def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
 
 _compensated_sum = contracted("test_the_precision_seams_hold_every_order")(
     declared_tangent(Protected(), _compensated, _compensated_sum_jvp, nondiff_argnums=(1,)))
+
+
+def summed_once(values: Sequence[jax.Array], products: Sequence[tuple[jax.Array, jax.Array]] = ()
+                ) -> jax.Array:
+    """The sum of `values` and of `products` (each a `(left, right)` pair, broadcasting as `*` does), every
+    product's rounding (`two_product`) and every addition's (`two_sum`) kept and added back once at the end:
+    the sum as one rounding of its twice-precise value leaves it (Ogita, Rump and Oishi's Dot2), whatever a
+    compiler fuses or keeps apart, so no contraction of a multiply into an add (an FMA) it takes or leaves
+    rounds it more (row 7953: a barrier in a step's arithmetic split its fusion and lost the contractions its
+    plain float32 sum leaned on, row 7979). Its tangent is the plain sum's."""
+    return _summed_once(tuple(values), tuple(products))
+
+
+def _summed_once_value(values, products):
+    total = values[0]
+    carried = jnp.zeros_like(total)
+    for left, right in products:
+        product, lost = two_product(left, right, bit_split=True)
+        total, dropped = two_sum(total, product)
+        carried = carried + (lost + dropped)
+    for value in values[1:]:
+        total, dropped = two_sum(total, value)
+        carried = carried + dropped
+    return total + carried
+
+
+def _summed_once_tangent(primals, tangents):
+    (values, products), (value_tangents, product_tangents) = primals, tangents
+    terms = [*value_tangents, *(left_tangent * right + left * right_tangent for (left, right), (
+        left_tangent, right_tangent) in zip(products, product_tangents, strict=True))]
+    return _summed_once_value(values, products), sum(terms[1:], terms[0])
+
+
+_summed_once = contracted("test_the_precision_seams_hold_every_order")(
+    declared_tangent(Protected(), _summed_once_value, _summed_once_tangent))
 
 def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype (`rounded_operand`'s value).
