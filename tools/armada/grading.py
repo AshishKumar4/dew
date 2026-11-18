@@ -51,15 +51,6 @@ def of(case: ET.Element, name: str) -> bool:
     return holds(name, node_of(case))
 
 
-def running_row(tests: list[str], running: str | None, reported: set[str]) -> str | None:
-    """Of a task's rows `tests`, the one its time was spent in at its deadline, given the file `running`
-    then (its executed log's last visit, which names files): the file's own row, or of the test nodes of it
-    the task ran, the last that reported no test (the one stopped), else its last; `running` itself where
-    no row is of it."""
-    of_it = [name for name in tests if owning(name) == running]
-    return next((name for name in reversed(of_it) if name not in reported), of_it[-1] if of_it else running)
-
-
 def red_as(kind: str, nodes: list[str]) -> dict:
     """What turned a red row red, for grading it again (`land.sh`, `suspect.sh`): `kind` "nodes", its
     `failed` tests alone, by node id; "collect", its file's collection; "deadline", its task's; or
@@ -107,7 +98,8 @@ def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: M
                f"{node.get('message')}" for case in own for node in case.iter("skipped")
                if "could not import" in f"{node.get('message')} {node.text}"]
     deselected = bool(counted) and counted["collected"] == counted["deselected"]
-    spent = expired is not None and (name == running or running is None)
+    # The executed log's visits name files: a test node's row is spent where its file's test was running.
+    spent = expired is not None and (owning(name) == running or running is None)
     unreached = expired is not None and not spent and not own and not deselected
     unstarted = expired is None and not started and not reported and returncode != 0
     exited = [] if (expired is not None and not spent) or unstarted else \

@@ -4,6 +4,7 @@
 no hash)."""
 
 import hashlib
+import re
 from collections.abc import Mapping
 
 
@@ -51,6 +52,8 @@ def cut_of(group: str) -> str:
     return group.partition(VARIED)[0]
 
 
+DIGEST = "=ZZ"
+"""What begins a test node's place spelled by its digest (`placed`), no character's escape."""
 NODE_PLACE = 160
 """The most characters a test node's part of its record's place (`placed`) spells out; a longer one is its
 digest."""
@@ -65,8 +68,18 @@ def placed(name: str) -> str:
         return name
     spelled = "".join(char if char.isascii() and (char.isalnum() or char in "._-")
                       else "".join(f"={byte:02X}" for byte in char.encode()) for char in colons + node)
-    digest = "=" + hashlib.sha256(node.encode()).hexdigest()[:32]
+    digest = f"=3A=3A{DIGEST}{hashlib.sha256(node.encode()).hexdigest()[:32]}"
     return file + (spelled if len(spelled) <= NODE_PLACE else digest)
+
+
+def unplaced(spelled: str) -> str:
+    """`placed`'s row name back from its spelling: a test node's whole, or one spelled by its digest as
+    `file::` and the digest; a file's as it is."""
+    file, colons, node = spelled.partition("=3A=3A")
+    if not colons:
+        return spelled
+    return f"{file}::" + re.sub(rb"=([0-9A-F]{2})", lambda byte: bytes.fromhex(byte[1].decode()),
+                                node.encode()).decode()
 
 
 def row_place(row_name: str, held: str) -> str:
@@ -84,7 +97,7 @@ def key_parts(key: str) -> tuple[str, str, str]:
     its test file and its group (`whole`, or a split's `<index>-of-<count>`)."""
     held, rest = key.split("/", 1)
     name, group = rest.rsplit("/", 1)
-    return held, name, group
+    return held, unplaced(name), group
 
 
 def place_variant(group: str) -> str:

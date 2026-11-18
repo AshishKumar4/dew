@@ -1667,17 +1667,15 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # "at 0.0 s").
     # A task stalled before any test started (its collection) has no such file: each of its rows is the
     # deadline's.
-    # A row named by a test node (`file::test`) is graded by its own cases, its file's collection and visits
-    # its own (`grading.of`, `grading.running_row`).
+    # A row named by a test node (`file::test`) is graded by its own cases (`grading.of`), its file's
+    # collection and visits its own: a GPU lane runs each such row in a task of its own (`lane_units`).
     stood = followed.visited(followed.log_events(log)) if expired or not report.is_file() else []
     running = stood[-1] if stood else None
-    stopped = grading.running_row(tests, running, {name for name in tests
-                                                   if any(grading.of(case, name) for case in cases)})
     for name in tests:
         own = [case for case in cases if grading.of(case, name)]
         red, failed, cause = grading.graded(name, own, cases, counts.get(grading.owning(name), {}),
                                             report.is_file(), returncode, deadline if expired else None,
-                                            stopped if running is not None else None, pid.is_file(), running)
+                                            running, pid.is_file(), running)
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares
@@ -1726,12 +1724,13 @@ def task_seconds(tests: list[str], cases: list[ET.Element], log: Path, wall: flo
                    for name in tests}
     if not expired:
         return apportioned(own_seconds, wall, len(tests))
-    # The file whose test started last is the one running at the deadline (executed.py logs each visit),
-    # its row the one stopped (`grading.running_row`).
+    # The file whose test started last is the one running at the deadline (executed.py logs each visit), its
+    # row the one stopped (a test node's, which runs in a task of its own: `lane_units`).
     stood = followed.visited(followed.log_events(log))
+    running = next((name for name in tests if grading.owning(name) == stood[-1]), stood[-1]) if stood \
+        else None
     reported = {name for name in tests if any(grading.of(case, name) for case in cases)}
-    return deadline_shares(own_seconds, reported, wall,
-                           grading.running_row(tests, stood[-1], reported) if stood else None)
+    return deadline_shares(own_seconds, reported, wall, running)
 
 
 def resumed(tests: list[str]) -> dict[str, float]:
@@ -1922,6 +1921,9 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
         _, name, _ = key_parts(key)
+        # A test node's record (a GPU lane's, `rows.placed`) is no file's evidence: its file's own runs are.
+        if "::" in name:
+            return name, []
         found = recorded(f"{prefix}{key}", token)
         if found is None:
             return name, ["unrecorded"]
@@ -2117,11 +2119,12 @@ def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str
     # file's process on this class measured, whole or a group of any cut. A whole run that measured nothing (a
     # child it did not follow, no report) stays the file's, which so takes the lane's whole share.
     if cut:
-        files = {file for file, _, _ in units.values()}
+        files = {grading.owning(file) for file, _, _ in units.values()}
         most = largest_records(python, token, under=f"{held}/", measures=lambda _, name, group: (
             (name, place_variant(group)) if name in files else None))
         records = {name: found if found is not None and not gpu_measures.measured(found)
-                   else most.get((units[name][0], units[name][2]), found) for name, found in records.items()}
+                   else most.get((grading.owning(units[name][0]), units[name][2]), found)
+                   for name, found in records.items()}
     # A group no run on this class measured borrows the most its file held on another, which holds at least
     # its own; a file's process under other flags, its tests a part of the file's, the lane's own's first.
     borrowed = borrowed_records(sorted({grading.owning(units[name][0]) for name, found in records.items()
