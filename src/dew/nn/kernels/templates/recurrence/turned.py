@@ -18,7 +18,7 @@ import numpy as np
 
 from dew.algebra import scan
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
-from dew.nn.precision import at_least_fp32, compensated_add
+from dew.nn.precision import at_least_fp32, compensated_add, vanishing
 
 TWO_PI = (np.float32(2 * np.pi), np.float32(2 * np.pi - float(np.float32(2 * np.pi))))
 """2 pi as fp32's nearest and what it drops, a turn's whole in double float."""
@@ -137,8 +137,9 @@ def _first_tokens(firsts, length: int) -> jax.Array:
 
 def _turned_primal(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
                    documents) -> tuple[jax.Array, jax.Array]:
-    return _turned_forward(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn,
-                           starts, documents)[0]
+    del scale, group, held
+    framed, turning, _ = _framed(query, key, state, entry, turn, starts, documents)
+    return launch(*framed[:2], value, g, beta, framed[2], skip, framed[3], turning)
 
 
 def _in_last_frame(local, starts, documents):
@@ -176,13 +177,15 @@ def _memory_axis(rotation, memory):
     return tuple(part[:, :, :, None, :] for part in rotation)
 
 
-def _turned_forward(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
-                    documents) -> tuple[tuple[jax.Array, jax.Array], tuple]:
-    del scale, group, held
+def _framed(query, key, state, entry, turn, starts, documents):
+    """A turned call's launch operands in its documents' frames (`_in_last_frame`): its queries and keys,
+    its memory entering (a forked call's table as given) and its entry write's keys, as `(query, key, state,
+    entry)`; the load rotation a forked call's walk turns each memory it takes up by (`Forked.turning`, None
+    for another call); and the frames' `((cos, sin), owned)` its derivative reads."""
     local = frames(turn, starts)
     (cos, sin), owned = _in_last_frame(local, starts, documents)
     turned = [scan.rotated(_wide(x), cos, sin).astype(x.dtype) for x in (query, key)]
-    turning, given_entry, given_state = None, entry, state
+    turning = None
     if documents is None:
         if state is not None:
             # The memory entering, its first document's, in that document's last frame.
@@ -193,11 +196,21 @@ def _turned_forward(launch, scale, group, held, query, key, value, g, beta, stat
         if entry is not None:
             keys = scan.rotated(_wide(entry[0]), *(part[:, :, None] for part in owned))
             entry = (keys.astype(entry[0].dtype), *entry[1:])
-    (out, final), pullback = jax.vjp(lambda *operands: launch(*operands, turning), *turned, value, g, beta,
-                                     state, skip, entry)
+    return (*turned, state, entry), turning, ((cos, sin), owned)
+
+
+def _turned_forward(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
+                    documents) -> tuple[tuple[jax.Array, jax.Array], tuple]:
+    """`_turned_primal` with its launch's pullback: the derivative's forward alone traces the launch for one
+    (a forward-only call launches as inference does, audit KPM-04)."""
+    del scale, group, held
+    (q, k, framed_state, framed_entry), turning, ((cos, sin), owned) = _framed(query, key, state, entry, turn,
+                                                                              starts, documents)
+    (out, final), pullback = jax.vjp(lambda *operands: launch(*operands, turning), q, k, value, g, beta,
+                                     framed_state, skip, framed_entry)
     kind = jnp.zeros((), turn.dtype)
-    return (out, final), (pullback, query, key, value, g, beta, given_state, given_entry, turn, starts,
-                          documents, cos, sin, owned, kind)
+    return (out, final), (pullback, query, key, value, g, beta, state, entry, turn, starts, documents, cos,
+                          sin, owned, kind)
 
 
 def _rooted(query, key, state, entry, turn, starts, documents):
@@ -404,6 +417,16 @@ def _between(later, earlier) -> jax.Array:
     return (later[0] - earlier[0]) + (later[1] - earlier[1])
 
 
+def _vanished(g, begins):
+    """A row's log decays `g` `[B, T, H]` with each that vanishes (`precision.vanishing`: its decay and every
+    span's through it zero) taken as zero, and where its prefix restarts, `[B, T, H]`: at each document's
+    first token (`begins` `[B, T, 1]`) and at each vanished token, which a span through cuts as a document's
+    start does, as the scan's decays segment theirs (`scan._decays_value`): summed in, two of -2^127 put a
+    prefix at -inf and its turns' gradient NaN where the recurrence is finite (audit KPM-02)."""
+    vanished = g <= vanishing(g.dtype)
+    return jnp.where(vanished, 0.0, g), begins | vanished
+
+
 def _sides(q, k, log, b, reads, writes, scale: float):
     """A chunk's readers of the memory entering it, `q_s scale exp(G_s)`, and writers into the memory
     leaving it, `k_u beta_u exp(G_end - G_u)`, of the chunk's document alone (`reads`, `writes`): another
@@ -435,17 +458,19 @@ def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale:
     begins = jnp.zeros((batch, length), bool) if starts is None else jnp.asarray(starts, bool)
     # Each chunk's log decays' prefix restarts at each document's first token: summed across a chunk's
     # documents, a pair of a later one took its decays as a difference of the earlier ones' (PaTH's row
-    # 7609: a first document's -2^30 rounded the next one's to nothing).
-    g = laid(jnp.asarray(g, work))
-    log = scan.compensated(g, axis=-1, restarts=jnp.broadcast_to(laid(begins)[:, None], g.shape))
+    # 7609: a first document's -2^30 rounded the next one's to nothing). A token whose decay vanishes cuts
+    # a head's as a document's start does (`_vanished`).
+    g, cut = _vanished(jnp.asarray(g, work), begins[..., None])
+    log = scan.compensated(laid(g), axis=-1, restarts=laid(cut))
     b = laid(jnp.asarray(beta, work))
-    ids = laid(jnp.cumsum(begins.astype(jnp.int32), axis=1), mode='edge')[:, None]
+    ids = laid(jnp.cumsum(cut.astype(jnp.int32), axis=1), mode='edge')
     # Each token's group: a row's tokens' ranks in turn from its first, each document beginning a token.
     teams = laid(jnp.broadcast_to(jnp.arange(length) // group, (batch, length)), mode='edge')[:, None]
     before = jnp.concatenate([jnp.zeros_like(ids[..., :1, -1]), ids[..., :-1, -1]], axis=-1)
     readers, writers = _sides(q, k, log, b, ids == before[..., None], ids == ids[..., -1:], scale)
-    whole = jnp.exp(log[0][..., -1] + log[1][..., -1])
-    passes = ((ids[..., -1] == before) * whole)[..., None, None]
+    # A chunk its memory passes through whole: one document's, no decay of it vanished.
+    whole = jnp.where(ids[..., -1] == before, log[0][..., -1] + log[1][..., -1], -jnp.inf)
+    passes = jnp.exp(whole)[..., None, None]
     written = jnp.einsum('bhnck,bhncv->bhnkv', writers, v)
     read = jnp.einsum('bhnck,bhncv->bhnkv', readers, do)
     entering = (jnp.zeros((batch, heads, turned, v.shape[-1]), work) if state is None
@@ -505,16 +530,20 @@ def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents
 
     q, k = (laid(jnp.asarray(x, work)[..., :turned]) for x in (query, key))
     v, do = (laid(jnp.asarray(x, work)) for x in (value, d_out))
-    log = scan.compensated(laid(jnp.asarray(g, work)), axis=-1)
+    # A token whose decay vanishes cuts its chunk's prefix (`_vanished`): a span through it is none.
+    g, cut = _vanished(jnp.asarray(g, work), jnp.zeros((batch, length, 1), bool))
+    log = scan.compensated(laid(g), axis=-1, restarts=laid(cut))
+    seen = jnp.cumsum(laid(cut).astype(jnp.int32), axis=-1)
     b = laid(jnp.asarray(beta, work))
     on = _chunked(real, chunks, chunk)[:, None]
-    readers, writers = _sides(q, k, log, b, on, on, scale)
+    readers, writers = _sides(q, k, log, b, on & (seen == 0), on & (seen == seen[..., -1:]), scale)
     head = _chunked(document, chunks, chunk)[..., 0]
     alive = _chunked(live, chunks, chunk)[..., 0]
     first = alive & (jnp.arange(chunks)[None] * chunk == _taken(offsets, head))
     last = alive & ((jnp.arange(chunks)[None] + 1) * chunk == _taken(offsets + spans, head))
     final = last & (head == _document_of(firsts, length)[:, -1:])
-    passes = (alive[:, None] * jnp.exp(log[0][..., -1] + log[1][..., -1]))[..., None, None]
+    whole = jnp.where(seen[..., -1] == 0, log[0][..., -1] + log[1][..., -1], -jnp.inf)
+    passes = (alive[:, None] * jnp.exp(whole))[..., None, None]
     written = jnp.einsum('bhnck,bhncv->bhnkv', writers, v)
     read = jnp.einsum('bhnck,bhncv->bhnkv', readers, do)
     shape = (batch, heads, turned, v.shape[-1])
@@ -544,7 +573,8 @@ def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents
         total = jnp.reshape(jnp.moveaxis(total, 1, 3), (batch, chunks * chunk, heads, total.shape[-1]))
         return jax.vmap(lambda row, at: row[at])(total, position)
 
-    ids = jnp.broadcast_to(head[:, None, :, None], (batch, 1, chunks, chunk))
+    # A chunk's tokens apart where a vanished decay cuts them (each chunk one document's).
+    ids = head[:, None, :, None] * (chunk + 1) + seen
     # Each token's group, counted from its document's first token (a chunk's edge).
     teams = _chunked(within // group, chunks, chunk)[:, None]
     return (q, k, v, do, log, b, ids, teams, readers, writers, memories, leaving, passes), unlaid
