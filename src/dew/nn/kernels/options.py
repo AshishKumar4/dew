@@ -1,5 +1,5 @@
-"""The XLA options a program compiles with, by the models it runs and the device it runs on, and the
-one place a program over them is compiled (`program`).
+"""The XLA options a program compiles with, and the one place a program over a run's models is compiled
+(`program`).
 
 `dew.nn.kernels.generation` stays free of Dew's imports, since benchmark
 environments load its target table without Dew or JAX; this reads its
@@ -21,7 +21,7 @@ import types
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, TypedDict, Unpack
 
 import jax
 import numpy as np
@@ -34,7 +34,7 @@ from jax.sharding import Sharding
 from dew import _cache, _stated, algebra
 from dew._devices import xla_flag
 from dew._stated import Unestablished
-from dew.nn.kernels.generation import backend, gpu_target, stated, traced_fact
+from dew.nn.kernels.generation import stated, traced_fact
 from dew.nn.nested import staged
 from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
 
@@ -43,60 +43,9 @@ if TYPE_CHECKING:
     from flax import linen as nn
 
 
-class QuantizedDtypes(Protocol):
-    """What the options read of a run's quantization (`dew.quantization.Quantization`, above the kernels):
-    the dtypes its forward and backward quantize to."""
-
-    @property
-    def dtype(self) -> str: ...
-
-    @property
-    def bwd_qtype(self) -> str | None: ...
-
-
-@runtime_checkable
-class Quantized(Protocol):
-    """A model class that carries a run's quantization (`dew.quantization.QuantizedClass`), as the options
-    read it: its two dtypes."""
-
-    _dew_quantization: ClassVar[QuantizedDtypes]
-
-
 type Held = nn.Module | DataclassInstance | Mapping[str, Held] | tuple[Held, ...] | list[Held] | None
-"""What a program runs that may hold a quantized tower (`quantizations`): a model, a record of one (a
-condition's encoder), or a mapping or sequence of them; anything else a record holds is passed over."""
-
-
-def quantizations(*models: Held) -> list[QuantizedDtypes]:
-    """The quantization every model class among `models` carries (`Quantized`), and every tower they
-    hold: each module a model, a task's encoder or any record it is handed holds in its fields,
-    a tuple's or a mapping's entries, at any depth, so a quantized text encoder inside a condition's
-    encoder counts as the denoiser beside it does. Arrays and their trees are not walked."""
-    found: list[QuantizedDtypes] = []
-    # Each object visited, held until the walk ends: a mapping's values may be made as they are read
-    # (a FrozenDict's nested ones), and a freed one's id could name a later, unvisited value.
-    seen: dict[int, Held] = {}
-
-    def walk(value: Held) -> None:
-        if id(value) in seen or isinstance(value, (jax.Array, np.ndarray, str, bytes, int, float, type)):
-            return
-        seen[id(value)] = value
-        if isinstance(value, Quantized):
-            found.append(type(value)._dew_quantization)
-        if isinstance(value, Mapping):
-            for entry in value.values():
-                walk(entry)
-        elif isinstance(value, (tuple, list)):
-            for entry in value:
-                walk(entry)
-        elif dataclasses.is_dataclass(value):
-            for field in dataclasses.fields(value):
-                if field.name not in ("parent", "name"):
-                    walk(getattr(value, field.name, None))
-
-    for model in models:
-        walk(model)
-    return found
+"""What a program runs: a model, a record of one (a condition's encoder), or a mapping or sequence of
+them."""
 
 
 type Option = bool | int | str
@@ -123,26 +72,14 @@ def compiled_with(options: Mapping[str, Option]) -> Iterator[None]:
         _COMPILED_WITH.reset(token)
 
 
-def compiler_options(*models: Held) -> dict[str, Option]:
-    """The XLA options a program that runs `models` compiles with on the default device, for its
-    `jax.jit(..., compiler_options=)`. Every program Dew compiles over a task's model,
-    autoencoder or encoders, or over an objective's modules, takes them, for every tower they hold
-    (`quantizations`). JAX takes compiler options on a program's outermost jit alone, so a module's
-    own jitted method runs under the options of the program that calls it.
-
-    XLA's Triton GEMM fusion computes some int8 dots as two or four times their product
-    (openxla/xla#51016), silently, on every GPU measured (`GpuTarget.int8_triton_gemm`). A program
-    that runs a model quantized to int8, forward or backward, therefore compiles its GEMMs on
-    cuBLAS. With CUDA 13, cuBLAS refuses some int8 shapes (on an A100 a contraction of 16 or 48),
-    and then the program does not compile rather than compute wrong. A run that sets
-    `xla_gpu_enable_triton_gemm` in XLA_FLAGS keeps its own setting. The options `compiled_with`
-    holds open join them.
-    """
-    int8 = any("int8" in (spec.dtype, spec.bwd_qtype) for spec in quantizations(*models))
+def compiler_options() -> dict[str, Option]:
+    """The XLA options a program Dew compiles takes beyond its target's (`report.targeted`, where a GEMM's
+    backend is chosen from the program's own dots and the device it compiles for), for its
+    `jax.jit(..., compiler_options=)`: those `compiled_with` holds open, each but those the run's
+    XLA_FLAGS sets itself. JAX takes compiler options on a program's outermost jit alone, so a module's
+    own jitted method runs under the options of the program that calls it. It reads no device: a process
+    may form a program's options before it joins its peers (`jax.distributed.initialize`)."""
     options: dict[str, Option] = {}
-    if (int8 and backend() == "gpu" and not gpu_target().int8_triton_gemm
-            and xla_flag("xla_gpu_enable_triton_gemm") is None):
-        options["xla_gpu_enable_triton_gemm"] = False
     for opened in _COMPILED_WITH.get():
         options.update({name: value for name, value in opened.items() if xla_flag(name) is None})
     return options
@@ -931,7 +868,7 @@ def program[**P, R](function: Callable[P, R], *models: Held,
     `step`) or a simulator's, but those whose owner keeps them: an objective's (`Objective.program`, for
     what runs its modules, a rollout over an environment included), and a closure's or a bound method's a
     run makes (`owned_program`)."""
-    options = {**compiler_options(*models), **(step or {})}
+    options = {**compiler_options(), **(step or {})}
     return _program(
         function, tuple(sorted(options.items())),
         static_argnums=arguments.get("static_argnums"),
@@ -948,7 +885,7 @@ def owned_program[**P, R](function: Callable[P, R], *models: Held,
     Dew's: its caller holds it, and it goes with its caller's last reference. A closure or a bound method
     a run makes (its placement's, its host phases') takes this one, as `program`'s process-wide cache
     would keep it and the run it closes over (a trainer, its objective and their arrays) for good."""
-    return OuterProgram(function, compiler_options={**compiler_options(*models), **(step or {})},
+    return OuterProgram(function, compiler_options={**compiler_options(), **(step or {})},
                         **arguments)
 
 

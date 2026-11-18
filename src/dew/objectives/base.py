@@ -1446,7 +1446,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             self._program_cache = cached
         from dew.nn.sharding import trace_context
         # The options follow where the program runs (`compiler_options`), so they key it too.
-        options = {**compiler_options(*self.towers(), *modules), **(step or {})}
+        options = {**compiler_options(), **(step or {})}
         key = (name, trace_context(), tuple(sorted(options.items())))
         held = cached[1].get(key)
         kept = (*holds, *modules)

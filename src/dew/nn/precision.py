@@ -398,7 +398,13 @@ def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
 FP32_PRODUCTS = frozenset({"HIGHEST", "F32_F32_F32"})
 """The precision names that declare fp32 operands' products in IEEE fp32 (`precision_names`): `highest` and
 the F32_F32_F32 preset, which `jax_default_matmul_precision` spells 'highest', 'float32' or the preset's
-name."""
+name. On a GPU a program holding such a dot compiles its GEMMs on cuBLAS
+(`dew.nn.kernels.templates.report.targeted`, reading the program's own dots, an operation's precision as
+a run's), whose sum is the one a float32 reference is computed with: XLA's Triton GEMM sums farther from
+float64 (1.29 to 1.45 times cuBLAS's distance on an A100 and a GH200, rows 5026/5028/5029). That is the
+price of 'highest' meeting its reference, a wrong result weighed against a slower one: a float32
+decode-sized forward (32 rows of one token) 16 to 18 percent slower on both GPUs, a Qwen3-0.6B's float32
+forward and its loss and gradient at 8 x 512 within 2 percent either way (M-IG-13)."""
 
 
 def declares_fp32_products(precision: jax.lax.PrecisionLike) -> bool:
