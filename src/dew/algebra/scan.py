@@ -455,14 +455,15 @@ def _entered(outputs, entering: tuple, values_read: bool, h):
     return jnp.concatenate([first[None].astype(outputs.dtype), outputs[:-1]]) + free
 
 
-def _read(h, reader, values_read: bool, scale: float):
+def _read(h, reader, values_read: bool, scale: float | np.floating):
     """A scaled read along the state's keys or values, its rank-one part contracted before it is formed."""
+    dtype = np.asarray(scale).dtype if isinstance(scale, np.floating) else None
     if isinstance(h, tuple):
         left, right = h
-        return (_scaled_contract("j,j,i->i", scale)(reader, right, left) if values_read
-                else _scaled_contract("i,i,j->j", scale)(reader, left, right))
-    return (_scaled_contract("j,ij->i", scale)(reader, h) if values_read
-            else _scaled_contract("i,ij->j", scale)(reader, h))
+        return (_scaled_contract("j,j,i->i", scale, dtype)(reader, right, left) if values_read
+                else _scaled_contract("i,i,j->j", scale, dtype)(reader, left, right))
+    return (_scaled_contract("j,ij->i", scale, dtype)(reader, h) if values_read
+            else _scaled_contract("i,ij->j", scale, dtype)(reader, h))
 
 
 class Walk(NamedTuple):
@@ -815,8 +816,9 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
 
 
 @functools.cache
-def _scaled_contract(subscripts: str, scale: float):
-    """A multilinear contraction whose transposes apply its scalar before their products."""
+def _scaled_contract(subscripts: str, scale: float | np.floating, scale_dtype: np.dtype | None):
+    """A multilinear contraction whose transposes apply its scalar before their products. Equal-valued
+    literals of different dtypes promote differently, so the cache keeps their dtype too."""
     from jax.custom_derivatives import SymbolicZero
 
     from dew.nn.kernels import generation
@@ -826,7 +828,8 @@ def _scaled_contract(subscripts: str, scale: float):
     axes = inputs.split(",")
 
     def value(*operands):
-        return _portable_einsum(subscripts, scale * operands[0], *operands[1:])
+        factor = scale if scale_dtype is None else jnp.asarray(scale, dtype=scale_dtype)
+        return _portable_einsum(subscripts, factor * operands[0], *operands[1:])
 
     def tangent(primals, tangents):
         out = value(*primals)
@@ -845,7 +848,9 @@ def _scaled_contract(subscripts: str, scale: float):
                 others = tuple(part for at, part in enumerate(held) if at != index)
                 remaining = [axis for at, axis in enumerate(axes) if at != index]
                 transposed = ",".join((*remaining, output)) + "->" + axes[index]
-                cotangents.append(_scaled_contract(transposed, scale)(*others, cotangent))
+                # A strong scalar can widen a contraction whose operand's cotangent stays narrower.
+                cotangents.append(_scaled_contract(transposed, scale, scale_dtype)(
+                    *others, cotangent).astype(held[index].dtype))
             return tuple(cotangents)
 
         return out, generation.linear_map(applied, pulled, primals, moving)

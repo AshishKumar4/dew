@@ -245,7 +245,7 @@ class Parts:
     reader: Token
     free: Token
     values_read: bool = False
-    reader_scale: float = 1.0
+    reader_scale: float | np.floating = 1.0
 
 
 def _chain(traced: Program) -> int:
@@ -287,8 +287,10 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
     if found is None:
         raise Refused("the readout is not the state contracted with a vector over its keys or its values "
                       f"plus a part free of it{stopped}")
+    from dew.nn.precision import at_least_fp32
+
     reader, free = found
-    reader, reader_scale = _reader_scale(reader, atoms)
+    reader, reader_scale = _reader_scale(reader, atoms, at_least_fp32(aval(update.jaxpr.invars[0]).dtype))
     base2, per_key, exponent, left, right, *correction = args
     return Parts(update, readout, tuple(atoms), bool(terms.integer(base2)),
                  bool(terms.integer(per_key)), exponent, left, right,
@@ -296,29 +298,36 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
                  reader_scale=reader_scale)
 
 
-def _reader_scale(reader: Token, atoms: list) -> tuple[Token, float]:
-    """A reader's literal scalar factored once, so its transposes keep it before their products."""
+def _reader_scale(reader: Token, atoms: list, dtype: np.dtype) -> tuple[Token, float | np.floating]:
+    """A shrinking literal factored once with its dtype. A magnifying one stays on the reader, so its
+    transpose never magnifies the memory before a small cotangent."""
     def factored(term):
         scalar = get_callable_args(term, Token.scalar)
         if scalar is not None:
             literal = get_callable_args(scalar[0], Token.literal)
             if literal is not None:
-                return None, terms.real(literal[0])
+                literal_value = np.asarray(terms.real(literal[0]), dtype=dtype)[()]
+                if abs(literal_value) <= 1.0:
+                    return None, literal_value
             leaf = get_callable_args(scalar[0], Token.value)
             if leaf is not None:
                 _, atom = atoms[terms.integer(leaf[0])]
                 if isinstance(atom, jcore.Literal):
-                    return None, float(atom.val)
+                    literal_value = np.asarray(atom.val)[()]
+                    if isinstance(literal_value, np.floating) and abs(literal_value) <= 1.0:
+                        return None, literal_value
         product = get_callable_args(term, Token.times)
         if product is not None:
             left, ls = factored(product[0])
             right, rs = factored(product[1])
             vector = right if left is None else left if right is None else left.times(right)
-            return vector, ls * rs
-        return term, 1.0
+            scale = rs if ls is None else ls if rs is None else ls * rs
+            return vector, scale
+        return term, None
 
     vector, scale = factored(reader)
-    return Token.scalar(Token.literal(1.0)) if vector is None else vector, scale
+    return (Token.scalar(Token.literal(1.0)) if vector is None else vector,
+            1.0 if scale is None else scale)
 
 
 _KEEPING = (jax.lax.copy_p,)
