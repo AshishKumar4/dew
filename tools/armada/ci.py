@@ -2408,6 +2408,8 @@ def lane_asked(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
 def main() -> int:
     parser = command_line.parser(PYTHONS, session.DEADLINE)
     args = parser.parse_args()
+    if args.operation in ("task", "pytest", "gpu-tier"):  # each collects tests: the pins they read, fetched
+        args.deadline -= session.fetched_absent(args.python, args.deadline, digests.fetched.absent(Path()))
     if args.operation == "pythons":
         return pythons(check=args.check)
     if args.operation == "gangs":
@@ -2458,8 +2460,6 @@ def main() -> int:
         # And each file's pinned generations, one line of JSON: what a tier's composer cuts each kind's by.
         print(json.dumps(pinned))
         return 0
-    if args.operation in ("task", "pytest", "gpu-tier"):  # each collects tests: the pins they read, fetched
-        args.deadline -= session.fetched_absent(args.python, args.deadline, digests.fetched.absent(Path()))
     if args.operation == "pytest":  # argparse keeps the `--` that sets pytest's arguments apart from these
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
         return targeted(args.python, arguments, args.report, args.tests.split(), args.split)
