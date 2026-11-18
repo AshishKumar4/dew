@@ -428,3 +428,49 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
     assert lowered["tests/test_ranks.py::test_a"][2] == light
     assert ci.heavy_files() == set()
     assert all("size" not in entry for entry in ci.plan(240.0, {"files": {}}))
+
+
+def test_a_killed_tasks_peak_raises_its_files_tests_and_heavy_tasks_run_large(ci, tmp_path, monkeypatch):
+    """A red row whose pytest left no case (killed before it reported) raises its file's tests' peaks to its
+    own, never lowering one; and `sized` puts any task that runs a heavy file's tests on a large
+    container, a check-1 site's map task or judge (its `tests` the file) among them, and no task that only
+    looks a kept row up."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240, "environment": {}}))
+    (tmp_path / "tests" / "test_ranks.py").write_text("def test_a(): pass\ndef test_b(): pass\n")
+    record = {"tests/test_ranks.py::test_a": [1.0, None, 9_000_000_000], "tests/test_ranks.py::test_b": 2.0}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(record))
+    killed = 7_700_000_000
+    rows = [{"name": "3.12:tests/test_ranks.py#1/2", "exitCode": 1, "seconds": 0.0, "peak": killed,
+             "tests": {}}]
+    verdict = tmp_path / "main.json"
+    verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    assert ci.main() == 0
+    folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
+    assert folded["tests/test_ranks.py::test_a"][2] == 9_000_000_000
+    assert folded["tests/test_ranks.py::test_b"][2] == killed
+    heavy = {"tests/test_ranks.py"}
+    assert ci.sized({"tests": "tests/test_ranks.py", "split": "test_site"}, heavy)["size"] == "large"
+    assert ci.sized({"tests": "tests/test_light.py tests/test_ranks.py"}, heavy)["size"] == "large"
+    assert "size" not in ci.sized({"tests": f"tests/test_ranks.py{ci.KEPT_AT}abc"}, heavy)
+
+
+def test_a_resumed_attempts_rows_carry_the_earlier_attempts_peak(tmp_path, monkeypatch):
+    """The progress an earlier attempt kept carries its peak; the next attempt's resumed tests are bounded by
+    it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "progress", Path(__file__).parents[1] / "tools/armada/progress.py")
+    progress = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(progress)
+    (tmp_path / "resume").mkdir()
+    (tmp_path / "resume" / progress.PROGRESS).write_text(
+        json.dumps({"node": "tests/test_x.py::heavy", "seconds": 3.0, "peak": 7_000}) + "\n"
+        + json.dumps({"node": "tests/test_x.py::light", "seconds": 1.0, "peak": 2_000}) + "\n")
+    monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "now"))
+    passed, cold, peak = progress.resumed(["tests/test_x.py"], lambda node: node.split("::")[0])
+    assert sorted(passed) == ["tests/test_x.py::heavy", "tests/test_x.py::light"]
+    assert (cold, peak) == (set(), 7_000)
+    carried = [json.loads(line) for line in (tmp_path / "now" / progress.PROGRESS).read_text().splitlines()]
+    assert {line["peak"] for line in carried} == {7_000}

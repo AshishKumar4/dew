@@ -1246,13 +1246,10 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
             alone = held_rows[0][1] if len(held_rows) == 1 and held_rows[0] not in found else ""
             tokens = [kept_token(name, group, found[(name, group)]) if (name, group) in found else name
                       for name, group in held_rows]
-            # A task that runs a file past `LARGE_FROM` runs on a large container (`heavy_files`).
-            large = any(name in heavy and (name, group) not in found for name, group in held_rows)
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(tokens),
                             "split": alone, "rows": [row(python, name, group) for name, group in held_rows],
                             "weight": weight + (COLD_SECONDS if cache != "on" and any(
-                                each not in found for each in held_rows) else 0.0),
-                            **({"size": "large"} if large else {}), **stamped})
+                                each not in found for each in held_rows) else 0.0), **stamped})
         # The sites to run whose judge's last run needed its later map tasks draw them at once
         # (`eager_sites`).
         eager = eager_sites(python, [(name, test) for name, held in marked.items() for test in held
@@ -1263,7 +1260,15 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
     # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.
     rest = [] if census else [name for name in every if name not in NEWEST_FILES]
     collecting = collect_entries(rest, timings, target)
-    return keyed(entries + [{**entry, **stamped} for entry in collecting])
+    return keyed([sized(entry, heavy) for entry in entries + [{**entry, **stamped} for entry in collecting]])
+
+
+def sized(entry: dict, heavy: set[str]) -> dict:
+    """`entry`, on a large container where it runs a file of `heavy` (`heavy_files`): a file's group, its
+    whole row, or a check-1 site's map task or judge, any task that runs its tests rather than looking a
+    kept row up (`KEPT_AT`)."""
+    runs = {token for token in entry["tests"].split() if KEPT_AT not in token}
+    return {**entry, "size": "large"} if runs & heavy else entry
 
 
 def keyed(entries: list[dict]) -> list[dict]:
@@ -1521,18 +1526,6 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     return rows
 
 
-def task_peak() -> int | None:
-    """This task's resident peak in bytes so far: its cgroup's (cgroup v2's memory.peak, which every process
-    the task started counts in, a test's ranks with it), each of its tests' bound above (row 6003: a test's
-    four ranks peaked at 7.17 GiB, packed beside another on a medium). None where the task runs in no
-    cgroup this process can read."""
-    try:
-        group = Path("/proc/self/cgroup").read_text().strip().split("\n")[0].split("::", 1)[1]
-        return int((Path("/sys/fs/cgroup") / group.lstrip("/") / "memory.peak").read_text())
-    except (OSError, ValueError, IndexError):
-        return None
-
-
 def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
@@ -1662,7 +1655,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # does a run that records none (a prepare's: a test it prepared has not passed, and a test an earlier
     # attempt passed still prepares into this one's store).
     resumes = recorded and site is None and coverage is None
-    done_before, cold_before = progress.resumed(tests, grading.owning) if resumes else ({}, set())
+    done_before, cold_before, peak_before = (progress.resumed(tests, grading.owning) if resumes
+                                             else ({}, set(), None))
     aside = out.with_name(f"{out.name}.set-aside.json")
     aside.write_text(json.dumps(sorted(done_before)))
     command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
@@ -1675,7 +1669,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
         command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
-    peak = task_peak()
+    # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
+    peak = max((found for found in (progress.task_peak(), peak_before) if found is not None), default=None)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
@@ -2293,6 +2288,13 @@ def folded_entries(record: dict[str, session.Entry], verdict: dict, target: floa
                 for node in row_.get("tests", {}):
                     if node in kept:
                         peaks[node] = int(measured)
+                # A task killed before it reported a case (its pytest OOM-killed) still bounds its file's
+                # tests: their peaks raised to it, never lowered by a run that timed none of them (review).
+                if not row_.get("tests"):
+                    file = row_["name"].split(":", 1)[1].split("#", 1)[0]
+                    for node in kept:
+                        if grading.owning(node) == file:
+                            peaks[node] = max(peaks.get(node, 0), int(measured))
     return {node: session.entry(seconds, cold.get(node), peaks.get(node)) for node, seconds in kept.items()}
 
 
