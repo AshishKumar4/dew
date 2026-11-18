@@ -14,6 +14,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   devices, made once a call; the copy and each program the rollout compiles beside it (a generation's KV
   cache and activations) are refused by name where the devices cannot hold them. The streamed layout's
   choice considers a run with a rollout, its plan's price counting the copy (`StepPrice.rollout`).
+- Under AutoPGLE (`jax_enable_pgle`) a step that keeps its variables on the host is profiled on a trial
+  after its startup and runs its accelerator programs guided by the profile, as a device plan does
+  (`HostStartup.pgle` records it); the streamed layout's choice considers such a run.
 - A TPU v6e states its host link (PCIe Gen5 x8 a chip, 32 GB/s each way), so its runs' streamed
   layout is priced.
 
