@@ -1475,10 +1475,9 @@ class Trainer(Generic[Loss, Effects]):
         from dew.held_updates import holds_back
 
         held = abstract.opt_state if abstract.inner is None else abstract.inner.opt_state
-        return Interval.resumed(run.stop_control, last_saved=(
-            current if checkpoints is not None and checkpoints.latest is not None else None),
-            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held),
-            kept_paths=leaf_paths(checked(abstract)))
+        saved = current if checkpoints is not None and checkpoints.latest is not None else None
+        return Interval.resumed(run.stop_control, last_saved=saved, kept_paths=leaf_paths(checked(abstract)),
+                                skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held))
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
