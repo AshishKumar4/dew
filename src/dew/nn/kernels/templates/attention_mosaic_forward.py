@@ -784,8 +784,8 @@ class _Layout(NamedTuple):
         written, refs = refs[:self.outputs], refs[self.outputs:]
         (q_smem, row_smem, *stages), (q_loaded, schedule, *verdicts) = refs[:self.arrays], refs[self.arrays:]
         words, barrier = verdicts if verdicts else (None, None)
-        decided = (after_walk.Decided(words, barrier, len(verdicts) and words.shape[0] or 1) if self.decides
-                   else None)
+        consumers = 1 if words is None else words.shape[0]
+        decided = after_walk.Decided(words, barrier, consumers) if self.decides else None
         relay = stages.pop() if self.relays else None
         converted = (stages[-2], stages[-1]) if self.converts else None
         stages = stages[:-2] if self.converts else stages

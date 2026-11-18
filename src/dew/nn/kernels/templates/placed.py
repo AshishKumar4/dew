@@ -705,7 +705,7 @@ class Tcgen05Walked(Tcgen05Placed):
         # turns once their compute warpgroup read the step before last's.
         # Its one compute warpgroup's tiles, its walk the program's.
         del reaches
-        (lefts,) = lefts
+        (given,) = lefts
         placed = walked_products(products, self.kept_sums)
         hand_offs = self._hand_offs()
         scored, formed, finished = hand_offs.scored, hand_offs.formed, hand_offs.finished
@@ -732,7 +732,7 @@ class Tcgen05Walked(Tcgen05Placed):
             released = []
             for position, product in enumerate(placed.ahead):
                 slot, release = read(position, product, index)
-                self.products(self.turn_of(product.into, turn), lefts[product.left],
+                self.products(self.turn_of(product.into, turn), given[product.left],
                               slot.T if product.transposed else slot, accumulate=False)
                 released.append(release)
             scored.committed(scored.turn(index - lo))
@@ -752,7 +752,7 @@ class Tcgen05Walked(Tcgen05Placed):
                 # dQ `= dS K` over the step's turns once their products are read (tcgen05's products from one
                 # thread run in order), its left the score cotangents staged, its right the resident keys a
                 # half of their columns over each turn.
-                staged, keys = lefts[placed.fused.left].at[turn].T, lefts[placed.fused.right]
+                staged, keys = given[placed.fused.left].at[turn].T, given[placed.fused.right]
                 for half, acc in enumerate(self.dq_of(turn)):
                     columns = acc.shape[1]
                     self.products(acc, staged, keys.at[:, pl.ds(half * columns, columns)], accumulate=False)

@@ -42,6 +42,7 @@ from dew import _cache
 from dew.nn import derivatives
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import (
+    across,
     after_walk,
     bodies,
     emission,
