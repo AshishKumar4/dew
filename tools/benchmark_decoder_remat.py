@@ -47,6 +47,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from jax import core
 from jax._src.ad_checkpoint import saved_residuals
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -98,7 +99,7 @@ def main():
 
     kept = saved_residuals(lambda variables: loss(variables, tokens)[0], shapes)
     activation_bytes = sum(aval.size * aval.dtype.itemsize for aval, source in kept
-                           if isinstance(aval, jax.core.ShapedArray)
+                           if isinstance(aval, core.ShapedArray)
                            and not source.startswith("from the argument"))
 
     def step(params, opt_state, tokens):

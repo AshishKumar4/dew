@@ -7,10 +7,10 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, TypedDict
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
-import flax.linen as nn
 import optax
 from benchmark_cases import (
     TEXT_FEATURES,
@@ -26,7 +26,7 @@ from jax.sharding import Mesh
 
 import dew.nn.backbones
 import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
-from dew.batch import Variables, coordinates
+from dew.batch import Coordinates, Variables, coordinates
 from dew.data import preferences
 from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import DataPartition
@@ -63,7 +63,7 @@ from dew.training import Layout, MeshSpec, Trainer
 from dew.training.ahead import AheadOfTime, compile_ahead, step_batch
 from dew.training.planning import Trials
 
-Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
+Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs | Coordinates]
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -79,16 +79,16 @@ class _DenoisingTextTable(ConditionEncoder[str]):
     """Whether the condition marks the real tokens, as Z-Image reads them."""
 
     @classmethod
-    def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = TEXT_TOKENS,
-                        features: int = TEXT_FEATURES, pooled_features: int | None = None,
-                        guidance: float | None = None, masked: bool = False, vocab: int = 130, seed: int = 0,
-                        dtype=None):
-        table = CharTable.from_pretrained(checkpoint, tokens=tokens, vocab=vocab, seed=seed, dtype=dtype,
-                                          features=max(features, pooled_features or 0))
+    def from_pretrained(cls, checkpoint: str = "char_table", *, params: Variables | None = None,
+                        tokens: int = TEXT_TOKENS, features: int = TEXT_FEATURES,
+                        pooled_features: int | None = None, guidance: float | None = None, masked: bool = False,
+                        vocab: int = 130, seed: int = 0, dtype=None):
+        table = CharTable.from_pretrained(checkpoint, params=params, tokens=tokens, vocab=vocab, seed=seed,
+                                          dtype=dtype, features=max(features, pooled_features or 0))
         return cls(table, table.params, features, pooled_features, guidance, masked)
 
-    def tokenize(self, data: Sequence[str]) -> Mapping[str, np.ndarray]:
-        return self.table.tokenize(data)
+    def tokenize(self, texts: Sequence[str]) -> Mapping[str, np.ndarray]:
+        return self.table.tokenize(texts)
 
     def encode(self, params: Variables, tokens) -> DenoisingCondition:
         text = self.table.encode(params, tokens)
@@ -258,38 +258,37 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     else:
         model = trunk
         preset = presets.EDM(regime="pixel")
-        encoder: ConditionEncoder[Any, Any]
         if isinstance(model, QwenImageTransformer):
             keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained()
+            condition = Condition(_DenoisingTextTable.from_pretrained())
             preset = presets.Flow()
         elif isinstance(model, WanTransformer):
             keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained(features=model.text_dim)
+            condition = Condition(_DenoisingTextTable.from_pretrained(features=model.text_dim))
             preset = presets.Flow()
         elif isinstance(model, ZImageTransformer):
             keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained(features=model.cap_feat_dim, masked=True)
+            condition = Condition(_DenoisingTextTable.from_pretrained(features=model.cap_feat_dim, masked=True))
             preset = presets.Flow()
         elif isinstance(model, Flux2Transformer):
             keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained(
-                features=model.joint_attention_dim, guidance=3.5 if model.guidance_embeds else None)
+            condition = Condition(_DenoisingTextTable.from_pretrained(
+                features=model.joint_attention_dim, guidance=3.5 if model.guidance_embeds else None))
             preset = presets.Flow()
         elif isinstance(model, (SD3Transformer, FluxTransformer)):
             keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained(
+            condition = Condition(_DenoisingTextTable.from_pretrained(
                 features=model.joint_attention_dim, pooled_features=model.pooled_projection_dim,
-                guidance=3.5 if isinstance(model, FluxTransformer) and model.guidance_embeds else None)
+                guidance=3.5 if isinstance(model, FluxTransformer) and model.guidance_embeds else None))
             preset = presets.Flow()
         elif isinstance(model, UNet2DCondition):
             keyword = "conditioning"
-            encoder = _DenoisingTextTable.from_pretrained()
+            condition = Condition(_DenoisingTextTable.from_pretrained())
         else:
             keyword = "textcontext"
-            encoder = CharTable.from_pretrained(tokens=TEXT_TOKENS, features=TEXT_FEATURES)
+            condition = Condition(CharTable.from_pretrained(tokens=TEXT_TOKENS, features=TEXT_FEATURES))
         inputs = InputSpec(Field(sample_key, case.sample_shape),
-                           {keyword: Condition(encoder)})
+                           {keyword: condition})
         objective = DiffusionObjective(model, preset, inputs)
     return objective
 
@@ -382,7 +381,7 @@ def global_batch(case: Case, seed: int = 0) -> Batch:
                 pairs[:, 1, :prompt] = pairs[:, 0, :prompt]
                 completion = np.zeros(pairs.shape, np.int32)
                 completion[:, :, prompt:] = 1
-                return preferences.pair_windows(pairs, completion, count=case.batch_size)
+                return dict(preferences.pair_windows(pairs, completion, count=case.batch_size))
             case "grpo":
                 # One rollout a row, a prompt and the response the mask counts:
                 # each row's advantage on its response tokens, and the
@@ -518,5 +517,6 @@ def timed_steps(step: Step, state: TrainState, steps: int
 
     Returns the last state, loss and finiteness, and the seconds the window took.
     """
-    (state, loss, finite), (seconds,) = carried(lambda carry: step(carry[0]), (state, None, None), steps)
+    (state, loss, finite), (seconds,) = carried(lambda carry: step(carry[0]),
+                                                (state, jnp.zeros(()), jnp.zeros((), bool)), steps)
     return state, loss, finite, seconds

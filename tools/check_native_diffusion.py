@@ -25,6 +25,7 @@ from dew.inference import DenoisingInputs
 from dew.inputs import Field, unit_range
 from dew.interop import Pretrained
 from dew.interop.pretrained import PretrainedPipeline
+from dew.nn.inputs import DenoisingCondition
 from dew.nn.kernels.options import program
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
@@ -216,7 +217,6 @@ def diffusers_reads(task, source, export, model, variables, noise, given):
     from diffusion_support import assert_export_recomputes
     from safetensors.numpy import load_file
 
-    from dew.nn.inputs import DenoisingCondition
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
@@ -514,8 +514,13 @@ def handoff(directory, source, task, key):
     def start(task, rows):
         encoder = task.inputs.conditions["conditioning"].encoder
         params = task.variables["encoders"]["conditioning"]
-        given, null = ({"conditioning": encoder.encode(params, encoder.tokenize([row]))}
-                       for row in ({"text": "cat"}, {"text": "dog", "negative": True}))
+        def encoded(row: dict[str, str | bool]) -> dict[str, DenoisingCondition | jax.Array]:
+            condition = encoder.encode(params, encoder.tokenize([row]))
+            if not isinstance(condition, (DenoisingCondition, jax.Array)):
+                raise TypeError(f"the base's encoder encodes a {type(condition).__name__}, no condition")
+            return {"conditioning": condition}
+
+        given, null = encoded({"text": "cat"}), encoded({"text": "dog", "negative": True})
         process, times = task.prepared_process(steps)
         # Diffusers' discrete cutoff for denoising_end = denoising_start = 0.5.
         cutoff = round(len(source.schedule.betas) * 0.5)
@@ -540,6 +545,8 @@ def handoff(directory, source, task, key):
         prepared = refiner_task.prepare(conditions=given, unconditional=null, key=key, steps=steps,
                                         initial=latents, times=tail)
         final = refiner_task(prepared, steps=steps, guidance=3.0, key=key, decode=False).host().latents
+        if refiner.autoencoder is None:
+            raise ValueError("the refiner holds no autoencoder to decode its latents")
         images = refiner.autoencoder.decode(refiner.variables["autoencoder"], jnp.asarray(final))
         return {"prefix": np.asarray(latents), "final": np.asarray(final), "images": np.asarray(images)}
 
@@ -579,33 +586,40 @@ def regress(directory, case):
     source = bundle(directory)
     task = source.text_to_image()
     key = jax.random.PRNGKey(17)
-    options = dict(key=key, steps=2, guidance=3.0)
+
+    def generated(pipe, conditions) -> np.ndarray:
+        """The images `pipe` makes of `conditions` at the regression's key, two steps and guidance 3."""
+        images = pipe(conditions, key=key, steps=2, guidance=3.0).host().images
+        if images is None:
+            raise ValueError("the pipeline decoded no images")
+        return images
+
     if case == "prepared":
         prepared = task.prepare(["cat"], key=key, steps=2)
-        np.testing.assert_array_equal(task(prepared, **options).host().images, task(["cat"], **options).host().images)
+        np.testing.assert_array_equal(generated(task, prepared), generated(task, ["cat"]))
     elif case == "geometry":
         old = source.inputs.conditions["conditioning"]
         encoder = replace(old.encoder, height=64, width=32)
         inputs = replace(source.inputs, sample=Field("image", (64, 32, 3)),
                          conditions={"conditioning": replace(old, encoder=encoder)})
         source = replace(source, inputs=inputs)
-        expected = source.text_to_image()(["cat"], **options).host().images
+        expected = generated(source.text_to_image(), ["cat"])
         with tempfile.TemporaryDirectory(prefix="dew-native-geometry-") as saved:
             source.save(saved)
-            np.testing.assert_array_equal(bundle(saved).text_to_image()(["cat"], **options).host().images, expected)
+            np.testing.assert_array_equal(generated(bundle(saved).text_to_image(), ["cat"]), expected)
     elif case == "negative-policy":
         # The empty negative prompt encoded as the task encodes a caller's negatives (`prepare`'s
         # `unconditional`), the program a saved bundle encodes its own unconditional row by, so the two
         # agree to the bit; an encoding apart compiles another program, whose sums may round apart.
         prepared = task.prepare(["cat"], key=key, steps=2, unconditional=[{"text": "", "negative": True}])
-        expected = task(prepared, **options).host().images
+        expected = generated(task, prepared)
         with tempfile.TemporaryDirectory(prefix="dew-native-policy-") as saved:
             source.save(saved)
             index = json.loads((Path(saved) / "model_index.json").read_text())
             index["force_zeros_for_empty_prompt"] = False
             (Path(saved) / "model_index.json").write_text(json.dumps(index))
-            np.testing.assert_array_equal(bundle(saved).text_to_image()(["cat"], **options).host().images, expected)
-        assert not np.array_equal(task(["cat"], **options).host().images, expected)
+            np.testing.assert_array_equal(generated(bundle(saved).text_to_image(), ["cat"]), expected)
+        assert not np.array_equal(generated(task, ["cat"]), expected)
     elif case == "handoff":
         handoff(directory, source, task, key)
     elif case == "mask-levels":
@@ -649,7 +663,6 @@ def model_site(directory):
     from reference_error import with_gradients
 
     from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
-    from dew.nn.inputs import DenoisingCondition
     from tools.diffusers_consumer import flax_unet
 
     directory = Path(directory)
