@@ -1129,6 +1129,20 @@ def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     assert (hopper.multiprocessors, hopper.shared_limit, hopper.wgmma) == (132, 232448, True)
 
 
+def test_a_compile_only_gpu_states_its_facts_and_asks_the_driver_nothing():
+    """A compile-only GPU's target takes the multiprocessors and shared memory its topology states, and asks
+    the CUDA driver nothing (`runtime_facts`'s `read`), which on a host whose GPUs are hidden has no device
+    to answer (rows 6717, 7924)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    def driver(ordinal, attribute):
+        raise RuntimeError(f"the driver was asked attribute {attribute} of GPU {ordinal}")
+
+    device = compile_only_gpus("sm90", multiprocessors=114)[0]
+    target = runtime_facts(GpuTarget("sm90", device.device_kind, host_links={}), device, read=driver)
+    assert (target.multiprocessors, target.shared_limit) == (114, device.shared_memory_per_block_optin)
+
+
 def test_a_gpu_target_takes_the_clocks_bandwidth_and_l2_its_driver_reports():
     """A real device's target takes its multiprocessor clock, its memory bandwidth (twice the memory clock
     times the bus's bytes) and its L2 cache from the CUDA driver's attributes, read at the driver's

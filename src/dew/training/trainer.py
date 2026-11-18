@@ -174,11 +174,11 @@ from dew.training.distributed import (
 )
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
-from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, logged_scalars
+from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
 from dew.training.memory import first_run, recompute_record, refuse_wide_floats, split_share
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepare_counts, uncounted
 from dew.training.observe import Observe
-from dew.training.phase_passes import PhasePasses
+from dew.training.phase_passes import PhasePasses, SampledPasses
 from dew.training.planning import Candidate, Planned, Trials, read_whole, released, splits
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
@@ -267,9 +267,12 @@ def signature_digest(signature: Hashable) -> str:
 
 
 
-def _custom_step_refusal(step, record: bool, inspection) -> None:
-    """Refuse what a custom step cannot serve (ValueError): records of its Steps, or an inspection of an
-    update it commits."""
+def _custom_step_refusal(step, record: bool, inspection, rollout: Rollout | None,
+                         sampled: SampledPasses | None) -> None:
+    """Refuse what a custom step cannot serve (records of its Steps, an inspection of its update), and a
+    rollout beside per-microbatch pass counts, sampling at the cap what each trains at its own (row 8272)."""
+    if rollout is not None and sampled is not None:
+        raise ValueError("a rollout samples one policy a step, not sampled_passes' count a microbatch")
     if record and step is not None:
         raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                          "build them with Step(record=True)")
@@ -318,6 +321,7 @@ class Trainer(Generic[Loss, Effects]):
         param_dtype: str | None = None,
         diloco: DiLoCo | None = None,
         phase_passes: Sequence[int] | None = None,
+        sampled_passes: SampledPasses | None = None,
         data_resume: DataResume = "relaxed",
         skip_nonfinite: bool = False,
     ):
@@ -354,7 +358,7 @@ class Trainer(Generic[Loss, Effects]):
         module's own. `inspection` names what the run watches at its sampled steps
         (`dew.training.inspection`). `diloco` trains the mesh's diloco groups apart, every few updates
         averaged (`dew.training.diloco`). `phase_passes` runs a looped model a count of passes a phase of
-        the run's data (`dew.training.phase_passes`).
+        the run's data, and `sampled_passes` one drawn per microbatch (`dew.training.phase_passes`).
         """
         self.objective = objective
         # A config's groups take what the objective draws fresh, as a run's do (`OptimConfig.claiming`).
@@ -376,13 +380,13 @@ class Trainer(Generic[Loss, Effects]):
         self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
-        _custom_step_refusal(step, record, inspection)
+        _custom_step_refusal(step, record, inspection, rollout, sampled_passes)
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
         self.lower_for, self.tune_kernels = lower_for, tune_kernels
         self.inspection, self.param_dtype, self.diloco = inspection, param_dtype, diloco
-        self.phase_passes = PhasePasses.of(objective, phase_passes)
+        self.phase_passes = PhasePasses.of(objective, phase_passes, sampled_passes)
         # The later data phases' steps of the fit in progress, planned off its loop (`LaterPlans`).
         self._later: LaterPlans | None = None
         if diloco is not None:
@@ -419,7 +423,7 @@ class Trainer(Generic[Loss, Effects]):
                             self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
                             self.microbatches, self.record, self.lower_for, self.state_mesh,
-                            self.skip_nonfinite, self._compiler.ns_group)
+                            self.skip_nonfinite, self._compiler.ns_group, self.phase_passes.drawn_count())
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
@@ -587,7 +591,7 @@ class Trainer(Generic[Loss, Effects]):
             return None
         return (type(objective), stated, settings, self._shape.updates, self._shape.examples,
                 self._microbatches, self.accumulation, self.split, self._scaled, self.lower_for,
-                compiler.narrow, self.record, self.skip_nonfinite)
+                compiler.narrow, self.record, self.skip_nonfinite, self.phase_passes.sampled)
 
     def _stepping(self, objective: Objective[Loss, Effects] | None = None,
                   compiler: StepCompiler | None = None) -> Stepping[Loss, Effects]:
@@ -977,7 +981,7 @@ class Trainer(Generic[Loss, Effects]):
                 qk_stats=jax.tree.map(
                     lambda x: jnp.full(x.shape, -jnp.inf, at_least_fp32(x.dtype))
                     if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
-                    compact_qk(jax.tree.map(zeros, aux.qk_stats))),
+                    compact_qk(jax.tree.map(zeros, aux.qk_stats), self.phase_passes.sampled is not None)),
                 batches=None if shared else buffer(records),
                 variables=None if mutable is None else buffer(mutable),
                 attempts=None if shared else jnp.zeros((slots,), jnp.int32),
@@ -1058,7 +1062,7 @@ class Trainer(Generic[Loss, Effects]):
                                split=split, record=self.record, resting=resting,
                                examples=self._shape.examples,
                                inspection=self.inspection if sampled else None, placed=placed,
-                               skip=self.skip_nonfinite).step()
+                               skip=self.skip_nonfinite, calls=self.phase_passes.sampled is not None).step()
         # A custom step need not run the objective's loss, which passes a model the run's progress.
         refuse_unpassed_progress(objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(objective, self.optimizer)
@@ -1106,7 +1110,7 @@ class Trainer(Generic[Loss, Effects]):
         with self.phase_passes.scoped(self, self._compiler):
             compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials))
         assert compiled.step is not None
-        return compiled.step
+        return self._compiler.drawing(self, self._stepping, compiled, state, batch, self.key)
 
     @ruled
     def _planned_unplaced(self, start: Start, batch: Batch) -> None:
@@ -1332,10 +1336,8 @@ class Trainer(Generic[Loss, Effects]):
             metrics=metrics, preview=preview and self.tracker is not None, best=selection, stop=plateau,
             suites=suites, pause=pause, scored_to=None if scored_to is None else os.fspath(scored_to),
             held_best=restore_best and self.checkpoints is None, restore_best=restore_best, observe=observe,
-            summaries=tuple(summaries), startup=startup,
-            declared=declared, branches=() if cooldowns is None else cooldowns.branches(
-                steps, tokens, self.accumulation, self._shape.examples),
-        )
+            summaries=tuple(summaries), startup=startup, declared=declared, branches=() if cooldowns is None
+            else cooldowns.branches(steps, tokens, self.accumulation, self._shape.examples))
 
     def scheduled(self, updates: int | None) -> None:
         """Build the configured optimizer (an `OptimConfig`) for `updates` updates, as `fit` and
@@ -1407,7 +1409,7 @@ class Trainer(Generic[Loss, Effects]):
                     check_inputs(self, device)
                 known, began = len(compiled), time.perf_counter()
                 with run.startup.phase("compile", "compiling the step", when=not known):
-                    train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
+                    train_step, flops, state = self._compiled_for(compiled, state, device, run, interval)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
                     signature = batch_signature(device)
                     run.reads[signature] = step_reads(self.executable, signature)
@@ -1445,7 +1447,7 @@ class Trainer(Generic[Loss, Effects]):
                 position = run.train.source_state if ahead is None else ahead
                 run.current, seen = run.current + 1, seen + 1
                 self._display.step(run.current)
-                counted_step(interval, run, self.objective.row_tokens, batch, device, measured_flops, loss,
+                counted_step(interval, run, self.objective.row_tokens, batch, device, flops, loss,
                              finite, committed, aux)
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
@@ -1474,9 +1476,9 @@ class Trainer(Generic[Loss, Effects]):
         from dew.held_updates import holds_back
 
         held = abstract.opt_state if abstract.inner is None else abstract.inner.opt_state
-        return Interval.resumed(run.stop_control, last_saved=(
-            current if checkpoints is not None and checkpoints.latest is not None else None),
-            skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held))
+        saved = current if checkpoints is not None and checkpoints.latest is not None else None
+        return Interval.resumed(run.stop_control, last_saved=saved, kept_paths=leaf_paths(checked(abstract)),
+                                skips_nonfinite=self.skip_nonfinite or self.dynamic_scale or holds_back(held))
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
@@ -1922,9 +1924,8 @@ class Trainer(Generic[Loss, Effects]):
                     examples=self._consumed(interval))
                 run.scored = frozenset(plan.suites if names is None else names)
                 run.other += run.evaluation.elapsed_seconds
-        scores = (
-            {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
-        )
+        evaluated = run.evaluation
+        scores = {} if evaluated is None or evaluated.step != current else dict(evaluated.scores)
         # Before the step's save, so a preemption inside the branch saves this step to run it again; at
         # the run's last step, after its final save (`_wind_down`). The points share one length and
         # decay, so those due together are one branch.
@@ -1996,7 +1997,7 @@ class Trainer(Generic[Loss, Effects]):
         # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
         # as the run's do (`_scheduled`), read off the devices where its steps may have reached what it
         # reads next (`FitPlan.committed`); the stages it begins are its own, the run's kept as they were.
-        counted = Interval(time.time(), None, tokens_before_log=interval.real_tokens)
+        counted = interval.branched()
         branched.clock = TokenClock(*counted.clocked(state.pending_tokens))
         starts = self._shape.stage_starts
         cooled, done, cut = state, 0, False
@@ -2020,7 +2021,7 @@ class Trainer(Generic[Loss, Effects]):
                         break
                     (batch, device, _), read = read, None
                     self.phase_passes.at(batch)
-                    step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
+                    step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched, counted,
                                                          reported=run.current)
                     factor = decay(shape, done // self.accumulation, steps // self.accumulation)
                     cooled, loss, aux, finite, _, committed = step(
@@ -2255,15 +2256,15 @@ class Trainer(Generic[Loss, Effects]):
             # since this thread prepares it ahead of the step that takes the count.
             objective = self._step_objective(batch)
             try:
-                return prepare_counts(objective, batch, count_model=True)
+                return prepare_counts(objective, batch, count_model=True, counts=self.phase_passes.counted())
             except MissingFlopsCount as missing:
                 self._refusal = str(missing)
                 _log.debug("train/mfu is not reported for %s: %s", type(self.objective).__name__, missing)
         counted = prepare_counts(self.objective, batch, count_model=False)
-        return counted if self._refusal is None else uncounted(counted)
+        return counted if self._refusal is None else uncounted(counted, self.phase_passes.drawn_cap())
 
     def _compiled_for(self, compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]],
-                      state: TrainState, batch: Batch, run: FitRun,
+                      state: TrainState, batch: Batch, run: FitRun, interval: Interval,
                       reported: int | None = None) -> tuple[CompiledStep, StepFlops | None, TrainState]:
         """Return the step compiled for this batch's abstract signature (`batch_signature`),
         compiling on first sight, and the state to step, a fresh copy where AutoPGLE profiled it
@@ -2275,7 +2276,7 @@ class Trainer(Generic[Loss, Effects]):
         another program, compiled as one: an executable refuses it. A step that begins a ramp's or a
         schedule's stage gets its state with the window a rejection left part filled dropped (`_staged`), the
         state an AutoPGLE trial steps on too. A compile reports at `reported`, a cooldown branch's at the
-        run's step, else at the state's.
+        run's step, else at the state's; a step drawing its pass counts draws them at `interval`'s.
         """
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
@@ -2319,7 +2320,7 @@ class Trainer(Generic[Loss, Effects]):
             self._unproven = True
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        return (*compiled[signature], trials.state)
+        return (*self._compiler.drawn(compiled[signature], interval, run.current), trials.state)
 
     def _saved_checkpoint(
         self,

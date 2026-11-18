@@ -58,7 +58,7 @@ def fixtures() -> dict[str, Path]:
     """Each model_type's tiniest committed fixture directory: the fewest decoder layers, then the first
     by name. A released model's config committed beside its tiny twin (Llama 3.1 8B's 32 layers beside
     llama-tiny's 2) traces each layer, so the tiny one stands for the family."""
-    found: dict[str, tuple[int, str, Path]] = {}
+    found: dict[str, tuple[float, str, Path]] = {}
     for directory in sorted(FIXTURES.iterdir()):
         config = directory / "config.json"
         if config.is_file():
@@ -81,7 +81,7 @@ def published(config: dict) -> tuple[dict, bool]:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     kind = config.get("model_type")
-    if kind not in CONFIG_MAPPING:
+    if kind is None or kind not in CONFIG_MAPPING:
         return config, False
     reference = CONFIG_MAPPING[kind]().to_dict()
     text = reference.get("text_config") or reference
@@ -274,8 +274,8 @@ def cells(names: Iterable[str], targets: Iterable[str] | None = None,
                                               for kind in model.per_layer_types)
         for target in audited() if targets is None else targets:
             for mode in modes:
-                cell = {"family": name, "fixture": found.name, "target": target, "mode": mode,
-                        "widths": "reference" if widened else "fixture"}
+                cell: dict[str, object] = {"family": name, "fixture": found.name, "target": target,
+                                           "mode": mode, "widths": "reference" if widened else "fixture"}
                 if prefixless and mode != "train":
                     cell["absent"] = ("its layers keep windows on both sides of a query, which no causal "
                                       "view takes, so it has no prefix to prefill or decode over")

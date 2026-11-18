@@ -59,6 +59,24 @@ def compilation_cache_counts() -> dict[str, float]:
         return {f'train/{event.rsplit("/", 1)[-1]}': float(count)
                 for event, count in _cache_counts.items()}
 
+_step_misses = [0]
+
+
+def count_step_misses(count: int) -> None:
+    """Count `count` programs a step traced or compiled past what its compile prepared (a host step's past
+    its startup pass, `dew.training.compiler.HostRun`)."""
+    with _cache_lock:
+        _step_misses[0] += count
+
+
+def step_miss_counts() -> dict[str, float]:
+    """The programs this process's steps traced or compiled past what their compiles prepared, cumulative
+    (`count_step_misses`), as a run's record counts them: a run that warms poorly shows it in its
+    metrics, not only in its log."""
+    with _cache_lock:
+        return {"train/step_misses": float(_step_misses[0])}
+
+
 # A multiply-add is two FLOPs.
 _MAC = 2
 _INTEGER_TYPE = re.compile(r'([su])(8|16|32|64)$')

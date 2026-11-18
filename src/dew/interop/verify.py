@@ -929,7 +929,7 @@ def logits_mapped(source: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]],
     with jax.enable_x64(new_val=True):
         model, held = _wide_dew(record, variables)
         # Held by this verdict alone, which a closure over its probe's arrays is (`owned_program`).
-        forward = owned_program(lambda ids: model.apply(held, ids), model)
+        forward = owned_program(lambda ids: model.apply(held, ids))
 
         def draw(seed: int):
             ids = probe_ids(_VOCAB, seed, _DRAWN)
@@ -999,7 +999,7 @@ def gradients_mapped(source: _Source, family: decoder_parts.DecoderFamily,
             return jax.grad(lambda params: jnp.sum(model.apply({**held, 'params': params}, ids) * cotangent))(
                 params)
 
-        compiled = owned_program(gradient, model)
+        compiled = owned_program(gradient)
 
         def draw(seed: int):
             ids, cotangent = _gradient_inputs(seed)

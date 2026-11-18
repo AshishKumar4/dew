@@ -717,9 +717,9 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
 
 @compiling
 def compile(
-    train: Pipeline,
+    train: Dataset,
     *,
-    validation: Pipeline | None = None,
+    validation: Dataset | None = None,
     host: tuple[HostStep, ...] = (),
     objective: ObjectiveData | None = None,
     read: Read | None = None,
@@ -750,6 +750,8 @@ def compile(
     `epoch` or `passes` cadence), counts the source examples its read consumes where its read has no
     record count and states a pass's (`Loader.pass_examples`, `_staged`), its read marking them with no
     bound; a run whose cadence reads none is compiled as it was, its plan and batches unchanged."""
+    # A dataset a stage returned as a dataset (`Dataset.pipe`) is read as its chain.
+    train, validation = train._chain(), None if validation is None else validation._chain()
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _TRAINING_LOADING

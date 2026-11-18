@@ -179,7 +179,7 @@ class BlockProcess:
         """Refines one canvas without updating its prefix cache, compiled with the model's own XLA
         options (`program`). `positions` `[B, canvas_length]` are its tokens' logical
         positions; None places them on from the cache's cursor."""
-        return program(BlockProcess.refined, model, static_argnames=("self", "model", "batch"))(
+        return program(BlockProcess.refined, static_argnames=("self", "model", "batch"))(
             self, model, variables, cache, key, batch, finished, positions)
 
     def refined(self, model: nn.Module, variables: Variables, cache: Variables,
@@ -257,7 +257,7 @@ class BlockProcess:
         plan = request.plan
         # The canvas sampler draws one batch-wide key per refinement, so its
         # repeats stay as they are and its rows take the request's own key.
-        generation, undefined = program(_generate, model, static_argnames=("model", "plan", "n"),
+        generation, undefined = program(_generate, static_argnames=("model", "plan", "n"),
                                         in_shardings=(None, plan.sharding, None),
                                         out_shardings=(plan.sharding, None))(
             model, decoding_storage(model, variables), plan.place(plan.pad(request.inputs)), request.key,

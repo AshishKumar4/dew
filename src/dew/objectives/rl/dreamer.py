@@ -1225,7 +1225,7 @@ class DreamerRollout:
         ended episodes' returns' sum and count. The replay is written in place: its buffer is donated to
         the program that writes it."""
         carry, steps_taken = simulator_rollout(simulator, self._policy(random), variables, live.carry, steps,
-                                               reset=False, models=self.objective.towers())
+                                               reset=False)
         replay, returns, total, count = program(_kept, donate_argnames=("replay",))(
             live.replay, live.returns, steps_taken)
         return _Live(carry, replay, returns), total, count
@@ -1454,8 +1454,7 @@ def episodes_return(objective: DreamerV3Objective, env: Env | Simulator, variabl
     environment driven for the agent)."""
     driven = DrivenSimulator(env) if isinstance(env, Simulator) else Driven(env)
     policy = objective.greedy if greedy else objective.act
-    return episodes(policy, driven, steps, memory=objective.memory,
-                    models=objective.towers())(variables, key)["return"]
+    return episodes(policy, driven, steps, memory=objective.memory)(variables, key)["return"]
 
 
 __all__ = ["AUXILIARY_SCALE", "AgentMemory", "ConvDecoder", "ConvEncoder", "Critic", "DreamerRollout",

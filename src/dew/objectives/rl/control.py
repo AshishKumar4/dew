@@ -469,8 +469,7 @@ class ControlRollout:
         and their steps `[unrolls, T, envs, ...]`."""
         unrolled = []
         for _ in range(self.unrolls):
-            carry, steps = simulator_rollout(simulator, self.objective.act, params, carry, self.unroll_length,
-                                             models=self.objective.towers())
+            carry, steps = simulator_rollout(simulator, self.objective.act, params, carry, self.unroll_length)
             unrolled.append(steps)
         return carry, jax.tree.map(lambda *leaves: jnp.stack(leaves), *unrolled)
 
@@ -505,8 +504,7 @@ def episode_return(objective: ControlPPOObjective, env: Env | Simulator, params:
     """The mean undiscounted return of the first episode of each of `env`'s environments, an `Env` or a
     `Simulator`, over `steps` steps of the policy, its deterministic action where `greedy`: the whole
     episode where `steps` is an episode's length (`dew.rl.evaluation.episodes`)."""
-    return episodes(objective.greedy if greedy else objective.act, env, steps,
-                    models=objective.towers())(params, key)["return"]
+    return episodes(objective.greedy if greedy else objective.act, env, steps)(params, key)["return"]
 
 
 __all__ = ["ActorCritic", "ControlPPOObjective", "ControlRollout", "Saved", "episode_return",

@@ -993,10 +993,10 @@ def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, re
     each pass afresh (`reseed`) as Grain's does, unless it stands for a repeat of a stream, whose
     passes replay the first. An endless repeat of a pass that holds nothing is refused, as it
     would read nothing forever: an indexed pass by its length, a stream's when a pass ends without
-    a row and nothing before the repeat drops one, or every step before it makes the same rows each
-    pass (`certain`, `_same_each_pass`): a share whose records a filter or a rejecting step keeps none
-    of, which read on forever. A pass a step emptied that may yield rows next time (a fetch that failed
-    for now, a draw, a reseeded shuffle, `varying` naming those steps) is read on, saying so at each
+    a row and nothing before the repeat drops one, or none before it varies (`certain`, `_varies`: its
+    passes replay the first, its shuffles and its share's cut alike): a share whose records a filter or
+    a rejecting step keeps none of, which read on forever. A pass a step emptied that may yield rows next
+    time (a fetch that failed for now, a draw, `varying` naming those steps) is read on, saying so at each
     empty pass after the first: the share, the passes so far and those steps. Every pass of a stream
     goes on counting its corpus (`_Passes`). A worker's pass of its inputs and the markers of what they
     dropped that holds nothing (`barren`) holds no input at all, which ends it (`_Barren`)."""
@@ -1954,10 +1954,12 @@ class _Build:
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
             return self.block_shuffle(rows, stage, pipeline, partition)
         if isinstance(stage, Repeat):
+            # A stream's passes replay its first (`_PassesIterator`), its shuffles and its share's cut alike:
+            # only a step that varies (`_varies`) may make another row on a later pass.
             before = pipeline.stages[:at]
-            certain = (not any(_drops(written) for written in before)
-                       or _same_each_pass(before, self.cut_after(partition)))
-            varying = () if certain else _varying(before)
+            moving = tuple(_identity(written).name for written in before if _varies(written))
+            certain = not any(_drops(written) for written in before) or not moving
+            varying = () if certain else moving
             share = f"{_name(pipeline)} (share {partition.index} of {partition.count})"
             return _repeated(rows, stage.epochs, share, self.loading, certain=certain, varying=varying)
         from dew.data.ordering import WindowShuffle
