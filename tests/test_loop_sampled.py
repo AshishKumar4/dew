@@ -228,6 +228,30 @@ def test_a_sampled_run_under_qk_clip_pools_its_counts_logit_maxima_in_one_window
     assert int(trainer.fit(phased_loader(tokens), steps=4, log_every=100).step) == 4
 
 
+@pytest.mark.parametrize("sampled_first", [False, True], ids=["fixed-first", "sampled-first"])
+def test_a_fixed_and_a_sampled_run_of_one_config_each_trace_their_own_window(sampled_first):
+    """Two runs of one optimizer config under QK-Clip (muonclip) in one process, one at the loop's own count
+    and one drawing it per microbatch, two microbatches an update: each traces its own step, a fixed run's
+    window a looped layer's QK calls apart and a sampled run's as one (`compact_qk`), so neither reads the
+    other's from the process's cache of steps (`Trainer._step_key`), in either order, and both step."""
+    from test_pass_weights import phased_draw, phased_loader
+
+    from dew.optim import OptimConfig
+    from dew.training import Layout, Trainer
+
+    tokens, _ = phased_draw(0)
+    config = OptimConfig(optimizer="muonclip", learning_rate=0.01)
+
+    def fitted(**sampling):
+        return Trainer(LMObjective(unnormed(), 16), config, key=jax.random.key(0),
+                       layout=Layout(min_shard=1, tolerance=1.0), accumulation=2, **sampling).fit(
+            phased_loader(tokens), steps=2, log_every=100)
+
+    runs = [{}, {"sampled_passes": TRAINED}]
+    for options in (runs[::-1] if sampled_first else runs):
+        assert int(fitted(**options).step) == 2
+
+
 def test_a_phased_run_keeps_its_loops_horizon_at_every_count():
     """A run whose loop trains through its last two passes (`backprop_steps`) and runs one pass in its first
     phase and three in its second steps each phase as a run of the model at that count steps it, the first

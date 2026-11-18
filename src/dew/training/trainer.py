@@ -549,13 +549,14 @@ class Trainer(Generic[Loss, Effects]):
         objective anew reads the step its equal traced (`dew.training._candidates.candidate_for`; row 3873):
         the objective's own (`Objective.trace_key`, its EMA among it) at its current rung, the optimizer's
         config and the updates or examples it was built for, the reader's device steps, and every setting the
-        step reads. The links it traces under are the candidate's key's (`trace_context`, their measured
-        figures), its spreads replayed where it is kept (`Candidate.spread`), so the links the last compile
-        decided key nothing (row 6022: every refit on a tensor- or sequence-split mesh traced its step again).
-        None where a value states none of it: an objective that states no trace, an optimizer given built, a
-        custom step, a device step or a setting compared by identity (`frozen_value`), a loss scale given
-        built, stated links, or a run that measures its kernels' configs as it lowers. `objective` and
-        `compiler` are those the step is built from and climbs on (`_stepping`)."""
+        step reads, a sampled pass count's law among them (its window's QK calls folded, `compact_qk`). The
+        links it traces under are the candidate's key's (`trace_context`, their measured figures), its spreads
+        replayed where it is kept (`Candidate.spread`), so the links the last compile decided key nothing (row
+        6022: every refit on a tensor- or sequence-split mesh traced its step again). None where a value
+        states none of it: an objective that states no trace, an optimizer given built, a custom step, a
+        device step or a setting compared by identity (`frozen_value`), a loss scale given built, stated
+        links, or a run that measures its kernels' configs as it lowers. `objective` and `compiler` are those
+        the step is built from and climbs on (`_stepping`)."""
         from dew.objectives.base import UNKEYED, frozen_value, stated_trace
 
         stated = stated_trace(objective)
@@ -568,7 +569,7 @@ class Trainer(Generic[Loss, Effects]):
             return None
         return (type(objective), stated, settings, self._shape.updates, self._shape.examples,
                 self._microbatches, self.accumulation, self.split, self._scaled, self.lower_for,
-                compiler.narrow, self.record, self.skip_nonfinite)
+                compiler.narrow, self.record, self.skip_nonfinite, self.phase_passes.sampled)
 
     def _stepping(self, objective: Objective[Loss, Effects] | None = None,
                   compiler: StepCompiler | None = None) -> Stepping[Loss, Effects]:
