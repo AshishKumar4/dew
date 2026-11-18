@@ -197,7 +197,7 @@ def test_a_take_of_the_chains_own_where_the_count_marks_reads_each_share_as_coun
     from dew.data.pipeline import Pipeline
 
     ids = np.arange(1, 11, dtype=np.int32)
-    chain = Pipeline(Memory({"id": ids}, shard_rows=3)).take(5).filter_map(Keeps(2)).read("indexed").batch(2)
+    chain = Pipeline(Memory({"id": ids}, shard_rows=3)).take(5).filter_map(Keeps(3)).read("indexed").batch(2)
     plain, counting = (_loader(chain, counting=asked, expands=False) for asked in (False, True))
     assert counting.pass_examples == 5
     for share in range(2):
