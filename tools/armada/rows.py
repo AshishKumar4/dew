@@ -94,7 +94,9 @@ def key_parts(key: str) -> tuple[str, str, str]:
     its test file and its group (`whole`, or a split's `<index>-of-<count>`)."""
     held, rest = key.split("/", 1)
     name, group = rest.rsplit("/", 1)
-    return held, unspelled(name), unspelled(group)
+    # The file's path as it is (`row_place` spells only a test node's part after it, from its colons on).
+    file, colons, node = name.partition(spelled("::"))
+    return held, file + (unspelled(colons + node) if colons else ""), unspelled(group)
 
 
 def place_variant(group: str) -> str:
