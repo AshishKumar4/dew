@@ -866,14 +866,13 @@ class MosaicForward(_Mainloop[Tiles]):
                                            in_key=self.reads_key_slot(family),
                                            decides=self.deciding(ba.arguments.get("residuals"),
                                                                  ba.arguments["value"].dtype, family))
-        # An inference launch may flag its rows for the fold's rewalk, and a cache's scaled walk reads its
-        # keys' value magnitudes from its value slots (`algebra.SCALED_WALK`; another scaled walk the call's,
-        # `attention_mosaic_forward._largest`), each a reduction across warps (`reducing`).
-        flagged = ba.arguments.get("residuals") is not Kept.SPLIT
+        # A cache's scaled walk reads its keys' value magnitudes from its value slots (`algebra.SCALED_WALK`;
+        # another scaled walk the call's, `attention_mosaic_forward._largest`), a reduction across warps
+        # (`reducing`).
         arguments = ba.arguments
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
-            family, config.consumers, self.score_reduces or self.output_mod is not None, flagged=flagged,
+            family, config.consumers, self.score_reduces or self.output_mod is not None,
             magnitudes=cached and self.scales_in_kernel(ba)), products=self._products(ba, config)))
 
     def _products(self, ba: tokamax.BoundArguments, config: Tiles) -> tuple:

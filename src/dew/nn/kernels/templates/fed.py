@@ -77,6 +77,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     takes_pingpong = False  # its first consumer issues every ring's loads, its partner's tiles' too
     cluster = 1
+    stages_over_rings = True  # its rings the program's, its consumers their only readers
 
     def taken_once(self, held: dict, views: dict, wg) -> dict:
         # Its loads its loading consumer's: a walk's once streams too, before the walk's first step.

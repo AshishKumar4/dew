@@ -508,7 +508,9 @@ class Scope:
     """A program's shared-memory allocations by lifetime, as its kernel scopes them (`shared_bytes`): those
     live for the whole `program` (arrays, barriers, a ring's: `plgpu.SMEM`, `plgpu.Barrier`,
     `plgpu.ClusterBarrier`, nested in sequences and mappings); each walk's own, one after another (`walks`:
-    an `emit_pipeline`'s slots); tiles scoped `after` the walks, each `(shape, dtype)`; whether the
+    an `emit_pipeline`'s slots); tiles scoped `after` the walks, each `(shape, dtype)`; the program's rings
+    those tiles share their slots with (`over`, `Family.stages_over_rings`: one union as large as the larger,
+    and the barrier its consumers pass once their walks are read); whether the
     program `reduces` across warps, reserving its family's scratch (`Family.reduction_scratch`); and its
     `reducing_warpgroups`, each reserving its share where its arithmetic reduces implicitly
     (`Family.warpgroup_reduction_scratch`, the kernel's); and its `addresses`, the unaligned words its
@@ -516,6 +518,7 @@ class Scope:
     program: tuple = ()
     walks: tuple = ()
     after: tuple = ()
+    over: tuple = ()
     reduces: bool = False
     reducing_warpgroups: int = 0
     addresses: int = 0
@@ -556,8 +559,9 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
     """The shared memory a program of `scope` asks for besides its barriers and semaphores (`_semaphore`),
     as Mosaic GPU's resource estimate counts it (its `smem_scratch_bytes`): every array rounded up to
     `SMEM_ALIGNMENT` (`allocated`), the walks the largest of them, the tiles scoped after the walks the
-    larger of them and the walks on a family that scopes its walks apart (`Family.walks_scoped`) and beside
-    the program's otherwise, and the family's reduction scratch where the program reduces
+    larger of them and the walks on a family that scopes its walks apart (`Family.walks_scoped`), of them and
+    the rings whose slots they share (`Scope.over`), and beside the program's otherwise, and the family's
+    reduction scratch where the program reduces
     (`Family.reduction_scratch`) and its warpgroups' shares where they reduce implicitly
     (`Family.warpgroup_reduction_scratch`)."""
     def arrays(tree) -> list[int]:
@@ -569,8 +573,11 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
     after = [stored_bytes(shape, dtype) for shape, dtype in scope.after]
     if family.walks_scoped:
         walks += [allocated(size) for size in after]
+    elif scope.over and after:
+        # The rings' slots and the tiles after the walks one union (`plgpu.RefUnion`), as large as the larger.
+        sizes.append(max(allocated(*arrays(scope.over)), allocated(*after)))
     else:
-        sizes += after
+        sizes += arrays(scope.over) + after
     scratch = [family.reduction_scratch] if scope.reduces and family.reduction_scratch else []
     if scope.reducing_warpgroups:
         scratch.append(family.warpgroup_reduction_scratch * scope.reducing_warpgroups)
@@ -579,10 +586,13 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
 
 def shared_bytes(family: "Family", scope: Scope) -> int:
     """The shared memory a program of `scope` asks for: its scratch (`scratch_bytes`), then every
-    barrier (`BARRIER_BYTES`) and every address word (`Scope.addresses`)."""
-    barriers = sum(_count(leaf.num_barriers) for tree in (scope.program, scope.walks)
+    barrier (`BARRIER_BYTES`, its rings' where its tiles after its walks share their slots, `Scope.over`) and
+    every address word (`Scope.addresses`)."""
+    barriers = sum(_count(leaf.num_barriers) for tree in (scope.program, scope.walks, scope.over)
                    for leaf in jax.tree.leaves(tree) if _barrier(leaf))
-    return scratch_bytes(family, scope) + BARRIER_BYTES * barriers + scope.addresses
+    # The barrier a program's consumers pass before writing over their rings' slots (`Family.walked`).
+    passed = 1 if scope.over and scope.after else 0
+    return scratch_bytes(family, scope) + BARRIER_BYTES * (barriers + passed) + scope.addresses
 
 
 MOST_STAGES = 8

@@ -1540,6 +1540,15 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
+    stages_over_rings: bool = False
+    """Whether tiles a program scopes after its walks share its rings' slots (`scoped`: one `plgpu.RefUnion`,
+    as large as the larger, `resources.Scope.over`) where its rings are the program's and its consumers
+    alone read them (`ConsumerFed`'s): a tile written only once every consumer has passed the end of its
+    walks (`walked`), when none reads a slot again and no load lands in one. sm120's forward at width 256
+    staged its output beside its rings, 136,272 bytes at 64 x 32, past the 101,376 a program holds, and
+    split its output's columns four ways, its scores formed four times (3.16x FlashAttention's time,
+    M-EM-70c)."""
+
     ring_slots: int | None = None
     """The slots each stream's ring holds whatever stages a launch asks (`streams`), where it fixes them (a
     TPU core's two); None where the ring is the launch's stages."""
@@ -1615,6 +1624,8 @@ class Transport[Allocated, Opened](abc.ABC):
         `resources.Scope.after` counts them), the program's otherwise."""
         if not after_walks:
             return self.program_scoped(body, *allocations, streams=streams)
+        if self.stages_over_rings and not self.walks_scoped:
+            return self._scoped_over_rings(body, allocations, streams, after_walks)
         if self.walks_scoped:
             # The after-walks scope is the program's own kind (`program_scoped`: collective where its
             # consumers share one).
@@ -1628,6 +1639,35 @@ class Transport[Allocated, Opened](abc.ABC):
             return body(*refs[:held], streams=streams, after=lambda fn: fn(*refs[held:]))
 
         return self.program_scoped(program, *allocations, *after_walks, streams=streams)
+
+    def _scoped_over_rings(self, body, allocations: tuple, streams: dict, after_walks: tuple):
+        """`scoped` where the tiles after the walks share the rings' slots (`stages_over_rings`): every ring's
+        slots and those tiles one union, the rings' barriers apart, and `body` given `after` and `walked`.
+        The order a tile is written in: a consumer's last product reads its slot (mma.sync's loads are its
+        own; a warpgroup MMA's awaited before its accumulator finishes), then it arrives at `walked`'s
+        barrier, of as many arrivals as a ring's slot has readers; a tile is written only after every
+        consumer's arrival, so after every read of every slot, and no load lands past a consumer-fed walk's
+        last step. Each consumer passes `walked` once, before its first write `after`."""
+        names = tuple(streams)
+        slots = tuple(streams[name]["smem"] for name in names)
+        rest = {name: {key: value for key, value in streams[name].items() if key != "smem"} for name in names}
+        readers = streams[names[0]]["consumed"].num_arrivals
+        held = len(allocations)
+
+        def program(*refs, streams):
+            (ring_slots, staged), passed = refs[held], refs[held + 1]
+            rings = {name: {**streams[name], "smem": slot}
+                     for name, slot in zip(names, ring_slots, strict=True)}
+
+            def walked():
+                plgpu.barrier_arrive(passed)
+                plgpu.barrier_wait(passed)
+
+            return body(*refs[:held], streams=rings, after=lambda fn: fn(*staged), walked=walked)
+
+        union = plgpu.RefUnion(slots, tuple(after_walks))
+        return self.program_scoped(program, *allocations, union, plgpu.Barrier(num_arrivals=readers),
+                                   streams=rest)
 
     @abc.abstractmethod
     def program_scoped(self, body, *allocations, streams):

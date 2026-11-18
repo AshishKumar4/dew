@@ -234,7 +234,8 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
         stage = family.staged_memory((consumers, block_q, chunk), jnp.float32)
     elif not peaks and not _stores_through_query(family, width, value_width, dtype, out_dtype):
         stage = family.staged_memory((consumers, block_q, value_width), out_dtype or dtype)
-    after = [stage] if stage is not None and stages_after_walks(family) else []
+    # Or over its rings' slots where its consumers alone read them (`Family.stages_over_rings`).
+    after = [stage] if stage is not None and (stages_after_walks(family) or family.stages_over_rings) else []
     if stage is not None and not after:
         scoped.append(stage)
     if residuals or peaks:
@@ -1056,8 +1057,10 @@ def _status_stored(family: mosaic.Family, spec: algebra.Forward, state: algebra.
         # its columns, as `algebra.Coords.query_places` forms them (a row's iota takes no row layout).
         queries = (jnp.max(first + family.iota(state.acc.shape, 0), axis=-1)
                    if algebra.padded_queries(spec) is not None else None)
-        live = jnp.where(algebra.rewalks(spec, maximum, queries)[0], 1.0, 0.0)
-        status = (maximum, live, jnp.broadcast_to(jnp.max(live), live.shape))
+        rewalked = algebra.rewalks(spec, maximum, queries)[0]
+        # Its block's flag a vote of its warpgroup's predicates (`bar.red.or.pred`), no reduction scratch.
+        live, block = jnp.where(rewalked, 1.0, 0.0), jnp.where(jnp.any(rewalked), 1.0, 0.0)
+        status = (maximum, live, jnp.broadcast_to(block, live.shape))
     family.stored(tuple(map(family.as_row, status)), status_views, smem=row_smem)
 
 def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded, hooks: Hooks,
@@ -1128,7 +1131,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
               first, spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks, training: bool,
               anchors: tuple | None = None, interpret: bool, certified: tuple | None = None, kept=None,
               relay=None, codes: _Codes | None = None, value_width: int,
-              first_at: Callable | None = None, decided: mosaic.Decided | None = None):
+              first_at: Callable | None = None, decided: mosaic.Decided | None = None,
+              walked: Callable | None = None):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
@@ -1230,6 +1234,9 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         return state, trained, merged
 
     def store(spec: algebra.Forward, state: algebra.Partial, trained, merged: bool) -> None:
+        # Where its stages lie over the rings' slots, past every consumer's walk first (`Family.walked`).
+        if walked is not None:
+            walked()
         if merged:
             state = algebra.merge(spec, _initial(family, spec, hooked, state_rows), state)
         keep = None if kept is None else _kept_of(program, kept, rows=(row, head, first))
@@ -1828,7 +1835,7 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
     family, tiles, parts = program.family, program.tiles, program.parts
     consumers, block_q = tiles.consumers, tiles.block_q
 
-    def body(*refs, streams, after=None):
+    def body(*refs, streams, after=None, walked=None):
         refs = layout.unpacked(*refs)
         read = refs.read
         located = functools.partial(_program_views, program, refs, read, peaks=peaks, group=group, page=page,
@@ -1876,7 +1883,8 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
                       codes=None if refs.converted is None or read.hooked.scales is None else _Codes.of(
                           family, tuple(tile.at[index] for tile in refs.converted), read.hooked.scales,
                           row if read.sources is None else read.sources[row], lax.div(head, group),
-                              tiles.block_k, interpret), value_width=value_width, decided=refs.decided)
+                              tiles.block_k, interpret), value_width=value_width, decided=refs.decided,
+                      walked=walked)
 
         def producer():
             *_, views, _, own = placed()
@@ -1959,7 +1967,6 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                          registers=registers,
                          reducing_warpgroups=reducing(family, consumers,
                                                       hook_reduces(hooks) or hooks.output_mod is not None,
-                                                      flagged=flags,
                                                       magnitudes=(spec.headroom and not peaks
                                                                   and read.hooked.magnitudes is None))
                          )(query, key, value, *leaves)

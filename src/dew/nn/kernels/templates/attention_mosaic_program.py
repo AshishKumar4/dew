@@ -493,9 +493,12 @@ def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups:
     (`resources.Scope`)."""
     scoped, streams, *after = allocations
     held, walks = family.lifetimes(streams)
-    return resources.Scope(program=(scoped, *family.product_held(products), *held), walks=walks,
-                           after=tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ())),
-                           reduces=reduces, reducing_warpgroups=reducing_warpgroups,
+    tiles = tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ()))
+    # The tiles after the walks over the rings' slots where the family stages them so (`stages_over_rings`).
+    over = held if tiles and family.stages_over_rings and not family.walks_scoped else ()
+    return resources.Scope(program=(scoped, *family.product_held(products), *(() if over else held)),
+                           walks=walks, after=tiles, over=over, reduces=reduces,
+                           reducing_warpgroups=reducing_warpgroups,
                            addresses=family.product_addresses(products))
 
 
@@ -622,18 +625,18 @@ def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differ
     return not any(_primitives(jaxpr) & emission.APPROXIMATED for jaxpr in traced)
 
 
-def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, flagged: bool = False,
-             scaled: bool = False, magnitudes: bool = False) -> int:
+def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, scaled: bool = False,
+             magnitudes: bool = False) -> int:
     """The warpgroups of a launch of `consumers` whose arithmetic may reduce across warps implicitly, each
     reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a
     `hooked` launch's hook's (`hook_reduces`: a unit row, which the fork selects by a reduction across warps,
-    ledger 1428; an output hook's, untraced), a `flagged` launch's rows reduced to their block's flag (the
-    plain launch that flags its rows, `attention_mosaic_forward._Flags`), a `scaled` step's tile reduced
-    to its largest across the warps holding its rows (`algebra.running_parts`, an fp16 fused backward's), or
-    a scaled walk's keys' value `magnitudes`, its value tile's columns reduced across the warps holding them
-    (`Family.key_magnitudes`, `algebra.SCALED_WALK`), so every warpgroup of a launch that runs such a hook,
-    flags or scales; none otherwise."""
-    if flagged or scaled or magnitudes or hooked:
+    ledger 1428; an output hook's, untraced), a `scaled` step's tile reduced to its largest across the warps
+    holding its rows (`algebra.running_parts`, an fp16 fused backward's), or a scaled walk's keys' value
+    `magnitudes`, its value tile's columns reduced across the warps holding them (`Family.key_magnitudes`,
+    `algebra.SCALED_WALK`), so every warpgroup of a launch that runs such a hook or scales; none otherwise.
+    A launch's rows flagged to their block's flag reserve none: the flag is its warpgroup's vote
+    (`attention_mosaic_forward._status_stored`, `bar.red.or.pred`)."""
+    if scaled or magnitudes or hooked:
         return family.warpgroups(consumers)
     return 0
 
