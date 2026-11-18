@@ -17,6 +17,7 @@ case's generation with the template named, the route its choice reports the temp
 
 import itertools
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -114,8 +115,7 @@ def values_product(values, sizes, wide=jnp.float32):
 
 
 @cell("mxfp8", covers=lambda case: dict(zip(AXES["mxfp8"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def an_mxfp8_product_is_on_par(case: tuple[str, ...]) -> None:
     """The block-scaled product of `case` on its GPU through the template on par with the decoded operands'
