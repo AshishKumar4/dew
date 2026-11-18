@@ -83,10 +83,6 @@ def _identity_map(rows):
     return rows
 
 
-def _odd(row) -> bool:
-    return bool(row["id"] % 2)
-
-
 def _chain(read: str, *, shard_rows: int = 3):
     """Ten records, shuffled, read `read`, an objective making `id % 3 + 1` rows of each (`Questioned`),
     in batches of four."""
@@ -190,17 +186,18 @@ def test_a_read_whose_count_would_change_its_rows_counts_no_pass_and_reads_as_be
 
 
 def test_a_take_of_the_chains_own_where_the_count_marks_reads_each_share_as_counting_none():
-    """A take of the chain's own before a filter, where a run counting its passes marks them, read by two
-    shares: each share reads the records it reads counting none, the take no bound of the run's
-    (`MarkCounted`, `examples_limit`), where the take with the mark after it read as the run's bound was
+    """A take of the chain's own before a step rejecting some records (`Keeps`), where a run counting its
+    passes marks them, read by two shares: each share reads the records it reads counting none, the take
+    no bound of the run's (`MarkCounted`, `examples_limit`), where the take with the mark after it read as the run's bound was
     dealt to the shares as quotas of their own (the theme's re-review, F1)."""
     import numpy as np
+    from data_support import Keeps
 
     from dew.data import Memory
     from dew.data.pipeline import Pipeline
 
-    chain = Pipeline(Memory({"id": np.arange(1, 11, dtype=np.int32)}, shard_rows=3)).take(5).filter(
-        _odd).read("indexed").batch(2)
+    ids = np.arange(1, 11, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids}, shard_rows=3)).take(5).map(Keeps(2)).read("indexed").batch(2)
     plain, counting = (_loader(chain, counting=asked, expands=False) for asked in (False, True))
     assert counting.pass_examples == 5
     for share in range(2):
