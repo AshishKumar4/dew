@@ -242,11 +242,12 @@ class Read:
                                             for index in forwarded])
 
 
-def _unforwarded(traced: jcore.ClosedJaxpr, computed: tuple[bool, ...], variables, compute) -> tuple:
-    """The results of `traced`, a read's one trace (`Read`), that are no input as given, in their order:
-    its equations evaluated over the inputs' leaves, the read's Python run no second time."""
-    results = jcore.jaxpr_as_fun(traced)(*jax.tree.leaves((variables, compute)))
-    return tuple(leaf for leaf, made in zip(results, computed, strict=True) if made)
+def _unforwarded(traced: jcore.Jaxpr, computed: tuple[bool, ...], variables, compute) -> tuple:
+    """The results of `traced`, a read's one trace (`Read`; a Jaxpr carries its constants on JAX 0.12),
+    that are no input as given, in their order: its equations evaluated over the inputs' leaves, the read's
+    Python run no second time."""
+    read = jcore.jaxpr_as_fun(traced)(*jax.tree.leaves((variables, compute)))
+    return tuple(leaf for leaf, made in zip(read, computed, strict=True) if made)
 
 
 def outcome_of(step: jax.Array, clock: jax.Array | None, microstep: jax.Array, advanced: jax.Array,
