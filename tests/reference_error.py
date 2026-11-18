@@ -667,6 +667,9 @@ def _local_functions_known(value, at: str, known: dict[int, Any], walking: tuple
         return
     if isinstance(value, functools.partial):
         parts = (value.func, *value.args, *value.keywords.values())
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        # A record (the gate's window loop and run-to-run declaration among them): its fields.
+        parts = tuple(getattr(value, field.name) for field in dataclasses.fields(value))
     elif isinstance(value, tuple):
         parts = value
     elif isinstance(value, types.FunctionType) and "<locals>" in value.__qualname__:
