@@ -55,15 +55,18 @@ class Tcgen05Placed(Tcgen05Rings):
     across the walk (`accumulated`), rescaled there by the consumer a block of columns at a time; each
     hand-off a signal of its own (the logits' `scored`, the weights' `weighed`, the sums' `summed`), waited
     at its turn's phase, no commit of one behind a wait on another's barrier. Its products fill tcgen05's
-    128 lanes, where the chunks' 64-row products fill half (`CHUNKS`). Its consumer serves one walk
-    (`consumers`), its loads the producer warp's and its products the issuer warp's (`roles`)."""
+    128 lanes, where the chunks' 64-row products fill half (`CHUNKS`). Up to two consumer warpgroups
+    (`consumers`), each a query tile's walk over the program's one key walk, their products issued in turn
+    (`issuing`: FlashAttention 4's two softmax warpgroups, cuDNN's, each one's softmax under the other's
+    products), where tensor memory holds both's accumulators (`product_columns`); its loads the producer
+    warp's and its products the issuer warp's (`roles`)."""
 
     name = "tcgen05.rows"
     places_on_role = True
     issues_ahead = True
     rescales_kept = True
     rewalks = False
-    consumers = 1
+    consumers = 2
 
     products_in = Tcgen05ChunksIssuer.products_in
     _scoped = Tcgen05ChunksIssuer._scoped
@@ -159,17 +162,19 @@ class Tcgen05Placed(Tcgen05Rings):
     def product_addresses(self, products: tuple | None) -> int:
         return 0 if products is None else resources.TMEM_ADDRESS_BYTES
 
-    def _signals(self) -> tuple[Signal, Signal, Signal]:
-        """The building role's hand-offs (`product_scratch`'s): the logits', the weights', the sums'."""
-        found, role = self._scoped(), mosaic.ROLE.get()
+    def _signals(self, consumer: int | None = None) -> tuple[Signal, Signal, Signal]:
+        """A consumer's hand-offs (`product_scratch`'s), the building role's where None: the logits', the
+        weights', the sums'."""
+        found, role = self._scoped(), mosaic.ROLE.get() if consumer is None else consumer
         return (self.signals(2).opened(found["scored"][role]), self.signals(2).opened(found["weighed"][role]),
                 self.signals(1).opened(found["summed"][role]))
 
-    def _turns(self, name: str) -> tuple[Accumulator, ...]:
-        """The building role's two turns of the `name` tiles (`product_scratch`'s `LOGITS` or `WEIGHTS`), each
-        its scope's shape and dtype."""
-        return tuple(Accumulator(ref, tuple(ref.shape), dtype=ref.dtype)
-                     for ref in self._scoped()[name][mosaic.ROLE.get()])
+    def _turns(self, name: str, consumer: int | None = None) -> tuple[Accumulator, ...]:
+        """A consumer's two turns of the `name` tiles (`product_scratch`'s `LOGITS` or `WEIGHTS`), the
+        building role's where None, each its scope's shape and dtype."""
+        role = mosaic.ROLE.get() if consumer is None else consumer
+        refs = self._scoped()[name][role]
+        return tuple(Accumulator(ref, tuple(ref.shape), dtype=ref.dtype) for ref in refs)
 
     def scored(self, declared: mosaic.Product, lhs, index, slots, shape: tuple[int, int]) -> jax.Array:
         # The issuer's logits of the step (`issuing`), awaited at its turn and read in tensor memory's own
@@ -246,36 +251,71 @@ class Tcgen05Placed(Tcgen05Rings):
         pl.when(hi > lo)(lambda: summed.wait(summed.turn(hi - lo - 1)))
         return carry, kept
 
-    def issuing(self, streams, products: Sequence[mosaic.Product], lo, hi, *, first, lefts: Mapping,
-                ready) -> None:
-        # Once the query is in (`ready`), the walk's steps as `issued` runs them, each product's operands'
-        # slots given back by its commit (`CommittedRing`): a step's logits fresh into their turn's
-        # accumulator, its weighted values onto the sums once the consumer gives the step's weights (the
-        # logits' turn is free then: the consumer read it before giving the step before's weights), but at
-        # the walk's first step, whose sums are its product's alone.
+    def issuing(self, streams, products: Sequence[mosaic.Product], lo, hi, *, first,
+                lefts: Sequence[Mapping], ready: Sequence, reaches: Sequence[tuple] | None = None) -> None:
+        # Once every consumer's query is in (`ready`, one a consumer), the walk's steps as `issued` runs them,
+        # each product's operands' slots given back by its commit (`CommittedRing`): a step's key slot taken
+        # once for every consumer's logits, fresh into each one's turn's accumulator, then its value slot once
+        # for each one's weighted values onto its sums as it gives the step's weights (its logits' turn free
+        # then: it read it before giving the step before's weights), but at its walk's first step, whose sums
+        # are its product's alone. Consumers' own steps `reaches` (each a query tile's keys, a causal walk's
+        # longer the later the tile) within the program's `lo` to `hi`: a consumer's products issued at its
+        # own steps alone, at its own turn's parity, two consumers' query tiles of 128 rows over one key
+        # walk in turn (FlashAttention 4's ping-pong of two softmax warpgroups).
         scores, weighted = placed_products(products)
-        scored, weighed, summed = self._signals()
         keys, values = streams[scores.right], streams[weighted.right]
-        lhs = lefts[scores.left]
-        logits, weights = self._turns(scores.into), self._turns(WEIGHTS)
-        held = self._scoped()[weighted.into][mosaic.ROLE.get()]
-        sums = Accumulator(held, tuple(held.shape))
+        served = range(len(lefts))
+        reaches = tuple(reaches) if reaches is not None else ((lo, hi),) * len(lefts)
+        signals = tuple(self._signals(consumer) for consumer in served)
+        logits = tuple(self._turns(scores.into, consumer) for consumer in served)
+        weights = tuple(self._turns(WEIGHTS, consumer) for consumer in served)
+        held = self._scoped()[weighted.into][:len(lefts)]
+        sums = tuple(Accumulator(each_held, tuple(each_held.shape)) for each_held in held)
+        lhs = tuple(left[scores.left] for left in lefts)
+
+        def each(index, turn: int, consumer: int, issue: Callable[[jax.Array, int], None]) -> None:
+            # A consumer's product of step `index`: at the program's own turn where it walks every step (one
+            # consumer's), else where its walk takes the step, at its own step's parity.
+            start, end = reaches[consumer]
+            if len(lefts) == 1:
+                issue(index - start, turn)
+                return
+            n = index - start
+            for own in (0, 1):
+                pl.when((index >= start) & (index < end) & (n % 2 == own))(lambda own=own: issue(n, own))
 
         def score(index, turn: int) -> None:
             ring = keys.turn(index - first)
             right = keys.acquire(ring)
-            self.products(logits[turn], lhs, right.T if scores.transposed else right, accumulate=False)
-            scored.committed(scored.turn(index - lo))
+            right = right.T if scores.transposed else right
+            for consumer in served:
+                def logit(n, own, consumer=consumer):
+                    self.products(logits[consumer][own], lhs[consumer], right, accumulate=False)
+                    scored = signals[consumer][0]
+                    scored.committed(scored.turn(n))
+
+                each(index, turn, consumer, logit)
             keys.release(ring)
 
         def weigh(index, turn: int) -> None:
-            n, ring = index - lo, values.turn(index - first)
-            weighed.wait(weighed.turn(n))
-            self.products(dataclasses.replace(sums, accumulate=n > 0), weights[turn], values.acquire(ring))
-            summed.committed(summed.turn(n))
+            # The value slot awaited after one consumer's weights, as ever, and before many consumers' (each
+            # its own wait at its own step).
+            ring = values.turn(index - first)
+            right = None if len(lefts) == 1 else values.acquire(ring)
+            for consumer in served:
+                def weighted_values(n, own, consumer=consumer):
+                    _, weighed, summed = signals[consumer]
+                    weighed.wait(weighed.turn(n))
+                    taken = values.acquire(ring) if right is None else right
+                    self.products(dataclasses.replace(sums[consumer], accumulate=n > 0),
+                                  weights[consumer][own], taken)
+                    summed.committed(summed.turn(n))
+
+                each(index, turn, consumer, weighted_values)
             values.release(ring)
 
-        plgpu.barrier_wait(ready)
+        for barrier in ready:
+            plgpu.barrier_wait(barrier)
         mosaic.looped(issued(score, weigh, lo, hi), None, ())
 
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
@@ -492,6 +532,8 @@ class Tcgen05Walked(Tcgen05Placed):
     of its own (the scores' `scored`, the given lefts' `formed`, the walk's end `finished`)."""
 
     rescales_kept = False
+    # Its compute warpgroups' count the walked launch's own (`MosaicBackward`), not the forward rows' two.
+    consumers = 1
     kept_sums: tuple[str, ...] = ()
     """The sums the walk keeps in tensor memory across it, in its shapes' order (`accumulated`)."""
 

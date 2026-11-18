@@ -1975,16 +1975,23 @@ def _per_role(family: mosaic.Family, consumers: int, consumer: Callable) -> Call
 
 def _issuer(program: _Program, streams, refs, placed: Callable) -> Callable | None:
     """The products' role where its family places them on one (`Issuer.places_on_role`): the walk's steps it
-    streams (`_placed`), each product issued a step ahead of the consumer that reads it, the query's stage its
-    logits' left once its load is in (its one consumer's); None where the consumers issue their own."""
+    streams (`_placed`), each product issued a step ahead of the consumer that reads it, each consumer's
+    query stage its logits' left once its load is in; None where the consumers issue their own."""
     family = program.family
     if not family.places_on_role:
         return None
 
     def issuer():
-        *_, own = placed()
-        family.issuing(streams, program.products, *own, first=own[0], lefts={"query": refs.q_smem.at[0]},
-                       ready=_query_barriers(refs.q_loaded, 0, 1))
+        # Each consumer's query tile its logits' left and its own keys' reach within the program's walk.
+        row, _, _, _, pair_first, own = placed()
+        served = range(program.tiles.consumers)
+        family.issuing(streams, program.products, *own, first=own[0],
+                       lefts=tuple({"query": refs.q_smem.at[consumer]} for consumer in served),
+                       ready=tuple(_query_barriers(refs.q_loaded, consumer, 1) for consumer in served),
+                       # One consumer's reach the program's own walk.
+                       reaches=None if len(served) == 1 else tuple(
+                           program.reach(pair_first + consumer * program.tiles.block_q, refs.read.spans,
+                                         row)[:2] for consumer in served))
 
     return issuer
 
