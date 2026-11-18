@@ -84,15 +84,14 @@ def _wrapped(angle):
     """A double-float angle `(hi, lo)` less its whole turns (`TWO_PI`, each turn's product exact, Dekker's),
     about [0, 2 pi): its rounding a turn's however long the document, as mamba_ssm's `angle_dt` holds it."""
     turns = jnp.floor(angle[0] * np.float32(1 / (2 * np.pi)))
-    whole, dropped = two_product(-turns, jnp.full_like(turns, TWO_PI[0]),
-                                 bit_split=turns.dtype == jnp.float32)
+    whole, dropped = two_product(-turns, jnp.full_like(turns, TWO_PI[0]), bit_split=True)
     return compensated_add(angle, (whole, dropped - turns * TWO_PI[1]))
 
 
 def _angles(dt, theta, continues):
     """Each token's angle `[B, S, H, R]` over its document as a double-float `(hi, lo)` pair: `dt theta`
-    (each its exact product, `two_product`'s bit split in fp32: a Veltkamp split multiplies `dt` by 4097
-    first, inf past 2^115, base review 9bc4326dd F1; float64's splitter overflows past 2^996 alone) summed
+    (each its exact product, `two_product`'s bit split: a Veltkamp split multiplies `dt` by `2^(p/2) + 1`
+    first, inf past 2^115 in fp32 and 2^996 in float64, base reviews 9bc4326dd F1, 1fe546a10 F1) summed
     from the document's first token through the token (`dt`
     zero where a token's turn acts on no state, `chunk_mamba3`) and less its whole turns once summed
     (`_wrapped`), in `dt`'s dtype: a double float's 48 bits hold a document's sum of turns of at most pi to
@@ -102,8 +101,7 @@ def _angles(dt, theta, continues):
     and its gradients to 2.1 times, where a double-float angle and its rotation of it (`rotated`'s
     `residual`) hold them under (row 7402)."""
     rates = jnp.broadcast_to(jnp.asarray(theta, dt.dtype), (*dt.shape, theta.shape[-1]))
-    high, low = two_product(jnp.broadcast_to(dt[..., None], rates.shape), rates,
-                            bit_split=dt.dtype == jnp.float32)
+    high, low = two_product(jnp.broadcast_to(dt[..., None], rates.shape), rates, bit_split=True)
     # A segmented sum: a token that begins a document drops what came before it.
     restarts = jnp.broadcast_to(~continues[:, :, None, None], high.shape)
     return _wrapped(scan.compensated(high, low=low, axis=1, restarts=restarts))
