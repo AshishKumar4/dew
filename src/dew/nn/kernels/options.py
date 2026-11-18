@@ -400,8 +400,9 @@ def lowering(platforms: tuple[str, ...]) -> Iterator[list[tuple[str, jax.stages.
         _LOWERING.reset(token)
 
 
-type Around = Callable[["OuterProgram", jax.stages.Compiled], contextlib.AbstractContextManager]
-"""What `running` runs each call's executable inside: given its program and the executable, a context."""
+type Around = Callable[["OuterProgram", jax.stages.Compiled, tuple, dict], contextlib.AbstractContextManager]
+"""What `running` runs each call's executable inside: given its program, the executable and the call's
+arguments (its static ones among them), a context."""
 
 _RUNNING: contextvars.ContextVar[tuple[Around, ...]] = _cache.untraced(
     contextvars.ContextVar("dew_running_programs", default=()))
@@ -411,10 +412,11 @@ _RUNNING: contextvars.ContextVar[tuple[Around, ...]] = _cache.untraced(
 def running(around: Around) -> Iterator[None]:
     """Within the block, each executable a call through Dew's compile point runs over arrays (one its
     program keeps, one compiled over shapes, one taken, or one compiled at the call) runs inside
-    `around(program, executable)`, and inside every enclosing block's, the outermost first: an admission
-    that refuses it by raising as it enters (a host run's rollout's, `dew.training.rollout.admitted`), or a
-    profile of its run. Nothing else of the call changes, and a call within `lowering`, which runs nothing,
-    enters none."""
+    `around(program, executable, args, kwargs)`, and inside every enclosing block's, the outermost first: an
+    admission that refuses it by raising as it enters (a host run's rollout's, `dew.training.rollout
+    .admitted`), or a profiled trial's record of what it ran (`dew.training.planning.Trials
+    .profiled_programs`). Nothing else of the call changes, and a call within `lowering`, which runs
+    nothing, enters none."""
     token = _RUNNING.set((*_RUNNING.get(), around))
     try:
         yield
@@ -708,7 +710,7 @@ class OuterProgram:
             return ready(*dynamic, **named)
         with contextlib.ExitStack() as stack:
             for around in arounds:
-                stack.enter_context(around(self, ready))
+                stack.enter_context(around(self, ready, args, kwargs))
             return ready(*dynamic, **named)
 
     def _shaped_for(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
@@ -831,6 +833,37 @@ class OuterProgram:
         with self._compiling:
             if key in self._executables:
                 self._ready[key] = executable
+
+    def guided(self, executable: jax.stages.Compiled, replacement: jax.stages.Compiled) -> None:
+        """`executable`, one this program holds, replaced by `replacement`, its compile again guided by a
+        profile of its runs (AutoPGLE's, `dew.training.planning.guided_compile`), wherever the program holds
+        it (kept, ready to run, or compiled over shapes) under the same key: its calls run the guided one
+        from here on. A replacement of other inputs' or outputs' types, placements or layouts, leaf by leaf,
+        is refused, as a guided compile is the same program. A collection (`collecting`) holding `executable`
+        by its digest keeps it."""
+        # Their leaves: a tree's static data may hold a closure each trace makes anew (a forward's pullback,
+        # `jax.vjp`'s), the same function of another object.
+        def stated(compiled):
+            return {name: jax.tree.leaves(tree) for name, tree in (
+                ("inputs", compiled.in_avals), ("input formats", compiled.input_formats),
+                ("outputs", compiled.out_info), ("output formats", compiled.output_formats))}
+        differs = {name: (held, guided) for (name, held), guided in zip(
+            stated(executable).items(), stated(replacement).values(), strict=True) if held != guided}
+        if differs:
+            raise ValueError(f"{self.called}'s guided compile states other {', '.join(differs)} than the "
+                             f"executable it replaces: {differs}")
+        with self._compiling:
+            for key, pending in list(self._executables.items()):
+                if pending.done() and pending.exception() is None and pending.result() is executable:
+                    settled: Future[jax.stages.Compiled] = Future()
+                    settled.set_result(replacement)
+                    self._executables[key] = settled
+            for key, ready in list(self._ready.items()):
+                if ready is executable:
+                    self._ready[key] = replacement
+            for abstract, (shaped, digest) in list(self._shaped.items()):
+                if shaped is executable:
+                    self._shaped[abstract] = (replacement, digest)
 
     def _released(self, key: Hashable, pending: Future[jax.stages.Compiled], failure: BaseException) -> None:
         """Fail the compile reserved under `key` (`_reserved`), the program keeping none."""

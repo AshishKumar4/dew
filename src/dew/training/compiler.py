@@ -70,6 +70,7 @@ from dew.training.planning import (
     Planned,
     PlanRefused,
     Trials,
+    guided_compile,
     held_objects,
     released,
     settled,
@@ -164,6 +165,9 @@ class HostStartup(NamedTuple):
     programs: int
     seconds: float
     by_backend: Mapping[str, Mapping[str, float]]
+    pgle: Mapping[str, int] | None = None
+    """Under JAX's AutoPGLE (`pgle_runs`), the trial steps its profile ran, its bytes and the accelerator's
+    programs compiled again guided by it (`StepCompiler._guided_host`); None where it is off."""
 
     @classmethod
     def joined(cls, passes: Sequence[HostStartup]) -> HostStartup:
@@ -189,7 +193,8 @@ class HostStartup(NamedTuple):
 
     def record(self) -> dict[str, JSON]:
         return {"names": list(self.names), "programs": self.programs, "seconds": self.seconds,
-                "by_backend": {name: dict(held) for name, held in self.by_backend.items()}}
+                "by_backend": {name: dict(held) for name, held in self.by_backend.items()},
+                "pgle": None if self.pgle is None else dict(self.pgle)}
 
 
 STEADY = 3
@@ -738,7 +743,10 @@ class StepCompiler[L, E]:
             if self.ahead is not None:
                 raise ValueError("a step compiled ahead runs where the devices hold the state; this layout "
                                  "keeps the variables on the host")
-            return Compiled(stepping.shape.split, step=self._compile_host(stepping, state, batch))
+            run = self._compile_host(stepping, state, batch)
+            if runs := pgle_runs():
+                self._guided_host(stepping, run, state, batch, trials, runs)
+            return Compiled(stepping.shape.split, step=run)
         held, self._unplaced = self._unplaced, None
         mesh = settings.device_mesh
         fit, headroom = (False, None) if held is None or held.signature != batch_signature(batch) else (
@@ -1198,8 +1206,7 @@ class StepCompiler[L, E]:
         assert self.host_startup is not None, "a host step's compile runs its startup pass"
         return self.host_startup
 
-    def _compile_host(self, stepping: Stepping, state: TrainState, batch: Batch
-                      ) -> CompiledStep:
+    def _compile_host(self, stepping: Stepping, state: TrainState, batch: Batch) -> HostRun:
         """The host step over `state` and `batch` (`_host_run`), its startup run before its first step: each
         of its steps' bodies, a sampled step's as well where the run inspects (`HostRun.startup`)."""
         run, held, cpu_batch = self._host_run(stepping, state, batch, stepping.settings.device_mesh)
@@ -1207,6 +1214,32 @@ class StepCompiler[L, E]:
             passes = [run.startup(held, cpu_batch, sampled) for sampled in run.bodies]
         self.host_startup = HostStartup.joined(passes)
         return run
+
+    def _guided_host(self, stepping: Stepping, run: HostRun, state: TrainState, batch: Batch,
+                     trials: Trials | None, runs: int) -> None:
+        """Under JAX's AutoPGLE, `run`'s steps profiled `runs` times on a trial (`trials`', or a copy of
+        `state` beside it, in host memory: `Trials.profiled_programs`), after its startup, as a device plan
+        is profiled before its run (`Planned.guided`); each program they ran on the accelerator compiled
+        again guided by the profile (`guided_compile`) and run in its executable's place
+        (`OuterProgram.guided`), so the run's steps run the guided programs and compile nothing. An empty
+        profile, a backend XLA profiles none of, guides nothing. Its count is the startup's record
+        (`HostStartup.pgle`)."""
+        accelerator = {device.platform for device in stepping.settings.device_mesh.devices.flat} - {"cpu"}
+
+        def on_accelerator(executable: jax.stages.Compiled) -> bool:
+            return any(device.platform in accelerator
+                       for sharding in (*jax.tree.leaves(executable.input_shardings),
+                                        *jax.tree.leaves(executable.output_shardings))
+                       for device in sharding.device_set)
+
+        trials = Trials(state, batch, owned=False) if trials is None else trials
+        profile, ran = trials.profiled_programs(run, runs, on_accelerator)
+        guided = ran if profile else []
+        for program, executable, lowered, relower in guided:
+            program.guided(executable, guided_compile(lowered, program.options, profile, relower))
+        assert self.host_startup is not None, "a host step's compile runs its startup pass"
+        self.host_startup = self.host_startup._replace(
+            pgle={"runs": runs, "bytes": len(profile), "programs": len(guided)})
 
     def _lowered_host(self, stepping: Stepping, state: TrainState, batch: Batch, target: str
                       ) -> list[tuple[str, jax.stages.Lowered]]:

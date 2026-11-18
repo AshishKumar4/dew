@@ -117,7 +117,17 @@ def centered():
                     {"first": "a", "second": "b"}),
 ], ids=["global-clip-scheduled-adam", "cross-leaf-mean", "masked-partition-state"])
 def test_complete_optimizer_tree_crosses_the_execution_boundary(optimizer):
-    placed = compiled_for(lambda layout: Trainer(Coupled(), optimizer, key=jax.random.key(4), layout=layout))
+    crossed(optimizer, "three updates across the execution boundary")
+
+
+def crossed(optimizer, label: str, devices=None):
+    """Three updates by `optimizer` of a run keeping its variables on the host on par from float64 with a
+    device run's (check 1, `layouts_agree`), each on `devices` where given, else on the process's."""
+    from dew.training import MeshSpec
+
+    mesh = {} if devices is None else {"mesh": MeshSpec().build(devices)}
+    placed = compiled_for(lambda layout: Trainer(Coupled(), optimizer, key=jax.random.key(4), layout=layout,
+                                                 **mesh))
 
     def run(layout, small, large):
         data = {"small": jnp.asarray(small), "large": jnp.asarray(large)}
@@ -131,7 +141,7 @@ def test_complete_optimizer_tree_crosses_the_execution_boundary(optimizer):
         rng = np.random.default_rng([127, seed])
         return np.float32(rng.uniform(.1, 1.)), np.float32(rng.uniform(10., 80.))
 
-    layouts_agree(run, draw, "three updates across the execution boundary", HOST, DEVICE)
+    layouts_agree(run, draw, label, HOST, DEVICE)
 
 
 def test_a_host_step_read_in_a_stated_split_is_on_par_with_the_devices_split_step():
@@ -1280,6 +1290,40 @@ def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_stat
     equal(trained.variables, expected.variables)
 
 
+@pytest.mark.tpu(reason="a TPU v6e prices the streamed step by its stated host link (row 7908)")
+def test_a_tpu_that_holds_only_the_streamed_step_streams_on_par_with_its_device_plan():
+    """A fresh bf16 fit on a v6e stated to hold the decoder's streamed step and not its device plan (its
+    memory between their needs, each its compiled program's arguments and temporaries there) takes the
+    streamed plan, priced by the TPU's host link, and trains its steps bit for bit as a run given the host
+    layout; and a host step on the TPU is on par with its device plan's from float64 (check 1, `crossed`):
+    the streamed layout the planner may now choose on a TPU, run on one."""
+    from model_support import memory_limited_to
+
+    from dew.telemetry import instrumentation as memory
+    from dew.training.ahead import stand_in_gpus
+
+    def on_one(trainer: Trainer) -> Trainer:
+        # One TPU, whose CPU companion a TPU host holds whatever its CPU device count.
+        trainer.device_mesh = trainer.mesh.build(jax.devices()[:1])
+        return trainer
+
+    roomy = on_one(streaming_decoder(dtype=jnp.bfloat16))
+    roomy.fit(streaming_data(), steps=1, log_every=100)
+    device = memory.compiled_memory(roomy.executable)
+    held = on_one(streaming_decoder(Layout(host=("variables",)), dtype=jnp.bfloat16))
+    start = held.place()[0]
+    whole = memory.compiled_memory(streamed_program(held, start, *memory_streamed_arguments(held, start)))
+    between = memory_limited_to((device.argument + device.temp + whole.argument + whole.temp) // 2)
+    with stand_in_gpus(jax.devices()[:1], between):
+        chosen = on_one(streaming_decoder(dtype=jnp.bfloat16))
+        trained = chosen.fit(streaming_data(), steps=2, log_every=100)
+    given = on_one(streaming_decoder(Layout(host=("variables",)), dtype=jnp.bfloat16))
+    expected = given.fit(streaming_data(), steps=2, log_every=100)
+    assert chosen.host_master and chosen.layout_choice.streamed is not None, chosen.layout_choice
+    equal(trained.variables, expected.variables)
+    crossed(optax.adam(.01), "three updates across a TPU's execution boundary", jax.devices()[:1])
+
+
 def test_a_run_that_chose_to_stream_resumes_streamed_where_it_would_have_stood(tmp_path):
     """A run that chose to stream its parameters from the host (its devices holding that step alone),
     stopped after its first step and resumed on devices that hold either step, resumes in its checkpoint's
@@ -1511,7 +1555,7 @@ def test_each_executable_runs_inside_every_enclosing_blocks_context_cached_or_no
 
     def entered(name):
         @contextlib.contextmanager
-        def around(program, executable):
+        def around(program, executable, args, kwargs):
             ran.append(name)
             yield
             jax.effects_barrier()
@@ -1524,13 +1568,68 @@ def test_each_executable_runs_inside_every_enclosing_blocks_context_cached_or_no
     class Refused(Exception):
         pass
 
-    def refused(program, executable):
+    def refused(program, executable, args, kwargs):
         raise Refused
 
     with running(refused), pytest.raises(Refused):
         counted(values)
     jax.effects_barrier()
     assert ran.count("run") == 2, ran
+
+
+def test_a_host_step_under_autopgle_runs_its_programs_guided_by_a_trials_profile():
+    """Under JAX's AutoPGLE a host step, whose programs Dew compiles ahead of its run and no jit call
+    profiles, steps on a trial after its startup, profiled, and each program those steps ran, compiled
+    again guided by the profile, runs in its executable's place: here every program, handed one
+    instruction's profile (`COST`), which a CPU's compile takes and does not read, its guided compile's
+    optimized program the unguided one's text for text, so the run steps as the unguided run does, bit for
+    bit (testing.md:109: one program), compiling nothing past its startup."""
+    import re
+
+    from test_plan import COST, autopgle
+
+    from dew.telemetry.compiles import executable_only
+    from dew.training.planning import Trials, guided_compile
+
+    ran = []
+
+    class Handed(Trials):
+        """Trials whose profile is `COST`, every program the steps ran handed it, a CPU's among them."""
+
+        def profiled_programs(self, step, runs, platform):
+            _, programs = super().profiled_programs(step, runs, lambda executable: True)
+            ran.extend(programs)
+            return COST, programs
+
+    def stepped(trials):
+        trainer = Trainer(Tiny(composite=True), optax.adamw(.03), key=jax.random.PRNGKey(9), layout=HOST)
+        state, _, _ = trainer.place()
+        batch = placed_batch(trainer, batches()[0])
+        held = None if trials is None else trials(state, batch)
+        step = trainer.compile(state, batch, held)
+        state = state if held is None else held.state
+        for _ in range(3):
+            with executable_only():
+                state, *_ = step(state, batch)
+        return trainer, state
+
+    _, unguided = stepped(None)
+    with autopgle(2):
+        trainer, guided = stepped(Handed)
+    record = trainer._compiler.host_startup.record()["pgle"]
+    assert record["runs"] == 2 and record["bytes"] == len(COST) and record["programs"] == len(ran) > 0, record
+    # The premise of the bitwise claim: each guided compile is the program it replaces, its optimized HLO's
+    # instructions alike, their source metadata (a trace's stack frames and the table naming them) aside.
+    def instructions(executable) -> list[str]:
+        program = executable.as_text().split("\nFileNames")[0]
+        return re.sub(r", metadata=\{[^}]*\}", "", program).splitlines()
+
+    for program, executable, lowered, relower in ran:
+        mine, theirs = instructions(guided_compile(lowered, program.options, COST, relower)), instructions(
+            executable)
+        differing = [pair for pair in zip(mine, theirs, strict=False) if pair[0] != pair[1]][:4]
+        assert not differing and len(mine) == len(theirs), (program.called, len(mine), len(theirs), differing)
+    equal(guided.variables, unguided.variables)
 
 
 def test_a_host_step_lowers_for_a_gpu_here_compiling_nothing():

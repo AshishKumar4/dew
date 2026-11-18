@@ -234,7 +234,7 @@ def admitted(mesh: Mesh, held: Held):
     seen: dict[int, jax.stages.Compiled] = {}
 
     @contextlib.contextmanager
-    def heard(program, executable):
+    def heard(program, executable, args, kwargs):
         if id(executable) not in seen:
             admit(program, executable)
             seen[id(executable)] = executable
