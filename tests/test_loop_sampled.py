@@ -1,6 +1,7 @@
 """A looped model's pass count drawn per microbatch from a bounded law
 (`dew.training.phase_passes.SampledPasses`, row 7660)."""
 
+import dataclasses
 import math
 import time
 
@@ -116,21 +117,25 @@ def words(key) -> tuple[int, ...]:
     return tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
 
 
-def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count():
+@pytest.mark.parametrize("trained", [None, 2], ids=["every-pass", "last-two"])
+def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trained):
     """A run drawing its loop's pass count per microbatch, two microbatches an update (`accumulation` 2),
     steps each microbatch as a run of the model at its drawn count steps it (invariant 1): from the same
     state over the same batch, its loss, its metrics and its stepped state, an update's window pooled
     over microbatches of other counts and committed by the second's, the same bits as that count's run's,
-    each count's program its own over the one state. Its counts are its key's draws at the microbatches'
-    positions, and it draws more than one count."""
-    model = looped(steps=CAP)
+    each count's program its own over the one state. A loop training through its last two passes
+    (`backprop_steps`) trains a count below them through them all. Its counts are its key's draws at the
+    microbatches' positions, and it draws more than one count."""
+    model = looped(steps=CAP).with_passes(CAP, backprop_steps=trained)
+    assert model is not None
     batch = token_batch()
     sampled = trainer_of(model, sampled_passes=TRAINED, accumulation=2)
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
     assert isinstance(step, SampledStep)
     interval = Interval(time.time(), None, microbatches=0)
-    alone = {count: trainer_of(model.with_passes(count), accumulation=2) for count in range(1, CAP + 1)}
+    alone = {count: trainer_of(model.with_passes(count, backprop_steps=trained and min(trained, count)),
+                               accumulation=2) for count in range(1, CAP + 1)}
     programs: dict = {}
     drawn = []
     for index in range(8):
@@ -181,48 +186,61 @@ def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
     assert lacking.microbatches == 16
 
 
-class Tokens:
-    """`tokens` every step, a stream that keeps its place (`dew.data.dataset.Checkpointable`): the steps it
-    handed over."""
-
-    def __init__(self, tokens):
-        self.tokens, self.steps = jnp.asarray(tokens), 0
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        self.steps += 1
-        return {"text": self.tokens}
-
-    def get_state(self) -> bytes:
-        return str(self.steps).encode()
-
-    def set_state(self, state: bytes) -> None:
-        self.steps = int(state)
-
-
 def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path):
-    """A sampled run of four steps stopped after two and resumed lands, bit for bit, where the run never
-    stopped lands: its resume draws on from the microbatches its checkpoint counted."""
+    """A sampled run of four steps over data read in phases (`PhasedStream`), stopped after two and resumed,
+    lands, bit for bit, where the run never stopped lands: each microbatch draws its count whatever its
+    data's phase, and its resume draws on from the microbatches its checkpoint counted."""
     from test_data_mixtures import assert_same, parameters
+    from test_pass_weights import phased_draw, phased_loader
 
-    from dew.data.dataset import Loader
     from dew.training import Checkpoints
 
-    tokens = np.asarray(token_batch(0)["text"])
-    loader = Loader(train=lambda partition: Tokens(tokens), val=None, records=None, batch=len(tokens))
+    tokens, _ = phased_draw(0)
 
     def fitted(directory, steps):
         return trainer_of(looped(steps=CAP), sampled_passes=TRAINED,
                           checkpoints=Checkpoints(str(directory), keep=8)).fit(
-            loader, steps=steps, log_every=100, checkpoint_every=1)
+            phased_loader(tokens), steps=steps, log_every=100, checkpoint_every=1)
 
     whole = fitted(tmp_path / "whole", 4)
     fitted(tmp_path / "resumed", 2)
     resumed = fitted(tmp_path / "resumed", 4)
     assert int(resumed.step) == 4
     assert_same(parameters(whole), parameters(resumed), "the resumed sampled run is not the run unstopped")
+
+
+def test_a_window_saved_a_qk_call_each_steps_on_as_its_largest():
+    """A looped run under QK-Clip whose window an earlier format saved holding each pass's logit maxima a
+    call each, its pooled maxima their largest, steps on as the run holding them as one does
+    (`calls_folded`): its update lands bit for bit where the uninterrupted run's does."""
+    from test_data_mixtures import assert_same, parameters
+    from test_pass_weights import phased_draw, phased_loader
+
+    from dew.optim import scale_by_qk_clip
+    from dew.training import Layout, Trainer
+
+    tokens, _ = phased_draw(0)
+
+    def fitted(state, steps):
+        clipped = optax.chain(scale_by_qk_clip(1.0), optax.sgd(0.1))
+        trainer = Trainer(LMObjective(looped(steps=CAP), 16), clipped, key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0), accumulation=2)
+        return trainer.fit(phased_loader(tokens), state=state, steps=steps, log_every=100)
+
+    whole = fitted(None, 2)
+    half = fitted(None, 1)
+    window = half.accumulation
+    assert window is not None and window.qk_stats is not None
+
+    def called_twice(node):
+        if isinstance(node, dict):
+            return {name: called_twice(value) for name, value in node.items()}
+        (held,) = node
+        return (held, held - 1) if jnp.issubdtype(held.dtype, jnp.inexact) else (held, held)
+
+    earlier = dataclasses.replace(half, accumulation=dataclasses.replace(
+        window, qk_stats=called_twice(window.qk_stats)))
+    assert_same(parameters(whole), parameters(fitted(earlier, 2)), "the window saved a call each")
 
 
 def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
@@ -327,21 +345,23 @@ def test_a_sampled_run_whose_window_replays_its_microbatches_is_refused():
     from dew.nn.backbones.decoder_stack import Loop
     from dew.objectives.routing import ExpertBalance
     from dew.training import Layout, Trainer
+    from dew.training.diloco import DiLoCo
 
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
                               max_seq_len=128, attention_impl="xla", mixture=Mixture(experts=4, top_k=2),
                               loop=Loop(CAP, layers=(1, 2)))
 
-    def trainer(split):
+    def trainer(split, **options):
         return Trainer(LMObjective(model, 16, balance=ExpertBalance(aux_loss_alpha=0.01)), optax.sgd(0.1),
                        key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
-                       sampled_passes=TRAINED, split=split)
+                       sampled_passes=TRAINED, split=split, **options)
 
     batch = token_batch()
-    replayed = trainer(2)
-    state, _, _ = replayed.place()
-    with pytest.raises(ValueError):
-        replayed.compile(state, batch)
+    # A run's own window, and DiLoCo's groups' (`TrainState.window`).
+    for replayed in (trainer(2), trainer(2, diloco=DiLoCo(every=2, rate=0.7, momentum=0.9))):
+        state, _, _ = replayed.place()
+        with pytest.raises(ValueError):
+            replayed.compile(state, batch)
     whole = trainer(1)
     state, _, _ = whole.place()
     assert isinstance(whole.compile(state, batch), SampledStep)

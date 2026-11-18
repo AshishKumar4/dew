@@ -199,6 +199,7 @@ from dew.training.transaction import (
     pooled_by_mean,
     refuse_unpassed_progress,
     traced_loss,
+    window_calls_folded,
 )
 
 _log = logging.getLogger(__name__)
@@ -970,6 +971,7 @@ class Trainer(Generic[Loss, Effects]):
                 fill=jnp.zeros((), jnp.int32))
 
         pending = jax.eval_shape(allocate)
+        state = dataclasses.replace(state, accumulation=window_calls_folded(state.accumulation))
         # The microbatches the state's window holds are read only where it is replaced (`kept_window`).
         if kept_window(state.accumulation, pending, read=not shape_only):
             return state

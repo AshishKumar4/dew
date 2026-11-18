@@ -636,12 +636,24 @@ def compact_qk(tree):
             return jnp.max(leaf, axis=-2, keepdims=True) if leaf.ndim > 1 else leaf
         return jnp.max(leaf) if leaf.ndim else leaf
 
-    def called(tree: Mapping) -> dict:
-        return {name: called(value) if isinstance(value, Mapping) else
-                (functools.reduce(jnp.maximum, value),) if isinstance(value, tuple) and value else value
-                for name, value in tree.items()}
-    compacted = jax.tree_util.tree_map_with_path(compact, tree)
-    return called(compacted) if isinstance(compacted, Mapping) else compacted
+    return calls_folded(jax.tree_util.tree_map_with_path(compact, tree))
+
+
+def calls_folded(tree):
+    """`tree`, a QK tree, its layers' sown tuples of several calls (`dew.batch.sown_calls`) held as one,
+    their elementwise largest, a shape's as its first call's: the tree `compact_qk` makes."""
+    def folded(node: Mapping) -> dict:
+        return {name: folded(value) if isinstance(value, Mapping) else
+                ((value[0],) if isinstance(value[0], jax.ShapeDtypeStruct)
+                 else (functools.reduce(jnp.maximum, value),)) if isinstance(value, tuple) and value
+                else value for name, value in node.items()}
+    return folded(tree) if isinstance(tree, Mapping) else tree
+
+
+def window_calls_folded(window: Accumulation | None) -> Accumulation | None:
+    """`window` holding its QK maxima as `compact_qk` makes them (`calls_folded`), from one a run saved a
+    call each (a looped layer's passes, before windows held one), its pooled maxima kept."""
+    return None if window is None else dataclasses.replace(window, qk_stats=calls_folded(window.qk_stats))
 
 
 def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_scale_lib.DynamicScale | None:

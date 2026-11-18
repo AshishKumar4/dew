@@ -42,11 +42,13 @@ def _counted[L, E](objective: Objective[L, E], passes: int) -> list[nn.Module]:
 
 
 def _passed(module: nn.Module, passes: int) -> nn.Module:
-    """`module` run `passes` times where it loops (`Looping.with_passes`), else as it is."""
+    """`module` run `passes` times where it loops (`Looping.with_passes`), else as it is; a count below the
+    final passes its loop trains through (`Loop.backprop_steps`) trains through them all."""
     if not _looped(module):
         return module
-    assert isinstance(module, Looping)
-    passed = module.with_passes(passes)
+    assert isinstance(module, Looping) and isinstance(module, Looped) and module.loop is not None
+    trained = module.loop.backprop_steps
+    passed = module.with_passes(passes, backprop_steps=None if trained is None else min(trained, passes))
     assert isinstance(passed, nn.Module), "a looped module keeps its loop"
     return passed
 
@@ -94,7 +96,10 @@ class PhasePasses[L, E]:
 
     def count(self, batch: Batch) -> int | None:
         """The count of the phase `batch` was read in (its host `PHASE`, phase 0 where its data has none);
-        None where the run states no counts. A phase past the counts is refused, naming both."""
+        None where the run states no counts; the cap where it draws one per microbatch, whatever phase its
+        data reads. A phase past the counts is refused, naming both."""
+        if self.sampled is not None:
+            return self.sampled.cap
         if not self.counts:
             return None
         phase = batch[PHASE].index if PHASE in batch else 0

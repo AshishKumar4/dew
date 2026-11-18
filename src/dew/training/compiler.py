@@ -561,8 +561,9 @@ class StepCompiler[L, E]:
         sampled, planned = self.phase_passes.sampled, cap.planned
         assert sampled is not None and planned is not None, "a sampled count's cap compiled on the devices"
         # A window that pools its microbatches by their mean holds their gradient's sum and its mass
-        # (`Trainer._initialize_accumulation`); one that replays them holds their batches instead.
-        window = planned.candidate.prepared.accumulation
+        # (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that replays
+        # them holds their batches instead.
+        window = planned.candidate.prepared.window
         if window is not None and window.mass is None:
             raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
                              "its update replays each microbatch at the count that closes it: a pass count "
