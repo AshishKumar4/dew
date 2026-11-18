@@ -823,6 +823,29 @@ def test_a_ladder_holds_no_rung_its_assembler_caps_otherwise():
 
 
 @COMPILES_ON_CPU
+def test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks():
+    """An A100's backward at mma.sync's fewer rows (32 a consumer, `fewer_rows`) from a 128-row query block:
+    its ladder (`MosaicBackward.ladder`) offers the query blocks its derivation walks at those rows
+    (`_sides` on the layout it derives on, not `bundle_of`'s, whose warps are already arranged for 32
+    rows), each one its launch takes within the config's cap and residency (row 8487)."""
+    from dew.nn.kernels.templates.attention_mosaic_program import fewer_rows
+
+    op, ba, derived = _gated_backward("sm80", 64, accurate=True)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        query = ba.arguments["query"]
+        layout = op._named(target.generation, query.dtype, query.shape[1])[derived.family]
+        assert 32 in fewer_rows(layout), fewer_rows(layout)
+        config = dataclasses.replace(derived, block_q=128, block_k=32)
+        walked = {block for block in attention_mosaic._sides(32, layout, query.dtype, query.shape[1])
+                  if block < 128 and op.takes(ba, dataclasses.replace(config, block_q=block), target)
+                  and op._regime(ba, dataclasses.replace(config, block_q=block), target)
+                  == op._regime(ba, config, target)}
+        ladder = {rung.block_q for rung in op.ladder(ba, config)}
+    assert walked and ladder == walked, (ladder, walked)
+
+
+@COMPILES_ON_CPU
 def test_a_start_runs_the_kernels_its_launches_certified():
     """A launch's derived config certified as it traces (`report.certified`: its kernels compiled alone as
     the GPU's compiler assembles them) on a compile-only B200, and then compiled within its program: every
