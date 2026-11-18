@@ -508,3 +508,29 @@ def test_a_complex_value_by_one_is_read_as_the_program_computes_it(by_one):
     NaN, where a real `x * 1` is `x`; the form that dropped it computed another value."""
     _computed_as_written(lambda z: by_one(z, jnp.asarray(1, z.dtype)), kept=True)
 
+
+
+def test_a_programs_sigmoid_and_dews_one_logistic_reach_one_normal_form():
+    """A program's own sigmoid (`jax.nn.sigmoid`, JAX's `logistic`) and Dew's one logistic
+    (`activations.logistic`, a declared tangent over a protected span that states it computes
+    `precision.logistic_value`) reach one normal form (`canonical`) at float32, the same equation, so
+    recognition reads a plain program's SwiGLU as Dew's (`recognize._swiglus`); at bfloat16 Dew's is the
+    float32 logistic rounded once, as it computes it. A protected span stating nothing stays as written."""
+    from dew.algebra.normal_form import canonical
+    from dew.nn import activations
+    from dew.nn.derivatives import marked_call_p
+    from dew.nn.precision import two_sum
+
+    def primitives_of(form) -> list:
+        return [equation.primitive for equation in form.eqns]
+
+    x = jnp.linspace(-4.0, 4.0, 8, dtype=jnp.float32)
+    plain, dews = (canonical(jax.make_jaxpr(function)(x))
+                   for function in (jax.nn.sigmoid, activations.logistic))
+    assert primitives_of(plain) == primitives_of(dews) == [jax.lax.logistic_p]
+    narrow = canonical(jax.make_jaxpr(activations.logistic)(x.astype(jnp.bfloat16)))
+    assert primitives_of(narrow) == [jax.lax.convert_element_type_p, jax.lax.logistic_p,
+                                     jax.lax.convert_element_type_p]
+    # A span of Dew's error-free arithmetic names no operation: kept as written.
+    kept = canonical(jax.make_jaxpr(lambda a, b: two_sum(a, b))(x, x))
+    assert marked_call_p in primitives_of(kept)
