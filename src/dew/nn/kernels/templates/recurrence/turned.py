@@ -108,16 +108,17 @@ def call(launch: Callable, query, key, value, g, beta, state, skip, turn, starts
     """`launch(query, key, value, g, beta, state, skip, entry)`'s `(output, final memory)` (the template's,
     its memories `[B, H, K, V]`) of a call whose state turns its first `A` key pairs each token by `turn` `[B,
     T, H, A]` (`recurrence.Hooks.turns`), `starts` `[B, T]` each document's first token or None, a readout
-    `apart` from its token's `group` of writes where `group` is past one (`mainloop.Call.apart`): its queries
-    and keys turned into their documents' frames (`frames`) less the row's last token's (`_in_last_frame`),
-    in at least fp32 and rounded once to their dtype, its memory entering turned into that frame too, so its
-    final memory is in the last token's frame as the launch leaves it. A forked call (`documents`, its `(firsts, loads, stores)` `[B,
-    D]` and `held` stored slots, `chunked_launch.Forked`'s; `state` its table's given memories `[B, S', H, K,
-    V]`; `entry` its documents' entry writes `(key [B, D, R, H, K], value [B, D, R, H, V], weight [B, D, H])`
-    or None) runs each document's frame on from the one its source left (`_forked_frames`), so a memory a
-    document stores is in the frame a document entering it starts in, and turns its entry keys into it. Its
-    gradient takes the template's through the frames and its turns' in the crossing form (`turn_gradient`);
-    a given memory is in the frame of its document's first token, as given, turned into the common frame."""
+    `apart` from its token's `group` of writes where `group` is past one (`mainloop.Call.apart`): its
+    queries and keys turned into their documents' frames (`frames`) less the row's last token's
+    (`_in_last_frame`), in at least fp32 and rounded once to their dtype, its memory entering turned into
+    that frame too, so its final memory is in the last token's frame as the launch leaves it. A forked call
+    (`documents`, its `(firsts, loads, stores)` `[B, D]` and `held` stored slots, `chunked_launch.Forked`'s;
+    `state` its table's given memories `[B, S', H, K, V]`; `entry` its documents' entry writes `(key [B, D,
+    R, H, K], value [B, D, R, H, V], weight [B, D, H])` or None) runs each document's frame on from the one
+    its source left (`_forked_frames`), so a memory a document stores is in the frame a document entering it
+    starts in, and turns its entry keys into it. Its gradient takes the template's through the frames and its
+    turns' in the crossing form (`turn_gradient`); a given memory is in the frame of its document's first
+    token, as given, turned into the common frame."""
     return _turned(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
                    documents)
 
