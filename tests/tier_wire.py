@@ -5,6 +5,7 @@ lane), which loads this file by its path as it loads check1_wire: it imports not
 
 import hashlib
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 PREPARE = "DEW_TIER_PREPARE"
@@ -16,9 +17,10 @@ UNIT = "DEW_TIER_UNIT"
 of either), set in the prepare's environment: the unit's flows' needs are filed under it (`needs_file`)."""
 
 
-def preparing() -> bool:
-    """Whether this process is a GPU tier part's prepare (`PREPARE`): on the node's CPU, before its run."""
-    return os.environ.get(PREPARE) == "1"
+def preparing(environ: Mapping[str, str] = os.environ) -> bool:
+    """Whether a process of `environ` (this one's by default) is a GPU tier part's prepare (`PREPARE`): on
+    the node's CPU, before its run."""
+    return environ.get(PREPARE) == "1"
 
 
 def needs_file(store: Path, unit: str) -> Path:

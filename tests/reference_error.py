@@ -601,14 +601,12 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
 def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference: bool) -> None:
     """Into `programs` and `held`, arm `fn`'s program at a draw's `inputs` as the gate compiles it
     (`_compiled`): within a run-to-run declaration and a window loop (at one window's inputs), a reference
-    unrewritten but one of Dew's own paths; none for an arm the gate runs as given or one running Dew's own
-    programs. Traced as its run traces it, and again where its compile lowers it (a launch a spill refused
+    unrewritten but one of Dew's own paths (an arm that holds a program, `_holds_program`). Traced as its run
+    traces it, and again where its compile lowers it (a launch a spill refused
     derived at its next config), its constants the first trace's, by place (`_hold`); held under `role`, its
     name with its fingerprint (`_arm_role`)."""
     if isinstance(fn, _RunToRun):
         _arm_program(programs, held, role, fn.fn, inputs, reference=reference)
-        return
-    if _given(fn) or getattr(fn, "dew_programs", False):
         return
     if isinstance(fn, _Windowed):
         _arm_program(programs, held, role, fn.fn, jax.tree.map(lambda leaf: leaf[0], inputs),
@@ -693,11 +691,9 @@ def _ahead_arm(given, compiled, call: Callable, role: str):
     """A site's arm (`given`, as the site passed it) whose programs a store compiled ahead
     (`_compile_arms`), as the gate runs it (`compiled`, `_compiled`'s): each plain program's call its draw's
     executable (`call(role, inputs)`, `truths_ahead.CompiledTruths.called`), within a run-to-run declaration
-    and a window loop; one the gate runs as given, or running Dew's own programs, as it is."""
+    and a window loop (an arm that holds a program, `_holds_program`)."""
     if isinstance(given, _RunToRun):
         return _RunToRun(_ahead_arm(given.fn, compiled.fn, call, role), given.why)
-    if _given(given) or getattr(given, "dew_programs", False):
-        return compiled
     if isinstance(given, _Windowed):
         return _Windowed(_ahead_arm(given.fn, compiled.fn, call, role))
     return _Ahead(compiled, functools.partial(call, role))
