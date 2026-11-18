@@ -50,7 +50,7 @@ from dew import _cache
 from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
-from dew.nn.derivatives import Protected, contracted
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.nested import nested
 from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, vanishing
 from dew.nn.programs import read_by
@@ -334,7 +334,7 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
         entering = None
         if declaration.reads == "before":
             read = h if declaration.reset is None else jnp.where(step[declaration.reset], 0.0, h)
-            entering = read_scale * _read(read, q, affine.values_read) + r
+            entering = _read(read, read_scale * q, affine.values_read) + r
         floor = vanishing(z.dtype, affine.base2)
         h = jnp.where((z <= floor)[:, None], 0.0, h)
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
@@ -343,22 +343,22 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             # since it: the group's first takes the state as it enters (`h`, its vanishing decay's zero).
             apart = jnp.where(index % group == 0, h, jnp.where((z <= floor)[:, None], 0.0, apart))
             apart = apart * decay[:, None]
-            entering = read_scale * _read(apart, q, affine.values_read) + r
+            entering = _read(apart, read_scale * q, affine.values_read) + r
         if not affine.per_key:
             correction = jnp.sum(c[:, None] * h, axis=0)
             transitioned = (h - b[:, None] * (strength * correction)[None, :]) * decay[:, None]
             h = transitioned + b[:, None] * u[None, :]
             if affine.values_read:
-                output = read_scale * (
-                    jnp.sum(transitioned * q[None, :], axis=1) + b * jnp.sum(u * q)) + r
+                output = (_scaled_contract("j,ij->i", read_scale)(q, transitioned)
+                          + _scaled_contract("j,j,i->i", read_scale)(q, u, b) + r)
             else:
-                output = read_scale * (
-                    jnp.sum(q[:, None] * transitioned, axis=0) + jnp.sum(q * b) * u) + r
+                output = (_scaled_contract("i,ij->j", read_scale)(q, transitioned)
+                          + _scaled_contract("i,i,j->j", read_scale)(q, b, u) + r)
         else:
             decayed = h * decay[:, None]
             correction = jnp.sum(c[:, None] * decayed, axis=0)
             h = decayed + b[:, None] * (u - strength * correction)[None, :]
-            output = read_scale * _read(h, q, affine.values_read) + r
+            output = _read(h, read_scale * q, affine.values_read) + r
         return (h, apart, index + 1), output if entering is None else entering
 
     carried = at_least_fp32(h.dtype)
@@ -813,16 +813,59 @@ def _token(parts: linear_scan.Parts, token: tuple, *, split_reader: bool = False
     def factored(term):
         scalar = get_callable_args(term, linear_scan.Token.scalar)
         if scalar is not None:
-            return jnp.ones((reader,), carried), linear_scan.value_of(scalar[0], read, keys, carried)
+            leaf = get_callable_args(scalar[0], linear_scan.Token.value)
+            if leaf is not None:
+                _, atom = parts.atoms[terms.integer(leaf[0])]
+                if isinstance(atom, jcore.Literal):
+                    return jnp.ones((reader,), carried), float(atom.val)
         product = get_callable_args(term, linear_scan.Token.times)
         if product is not None:
             lhs, ls = factored(product[0])
             rhs, rs = factored(product[1])
             return lhs * rhs, ls * rs
-        return along(term, reader), jnp.asarray(1.0, carried)
+        return along(term, reader), 1.0
 
     vector, factor = factored(parts.reader)
     return exponent, B, U, s, C, vector, along(parts.free, out), factor
+
+
+@functools.cache
+def _scaled_contract(subscripts: str, scale: float):
+    """A multilinear contraction whose transposes apply its scalar before their products."""
+    from jax.custom_derivatives import SymbolicZero
+
+    from dew.nn.kernels import generation
+
+    inputs, output = subscripts.split("->")
+    axes = inputs.split(",")
+
+    def value(*operands):
+        return _portable_einsum(subscripts, scale * operands[0], *operands[1:])
+
+    def tangent(primals, tangents):
+        live = tuple(index for index, part in enumerate(tangents) if not isinstance(part, SymbolicZero))
+        if not live:
+            return rule(*primals), jnp.zeros_like(rule(*primals))
+        moving = tuple(tangents[index] for index in live)
+
+        def applied(held, directions):
+            return sum(rule(*(direction if at == index else part for at, part in enumerate(held)))
+                       for index, direction in zip(live, directions, strict=True))
+
+        def pulled(held, cotangent):
+            results = []
+            for index in live:
+                others = tuple(part for at, part in enumerate(held) if at != index)
+                remaining = [axis for at, axis in enumerate(axes) if at != index]
+                transposed = ",".join((*remaining, output)) + "->" + axes[index]
+                results.append(_scaled_contract(transposed, scale)(*others, cotangent))
+            return tuple(results)
+
+        return rule(*primals), generation.linear_map(applied, pulled, primals, moving)
+
+    rule = contracted("test_the_chunked_delta_rule_holds_every_order")(
+        declared_tangent(Protected(), value, tangent, symbolic_zeros=True))
+    return rule
 
 
 def _pairing_role(left) -> str:
