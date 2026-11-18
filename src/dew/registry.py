@@ -1724,6 +1724,21 @@ JsonDict = Annotated[
 command line. The registry knows which architecture takes which field and
 narrows each one where it builds it, so the values are read there."""
 
+JsonRecords = Annotated[
+    Mapping[str, JSON],
+    tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="JSON",
+        instance_from_str=lambda args: json.loads(args[0]),
+        is_instance=lambda value: isinstance(value, dict),
+        str_from_instance=lambda value: [json.dumps(value)],
+    ),
+]
+"""Records by name, written as a single JSON string on the command line and
+read back as the records they are (`JSON` entries, `_rebuilt`), never as the
+values they describe: a class's defaults as a run recorded them
+(`Registered.defaults`)."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Registered(ABC):
@@ -1735,8 +1750,9 @@ class Registered(ABC):
 
     name: str
     fields: JsonDict = dataclasses.field(default_factory=dict)
-    defaults: JsonDict = dataclasses.field(default_factory=dict)
-    """Each argument the class defaults and `fields` leaves out, as a record holds it;
+    defaults: JsonRecords = dataclasses.field(default_factory=dict)
+    """Each argument the class defaults and `fields` leaves out, as a record holds it, read back as that
+    record (a function's `{"function": ...}`), so a run read back holds the defaults it was written with;
     one a record lacks, as an argument the class has since gained, takes the class's default now."""
 
     _recorded: ClassVar[bool] = True

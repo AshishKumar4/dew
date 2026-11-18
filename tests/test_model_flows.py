@@ -248,6 +248,10 @@ ARM_FACTOR = 1.0
 """A module's flag an arm reads (`test_an_arm_reading_another_flag_than_its_prepares_is_a_red`), as a test's
 backend read at import is one."""
 
+ARM_OPTIONS = {"factor": 1.0}
+"""A module's options an arm reads (`test_an_arm_reading_other_options_than_its_prepares_is_a_red`), as a
+test's options read off its backend are."""
+
 
 def test_an_arm_reading_another_flag_than_its_prepares_is_a_red(tmp_path, monkeypatch):
     """An arm whose module's flag reads otherwise in its run than in its prepare (a backend read at import:
@@ -265,6 +269,59 @@ def test_an_arm_reading_another_flag_than_its_prepares_is_a_red(tmp_path, monkey
     monkeypatch.setattr(sys.modules[__name__], "ARM_FACTOR", 1.0 + 2.0 ** -8)
     with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
         assert_as_exact(flagged, reference, draw, "a flagged product", seeds=8)
+
+
+def test_an_arm_reading_other_options_than_its_prepares_is_a_red(tmp_path, monkeypatch):
+    """An arm reading a dict whose contents are others in its run than in its prepare (options read off the
+    backend: the prepare's CPU, the run's GPU, each process its own dict) is another arm: its run finds none
+    of it (`MissingTruth`), never the prepare's program in its place; with the same contents it passes (row
+    7674: a container stated by its type alone named one arm in both, and the run computed the prepare's
+    program)."""
+    dew, reference, draw = _site()
+
+    def optioned(a, b):
+        return dew(a, b) * ARM_OPTIONS["factor"]
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(optioned, reference, draw, "an optioned product", seeds=8)
+    monkeypatch.setattr(sys.modules[__name__], "ARM_OPTIONS", {"factor": 1.0})
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(optioned, reference, draw, "an optioned product", seeds=8)
+    monkeypatch.setattr(sys.modules[__name__], "ARM_OPTIONS", {"factor": 1.0 + 2.0 ** -8})
+    with compiled_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+        assert_as_exact(optioned, reference, draw, "an optioned product", seeds=8)
+
+
+def test_a_record_a_trace_fills_is_named_as_first_found_inside_another_container(tmp_path, monkeypatch):
+    """A list an arm's trace fills (a test's record of its calls), named first by one site's arm and read by a
+    later site's arm inside a dict, beside an alias of itself, is stated there as it was first found, so the
+    later arm's run, a process of its own whose earlier site's executable fills none of it, finds its program
+    (the reviews of row 7674's fix: the dict stated the list as the prepare's trace had filled it, and then
+    its alias inside another dict did)."""
+    import reference_error
+
+    dew, reference, draw = _site()
+    calls: list = []
+
+    def recording(a, b):
+        calls.append(None)
+        return dew(a, b)
+
+    # The record inside the dict, and beside an alias of itself inside another (the review's).
+    held = {"direct": calls, "nested": {"calls": calls}}
+
+    def holding(a, b):
+        return dew(a, b) * (1.0 + 0.0 * len(held))
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(recording, reference, draw, "a recorded product", seeds=8)
+        assert_as_exact(holding, reference, draw, "a held product", seeds=8)
+    # The run's own process: its record empty and every container first named in it.
+    calls.clear()
+    monkeypatch.setattr(reference_error, "_FIRST_NAMED", {})
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(recording, reference, draw, "a recorded product", seeds=8)
+        assert_as_exact(holding, reference, draw, "a held product", seeds=8)
 
 
 def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):

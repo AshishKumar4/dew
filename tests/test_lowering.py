@@ -1109,7 +1109,7 @@ def test_an_unseen_member_of_a_family_takes_its_familys_facts_and_its_own_device
     """A Blackwell GPU no row names (sm110) takes the family's facts: its tensor rates and tensor memory are
     tcgen05's."""
     target = GpuTarget("sm110", "an unseen Blackwell", 227 * 1024, multiprocessors=20, clock_hz=1.5e9,
-                       memory_bandwidth=273e9)
+                       memory_bandwidth=273e9, host_links={})
     blackwell = architecture("sm100")
     assert blackwell is not None
     assert (target.tensor_rates, target.tmem_columns, target.wgmma) == (blackwell.tensor_rates, 512, False)
@@ -1119,10 +1119,10 @@ def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     """A CUDA device of a generation no row names (a B200, sm100) takes its multiprocessors and its
     block's shared memory from the device, and Hopper's warpgroup MMA from its capability, 9.0 alone,
     so a launch sized by them sizes itself rather than taking a default for want of a row."""
-    blackwell = runtime_facts(GpuTarget("sm100", "NVIDIA B200"), SimpleNamespace(
+    blackwell = runtime_facts(GpuTarget("sm100", "NVIDIA B200", host_links={}), SimpleNamespace(
         compute_capability="10.0", core_count=148, shared_memory_per_block_optin=232448, local_hardware_id=0,
         device_kind="NVIDIA B200"))
-    hopper = runtime_facts(GpuTarget("sm90", "NVIDIA H100 80GB HBM3"), SimpleNamespace(
+    hopper = runtime_facts(GpuTarget("sm90", "NVIDIA H100 80GB HBM3", host_links={}), SimpleNamespace(
         compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448, local_hardware_id=0,
         device_kind="NVIDIA H100 80GB HBM3"))
     assert (blackwell.multiprocessors, blackwell.shared_limit, blackwell.wgmma) == (148, 232448, False)
@@ -1140,7 +1140,7 @@ def test_a_gpu_target_takes_the_clocks_bandwidth_and_l2_its_driver_reports():
     device = SimpleNamespace(compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448,
                              local_hardware_id=3, device_kind="NVIDIA H100 80GB HBM3")
     table = GpuTarget("sm90", "NVIDIA H100 80GB HBM3", clock_hz=1830e6, memory_bandwidth=3350e9,
-                      l2_bytes=50 * 2 ** 20)
+                      l2_bytes=50 * 2 ** 20, host_links={})
     driven = runtime_facts(table, device, read=lambda ordinal, attribute: reported[attribute])
     assert (driven.clock_hz, driven.memory_bandwidth, driven.l2_bytes) == (
         1_755_000e3, 2 * 2_619_000e3 * 5120 / 8, 52_428_800)
@@ -1201,7 +1201,7 @@ def a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
     default device's target reports, and the row's own where the table records them."""
     device = jax.devices()[0]
     named = gpu_target()
-    bare = runtime_facts(GpuTarget(device_generation(), device.device_kind), device)
+    bare = runtime_facts(GpuTarget(device_generation(), device.device_kind, host_links={}), device)
     assert bare.shared_limit is not None and bare.multiprocessors == device.core_count
     assert (bare.shared_limit, bare.multiprocessors, bare.wgmma) == (
         named.shared_limit, named.multiprocessors, named.wgmma)

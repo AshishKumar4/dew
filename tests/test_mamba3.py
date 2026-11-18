@@ -76,17 +76,16 @@ def draw(rank: int, seed: int):
     return *(hosted(t) for t in (x, dt, A, B, C, lam, theta, state)), jax.tree.map(hosted, cotangent)
 
 
-def entering(state, pairs: int, rank: int) -> Carried:
-    """`state` `[B, H, P, N]` as a call's carried state, its `pairs` angles zero and no previous token."""
+def entering(state, rank: int) -> Carried:
+    """`state` `[B, H, P, N]` as a call's carried state, no previous token."""
     batch, heads, width, size = state.shape
     zeros = functools.partial(jnp.zeros, dtype=state.dtype)
-    return Carried(state, zeros((batch, heads, pairs)), zeros((batch, heads, rank, size)),
-                   zeros((batch, heads, rank, width)))
+    return Carried(state, zeros((batch, heads, rank, size)), zeros((batch, heads, rank, width)))
 
 
 def chunked(x, dt, A, B, C, lam, theta, state, *, starts):
     """`chunk_mamba3` from `state` (`entering`): its output and final state."""
-    out, carried = chunk_mamba3(x, dt, A, B, C, lam, theta, entering(state, theta.shape[-1], x.shape[2]),
+    out, carried = chunk_mamba3(x, dt, A, B, C, lam, theta, entering(state, x.shape[2]),
                                 starts=starts, chunk_size=CHUNK)
     return out, carried.state
 
@@ -121,7 +120,7 @@ def continued(x, dt, A, B, C, lam, theta, state):
     operands = (x, dt, A, B, C, lam, theta)
     rest, starts = PREFILL + STEPPED, marks(CONTINUED)
     out, carried = chunk_mamba3(*(t[:, :PREFILL] for t in operands),
-                                entering(state, theta.shape[-1], x.shape[2]), chunk_size=CHUNK)
+                                entering(state, x.shape[2]), chunk_size=CHUNK)
     outs = [out]
     for token in range(PREFILL, rest):
         out, carried = step_mamba3(*(t[:, token] for t in operands), carried, begins=starts[:, token])
@@ -205,10 +204,10 @@ def test_a_continuation_is_the_whole_call(rank):
 @pytest.mark.parametrize(("dtype", "edge"), [(jnp.float32, 120), (jnp.float64, 1000)],
                          ids=["fp32", "float64"])
 def test_a_tokens_turn_at_a_dtypes_edge_stays_its_exact_product(dtype, edge):
-    """One token's turn `dt theta` formed exactly (`two_product`) at its dtype's edge: `dt` 2^edge under
-    `theta` zero turns nothing, and the token writes `lambda dt x B = 0.5 [1, 0]` and reads it back, 0.5
-    (base reviews 9bc4326dd F1, 1fe546a10 F1). A Veltkamp split multiplies `dt` by `2^(p/2) + 1` first, inf
-    there, its residual NaN."""
+    """One token's turn `dt theta` at its dtype's edge: `dt` 2^edge under `theta` zero turns nothing, and
+    the token writes `lambda dt x B = 0.5 [1, 0]` and reads it back, 0.5 (base reviews 9bc4326dd F1,
+    1fe546a10 F1: its angle's exact product, a Veltkamp split multiplying `dt` by `2^(p/2) + 1` first, was
+    inf there, its residual NaN)."""
     with jax.enable_x64(new_val=dtype == jnp.float64):
         x = jnp.full((1, 1, 1, 1, 1), 2.0 ** -edge, dtype)
         dt = jnp.full((1, 1, 1), 2.0 ** edge, dtype)
@@ -218,6 +217,22 @@ def test_a_tokens_turn_at_a_dtypes_edge_stays_its_exact_product(dtype, edge):
         out, carried = chunk_mamba3(x, dt, jnp.asarray([-1.0], dtype), B, C, lam, theta)
         np.testing.assert_array_equal(np.asarray(out).reshape(-1), [0.5])
         np.testing.assert_array_equal(np.asarray(carried.state).reshape(-1), [0.5, 0.0])
+
+
+def test_turns_past_a_tokens_reach_sum_to_a_finite_state():
+    """Four fp32 tokens each turning by `dt theta = 2^126` (`dt` 2^125, `theta` 2), each writing `lambda dt x
+    B = 0.5 [1, 0]` under a decay that keeps nothing (`dt A = -2^125`): every output is 0.5 and the state
+    the last token leaves is 0.5 [1, 0], as the recurrence's, each turn taken within pi before the frames
+    sum them (base review 7d6f1ffa0 F1: the angles summed whole reached 2^128, and the state NaN)."""
+    shape = (1, 4, 1, 1)
+    x = jnp.full((*shape, 1), 2.0 ** -125, jnp.float32)
+    dt = jnp.full(shape[:3], 2.0 ** 125, jnp.float32)
+    B = C = jnp.broadcast_to(jnp.asarray([1.0, 0.0], jnp.float32), (*shape, 2))
+    lam = jnp.full(shape[:3], 0.5, jnp.float32)
+    theta = jnp.full((*shape[:3], 1), 2.0, jnp.float32)
+    out, carried = chunk_mamba3(x, dt, jnp.asarray([-1.0], jnp.float32), B, C, lam, theta)
+    np.testing.assert_array_equal(np.asarray(out).reshape(-1), [0.5] * 4)
+    np.testing.assert_array_equal(np.asarray(carried.state).reshape(-1), [0.5, 0.0])
 
 
 def test_a_mimo_layer_draws_as_its_full_forward_scores():

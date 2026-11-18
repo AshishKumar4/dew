@@ -40,13 +40,13 @@ import dataclasses
 import functools
 from typing import ClassVar
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, real_places, valid_order
+from dew.nn.activations import logistic
 from dew.nn.dense import Dense
 
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
@@ -417,7 +417,7 @@ class EngramLayer(nn.Module):
         rstd = (rms_statistics(h, self.norm_eps, keepdims=False)[1]
                 * rms_statistics(key, self.norm_eps, keepdims=False)[1])
         dot = jnp.sum(h * (q_weight * k_weight) * key, -1) * rstd * self.emb_features ** -0.5
-        gate = jax.nn.sigmoid(jnp.copysign(jnp.sqrt(jnp.maximum(jnp.abs(dot), 1e-6)), dot))
+        gate = logistic(jnp.copysign(jnp.sqrt(jnp.maximum(jnp.abs(dot), 1e-6)), dot))
         if token_mask is not None:
             gate = jnp.where(token_mask[..., None], gate, 0.0)
         return (h + gate[..., None] * value[..., None, :]).astype(streams.dtype)
@@ -514,7 +514,7 @@ class PLELayer(nn.Module):
         wide = at_least_fp32(dot.dtype)
         dot = dot.astype(wide) / jnp.sqrt(jnp.asarray(width, wide))
         gate = jnp.sign(dot) * jnp.sqrt(jnp.maximum(jnp.abs(dot), 1e-6))
-        gated = (jax.nn.sigmoid(gate)[..., None] * value[:, :, None, :]).reshape(batch, length, hc * width)
+        gated = (logistic(gate)[..., None] * value[:, :, None, :]).reshape(batch, length, hc * width)
         normed = norm(name='norm_conv')(gated)
         if token_mask is not None:
             gated = jnp.where(token_mask[..., None], gated, 0).astype(gated.dtype)

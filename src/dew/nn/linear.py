@@ -47,6 +47,7 @@ from dew.nn.kernels import recurrence, short_conv
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
 from dew.nn.residuals import Residual
 
+from .activations import silu
 from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
 from .derivatives import Protected, contracted, declared_derivative
@@ -72,7 +73,6 @@ from .precision import (
     compensated_sum,
     float32_dot_general,
     l2norm,
-    silu,
 )
 from .sharding import (
     HEADS,

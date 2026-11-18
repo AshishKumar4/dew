@@ -38,6 +38,7 @@ from jax.extend import core as jcore
 from dew import _cache
 from dew.algebra import SATURATION, forms, fusion, normal_form, program, rules, terms
 from dew.algebra.forms import aval
+from dew.nn.derivatives import Protected, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
 from dew.nn.programs import bodies
@@ -231,15 +232,51 @@ def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Cand
 
 def _holds(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> bool:
     """Whether `equation` binds `primitive`, or a nested program whose body does (`bodies`), as a jit
-    `jax.nn.silu` traces holds its sigmoid: the region around it reads the call whole, and its equality its
-    body inlined (`normal_form.canonical`)."""
+    `jax.nn.silu` traces holds its sigmoid, or is it (`_read_as`: Dew's one logistic): the region around it
+    reads the call whole, and its equality its body inlined (`normal_form.canonical`)."""
     return _binds(equation, (primitive,))
 
 
 def _binds(equation: jcore.JaxprEqn, primitives: Sequence[jcore.Primitive]) -> bool:
-    """Whether `equation` binds one of `primitives`, at any depth of the programs it nests (`_bound`)."""
+    """Whether `equation` binds one of `primitives`, at any depth of the programs it nests (`_bound`), one
+    operation of Dew's read as that operation alone (`_read_as`)."""
+    if (read := _read_as(equation)) is not None:
+        return read in primitives
     return equation.primitive in primitives or any(
         not _bound(body).isdisjoint(primitives) for body in bodies(equation))
+
+
+def _read_as(equation: jcore.JaxprEqn) -> jcore.Primitive | None:
+    """The operation `equation` is where it is one of Dew's, read as the normal form reads it
+    (`normal_form.stated_primitive`): a marked span stating it, or Dew's own declaration of it, a declared
+    derivative whose primal is one span of the kind Dew's one logistic binds (`_logistic_kind`: its operation
+    and the rule it is declared with), whose rule is no barrier (`BARRIERS`): the call written in its place
+    differentiates it alike (`precision.logistic_and_slope`). None for any other equation, one declared
+    with another rule among them: a fused call would drop that rule. Train 1026's review: Dew's silu hid a
+    SwiGLU's sigmoid from its anchor and barred its region."""
+    if (stated := normal_form.stated_primitive(equation)) is not None:
+        return stated
+    if equation.primitive is not jcore.primitives.custom_jvp_call_p:
+        return None
+    primal = equation.params["call_jaxpr"].jaxpr
+    if len(primal.eqns) != 1 or list(primal.outvars) != list(primal.eqns[0].outvars):
+        return None
+    (span,) = primal.eqns
+    if span.primitive is not marked_call_p or span.params["kind"] != _logistic_kind():
+        return None
+    return normal_form.stated_primitive(span)
+
+
+@functools.cache
+def _logistic_kind() -> Protected:
+    """The kind Dew's one logistic binds its primal's span with (`activations.logistic`, traced once): the
+    operation it states and the rule it is declared with (`derivatives.declared_tangent`)."""
+    from dew.nn.activations import logistic
+
+    # Its abstract argument alone: no value made on a default device that computes nothing (a prepare's).
+    (declared,) = jax.make_jaxpr(logistic)(jax.ShapeDtypeStruct((), jnp.float32)).jaxpr.eqns
+    (span,) = declared.params["call_jaxpr"].jaxpr.eqns
+    return span.params["kind"]
 
 
 def _bound(jaxpr: jcore.Jaxpr) -> frozenset[jcore.Primitive]:
@@ -254,12 +291,15 @@ def _bound(jaxpr: jcore.Jaxpr) -> frozenset[jcore.Primitive]:
         if program_ in _HELD_BOUND:
             pending.pop()
             continue
-        nested = [body for equation in program_.eqns for body in bodies(equation)]
+        # One operation of Dew's is that operation alone (`_read_as`), its spans' insides unread.
+        nested = [body for equation in program_.eqns if _read_as(equation) is None
+                  for body in bodies(equation)]
         unread = [body for body in nested if body not in _HELD_BOUND]
         if unread:
             pending.extend(unread)
             continue
-        _HELD_BOUND[program_] = frozenset({equation.primitive for equation in program_.eqns}).union(
+        _HELD_BOUND[program_] = frozenset({_read_as(equation) or equation.primitive
+                                           for equation in program_.eqns}).union(
             *(_HELD_BOUND[body] for body in nested))
     return _HELD_BOUND[jaxpr]
 
@@ -311,7 +351,8 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
 BARRIERS = (jcore.primitives.custom_jvp_call_p, jcore.primitives.custom_vjp_call_p,
             jcore.primitives.custom_vmap_p, jcore.primitives.remat_p)
 """The equations a region the compile point writes never holds: a program's own derivative or batching rule,
-which the call written in its place would not keep, and a checkpoint (`jax.checkpoint`), whose boundary
+which the call written in its place would not keep (but Dew's one logistic's, read as the logistic it is,
+`_read_as`), and a checkpoint (`jax.checkpoint`), whose boundary
 decides what a derivative saves, which a call written across it would remove (§6.2: rewriting stays within
 remat boundaries). Its body is searched apart, as every program a call holds is. A gradient's stop is no
 barrier but no identity either

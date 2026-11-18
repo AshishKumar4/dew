@@ -42,7 +42,7 @@ from dew.nn.dense import Dense
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.residuals import Residual
 
-from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
+from .activations import GatedActivation, gated_product, logistic, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels import formats, gemm, generation, projections
@@ -538,7 +538,7 @@ class Router(nn.Module):
             return expert_softmax(logits)
         if self.score_function == 'sqrtsoftplus':
             return sqrt_softplus(logits)
-        return jax.nn.sigmoid(logits)
+        return logistic(logits)
 
     def group_mask(self, selection):
         """True where an expert sits in one of a token's best groups.
@@ -1499,5 +1499,5 @@ class SparseMLP(nn.Module):
         shared = self.shared_experts(x)
         if self.shared_gate:
             with projection_role("shared_gate"):  # The gate keeps the run's dtypes under a recipe.
-                shared = shared * jax.nn.sigmoid(self.shared_expert_gate(x))
+                shared = shared * logistic(self.shared_expert_gate(x))
         return routed + shared

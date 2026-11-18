@@ -76,7 +76,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Time to first step: the compile path's re-derivations. [5556]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - XLA:CPU edges. [1591]
-- Training and serving efficiency. [1880, 5292]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -84,6 +83,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Data
 
+- Training and serving efficiency. [5292]
 - The diffusion kinds' starts keep no record and their refits trace again. [6297]
 
 ## RL and serving
@@ -96,8 +96,8 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
+- Check 2's ratio contract reads the law's bound looser than its spec states. [7980]
 - Bit-level synthesis in dew.algebra. [3733]
-- An arm's mutable containers stated by type. [7674]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]

@@ -60,6 +60,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.algebra.scan import RESET_DECAY
 from dew.mesh import SEQUENCE_AXIS
+from dew.nn.activations import silu
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
@@ -88,7 +89,6 @@ from dew.nn.precision import (
     float32_dot_general,
     rms_statistics,
     rms_weighted,
-    silu,
     softplus,
 )
 from dew.nn.residuals import Residual
@@ -476,7 +476,7 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
         span = recurrence_algebra.Span(jnp.sum(log_decay, axis=1), final)
         entering = recurrence_algebra.entering(span, axis)
         entering = entering.reshape(batch, n_groups, num_heads // n_groups, state_size, head_dim)
-        decayed = jnp.exp(jnp.cumsum(log_decay, axis=1)).reshape(
+        decayed = accurate_exp(jnp.cumsum(log_decay, axis=1)).reshape(
             batch, length, n_groups, num_heads // n_groups)
         carried = recurrence_algebra.portable_einsum('bsgn,bgknp,bsgk->bsgkp', C, entering, decayed)
         out = out + carried.reshape(batch, length, num_heads, head_dim)

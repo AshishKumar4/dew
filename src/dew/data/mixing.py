@@ -233,11 +233,28 @@ _WARN_OVER = 0.01
 """The share of a corpus's attempted records it may reject before a run warns, once: a filter that
 drops more than one record in a hundred is worth a look."""
 
+@dataclasses.dataclass(frozen=True)
+class Streak:
+    """A run of rejections of the records an endless repeat reads in order
+    (`dew.data.lowering._barren_bound`): two whole passes of `rows` each, and `slack` more where loading
+    workers read them in another order (`after`). Where no step before the repeat may keep another record
+    on a later pass (`varying` empty) such a run is certain to go on, and is refused; otherwise it is said
+    at every pass's worth past it, naming those steps."""
+
+    rows: int
+    varying: tuple[str, ...] = ()
+    slack: int = 0
+
+    @property
+    def after(self) -> int:
+        return 2 * self.rows + self.slack
+
+
 class _KeepAccepted:
     def __init__(self, counts: CorpusCounts, tokens: Callable[[Batch], int] | None,
-                 certain_after: int | None = None, members: Mapping[str, CorpusCounts] | None = None,
+                 streak: Streak | None = None, members: Mapping[str, CorpusCounts] | None = None,
                  credits: bool = False):
-        self.counts, self.tokens, self.certain_after = counts, tokens, certain_after
+        self.counts, self.tokens, self.streak = counts, tokens, streak
         self.members, self.credits = dict(members or {}), credits
         """A mixture's members' counts, under which it counts what it rejects of each member's rows
         (`Rejected.member`, `MEMBER`), and, where it `credits` them (its last counter), the examples each
@@ -312,7 +329,14 @@ class _KeepAccepted:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
                          self.counts.label, _WARN_OVER * 100, reason)
             self.warned = True
-        if self.certain_after is not None and self.consecutive >= self.certain_after:
+        if self.streak is not None and self.consecutive >= self.streak.after and self.streak.varying:
+            if (self.consecutive - self.streak.after) % self.streak.rows == 0:
+                # Every pass's worth past two, loudly: a read that is not moving says why it reads on.
+                _log.warning("corpus %s rejected its last %d records, %d passes of what it reads; it reads "
+                             "on, as %s may keep a record on a later pass", self.counts.label,
+                             self.consecutive, self.consecutive // self.streak.rows,
+                             ", ".join(self.streak.varying))
+        elif self.streak is not None and self.consecutive >= self.streak.after:
             reasons = ", ".join(f"{name} {count}" for name, count in self._rejected().most_common(3))
             raise ValueError(
                 f"corpus {self.counts.label} rejected its last {self.consecutive} records, every record of "
@@ -444,8 +468,9 @@ class _AcceptedIterator(_CountedIterator[Batch]):
 
 class Accepted(pygrain.IterDataset[Batch]):
     """Grain's filter, with checkpointed counts. A filter of an endless repeat whose passes it
-    rejects alike refuses a run of `certain_after` rejections, two whole passes, as reading nothing
-    forever; any other run of rejections it logs and reads on, a fetch that failed for now say. One
+    rejects alike refuses a run of rejections two whole passes long (`Streak`), as reading nothing
+    forever; past a repeat whose steps may keep another record on a later pass it says so at every
+    pass's worth of such a run, naming them; any other run of rejections it logs and reads on. One
     past an objective's step that makes rows of source examples counts none of the rows it keeps
     (`rows` false, `CorpusCounts.rows`). A mixture's counter past the mix counts what it rejects of each
     member's rows under that member (`members`, each's name and label), and its last counter, which
@@ -459,7 +484,7 @@ class Accepted(pygrain.IterDataset[Batch]):
         label: str,
         *,
         tokens: Callable[[Batch], int] | None = None,
-        certain_after: int | None = None,
+        streak: Streak | None = None,
         rows: bool = True,
         examples: bool = False,
         members: Sequence[tuple[str, str, str]] = (),
@@ -467,13 +492,13 @@ class Accepted(pygrain.IterDataset[Batch]):
     ):
         super().__init__(parent)
         self._records, self._name, self._label = parent, name, label
-        self._tokens, self._certain_after, self._rows, self._examples = tokens, certain_after, rows, examples
+        self._tokens, self._streak, self._rows, self._examples = tokens, streak, rows, examples
         self._members, self._credits = tuple(members), credits
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         counts = CorpusCounts(self._name, self._label, rows=self._rows, examples=self._examples)
         members = {key: CorpusCounts(name, label, examples=True) for key, name, label in self._members}
-        predicate = _KeepAccepted(counts, self._tokens, self._certain_after, members, self._credits)
+        predicate = _KeepAccepted(counts, self._tokens, self._streak, members, self._credits)
         return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
 

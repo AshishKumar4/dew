@@ -8,7 +8,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
+from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, sows_appended, thaw
 from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS, ContextReader
@@ -16,7 +16,7 @@ from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
 from dew.inputs.spec import Condition, encode_conditions
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, ModelInputs
-from dew.nn.inspection import INSPECTED, QK, component, in_parts, observed_maxima
+from dew.nn.inspection import INSPECTED, QK, component, in_parts
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import EXITS, CountedCondition, Looped, TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
@@ -298,14 +298,15 @@ class DecisionModel(HeadedModel):
         assert isinstance(backbone, Looped), "a looped backbone's exits"
         earlier, gates = backbone.exit_passes(sown)
         # Every exit through the head, each sowing what the step opened: a QK-Clip bounds the head by the
-        # largest logit any scored exit reads (`observed_maxima`); a watched module keeps its latest call's
-        # summary, the last pass's, as a module run more than once does (`dew.nn.inspection.watching`).
+        # largest logit any scored exit reads, each exit's call kept after the last's (`sows_appended`);
+        # a watched module keeps its latest call's summary, the last pass's, as a module run more than once
+        # does (`dew.nn.inspection.watching`).
         read = [self.head_logits(variables, state, inputs, spanned, train=train, rngs=rngs, opened=opened)
                 for state in (*earlier, states)]
         sown = {name: value for name, value in sown.items() if name != EXITS}
         head = dict(read[-1][1])
         if QK in opened:
-            head[QK] = observed_maxima(*(held.get(QK, {}) for _, held in read))
+            head[QK] = functools.reduce(sows_appended, (held.get(QK, {}) for _, held in read), {})
         return tuple(logits for logits, _ in read), gates, beside_head(sown, head, opened)
 
     def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,

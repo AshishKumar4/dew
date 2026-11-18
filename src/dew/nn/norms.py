@@ -16,6 +16,7 @@ from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 
+from .activations import GATE_ACTIVATIONS, logistic, silu
 from .dense import Dense
 from .derivatives import portable_formed
 from .kernels import norm_swiglu
@@ -164,8 +165,8 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
         wide = at_least_fp32(x.dtype)
         x = x.astype(wide)
         weight = None if scale is None else scale.astype(wide)
-        return rms_weighted(x, rms_statistics(x, epsilon)[1], weight=weight, gate=gate.astype(wide),
-                            activation=activation).astype(dtype)
+        activated = GATE_ACTIVATIONS[activation](gate.astype(wide))
+        return rms_weighted(x, rms_statistics(x, epsilon)[1], weight=weight, gate=activated).astype(dtype)
 
     chosen = norm_swiglu.gated_rms_kernel(implementation, x, gate, scale, dtype, activation, axes=axes)
     if chosen == 'pallas':
@@ -374,7 +375,7 @@ class NormGate(nn.Module):
     def __call__(self, y):
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
-        return dense(y.shape[-1], name='fc2')(nn.silu(dense(self.rank, name='fc1')(y)))
+        return dense(y.shape[-1], name='fc2')(silu(dense(self.rank, name='fc1')(y)))
 
 
 class GatedRMSNorm(nn.Module):
@@ -397,7 +398,7 @@ class GatedRMSNorm(nn.Module):
         stream, normed = self.norm(name='norm').seam(x, branch, axes=axes)
         gate = NormGate(self.rank, dtype=self.dtype, precision=self.precision, name='mlp')(normed)
         wide = at_least_fp32(normed.dtype)
-        return stream, (normed.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(normed.dtype)
+        return stream, (normed.astype(wide) * logistic(gate.astype(wide))).astype(normed.dtype)
 
 
 class _Shifted(nn.LayerNorm):
