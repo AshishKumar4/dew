@@ -21,16 +21,10 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
-"tests/test_algebra_fuzz.py": [
-"tests/test_algebra_fuzz.py::test_a_rewritten_program_is_on_par_with_the_program"
-],
 "tests/test_algebra_scan.py": [
 "tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[gated_delta-before]",
 "tests/test_algebra_scan.py::test_a_turned_scans_adjoint_is_the_token_scans_gradient[apart-ranks]",
 "tests/test_algebra_scan.py::test_the_delta_rules_derived_chunks_compute_their_token_scans[gated_delta]"
-],
-"tests/test_alignment.py": [
-"tests/test_alignment.py::test_from_run_publishes_the_model_without_the_alignment_head"
 ],
 "tests/test_architectures.py": [
 "tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[hierarchical_mmdit-1-step-fsdp-one device]",
@@ -913,6 +907,9 @@
 "tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-chunk-places-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
 "tests/test_attention_triton.py::test_the_plain_backward_is_on_par_over_runs[runs-causal-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]"
 ],
+"tests/test_autoencoder.py": [
+"tests/test_autoencoder.py::test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone[flux2]"
+],
 "tests/test_barren_reads.py": [
 "tests/test_barren_reads.py::test_a_mixture_edit_that_moves_a_kept_corpus_to_other_workers_reads_on",
 "tests/test_barren_reads.py::test_a_mixture_of_corpora_each_kept_in_one_workers_inputs_reads_on[streamed]",
@@ -1136,9 +1133,6 @@
 "tests/test_contracts_gemm.py::test_a_quantized_convolution_holds_every_order_it_takes[1-normal]",
 "tests/test_contracts_gemm.py::test_a_transposed_hooks_custom_derivative_holds_every_order[normal]",
 "tests/test_contracts_gemm.py::test_an_nvfp4_projection_holds_every_reverse_order[near the largest]"
-],
-"tests/test_contracts_norms.py": [
-"tests/test_contracts_norms.py::test_the_fused_norms_and_products_hold_every_order[near the largest]"
 ],
 "tests/test_contracts_objectives.py": [
 "tests/test_contracts_objectives.py::test_the_lm_heads_hold_every_order_of_their_gradient[near the largest-fused]",
@@ -1650,9 +1644,6 @@
 "tests/test_dory.py::test_packed_documents_read_only_themselves_through_every_pass[reference]",
 "tests/test_dory.py::test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop_count[2]",
 "tests/test_dory.py::test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums"
-],
-"tests/test_dpo.py": [
-"tests/test_dpo.py::test_packed_pairs_train_as_each_pair_a_row[attention-shared]"
 ],
 "tests/test_dreamer.py": [
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-replay]",
@@ -2232,6 +2223,9 @@
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_stage2]"
 ],
+"tests/test_level_stacking.py": [
+"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
+],
 "tests/test_lfm3.py": [
 "tests/test_lfm3.py::test_an_lfm3_vl_trunk_read_or_built_resolves_its_defaults_and_cadence_one_way"
 ],
@@ -2268,6 +2262,9 @@
 "tests/test_lm_serving_benchmark.py::test_a_multimodal_model_serves_the_layout_asked_for[qwen35-tiny-mm-paged]",
 "tests/test_lm_serving_benchmark.py::test_the_benchmark_serves_weights_a_mesh_splits"
 ],
+"tests/test_local_attention.py": [
+"tests/test_local_attention.py::test_chunks_count_tokens_from_the_place_a_caller_gives_their_first[banded-repeated-xla]"
+],
 "tests/test_loop.py": [
 "tests/test_loop.py::test_a_loop_exits_each_token_at_its_threshold_through_each_passs_coda",
 "tests/test_loop.py::test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all",
@@ -2278,8 +2275,8 @@
 "tests/test_loop.py::test_an_implicit_loop_at_drawn_theta_takes_the_theta_method[two passes]",
 "tests/test_loop.py::test_an_implicit_loop_at_zero_theta_computes_the_decoder_it_loops[2]",
 "tests/test_loop.py::test_an_implicit_loop_at_zero_theta_computes_the_decoder_it_loops[3]",
-"tests/test_loop.py::test_an_implicit_loop_at_zero_theta_computes_the_decoder_it_loops[4]",
-"tests/test_loop.py::test_checkpointed_passes_leave_decode_and_its_collections_unchanged[False]",
+"tests/test_loop.py::test_an_implicit_loop_whose_rows_are_one_theta_computes_the_shared_theta",
+"tests/test_loop.py::test_an_implicit_loop_with_a_theta_per_pass_reads_each_pass_its_own[two of three]",
 "tests/test_loop.py::test_checkpointed_passes_preserve_logits_and_gradients[False-None]",
 "tests/test_loop.py::test_checkpointed_passes_preserve_logits_and_gradients[True-1]",
 "tests/test_loop.py::test_checkpointed_passes_preserve_logits_and_gradients[True-None]",
@@ -2327,6 +2324,9 @@
 "tests/test_lowering.py::test_a_topology_compile_writes_the_persistent_cache_and_compiles_again_past_its_entry",
 "tests/test_lowering.py::test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh[sm80-expert layer]",
 "tests/test_lowering.py::test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh[sm90-attention]"
+],
+"tests/test_mamba.py": [
+"tests/test_mamba.py::test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones[right_padded]"
 ],
 "tests/test_mamba2.py": [
 "tests/test_mamba2.py::test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones[empty_shard]",
@@ -3280,9 +3280,6 @@
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-sliding-tiny-native]",
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-tiny-saved]"
 ],
-"tests/test_rl_expert_balance.py": [
-"tests/test_rl_expert_balance.py::test_a_policy_runs_balance_flag_builds_a_policy_that_balances_its_routers[grpo]"
-],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
 "tests/test_router_statistics.py::test_all_padding_has_no_router_support_or_bias_effect[mtp-attention_mask-False]",
@@ -3890,6 +3887,9 @@
 "tests/test_wan_source.py": [
 "tests/test_wan_source.py::test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone",
 "tests/test_wan_source.py::test_pipeline_walk_matches_the_source[streamed]"
+],
+"tests/test_wan_vae.py": [
+"tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
