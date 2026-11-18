@@ -9,7 +9,7 @@ set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a f
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Hashable, Sequence, Set
+from collections.abc import Callable, Hashable, Iterable, Sequence, Set
 from typing import ClassVar, Literal, overload
 
 import jax
@@ -150,9 +150,10 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     where its family's products read operands from registers, a tile its transposed streams staged at the
     family's own swizzle do not fit fits them staged narrowest (`Tiles.narrow`), a wide stage's bandwidth
     traded for the larger tile; fewer consumers where no tile of the family's count holds the block (a GPU
-    of a smaller one). Where an `overlapped` step's family runs one consumer a program on registers it
-    budgets (no partner whose products a softmax runs under: mma.sync's), its consumer's rows twice the unit
-    too, each warp two of the products' row tiles, FlashAttention 2's 128-row tile on one warpgroup, first,
+    of a smaller one). Where an `overlapped` step's program runs one consumer on registers its family
+    budgets (no partner whose products a softmax runs under: a family of one, or a family whose products read
+    registers falling back to one, `wide`), its consumer's rows twice the unit too, each warp two of the
+    products' row tiles, FlashAttention 2's 128-row tile on one warpgroup, first among one consumer's tiles,
     where its first key tile holds, each key tile's loads and fragments read once for twice the queries (an
     A100 at width 128, 128 x 32 against 64 x 64, ptxas 250 and 189 registers spilling none; width 64, 128 x
     64 against 64 x 128, two programs a multiprocessor against one, et-a100tile2); then the unit, then
@@ -163,13 +164,20 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     unit = least_held(family, dtype, held) if rows is None else rows
     most = (min(most_consumers(family, tiles(unit, family.rows, 1)), family.derived_consumers) if overlapped
             else 1)
-    wide = rows is None and overlapped and most == 1 and family.budgets_registers
+    # Twice the unit a consumer where the program runs one: a family of one consumer, or a family whose
+    # products read registers at its fallback to one (a fed mma.sync's two consumers that hold no tile, its
+    # one then FlashAttention 2's 128 rows, as a family of one derives it).
+    wide = (rows is None and overlapped and family.budgets_registers
+            and (most == 1 or family.operands_in_registers))
 
     def padded(rows: int, consumers: int) -> int:
         return -(-held // (rows * consumers)) * rows * consumers
 
-    def first(rows: int) -> Config | None:
-        for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
+    def counts(rows: int) -> range:
+        return range(max(1, min(most, -(-held // rows))), 0, -1)
+
+    def first(rows: int, tried: Iterable[int]) -> Config | None:
+        for consumers in tried:
             if consumers > 1 and padded(rows, consumers) - padded(rows, consumers - 1) > held // 8:
                 # A count whose tile pads the held rows by more than an eighth of them beyond the next
                 # count's (a 192-row tile of three consumers over a 256-row shard pads it by half, where two
@@ -182,15 +190,18 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                         return config
         return None
 
-    # Twice the unit where the held rows take it, padding them by no more than an eighth beyond the unit's;
-    # then the unit; then, for a call of fewer rows than a role's, fewer of them a tile, its issuer's rows at
-    # least, where no tile of them all holds (a 48-row training walk's scaled op on mma.sync held 278
-    # registers of 255 at 48 x 64, the least key tile so few rows take, `_least_keys`, et-sm86scaled). The
-    # first that holds is the config: legality steps down, nothing is ranked (design §7).
+    # The unit at the counts above one first (FlashAttention 3's consumers); then one consumer's heights:
+    # twice the unit where `wide` and the held rows take it, padding them by no more than an eighth beyond
+    # the unit's, then the unit; then, for a call of fewer rows than a role's, fewer of them a tile at every
+    # count, its issuer's rows at least, where no tile of them all holds (a 48-row training walk's scaled op
+    # on mma.sync held 278 registers of 255 at 48 x 64, the least key tile so few rows take, `_least_keys`,
+    # et-sm86scaled). The first that holds is the config: legality steps down, nothing is ranked (design §7).
     heights = [2 * unit] if wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8 else []
     heights.append(unit)
     fewer = range(unit - family.rows, 0, -family.rows) if rows is None and few_rows(family, held) else ()
-    return next((config for config in map(first, (*heights, *fewer)) if config is not None), None)
+    order = ((unit, [count for count in counts(unit) if count > 1]), *((height, [1]) for height in heights),
+             *((rows, counts(rows)) for rows in fewer))
+    return next((config for config in (first(*each) for each in order) if config is not None), None)
 
 
 def _role_rows(family: mosaic.Family, dtype, held: int) -> int:
