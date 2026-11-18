@@ -189,3 +189,53 @@ def test_a_gated_mlp_whose_hook_the_template_cannot_lower_runs_apart(generation_
 
     assert route("geglu") == ["fused"]
     assert route("geglu_exact") == ["apart"]
+
+
+def _activation_spans(jaxpr) -> list:
+    """The activation regions (`derivatives.Activation`) a program's jaxpr holds, its calls' bodies' too."""
+    from jax.extend.core import jaxprs_in_params
+
+    from dew.nn import derivatives
+
+    found = []
+    for equation in jaxpr.eqns:
+        if equation.primitive is derivatives.marked_call_p and isinstance(equation.params["kind"],
+                                                                          derivatives.Activation):
+            found.append(equation.params["kind"])
+        for inner in jaxprs_in_params(equation.params):
+            found += _activation_spans(inner)
+    return found
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+def test_a_gated_product_is_one_activation_region_and_computes_as_it_did(dtype):
+    """A gated product's XLA arithmetic (`gated_product`, 'swiglu' at 'xla') is one region of its
+    activation (`derivatives.Activation('swiglu', gated=True)`), a fusion pass's epilogue's, over its gate
+    and up projection: inlined, it computes what its arithmetic unmarked computes, its value and its
+    operands' gradients bit for bit (`activations._gated`). An ungated MLP's named activation is one region
+    of it ungated."""
+    from dew.nn import derivatives
+    from dew.nn.mlp import GatedMLP
+
+    rng = np.random.default_rng(0)
+    gate, up = (jnp.asarray(rng.standard_normal((4, 64)) * 3, dtype) for _ in range(2))
+    product = activations.gated_product("swiglu", implementation="xla")
+    plain = activations._gated(activations.silu)
+    assert _activation_spans(jax.make_jaxpr(product)(gate, up).jaxpr) == [
+        derivatives.Activation("swiglu", gated=True)]
+
+    def summed(function):
+        return jax.jit(jax.value_and_grad(lambda g, u: jnp.sum(function(g, u).astype(jnp.float32)),
+                                          argnums=(0, 1)))
+
+    (value, gradients), (own, own_gradients) = summed(product)(gate, up), summed(plain)(gate, up)
+    np.testing.assert_array_equal(np.asarray(value), np.asarray(own))
+    for mine, theirs in zip(gradients, own_gradients, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+    np.testing.assert_array_equal(np.asarray(jax.jit(product)(gate, up)),
+                                  np.asarray(jax.jit(plain)(gate, up)))
+    mlp = GatedMLP(hidden_features=128, out_features=64, activation="gelu")
+    x = jnp.asarray(rng.standard_normal((2, 64)), dtype)
+    params = mlp.init(jax.random.key(0), x)
+    assert derivatives.Activation("gelu", gated=False) in _activation_spans(
+        jax.make_jaxpr(lambda v: mlp.apply(v, x))(params).jaxpr)

@@ -354,7 +354,17 @@ class WalkStep:
     or unrolled rotation holds it; inlined, it lowers to its index."""
 
 
-type Kind = Protected | Surrogate | KernelGlue | Algebra | WalkStep
+@dataclasses.dataclass(frozen=True)
+class Activation:
+    """An activation's region (`dew.nn.activations`): `name`'s activation of its operand, or where `gated` a
+    gated product's, the activation of its gate times its up projection, its operands gate then up. Its one
+    reader is a fusion pass's choice of a matmul's epilogue that computes it; inlined, it lowers to its body,
+    Dew's arithmetic as it stands."""
+    name: str
+    gated: bool
+
+
+type Kind = Protected | Surrogate | KernelGlue | Algebra | WalkStep | Activation
 """What a marked span is, read as an object, never a name: to the algebra pass, or to a kernel's count."""
 
 type TangentKind = Protected | KernelGlue | Algebra
