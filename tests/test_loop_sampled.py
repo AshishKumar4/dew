@@ -262,3 +262,110 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     first, second = (own[count] for count in step.counts)
     assert flops is not None and first is not None and second is not None
     assert flops == 0.5 * first + 0.5 * second
+
+
+def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
+    """On devices with room for the one-pass step read whole and for the cap's only in two microbatches, a
+    sampled run plans its cap's step at two (`compile`), and admits every other count's at that plan
+    (`StepCompiler.admitted_at`), the one-pass step's at two microbatches where its own search plans it
+    whole: one window, of the cap's split, over every count's step."""
+    from test_plan import LIMIT, free
+
+    from dew.nn.kernels import options
+
+    batch = token_batch()
+
+    def needed(model, split):
+        free(monkeypatch, LIMIT)
+        trainer = trainer_of(model, split=split)
+        state, _, _ = trainer.place()
+        trainer.compile(state, batch)
+        options.unhold()
+        return LIMIT - trainer.plan["probes"][0]["headroom"]
+
+    model = looped(steps=CAP)
+    once, whole, halves = needed(model.with_passes(1), 1), needed(model, 1), needed(model, 2)
+    assert max(once, halves) < whole, (once, halves, whole)
+    free(monkeypatch, (max(once, halves) + whole) // 2)
+    sampled = trainer_of(model, sampled_passes=TRAINED)
+    state, _, _ = sampled.place()
+    step = sampled.compile(state, batch)
+    assert isinstance(step, SampledStep) and step.split == 2
+    assert {count: plan.split for count, plan in step.plans.items()} == dict.fromkeys(range(1, CAP + 1), 2)
+    alone = trainer_of(model.with_passes(1))
+    start, _, _ = alone.place()
+    alone.compile(start, batch)
+    assert alone.plan["split"] == 1
+
+
+def test_a_sampled_count_whose_step_returns_other_outputs_is_refused():
+    """A count whose step returns outputs other than its cap's (here a metric named by its count) cannot
+    pass the one state and pool its step's outputs with the other counts': its admission is refused,
+    naming the outputs."""
+    import dataclasses
+
+    class ByCount(LMObjective):
+        def loss(self, variables, batch, step):
+            stats, aux = super().loss(variables, batch, step)
+            named = {**aux.metrics, f"passes_{self.model.loop.steps}": jnp.zeros(())}
+            return stats, dataclasses.replace(aux, metrics=named)
+
+    from dew.training import Layout, Trainer
+
+    trainer = Trainer(ByCount(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
+    state, _, _ = trainer.place()
+    with pytest.raises(ValueError, match="other than its cap's step does") as refused:
+        trainer.compile(state, token_batch())
+    assert "passes_" in str(refused.value)
+
+
+def test_a_sampled_run_whose_window_replays_its_microbatches_is_refused():
+    """A looped mixture whose loss adds its routers' balance terms (`RoutedStatistics`), no mean its window
+    pools, replays each microbatch of an update at the count closing it: a sampled run of two microbatches a
+    step is refused, naming row 7884; read one microbatch an update, it steps."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import Mixture
+    from dew.nn.backbones.decoder_stack import Loop
+    from dew.objectives.routing import ExpertBalance
+    from dew.training import Layout, Trainer
+
+    model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
+                              max_seq_len=128, attention_impl="xla", mixture=Mixture(experts=4, top_k=2),
+                              loop=Loop(CAP, layers=(1, 2)))
+
+    def trainer(split):
+        return Trainer(LMObjective(model, 16, balance=ExpertBalance(aux_loss_alpha=0.01)), optax.sgd(0.1),
+                       key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+                       sampled_passes=TRAINED, split=split)
+
+    batch = token_batch()
+    replayed = trainer(2)
+    state, _, _ = replayed.place()
+    with pytest.raises(ValueError, match="row 7884"):
+        replayed.compile(state, batch)
+    whole = trainer(1)
+    state, _, _ = whole.place()
+    assert isinstance(whole.compile(state, batch), SampledStep)
+
+
+@pytest.mark.parametrize("fields", [{"loop_steps_mean": 2.0},
+                                    {"loop_steps_sample": "lognormal-poisson", "loop_steps_mean": 2.0,
+                                     "loop_steps_max": 4},
+                                    {"loop_steps_sample": "lognormal-poisson", "loop_steps_mean": 2.0,
+                                     "loop_steps_dispersion": 0.5, "loop_steps_max": 4, "loop_steps": 4},
+                                    {"loop_steps_sample": "lognormal-poisson", "loop_steps_mean": 1.0,
+                                     "loop_steps_dispersion": 0.5, "loop_steps_max": 4}],
+                         ids=["a law unnamed", "a law half stated", "beside a stated count",
+                              "outside its law"])
+def test_a_decoder_run_states_a_sampled_pass_count_whole_and_once(fields):
+    """A run's sampled pass count (`--loop-steps-sample`) is stated whole, its law's mean, dispersion and cap
+    with its name, beside no stated count (the cap the model holds), and within its law; stated so, the run
+    hands its trainer the law and its model the cap."""
+    from dew.config import DecoderRunConfig
+
+    with pytest.raises(ValueError):
+        DecoderRunConfig(**fields)
+    stated = DecoderRunConfig(loop_steps_sample="lognormal-poisson", loop_steps_mean=2.0,
+                              loop_steps_dispersion=0.5, loop_steps_max=4)
+    assert stated.sampled_passes() == SampledPasses(2.0, 0.5, 4) and stated.handed_passes == 4

@@ -569,6 +569,9 @@ class StepCompiler[L, E]:
                              "drawn per microbatch takes them one microbatch an update (split and "
                              "accumulation 1), until replays run each at its own (row 7884)")
         plans, flops = {sampled.cap: planned}, {sampled.cap: cap.step_flops}
+        # Compiled here, a step compiled ahead holding its cap's alone (`dew.training.ahead`).
+        _log.info("the run draws its pass count per microbatch: it compiles the steps of counts %s at its "
+                  "cap's plan", list(range(1, sampled.cap)))
         for count in range(1, sampled.cap):
             self.phase_passes.current = count
             with self.phase_passes.scoped(holder, self):
