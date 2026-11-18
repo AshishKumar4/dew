@@ -123,7 +123,8 @@ def truth(model_dir: str):
     def scored(prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
         with jax.enable_x64(new_val=True):
             sequence = jnp.asarray(np.concatenate([prompt, forced])[None, :-1], jnp.int32)
-            logits = jnp.asarray(wide.apply(variables, sequence, train=False, decode=False))[0, len(prompt) - 1:]
+            whole = jnp.asarray(wide.apply(variables, sequence, train=False, decode=False))
+            logits = whole[0, len(prompt) - 1:]
             scores = jax.nn.log_softmax(logits.astype(jnp.float64), axis=-1)
             chosen_scores = jnp.take_along_axis(scores, jnp.asarray(forced)[:, None], axis=-1)[:, 0]
             return np.asarray(chosen_scores, np.float64)
