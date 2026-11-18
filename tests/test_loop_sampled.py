@@ -277,16 +277,21 @@ def test_a_sampled_step_called_by_hand_draws_each_calls_counts_itself():
 def test_a_sampled_run_whose_variables_are_on_the_host_is_refused_as_it_is_built():
     """A run drawing its pass count per microbatch whose stated layout keeps its variables on the host (a
     host-master run, which no plan of the devices steps) is refused as the trainer is built (rows 8271,
-    8400), and a run of the default layout is never offered the streamed host layout (`streaming.refusal`),
-    which its first compile then refused, a layout the user never stated."""
+    8400), and on a part whose table prices the streamed step (an H100's) a run of the default layout is
+    never offered the streamed host layout (`streaming.refusal`), where the same run drawing no count is
+    (row 8441: on the CPU's own table no part prices it, which refused both alike)."""
+    from test_host_training import assumed_on_cpu
+
     from dew.training import Layout, Trainer, streaming
 
     with pytest.raises(ValueError):
         Trainer(LMObjective(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
                 layout=Layout(host=("variables",), min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
-    default = Trainer(LMObjective(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
-                      sampled_passes=TRAINED)
-    assert streaming.refusal(default, stated=False, ahead=False) is not None
+    drawing, fixed = (Trainer(LMObjective(looped(steps=CAP), 16), optax.adam(0.1), key=jax.random.key(0),
+                              **given) for given in ({"sampled_passes": TRAINED}, {}))
+    with assumed_on_cpu("sm90"):
+        assert streaming.refusal(fixed, stated=False, ahead=False) is None
+        assert streaming.refusal(drawing, stated=False, ahead=False) is not None
 
 
 def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path, caplog):
@@ -307,13 +312,22 @@ def test_a_sampled_run_resumed_steps_as_the_run_never_stopped(tmp_path, caplog):
                           checkpoints=Checkpoints(str(directory), keep=8)).fit(
             phased_loader(tokens), steps=steps, log_every=100, checkpoint_every=1)
 
+    def noted() -> int:
+        """How many times a fit said its checkpoint counted none of its microbatches (`DrawingStep.drawn`)."""
+        return len([record for record in caplog.records if record.name == "dew.training.compiler"
+                    and record.funcName == "drawn"])
+
     with caplog.at_level("INFO", logger="dew.training.compiler"):
         whole = fitted(tmp_path / "whole", 4)
         fitted(tmp_path / "resumed", 2)
         resumed = fitted(tmp_path / "resumed", 4)
-    # The one note of a checkpoint lacking its count names its step and microbatch (`DrawingStep.drawn`).
-    assert not [record for record in caplog.records if record.name == "dew.training.compiler"
-                and isinstance(record.args, tuple) and len(record.args) == 2]
+        assert noted() == 0
+        # A checkpoint of a run drawing no count, which counted no microbatch: said once as the sampled
+        # run resumes it, its draws on from its step's microbatches (row 8442).
+        phased_trainer(looped(steps=CAP), 0, None, checkpoints=Checkpoints(str(tmp_path / "fixed"), keep=8)
+                       ).fit(phased_loader(tokens), steps=2, log_every=100, checkpoint_every=1)
+        taken = fitted(tmp_path / "fixed", 4)
+    assert noted() == 1 and int(taken.step) == 4
     assert int(resumed.step) == 4
     assert_same(parameters(whole), parameters(resumed), "the resumed sampled run is not the run unstopped")
 
