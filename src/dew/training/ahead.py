@@ -372,6 +372,11 @@ class AheadOfTime:
     """The kernel launch configs its compiles found spilling and refused
     (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
     lowers (`FitSearch`), so its derivations step down as the compile's did and it lowers this program."""
+    counts: dict[int, tuple[AheadProgram, AheadProgram | None]] = dataclasses.field(default_factory=dict)
+    """A run that draws its looped model's pass count per microbatch
+    (`dew.training.phase_passes.SampledPasses`): every count's step but its cap's, the step's own, at its
+    plan (`StepCompiler.admitted_at`), with its sampled step where the run inspects, by count, which a run
+    handed the step takes in place of compiling them (`at_count`); none for any other run."""
     starts: dict[str, Executable] = dataclasses.field(default_factory=dict)
     """The programs a run builds its fresh state with before its first step and that step's own copies of
     its weights (`dew.training.distributed.start_compiled`, the narrowed copies), compiled for the target
@@ -444,12 +449,15 @@ class AheadOfTime:
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
-        if "starts" not in vars(step) or "autotuned" not in record(step.plan, "plan"):
+        if ("starts" not in vars(step) or "counts" not in vars(step)
+                or "autotuned" not in record(step.plan, "plan")):
             raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
-                             "programs (`starts`) and said whether XLA tuned them (`autotuned`); compile it "
-                             "ahead again")
+                             "programs (`starts`), a sampled pass count's other counts' steps (`counts`) and "
+                             "said whether XLA tuned them (`autotuned`); compile it ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
-        _current(path, "step", [step.executable, *sampled])
+        counted = [program.executable for held in step.counts.values() for program in held
+                   if program is not None]
+        _current(path, "step", [step.executable, *sampled, *counted])
         return step
 
     def loaded(self) -> jax.stages.Compiled:
@@ -489,6 +497,17 @@ class AheadOfTime:
                              f"{device.shared_limit} bytes) does not run (`BuildTarget`); compile it ahead "
                              "for this GPU")
         return self.target
+
+    def at_count(self, passes: int) -> AheadOfTime:
+        """The step of `passes`, one of a sampled pass count's (`counts`), as a step compiled ahead a run
+        takes in place of compiling it (`taken`): refused where the step holds none of it, compiled ahead
+        before steps held their counts or for another law."""
+        if passes not in self.counts:
+            raise ValueError(f"the step compiled ahead holds no step of {passes} passes (its counts "
+                             f"{sorted(self.counts)}); compile it ahead again from this run's config")
+        step, sampled = self.counts[passes]
+        return dataclasses.replace(self, program=step.program, executable=step.executable, sampled=sampled,
+                                   counts={})
 
     def taken(self, lowered: jax.stages.Lowered) -> jax.stages.Compiled:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
@@ -1438,9 +1457,13 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
             begun = None if start.resume is not None or trainer.host_master else start_compiling(
                 start.placing, start.initializer, shapes_of(start.key),
                 start.abstract, start.shardings, trainer.device_mesh)
-            planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, frontier)
+            stepped = step_batch(trainer, batch)
+            planned = trainer._compiled_plan(start.abstract, stepped, None, frontier)
             with attempting(begun):
                 starts = started(trainer, start, planned, plan)
+            counts = {} if trainer.phase_passes.sampled is None else {
+                count: _held_ahead(each) for count, each in trainer._compiler.admitted_counts(
+                    trainer, trainer._stepping, planned, start.abstract, stepped)}
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
     # The sampled step as the search compiled it, its program what it lowered then (the plan unreleased, its
@@ -1464,7 +1487,18 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), capacity, topology=topology),
-        refusals=report.refused_launches(), sampled=sampled, starts=starts)
+        refusals=report.refused_launches(), sampled=sampled, starts=starts, counts=counts)
+
+
+def _held_ahead(planned: Planned) -> tuple[AheadProgram, AheadProgram | None]:
+    """A sampled pass count's step admitted at its cap's plan (`StepCompiler.admitted_counts`), and its
+    sampled step where the run inspects, as programs compiled ahead (`AheadOfTime.counts`)."""
+    step = AheadProgram.of(program_digest(planned.candidate.lowered), planned.executable)
+    if planned.sampled is None:
+        return step, None
+    if planned.sampled.lowered is None:
+        raise ValueError("a count's sampled step was released before it was compiled ahead")
+    return step, AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable)
 
 
 def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> HostStartup:
