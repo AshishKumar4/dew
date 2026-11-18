@@ -20,6 +20,7 @@ import model_flows
 import numpy as np
 import pytest
 import tier_wire
+from arm_forms import WITHOUT_YNN, without_ynn
 from process_support import relayed
 from reference_error import ahead_arm, assert_as_exact, over_windows, run_to_run, windows
 from truths_ahead import UNPREPARED, MissingTruth, compiled_truths
@@ -388,20 +389,27 @@ def test_an_arm_of_its_own_compiler_options_is_prepared_whole(tmp_path):
     that program, tracing none, with no test of it recorded unprepared (row 8469: traced inside the arms'
     program, the prepare refused it, 'compiler_options can only be passed to top-level jax.jit', and its test
     ran unprepared). Its truth its own float64 function, as such a site's is (`blockwise_matrix`'s cuBLASLt
-    reference beside its truth): a truth is walked by its trace, which no jit of compiler options lives in."""
-    from arm_forms import WITHOUT_YNN, without_ynn
+    reference beside its truth): a truth is walked by its trace, which no jit of compiler options lives in.
+    A reference, it is traced and lowered with the algebra pass off, as its call runs (`unrewritten`): held
+    whole, it was traced with the pass on, the program it stored a rewrite of the reference (the review).
+    Its draw's arrays JAX's, so no NumPy refusal runs it beside the gate's arm (`_refuse_numpy_arms`)."""
+    from dew._cache import ALGEBRA
 
-    dew, reference, draw = _site()
-    traced: list[None] = []
+    dew, reference, numpy_draw = _site()
+    traced: list[bool] = []
 
     def counted(a, b):
-        traced.append(None)
+        traced.append(ALGEBRA.value.on)
         return reference(a, b)
+
+    def draw(seed):
+        return tuple(map(jnp.asarray, numpy_draw(seed)))
 
     # Its own compiler options, YNNPACK's off, whatever the census (`arm_forms.switched_off`).
     whole = without_ynn(counted, compiler_options=dict(WITHOUT_YNN))
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8, truth_fn=reference)
+    assert traced and not any(traced)
     traced.clear()
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8, truth_fn=reference)
@@ -430,7 +438,9 @@ def test_a_library_sites_arms_are_prepared_and_run_from_their_programs(tmp_path)
     assert not traced and not (tmp_path / UNPREPARED).exists()
 
 
-def test_a_site_free_arm_runs_its_prepared_program(tmp_path):
+@pytest.mark.parametrize("jitted", [jax.jit, lambda fn: without_ynn(fn, compiler_options=dict(WITHOUT_YNN))],
+                         ids=["a plain jit", "a jit of its own compiler options"])
+def test_a_site_free_arm_runs_its_prepared_program(tmp_path, jitted):
     """A computation with no check-1 site (a bitwise check's kernel, `reference_error.ahead_arm`) is
     prepared as an arm is: its prepare traces it and gives zeros of its outputs' shapes, its run computes it
     with the program its prepare compiled, tracing none, the same values bit for bit as computing it; one its
@@ -444,15 +454,15 @@ def test_a_site_free_arm_runs_its_prepared_program(tmp_path):
 
     a, b = (np.arange(6, dtype=np.float32).reshape(2, 3) + offset for offset in (1.0, 0.5))
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
-        prepared = ahead_arm(jax.jit(scaled), "a scaled product")(a, b)
+        prepared = ahead_arm(jitted(scaled), "a scaled product")(a, b)
     assert traced and np.asarray(prepared).tolist() == np.zeros((2, 3), np.float32).tolist()
     traced.clear()
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
-        stored = ahead_arm(jax.jit(scaled), "a scaled product")(a, b)
+        stored = ahead_arm(jitted(scaled), "a scaled product")(a, b)
     assert not traced and np.asarray(stored).tolist() == (a * b + 1.0).tolist()
     # Another function's jit, which JAX's own cache of traces (of `scaled`, the prepare's) does not hold.
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
-        unreached = ahead_arm(jax.jit(lambda a, b: scaled(a, b)), "a product no prepare reached")(a, b)
+        unreached = ahead_arm(jitted(lambda a, b: scaled(a, b)), "a product no prepare reached")(a, b)
     assert traced and np.asarray(unreached).tolist() == (a * b + 1.0).tolist()
     assert (tmp_path / UNPREPARED).is_file()
 

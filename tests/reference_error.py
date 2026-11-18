@@ -612,34 +612,34 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
             store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain), arms=True)
 
 
-def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference: bool) -> None:
+def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference: bool):
     """Into `programs` and `held`, arm `fn`'s program at a draw's `inputs` as the gate compiles it
     (`_compiled`): within a run-to-run declaration and a window loop (at one window's inputs), a reference
     unrewritten but one of Dew's own paths (an arm that holds a program, `_holds_program`). Traced as its run
     traces it, and again where its compile lowers it (a launch a spill refused
     derived at its next config), its constants the first trace's, by place (`_hold`); held under `role`, its
-    name with its fingerprint (`_arm_role`)."""
+    name with its fingerprint (`_arm_role`). Its outputs' shapes and dtypes at `inputs`, its trace's (a window
+    loop's at one window's)."""
     if isinstance(fn, _RunToRun):
-        _arm_program(programs, held, role, fn.fn, inputs, reference=reference)
-        return
+        return _arm_program(programs, held, role, fn.fn, inputs, reference=reference)
     if isinstance(fn, _Windowed):
-        _arm_program(programs, held, role, fn.fn, jax.tree.map(lambda leaf: leaf[0], inputs),
-                     reference=reference)
-        return
+        return _arm_program(programs, held, role, fn.fn, jax.tree.map(lambda leaf: leaf[0], inputs),
+                            reference=reference)
     name = named(role, inputs)
+    traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
     if getattr(fn, "without_ynn", False) and hasattr(fn, "trace"):
         # A jit of its own compiler options (`without_ynn`'s: a library arm's cuBLAS,
         # `generation_support.cublas_compiled`), which JAX lowers only as a top-level program: held whole
-        # (`_Whole`), never traced inside another, as the gate runs it as it is (`_compiled`).
+        # (`_Whole`), never traced inside another, as the gate runs it as it is (`_compiled`), a reference's
+        # trace and lowering unrewritten as its call is (`Unrewritten`'s).
         leaves = jax.tree.leaves(inputs)
         if list(inputs) != leaves:
             raise ValueError(f"{name}: an arm compiled with its own compiler options is held whole, over its "
                              "inputs as arrays, and these inputs are a tree of them")
-        programs[name] = (_Whole(fn), [*map(jax.typeof, leaves)])
-        out = fn.trace(*inputs).out_info
+        programs[name] = (_Whole(traced_fn), [*map(jax.typeof, leaves)])
+        out = traced_fn.trace(*inputs).out_info
         held[name] = {"constants": [], "tree": jax.tree.structure(out)}
-        return
-    traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
+        return out
     closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
     structure = jax.tree.structure(inputs)
     schema = [jax.typeof(constant) for constant in closed.consts]
@@ -656,6 +656,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         return retraced
 
     _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
+    return shapes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1959,9 +1960,11 @@ def ahead_arm(fn: Callable, label: str) -> Callable:
             programs: dict = {}
             held: dict = {}
             with store.tracing():
-                _arm_program(programs, held, role, fn, inputs, reference=False)
+                shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
             store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True), arms=True)
-            return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), jax.eval_shape(fn, *inputs))
+            # Zeros of the shapes its own trace gave, in the store's tracing: a jit of its own compiler
+            # options traced again inside another, `eval_shape`'s, was refused.
+            return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)
         if not store.holds(armed(label)):
             store.unprepared(f"{label}: its prepare did not reach this arm")
             return fn(*inputs)
