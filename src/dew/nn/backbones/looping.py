@@ -34,20 +34,32 @@ from .decoder_stack import OBSERVED, WRITTEN, Loop, PassView, SharedPassView, so
 from .layer_names import group_layers
 
 
-def _preamble(model, loop: Loop, x, injected, *, stop: bool, normed=None):
+def _preamble(model, loop: Loop, x, injected, *, stop: bool, normed=None, theta=None):
     """A later pass's input from the state the pass before left: normed under `step_norm` (by `normed`,
     the norm the exit gate already read, where it read this state with no coda between), cut from the
     gradient where `stop` says, the block's input added back under `reinject`, or the block's input moved
-    toward the state by θ under `implicit` (`a + θ⊙(h - a)`, `a` the block's input, θ
-    `model.loop_theta`)."""
+    toward the state by θ under `implicit` (`a + θ⊙(h - a)`, `a` the block's input, θ the pass's own,
+    `theta`, which `_theta` gives an implicit loop alone)."""
     if loop.step_norm:
         x = model.norm(x) if normed is None else normed
     x = jax.lax.stop_gradient(x) if stop else x
     if loop.reinject:
         x = model.norm(x + injected)
-    if loop.implicit:
-        x = injected + model.loop_theta.astype(x.dtype) * (x - injected)
+    if theta is not None:
+        x = injected + theta.astype(x.dtype) * (x - injected)
     return x
+
+
+def _theta(model, loop: Loop, steps: range, *, rows: bool = False):
+    """The θ the later passes of `steps` read, under `implicit`: `model.loop_theta`, one every pass reads, or
+    with `theta_passes` its row t - 1 for pass t, a pass's own: one pass's row, or with `rows` the passes'
+    rows `[len(steps), d]` (None where they read one θ); None where the loop is not implicit."""
+    if not loop.implicit or (rows and loop.theta_passes is None):
+        return None
+    if loop.theta_passes is None:
+        return model.loop_theta
+    held = model.loop_theta[steps.start - 1:steps.stop - 1]
+    return held if rows else held[0]
 
 
 def exit_log_distribution(logits: Sequence[jax.Array]) -> jax.Array:
@@ -247,7 +259,8 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
             if logit is not None:  # a gated exit, which the threshold's choice weighs (`_exited`)
                 exited.append((leaving, logit))
             normed = output if end == layers and model.normed_output else None
-        x = _preamble(model, loop, x, injected, stop=step == cut, normed=normed)
+        x = _preamble(model, loop, x, injected, stop=step == cut, normed=normed,
+                      theta=_theta(model, loop, range(step, step + 1)))
         run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
         return _stepped(loop, run(model, x, **inputs), x, injected)
@@ -276,9 +289,10 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         entering = None if shared is None else (shared.entering if shared.entering is not None
                                                else model.variables.get('cache') or None)
 
-        def later(module, x):
+        def later(module, x, theta):
             # The block's input, its per-layer inputs and the entering cache close over the scan.
-            x = _preamble(module, loop, x, injected, stop=False)
+            x = _preamble(module, loop, x, injected, stop=False,
+                          theta=_theta(module, loop, steps) if theta is None else theta)
             if entering is None:
                 return _stepped(loop, run_block(module, x, **inputs), x, injected), None
             reading = nn.map_variables(run_block, mapped_collections='cache',
@@ -293,7 +307,7 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
                        length=len(steps), metadata_params={nn.PARTITION_NAME: None})
         run = nn.map_variables(scan, mapped_collections=mapped, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
-        x, _ = run(model, x)
+        x, _ = run(model, x, _theta(model, loop, steps, rows=True))  # each pass's own θ row, if it holds one
         return x
 
     # Under a shared cache the last pass keeps its writes and runs as the first does, after the scan.

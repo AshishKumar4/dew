@@ -7,9 +7,11 @@ block [1, 3) run once in the first and twice in the second (`DecoderRunConfig.lo
 import csv
 import dataclasses
 import itertools
+import json
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from run_kinds import MostlyKept, trained
@@ -80,9 +82,20 @@ def phased(root: Path):
                   (asked(tickets(root, "second", "sales")), None))
 
 
-def parameters(state) -> dict:
+def named_leaves_of(variables) -> list:
+    """Each leaf of `variables`' parameters by its path, shapes held as they are."""
+    return [(jax.tree_util.keystr(path), leaf)
+            for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"])]
+
+
+def named_leaves(variables) -> dict:
+    """Each leaf of `variables`' parameters by its path."""
     return {jax.tree_util.keystr(path): np.asarray(leaf)
-            for path, leaf in jax.tree_util.tree_leaves_with_path(state.variables["params"])}
+            for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"])}
+
+
+def parameters(state) -> dict:
+    return named_leaves(state.variables)
 
 
 def theta(state) -> np.ndarray:
@@ -124,6 +137,96 @@ def test_a_decision_run_whose_passes_grow_by_phase_resumes_as_one(tmp_path):
         np.testing.assert_array_equal(leaf, parameters(resumed)[name], err_msg=name)
     loaded = Decide.from_run(str(tmp_path / "runs" / "stopped"))
     assert loaded.model.backbone.loop.steps == STEPS[-1]
+
+
+def test_a_phased_run_with_a_theta_per_pass_keeps_its_rows_through_its_phases_and_resumes(tmp_path):
+    """The phased run with a θ per later pass (`loop_theta_per_pass`, rows for its largest count): its θ
+    holds its rows through the phase of one pass, whose steps move none, and moves from the second; stopped
+    inside the second phase and resumed, it lands where the run nobody stopped lands, bit for bit; its
+    record states the choice and its saved run loads with its rows; and the choice without an implicit loop
+    is refused before anything loads (row 7661)."""
+    from dew.checkpoints import RUN_FILE
+
+    data = phased(tmp_path)
+
+    def per_pass(name: str, steps: int):
+        return trained(dataclasses.replace(run(tmp_path, STEPS, data), loop_theta_per_pass=True), tmp_path,
+                       name, trainer={"steps": steps, "checkpoint_every": 1})[0]
+
+    whole = per_pass("whole", 4)
+    assert theta(whole).shape[0] == STEPS[-1] - 1 and np.any(theta(whole))
+    per_pass("stopped", 3)
+    resumed = per_pass("stopped", 4)
+    for name, leaf in parameters(whole).items():
+        np.testing.assert_array_equal(leaf, parameters(resumed)[name], err_msg=name)
+    # The run's record states the choice (its data built in Python, which no record reads back).
+    assert recorded(json.loads((tmp_path / "runs" / "stopped" / RUN_FILE).read_text()), "loop_theta_per_pass")
+    loaded = Decide.from_run(str(tmp_path / "runs" / "stopped"))
+    assert loaded.model.backbone.loop.theta_passes == STEPS[-1]
+
+
+def recorded(record, name: str):
+    """The value a run's record (`run.json`'s JSON) holds for its field `name`, wherever it states it."""
+    if isinstance(record, dict):
+        if name in record:
+            return record[name]
+        found = [recorded(value, name) for value in record.values()]
+    elif isinstance(record, list):
+        if len(record) == 2 and record[0] == name:
+            return record[1]
+        found = [recorded(value, name) for value in record]
+    else:
+        return None
+    return next((value for value in found if value is not None), None)
+
+
+def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_its_theta():
+    """A run asking only for a θ per pass over a checkpoint whose implicit loop holds one θ takes it at the
+    checkpoint's own count, each row the checkpoint's θ, so it computes what the checkpoint computed; over a
+    checkpoint whose loop is not implicit it is refused, by the loop (row 7661)."""
+    from dew.config import looping
+    from dew.interop.pretrained import Pretrained
+
+    loaded = Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference")
+    implicit = looping(loaded, 3, (1, 3), implicit=True)
+    (held,) = [leaf for name, leaf in named_leaves(implicit.variables).items() if "loop_theta" in name]
+    theta = np.random.default_rng(7661).uniform(0.1, 0.9, held.shape).astype(np.float32)
+    implicit = dataclasses.replace(implicit, variables=jax.tree_util.tree_map_with_path(
+        lambda path, leaf: theta if "loop_theta" in jax.tree_util.keystr(path) else leaf, implicit.variables))
+    asked = dataclasses.replace(run(Path(), None, None), loop_layers=None, loop_implicit=False,
+                                loop_theta_per_pass=True)
+    per_pass = asked.looped(implicit)
+    assert per_pass.model.loop.theta_passes == 3 and per_pass.model.loop.steps == 3
+    (rows,) = [leaf for name, leaf in named_leaves(per_pass.variables).items() if "loop_theta" in name]
+    np.testing.assert_array_equal(np.asarray(rows), np.stack([theta] * 2))
+    ids = jnp.arange(12, dtype=jnp.int32).reshape(2, 6)
+    np.testing.assert_array_equal(np.asarray(per_pass.model.apply(per_pass.variables, ids)),
+                                  np.asarray(implicit.model.apply(implicit.variables, ids)))
+    plain = looping(loaded, 3, (1, 3))
+    with pytest.raises(ValueError):
+        asked.looped(plain)
+    # Held as shapes alone, as a resume loads its source, its θ rows as its shape.
+    shaped = dataclasses.replace(implicit, variables=jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), np.asarray(leaf).dtype), implicit.variables))
+    rowed = asked.looped(shaped).variables
+    (shape,) = [leaf for name, leaf in named_leaves_of(rowed) if "loop_theta" in name]
+    assert isinstance(shape, jax.ShapeDtypeStruct) and shape.shape == (2, *held.shape)
+    # Its channels placed as its one θ's, over a mesh, its rows whole.
+    mesh = jax.make_mesh((2,), ("x",), devices=jax.devices()[:2])
+    channels = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("x"))
+    placed = dataclasses.replace(implicit, variables=jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jax.ShapeDtypeStruct(np.shape(leaf), np.asarray(leaf).dtype, sharding=channels)
+        if "loop_theta" in jax.tree_util.keystr(path) else leaf, shaped.variables))
+    (rowed_placed,) = [leaf for name, leaf in named_leaves_of(asked.looped(placed).variables)
+                       if "loop_theta" in name]
+    assert rowed_placed.sharding.spec == jax.sharding.PartitionSpec(None, "x")
+    # A checkpoint holding rows for three passes keeps them, run at two.
+    fewer = dataclasses.replace(asked, loop_steps=2).looped(per_pass)
+    assert fewer.model.loop.theta_passes == 3 and fewer.model.loop.steps == 2
+    np.testing.assert_array_equal(np.asarray(fewer.model.apply(fewer.variables, ids)),
+                                  np.asarray(per_pass.model.with_passes(2).apply(per_pass.variables, ids)))
+    with pytest.raises(ValueError):
+        dataclasses.replace(asked, loop_steps=4).looped(per_pass)
 
 
 @pytest.mark.parametrize("phase", range(len(STEPS)), ids=[f"{passes}-passes" for passes in STEPS])
