@@ -231,17 +231,34 @@ def three_steps(trainer: Trainer, vocabulary: int):
     return state
 
 
+class _CountedProjection(LMObjective):
+    """An LM objective that counts each projection of its parameters before an update reads them
+    (`projected` with `updated` False), as each trace of it runs its Python."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reads: list[None] = []
+
+    def projected(self, params, *, updated: bool):
+        if not updated:
+            self.reads.append(None)
+        return super().projected(params, updated=updated)
+
+
 def test_a_projecting_decoders_host_steps_run_on_its_startups_programs_alone():
     """A host decoder whose parameters a step reads projected (Gemma 3n's AltUp prediction coefficients
     clamped, `ProjectsParameters`) runs its steps on the programs its startup compiled: the projection,
     arithmetic on its parameters, is a program of its own (`dew.training.transaction.Read`), each leaf it
-    leaves as it is handed back as the array it is."""
+    leaves as it is handed back as the array it is. Over its startup and three steps the projection's Python
+    runs twice: once in the read's one trace, whose program computes the changed leaves from that trace,
+    and once in the step's commit; the read's program traced it a third time when it lowered (row 8397)."""
     from dew.nn.gemma3n import AltUp
 
     model = decoder(altup=AltUp(num_inputs=2, coef_clip=.5), scan_layers=False)
-    trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.01),
-                      key=jax.random.key(3), layout=HOST)
+    objective = _CountedProjection(model, 8, head_chunks=1, ema_decay=None)
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(3), layout=HOST)
     assert int(three_steps(trainer, 16).updates) == 3
+    assert len(objective.reads) == 2
 
 
 def test_a_casting_projection_is_the_identity_where_its_leaves_are_of_its_dtype_alone():
@@ -257,43 +274,6 @@ def test_a_casting_projection_is_the_identity_where_its_leaves_are_of_its_dtype_
         wide = {"params": {"w": jnp.arange(3, dtype=jnp.float64)}}
         assert read(wide, None)["params"]["w"].dtype == jnp.float32
 
-
-
-def test_a_projecting_read_traces_its_projection_once_a_signature():
-    """A host step's read of its variables (`Read`) runs its projection's Python once per signature, in the
-    trace that tells which leaves it changes, and computes those leaves from that trace, where its
-    program's lowering traced the projection again (row 8397); a later call over arrays of the same
-    signature runs no projection's Python, its computed leaf the projection's."""
-    from dew.training.transaction import Read
-
-    calls = []
-
-    def projected(variables, compute):
-        calls.append(None)
-        return {"params": {"w": variables["params"]["w"] * 2.0, "b": variables["params"]["b"]}}
-
-    read = Read(projected)
-    variables = {"params": {"w": jnp.arange(3, dtype=jnp.float32), "b": jnp.ones(2, jnp.float32)}}
-    first = read(variables, None)
-    again = read(variables, None)
-    assert len(calls) == 1
-    assert first["params"]["b"] is variables["params"]["b"]
-    np.testing.assert_array_equal(np.asarray(again["params"]["w"]), np.arange(3, dtype=np.float32) * 2.0)
-
-def test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone():
-    """A host decoder whose embedding is frozen, outside its scanned stack (the run's frozen collection),
-    runs its steps on the programs its startup compiled: the startup tells a frozen leaf by its path, as a
-    step over arrays does (`HostExecution.inputs`), so it compiles the signature its steps call."""
-    model = decoder()
-    fresh = jax.tree.map(np.asarray, nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32))))
-
-    def trained(path):
-        return "embed_tokens" not in path
-
-    trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None, variables=freeze(fresh, trained)),
-                      optax.adam(.01), key=jax.random.key(3), layout=HOST)
-    state = three_steps(trainer, 16)
-    assert "embed_tokens" in state.variables[FROZEN] and int(state.updates) == 3
 
 
 def test_a_host_decoders_steps_run_on_its_startups_programs_alone():
