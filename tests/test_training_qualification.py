@@ -67,7 +67,7 @@ def finish(process: subprocess.Popen, mode: str) -> None:
     try:
         log = output(process, 900)
     except subprocess.TimeoutExpired:
-        terminate(process)
+        terminate([process])
         pytest.fail(f"the {mode} run did not finish within 900s\n{output(process)}")
     assert process.returncode == 0, f"the {mode} run exited {process.returncode}\n{log}"
 
@@ -77,7 +77,7 @@ def kill_when_ready(process: subprocess.Popen, marker: Path) -> None:
     deadline = time.monotonic() + 900
     while not marker.exists():
         if process.poll() is not None or time.monotonic() >= deadline:
-            terminate(process)
+            terminate([process])
             pytest.fail(f"the interrupted run never blocked\n{output(process)}")
         time.sleep(0.05)
     assert int(marker.read_text()) == process.pid

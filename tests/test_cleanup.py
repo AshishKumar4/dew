@@ -167,7 +167,7 @@ def test_a_started_command_meets_sigpipe_as_popen_leaves_it(disposition, restore
                f"plain = subprocess.run(command, restore_signals={restore}).returncode\n"
                f"started = start(command, restore_signals={restore})\n"
                "print(plain, started.wait(timeout=60))\n"
-               "stop(started)\n")
+               "stop([started])\n")
     done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=120)
     ended = -signal.SIGPIPE if restore or disposition == "SIG_DFL" else 3
     assert done.stdout == f"{ended} {ended}\n", done.stdout + done.stderr
@@ -213,7 +213,7 @@ def test_an_interruption_at_any_line_its_caller_runs_in_start_reaches_it_as_rais
             process = start(["sleep", "600"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         finally:
             sys.settrace(None)
-        stop(process)
+        stop([process])
         return ran[0]
 
     previous = signal.signal(signal.SIGALRM, interrupt)
@@ -338,7 +338,7 @@ def test_threads_starting_their_first_groups_at_once_in_a_process_without_dew_al
                "    thread.start()\n"
                "for thread in threads:\n"
                "    thread.join()\n"
-               "left = [pid for process in started for pid in groups.stop(process)]\n"
+               "left = groups.stop(started)\n"
                "print(len(started), failed, left)\n")
     for _ in range(5):
         done = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True,
