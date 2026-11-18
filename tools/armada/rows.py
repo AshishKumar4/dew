@@ -3,6 +3,8 @@
 (`<file>#G/N@users`), and its record's place on a device class, in the cache Worker's key alphabet (no colon,
 no hash)."""
 
+import hashlib
+import re
 from collections.abc import Mapping
 
 
@@ -50,13 +52,40 @@ def cut_of(group: str) -> str:
     return group.partition(VARIED)[0]
 
 
+SPELLED = 160
+"""The most characters a record place's part spells out (`spelled`); a longer one is spelled by its digest."""
+DIGEST = "=ZZ"
+"""What begins a part spelled by its digest (`spelled`), no character's escape."""
+
+
+def spelled(text: str) -> str:
+    """`text` in the Worker's key alphabet (tools/armada/r2.json): each character outside letters, digits,
+    `.`, `_` and `-` as `=XX` of its UTF-8 bytes (a parametrized test's brackets, a test node's colons), or
+    past `SPELLED` characters its digest (2026-11-18: every parametrized check-1 site's group, `test[id]`, was
+    refused as a key before any request since 11-09, 19,218 lookups from 11-13 on, and no such row was ever
+    kept or reused)."""
+    out = "".join(char if char.isascii() and (char.isalnum() or char in "._-")
+                  else "".join(f"={byte:02X}" for byte in char.encode()) for char in text)
+    return out if len(out) <= SPELLED else DIGEST + hashlib.sha256(text.encode()).hexdigest()[:32]
+
+
+def unspelled(text: str) -> str:
+    """`spelled`'s text back from its spelling; one spelled by its digest as it is."""
+    if text.startswith(DIGEST):
+        return text
+    return re.sub(rb"=([0-9A-F]{2})", lambda byte: bytes.fromhex(byte[1].decode()), text.encode()).decode()
+
+
 def row_place(row_name: str, held: str) -> str:
     """Row `row_name`'s place on class `held` under a record prefix: `<class>/<test file>/<group>`, a group
     `whole` or a split's `<index>-of-<count>` (`key_parts`), a process variant's (`varied`) with
-    `-as-<variant>` after it, in the Worker's key alphabet."""
+    `-as-<variant>` after it, in the Worker's key alphabet: a check-1 site's group (`test[id]`) and a test
+    node's name after its file `spelled`."""
     _, name, split = parsed_row(row_name)
     variant = split.partition(VARIED)[2]
-    return (f"{held}/{name}/" + ("-of-".join(cut.split("/")) if (cut := cut_of(split)) else "whole")
+    file, colons, node = name.partition("::")
+    return (f"{held}/{file}{spelled(colons + node) if colons else ''}/"
+            + (spelled("-of-".join(cut.split("/"))) if (cut := cut_of(split)) else "whole")
             + (f"-as-{variant}" if variant else ""))
 
 
@@ -65,7 +94,7 @@ def key_parts(key: str) -> tuple[str, str, str]:
     its test file and its group (`whole`, or a split's `<index>-of-<count>`)."""
     held, rest = key.split("/", 1)
     name, group = rest.rsplit("/", 1)
-    return held, name, group
+    return held, unspelled(name), unspelled(group)
 
 
 def place_variant(group: str) -> str:
