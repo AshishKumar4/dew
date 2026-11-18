@@ -27,8 +27,10 @@ class Table:
     laid as the memories are; the slot each chunk takes its memory up from, `loads` `[chunks]` (one-based,
     zero a zero memory, -1 none: the chunk continues the one before), and the stored slot it leaves its
     memory in, `stores` (zero none); each chunk's entry write `entries` `[chunks * HV * Dk, Dv]` fp32, zero
-    but where it takes a document up, where the call gives one; and a row's slots, `count` given and `held`
-    stored."""
+    but where it takes a document up, where the call gives one; a row's slots, `count` given and `held`
+    stored; and where a turned call gives it, each chunk's load rotation `turning` (`_turning_rows`: each
+    key row's cosine and its pair partner's sines, `[chunks, HV * Dk]` fp32 each), its memories then laid
+    one row past each end (`pad`), so a row's partner a row away reads in bounds."""
 
     given: jax.Array
     loads: jax.Array
@@ -36,11 +38,37 @@ class Table:
     entries: jax.Array | None
     count: int = dataclasses.field(metadata={'static': True})
     held: int = dataclasses.field(metadata={'static': True})
+    turning: tuple | None = None
+
+    @property
+    def pad(self) -> int:
+        """The rows its memories are laid past each end: one where it turns them (`turning`), else none."""
+        return 0 if self.turning is None else 1
 
     @property
     def operands(self) -> tuple:
         """What a walk's launch reads of it, in order (`Taking.of`, `Returning.of`)."""
-        return (self.given, self.loads, self.stores, *(() if self.entries is None else (self.entries,)))
+        return (self.given, self.loads, self.stores, *(() if self.entries is None else (self.entries,)),
+                *(() if self.turning is None else self.turning))
+
+    @property
+    def returning(self) -> tuple:
+        """What a reverse walk's launch reads of it (`returned_by`): its loads, stores and load rotation."""
+        return (self.loads, self.stores, *(() if self.turning is None else self.turning))
+
+
+def turning_rows(cos, sin, width: int) -> tuple:
+    """A load rotation `(cos, sin)` `[..., A]` (`chunked_launch.Forked.turning`) as a memory's key rows take
+    it `[..., width]` (`Taking`): each row's cosine, one past the `A` pairs, and its partner's coefficient, a
+    pair's first row's from the row after it (minus the sine), its second's from the row before (the sine),
+    each zero elsewhere, so a row turned is `cos x_r + after x_{r+1} + before x_{r-1}`."""
+    pairs = cos.shape[-1]
+    rest = width - 2 * pairs
+    zero, one = jnp.zeros_like(cos), jnp.ones((*cos.shape[:-1], rest), cos.dtype)
+    rows = jnp.concatenate([jnp.repeat(cos, 2, axis=-1), one], axis=-1)
+    after = jnp.concatenate([jnp.stack([-sin, zero], axis=-1).reshape(*cos.shape[:-1], -1), 0 * one], axis=-1)
+    before = jnp.concatenate([jnp.stack([zero, sin], axis=-1).reshape(*cos.shape[:-1], -1), 0 * one], axis=-1)
+    return rows, after, before
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,12 +80,13 @@ class Memories:
     head: jax.Array
     column: jax.Array
     bv: int
+    pad: int = 0
 
-    def view(self, ref, base, i):
-        """Key slice `i` of the memory at `base` of `ref`."""
+    def view(self, ref, base, i, by: int = 0):
+        """Key slice `i` of the memory at `base` of `ref`, its rows `by` rows on (a turned row's partner)."""
         call = self.call
-        return ref.at[pl.ds((base * call.heads + self.head) * call.width + i * call.block, call.block),
-                      pl.ds(self.column, self.bv)]
+        first = (base * call.heads + self.head) * call.width + i * call.block + self.pad + by
+        return ref.at[pl.ds(first, call.block), pl.ds(self.column, self.bv)]
 
     def views(self, ref, base) -> list:
         return [self.view(ref, base, i) for i in range(self.call.width // self.call.block)]
@@ -66,6 +95,16 @@ class Memories:
         """Key slice `i` of the memory at `base` of `ref`, in the walk's registers (`Family.tile_of`): a
         walk reads a memory a slice at a time, each beside the slices it carries alone."""
         return self.call.family.tile_of(self.view(ref, base, i))
+
+    def turned(self, ref, base, i, turning, n, sign: float = 1.0):
+        """Key slice `i` of the memory at `base` of `ref` turned by chunk `n`'s load rotation (`turning`, its
+        refs `[chunks, HV * Dk]`, `turning_rows`), back by it where `sign` is -1: each row's cosine times it
+        and its partner's coefficient times the partner, read a row on or back."""
+        call, family = self.call, self.call.family
+        span = pl.ds(self.head * call.width + i * call.block, call.block)
+        rows, after, before = (family.rows_of(part.at[n, span])[:, None] for part in turning)
+        return (rows * self.read(ref, base, i) + sign * after * family.tile_of(self.view(ref, base, i, 1))
+                + sign * before * family.tile_of(self.view(ref, base, i, -1)))
 
     def zero(self):
         return self.call.family.zeros((self.call.block, self.bv))
@@ -86,13 +125,17 @@ class Taking:
     held: int
     smem: object
 
+    turning: tuple | None = None
+
     @classmethod
     def of(cls, table: Table, refs: Sequence, stored, slots: Memories, row, smem) -> "Taking":
         """`table`'s walk from its refs as a launch reads them (`Table.operands`) and its stored slots'
         output `stored`."""
-        given, loads, stores, *entries = refs
+        given, loads, stores, *rest = refs
+        turning = tuple(rest[-3:]) if table.turning is not None else None
+        entries = rest[:-3] if table.turning is not None else rest
         return cls(slots, (given, loads, stores, entries[0] if entries else None), stored, row, table.count,
-                   table.held, smem)
+                   table.held, smem, turning)
 
     def opened(self) -> None:
         """Nothing: a stored slot is written by a document before any later one reads it."""
@@ -101,13 +144,19 @@ class Taking:
         given, loads, _, entries = self.refs
         load = loads[n]
 
+        def read(ref, base, i):
+            # A turned call's memory turned by its document's load rotation as it is taken up.
+            if self.turning is None:
+                return self.slots.read(ref, base, i)
+            return self.slots.turned(ref, base, i, self.turning, n)
+
         def taken(i):
             def from_given():
-                return lax.cond(load > 0, lambda: self.slots.read(given, self.row * self.count + load - 1, i),
+                return lax.cond(load > 0, lambda: read(given, self.row * self.count + load - 1, i),
                                 self.slots.zero)
 
             def from_stored():
-                return self.slots.read(self.stored, self.row * self.held + load - self.count - 1, i)
+                return read(self.stored, self.row * self.held + load - self.count - 1, i)
 
             memory = lax.cond(load > self.count, from_stored, from_given) if self.held else from_given()
             return memory if entries is None else memory + self.slots.read(entries, n, i)
@@ -149,6 +198,7 @@ class Returning:
     held: int
     chunks: int
     smem: object
+    turning: tuple | None = None
 
     def opened(self) -> None:
         """The row's stored slots' gradients zeroed for the walk's sums."""
@@ -175,13 +225,20 @@ class Returning:
         call = self.slots.call
 
         def taken():
-            call.family.stored(list(grad), self.slots.views(self.taken, n), smem=self.smem)
+            if self.turning is None:
+                call.family.stored(list(grad), self.slots.views(self.taken, n), smem=self.smem)
+            else:
+                # Kept, so its rows turn back from global memory, each beside its partner.
+                call.family.kept(list(grad), self.slots.views(self.taken, n), call.interpret, smem=self.smem)
             if self.held:
                 @pl.when(load > self.count)
                 def _():
                     base = self.row * self.held + load - self.count - 1
+                    parts = (grad if self.turning is None else
+                             [self.slots.turned(self.taken, n, i, self.turning, n, sign=-1.0)
+                              for i in range(len(grad))])
                     # A slice at a time: each summed beside the gradient's slices, then kept.
-                    summed = [part + self.slots.read(self.returned, base, i) for i, part in enumerate(grad)]
+                    summed = [part + self.slots.read(self.returned, base, i) for i, part in enumerate(parts)]
                     call.family.kept(summed, self.slots.views(self.returned, base), call.interpret,
                                      smem=self.smem)
             return [self.slots.zero()] * len(grad)
@@ -206,7 +263,7 @@ def taken_by(table: Table | None, refs: Sequence, stored, call: "Call", head, co
     wide, landing through `landing(role)`; None for a call without one."""
     if table is None:
         return None
-    return lambda role: Taking.of(table, refs, stored, Memories(call, head, column(role), bv), row,
+    return lambda role: Taking.of(table, refs, stored, Memories(call, head, column(role), bv, table.pad), row,
                                   landing(role))
 
 
@@ -218,9 +275,10 @@ def returned_by(table: Table | None, refs: Sequence, returned: Sequence, call: "
     if table is None:
         return None
     taken, *gathered = returned
-    return lambda role: Returning(Memories(call, head, column(role), bv), refs[0], refs[1], taken,
+    turning = tuple(refs[2:5]) if table.turning is not None else None
+    return lambda role: Returning(Memories(call, head, column(role), bv, table.pad), refs[0], refs[1], taken,
                                   gathered[0] if gathered else None, row, table.count, table.held,
-                                  call.chunks, landing(role))
+                                  call.chunks, landing(role), turning)
 
 
 def stored_split(table: Table | None, launched: Sequence) -> tuple[tuple, jax.Array | None]:
@@ -235,8 +293,8 @@ def table_returned(call: "Call", table: Table, batch: int) -> tuple:
     """A reverse walk's table outputs (`Returning`): the gradient of the memory each chunk takes up
     `[chunks * HV * Dk, Dv]` fp32 (a chunk that takes nothing up written by none), and its stored slots'
     gathered gradients where the table holds any, as `table_stored` lays them."""
-    return (jax.ShapeDtypeStruct((call.chunks * call.heads * call.width, call.value_width), jnp.float32),
-            *table_stored(call, table, batch))
+    return (jax.ShapeDtypeStruct((call.chunks * call.heads * call.width + 2 * table.pad, call.value_width),
+                                 jnp.float32), *table_stored(call, table, batch))
 
 
 def table_stored(call: "Call", table: Table | None, batch: int) -> tuple:
@@ -244,8 +302,8 @@ def table_stored(call: "Call", table: Table | None, batch: int) -> tuple:
     fp32, as the memories are laid."""
     if table is None or not table.held:
         return ()
-    return (jax.ShapeDtypeStruct((batch * table.held * call.heads * call.width, call.value_width),
-                                 jnp.float32),)
+    return (jax.ShapeDtypeStruct((batch * table.held * call.heads * call.width + 2 * table.pad,
+                                  call.value_width), jnp.float32),)
 
 
 def table_landing(call: "Call", keeps: bool, bv: int) -> dict:
