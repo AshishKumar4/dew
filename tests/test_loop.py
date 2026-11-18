@@ -303,13 +303,18 @@ def test_qk_clip_bounds_a_looped_layer_by_the_largest_logit_of_every_pass(rng):
         return {'self_attn': {**sown[0], 'max_logits': (jax.tree.map(
             lambda *maxima: jnp.max(jnp.stack(maxima), axis=0), *(held['max_logits'] for held in sown)))}}
 
-    every = {f'layers_{layer}': called(copies(layer)) for layer in range(4)}
-    first_only = {**every, 'layers_1': called(copies(1)[:1])}
-    passes = [jnp.max(jnp.asarray(theirs[f'layers_{index}']['self_attn']['max_logits'][0]), axis=-2)
-              for index in copies(1)]
-    head = int(jnp.argmax(passes[1] - passes[0]))
-    assert passes[1][head] > passes[0][head], "a head whose second pass reads a larger logit than its first"
-    tau = float((passes[0][head] + passes[1][head]) / 2)
+    def heads(index: int) -> jax.Array:
+        """Each head's largest logit over the rows at the unrolled stack's layer `index`."""
+        return jnp.max(jnp.asarray(theirs[f'layers_{index}']['self_attn']['max_logits'][0]), axis=-2)
+
+    # The looped layer and head whose second pass reads the larger logit by the most.
+    gaps = {(layer, head): float(gap) for layer in (1, 2)
+            for head, gap in enumerate(heads(copies(layer)[1]) - heads(copies(layer)[0]))}
+    layer, head = max(gaps, key=gaps.__getitem__)
+    assert gaps[layer, head] > 0, "a head whose second pass reads a larger logit than its first"
+    tau = float((heads(copies(layer)[0])[head] + heads(copies(layer)[1])[head]) / 2)
+    every = {f'layers_{index}': called(copies(index)) for index in range(4)}
+    first_only = {**every, f'layers_{layer}': called(copies(layer)[:1])}
     clip, params = scale_by_qk_clip(tau), variables['params']
 
     def rescales(qk) -> Mapping[str, jax.Array]:
@@ -319,8 +324,9 @@ def test_qk_clip_bounds_a_looped_layer_by_the_largest_logit_of_every_pass(rng):
 
     expected = rescales(every)
     jax.tree.map(np.testing.assert_array_equal, rescales(ours), expected)
-    clipped = [key for key, factor in expected.items() if "layers_1" in key and bool(jnp.any(factor < 1))]
-    assert clipped, "the second pass's logit clips layer 1"
+    clipped = [key for key, factor in expected.items()
+               if f"'layers_{layer}'" in key and bool(jnp.any(factor < 1))]
+    assert clipped, "the second pass's logit clips its layer"
     alone = rescales(first_only)
     assert any(not np.array_equal(alone[key], expected[key]) for key in clipped)
 
