@@ -92,7 +92,7 @@ class Decided:
         """Consumer `wg`'s `verdict` (a scalar, uniform over its warpgroup) published, and whether any
         consumer's takes the walk again (`taken`)."""
         if self.words is None:
-            return _rare(self.uniform(verdict.astype(jnp.int32)) != 0)
+            return rare(self.uniform(verdict.astype(jnp.int32)) != 0)
         self.words[wg] = verdict.astype(jnp.int32)
         plgpu.barrier_arrive(self.barrier)
         return self.taken()
@@ -102,7 +102,7 @@ class Decided:
         rare verdict (`derivatives.Rare`), which a count of the kernel's work reads as not taken."""
         plgpu.barrier_wait(self.barrier)
         published = (self.words[index] for index in range(self.consumers))
-        return _rare(self.uniform(functools.reduce(operator.or_, published)) != 0)
+        return rare(self.uniform(functools.reduce(operator.or_, published)) != 0)
 
 
 def verdicts(consumers: int) -> dict:
@@ -111,5 +111,6 @@ def verdicts(consumers: int) -> dict:
     return {"words": plgpu.SMEM((consumers,), jnp.int32), "barrier": plgpu.Barrier(num_arrivals=consumers)}
 
 
-_rare = derivatives.marked(derivatives.Rare(), lambda verdict: verdict)
-"""A decided walk's verdict marked rare (`derivatives.Rare`)."""
+rare = derivatives.marked(derivatives.Rare(), lambda verdict: verdict)
+"""A verdict a kernel's rare span runs by, marked so (`derivatives.Rare`): a decided walk's second, a lazy
+walk's move of its kept sums (`placed.Tcgen05Placed.accumulating`)."""
