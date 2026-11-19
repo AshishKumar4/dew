@@ -359,9 +359,10 @@ class Region[Node: (Term, Skeleton)]:
     held: dict[jcore.Var, Magnitude | None] = dataclasses.field(default_factory=dict)
     """Each value's magnitude (`magnitudes`') by the jaxpr's variable that names it: what a window cut from
     the jaxpr declares of its inputs (`dew.algebra.program._windowed`)."""
-    unproven: frozenset[jcore.Var] = frozenset()
-    """The jaxpr's variables naming values it proves no finite number (`Apart.finite`: an equation outside
-    the language's output, a NaN's tanh): what a window cut from it declares `UNPROVEN`."""
+    apart: dict[jcore.Var, Apart] = dataclasses.field(default_factory=dict)
+    """What the jaxpr proves of each value beside its magnitude (`Apart`: a number, finite, its side and
+    floor) by the variable that names it: with `held`, what a window cut from the jaxpr declares of its
+    inputs (`Proven`)."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -581,14 +582,9 @@ NOTHING = -(2 ** 20)
 """A zero's magnitude: under every other."""
 
 
-UNPROVEN = type("Unproven", (), {"__repr__": lambda self: "UNPROVEN"})()
-"""An input's declaration that nothing is proven of it (`Ranges`): no finite number, no bound, its `Apart`
-none (`NOWHERE`), as a value a window takes from outside it that its program proves no finite number
-(`dew.algebra.program._declared`, spec alignment 8993)."""
-
-type Ranges = Mapping[int, float | tuple[float, float] | object] | None
-"""Declared ranges by input index (`region`'s): a bound on an input's magnitude, an interval, or
-`UNPROVEN`."""
+type Ranges = Mapping[int, float | tuple[float, float] | Proven] | None
+"""Declared ranges by input index (`region`'s): a bound on an input's magnitude, an interval, or what a
+program around the input proves of it (`Proven`)."""
 
 
 @overload
@@ -727,7 +723,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                   max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
                   frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed,
                   {var: magnitudes.get(key(node)) for var, node in env.items()},
-                  frozenset(var for var in env if not apart.get(var, NOWHERE).finite))
+                  {var: apart.get(var, NOWHERE) for var in env})
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)
@@ -800,6 +796,17 @@ WHOLE = Apart(number=True, finite=True)
 sign."""
 
 
+class Proven(NamedTuple):
+    """An input's declaration as a program around it proves it (`dew.algebra.program._declared`): its
+    magnitude's bound where one holds (a power of two, 0 for nothing; None for none) and what else it holds
+    (`Apart`). A window cut from a program takes each value it reads from the program so, not as every
+    input is taken, a finite real: a value the program proves no number (a NaN's tanh made outside the
+    window) bounds nothing within it (spec alignment, 8993)."""
+
+    bound: float | None
+    apart: Apart
+
+
 def _floor_log2(value: float) -> int:
     """`floor(log2(value))` of a positive float, exactly, by its exponent."""
     return math.frexp(value)[1] - 1
@@ -844,14 +851,14 @@ def _constant_apart(value) -> Apart:
                  finite=bool(np.isfinite(values).all()))
 
 
-def _declared_apart(declared: float | tuple[float, float] | None) -> Apart:
+def _declared_apart(declared: float | tuple[float, float] | Proven | None) -> Apart:
     """An input's `Apart`: a finite number, as every input is taken to be (a real, within its declared range
     where it has one); and, of an interval, its end nearer zero where the interval holds none and the side
     of zero it lies on."""
     if declared is None:
         return WHOLE
-    if declared is UNPROVEN:
-        return NOWHERE
+    if isinstance(declared, Proven):
+        return declared.apart
     if not isinstance(declared, tuple):
         return Apart(number=True, finite=math.isfinite(declared))
     low, high = declared
@@ -1320,10 +1327,12 @@ def _magnitude(value) -> Magnitude | None:
     return _log2(largest) if math.isfinite(largest) else None
 
 
-def _declared(declared: float | tuple[float, float] | None) -> Magnitude | None:
+def _declared(declared: float | tuple[float, float] | Proven | None) -> Magnitude | None:
     """An input's magnitude from its declared range (an interval's larger end's), None where it declares
     none."""
-    if declared is None or declared is UNPROVEN:
+    if isinstance(declared, Proven):
+        declared = declared.bound
+    if declared is None:
         return None
     largest = max(abs(declared[0]), abs(declared[1])) if isinstance(declared, tuple) else declared
     return _log2(largest) if math.isfinite(largest) else None

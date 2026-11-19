@@ -63,24 +63,24 @@ def test_an_infinite_scale_stays_inside_a_maximum():
 def test_a_window_proves_nothing_of_a_value_its_program_proves_no_number():
     """`sum(tanh(a / b) * c)`, its quotient outside the window a reduction heads (three equations deep):
     `a / b` may be `0 / 0`, so the program proves `tanh` of it no number and bounds nothing it makes; each
-    window cut from it holds no bound the program does not (`program._declared`: the quotient declared
-    `terms.UNPROVEN`), where the window took its input for a finite real and bounded the tanh, its product and
-    its sum, which a reordering reads (spec alignment, 8993)."""
+    window cut from it holds no bound and no finiteness the program does not (`program._declared`: the
+    quotient declared as the program proves it, `terms.Proven`), where the window took its input for a finite
+    real and bounded the tanh, its product and its sum, which a reordering reads (spec alignment, 8993)."""
     from jax.extend import core as jcore
 
     def program_of(a, b, c):
         return jnp.sum(jnp.tanh(a / b) * c)
 
     closed = jax.make_jaxpr(program_of)(*(jnp.ones(8, jnp.float32) for _ in range(3)))
-    whole = terms.region(closed).held
+    whole = terms.region(closed)
     windows = program._windows(closed.jaxpr)
     assert windows
     proven = program._held(closed.jaxpr)
     for window, _ in windows:
-        held = terms.region(jcore.ClosedJaxpr(window, []), program._declared(window, proven)).held
+        cut = terms.region(jcore.ClosedJaxpr(window, []), program._declared(window, proven))
         made = [var for equation in window.eqns for var in equation.outvars]
-        assert [held.get(var) for var in made if whole.get(var) is None] == [None] * sum(
-            whole.get(var) is None for var in made)
+        assert [var for var in made if cut.held.get(var) is not None and whole.held.get(var) is None] == []
+        assert [var for var in made if cut.apart[var].finite and not whole.apart[var].finite] == []
 
 
 @pytest.mark.parametrize("kind", KINDS)

@@ -15,7 +15,7 @@ import math
 import time
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -34,6 +34,9 @@ from dew.nn.derivatives import Activation, Algebra, KernelGlue, Surrogate, marke
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 from dew.nn.programs import called, control_flow, inlined, live, with_bodies
+
+if TYPE_CHECKING:
+    from dew.nn.kernels import tuning
 
 
 @dataclasses.dataclass(frozen=True)
@@ -316,30 +319,28 @@ def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
 
 
 def _held(jaxpr: jcore.Jaxpr) -> terms.Region:
-    """What `jaxpr` proves of each value (`terms.Region.held`, its magnitudes, and `terms.Region.unproven`,
-    those it proves no finite number), its structure's alone (`terms.Skeleton`), its constants taken as
-    inputs: what its windows read of the values they take from outside them."""
+    """What `jaxpr` proves of each value (`terms.Region.held`, its magnitudes, and `terms.Region.apart`, the
+    rest), its structure's alone (`terms.Skeleton`), its constants taken as inputs: what its windows read
+    of the values they take from outside them."""
     opened = jaxpr.replace(constvars=[], invars=[*jaxpr.constvars, *jaxpr.invars])
     return terms.region(opened, forms=terms.Skeleton)
 
 
-def _declared(window: jcore.Jaxpr, proven: terms.Region | None) -> dict[int, float | object]:
-    """The ranges `window`'s inputs hold (`terms.Ranges`, by input index): each one's magnitude the program
-    proves where it bounds one (`_held`), as its power of two, so a bound a window cuts its equations below
-    holds within it: a rule's operand made outside a window is bounded as the program bounds it (a scale's
-    under a broadcast, three equations below the sum that reads it), where it would read no bound at all;
-    and one the program proves no finite number (a NaN's tanh made outside the window) declared so
-    (`terms.UNPROVEN`), where the window would take it as every input is taken, a finite real, and bound
-    what it makes of it (spec alignment, 8993)."""
-    declared: dict[int, float | object] = {}
+def _declared(window: jcore.Jaxpr, proven: terms.Region | None) -> dict[int, terms.Proven]:
+    """What `window`'s inputs hold (`terms.Proven`, by input index): each one as the program proves it
+    (`_held`), its magnitude's bound as its power of two where the program bounds one and the rest
+    (`terms.Apart`), so a bound a window cuts its equations below holds within it (a scale's under a
+    broadcast, three equations below the sum that reads it), and no more: a value the program proves no
+    number (a NaN's tanh made outside the window) bounds nothing the window makes of it, where the window
+    took every input for a finite real (spec alignment, 8993)."""
+    declared: dict[int, terms.Proven] = {}
     if proven is None:
         return declared
     for index, var in enumerate(window.invars):
         bound = proven.held.get(var)
-        if var in proven.unproven:
-            declared[index] = terms.UNPROVEN
-        elif bound is not None and bound < 1024:
-            declared[index] = 0.0 if bound == terms.NOTHING else math.ldexp(1.0, bound)
+        magnitude = (None if bound is None or bound >= 1024
+                     else 0.0 if bound == terms.NOTHING else math.ldexp(1.0, bound))
+        declared[index] = terms.Proven(magnitude, proven.apart.get(var, terms.NOWHERE))
     return declared
 
 
@@ -900,7 +901,20 @@ def _opened(jaxpr: jcore.Jaxpr, spans: list[_Span] | None = None) -> jcore.Jaxpr
                          outvars=[outer(atom) for atom in jaxpr.outvars])
 
 
-_REWRITTEN: weakref.WeakKeyDictionary[jcore.Jaxpr, dict[Hashable, jcore.Jaxpr | None]] = (
+@dataclasses.dataclass(frozen=True)
+class _Body:
+    """A body's rewrite as `_closed` holds it: its program (None where nothing changed), and what its rewrite
+    reported (its routes, its launches, the facts it read, its regions' rewrites), replayed where it is
+    written again."""
+
+    made: jcore.Jaxpr | None
+    routes: tuple
+    launches: tuning.Seen
+    reads: Mapping
+    rewrites: tuple
+
+
+_REWRITTEN: weakref.WeakKeyDictionary[jcore.Jaxpr, dict[Hashable, _Body]] = (
     weakref.WeakKeyDictionary())
 """Each body's rewrites (`_closed`) by what a rewrite read (the numerics' forms, the saturation, the
 switch's target), held while the body lives: every call site of one body, and every retrace that holds it
@@ -943,19 +957,6 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         for made_report in body.rewrites:
             kernel_report.record_rewrite(dataclasses.replace(made_report, reused=True))
     return closed if body.made is None else body.made
-
-
-@dataclasses.dataclass(frozen=True)
-class _Body:
-    """A body's rewrite as `_closed` holds it: its program (None where nothing changed), and what its rewrite
-    reported (its routes, its launches, the facts it read, its regions' rewrites), replayed where it is
-    written again."""
-
-    made: jcore.Jaxpr | None
-    routes: tuple
-    launches: Hashable
-    reads: Mapping
-    rewrites: tuple
 
 
 def _power_of_two(value) -> bool:
