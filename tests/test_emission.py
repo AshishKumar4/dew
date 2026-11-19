@@ -376,7 +376,7 @@ def test_an_async_smem_to_tmem_copy_charges_shared_bytes_from_its_source_without
     sliced = plgpu.kernel(sliced_body, out_type=_ROW, num_threads=1, thread_name="wg",
                           scratch_types=[plgpu.SMEM((128, 256), jnp.bfloat16),
                                          plgpu.TMEM((128, 64), jnp.bfloat16, packed=True)])
-    full_work = emission.emitted(jax.make_jaxpr(full)()).roles[0].fixed
-    sliced_work = emission.emitted(jax.make_jaxpr(sliced)()).roles[0].fixed
+    full_work = emission.emitted(jax.make_jaxpr(full)(), 1, "wg").roles[0].fixed
+    sliced_work = emission.emitted(jax.make_jaxpr(sliced)(), 1, "wg").roles[0].fixed
     assert full_work.shared_bytes == 128 * 256 * 2 and full_work.device_bytes == 0
     assert sliced_work.shared_bytes == 128 * 64 * 2 and sliced_work.device_bytes == 0

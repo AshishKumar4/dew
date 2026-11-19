@@ -197,7 +197,8 @@ class _Interpreter:
         stacked = values[num_consts + num_carry:]
         body = params["jaxpr"]
         for index in range(params["length"]):
-            sliced = [None if value is None or isinstance(value, Ref) else value[index] for value in stacked]
+            sliced = [None if value is None or isinstance(value, Ref) or np.ndim(value) == 0
+                      else value[index] for value in stacked]
             carry = self.run(body.jaxpr, body.consts, [*consts, *carry, *sliced])[:num_carry]
         return [*carry, *([None] * (len(body.out_avals) - num_carry))]
 

@@ -428,7 +428,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         staged = self.staged_bytes(ba, config, target) if target.shared_limit else None
         tmem = self.tmem_columns(ba, config, target)
         return max(1, resources.register_model(family, config.consumers, self.registers(ba, config),
-                                               shared=staged, target=target, tmem=tmem).programs)
+                                               shared=staged, target=target, tmem=tmem).most)
 
 
 @dataclasses.dataclass(frozen=True)
