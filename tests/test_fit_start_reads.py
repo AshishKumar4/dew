@@ -39,6 +39,8 @@ def test_a_named_input_run_resumed_exactly_over_a_changed_plan_reads_no_record_b
     before it reads any record, its input declared from the first batch the resume admits: refused having
     mapped none (row 9013: its start read the replacement stream's first batch before the plan refused)."""
     from dew.data import Memory
+    from dew.data.compile import compile
+    from dew.data.dataset import Loading
     from dew.data.pipeline import Pipeline
     from dew.training import Checkpoints
 
@@ -53,8 +55,9 @@ def test_a_named_input_run_resumed_exactly_over_a_changed_plan_reads_no_record_b
                "y": np.zeros((8 * rows, 4), np.float32)}
 
     def fit(seed: int, steps: int):
-        chain = (Pipeline(Memory(columns), name="xs").map(counted, identity="counted@1").shuffle(seed=seed)
-                 .repeat().batch(rows))
+        chain = compile(Pipeline(Memory(columns), name="xs").map(counted, identity="counted@1")
+                        .shuffle(seed=seed).repeat().batch(rows), read="streamed", loading=Loading(workers=0),
+                        resume="exact")
         objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
         trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), data_resume="exact",
                           checkpoints=Checkpoints(str(tmp_path)))

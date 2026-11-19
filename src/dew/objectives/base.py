@@ -1182,9 +1182,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         resume may change (`resumed_freely`). A setting of another kind, its modules and held trees among
         them, which its model's record and its draw state, is left out: a record refuses by what it states."""
         left = {*type(self)._untraced(), *type(self).resumed_freely(), *HELD}
-        return {name: recorded for name, value in sorted(vars(self).items())
-                if not name.startswith("_") and name not in left
-                and (recorded := _setting_record(value)) is not _UNRECORDED}
+        settings: dict[str, JSON] = {}
+        for name, value in sorted(vars(self).items()):
+            recorded = _setting_record(value)
+            if not name.startswith("_") and name not in left and not isinstance(recorded, _Unrecorded):
+                settings[name] = recorded
+        return settings
 
     @classmethod
     def _untraced(cls) -> dict[str, str]:

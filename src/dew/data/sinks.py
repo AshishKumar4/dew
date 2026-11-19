@@ -232,9 +232,7 @@ def _streamed(chunks: Iterator[list[Batch | bytes | None]]) -> pa.RecordBatchRea
 def _drained(stream: pa.RecordBatchReader, native: _Parquet | Writer) -> None:
     """Refuse an export whose writer returned with rows of `stream` unread: the manifest would commit a
     prefix of the export as the whole of it (row 9014)."""
-    try:
-        stream.read_next_batch()
-    except StopIteration:
+    if next(iter(stream), None) is None:
         return
     raise ValueError(f"the export's writer {native!r} returned before reading every row; nothing is "
                      "committed, so write the whole stream it is handed")
