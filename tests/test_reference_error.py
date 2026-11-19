@@ -594,8 +594,8 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     """The gate compiles a JAX truth (`_truth_program`) from its first call on, never running it eagerly, so
     a seed's truth is the same whichever seed a process draws first, and its values are the eager truth's
     own. A truth doing host work fails at its first call unless its site states it (`as_given`, ledger 3198);
-    a truth `as_given` runs as it is, one jitted already compiled as any other, and a window loop's by its
-    own; a check over a compiled truth judges as over the eager one."""
+    a truth `as_given`, one compiled already and a window loop's by its own run as they are; a check over a
+    compiled truth judges as over the eager one."""
     from arm_arithmetic import Truth
     from reference_error import _truth_program, _Windowed, as_given, over_windows
 
@@ -613,9 +613,9 @@ def test_a_float64_truth_runs_as_one_compiled_program():
                        lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64))):
             with pytest.raises(jax.errors.TracerArrayConversionError):
                 _truth_program(hosted)(x, w)
-    # A truth run as given is itself, its programs unrewritten; one jitted already is compiled as any is.
+    # A truth run as given, or compiled already, is itself, its programs unrewritten.
     given = as_given(truth)
-    assert _truth_program(given).wrapped is given and isinstance(_truth_program(_product), Truth)
+    assert _truth_program(given).wrapped is given and _truth_program(_product).wrapped is _product
     assert _truth_program(None) is None
     windowed = _truth_program(over_windows(truth))
     assert isinstance(windowed, _Windowed) and isinstance(windowed.fn, Truth)
@@ -2395,7 +2395,6 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
             null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
     else:
         null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
-
 
 
 def test_errors_whose_squares_float64_holds_as_zero_keep_their_ratio():

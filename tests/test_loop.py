@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, dew_path, with_gradients
 
 from dew.batch import leaves_by_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -514,7 +514,9 @@ def test_an_implicit_loop_with_a_theta_per_pass_reads_each_pass_its_own(steps):
     def unrolled(model):
         return lambda variables, ids: model.apply(variables, ids, method=_theta_method)
 
-    assert_as_exact(_results(looped.apply), _results(unrolled(looped)), draw, f"a θ per pass at {steps}",
+    # Its unrolled form is Dew's own (`dew_path`): an invariance claim, held against it compiled alike.
+    assert_as_exact(_results(looped.apply), dew_path(_results(unrolled(looped))), draw,
+                    f"a θ per pass at {steps}",
                     seeds=PER_PASS_SEEDS, truth_fn=_results(unrolled(looped.clone(dtype=jnp.float64))))
     variables, ids, cotangent = draw(0)
     assert variables["params"]["loop_theta"].shape == (2, looped.emb_features)
