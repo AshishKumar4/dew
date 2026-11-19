@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tiny_models
+from arm_arithmetic import on_float64_device
 from contract_support import normal_float32
 from delta_rule_support import stacked_documents
 from flax import linen as nn
@@ -483,6 +484,24 @@ def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recu
                     "a turned call's mixed derivative at zero queries", seeds=32, truth_fn=exact)
 
 
+def assert_finite_where_float64_is(operands, seeded) -> None:
+    """`TURNED`'s chunked op over `operands` on the portable math, its output and every gradient under the
+    cotangents `seeded`: finite wherever the recurrence a token at a time's in float64 is a normal float32,
+    the leaf named where one is not (a mark's gradient, float0, skipped)."""
+    ours = jax.jit(with_gradients(lambda given: chunk_on('xla', TURNED, given, chunk_size=CHUNK)))(operands,
+                                                                                                    seeded)
+    with jax.enable_x64(new_val=True), on_float64_device():
+        exact = jax.jit(with_gradients(lambda given: token_by_token(TURNED, given)))(*widened((operands,
+                                                                                               seeded)))
+    leaves = jax.tree_util.tree_leaves_with_path(ours)
+    for (path, made), truth in zip(leaves, jax.tree.leaves(exact), strict=True):
+        if not jnp.issubdtype(made.dtype, jnp.floating):
+            continue
+        held = normal_float32(np.asarray(truth))
+        wrong = held & ~np.isfinite(np.asarray(made, np.float64))
+        assert not wrong.any(), (jax.tree_util.keystr(path), int(wrong.sum()))
+
+
 def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
     """A one-token turned call whose token begins a document (its memory entering, every entry 2^127,
     discarded), a query of its first key, zero keys, values, turns and log decays, an output cotangent of 2
@@ -499,18 +518,21 @@ def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
                                    starts=jnp.ones(operands.value.shape[:2], bool), **zero)
     d_out = jnp.zeros_like(operands.value).at[..., :2].set(2.0)
     seeded = (d_out, jnp.zeros_like(operands.state))
-    ours = jax.jit(with_gradients(lambda given: chunk_on('xla', TURNED, given, chunk_size=CHUNK)))(operands,
-                                                                                                   seeded)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
-        exact = jax.jit(with_gradients(lambda given: token_by_token(TURNED, given)))(*wide)
-    leaves = jax.tree_util.tree_leaves_with_path(ours)
-    for (path, made), truth in zip(leaves, jax.tree.leaves(exact), strict=True):
-        if not np.issubdtype(np.asarray(made).dtype, np.floating):
-            continue  # A mark's gradient (its starts'), none.
-        held = normal_float32(np.asarray(truth))
-        wrong = held & ~np.isfinite(np.asarray(made))
-        assert not wrong.any(), (jax.tree_util.keystr(path), int(wrong.sum()))
+    assert_finite_where_float64_is(operands, seeded)
+
+
+def test_a_turned_calls_cotangent_near_the_largest_across_documents_keeps_every_gradient_finite():
+    """Two one-token turned documents, zero queries, keys, turns and log decays, unit write gates, values of
+    two and output cotangents of 2^127: its output and every gradient finite wherever float64's is a normal
+    float32, the turns' zero, where the turns' gradient's own pairs contracted the later document's cotangent
+    with the earlier one's value, 2^128, before their zero cross-document weight, NaN (row 8566)."""
+    (operands,) = draw(TURNED, packed=False, seed=0, length=2)
+    zero = {name: jnp.zeros_like(getattr(operands, name)) for name in ('query', 'key', 'log_decay', 'turn')}
+    operands = dataclasses.replace(operands, value=jnp.full_like(operands.value, 2.0),
+                                   beta=jnp.ones_like(operands.beta), state=jnp.zeros_like(operands.state),
+                                   starts=jnp.ones(operands.value.shape[:2], bool), **zero)
+    seeded = (jnp.full_like(operands.value, 2.0 ** 127), jnp.zeros_like(operands.state))
+    assert_finite_where_float64_is(operands, seeded)
 
 
 def cancelling_entries_draw(seed: int):

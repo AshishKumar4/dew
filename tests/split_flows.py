@@ -5,8 +5,7 @@ flows alone and none of the per-shard cells tests/test_per_shard.py states as it
 every flow's 100, row 6846)."""
 
 import jax
-import numpy as np
-from model_flows import KINDS, flow_named, generic_kernels
+from model_flows import flow_named, generic_kernels
 
 GENERATIONS = ("sm80", "sm90")
 """The GPU generations the model flows run on (an A100's, a GH200's: tests/gpu_flow.py's tiers), whose
@@ -22,10 +21,10 @@ print(json.dumps(split_flows.split_routes(sys.argv[1])))
 
 
 def split_routes(name: str) -> list[list[str]]:
-    """The kernels off the reference path (`generic_kernels`) that flow `name`'s programs (`KINDS`: its
-    training step, its decode loop) launch traced as each of `GENERATIONS`, their rows split over a run's
-    two-device data axis under a run's layout (`placing`), at the flow's matmul precision, as a run traces
-    them: each `[choice, kernel]`."""
+    """The kernels off the reference path (`generic_kernels`) that flow `name`'s programs
+    (`ModelFlow.kinds`: its training step, its decode loop or forward) launch traced as each of
+    `GENERATIONS`, their rows split over a run's two-device data axis under a run's layout (`placing`), at
+    the flow's matmul precision, as a run traces them: each `[choice, kernel]`."""
     from dew.distributed.placement import Layout, MeshSpec
     from dew.nn.kernels import generation
     from dew.nn.sharding import placing
@@ -37,18 +36,18 @@ def split_routes(name: str) -> list[list[str]]:
     params = jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=jax.NamedSharding(
             mesh, jax.sharding.PartitionSpec())),
-        jax.eval_shape(lambda: model.init(jax.random.key(0), np.zeros((flow.rows, flow.length), np.int32)))[
-            "params"])
-    ids = jax.ShapeDtypeStruct((flow.rows, flow.length), np.int32,
-                               sharding=jax.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
+        jax.eval_shape(lambda: flow.taken(model.init(jax.random.key(0), *flow.initialized()))))
+    inputs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype,
+                                   sharding=jax.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
+              for shape in flow.inputs]
     found = set()
     for target in GENERATIONS:
-        for kind in KINDS:
+        for kind in flow.kinds:
             # At the flow's own matmul precision (`Flow.precision`), which a kernel's legality may read (an
             # fp32 SSD's Triton port takes the default precision alone), as its run multiplies.
             with (generation.assumed(target), jax.default_matmul_precision(flow.precision),
                   jax.set_mesh(mesh), placing(Layout()), generation.routes() as routes):
-                jax.jit(getattr(flow, kind)(model)).trace(params, ids)
+                jax.jit(flow.program(kind, model)).trace(params, *inputs)
             found |= {(str(route.choice), route.kernel) for route in routes
                       if route.kernel not in generic[str(route.choice)]}
     return sorted(map(list, found))

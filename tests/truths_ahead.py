@@ -17,7 +17,7 @@ A program the store does not hold for a draw's shapes or an arm's statement, or 
 `stamp` (the commit and JAX), is a red (`MissingTruth`), never one compiled in its place; a site its
 prepare did not reach, and an arm no statement holds, runs unprepared, every draw judged, recorded in the
 test's store (`unprepared`); a terms walk its values steer (a branch or loop it reads as it runs,
-`float64_terms.static`) is held as one, which its run walks on the host's CPU.
+`float64_terms.static`) is held as one, which its run walks on the GPU, named (`AT_RUN`).
 
 A program takes its traced constants as arguments, held beside it (`held.pkl`): no executable serializes an
 array it closed over. The roles are a site's truth (`truth`: its float64 program, `arm_arithmetic.Truth`),
@@ -68,9 +68,11 @@ their count shows a tier drifting from its prepares), the GPU tier's list of unp
 alone (a ledger row each, the tier's)."""
 
 AT_RUN = "at_run.json"
-"""A test's record, in its store, of a site its prepare left to its run to compile on its GPU
-(`compile_site`'s `at_run`: a choice the GPU makes that no compile without it holds), as `UNPREPARED`'s: a
-decision named in the run's summary, not drift."""
+"""A test's record, in its store, of what its run compiled on its GPU as its prepare declared, as
+`UNPREPARED`'s (`CompiledTruths.unprepared`'s `record`): a site's truths or arms its prepare wrote at run
+(`compile_site`'s `at_run`: a choice the GPU makes that no compile without it holds, a convolution's
+algorithm), and a terms walk its values steer (`float64_terms._termed`); a decision named in the run's
+summary, not drift."""
 
 DEFERRED = "deferred.json"
 """A test's record, in its store, of a GPU flow's cell its prepare deferred to its run (`unprepared`'s, as
@@ -116,18 +118,13 @@ class CompiledTruths:
         stored = json.loads(site.read_text())
         return stored.get("at_run") if stored["stamp"] == self.stamp else None
 
-    def compiled_at_run(self, why: str) -> None:
-        """Records in the store that its test compiled a site's programs on its GPU as its prepare stated
-        (`at_run`, `AT_RUN`), where in its file this process stands: a decision its run names, not drift."""
+    def unprepared(self, why: str, record: str = UNPREPARED) -> None:
+        """Records in the store that its test ran a site, or an arm, unprepared (`unprepared`), where in its
+        file this process stands; under `AT_RUN`, that its run compiled it on its GPU as its prepare
+        declared."""
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         unprepared(self.directory, test, [(frame.filename, frame.lineno) for frame in inspect.stack(0)], why,
-                   record=AT_RUN)
-
-    def unprepared(self, why: str) -> None:
-        """Records in the store that its test ran a site, or an arm, unprepared (`unprepared`), where in its
-        file this process stands."""
-        test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
-        unprepared(self.directory, test, [(frame.filename, frame.lineno) for frame in inspect.stack()], why)
+                   record)
 
     def device(self):
         """A device of the ones the store's programs compute on, whose platform picks a branch its platform
@@ -234,18 +231,22 @@ class CompiledTruths:
 
     def ran(self, label: str, role: str, inputs):
         """The site's arm `role` run on `inputs` (`called`), reporting the routes its prepare's trace of it
-        reported (`generation.reported`), as a trace of it in the run would report them: the run calls its
-        executable and traces none (row 8374: a matrix cell's routes were empty on its GPU)."""
-        from dew.nn.kernels import generation
+        reported (`generation.reported`) and recording the launches it took and their configs
+        (`tuning.noted`), as a trace of it in the run would: the run calls its executable and traces none
+        (row 8374: a matrix cell's routes were empty on its GPU; row 8580: a pinned cell's launches)."""
+        from dew.nn.kernels import generation, tuning
 
         found = self.called(label, role, inputs)
-        generation.reported(self._site(label)[1][named(role, inputs)]["routes"])
+        record = self._site(label)[1][named(role, inputs)]
+        generation.reported(record["routes"])
+        tuning.noted(record["launches"])
         return found
 
-    def walked(self, label: str, role: str, inputs) -> bool:
-        """Whether the site's program `role` at `inputs` is one its run walks as it runs (`float64_terms`),
-        its prepare having found it steered by its values, which no program compiled ahead holds."""
-        return "walked" in self._site(label)[1].get(named(role, inputs), {})
+    def walked(self, label: str, role: str, inputs) -> str | None:
+        """Why the site's program `role` at `inputs` is one its run walks as it runs (`float64_terms`), as its
+        prepare stated, having found it steered by its values, which no program compiled ahead holds; None
+        for one its prepare compiled."""
+        return self._site(label)[1].get(named(role, inputs), {}).get("walked")
 
     def tree(self, label: str, role: str, inputs):
         """The output tree the site's program `role` at `inputs` was traced with (`held`)."""
@@ -309,12 +310,20 @@ SITE_IN_PROGRESS: contextvars.ContextVar[str | None] = contextvars.ContextVar("t
 """The label of the check-1 site whose truths are computed (`judged`), None outside one."""
 
 
+READ: list[Path] = []
+"""Each store this process's runs read, in order (`compiled_truths`): a test's own and a flow's alike, whose
+records of what its run compiled on its GPU (`AT_RUN`, `UNPREPARED`) the run's summary names
+(tests/conftest.py's `compiled_ahead`)."""
+
+
 @contextlib.contextmanager
 def compiled_truths(directory: str | Path, *, prepare: bool, stamp: str,
                     target=None) -> Iterator[CompiledTruths]:
     """Within the block, check 1's sites compile their float64 programs ahead into `directory` (`prepare`)
     or compute their truths from those programs (the module's account)."""
     store = CompiledTruths(Path(directory), prepare, stamp, target)
+    if not prepare:
+        READ.append(store.directory)
     token = COMPILED.set(store)
     try:
         yield store
@@ -393,12 +402,11 @@ def of_the_parent() -> Iterator[CompiledTruths | None]:
             yield store
 
 
-def running() -> tuple[CompiledTruths, str] | None:
-    """The store whose programs compute the truths of the site in progress, and its label: where a run reads
-    a store (`compiled_truths(prepare=False)`) within a site (`judged`) its prepare reached, else None. A
-    site its prepare did not reach (a cell its prepare skipped, one computing past an earlier site) runs
-    unprepared, recorded (`CompiledTruths.unprepared`); one prepared at another stamp is a red
-    (`MissingTruth`)."""
+def reading() -> tuple[CompiledTruths, str] | None:
+    """The store a run reads the site in progress from, and its label: where a run reads a store
+    (`compiled_truths(prepare=False)`) within a site (`judged`) its prepare reached, else None. A site its
+    prepare did not reach (a cell its prepare skipped, one computing past an earlier site) runs unprepared,
+    recorded (`CompiledTruths.unprepared`); one prepared at another stamp is a red (`MissingTruth`)."""
     store, label = COMPILED.get(), SITE_IN_PROGRESS.get()
     if store is None or store.prepare or label is None:
         return None
@@ -406,6 +414,17 @@ def running() -> tuple[CompiledTruths, str] | None:
         store.unprepared(f"{label}: its prepare did not reach this site")
         return None
     return store, label
+
+
+def running() -> tuple[CompiledTruths, str] | None:
+    """The store whose programs compute the truths of the site in progress, and its label (`reading`), but
+    None where its prepare wrote its truths at run (`compile_site`'s `at_run`): its run compiles them on its
+    GPU, their float64 on its FP64 units, as a site outside a part does, named (`AT_RUN`)."""
+    ran = reading()
+    if ran is not None and (why := ran[0].at_run(ran[1])) is not None:
+        ran[0].unprepared(f"{ran[1]}: its truths: {why}", AT_RUN)
+        return None
+    return ran
 
 
 def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str,

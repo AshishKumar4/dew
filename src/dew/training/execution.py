@@ -160,6 +160,17 @@ def check_bank_pool(nbytes: int, mesh) -> None:
             "the JAX backend starts")
 
 
+def unscanned(sites) -> str | None:
+    """Why a host layout cannot hold the stacks `sites` in bank memory, None where it can: a stack whose
+    decoder runs a plain loop, whose layer fetches the compiler hoists together (`resident`)."""
+    loops = [".".join(site.namespace) or "<root>" for site in sites if not site.scanned]
+    if not loops:
+        return None
+    return (f"a host layout streams a scanned stack; the decoder at {', '.join(loops)} runs a plain loop "
+            "(scan_layers=False), whose layer fetches the compiler hoists together, so set "
+            "scan_layers=True (and bank_layers to bound a run) on it")
+
+
 def resident(placement, sites, accelerator):
     """Return where the frozen collection sits beside the accelerator.
 
@@ -171,14 +182,10 @@ def resident(placement, sites, accelerator):
     per iteration, so the device holds one layer of the bank at a time. A
     plain loop's fetches have no order between them, so the scheduler hoists
     them all to the front and the whole stack lands on the device. That is
-    the memory the layout was asked to avoid, so it is refused by name."""
-    unscanned = [".".join(site.namespace) or "<root>" for site in sites if not site.scanned]
-    if unscanned:
-        raise ValueError(
-            "a host layout streams a scanned stack; the decoder at "
-            f"{', '.join(unscanned)} runs a plain loop (scan_layers=False), whose layer "
-            "fetches the compiler hoists together, so set scan_layers=True (and bank_layers "
-            "to bound a run) on it")
+    the memory the layout was asked to avoid, so it is refused by name (`unscanned`)."""
+    refused = unscanned(sites)
+    if refused is not None:
+        raise ValueError(refused)
     def leaf(path, sharding):
         keys = tuple(entry.key for entry in path)
         kind = BANK_MEMORY if _in_stack(keys, sites) else None

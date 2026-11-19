@@ -130,9 +130,13 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
     if refused is not None and pinned:
         with pytest.raises(tuning.Unpinnable):
             jax.eval_shape(through("mosaic", refused), *draw(0))
+    # One site a variant: a store of compiled truths holds one site a label.
+    variant = " ".join(name for name, on in (("paired", paired), ("scattered", scattered), ("pinned", pinned),
+                                             ("cublas", cublas)) if on)
     with tuning.seen() as launches:
         assert_as_exact(jax.jit(through("mosaic")), jax.jit(through("xla")), draw,
-                        "a gathered grouped product", seeds=SEEDS, truth_fn=through("xla"), **library)
+                        f"a gathered grouped product: {variant or 'derived'}", seeds=SEEDS,
+                        truth_fn=through("xla"), **library)
     taken = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
              if type(op) is grouped_matmul.MosaicGmm]
     assert taken and all(config == tiles for config in taken) if pinned else taken, taken

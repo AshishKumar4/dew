@@ -16,7 +16,7 @@ import numpy as np
 from arm_arithmetic import on_float64_device, on_float64_host, unrewritten
 from jax.extend.core import primitives
 from jax.interpreters import partial_eval as pe
-from truths_ahead import running
+from truths_ahead import AT_RUN, running
 
 from dew.nn import programs
 from dew.nn.precision import correctly_rounded_divide_p
@@ -148,10 +148,11 @@ def _termed(fn, args, *, power: int):
     """`fn(*args)`'s outputs' tree, their values and each one's terms summed at `power` (`POWER`: their
     squares, or their magnitudes), the evaluation `float64_terms` describes."""
     ran = running()
-    if ran is not None and not ran[0].walked(ran[1], f"terms {power}", args):
+    steered = None if ran is None else ran[0].walked(ran[1], f"terms {power}", args)
+    if ran is not None and steered is None:
         # A run reading programs compiled ahead (`truths_ahead`): the truth's compiled run and the walk's,
         # its terms alone, in turn (`reference_error._held_walk`); a walk its values steer runs as it is
-        # walked, on the host's CPU.
+        # walked, on the GPU, named.
         store, label = ran
         values = jax.tree.leaves(store.called(label, "truth", args))
         energies = store.called(label, f"terms {power}", args)
@@ -159,16 +160,13 @@ def _termed(fn, args, *, power: int):
             np.asarray(_or_size(energy, value)) for energy, value in zip(energies, values, strict=True)]
     closed, tree = traced(fn, args)
     leaves, consts = on_float64_host((jax.tree.leaves(args), closed.consts))
-    scope = on_float64_device()
     if ran is not None:
-        # In a part's run, a walk its values steer (its prepare held none) walks on the host's CPU: the run
-        # compiles nothing on its GPU, whose lane requires every program's tuning recorded (bible §8).
-        host = jax.devices("cpu")[0]
-        leaves, consts = jax.device_put((leaves, consts), host)
-        scope = jax.default_device(host)
+        # In a part's run, a walk its values steer (its prepare held none) compiles its spans on the GPU as
+        # it walks, its float64 on the GPU's FP64 units (bible §8), named as its prepare declared it.
+        ran[0].unprepared(f"{ran[1]}: its terms walk: {steered}", AT_RUN)
     token = POWER.set(power)
     try:
-        with scope, evaluated_on(leaves):
+        with on_float64_device(), evaluated_on(leaves):
             if static(closed.jaxpr):
                 values, energies = _compiled(closed.jaxpr)(consts, leaves)
             else:
