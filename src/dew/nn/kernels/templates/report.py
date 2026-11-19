@@ -649,7 +649,7 @@ class _AsideLaunch:
     config: Hashable
     reverse: bool
     device: Hashable
-    stored: str | None
+    stored: tuple[str | None, ...]
     kernels: Future
 
 
@@ -757,21 +757,28 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     stored = _verdict_key(_identity(op, arguments), config, reverse)
     verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
     if isinstance(verdict, dict):
-        return _kept_certification(key, op, config, reverse, verdict, stored, device, read=True).refused
+        return _kept_certification(key, op, config, reverse, verdict, (), device, read=True).refused
     aside = _ASIDE.get()
+    if aside is not None and key in aside.pending:
+        return ()
+    # Its verdict where its kernels' was stored however their Dew tree named it (`_lowered_verdict_key`),
+    # stored by this tree's key too, so its next start reads it tracing nothing.
+    lowered, modules, lowered_key = _lowered_launch(op, arguments, config, device, reverse)
+    verdict = None if lowered_key is None else tuning.stored_verdict(verdict_target(device), lowered_key)
+    if isinstance(verdict, dict):
+        return _kept_certification(key, op, config, reverse, verdict, (stored,), device, read=True).refused
+    unstored = (stored, lowered_key)
     if aside is not None and not _refused_before(op, arguments):
         # Taken as holding while it compiles aside (`certifying_aside`), once a block.
-        if key not in aside.pending:
-            lowered, modules = _lowered_launch(op, arguments, config, device, reverse)
-            compiling = aside.pool.submit(contextvars.copy_context().run, _launch_binaries, lowered, modules)
-            aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, compiling)
+        compiling = aside.pool.submit(contextvars.copy_context().run, _launch_binaries, lowered, modules)
+        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, unstored, compiling)
         return ()
     try:
-        kernels = _compiled_launch(op, arguments, config, device, reverse)
+        kernels = _launch_binaries(lowered, modules)
     except jax.errors.JaxRuntimeError as error:
         _uncertified_launch(key, op, config, error)
         return None
-    return _kept_certification(key, op, config, reverse, kernels, stored, device).refused
+    return _kept_certification(key, op, config, reverse, kernels, unstored, device).refused
 
 
 def _uncertified_launch(key: tuple, op, config: Hashable, error: Exception) -> None:
@@ -783,15 +790,16 @@ def _uncertified_launch(key: tuple, op, config: Hashable, error: Exception) -> N
         _UNCERTIFIED[key] = str(error)[:400]
 
 
-def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels: dict, stored: str | None,
-                        device, *, read: bool = False) -> "Certification":
+def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels: dict,
+                        stored: tuple[str | None, ...], device, *, read: bool = False) -> "Certification":
     """A launch's certification recorded once a process (`certifications`): its kernels `read` back from the
-    picks' store, else compiled here, their verdict stored for the GPU model by `stored` (None where no key
-    states the installation's code)."""
+    picks' store, else compiled here, their verdict stored for the GPU model by each of `stored`'s keys that
+    found none (None where no key states the installation's code)."""
     from dew.nn.kernels import tuning
 
-    if not read and stored is not None:
-        tuning.store_verdict(verdict_target(device), stored, kernels)
+    for each in stored:
+        if each is not None:
+            tuning.store_verdict(verdict_target(device), each, kernels)
     found = Certification(type(op).__name__, config, reverse, kernels, read, device)
     with _GUARD:
         _CERTIFIED[key] = found
@@ -805,6 +813,27 @@ def verdict_target(device) -> str:
     share sm90's, so a build certifying for a compile-only GPU stores the verdicts a run on its GPU reads,
     where by GPU model a GH200's run read none of them (row 6717)."""
     return generation.device_target(device).generation
+
+
+def _lowered_verdict_key(calls) -> str | None:
+    """What decides a lowered launch's certification on a GPU model, as its stored verdict's key once it has
+    lowered (`tuning.stored_verdict`): each Mosaic GPU and Pallas-Triton kernel it compiles, by its name, its
+    IR's digest and its config, the installed JAX, jaxlib and CUDA plugins, whose compiler assembles them (the
+    Pallas lowering cache's seal), and the environment a kernel's compile reads (that cache's policy); the
+    store's file names the GPU model. Its kernels decide its verdict, not the Dew tree that lowered them: a
+    tree whose own key (`_verdict_key`) finds none, an edit's anywhere outside them, lowers the launch and
+    reads its verdict, compiling nothing (row 8650: 23 of an edited tree's 51 seconds certifying a hybrid
+    decoder's step ahead, FS-8650-SPLIT). None where the installation has no seal."""
+    from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
+    from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
+
+    installed = seal().digest
+    if installed is None:
+        return None
+    kernels = sorted((call.kind, call.name, hashlib.sha256(call.ir).hexdigest(), call.config)
+                     for call in calls if call.kind in ("mosaic_gpu", "triton"))
+    stated = ["lowered", installed.hex(), kernels, _keyed_environment()]
+    return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
 
 
 def _verdict_key(identity: str, config: Hashable, reverse: bool) -> str | None:
@@ -893,19 +922,11 @@ def _certifying_device():
     return devices[0]
 
 
-def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device,
-                     reverse: bool) -> dict[str, tuple[str, "Binary"]]:
-    """`op`'s launch of `arguments` at `config` as a resource derivation lowers it (`KernelOp.lowering`),
-    compiled alone on `device`, as a call without a gradient runs it or, `reverse`, as reverse mode does (its
-    forward and its pullback of a unit cotangent): its Mosaic GPU and Pallas-Triton kernels' modules (a Triton
-    call's config) and binaries, by name and launch, none for a launch of none. A launch that does not trace
-    alone raises: certification is no optional pass."""
-    return _launch_binaries(*_lowered_launch(op, arguments, config, device, reverse))
-
-
 def _lowered_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device, reverse: bool
-                    ) -> tuple[jax.stages.Lowered, dict]:
-    """`_compiled_launch`'s launch lowered, beside its kernels' modules (a Triton call's config) by name."""
+                    ) -> tuple[jax.stages.Lowered, dict, str | None]:
+    """`op`'s launch of `arguments` at `config` lowered alone for `device` (as reverse mode runs it where
+    `reverse`), beside its kernels' modules (a Triton call's config) by name, and their verdict's key
+    (`_lowered_verdict_key`)."""
     from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.options import owned_program
     from dew.nn.programs import meshless
@@ -946,7 +967,7 @@ def _lowered_launch(op, arguments: tokamax.BoundArguments, config: Hashable, dev
     calls = kernel_calls(lowered, unrun=True)
     modules = kernel_modules(calls) | {name: call.config for name, call in
                                        kernel_bodies(call for call in calls if call.kind == "triton").items()}
-    return lowered, modules
+    return lowered, modules, _lowered_verdict_key(calls)
 
 
 def _launch_binaries(lowered: jax.stages.Lowered, modules: dict) -> dict[str, tuple[str, "Binary"]]:
@@ -965,7 +986,7 @@ def _launch_binaries(lowered: jax.stages.Lowered, modules: dict) -> dict[str, tu
 
 def _certifying_placement(device) -> tuple[jax.sharding.Mesh, frozenset]:
     """The mesh certification places a launch's operands on `device` on and sets its program on
-    (`_compiled_launch`), and the axes its launch holds manual: its program's where that runs
+    (`_lowered_launch`), and the axes its launch holds manual: its program's where that runs
     on `device` alone (the concrete mesh, `jax.set_mesh`'s, its axes manual where the call is in a map
     holding them, `sharding.manual_map`'s), so the launch lowers to the jaxpr and the mesh its program's call
     does (the GPU it states and each jit's recorded mesh among them) and the program reads its kernels'
