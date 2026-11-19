@@ -40,6 +40,7 @@ from reference_error import as_given, assert_as_exact, assert_computes_the_oracl
 from ssd_support import ssd_orbit, stepwise_scan
 
 from dew.algebra.scan import RESET_DECAY
+from dew.nn.kernels import generation, recurrence, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import ssd_operands
 from dew.nn.kernels.ssd import _chunk_scan
 
@@ -491,6 +492,47 @@ def test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel():
     assert_as_exact(held(documents_on_the_kernel), exactly_rounded(truth), levels_documents_draw,
                     "the TPU kernel's forked call's entry writes of cancelling levels", seeds=8,
                     truth_fn=truth)
+
+
+LEVELS_HOOKS = recurrence.Hooks(decay='scalar', rated=True, delta=False)
+"""Mamba2's SSD without its skip, as the rated scan's selector takes the cancelling levels' forked call."""
+
+
+def documents_as_selected(x, b, c, a, given, key, value, weight, added: bool = False):
+    """`documents_on_the_kernel`'s forked call through the public chunked op (`recurrence_chunk.chunk` under
+    `LEVELS_HOOKS`), its documents (`Chunk.firsts`, `loads`, `stores`) and entry writes forwarded and its
+    kernel the rated scan's selector's: the TPU's Pallas scan on a TPU. Its decay `exp(A dt)` with each
+    step's `dt` zero, as `levels_documents_draw` gives `a` and the inputs zero."""
+    del a
+    loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
+    rows, steps, heads, _ = x.shape
+    operands = recurrence_chunk.Chunk(
+        c, b, x, beta=jnp.zeros((rows, steps, heads), x.dtype), rate=-jnp.ones((heads,), x.dtype),
+        state=jnp.swapaxes(given, -1, -2), firsts=jnp.asarray(DOCUMENTS, jnp.int32), loads=loads,
+        stores=stores, entry_key=key, entry_value=value, entry_weight=weight, held=2,
+        adds=jnp.asarray(ADDS, jnp.int32) if added else None)
+    out, final = recurrence_chunk.chunk(LEVELS_HOOKS, operands, chunk_size=64)
+    # The chunked op's memory `[N, P]`, the SSD's transposed.
+    return out, jnp.swapaxes(final, -1, -2)
+
+
+@on_device
+def test_documents_entry_writes_of_cancelling_levels_take_the_selected_tpu_scan():
+    """`test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel`'s call as a TPU runs it
+    through the rated scan's selector (`documents_as_selected`): its forked documents and entry writes
+    forwarded to the Pallas scan it takes, each leaf held as on the kernel (rows 9463, 9464)."""
+    def held(scan):
+        def run(operands, seeded):
+            leaves = _documents_arm(scan)(operands, seeded)
+            return {name: leaves[name] for name in ENTRY_LEAVES}
+        return run
+
+    truth = jax.jit(held(documents_one_by_one))
+    with generation.routes() as found:
+        assert_as_exact(held(documents_as_selected), exactly_rounded(truth), levels_documents_draw,
+                        "the selected TPU scan's forked call's entry writes of cancelling levels", seeds=8,
+                        truth_fn=truth)
+    assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
 
 
 def test_documents_adding_a_slot_scan_as_each_alone():
