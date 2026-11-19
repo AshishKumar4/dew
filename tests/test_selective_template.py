@@ -16,8 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import tier_wire
-from generation_support import COMPILES_ON_CPU, here, lowers
+from generation_support import COMPILES_ON_CPU, here, interprets, lowers
 from reference_error import (
     FEWEST_SEEDS,
     as_given,
@@ -50,11 +49,9 @@ from dew.parity_stages import REDRAW
 
 pytestmark = pytest.mark.kernel
 
-INTERPRETED = not tier_wire.preparing() and jax.default_backend() != "gpu"
+INTERPRETED = interprets()
 """The template interprets off a GPU, by the wgmma bundle, whose rings and barriers the interpreter models;
-a GPU tier part's prepare, on the node's CPU, states it as the node's GPU runs it (`generation_support.here`),
-so the run reads its arm from the store: stated interpreted there, the run's arm was another, which the
-prepare never drew (row 8750)."""
+a GPU tier part's prepare states it as the node's GPU runs it (`generation_support.interprets`)."""
 
 SHAPES = {"interpreted": (1, 70, 256, 16), "falcon-mamba-7b": (2, 2048, 8192, 16)}
 """Each case's rows, tokens, channels and states: a ragged chunk over two channel blocks, and Falcon Mamba

@@ -19,6 +19,7 @@ from contract_support import (
     normal_float32,
     orders,
 )
+from generation_support import interprets
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, scan
@@ -79,7 +80,7 @@ def measured(edge: str, draw):
     the cell's inputs."""
     return draw if edge == "normal" else None
 
-INTERPRETED = jax.default_backend() != "gpu"
+INTERPRETED = interprets()
 """The ported kernels interpret off a GPU."""
 
 
