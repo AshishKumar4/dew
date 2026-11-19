@@ -171,7 +171,7 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
         q_srcs = [src for src in event.argument if src in written_at]
         assert len(q_srcs) == 1 and written_at[q_srcs[0]] < i
         consumer = next(owner_of[later.at[0]] for later in issuer[i + 1:]
-                        if later.kind == "arrive" and later.at[0] in owner_of)
+                        if later.kind == "committed" and later.at[0] in owner_of)
         assert tmem_source[q_srcs[0]] == q_smem[consumer]
         seen_consumers.add(consumer)
     assert seen_consumers == set(range(tiles.consumers))
@@ -182,17 +182,25 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
 def test_two_consumers_with_distinct_queries_on_tcgen05s_rows_match_reference_interpreted():
     """Two consumers on `tcgen05.rows` width 64 (Q in TMEM) given distinct query tiles produce each
     consumer's own output: swapping `lefts` in `placed.py:350` fails numerically (row 9474)."""
-    rng = np.random.default_rng(9474)
-    q0 = np.full((1, 128, 1, 64), 1.0, dtype=np.float32)
-    q1 = np.full((1, 128, 1, 64), -1.0, dtype=np.float32)
-    query = jnp.asarray(np.concatenate([q0, q1], axis=1), jnp.bfloat16)
-    key = jnp.asarray(rng.standard_normal((1, 128, 1, 64)), jnp.bfloat16)
-    value = jnp.asarray(rng.standard_normal((1, 128, 1, 64)), jnp.bfloat16)
-    spans = template.spans(256, 128, 1)
-    ref = template.reference(query, key, value, spans)
-    with generation.assumed("sm100"), _pinned(ROWS_PAIR_TILES):
-        out = attention_mosaic.forward(query, key, value, spans, interpret=True)
-    np.testing.assert_allclose(np.asarray(out, np.float32), np.asarray(ref, np.float32), atol=2e-2, rtol=2e-2)
+    def draw(seed: int):
+        rng = np.random.default_rng(9474 + seed)
+        q0 = rng.standard_normal((1, 128, 1, 64)) + 1.0
+        q1 = rng.standard_normal((1, 128, 1, 64)) - 1.0
+        query = jnp.asarray(np.concatenate([q0, q1], axis=1), jnp.bfloat16)
+        key = jnp.asarray(rng.standard_normal((1, 128, 1, 64)), jnp.bfloat16)
+        value = jnp.asarray(rng.standard_normal((1, 128, 1, 64)), jnp.bfloat16)
+        return query, key, value
+
+    def ours(query, key, value):
+        spans = template.spans(256, 128, 1)
+        with generation.assumed("sm100"), _pinned(ROWS_PAIR_TILES):
+            return attention_mosaic.forward(query, key, value, spans, interpret=True)
+
+    def theirs(query, key, value):
+        return template.reference(query, key, value, template.spans(256, 128, 1))
+
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw,
+                    "two-consumer tcgen05.rows distinct Q in TMEM", seeds=4)
 
 
 def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
@@ -206,7 +214,8 @@ def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
     # Consumer 0 empty (0..0), consumer 1 live (0..2 tiles of 64 keys).
     spans_mixed = template.KeySpans(
         start=jnp.zeros((1, 256), jnp.int32),
-        end=jnp.concatenate([jnp.zeros((1, 128), jnp.int32), jnp.full((1, 128), 128, jnp.int32)], axis=1))
+        end=jnp.concatenate([jnp.zeros((1, 128), jnp.int32), jnp.full((1, 128), 128, jnp.int32)], axis=1),
+        query_ids=None, key_ids=None, keys=256)
     mixed_maps = {5: np.array([[0, 0]], np.int32), 6: np.array([[0, 2]], np.int32),
                   7: np.array([[0, 0]], np.int32), 8: np.array([[0, 2]], np.int32)}
     threads, arrivals = programs(_placed_forward(ROWS_PAIR_TILES, spans_mixed), query, key,
@@ -221,7 +230,8 @@ def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
     # All-empty 1-consumer walk: zero Q copies issued.
     q1 = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
     k1 = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
-    spans_empty = template.KeySpans(start=jnp.zeros((1, 128), jnp.int32), end=jnp.zeros((1, 128), jnp.int32))
+    spans_empty = template.KeySpans(start=jnp.zeros((1, 128), jnp.int32), end=jnp.zeros((1, 128), jnp.int32),
+                                    query_ids=None, key_ids=None, keys=128)
     empty_maps = {5: np.array([[0]], np.int32), 6: np.array([[0]], np.int32),
                   7: np.array([[0]], np.int32), 8: np.array([[0]], np.int32)}
     threads_e, arrivals_e = programs(_placed_forward(ROWS_TILES, spans_empty), q1, k1,
@@ -260,9 +270,9 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
                 name = eq.params["name"]
             if isinstance(name, str):
                 kernel, launch = report.kernel_of(name)
-                if launch is not None and (record := report.traced(launch)) is not None:
-                    if kernel in record.kernels:
-                        found.append(record.kernels[kernel])
+                if (launch is not None and (record := report.traced(launch)) is not None
+                        and kernel in record.kernels):
+                    found.append(record.kernels[kernel])
             for sub in jax.extend.core.jaxprs_in_params(eq.params):
                 found.extend(traced_models(sub))
         return found
@@ -276,10 +286,8 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
         op = attention_mosaic.MosaicForward(scale=128 ** -0.5, keys=256, form="full")
         ba = op.bind(q, k, v, None, None, None, None, (), (), None,
                      residuals=template.Kept.NONE, interpret=False)
-        with generation.assumed("sm100"):
-            derived = op.derived(ba, target)
-            assert derived is not None and derived.family == "tcgen05.rows" and derived.consumers == 1
-            assert op.resident(ba, derived, target) == expect_most
+        with generation.assumed("sm100"), _pinned(ROWS_TILES):
+            assert op.resident(ba, ROWS_TILES, target) == expect_most
             traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
                 q, k, v, spans, interpret=False))(q, k, v).jaxpr
         assert has_tmem_copy(traced) is expect_copy
