@@ -913,6 +913,9 @@
 "tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-chunk-places-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
 "tests/test_attention_triton.py::test_the_plain_backward_is_on_par_over_runs[runs-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]"
 ],
+"tests/test_attention_witness.py": [
+"tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-causal]"
+],
 "tests/test_autoencoder.py": [
 "tests/test_autoencoder.py::test_a_users_autoencoder_rebuilds_from_its_record_as_a_built_in_does[inherited constructor]"
 ],
@@ -1123,7 +1126,7 @@
 "tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it"
 ],
 "tests/test_config_cli.py": [
-"tests/test_config_cli.py::test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_time"
+"tests/test_config_cli.py::test_a_run_trainer_fit_trains_directly_says_why_no_record_rebuilds_it[as a run states them]"
 ],
 "tests/test_config_paths.py": [
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[diffusion]",
@@ -1135,9 +1138,6 @@
 ],
 "tests/test_contracts_gemm.py": [
 "tests/test_contracts_gemm.py::test_a_quantized_convolution_holds_every_order_it_takes[1-normal]"
-],
-"tests/test_contracts_norms.py": [
-"tests/test_contracts_norms.py::test_the_fused_norms_and_products_hold_every_order[near the largest]"
 ],
 "tests/test_contracts_objectives.py": [
 "tests/test_contracts_objectives.py::test_a_node_perturbation_estimate_holds_every_order[normal]",
@@ -1320,9 +1320,6 @@
 "tests/test_decision_objective.py::test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from_the_run",
 "tests/test_decision_objective.py::test_the_joint_heads_bfloat16_cosine_is_an_fp32_cosine_in_every_process_on_a_cpu"
 ],
-"tests/test_decision_option_slots.py": [
-"tests/test_decision_option_slots.py::test_a_rows_real_options_compact_in_order_and_a_row_over_the_cap_is_refused"
-],
 "tests/test_decision_packing.py": [
 "tests/test_decision_packing.py::test_a_decision_run_steps_one_program_over_rows_of_every_length",
 "tests/test_decision_packing.py::test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_row[False]",
@@ -1333,9 +1330,6 @@
 "tests/test_decision_packing.py::test_a_reader_tokenizes_each_text_of_its_rows_once[joint]",
 "tests/test_decision_packing.py::test_single_option_questions_fit_the_packing_bounds[1]",
 "tests/test_decision_packing.py::test_single_option_questions_fit_the_packing_bounds[2]"
-],
-"tests/test_decision_readout.py": [
-"tests/test_decision_readout.py::test_a_slot_heads_scores_are_the_releases_law_with_its_query_and_key_trained"
 ],
 "tests/test_decision_recipe.py": [
 "tests/test_decision_recipe.py::test_a_checkpoint_declaring_block_attention_trains_and_serves_a_fresh_heads_rows_in_blocks",
@@ -2062,7 +2056,7 @@
 "tests/test_inference.py::test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images"
 ],
 "tests/test_inference_sampling.py": [
-"tests/test_inference_sampling.py::test_cached_generation_records_the_transformers_filtered_distribution[sampling1]"
+"tests/test_inference_sampling.py::test_cached_generation_records_the_transformers_filtered_distribution[sampling0]"
 ],
 "tests/test_inference_tasks.py": [
 "tests/test_inference_tasks.py::test_decoding_fp32_masters_draws_what_a_bf16_storage_load_draws[diffusion-gemma-workflow]"
@@ -2272,6 +2266,9 @@
 ],
 "tests/test_kimi_linear.py": [
 "tests/test_kimi_linear.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference"
+],
+"tests/test_kv_cache.py": [
+"tests/test_kv_cache.py::test_a_pool_split_into_groups_reads_what_each_row_wrote"
 ],
 "tests/test_layer_stack.py": [
 "tests/test_layer_stack.py::test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop",
@@ -3384,6 +3381,9 @@
 "tests/test_rl_expert_balance.py": [
 "tests/test_rl_expert_balance.py::test_a_policy_run_moves_each_balancing_bias_by_its_pooled_load_once_per_committed_update[ppo]"
 ],
+"tests/test_rl_methods.py": [
+"tests/test_rl_methods.py::test_each_method_is_its_papers_objective[gmpo--]"
+],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
 "tests/test_router_statistics.py::test_all_padding_has_no_router_support_or_bias_effect[mtp-attention_mask-False]",
@@ -3990,8 +3990,8 @@
 "tests/test_wan_source.py::test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone",
 "tests/test_wan_source.py::test_pipeline_walk_matches_the_source[streamed]"
 ],
-"tests/test_weighed_check.py": [
-"tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
+"tests/test_wan_vae.py": [
+"tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",

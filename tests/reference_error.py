@@ -112,6 +112,7 @@ from dew._accuracy import distance, reduction_bound, within
 from dew.algebra import passes
 from dew.nn import programs
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates import report
 from dew.parity import (
     CONFIDENCE,
     FACTOR,
@@ -534,19 +535,32 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
     for seed in range(staged_units(seeds)):
         inputs = drawn_on_the_host(draw, seed)
         shaped.setdefault(named("truth", widened(inputs)), inputs)
-    programs, held = {}, {}
-    with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(store.device()),
-          evaluated_on([])):
-        for index, inputs in enumerate(shaped.values()):
-            wide = widened(inputs)
-            # A truth the gate runs as given has its value alone to read, held to float64 in its run on its
-            # first draw (`_drawn`): the prepare computes none (bible section 8; on its default device, a
-            # compile-only GPU, its eager operations raised "'Executable' object has no attribute
-            # 'local_devices'", row 4881's class).
-            if index == 0 and not _given(truth):
-                _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
-            _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
-        store.compile_site(label, programs, held)
+
+    def compiled(device, *, host: bool) -> bool:
+        """The site traced for `device` and compiled for it (`host`: the host's CPU): whether it compiled,
+        none where its target's GPU would leave a choice to run time (`report.CompiledOnDevice`)."""
+        programs, held = {}, {}
+        with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(device), evaluated_on([])):
+            for index, inputs in enumerate(shaped.values()):
+                wide = widened(inputs)
+                # A truth the gate runs as given has its value alone to read, held to float64 in its run on
+                # its first draw (`_drawn`): the prepare computes none (bible section 8; on its default
+                # device, a compile-only GPU, its eager operations raised "'Executable' object has no
+                # attribute 'local_devices'", row 4881's class).
+                if index == 0 and not _given(truth):
+                    _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
+                _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
+            try:
+                store.compile_site(label, programs, held, host=host)
+            except report.CompiledOnDevice:
+                return False
+        return True
+
+    # A truth its target's GPU would leave a choice of to run time (a convolution's algorithm,
+    # `report.at_run_time`), which its compile there cannot hold, computes on the host's CPU: traced for it,
+    # as a CPU's run traces it, and compiled for it (row 7941's UNet truths).
+    if not compiled(store.device(), host=False):
+        compiled(jax.devices("cpu")[0], host=True)
     # A qualification run sizes a plain site first (`_qualified`), on its sizing draws through its arms.
     sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and plain else range(0)
     # A library arm (`library_fn`) one of them, run on Dew's own inputs as a further reference is (row 8468).
@@ -584,7 +598,9 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     it, for the store's devices (`CompiledTruths.tracing`, in the arithmetic arms run in, `summed_as_run`),
     and compiled as the gate compiles it (`_arm_compile`): its run calls each draw's executable
     (`_ahead_arm`), tracing, lowering and compiling none, its sizing too. An arm the gate runs as given, or
-    one running Dew's own programs (`dew_programs`, a host loop), holds no program."""
+    one running Dew's own programs (`dew_programs`, a host loop), holds no program. A site its target's
+    compile refuses (`report.CompiledOnDevice`: a convolution's algorithm, which its GPU picks) is written
+    at run (`compile_site`'s `at_run`): its run compiles every arm on its GPU, as given (`_stored_arm`)."""
     # Each arm named as each process first finds it, before any call of it here (`arm_role`); one no
     # statement holds runs unprepared in its run.
     named_arms = {role: (named_role, fn, reference) for role, (fn, reference) in arms.items()
@@ -611,7 +627,12 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     if programs:
         plain = any(_given(fn) for fn in (arms["dew"][0], arms["reference"][0]) if fn is not None)
         with arithmetic():
-            store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain), arms=True)
+            try:
+                store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain), arms=True)
+            except report.CompiledOnDevice as refused:
+                # Check 1 measures the arms as their GPU compiles them, a choice no compile without it
+                # holds: every arm of the site compiles in its run, as the prepare states (`_stored_arm`).
+                store.compile_site(armed(label), {}, {}, arms=True, at_run=str(refused))
 
 
 def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference: bool):
@@ -710,12 +731,18 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str):
     draw's program its prepare compiled into `store` (`_ahead_arm`), named as its prepare named it; one no
     statement holds, or whose site's arms its prepare did not finish (its truths written, a failure before
     its arms': a flow's cell its prepare deferred, `gpu_flow.run_cells`), runs unprepared, named, and one
-    that holds no program as it is (`_stored_arms`)."""
+    that holds no program as it is (`_stored_arms`). One of a site its prepare wrote at run (`at_run`, before
+    `holds`) runs as given, compiled on its GPU, named (`compiled_at_run`), nothing unprepared."""
     if not _holds_program(given_fn):
         return arm
     named_role = arm_role(role, given_fn, label)
     if named_role is None:
         store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
+        return arm
+    at_run = store.at_run(armed(label))
+    if at_run is not None:
+        # Compiled on its GPU in the run, as its prepare stated (`_compile_arms`).
+        store.compiled_at_run(f"{label}: its {role} arm: {at_run}")
         return arm
     if not store.holds(armed(label)):
         store.unprepared(f"{label}: its {role} arm ran unprepared: its prepare wrote the site's truths and "

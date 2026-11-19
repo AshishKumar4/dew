@@ -452,13 +452,44 @@ def vanishing_entered_draw(seed: int):
     return vanishing(operands), seeded
 
 
+def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recurrence():
+    """A turned call's turns' gradient differentiated along its queries (`jvp` of `grad`), a third of its
+    queries zero, packed: on par from float64 with the recurrence a token at a time's (check 1), where the
+    turns' gradient taking out the tokens whose readers were zero by their values lost a zero query's
+    derivative (row 8519's head review: [1, 0] read [0, 0])."""
+    def drawn(seed):
+        (operands,) = draw(TURNED, packed=True, seed=seed)
+        rng = np.random.default_rng([8519, seed])
+        query = operands.query.at[:, ::3].set(0.0)
+        direction, cotangent = (hosted(rng.standard_normal(x.shape)) for x in (query, operands.value))
+        return dataclasses.replace(operands, query=query), direction, cotangent
+
+    def mixed(run):
+        def second(operands, direction, cotangent):
+            def turns_gradient(query):
+                given = dataclasses.replace(operands, query=query)
+
+                def loss(turn):
+                    return jnp.sum(run(dataclasses.replace(given, turn=turn))[0] * cotangent)
+
+                return jax.grad(loss)(given.turn)
+
+            return jax.jvp(turns_gradient, (operands.query,), (direction,))[1]
+
+        return jax.jit(second)
+
+    exact = mixed(functools.partial(token_by_token, TURNED))
+    assert_as_exact(mixed(lambda given: chunk_on('xla', TURNED, given, chunk_size=CHUNK)), exact, drawn,
+                    "a turned call's mixed derivative at zero queries", seeds=32, truth_fn=exact)
+
+
 def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
     """A one-token turned call whose token begins a document (its memory entering, every entry 2^127,
     discarded), a query of its first key, zero keys, values, turns and log decays, an output cotangent of 2
     on each of its first two value columns: its output and every gradient finite wherever float64's is a
     normal float32, the turns' zero, where the turns' gradient contracted the discarded memory with the
-    output's cotangent before its zero readers took it out, 2^128 then 0 times inf (base review d6c1b2c1a
-    F2)."""
+    output's cotangent before its zero readers took it out, 2^128 then 0 times inf (row 8519, base review
+    d6c1b2c1a F2)."""
     (operands,) = draw(TURNED, packed=False, seed=0, length=1)
     zero = {name: jnp.zeros_like(getattr(operands, name)) for name in ('key', 'value', 'log_decay', 'turn')}
     first = jnp.zeros_like(operands.query).at[..., 0].set(1.0)

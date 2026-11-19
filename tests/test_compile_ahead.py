@@ -1965,9 +1965,9 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     off its plan: compiled on compile-only GPUs outside a prepare), whose XLA products ran up to 48 times
     slower on a GH200 (UB-4792-AHEAD-TIME), is not taken where the run's own compile tunes (its step
     compiled on its devices as without a file, said once), and is where it tunes nothing either (XLA_FLAGS
-    setting the autotuner's level 0, as a repeatable lane's do), its products then the run's own. A step
-    of this host's own target stands for the GPU host's here: a CPU is no target a step compiles ahead
-    for."""
+    setting the autotuner's level 0, as a repeatable lane's do), its products then the run's own, unless
+    it leaves a convolution's algorithm to run time (`at_run`). A step of this host's own target stands for
+    the GPU host's here: a CPU is no target a step compiles ahead for."""
     from dew.training.ahead import AheadOfTime, BuildTarget, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
@@ -1988,6 +1988,9 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
     level_zero = dataclasses.replace(handed, built=BuildTarget.of(here))
     assert level_zero.runnable(here) is level_zero
+    # One leaving a convolution's algorithm to run time is never taken: the run's own compile picks it.
+    at_run = dataclasses.replace(level_zero, plan={**record(level_zero.plan, "plan"), "at_run_time": True})
+    assert at_run.runnable(here) is None
     with pytest.raises(ValueError):
         own.runnable(here)
 
@@ -2226,6 +2229,39 @@ def test_programs_compiled_ahead_for_a_generation_are_untuned_and_refused_where_
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
     assert AheadPrograms(BuildTarget.of(here), {}, tuned=False).loaded() == {}
 
+
+def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path, monkeypatch):
+    """A compile without a device cannot pick a cuDNN convolution's algorithm, which is then picked at run
+    time, on an A100 not the same each run (`report.DEVICELESS_CONVOLUTION_PICKS`, row 7941): over a node's
+    topology, autotuner off as a repeatable lane runs, and over the generation's canonical GPUs alike, a
+    program holding a convolution is refused before any compiles (`report.CompiledOnDevice`), named, where a
+    product alone compiles."""
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import compile_programs
+
+    serialized = tmp_path / "topology.bin"
+    serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
+    image = jax.ShapeDtypeStruct((1, 8, 8, 4), jnp.float32)
+    kernel = jax.ShapeDtypeStruct((3, 3, 4, 4), jnp.float32)
+    square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+
+    def convolved(x, w):
+        return jax.lax.conv_general_dilated(x, w, (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"))
+
+    with pytest.raises(report.CompiledOnDevice) as refused:
+        compile_programs({"conv": (convolved, [image, kernel])}, "sm80", topology=serialized)
+    assert refused.value.programs == ("conv",)
+    assert list(compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm80",
+                                 topology=serialized).programs) == ["dot"]
+    with pytest.raises(report.CompiledOnDevice) as refused:
+        compile_programs({"conv": (convolved, [image, kernel]),
+                          "dot": (lambda x, y: x @ y, [square, square])}, "sm80")
+    assert refused.value.programs == ("conv",)
+
 def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
     """A device's own target, what a program compiled ahead is checked against, is the one `gpu_target`
     resolves for it unassumed: an H100 PCIe its own kind and peaks with the multiprocessors it reports, and an
@@ -2378,13 +2414,17 @@ def test_programs_built_for_the_host_cpu_load_onto_it_whatever_the_process_lists
     (`BuildTarget.own_devices`) in a process whose devices list another first, as a GPU's process lists its
     GPUs before the CPUs it holds beside them: loaded onto the process's first devices, a CPU's program went
     to them (row 8376's CPU-placed arms, `reference_error.ahead_arm(host=True)`)."""
+    from dew._cache import uncached
     from dew.training.ahead import AheadPrograms, BuildTarget, Executable
 
     host = jax.devices("cpu")
     x = np.arange(4.0, dtype=np.float32)
     placed = jax.sharding.SingleDeviceSharding(host[0])
-    doubled = jax.jit(lambda x: x * 2.0, out_shardings=placed).lower(
-        jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=placed)).compile()
+    # Compiled here, as every program compiled ahead is (`compile_programs`): one XLA loaded from the
+    # persistent cache serializes without its kernels, and loading it fails ("Function ... not found").
+    with uncached():
+        doubled = jax.jit(lambda x: x * 2.0, out_shardings=placed).lower(
+            jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=placed)).compile()
     programs = AheadPrograms(BuildTarget.of(host[:1]), {"doubled": Executable.of(doubled)})
     listed = jax.devices
     # A process listing another device first, the host's first CPU among its CPUs.

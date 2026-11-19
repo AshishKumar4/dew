@@ -67,6 +67,11 @@ UNPREPARED = "unprepared.json"
 their count shows a tier drifting from its prepares), the GPU tier's list of unprepared tests read from these
 alone (a ledger row each, the tier's)."""
 
+AT_RUN = "at_run.json"
+"""A test's record, in its store, of a site its prepare left to its run to compile on its GPU
+(`compile_site`'s `at_run`: a choice the GPU makes that no compile without it holds), as `UNPREPARED`'s: a
+decision named in the run's summary, not drift."""
+
 DEFERRED = "deferred.json"
 """A test's record, in its store, of a GPU flow's cell its prepare deferred to its run (`unprepared`'s, as
 `UNPREPARED`'s), which its run serves from the store beside it and then records unprepared."""
@@ -102,6 +107,22 @@ class CompiledTruths:
         """Whether the store's prepare reached site `label` (its programs written, at any stamp)."""
         return (self.path(label) / SITE).is_file()
 
+    def at_run(self, label: str) -> str | None:
+        """Why the store's prepare compiled none of site `label`'s programs, its run compiling each on its
+        GPU (`compile_site`'s `at_run`), at this stamp; None for a site it compiled or did not reach."""
+        site = self.path(label) / SITE
+        if not site.is_file():
+            return None
+        stored = json.loads(site.read_text())
+        return stored.get("at_run") if stored["stamp"] == self.stamp else None
+
+    def compiled_at_run(self, why: str) -> None:
+        """Records in the store that its test compiled a site's programs on its GPU as its prepare stated
+        (`at_run`, `AT_RUN`), where in its file this process stands: a decision its run names, not drift."""
+        test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+        unprepared(self.directory, test, [(frame.filename, frame.lineno) for frame in inspect.stack(0)], why,
+                   record=AT_RUN)
+
     def unprepared(self, why: str) -> None:
         """Records in the store that its test ran a site, or an arm, unprepared (`unprepared`), where in its
         file this process stands."""
@@ -133,15 +154,19 @@ class CompiledTruths:
 
     def compile_site(self, label: str, programs: Mapping[str, tuple[Callable, Sequence]],
                      held: Mapping[str, dict], *, compiled: Callable | None = None, arms: bool = False,
-                     host: bool = False) -> None:
+                     host: bool = False, at_run: str | None = None) -> None:
         """The site's `programs` (each a function of its constants and inputs, flat, and their shapes, by
         its name, `named`) compiled for the store's target and written with what each `held`; refused for a
         label this store compiled already, whose programs a second site of it would replace. `compiled` makes
         each program as its run's compile does (`dew.training.ahead.compile_programs`' `compiled`; Dew's
         compile point where None, a truth's, whose program is its run's); `arms` whether they are a site's
         arms (`compiled_memory`), whose state its run holds while its truths compute; `host` whether they
-        are compiled for the host's CPU, whatever the store's target (an arm placed there, `ahead_arm`'s)."""
+        are compiled for the host's CPU, whatever the store's target (an arm placed there, `ahead_arm`'s);
+        `at_run` why none is compiled, their run compiling each on its GPU (`at_run`), the site written with
+        no programs. A site its target's compile refuses (`report.CompiledOnDevice`: a choice its GPU makes at
+        run time) is left unbegun, its refusal raised for its caller to place it otherwise."""
         from dew._cache import uncached
+        from dew.nn.kernels.templates import report
 
         if label in self.begun:
             raise ValueError(f"{label}: two sites of one label in one store of compiled truths, where the "
@@ -151,10 +176,19 @@ class CompiledTruths:
         if site.exists():
             shutil.rmtree(site)
         site.mkdir(parents=True)
+        if at_run is not None:
+            (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": {},
+                                                 "arms": arms, "host": host, "at_run": at_run}))
+            return
         # Compiled here, never loaded from JAX's persistent cache, whose executables serialize without their
         # kernels (`dew.training.ahead.keeping`).
-        with uncached():
-            built = self._compiled(programs, compiled, host)
+        try:
+            with uncached():
+                built = self._compiled(programs, compiled, host)
+        except report.CompiledOnDevice:
+            self.begun.discard(label)
+            shutil.rmtree(site)
+            raise
         built.save(site / PROGRAMS)
         (site / HELD).write_bytes(pickle.dumps(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
