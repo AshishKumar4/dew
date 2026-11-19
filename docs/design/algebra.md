@@ -1380,9 +1380,10 @@ Agreed with the GEMM template's owner (2026-11-03):
 - A declaration names the fragment layout the family's MMA reads, which the family bundle supplies: on sm90
   the wgmma A-operand fragment, the weight taken as A and swapped onto M at decode shapes so the decoder writes
   straight into it; on sm100 the tcgen05 and tensor-memory layouts. A thread's input is the packed words it
-  loads: a 32-bit word holds 8 E2M1 codes. A declaration names it for each consumer by the consumer family's
-  name (`BitTransform.fragments`: `NVFP4_BFLOAT16`'s `{"wgmma": "wgmma"}`), which the consumer reads and
-  refuses a transform naming none for it; a new family's fragment is a new entry, no second declaration.
+  loads: a 32-bit word holds 8 E2M1 codes. A declaration names it for each consumer by the consumer's name,
+  the MMA that issues its registers (`BitTransform.fragments`: `NVFP4_BFLOAT16`'s `{"wgmma": "wgmma"}`, which
+  the packed GEMM reads as `packed.CONSUMER`, whatever family feeds it), a missing entry refused; a new
+  consumer's fragment is a new entry, no second declaration.
 - Block scales (NVFP4's 1×16, MX's 1×32) are a separate transform of a fixed layout, which feeds the
   template's promotion and epilogue: a form may re-encode the codes, never the scales. NVFP4's E4M3 scale is
   `bits.E4M3_SCALE`, its fields placed at a float32's own (the code's value times 2^-120,

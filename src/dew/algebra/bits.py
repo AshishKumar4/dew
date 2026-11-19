@@ -244,9 +244,9 @@ class BitTransform:
     need only read its bits back in some order; else the stored word is the input. `units`: the pipes its
     form may issue on (the ALU always, which issues every LOP3; a consumer whose own math holds the FMA pipe
     keeps its decode off it). `fragments`: each consumer's MMA fragment layout its registers are read in, by
-    the consumer family's name (the GEMM template's, algebra.md 7.4): a consumer reads its own entry and
-    refuses a transform naming none for it, so a new family's fragment is a new entry here, no second
-    declaration."""
+    the consumer's name, the MMA that issues them (`wgmma`, whatever family feeds it: algebra.md 7.4): a
+    consumer reads its own entry and refuses a transform naming none for it, so a new consumer's fragment is
+    a new entry here, no second declaration."""
 
     name: str
     width: int
