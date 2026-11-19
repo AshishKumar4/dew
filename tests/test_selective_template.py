@@ -28,6 +28,7 @@ from reference_error import (
     with_gradients,
 )
 from selective_support import (
+    RATES_PAST_THE_RANGE,
     mamba_selective_side,
     rate_past_the_range,
     selective_draw,
@@ -126,18 +127,72 @@ def held_to(portable_arm, draws, starts, label: str, template_arm):
                         most=8 * MOST_SEEDS, keyed=lambda *args: args[:-1])
 
 
-def test_a_rate_past_float32s_range_scans_as_the_recurrence_interpreted():
+@pytest.mark.parametrize("case", RATES_PAST_THE_RANGE)
+def test_a_rate_past_float32s_range_scans_as_the_recurrence_interpreted(case):
     """The template's output, final state and every input's gradient at a rate whose `A log2(e)` passes
-    float32's range over a ragged chunk (`selective_support.rate_past_the_range`) on par from float64 with
-    the recurrence a token at a time (`selective_support.stepwise`, check 1), where its parameter tile held
-    the rate in base 2, -inf, and a padded token's zero step made its decay NaN (row 8491)."""
+    float32's range over a ragged chunk (`selective_support.rate_past_the_range`, both vanishing decays and
+    `e^-3` decays at subnormal `dt = 2^-126`) on par from float64 with the recurrence a token at a time
+    (`selective_support.stepwise`, check 1; rows 8491, 8722)."""
     template = functools.partial(selective.selective_scan, family=taken_family(jnp.float32),
                                  interpret=INTERPRETED)
     exact = jax.jit(with_gradients(stepwise))
     assert_as_exact(jax.jit(with_gradients(template)), exact,
-                    functools.partial(rate_past_the_range, "vanishing decays"),
-                    "the selective template at a rate past float32's range", seeds=FEWEST_SEEDS,
+                    functools.partial(rate_past_the_range, case),
+                    f"the selective template at a rate past float32's range, {case}", seeds=FEWEST_SEEDS,
                     truth_fn=exact)
+
+
+@pytest.mark.parametrize("case", ("normal step", "zero step", "skip cancelling",
+                                  "subnormal skip cancelling"))
+def test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted(case):
+    """Large `B` across four states on a selector-supported shape (`length=32`, `states=4`) through the
+    public `recurrence_chunk.selective_scan` route (`mosaic_gpu`) with normal (`2^-4`), zero (`0.0`),
+    skip-cancelling (`dt = 1`, `D = -2^127`), or subnormal skip-cancelling (`dt = 2^-110`, `D = -2^-10`,
+    `B = (2^100, 2^70)`) steps: its output, final state and every input's gradient on par from float64 with
+    `selective_support.stepwise` (check 1; row 8722, base reviews b9f004f74 F7, da734bf54 F3)."""
+    cases = ("normal step", "zero step", "skip cancelling", "subnormal skip cancelling")
+
+    def draw(seed):
+        rng = np.random.default_rng([8722, seed, cases.index(case)])
+        length, channels, states = 32, 128, 4
+        x = np.zeros((1, length, channels), np.float32)
+        a = np.zeros((channels, states), np.float32)
+        scale = rng.uniform(0.5, 1.0, (1, length, 2)).astype(np.float32)
+        b = np.zeros((1, length, states), np.float32)
+        b[:, :, :2] = (2.0 ** 127) * scale
+        c = np.zeros((1, length, states), np.float32)
+        c[:, :, :2] = 1.0
+        entering = np.zeros((1, channels, states), np.float32)
+        if case == "normal step":
+            dt = np.full((1, length, channels), 2.0 ** -4, np.float32)
+            skip = np.zeros((channels,), np.float32)
+        elif case == "zero step":
+            dt = np.zeros((1, length, channels), np.float32)
+            skip = np.zeros((channels,), np.float32)
+        elif case == "skip cancelling":
+            factor = np.float32(rng.uniform(0.5, 1.0))
+            dt = np.ones((1, length, channels), np.float32)
+            skip = np.full((channels,), -(2.0 ** 127) * factor, np.float32)
+            b[:, :, :2] = (2.0 ** 127) * factor
+        else:
+            factor = np.float32(rng.uniform(0.5, 1.0))
+            dt = np.full((1, length, channels), 2.0 ** -110, np.float32)
+            skip = np.full((channels,), -(2.0 ** -10) * factor, np.float32)
+            b[:, :, 0] = (2.0 ** 100) * factor
+            b[:, :, 1] = (2.0 ** 70) * factor
+        dy = np.zeros((1, length, channels), np.float32)
+        dy[:, -1, :] = 1.0
+        dfinal = np.zeros((1, channels, states), np.float32)
+        return (jnp.asarray(x), jnp.asarray(dt), jnp.asarray(a), jnp.asarray(b), jnp.asarray(c),
+                jnp.asarray(skip), jnp.asarray(entering), (jnp.asarray(dy), jnp.asarray(dfinal)))
+
+    def routed(*operands):
+        with generation.chosen(selective_scan="mosaic_gpu"):
+            return recurrence_chunk.selective_scan(*operands, None, portable=portable)
+
+    exact = jax.jit(with_gradients(stepwise))
+    assert_as_exact(jax.jit(with_gradients(routed)), exact, draw,
+                    f"the selective template at large B, {case}", seeds=FEWEST_SEEDS, truth_fn=exact)
 
 
 def taken_family(dtype) -> mosaic.Family:
