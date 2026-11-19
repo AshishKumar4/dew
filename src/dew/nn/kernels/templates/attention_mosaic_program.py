@@ -1167,8 +1167,8 @@ def reached(spec: algebra.Forward, queries: int) -> int | None:
     """The query and key pairs a call of `queries` queries (unpadded) reaches, by its form: every pair of a
     full call; a causal call's, each query's keys up to its own place (`algebra.seen`'s `k_pos <= q_pos`,
     the first key aligned to the first query); None for a spans call, whose pairs its arrays decide, which
-    no launch states before it runs."""
-    if spec.form == "full":
+    no launch states before it runs, but one whose every query sees every key (`algebra.Forward.whole`)."""
+    if spec.form == "full" or spec.whole:
         return queries * spec.keys
     if spec.form == "causal":
         return sum(min(spec.keys, row + 1) for row in range(queries))
@@ -1202,8 +1202,9 @@ def walked_steps(spec: algebra.Forward, tile_walk: TileWalk) -> int | None:
     at 2048 queries and 128-row tiles: 6.25% past its reached pairs, row 3948), and a common walk's every
     tile for each holder, one wholly past the keys too (`algebra.Forward.walked_keys`); None for a spans
     call. The work a consumer's step emits (`emission.Role.step`) times these is its walks'
-    (`cost.Stated.steps`, `emission.Emitted.issued`)."""
-    if spec.form == "spans":
+    (`cost.Stated.steps`, `emission.Emitted.issued`); a spans call's every key seen, known at trace time
+    (`algebra.Forward.whole`), a full call's."""
+    if spec.form == "spans" and not spec.whole:
         return None
     (queries, keys), (block_q, block_k) = tile_walk.extents, tile_walk.blocks
     query_tiles, causal = queries // block_q, spec.form == "causal"

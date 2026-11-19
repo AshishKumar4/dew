@@ -239,7 +239,7 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
 def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
                 state_total: jax.Array, anchor_value: jax.Array, dout: jax.Array,
                 key_index: jax.Array, shift: jax.Array, *,
-                rows: Callable[[jax.Array, jax.Array], jax.Array], dropped: float = 1.0
+                rows: Callable[[jax.Array, jax.Array], jax.Array], dropped: float = 1.0, power: float = 1.0
                 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """`off_anchor_delta` from a training forward's split sums (`training_step`), the backward's first
     pass taken by the forward: `B` with the initial state's share inside it, the other keys' weights'
@@ -251,17 +251,19 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     `NORMALIZED` holds normalized sums (an output residual's, `normalized_rows`), its total 1. Each sum is
     taken over the total before its product with dO, as the reference's output is, so none overflows where
     the sums are near fp32's largest (a state's). A dropping call's `B` holds its kept keys' weights alone
-    and its anchor's value row arrives where its draw keeps it (`algebra.kept`): its D and centre are taken
-    without the draw's multiplier `dropped`, which multiplies them once (`algebra.Forward.dropped`), as
-    nearer centre is chosen alike at any scale; a normalized row's sums (an output's) took it already. Taken
+    and its anchor's value row arrives where its draw keeps it (`algebra.kept`), its sums at the
+    multiplier's power of two `power` (`algebra.Forward.kept_power`): its D and centre are taken without the
+    draw's multiplier `dropped`, which multiplies them once (`algebra.Forward.dropped`), as nearer centre is
+    chosen alike at any scale; a normalized row's sums (an output's) took it already. Taken
     with each weight over the total, sums near fp32's largest times 4/3 overflowed where D is finite (row
     8652). Each row's product with dO is `rows`' (`off_anchor_delta`'s), of the sums as dO reads them
     (`read`)."""
     multiplier = np.float32(dropped)
     over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
-    # A normalized row's sums are its output, which took the multiplier (`algebra.dropped_output`).
-    others_over = (over if dropped == 1.0
-                   else jnp.where(normalized_rows(shift), np.float32(1 / dropped), over))
+    # A normalized row's sums are its output, which took the multiplier (`algebra.dropped_output`); another
+    # row's hold its power of two, taken out exactly.
+    others_over = (over if dropped == 1.0 else
+                   jnp.where(normalized_rows(shift), np.float32(1 / dropped), over * np.float32(1 / power)))
     # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
     # and the state's share of D about the anchor with it (row 2466).
     state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
