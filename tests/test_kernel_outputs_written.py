@@ -18,7 +18,7 @@ from kernel_outputs import launched_outputs, unwritten
 
 from dew.nn import norms
 from dew.nn.activations import gated_product, packed_gated_product
-from dew.nn.kernels import generation, grouped_matmul, norm_swiglu
+from dew.nn.kernels import generation, grouped_launch, norm_swiglu
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
 from dew.nn.norms import gated_rms_normalized, stream_rms_normalized
 
@@ -126,7 +126,7 @@ def test_the_tpus_gemm_launches_write_every_output(product):
     the routed ones its zero accumulator's), and a grouped product of two outputs."""
     sizes = jnp.asarray([100, 0, 150], jnp.int32)
     tiles = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family='mxu')
-    options = {"tiles": tiles, "multiprocessors": 1, "interpret": grouped_matmul.INTERPRETED}
+    options = {"tiles": tiles, "multiprocessors": 1, "interpret": grouped_launch.INTERPRETED}
     with generation.assumed("v5e"):
         if product == "gmm":
             lhs, rhs = drawn((300, 256), (3, 256, 256))
@@ -149,7 +149,7 @@ def test_the_gpus_grouped_gemm_launches_write_every_output(product):
     sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family="wgmma")
     options = {"tiles": tiles, "out_dtype": jnp.float32, "multiprocessors": 4,
-               "interpret": grouped_matmul.INTERPRETED}
+               "interpret": grouped_launch.INTERPRETED}
     with generation.assumed("sm90"):
         if product == "gmm":
             lhs, rhs = drawn((300, 128), (4, 128, 256))
@@ -171,7 +171,7 @@ def test_the_gpus_partial_gemm_launches_write_every_output(product):
     tiles = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family="wgmma")
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
     options = {"tiles": tiles, "out_dtype": jnp.float32, "multiprocessors": 8,
-               "interpret": grouped_matmul.INTERPRETED}
+               "interpret": grouped_launch.INTERPRETED}
     with generation.assumed(target):
         if product == "balanced gmm":
             lhs, rhs = drawn((1408, 128), (1, 128, 128))

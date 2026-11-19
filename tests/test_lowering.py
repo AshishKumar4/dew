@@ -1601,21 +1601,21 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
     call no launch traced."""
     import tokamax
 
-    from dew.nn.kernels import grouped_matmul
+    from dew.nn.kernels import grouped_launch, grouped_triton
     from dew.nn.kernels.lowered import KernelCall
     from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program, report
 
     def spec(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.bfloat16)
 
-    gemm, tile = grouped_matmul.Gmm(), grouped_matmul.Tile(128, 256, 64, 4, 3)
+    gemm, tile = grouped_triton.Gmm(), grouped_launch.Tile(128, 256, 64, 4, 3)
     dense = tokamax.BoundArguments(gemm, {"tokens": spec(200, 64), "kernel": spec(1, 64, 300),
                                           "trans_rhs": False, "dense": True})
     assert gemm.padded(dense, tile) == 1 - 200 * 300 / (256 * 512)
     grouped = tokamax.BoundArguments(gemm, {**dense.arguments, "dense": False})
     assert gemm.padded(grouped, tile) is None
     # A kernel gradient's grid is its kernel's, the tokens' width by the cotangent's.
-    gradient = grouped_matmul.Tgmm()
+    gradient = grouped_triton.Tgmm()
     weights = tokamax.BoundArguments(gradient, {"tokens": spec(200, 64), "cotangent": spec(200, 300),
                                                 "dense": True})
     assert gradient.padded(weights, tile) == 1 - 64 * 300 / (128 * 512)

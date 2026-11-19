@@ -31,6 +31,7 @@ from dew.nn.kernels.templates import (
     persistent,
     report,
     resources,
+    rings,
     stores,
     swizzling,
 )
@@ -107,7 +108,7 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
                 slot = lax.rem(index - lo, stages)
                 started, accumulators = carried
                 tiles = {name: ring.at[slot] for name, ring in zip(names, slots, strict=True)}
-                return step(index, mosaic.WholeSlots(tiles), started, accumulators)
+                return step(index, rings.WholeSlots(tiles), started, accumulators)
 
             return lax.fori_loop(lo, hi, body, carry)
 
@@ -190,6 +191,25 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     relay: Any = dataclasses.field(default=None, compare=False)
     """A consumer's shared-memory tile its register left operands relay through where its warps split their
     columns (`relaying`, `relay_bytes`)."""
+
+    held_registers = 40
+    """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
+    indices, the walk's carry), a measured whole (`scalars_whole`): CUTLASS's cooperative sm90 kernel's 168
+    less its accumulator's 128; an A100's attention dQ holds 13 to 43 integers live at its peaks, places and
+    addresses together. Its derivations need it: without it the GEMM's gate picks on sm80, sm86, sm89 and
+    sm120 spill 36 to 784 bytes, where its operands' fragments share the registers (FS-HELDREG). A
+    pre-lowering prior, which certification overrules (`report.certified`): the count a lowering holds is
+    not derived from the traced kernel, whose shared-memory tile addresses and loop carries predicted the
+    lowered peak's scalars no better than a family's constant over 260 sm80 GEMM and recurrence kernels
+    (FS-DERIVED-HELD2-sm80, row 8377: correlation 0.49 and 0.39; a recurrence's peak 4 to 97 scalars, two to
+    five times its traced count, the lowering's shared-memory addresses and swizzles)."""
+
+    scalars_whole = True
+
+    def scalar_registers(self, addressed=()) -> int:
+        # Its measured whole, its addresses among them.
+        del addressed
+        return self.held_registers
 
     rows = 16
 
@@ -542,6 +562,9 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     gathers_rows = True  # its one warpgroup's cp.async copies gather a step's rows (`_gathered_walk`)
+    # `emit_pipeline` would allocate a folded once block a slot per stage in the walk's scope, where its
+    # planned once allocation (`lifetimes`) holds one: no once stream walks here until the plan counts it.
+    walks_once = False
     gathers_alone = False  # its walk gathers every stream's rows or none (`streams`)
     gathers_interpreted = True
 
@@ -599,7 +622,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
-                gathered: tuple[str, ...] = ()):
+                gathered: tuple[str, ...] = (), joined: tuple[str, ...] = ()):
+        del joined  # a pair a stream (`Family.streams`)
         _one(consumers, clustered=bool(multicast))
         if gathered and set(gathered) != set(blocks):
             raise NotImplementedError("an A100's walk gathers every stream's rows or none")
@@ -618,6 +642,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         if views is None:
             raise ValueError("a pipelined family's streams take their views where they open (its walk loads)")
         return Streams(allocated, views)
+
+    def stored_swizzle(self, shape: tuple[int, int], dtype) -> int:
+        """The swizzle an output tile of `shape` in `dtype` stages at (`output_staging`): plain where its
+        issuer states none (`Mma.stored_swizzle`)."""
+        del shape, dtype
+        return swizzling.UNSWIZZLED
 
     def stream(self, streams, views, lo, hi) -> None:
         del streams, views, lo, hi
@@ -639,10 +669,16 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 plgpu.wait_gmem_to_smem(0)
 
             def copied(smem):
-                # The row-copy ladder needs strided layouts, not optimized-only transfers.
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
-                stores.store_rows(smem, ref, *place, copy=swizzling.copied,
-                                  widest=resources.copied_rows(smem.shape[1], smem.dtype))
+                swizzle = swizzling.UNSWIZZLED if len(smem.shape) != 2 else self.stored_swizzle(smem.shape,
+                                                                                                   smem.dtype)
+                if interpret or swizzle == swizzling.UNSWIZZLED:
+                    # The row-copy ladder needs strided layouts, not optimized-only transfers.
+                    stores.store_rows(smem, ref, *place, copy=swizzling.copied,
+                                      widest=resources.copied_rows(smem.shape[1], smem.dtype))
+                else:
+                    # A swizzled tile's rows out by its threads, whole tiles read (`output_staging`).
+                    stores.swizzled_rows_out(smem, ref, *place[:4], swizzle=swizzle)
 
             pl.run_scoped(copied, staging[output])
             if not interpret:
@@ -682,7 +718,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
             def body(indices, *refs, step=step, lo=lo):
                 (index,), (carried, accumulators) = indices, refs[-1]
-                slots = mosaic.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
+                slots = rings.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
             # A tile's blocks staged swizzled for ldmatrix (`_staging`), each read inside its operand: its
@@ -761,6 +797,37 @@ class Mma(MmaIssuer, CpAsync):
     # spilled where the forward derived them (sm80 width 64, split residuals), and no GEMM derived them;
     # FlashAttention 2's rows come from one warpgroup's wider tiles, not a second warpgroup.
     consumers = 1
+
+    def output_staging(self, outputs: tuple, consumers: int) -> list:
+        # Each output tile staged at the swizzle its accumulator's stores pass the banks fewest times at
+        # (`stored_swizzle`), copied out a 16-byte piece a thread over whole tiles (`persist`'s store,
+        # `stores.swizzled_rows_out`).
+        del consumers
+        return [swizzling.staged(shape, dtype, self.stored_swizzle(shape, dtype)) if len(shape) == 2
+                else plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
+
+    def stored_swizzle(self, shape: tuple[int, int], dtype) -> int:
+        """The swizzle an output tile of `shape` in `dtype` stages at: of the swizzles its rows fill whole
+        (`swizzling.SWIZZLE_BYTES` down to the narrowest) and plain, the one its accumulator's stores pass
+        shared memory's banks fewest times at (`swizzling.wavefronts`, by the staging's address arithmetic),
+        the widest on a tie. A warp stores mma.sync's accumulator fragment an 8-row slab by 8 columns at a
+        time, lane `l` two adjacent elements of row `l // 4` at column `2 (l % 4)`: plain, 64 16-bit columns
+        put a slab's 8 rows in the same banks, 8 passes a store, where a 128-byte swizzle gives each row's
+        piece its own banks, one pass (row 5271: the A100's dense kernel gradient's 4x cuBLAS's bank
+        conflicts, FS-DW-NCU2)."""
+        rows, columns = shape
+        itemsize = jnp.dtype(dtype).itemsize
+        stagings = [swizzle for swizzle in (swizzling.SWIZZLE_BYTES, 64, swizzling.NARROWEST_SWIZZLE_BYTES)
+                    if (columns * itemsize) % swizzle == 0 and rows % swizzling.TILE_ROWS == 0]
+        stagings.append(swizzling.UNSWIZZLED)
+
+        def passes(swizzle: int) -> int:
+            return sum(swizzling.wavefronts(
+                [swizzling.staged_address(slab + lane // 4, (block + 2 * (lane % 4)) * itemsize,
+                                          columns * itemsize, swizzle) for lane in range(32)], 2 * itemsize)
+                for slab in range(0, rows, swizzling.TILE_ROWS) for block in range(0, columns, 8))
+
+        return min(stagings, key=lambda swizzle: (passes(swizzle), -swizzle))
 
 
 def _one(consumers: int, *, clustered: bool = False) -> None:

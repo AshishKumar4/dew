@@ -1599,11 +1599,9 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
     mainloop holds take the product in place, unscaled (`Keys.accumulate`'s `scale` None), but on a scaled
     tile, whose sums take their rows' change of scale (`scaled_step`)."""
     state, arg, own, others_total = carry
-    if keys.coords.drop is None:
-        # The derived forms' weights at the known maximum, which no tile moves.
-        _, _, p, value = _softmax(spec, state, keys)
-    else:
-        p, value = weights(spec, keys.logits, state.m), keys.values.load()
+    # The derived forms' weights at the known maximum, which no tile moves, a dropping call's too: its draw
+    # multiplies the product's weights alone (`multiplier` below).
+    _, _, p, value = _softmax(spec, state, keys)
     # A quantized model's weights in the value product its codes at the row's maximum, each at most
     # `rounds` and exact in the values' dtype; the denominator the weights themselves (`Forward.rounds`).
     taken = p if spec.rounds is None else coded(p, spec.rounds)

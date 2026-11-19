@@ -140,10 +140,6 @@ def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
     `dtype` and each input a leaf in its own dtype. Packed into documents at `cuts`, the row's memory
     is its first document's and its final memory and cotangent its last's: the others start from
     zero and give theirs no cotangent."""
-    python = os.environ.get("DEW_FLA_PYTHON")
-    if not python:
-        pytest.fail("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch: the GPU tier's reference, "
-                    "which a run selecting fla's gate gives it")
     given = dict(zip(("q", "k", "v", "g", "beta", "h0", "do", "dht"),
                      (np.asarray(x, np.float32) for x in inputs), strict=True))
     given["dtypes"] = np.asarray(",".join(jnp.dtype(x.dtype).name for x in inputs))
@@ -152,12 +148,8 @@ def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
         given["h0"] = np.concatenate([given["h0"], others])
         given["dht"] = np.concatenate([others, given["dht"]])
         given["cu_seqlens"] = np.asarray([*cuts, given["q"].shape[1]], np.int64)
-    with tempfile.TemporaryDirectory() as root:
-        np.savez(Path(root) / "in.npz", **given)
-        subprocess.run([python, "-c", FLA_SIDE, Path(root) / "in.npz", Path(root) / "out.npz",
-                        jnp.dtype(dtype).name, *NAMES], check=True)
-        found = np.load(Path(root) / "out.npz")
-        theirs = {name: found[name].astype(np.float64) for name in NAMES}
+    found = fla_run(FLA_SIDE, given, jnp.dtype(dtype).name, *NAMES)
+    theirs = {name: found[name].astype(np.float64) for name in NAMES}
     theirs["final"], theirs["dh0"] = theirs["final"][-1:], theirs["dh0"][:1]
     return [theirs[name] for name in NAMES]
 
@@ -269,15 +261,22 @@ def fla_layer_side(form: str, leaves: dict, cotangents: tuple, starts, dtype, *,
     """fla's layer (`FLA_LAYER_SIDE`) on a request of stacked draws (`fla_request`) in the interpreter
     `DEW_FLA_PYTHON` names: its outputs and every leaf's gradient by name (`out`, `final`, `d_<leaf>`),
     each stacked."""
+    given = fla_request(form, leaves, cotangents, starts, dtype, epsilon=epsilon)
+    return fla_run(FLA_LAYER_SIDE, given, form, jnp.dtype(dtype).name)
+
+
+def fla_run(script: str, given: dict, *arguments: str) -> dict:
+    """`script` run in the interpreter `DEW_FLA_PYTHON` names (fla 0.5.2 and torch, the GPU tier's
+    reference) on the arrays `given`, an npz its first argument, writing the arrays it finds to its second,
+    its `arguments` after them: what it found, by name."""
     python = os.environ.get("DEW_FLA_PYTHON")
     if not python:
         pytest.fail("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch: the GPU tier's reference, "
                     "which a run selecting fla's gate gives it")
-    given = fla_request(form, leaves, cotangents, starts, dtype, epsilon=epsilon)
     with tempfile.TemporaryDirectory() as root:
         np.savez(Path(root) / "in.npz", **given)
-        subprocess.run([python, "-c", FLA_LAYER_SIDE, Path(root) / "in.npz", Path(root) / "out.npz", form,
-                        jnp.dtype(dtype).name], check=True)
+        subprocess.run([python, "-c", script, Path(root) / "in.npz", Path(root) / "out.npz", *arguments],
+                       check=True)
         with np.load(Path(root) / "out.npz") as found:
             return dict(found)
 

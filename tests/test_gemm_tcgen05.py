@@ -11,10 +11,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 
-from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import gemm, generation, grouped_launch, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
 
 TILE = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
@@ -115,7 +115,7 @@ def test_a_blackwell_tiles_sum_holds_every_step_however_its_rotations_fall(depth
     w = jax.random.randint(keys[1], (depth, 512), -1, 2).astype(jnp.bfloat16)
     with generation.assumed("sm100"):
         got = mosaic_gpu.gmm(x, w[None], jnp.asarray([256], jnp.int32), tiles=tiles, transpose_rhs=False,
-                             out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_matmul.INTERPRETED,
+                             out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_launch.INTERPRETED,
                              dense=True)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(x, np.float32) @ np.asarray(w, np.float32))
 
@@ -169,7 +169,7 @@ def _epilogued(case: str, tiles: mosaic_gpu.Tiles, *, interpret: bool):
         outs = mosaic_gpu.gmm(drawn["x"], w, jnp.asarray(SIZES, jnp.int32), tiles=tiles,
                               transpose_rhs=case == "transposed", out_dtype=dtypes[0],
                               multiprocessors=programs,
-                              interpret=grouped_matmul.INTERPRETED if interpret else False, epilogue=epilogue,
+                              interpret=grouped_launch.INTERPRETED if interpret else False, epilogue=epilogue,
                               epilogue_operands=tuple(drawn[name] for name, _ in sides),
                               epilogue_axes=tuple(axes for _, axes in sides),
                               out_dtypes=dtypes if len(dtypes) > 1 else None)
@@ -216,6 +216,7 @@ def tcgen05s_epilogues_hold_check_1_on_blackwell(case, tiles):
                     f"{case} at {tiles} on Blackwell", seeds=SEEDS, truth_fn=_plain(case, truth=True))
 
 
+@COMPILES_ON_CPU
 def test_tcgen05s_mainloop_compiles_for_a_b200_within_its_resources():
     """The shared mainloop at each tcgen05 tile, its deepest rings' (`DEEP`) and a pair's (`PAIRED`, each
     CTA's accumulators 256 columns), with a bias epilogue, compiled by Mosaic for a compile-only B200 on this
@@ -246,6 +247,7 @@ def test_tcgen05s_mainloop_compiles_for_a_b200_within_its_resources():
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+@COMPILES_ON_CPU
 def test_an_eight_slot_kernel_gradient_compiles_within_its_predicates():
     """The dense kernel gradient (`mosaic_gpu.tgmm`) on an eight-slot tcgen05 ring (`DEEP`'s second), into
     fp32 and bf16, compiled by Mosaic for a compile-only B200 through ptxas: no spill, where its ring's
@@ -287,6 +289,7 @@ def _pair_gradient(out_dtype, *, k_major: bool = False, rows: int = 4096, depth:
     return product, shapes
 
 
+@COMPILES_ON_CPU
 def test_a_pairs_dense_kernel_gradient_compiles_for_a_b200_within_its_resources():
     """The dense kernel gradient on a pair (`_pair_gradient`), into fp32 and bf16, its operands laid
     rows-major and rows-contiguous, compiled by Mosaic for a
@@ -357,7 +360,7 @@ def test_a_pairs_tile_is_legal_for_a_dense_product_on_a_b200():
 
 
 def test_a_b200s_products_lower_at_the_tiles_their_launch_derives():
-    """On a B200, where the derivation tries a pair's bundle first (`mosaic_gpu.paired_first`), a dense
+    """On a B200, where the derivation tries a pair's bundle first (`derivation.paired_first`), a dense
     product over a step's rows and a routed one, its outputs scattered to their slots (which a pair's
     bundle does not take, `Transport.gathers_rows`), each lower through Mosaic for sm100 at the tile their
     launch derives, which it holds legal."""
@@ -448,6 +451,7 @@ def _gated_product(tile):
     return product, shapes
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("tile", [dataclasses.replace(TILE, block_n=64),
                                   dataclasses.replace(PAIRED, block_n=64)], ids=["one CTA", "pair"])
 def test_a_gated_mlp_runs_as_one_paired_product_on_tcgen05_within_its_resources(tile):

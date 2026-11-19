@@ -13,11 +13,12 @@ import jax.numpy as jnp
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, launches
+from dew.nn.kernels.templates import rings
 
 
 def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
     """A launch's interpreter: `interpret`'s own parameters where it gives them (a read past an operand
-    poisoned, `grouped_matmul.INTERPRETED`), the default where it is True, none where False."""
+    poisoned, `grouped_launch.INTERPRETED`), the default where it is True, none where False."""
     if isinstance(interpret, plgpu.InterpretGPUParams):
         return interpret
     return plgpu.InterpretGPUParams() if interpret else None
@@ -44,14 +45,14 @@ def dependent(entry: Callable, interpret, *, prefetched: Callable | None = None)
     `entry` as it is.
 
     With `prefetched`, `prefetched(*refs)`'s views of any operands each prefetched into L2 before the wait
-    (`plgpu.async_prefetch`): a prefetch reads nothing into the program, and L2 is where every write
+    (`rings.prefetch`): a prefetch reads nothing into the program, and L2 is where every write
     lands, so a view the launch before it still writes is correct to prefetch, at worst early."""
     if not waits(interpret):
         return entry
 
     def body(*refs):
         for view in () if prefetched is None else prefetched(*refs):
-            plgpu.async_prefetch(view)
+            rings.prefetch(view)
         plgpu.griddepcontrol_wait()
         entry(*refs)
         plgpu.griddepcontrol_launch_dependents()

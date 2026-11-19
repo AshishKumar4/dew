@@ -13,9 +13,8 @@ kernel emits."""
 import dataclasses
 import functools
 import math
-import operator
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -109,14 +108,22 @@ _OPERATIONS = frozenset({
     lax.abs_p, lax.add_p, lax.and_p, lax.ceil_p, lax.clamp_p, lax.div_p, lax.eq_p, lax.floor_p, lax.ge_p,
     lax.gt_p, lax.le_p, lax.lt_p, lax.max_p, lax.min_p, lax.mul_p, lax.ne_p, lax.neg_p, lax.not_p, lax.or_p,
     lax.rem_p, lax.select_n_p, lax.shift_left_p, lax.shift_right_logical_p, lax.shift_right_arithmetic_p,
-    lax.sign_p, lax.sub_p, lax.xor_p, lax.integer_pow_p, lax.sqrt_p, lax.rsqrt_p, lax.square_p, lax.round_p,
-    lax.one_minus_square_p, ad_util.add_jaxvals_p, lax.clz_p})
+    lax.sign_p, lax.sub_p, lax.xor_p, lax.integer_pow_p, lax.square_p, lax.round_p,
+    lax.one_minus_square_p, ad_util.add_jaxvals_p, lax.clz_p, lax.is_finite_p, lax.erf_p, lax.expm1_p})
 """Elementwise operations of the CUDA cores, one an output element (a cotangent's sum, `add_any`, among
 them; a leading-zero count, `clz`, an integer instruction the finish's exponent reads a subnormal's by,
-`dew.nn.precision.binade_of`)."""
+`dew.nn.precision.binade_of`). A finiteness test is a magnitude's comparison (XLA's elemental emitter: fabs
+and an fcmp), an erf XLA's own rational polynomial (xla/codegen/intrinsic/erf.cc: FMAs and a divide), and an
+expm1 CUDA's expm1f, whose fp32 SASS issues FMAs alone, no MUFU (sm80, probe FS-LIBM2: ten FFMAs and three
+FADDs, where an expf issues a MUFU.EX2)."""
 
-_REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p})
-"""Reductions, one operation an input element."""
+_REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p, lax.reduce_prod_p,
+                         lax.reduce_and_p, lax.reduce_or_p, lax.reduce_xor_p})
+"""Reductions of one operation an input element: an extreme, a sum or a product, and the bitwise and, or and
+xor (a mask's all, any and parity), so a producer's row value of any of them is priced (a fused region's
+prologue sides, `fused_gemm._split`). An extreme's index (argmax, argmin) carries its index beside each
+step's value, a compare and two selects as lowered: no rule here, its count its lowering's when a kernel
+reaches one."""
 
 APPROXIMATED = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.log1p_p, lax.tanh_p,
                           lax.logistic_p, lax.sin_p, lax.cos_p, lax.sqrt_p, lax.rsqrt_p, lax.pow_p})
@@ -124,10 +131,13 @@ APPROXIMATED = frozenset({lax.exp_p, lax.exp2_p, lax.log_p, lax.log2_p, lax.log1
 (`mosaic.compiler_params`; its lowering's exp, exp2, log, log2, tanh, sin, cos, sqrt and rsqrt; jax's
 logistic, log1p and pow lower through them)."""
 
-_EXPONENTIALS = APPROXIMATED - {lax.sqrt_p, lax.rsqrt_p}
-"""The special-function units' operations, one an output element: those Mosaic GPU lowers to the hardware's
-approximate forms, or through them (`APPROXIMATED`), but its square roots, which the CUDA cores' operations
-count."""
+SPECIAL_FUNCTIONS = APPROXIMATED
+"""The special-function units' operations, one an output element, the one rule Dew counts them by: those
+Mosaic GPU lowers to the hardware's approximate forms, or through them (`APPROXIMATED`), square roots among
+them. An fp32 sqrt and rsqrt issue one MUFU each an element on sm80, sm90 and sm100 alike, beside two FMULs
+and an FSETP scaling a subnormal: Mosaic GPU's `sqrt.approx.f32` a MUFU.SQRT and `rsqrt.approx.f32` a
+MUFU.RSQ, and XLA's `sqrt.rn.f32` a MUFU.RSQ refined on the FMA pipe (ptxas 13.0's SASS, probes FS-SQRT2 and
+FS-SQRT4, 2026-11-16), as an exp's MUFU.EX2 is one beside its scaling FMUL."""
 
 _FREE = frozenset({
     lax.axis_index_p, gpu.barrier_arrive_p, gpu.barrier_wait_p, lax.bitcast_convert_type_p,
@@ -138,11 +148,14 @@ _FREE = frozenset({
     gpu.wait_load_tmem_p, gpu.wgmma_accumulator_deref_p, gpu.wgmma_accumulator_store_p, gpu.load_p,
     gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p, state.get_p,
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
-    lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p})
+    lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
+    lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
-indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's),
-and its reads and writes between its registers and its scoped refs, which its products' operands and its
-copies count."""
+indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's;
+every layout move the Pallas fuser tiles: a dynamic slice and its update, whose index arithmetic is scalar,
+which nothing counts, a split, a stack, a tile and an unstack, so a fused prologue's stage holds no
+operation the counter cannot price, `fused_gemm._split`), and its reads and writes between its registers
+and its scoped refs, which its products' operands and its copies count."""
 
 _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 """Tensor-core products whose operands' shapes their transforms state (`_product`)."""
@@ -150,14 +163,118 @@ _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 _COPIES = frozenset({gpu.copy_gmem_to_smem_p, gpu.copy_smem_to_gmem_p})
 """Copies between device and shared memory (`_copied`)."""
 
-_CONCRETE: dict = {
-    lax.add_p: operator.add, lax.sub_p: operator.sub, lax.mul_p: operator.mul, lax.max_p: max, lax.min_p: min,
-    lax.lt_p: operator.lt, lax.le_p: operator.le, lax.gt_p: operator.gt, lax.ge_p: operator.ge,
-    lax.eq_p: operator.eq, lax.ne_p: operator.ne, lax.and_p: operator.and_, lax.or_p: operator.or_,
-    lax.not_p: operator.not_, lax.neg_p: operator.neg,
-    lax.div_p: lambda a, b: a // b if isinstance(a, int) and isinstance(b, int) else a / b,
-    lax.rem_p: lambda a, b: a % b}
-"""The scalar arithmetic a warpgroup's index flows through to its roles' predicates and switch, evaluated."""
+def _folded(equation, values: list) -> list:
+    """`equation` over its concrete integer and boolean scalar operands, each at its own dtype, as its
+    primitive computes it on the GPU (`scalar_evaluated`): a width's wrap, a quotient's truncation and a
+    remainder's sign the program's own; unknown where it computes none."""
+    operands = [np.asarray(value, dtype=atom.aval.dtype)[()] for value, atom in zip(values, equation.invars,
+                                                                                      strict=True)]
+    (out,) = equation.outvars
+    return [scalar_evaluated(equation.primitive, operands, equation.params, out.aval.dtype)]
+
+
+def scalar_evaluated(primitive, operands: Sequence, params: Mapping, dtype) -> np.generic | None:
+    """An elementwise `primitive`'s output, of `dtype`, over concrete integer and boolean scalar `operands`,
+    as `lax` and the GPU compute it exactly, in this host's own integers (`_SCALAR`): a width's wrap, a
+    quotient truncated and a remainder of its dividend's sign, a shift past the width, a product at the
+    output dtype it names. No program is compiled to fold one: evaluated by binding the primitive, each
+    kernel's index arithmetic compiled a one-primitive program a process (18 beside a 4B step's first trace,
+    row 8612). None for a primitive outside the arithmetic a warpgroup's index flows through
+    (`SCALAR_EVALUATED`), a parameter it does not read (`_READ`), a floating or complex operand or output,
+    whose IEEE semantics no warpgroup's index arithmetic reads and this host's CPU computes otherwise than a
+    GPU (its subnormals flushed), and a quotient or remainder the GPU leaves undefined (`_undefined`)."""
+    if (primitive not in SCALAR_EVALUATED
+            or any(value is not None for name, value in params.items() if name not in _READ)
+            or not all(_integral(np.result_type(value)) for value in operands) or not _integral(dtype)
+            or (primitive in (lax.div_p, lax.rem_p) and _undefined(*operands))):
+        return None
+    held = np.result_type(operands[0])
+    return np.dtype(dtype).type(_wrapped(_SCALAR[primitive](held, *map(int, operands)), dtype))
+
+
+def _wrapped(value: int, dtype) -> int | bool:
+    """`value` as `dtype` holds it: a boolean's truth, an integer's two's complement at its width."""
+    dtype = np.dtype(dtype)
+    if dtype == np.bool_:
+        return value != 0
+    limits = jnp.iinfo(dtype)
+    value &= (1 << limits.bits) - 1
+    return value - (1 << limits.bits) if value > limits.max else value
+
+
+def _quotient(dividend: int, divisor: int) -> int:
+    """An integer quotient truncated toward zero."""
+    quotient = abs(dividend) // abs(divisor)
+    return quotient if (dividend < 0) == (divisor < 0) else -quotient
+
+
+def _shifted(primitive, held, value: int, amount: int) -> int:
+    """`value`, of `held`'s width, shifted by `amount`, read unsigned: past the width a left or logical
+    shift leaves nothing and an arithmetic one its sign, which it reads of the value as signed (an
+    unsigned value's too)."""
+    bits = jnp.iinfo(held).bits
+    amount &= (1 << bits) - 1
+    signed = value & ((1 << bits) - 1)
+    signed -= (1 << bits) if signed >> (bits - 1) else 0
+    if primitive is lax.shift_right_arithmetic_p:
+        return signed >> min(amount, bits - 1)
+    if amount >= bits:
+        return 0
+    if primitive is lax.shift_left_p:
+        return value << amount
+    return (value & ((1 << bits) - 1)) >> amount
+
+
+_SCALAR: dict = {
+    lax.add_p: lambda held, a, b: a + b,
+    lax.sub_p: lambda held, a, b: a - b,
+    lax.mul_p: lambda held, a, b: a * b,
+    lax.neg_p: lambda held, a: -a,
+    lax.div_p: lambda held, a, b: _quotient(a, b),
+    lax.rem_p: lambda held, a, b: a - b * _quotient(a, b),
+    lax.max_p: lambda held, a, b: max(a, b),
+    lax.min_p: lambda held, a, b: min(a, b),
+    lax.clamp_p: lambda held, low, a, high: min(max(a, low), high),
+    lax.lt_p: lambda held, a, b: a < b,
+    lax.le_p: lambda held, a, b: a <= b,
+    lax.gt_p: lambda held, a, b: a > b,
+    lax.ge_p: lambda held, a, b: a >= b,
+    lax.eq_p: lambda held, a, b: a == b,
+    lax.ne_p: lambda held, a, b: a != b,
+    lax.and_p: lambda held, a, b: a & b,
+    lax.or_p: lambda held, a, b: a | b,
+    lax.xor_p: lambda held, a, b: a ^ b,
+    lax.not_p: lambda held, a: not a if held == np.bool_ else ~a,
+    lax.shift_left_p: functools.partial(_shifted, lax.shift_left_p),
+    lax.shift_right_arithmetic_p: functools.partial(_shifted, lax.shift_right_arithmetic_p),
+    lax.shift_right_logical_p: functools.partial(_shifted, lax.shift_right_logical_p),
+    lax.convert_element_type_p: lambda held, a: a,
+}
+"""Each of `SCALAR_EVALUATED`'s primitives over its operands as Python's integers (a boolean's 0 or 1), the
+dtype they are held at first: its result before `scalar_evaluated` wraps it to the output's dtype."""
+
+
+def _integral(dtype) -> bool:
+    """Whether `dtype` is an integer or boolean one (JAX's 4-bit integers among them)."""
+    return jnp.issubdtype(dtype, jnp.integer) or jnp.issubdtype(dtype, jnp.bool_)
+
+
+def _undefined(dividend, divisor) -> bool:
+    """Whether an integer quotient or remainder is undefined where the GPU computes it (LLVM's `sdiv` and
+    `srem`, which Mosaic GPU's integer division lowers to), though this host's XLA defines one: by zero, or
+    the least integer by -1."""
+    dtype = np.result_type(dividend)
+    return divisor == 0 or (dtype != np.bool_ and dividend == jnp.iinfo(dtype).min and divisor == -1)
+
+
+SCALAR_EVALUATED = frozenset(_SCALAR)
+"""The elementwise primitives a warpgroup's index arithmetic flows through, which `scalar_evaluated`
+computes over concrete integer and boolean scalars."""
+
+_READ = frozenset({"new_dtype", "out_dtype", "weak_type", "sharding"})
+"""The parameters `scalar_evaluated` evaluates with (a conversion's target, a product's output dtype) or that
+state nothing of a scalar's value (its weak type, its placement): a primitive given any other one set is
+computed by none."""
 
 _TRANSFORMS = ("acc_transforms_tree", "a_transforms_tree", "b_transforms_tree", "barrier_transforms_tree",
                "a_scale_transforms_tree", "b_scale_transforms_tree", "a_sparse_metadata_transforms_tree")
@@ -271,7 +388,7 @@ class _Place:
     first trip (`at` "first"), its last ("last") or one between ("steady"), at its `parity`; `start` and
     `stop` its range's bounds as the count holds them. A step's guard on its place (`index == lo`,
     `index + 1 < hi`: a walk's first step opening its own slots, every step but the last reading the next's,
-    `mosaic.Slots`) and on its parity (`index % 2`: the accumulator of two a step issues ahead into) read
+    `rings.Slots`) and on its parity (`index % 2`: the accumulator of two a step issues ahead into) read
     concretely at each."""
 
     at: str
@@ -326,8 +443,9 @@ class _Counting:
 
         def read(atom):
             if isinstance(atom, jax_core.Literal):
-                # A literal's value is a host array (`literals.TypedNdArray`), a scalar's of no dimension.
-                return np.asarray(atom.val).item() if np.ndim(atom.val) == 0 else atom.val
+                # A literal's value is a host array (`literals.TypedNdArray`), a scalar's of no dimension,
+                # held at its own dtype as the program computes with it.
+                return np.asarray(atom.val)[()] if np.ndim(atom.val) == 0 else atom.val
             return held.get(atom)
 
         for equation in jaxpr.eqns:
@@ -340,12 +458,15 @@ class _Counting:
         unknown = [None] * len(equation.outvars)
         if primitive is lax.axis_index_p:
             return [self.place(params["axis_name"])]
-        if primitive in _CONCRETE and values and all(_scalar(value) for value in values):
-            return [_CONCRETE[primitive](*values)]
+        if (primitive in SCALAR_EVALUATED and values
+                and all(_scalar(value) for value in values)):
+            if primitive is lax.convert_element_type_p:
+                self.add(Work(conversions=1))
+            return _folded(equation, values)
         if (placed := _placed(primitive, values)) is not None:
             return [placed]
-        if primitive is lax.convert_element_type_p and _scalar(values[0]):
-            self.add(Work(conversions=1))
+        if primitive is pallas.multiple_of_p:
+            # A divisibility hint: its operand's value, nothing computed.
             return [values[0]]
         if (primitive is lax.select_n_p and _scalar(values[0])
                 and all(value is not None for value in values[1:])):
@@ -354,7 +475,7 @@ class _Counting:
             self.add(Work(operations=sum(_elements(v.aval) for v in equation.outvars)))
         elif primitive in _REDUCTIONS:
             self.add(Work(operations=_elements(equation.invars[0].aval)))
-        elif primitive in _EXPONENTIALS:
+        elif primitive in SPECIAL_FUNCTIONS:
             self.add(Work(exponentials=sum(_elements(v.aval) for v in equation.outvars)))
         elif primitive is lax.convert_element_type_p:
             self.add(Work(conversions=sum(_elements(v.aval) for v in equation.outvars)))
@@ -566,7 +687,12 @@ def _envelope(works) -> Work:
 
 
 def _scalar(value) -> bool:
-    return isinstance(value, int | bool | float | np.integer | np.bool_ | np.floating)
+    """Whether `value` is a concrete integer or boolean scalar, what a warpgroup's index arithmetic holds:
+    a Python integer or boolean, or a NumPy scalar of an integer or boolean dtype (JAX's 4-bit integers among
+    them). A float is none: its predicate's branches are unknown, each counted
+    (`scalar_evaluated`)."""
+    return isinstance(value, int) or (isinstance(value, np.generic) and any(
+        jnp.issubdtype(value.dtype, kind) for kind in (jnp.integer, jnp.bool_)))
 
 
 def built_with(cost: pl.CostEstimate | Stated | None) -> pl.CostEstimate | None:

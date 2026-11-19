@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from fla_sites import LEAVES, the_template_is_as_exact_as_fla
+from fla_sites import FLOOR_GATES, LEAVES, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU
 from map_judge import sharded
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
@@ -156,6 +156,31 @@ def runs(fn, hooks, operands: Chunk, drawn, product: str) -> bool:
     return True
 
 
+RESTARTED = 'resets on chunk edges'
+"""The one regime whose arms are its own (`_arms`): its documents restart on chunk edges (`restarting`), its
+chunked arms bounded by them (`bounded`)."""
+
+
+@functools.cache
+def _arms(name: str, regime: str, product: str, forms: str) -> tuple:
+    """A case's arms (`the_template_stays_finite_and_on_par_where_chunked_forms_break`'s): the template's,
+    its reference arm, the recurrence a token at a time and the portable math's, their gradients' where
+    `product` is; one function each for every regime but `RESTARTED`, which run them alike, so a form's
+    regimes of one shape trace its arms once, where each case built and traced its own (the GPU tier's 120
+    traces of the template's at assert_finite)."""
+    if regime != RESTARTED:
+        regime = next(other for other in REGIMES if other != RESTARTED)
+    hooks = SITES[name]
+    mosaic, portable = (functools.partial(chunk_on, kernel, hooks, **bounded(regime))
+                        for kernel in ('mosaic_gpu', 'xla'))
+    exact = functools.partial(token_by_token, hooks)
+    with under(forms):
+        reference = reference_arm(hooks, forms, **bounded(regime))
+    if product == 'gradient':
+        return tuple(with_gradients(restarting(fn, regime)) for fn in (mosaic, reference, exact, portable))
+    return mosaic, reference, exact, portable
+
+
 def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, product, forms):
     """Each form's 16-bit forward through the template, or its forward and gradient, under `forms`
     (`forms_of`), finite wherever the float64 recurrence's are on the regime's first draws, and on par with
@@ -175,15 +200,9 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
     operands = restarting(lambda given: given, regime)(draws(0)[0])
-    mosaic, portable = (functools.partial(chunk_on, kernel, hooks, **bounded(regime))
-                        for kernel in ('mosaic_gpu', 'xla'))
-    exact = functools.partial(token_by_token, hooks)
+    mosaic = _arms(name, regime, 'forward', forms)[0]
+    dew, reference, truth, portable = _arms(name, regime, product, forms)
     with under(forms):
-        reference = reference_arm(hooks, forms, **bounded(regime))
-        dew, truth = mosaic, exact
-        if product == 'gradient':
-            dew, reference, truth, portable = (with_gradients(restarting(fn, regime))
-                                               for fn in (mosaic, reference, exact, portable))
         if not runs(dew, hooks, operands, draws(0), product):
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
         label = f'the template, {name} under {regime}, its {product}'
@@ -316,6 +335,18 @@ def compiled_gradient(hooks, name: str) -> list[dict]:
 
 
 @COMPILES_ON_CPU
+@pytest.mark.check1_shards(seeds=512, per_task=8)
+def test_kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla_interpreted():
+    """Kimi delta attention's 16-bit gradient through the template, interpreted, under decays at its floor and
+    write gates down to 2^-60 (fla_sites' `FLOOR_GATES`): its output, final memory and every operand's
+    gradient on par with recorded fla-core's from float64 (check 1), its own pairs folded against its unit
+    keys (`mainloop.Call.unit_keys`). The template held 47 to 75 times the exact fp32 recurrence's error
+    there, as on plain draws, which only fla's judges (rows 7906, 7299)."""
+    mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
+    the_template_is_as_exact_as_fla(mosaic, FLOOR_GATES, LEAVES,
+                                    'the template, Kimi delta attention under tiny gates at the floor')
+
+
 def test_a_gradients_kernels_are_each_certified_as_its_program_lowers():
     """The gated delta net's bf16 gradient compiled for a compile-only H100 as a start compiles it
     (`compiled_gradient`): every Mosaic GPU kernel its program runs, its training forward's and its fast
