@@ -182,7 +182,8 @@ def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy_and_rounds_tmem_re
     op = attention_mosaic.MosaicForward(scale=128 ** -0.5, keys=256, form="full")
     ba = op.bind(q128, q128, q128, None, None, None, None, (), (), None,
                  residuals=template.Kept.NONE, interpret=False)
-    assert op.resident(ba, ROWS_TILES, target) == 1
+    with generation.assumed("sm100"):
+        assert op.resident(ba, ROWS_TILES, target) == 1
 
 
 @INTERPRETS
