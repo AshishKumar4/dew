@@ -30,7 +30,8 @@ def main() -> None:
         root = Path(directory)
         commit, path = LEGACY_SCRIPT
         script = root / "data_oracle_legacy.py"
-        urllib.request.urlretrieve(f"https://raw.githubusercontent.com/AshishKumar4/dew/{commit}/{path}", script)
+        source = f"https://raw.githubusercontent.com/AshishKumar4/dew/{commit}/{path}"
+        urllib.request.urlretrieve(source, script)
         archive = root / "baseline.tar.gz"
         urllib.request.urlretrieve(f"https://codeload.github.com/AshishKumar4/dew/tar.gz/{BASELINE}", archive)
         with tarfile.open(archive) as packed:

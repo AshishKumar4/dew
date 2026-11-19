@@ -290,7 +290,8 @@ def main(config):
     if not cpu:
         with open("/proc/cpuinfo") as handle:
             cpu = next(line.split(":", 1)[1].strip() for line in handle if line.startswith("model name"))
-    versions = {"jax": jax.__version__, "opencv": cv2.__version__, "tfds": importlib.metadata.version("tensorflow-datasets"),
+    versions = {"jax": jax.__version__, "opencv": cv2.__version__,
+                "tfds": importlib.metadata.version("tensorflow-datasets"),
                 "pillow": importlib.metadata.version("pillow")}
     try:
         versions["torchvision"] = importlib.metadata.version("torchvision")
