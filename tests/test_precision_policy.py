@@ -1755,10 +1755,11 @@ def edge_values(dtype) -> np.ndarray:
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
-                                   jnp.float8_e5m2])
+                                   jnp.float8_e5m2, jnp.float6_e2m3fn, jnp.float6_e3m2fn, jnp.float4_e2m1fn])
 def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
     """`dew.nn.float_bits.exact_power2` is `2^n` in its format, bit for bit, at every normal exponent from the
-    least to the largest, and +0 one below them (a zero a caller encodes so), compiled."""
+    least to the largest, and +0 one below them (a zero a caller encodes so), compiled, a sub-byte format's
+    too (FP6, FP4: base review d47c0d69c F1)."""
     from dew.nn.float_bits import exact_power2
 
     with jax.enable_x64(new_val=dtype == jnp.float64):
@@ -1767,7 +1768,9 @@ def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
         found = np.asarray(jax.jit(lambda n: exact_power2(n, dtype))(jnp.asarray(exponents, jnp.int32)))
     assert found.dtype == dtype
     expected = np.asarray([0.0, *(2.0 ** int(n) for n in exponents[1:])], np.float64).astype(dtype)
-    np.testing.assert_array_equal(found.view(f"uint{limits.bits}"), expected.view(f"uint{limits.bits}"))
+    # A sub-byte format's value is held in a byte (ml_dtypes'): its storage's bits.
+    stored = f"uint{8 * np.dtype(dtype).itemsize}"
+    np.testing.assert_array_equal(found.view(stored), expected.view(stored))
 
 
 def power2_rounds_a_subnormal_result_once():
