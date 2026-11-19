@@ -281,11 +281,7 @@ def _located(ref, transforms) -> tuple:
             if index is None:
                 return (ref.name, *found) if found else (ref.name, None)
             if not hasattr(index, "start"):
-                # An array of several indices (a gathered tile's rows) names no one entry: the location stops
-                # at the prefix known.
-                if (one := _one_value(index)) is None:
-                    return (ref.name, *found) if found else (ref.name, None)
-                found.append(one)
+                found.append(int(np.asarray(index)))
                 continue
             # A slice: the axes from it on whole, the next transform indexes them; else its one entry, if it
             # takes one, the location's last.

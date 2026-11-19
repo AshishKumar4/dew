@@ -625,10 +625,9 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         kv_of = jnp.arange(q.shape[2]) // (q.shape[2] // kv_heads)
         places = ((jnp.arange(batch)[:, None, None] * kv_heads + kv_of[None, :, None]) * keys_count + anchors)
         value_rows = jnp.take(jnp.swapaxes(v, 1, 2).reshape(-1, v.shape[-1]), places, axis=0)
-        # Under dropout the anchor's own weight where its draw keeps it, at the power of its multiplier the
-        # sums hold, as `algebra.joined` takes it.
+        # Under dropout the anchor's own weight where its draw keeps it, as `algebra.joined` takes it.
         own = (split.own if hooks.drop is None
-               else algebra.kept(split.own, algebra.anchor_multipliers(hooks.drop, anchors), form.kept_power))
+               else algebra.kept(split.own, algebra.anchor_multipliers(hooks.drop, anchors)))
         acc = algebra.split_output(split.others, own, value_rows)
         # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`), times a
         # dropping call's multiplier past the division (`algebra.dropped_output`).
@@ -689,7 +688,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                        query_block=tiles.consumers * tiles.block_q if inference else None,
                        widths=head_width)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
-                           score_mod=hooks.score_mod, natural=natural, whole=spans.whole,
+                           score_mod=hooks.score_mod, natural=natural,
                            # A quantized model's codes and values, each at most 127, sum far within fp32.
                            headroom=scaled and hooks.rounds is None and algebra.headroom(
                                query.dtype if scales is not None else value.dtype),
@@ -697,9 +696,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                            queries=(call.queries if call.query.shape[1] > call.queries or call.per_span > 1
                                     else None),
                            prescale=power / taken, subtracted=subtracted, rounds=hooks.rounds,
-                           dropped=1.0 if hooks.drop is None else hooks.drop.bound,
-                           kept_power=1.0 if hooks.drop is None else algebra.kept_power(hooks.drop.bound,
-                                                                                        value.dtype))
+                           dropped=1.0 if hooks.drop is None else hooks.drop.bound)
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     hooked = _hooked_of(hooks, call, unit)
     if scales is not None:

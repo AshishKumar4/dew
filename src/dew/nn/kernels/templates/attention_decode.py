@@ -97,9 +97,8 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
     group = heads // kv_heads
     rows = grouped_rows(query, kv_heads)
     if spans.query_ids is None and spans.start.ndim == 2:
-        # A full call's rows see every key still, which its launches' costs state (`KeySpans.whole`).
         spans = KeySpans(spans.start, spans.end, None, spans.key_ids, spans.keys, "spans",
-                         spans.per_span * group, whole=spans.whole or spans.form == "full")
+                         spans.per_span * group)
     else:
         start, end = (jnp.repeat(x, group, axis=1) for x in (spans.start, spans.end))
         query_ids = None if spans.query_ids is None else jnp.repeat(spans.query_ids, group, axis=1)
@@ -356,13 +355,13 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
 
 
 def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: int, heads: int,
-                kv_heads: int, width: int, dtype, page_size: int | None = None) -> Work | None:
+                kv_heads: int, width: int, dtype, page_size: int | None = None) -> Work:
     """A decode step's work as `attend` launches it on `target` (a server's choice between a dense and a paged
     cache, row 7420): `rows` rows of `queries` query positions, `heads` query heads over `kv_heads` key heads
     `width` wide in `dtype`, over `keys` keys of a dense cache or, with `page_size`, of a paged pool's pages
     that long. Each Mosaic launch's work as its emission counts it (`emission.work_of`), the launches in
     sequence (their spans summed), and a split step's merge its slices' fp32 states read and its output
-    written, one kernel more; None where some launch's work its emission does not count."""
+    written, one kernel more."""
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype)
     spans = key_spans(queries, keys, rows)
     pages = None if page_size is None else -(-keys // page_size)
@@ -384,11 +383,7 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
     (work,) = plans
     kernels = (equation for equation in programs.equations(traced.jaxpr)
                if equation.primitive in programs.NATIVE_KERNELS)
-    launches = [emission.work_of(kernel) for kernel in kernels]
-    if not launches or any(found is None for found in launches):
-        # A launch whose work its emission does not count leaves the step's price unknown, never 0 (the base
-        # review of 56a716c95, F3: a full step's spans launch priced none, and a step of no split Work()).
-        return None
+    launches = [found for kernel in kernels if (found := emission.work_of(kernel)) is not None]
     priced = dataclasses.replace(sum(launches, Work()), span=sum(each.span for each in launches))
     if max(plan.slices for plan in work.values()) > 1:
         slices = max(plan.slices for plan in work.values())

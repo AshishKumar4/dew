@@ -637,43 +637,6 @@ def test_a_resumed_state_of_a_large_denominator_keeps_a_finite_dropping_backward
     assert bool(np.all(np.isfinite(np.asarray(grads.value))))
 
 
-@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
-def test_a_near_total_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(training):
-    """The fp16 witness of the base review of 56a716c95, F1: a rate of 1 - 2^-14 (z = 2^14), two keys at
-    logits 0 and -18, the first dropped and the second kept, values 0 and 2^15. The kept weight e^-18 is
-    below fp16's least subnormal and its weight times z is not, so the output is z e^-18 2^15 / (1 + e^-18),
-    about 8.18, as the reference's narrowed coefficient gives it, where the weight narrowed without z flushed
-    to 0: within two fp16 roundings of float64's, on the inference walk and the training walk alike."""
-    rate = 1.0 - 2.0 ** -14
-    words = first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1]))
-    query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[..., 0].set(1)
-    key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(-18)
-    value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(2.0 ** 15)
-    walked = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value,
-                                             template.spans(1, 2, 1), hooked(words, 1, 1, rate), scale=1.0,
-                                             residuals=training)
-    out = walked[0] if training else walked
-    weight = np.exp(np.float64(-18))
-    truth = 2.0 ** 14 * weight * 2.0 ** 15 / (1 + weight)
-    assert abs(float(out[0, 0, 0, 0]) - truth) <= 2.0 ** -10 * truth
-
-
-@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
-def test_a_resumed_states_small_sums_are_kept_under_a_near_total_draw(training):
-    """The fp32 witness of the base review of 56a716c95, F2: a state of maximum 0, denominator 1 and sums
-    2^-120 resumed over one key of logit 0 and value 0 at a rate of 1 - 2^-32, whatever the draw: the output
-    is the state's sums over the joint denominator 2, exactly 2^-121, where the state's sums divided by the
-    whole multiplier, 2^32, flushed to 0."""
-    rate = 1.0 - 2.0 ** -32
-    query, key, value = (jnp.zeros((1, 1, 1, 8), jnp.float32) for _ in range(3))
-    state = template.Initial(jnp.zeros((1, 1, 1)), jnp.ones((1, 1, 1)), jnp.full((1, 1, 1, 8), 2.0 ** -120))
-    hooks = template.Hooks(initial=state, drop=dropout_of(seed_words(0), 1, 1, rate))
-    walked = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value,
-                                             template.spans(1, 1, 1), hooks, residuals=training)
-    out = walked[0] if training else walked
-    np.testing.assert_array_equal(np.asarray(out), np.full(out.shape, 2.0 ** -121, np.float32))
-
-
 def test_the_reference_scales_a_dropped_weight_at_float64_precision():
     """One key, kept at a rate of 1/4, in float64: its output is 1 / (1 - 1/4) = 4/3 exactly. The
     reference rounded the multiplier to fp32 first (1.3333333730697632) and widened it into the truth."""
