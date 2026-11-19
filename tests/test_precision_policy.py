@@ -1295,6 +1295,32 @@ def test_an_aligned_sums_shared_factors_gradient_holds_its_groups_scaled_until_t
     np.testing.assert_array_equal(np.asarray(pulled(jnp.ones_like(value))[0]), np.full((2, 3), 2.0 ** 126))
 
 
+@pytest.mark.parametrize("order", ["forward over reverse", "reverse over reverse"])
+def test_an_aligned_sums_second_order_keeps_its_losss_curvature(order):
+    """The Hessian along `[1, 0]` of `sum(aligned_sum([(a, a, c)])^2)` at `a` `[1, 2]` and `c` `[3, 4]`, its
+    loss nonlinear in the sum, `12 a^2 c^2` there, `[108, 0]`, and of a mixed-rank sum's
+    `sum(aligned_sum([(x, y), (y,)], axis=0)^2)` its `y`-gradient's gradient along `x`, `[8, 24]`: float64's,
+    by `jax.jvp` of the gradient and by the gradient of the gradient's product with the direction, where the
+    sum's tangent rule formed its value from bits, which carry no tangent, and both orders lost the loss's
+    curvature, `[36, 0]` and `[0, 0]` (base review d2d45bd6f F2)."""
+    a, c, direction = (jnp.asarray(v, jnp.float32) for v in ([1.0, 2.0], [3.0, 4.0], [1.0, 0.0]))
+
+    def loss(a):
+        return jnp.sum(aligned_sum([(a, a, c)]) ** 2)
+
+    if order == "forward over reverse":
+        found = jax.jvp(jax.grad(loss), (a,), (direction,))[1]
+    else:
+        found = jax.grad(lambda a: jnp.vdot(jax.grad(loss)(a), direction))(a)
+    np.testing.assert_array_equal(np.asarray(found), [108.0, 0.0])
+    y = jnp.asarray([[1.0, 2.0]], jnp.float32)
+
+    def mixed(x):
+        return jnp.sum(jax.grad(lambda y: jnp.sum(aligned_sum([(x, y), (y,)], axis=0) ** 2))(y))
+
+    np.testing.assert_array_equal(np.asarray(jax.grad(mixed)(a)), [8.0, 24.0])
+
+
 def test_an_aligned_sums_gradient_scales_a_cotangent_before_its_broadcast_sum():
     """`aligned_sum([(x, y), (z,)])` of one-element `x` 2^-20 and `y` 2^-100 beside `z` of two, under a
     cotangent of 1.5 2^127 on each: `x`'s gradient 3 2^27 and `y`'s 3 2^107, float64's, where the cotangent's
