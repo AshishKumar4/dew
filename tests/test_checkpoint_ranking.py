@@ -463,17 +463,11 @@ def test_a_directory_holding_only_a_model_alone_is_no_fresh_runs(tmp_path):
     step a resume reads, is occupied: a fresh run there, asked (`resume="never"`) or chosen (`"auto"`), is
     refused, as one beside a run's steps is, never started beside them (row 9019: read as empty, a fresh
     run wrote its steps among them); one that must continue (`"require"`) finds none to continue."""
-    import shutil
-
-    directory = tmp_path / 'run'
-    run = trainer(directory, keep=Keep(latest=1, every=2, weights_only=True))
-    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
-    run.checkpoints.save(2, state.replace(step=jnp.int32(2)), None)
-    run.checkpoints.wait()
-    run.checkpoints.save(3, state.replace(step=jnp.int32(3)), None)
-    run.checkpoints.wait()
+    state = trainer(tmp_path / 'run').initial_state()
     held = tmp_path / 'held'
-    shutil.copytree(directory / '2', held / '2')
+    written = Checkpoints(str(held))
+    written.save(2, state.replace(step=jnp.int32(2)), None, weights_only=True)
+    written.wait()
     assert _items(held, 2) == ['model']
     alone = Checkpoints(str(held))
     assert alone.latest is None and alone.occupied == 2
