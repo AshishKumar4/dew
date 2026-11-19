@@ -1408,6 +1408,32 @@ def route(choice: Choice, *, kernel: str, preferred: str | None = None, refusal:
     return found
 
 
+def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Callable:
+    """`linear_tangent`'s forward without `nested`: run on its operands held still (`stop_gradient`), its
+    output alone taking `portable`'s tangent where an outer order differentiates it, what it saves none:
+    held still whole, a second order lost its loss's curvature, `J^T H J` (row 8648)."""
+    import jax
+
+    from dew.nn.derivatives import contracted, declared_tangent
+
+    def tangent(primals, tangents):
+        output, *operands = primals
+        return output, jax.jvp(portable, tuple(operands), tuple(tangents[1:]))[1]
+
+    def holding(output, *operands):
+        del operands
+        return output
+
+    attached = contracted("test_an_embedding_lookup_holds_every_order")(
+        declared_tangent(kind, holding, tangent))
+
+    def run(*operands):
+        output, saved = forward(*jax.lax.stop_gradient(operands))
+        return attached(output, *operands), saved
+
+    return run
+
+
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *, kind: TangentKind,
                    live_cotangents: bool = False, zero_cotangents: bool = False,
                    primal: Callable | None = None, nested: bool = True,
@@ -1426,10 +1452,9 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     `portable`'s and its pullback's, so a higher order (`jax.jvp` of `jax.grad`, `jax.grad` of
     `jax.jvp`) differentiates through XLA while each level's value comes from the kernels; what
     `saved` holds is a function of the operands, whose tangents carry it. This composes with
-    `jax.vmap` of a gradient, the gradient of a `jax.vmap` and forward over reverse. Each of the three is
-    declared as the caller's `kind` (`dew.nn.derivatives.declared_tangent`): a kernel's glue (`KernelGlue`),
-    a rule its numerics need as written (`Protected`), or one written to restructure algebra (`Algebra`),
-    which is what the algebra pass reads of it.
+    `jax.vmap` of a gradient, the gradient of a `jax.vmap` and forward over reverse. Each is declared as
+    the caller's `kind` (`dew.nn.derivatives.declared_tangent`), which the algebra pass reads: a kernel's
+    glue (`KernelGlue`), a rule its numerics need as written (`Protected`) or algebra's own (`Algebra`).
 
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
@@ -1439,13 +1464,12 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     operands at `unread` positions, which no derivative reads (`portable` and `backward` alike: a value only
     the forward multiplies, `gemm`'s `applied`), are no residual of the derivative: it holds each as an empty
     array of its dtype, so a remat policy that saves the other operands recomputes nothing to form it.
-    `primal(*operands)` gives the output where no derivative is taken (a kernel
-    that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
-    it is on its operands held still (`stop_gradient`), not as a custom JVP of its own: a value it names
-    (`checkpoint_name`) is a residual a remat policy can keep, and no order differentiates the kernels'
-    forward, whose custom VJP takes none (what it saves reaches `pulled` alone, whose tangent reads the
-    operands': run as it was, a jvp of a gradient through a named kernel reached Mosaic GPU's call, which
-    no JAX rule differentiates, row 2655)."""
+    `primal(*operands)` gives the output where no derivative is taken (a kernel that saves nothing),
+    `forward`'s where None. Without `nested`, a derivative's level runs `forward` on its operands held
+    still (`_held_still`), not as a custom JVP of its own: a value it names (`checkpoint_name`) is a
+    residual a remat policy can keep, and no order differentiates the kernels' forward, whose custom VJP
+    takes none (what it saves reaches `pulled` alone, whose tangent reads the operands': a jvp of a
+    gradient through a named kernel reached Mosaic GPU's call, row 2655)."""
     import jax
     import jax.numpy as jnp
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
@@ -1482,8 +1506,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     pulled = contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,)))
 
+    still = _held_still(forward, portable, kind)
+
     def bounded_jvp(primals, tangents):
-        output, saved = produced(*primals) if nested else forward(*jax.lax.stop_gradient(primals))
+        output, saved = produced(*primals) if nested else still(*primals)
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
         directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)
