@@ -205,13 +205,12 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
         return coords.queries(read(x), s) if coords.keys_first else read(x)
 
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
-    # The anchor key's `dP - c` taken as 0 in the accurate form alone; the fast form's is its product's
-    # rounding, FlashAttention 3's math (a query of one key's cotangents a rounding where its float64
-    # gradient is 0, a cancelling row the gate sizes by its terms; the select 10.8% of the fused dK/dV
-    # launch's instructions, ET-CONFLICTS-h100).
-    at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if walk.accurate else None
-    # The tile's weights and cotangents the derived forms' (`derived_cotangents`), in its forward's units
-    # (`how`) and form (`accurate`, its anchor keys an operand).
+    # A dropping anchor's centre can survive where its tile's product rounds to zero before the
+    # multiplier joins it. Take its self-difference as 0, as the accurate form does. The undropped
+    # fast form keeps FlashAttention 3's math (the select took 10.8% of fused dK/dV's instructions).
+    anchored = walk.accurate or multiplier is not None
+    at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if anchored else None
+    # The tile's weights and cotangents the derived forms' (`derived_cotangents`).
     tiles = {"logits": logits, "products": dp, "peak": read(peak), "total": read(total),
              "anchor": read(anchor), "delta": read(delta)}
     if multiplier is not None:
@@ -221,7 +220,7 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     if at_anchor is not None:
         tiles["at_anchor"] = at_anchor
     forms = derived_cotangents(bool(coords.keys_first), multiplier is not None, seen is not None, how,
-                               walk.accurate)
+                               walk.accurate, anchored=anchored)
     exponentials, weights, cotangents = forms.mapped(tiles)
     return exponentials, weights, cotangents, slopes, seen
 
