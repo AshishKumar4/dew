@@ -915,7 +915,7 @@ def test_a_site_whose_truths_alone_are_at_run_computes_its_reference_as_its_trut
 
     def refusing_truths(store, label, programs, held, **options):
         # A choice its GPU makes, which no compile without that GPU holds, in its truths' programs alone.
-        if programs and not options.get("arms", False):
+        if programs and not options.get("arms", False) and options.get("at_run") is None:
             raise report.CompiledOnDevice(jax.jit(lambda x: x).lower(np.zeros(1, np.float32)), ["truth"])
         return real(store, label, programs, held, **options)
 
