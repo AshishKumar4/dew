@@ -41,7 +41,9 @@ SEEDS = 8
 
 
 def rounded(values, dtype) -> np.ndarray:
-    return np.asarray(jnp.asarray(values, dtype), np.float64)
+    """`values` rounded to `dtype` and held in float64, on the host (a GPU tier's prepare computes on no
+    device)."""
+    return np.asarray(values).astype(dtype).astype(np.float64)
 
 
 def operands(sizes, dtype, seed=0):
@@ -306,13 +308,14 @@ def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
     `depth`-deep contraction: at the default precision its sums the tensor cores' own, as XLA's (cuBLAS's)
     are, which held a dense kernel gradient within 0.98-1.00 of cuBLAS's error from float64 on an A100 and an
     H100 at depths of 128 to 2048 (M-EM-3; row 4331's 1.661x at depth 128 did not reproduce)."""
-    group_sizes = jnp.asarray([70, 66], jnp.int32)
+    group_sizes = np.asarray([70, 66], np.int32)
 
     def draw(seed):
-        keys = jax.random.split(jax.random.key(seed), 3)
-        return (jax.random.normal(keys[0], (136, depth)).astype(jnp.bfloat16),
-                (jax.random.normal(keys[1], (2, depth, 256)) / np.sqrt(depth)).astype(jnp.bfloat16),
-                jax.random.normal(keys[2], (136, 256)).astype(jnp.float32))
+        # NumPy's, as a site's draws are: a GPU tier's prepare computes on no device.
+        rng = np.random.default_rng(seed)
+        return (rng.normal(size=(136, depth)).astype(jnp.bfloat16),
+                (rng.normal(size=(2, depth, 256)) / np.sqrt(depth)).astype(jnp.bfloat16),
+                rng.normal(size=(136, 256)).astype(np.float32))
 
     def product(dtype):
         # fp32 out of 16-bit products, float64 out of the truth's, whose cotangent is float64.
@@ -337,11 +340,11 @@ def the_template_takes_a_gpt_oss_width_as_exactly_as_xla():
     width dividing it an odd multiple of 64), its groups' rows odd, so each group's last tile stores a
     one-row rung (an A100's in a row's layout, `swizzling.copied`: row 4474): its forward and both gradients
     are as exact as XLA's ragged dot, from float64."""
-    group_sizes = jnp.asarray([67, 69], jnp.int32)
+    group_sizes = np.asarray([67, 69], np.int32)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        return tuple(jnp.asarray(rounded(values, jnp.bfloat16), jnp.bfloat16)
+        return tuple(np.asarray(values).astype(jnp.bfloat16)
                      for values in (rng.normal(size=(136, 256)), rng.normal(size=(2, 256, 2880)) / 16,
                                     rng.normal(size=(136, 2880))))
 

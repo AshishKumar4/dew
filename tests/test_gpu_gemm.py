@@ -71,7 +71,7 @@ def _fused_projection_training():
     writes it and XLA's ragged product (`test_gemm_template`), outside the template."""
     rows, depth, width = 256, 256, 256
     sizes = (0, 100, 150)
-    groups = jnp.asarray(sizes, jnp.int32)
+    groups = np.asarray(sizes, np.int32)
 
     def native(x, params):
         normalized = rms_normalized(x, params["norm"], 1e-6, x.dtype, scale_offset=False,
@@ -101,14 +101,16 @@ def _fused_projection_training():
         return update
 
     def draw(seed):
+        # NumPy's, as a site's draws are: a GPU tier's prepare computes on no device (rows 8505, 8506).
         rng = np.random.default_rng(seed)
-        x = jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16).at[:2].set(0)
+        x = rng.normal(size=(rows, depth)).astype(jnp.bfloat16)
+        x[:2] = 0
         # Master weights begin at representable operand values; the update itself stays in fp32.
-        weight = jnp.asarray(rng.normal(size=(len(sizes), depth, width)) / np.sqrt(depth),
-                             jnp.bfloat16).astype(jnp.float32)
-        params = {"weight": weight, "norm": jnp.asarray(rng.uniform(0.8, 1.2, depth), jnp.float32),
-                  "bias": jnp.asarray(rng.normal(size=width) * 0.1, jnp.float32)}
-        return x, params, jnp.asarray(rng.normal(size=(rows, width)), jnp.float32)
+        weight = (rng.normal(size=(len(sizes), depth, width)) / np.sqrt(depth)).astype(jnp.bfloat16)
+        params = {"weight": weight.astype(np.float32),
+                  "norm": rng.uniform(0.8, 1.2, depth).astype(np.float32),
+                  "bias": (rng.normal(size=width) * 0.1).astype(np.float32)}
+        return x, params, rng.normal(size=(rows, width)).astype(np.float32)
 
     return step(fuser.fuse(native)), step(reference), draw
 
