@@ -514,11 +514,13 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
                     without=REVERSE_ONLY)
 
 
-def test_an_entry_writes_gradient_lowers_for_a_tpu():
+@pytest.mark.parametrize("x64", [False, True], ids=["x32", "x64"])
+def test_an_entry_writes_gradient_lowers_for_a_tpu(x64):
     """A forked call's gradient with its documents' entry writes (`documents_on_the_kernel`), traced for an
-    assumed v5p on its mesh: it lowers on any host to Mosaic kernels, where the entry write's aligned sums
-    over its 16 keys summed each halving with an empty tail, a slice Mosaic refuses, a vector of no rows
-    (base review 68c63603f F1)."""
+    assumed v5p on its mesh, with x64 off and on: it lowers on any host to Mosaic kernels, where the entry
+    write's aligned sums over its 16 keys summed each halving with an empty tail, a slice Mosaic refuses, a
+    vector of no rows (base review 68c63603f F1), and under x64 the digit loop's index was 64-bit where
+    Mosaic's is 32 (row 8757)."""
     from jax.sharding import AbstractDevice, AbstractMesh, AxisType
 
     from dew.nn.kernels.generation import TARGETS, assumed
@@ -531,7 +533,7 @@ def test_an_entry_writes_gradient_lowers_for_a_tpu():
 
     device = AbstractDevice(device_kind=TARGETS["v5p"].device_kind, num_cores=None, platform="tpu")
     mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
-    with assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
+    with jax.enable_x64(new_val=x64), assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(gradient).trace(operands, seeded).lower(lowering_platforms=("tpu",))
     assert any(call.target == "tpu_custom_call" for call in custom_calls(lowered))
 
