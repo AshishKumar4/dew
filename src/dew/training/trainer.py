@@ -82,6 +82,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
+from dew.objectives.drawn import drawn_once
 from dew.optim import STACKED_OPTIMIZERS, declaring, with_bounds
 from dew.optim_schedules import (
     ScheduleBase,
@@ -161,7 +162,6 @@ from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, wind
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     Produced,
-    built_start,
     check_batch,
     check_stream,
     marked,
@@ -445,10 +445,12 @@ class Trainer(Generic[Loss, Effects]):
         ready_process()  # A key given here opens the backend as the run's does (`key`).
         key = self.key if key is None else request_key(key)
         if not self.host_master and jax_core.trace_state_clean():
-            # Outside any trace, one program, not each operation's (`built_start`): the moving state its
+            # Outside any trace, one program, not each operation's (`drawn_once`): the moving state its
             # buffers, the frozen tree the held arrays. This body's, not the bound override's, which then
             # changes it once (row 8730). A state held on the host takes the arrays over as it is placed.
-            return built_start(self._fresh_state, initializer, key)
+            stated = self._step_key(self.objective, self._compiler)
+            return drawn_once(self._fresh_state, initializer, key, lambda state: apart(state)[1],
+                              kept=stated and (stated, type(self), "fresh"))
         return self._fresh_state(initializer, key)
 
     def _fresh_state(self, initializer: Initializer, key: jax.Array) -> TrainState:
