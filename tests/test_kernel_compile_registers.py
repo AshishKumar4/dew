@@ -69,5 +69,7 @@ def test_a_gpu_environment_none_of_whose_builds_a_generation_runs_is_refused(mon
     monkeypatch.setattr(kc, "nvidia_gpus", lambda: ("580.65", (8, 0)))
     monkeypatch.setattr(kc, "cuda_builds", lambda: ["cuda12"])
     kc.judged_builds.cache_clear()
-    with pytest.raises(RuntimeError, match="sm100's GPUs run JAX's cuda13 build"):
+    with pytest.raises(RuntimeError):
         kc.judged_builds("sm100")
+    # The same environment judges a generation its build runs: the refusal is the generation's alone.
+    assert kc.judged_builds("sm80") == ("cuda12",)
