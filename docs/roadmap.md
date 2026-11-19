@@ -93,7 +93,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
-- step_fits reads each device's allocator (step_headroom, Device.memory_stats) before its agreement. [8767]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 
