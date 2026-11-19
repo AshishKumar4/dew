@@ -543,9 +543,9 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
             for index, inputs in enumerate(shaped.values()):
                 wide = widened(inputs)
                 # A truth the gate runs as given has its value alone to read, held to float64 in its run on
-                # its first draw (`_drawn`): the prepare computes none (bible section 8; on its default device,
-                # a compile-only GPU, its eager operations raised "'Executable' object has no attribute
-                # 'local_devices'", row 4881's class).
+                # its first draw (`_drawn`): the prepare computes none (bible section 8; on its default
+                # device, a compile-only GPU, its eager operations raised "'Executable' object has no
+                # attribute 'local_devices'", row 4881's class).
                 if index == 0 and not _given(truth):
                     _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
                 _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
