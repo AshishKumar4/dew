@@ -1322,7 +1322,9 @@ def kept_parts(p: jax.Array, multiplier: jax.Array | None, reach: float, dtype) 
     at 256/129 and e^-28 at 2^17 rounded to 0 (the base reviews of 4e2eb287e and a648b3279, F1, F3)."""
     if multiplier is None or drops_in_place(dtype, reach):
         return (narrow(kept(p, multiplier, reach), dtype),)
-    return weights_parts(kept(p, multiplier, reach), dtype, rows=True)
+    (part,) = weights_parts(kept(p, multiplier, reach), dtype, rows=True)
+    # Its row's power of two along the product's columns, as the rows' product reads it.
+    return (product.Scaled(part.value, part.exponent[:, None]),)
 
 
 def in_units(spec: "Forward", products: jax.Array) -> jax.Array:
