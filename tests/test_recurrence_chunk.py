@@ -16,7 +16,14 @@ import numpy as np
 import pytest
 import tiny_models
 from arm_arithmetic import on_float64_device
-from contract_support import CANCELLING_LEVELS, cancelling_entries, exactly_rounded, normal_float32
+from contract_support import (
+    CANCELLING_LEVELS,
+    FORKED,
+    GIVEN,
+    cancelling_entries,
+    exactly_rounded,
+    normal_float32,
+)
 from delta_rule_support import stacked_documents
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec as P
@@ -722,14 +729,10 @@ def test_a_turned_forked_calls_cancelling_entry_write_is_as_exact_as_each_docume
                          f"xla {TURNED} a forked call's cancelling entry writes", seeds=160)
 
 
-LEVELS_ROUTES = [
-    pytest.param('xla', HOOKS[4], id='portable-delta-rule'),
-    pytest.param('xla', FORMED[4], id='portable-ssd'),
-    pytest.param('selected', FORMED[4], id='tpu-ssd',
-                 marks=pytest.mark.tpu(reason="the rated scan's selector takes its TPU scan there"))]
-"""The forked call's routes the cancelling levels take: the portable math's walk under the gated delta rule
-and Mamba2's SSD, and the SSD as the rated scan's selector routes it on a TPU (its Pallas scan, the one
-backend it is chosen on)."""
+LEVELS_FORMS = [pytest.param(HOOKS[4], id='delta-rule'), pytest.param(FORMED[4], id='ssd')]
+"""The forms whose forked calls the cancelling levels take on the portable math's walk: the gated delta rule
+and Mamba2's SSD (the TPU's selected scan takes the SSD's at its own chunks, test_ssd_kernel's
+`documents_as_selected`)."""
 
 
 def levels_entered_draw(hooks, seed: int):
@@ -738,8 +741,7 @@ def levels_entered_draw(hooks, seed: int):
     and each token's memory's first row read by a unit query: its output, last memory and entry writes'
     gradients each a sum float32 holds exactly or rounds once, as float64's is."""
     operands, _ = entered_draw(hooks, seed, entries=True)
-    entries = cancelling_entries(seed, ROWS, len(DOCUMENTS[0]), KEY_HEADS, KEY_WIDTH, VALUE_HEADS,
-                                 VALUE_WIDTH)
+    entries = cancelling_entries(seed, KEY_HEADS, KEY_WIDTH, VALUE_HEADS, VALUE_WIDTH)
     query = np.zeros(operands.query.shape)
     query[..., 0] = 1.0
     # Every other operand zero: no key, value, log decay, write gate or step (a rated decay's `exp(A 0)`),
@@ -754,14 +756,14 @@ def levels_entered_draw(hooks, seed: int):
     return drawn, (hosted(entries.signed(operands.value.shape)), hosted(entries.signed(final)))
 
 
-@pytest.mark.parametrize(('route', 'hooks'), LEVELS_ROUTES)
-def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact(route, hooks):
-    """A forked call on each of its routes (`LEVELS_ROUTES`) whose documents' entry writes are three levels
-    cancelling beside float32's largest (`levels_entered_draw`): its output, the row's last memory and its
-    entry keys', values' and weights' gradients held by check 1 against each document a sequence of its own
-    the recurrence a token at a time in float64, rounded once (exact, so the route must be: a write summed in
-    some order dropped a level at its tie as its negative survived, an ulp here and inf at float32's largest,
-    row 8757; rows 8840, 9463, 9464)."""
+@pytest.mark.parametrize('hooks', LEVELS_FORMS)
+def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact(hooks):
+    """A forked call of each form (`LEVELS_FORMS`) on the portable math's walk whose documents' entry writes
+    are three levels cancelling beside float32's largest (`levels_entered_draw`): its output, the row's last
+    memory and its entry keys', values' and weights' gradients held by check 1 against each document a
+    sequence of its own the recurrence a token at a time in float64, rounded once (exact, so the walk must
+    be: a write summed in some order dropped a level at its tie as its negative survived, an ulp here and inf
+    at float32's largest, row 8757; rows 8840, 9463, 9480)."""
 
     def leaves(walk):
         def run(operands, seeded):
@@ -776,20 +778,14 @@ def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact(route, hooks
         return run
 
     def ours(operands):
-        forked = entering_documents(operands)
-        out, final = (chunk_on(route, hooks, forked, chunk_size=CHUNK) if route != 'selected'
-                      else recurrence_chunk.chunk(hooks, forked, chunk_size=CHUNK))
+        out, final = chunk_on('xla', hooks, entering_documents(operands), chunk_size=CHUNK)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
     # The gate widens a truth's inputs; the reference is that truth rounded once.
     truth = jax.jit(leaves(functools.partial(document_by_document, hooks)))
-    with generation.routes() as found:
-        assert_as_exact(jax.jit(leaves(ours)), exactly_rounded(truth),
-                        functools.partial(levels_entered_draw, hooks),
-                        f"{route} {hooks} a forked call's entry writes of cancelling levels", seeds=8,
-                        truth_fn=truth)
-    if route == 'selected':
-        assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
+    assert_as_exact(jax.jit(leaves(ours)), exactly_rounded(truth),
+                    functools.partial(levels_entered_draw, hooks),
+                    f"xla {hooks} a forked call's entry writes of cancelling levels", seeds=8, truth_fn=truth)
 
 
 @pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],
@@ -901,16 +897,6 @@ def test_a_turned_forked_documents_arithmetic_reads_only_its_ancestors(case):
 
 DOCUMENTS = ((0, 23, 40), (0, 9, 48))
 """Each row's packed documents' first tokens under `draw`'s `packed`."""
-
-GIVEN = 1
-"""The memories a row's table holds before its documents store theirs (`Chunk.loads`: a row's start, a
-cache)."""
-
-FORKED = (((1, 2, 2), (1, 0, 0)), ((1, 2, 3), (1, 2, 0)))
-"""Each row's documents' table slots and stored slots (`Chunk.loads`, `Chunk.stores`): the first row's start
-continued by its first document, whose final both later documents enter (a slot's gradient summing two
-documents'); the second row a chain from its start, each document entering its predecessor's final. Every
-memory is entered, so no gradient's row is float64 zero, whose terms the gate would trace each draw."""
 
 HELD = 2
 """The stored slots a row's table holds (`Chunk.held`)."""
