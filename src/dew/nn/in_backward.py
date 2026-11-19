@@ -296,6 +296,11 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             if due is not None:
                 moved, moved_moments = jax.tree.map(lambda new, old, due=due: jnp.where(due, new, old),
                                                     (moved, moved_moments), (held, held_moments))
+            # The layer's new rows formed whole before any is written: its rows are read by two fusions (an
+            # Adam's new weight reads its new moments), which otherwise kept slices of the stacks past a row's
+            # write where XLA fused neither in place (row 8389: an A100's compile of a width-512 bf16 walk
+            # held 70.4 MB of temporaries against its 64.8 MB bound, 53.6 MB so; an H100's 64.2, 53.6).
+            moved, moved_moments = jax.lax.optimization_barrier((moved, moved_moments))
             moving = _written(moving, moved, index)
             moments = {name: _written(tree, moved_moments[name], index) for name, tree in moments.items()}
             sumsq = sumsq.at[index].set(squares)

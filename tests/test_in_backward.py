@@ -178,8 +178,9 @@ def test_a_scanned_steps_runs_train_under_each_update(optimizer, wider):
     assert int(jax.device_get(moved.updates)) == 3
 
 
-@pytest.mark.parametrize("generation, dtype", [("sm90", "float32"), ("sm80", "bfloat16")])
-def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype):
+@pytest.mark.parametrize("generation, dtype, width", [("sm90", "float32", None), ("sm80", "bfloat16", None),
+                                                     ("sm80", "bfloat16", 512), ("sm90", "bfloat16", 512)])
+def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype, width):
     """The scanned step that updates in its backward (row 4098) holds none of the run's gradient, compiled
     for a GPU (`compile_ahead`), under bf16 copies of float32 weights too, where the masters' update is the
     backward's. Its reference is the same scanned step under global-norm clipping, which holds the whole
@@ -190,12 +191,17 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype):
     plus one layer's rows of the state the walk moves (the stacked weights as the state holds them, fp32
     masters of bf16 copies, and the optimizer's moments of them, over the run's layers): the rows a layer's
     update reads, which XLA keeps beside the stacks or fuses into their writes as it fuses (row 7953: one
-    barrier in the loss flipped which). Every term is read off the clipped run's abstract state. A step
-    that held the gradient again, or more than a layer's state at once, fails it; a fusion that keeps a
-    layer's rows does not."""
+    barrier in the loss flipped which), at the test's width and at 512, where a walk that kept slices of the
+    stacks past a layer's writes passed it (row 8389). Every term is read off the clipped run's abstract
+    state. A step that held the gradient again, or more than a layer's state at once, fails it; a fusion
+    that keeps a layer's rows does not."""
+    wider = {} if width is None else {"emb_features": width, "mlp_features": 4 * width,
+                                      "num_heads": max(2, width // 64)}
+
     def built(optimizer: OptimConfig):
         gpu = compile_only_gpus(generation, 1, 80 * 2**30)
-        run = Trainer(LMObjective(decoder(scan=True, dtype=dtype, num_layers=LAYERS), SEQ), optimizer,
+        model = decoder(scan=True, dtype=dtype, num_layers=LAYERS, **wider)
+        run = Trainer(LMObjective(model, SEQ), optimizer,
                       key=jax.random.key(0), mesh=MeshSpec().build(gpu),
                       layout=Layout(min_shard=TINY_SHARD), split=1, accumulation=1, checkpoints=None,
                       tracker=None)
