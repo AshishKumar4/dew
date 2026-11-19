@@ -102,7 +102,9 @@ def test_an_accuracy_claims_site_sizes_its_bound_as_written_too(monkeypatch, tmp
         return jnp.dot(x, w)
 
     def reference(x, w):
-        return jnp.dot(x[::-1], w[::-1])
+        # Its own, written apart from Dew: the dot of `x` at bfloat16's precision, far from the truth beside
+        # Dew's, so each pair resolves at few seeds whichever way it compiles.
+        return jnp.dot(x.astype(jnp.bfloat16).astype(jnp.float32), w)
 
     alike = seeds_for(reference, draw, LABEL, dew_fn=dot, truth_fn=truth)
     written = seeds_for(reference, draw, LABEL, dew_fn=dot, truth_fn=truth, written=True)
