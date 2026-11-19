@@ -571,6 +571,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
 def named_tier(ci, monkeypatch, capsys, *flags: str, lines: bool = False) -> list:
     """What `ci.py gpu-tier` with `flags` prints: its files (each shard's line; the line of JSON after them,
     each file's pinned generations, is test_gpu_lane.py's), or its lines where `lines`."""
+    monkeypatch.setattr(ci.digests.fetched, "absent", lambda root: {})  # an environment holding every pin
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *flags])
     capsys.readouterr()
     assert ci.main() == 0
