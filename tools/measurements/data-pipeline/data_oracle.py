@@ -15,7 +15,7 @@ from pathlib import Path
 BASELINE = "7ad0d4079de7ab7280e08924201992e3ae1a7ff9"
 """The reference checkout whose loaders the capture records."""
 
-LEGACY_SCRIPT = ("bb55b1993ba1db52437cb4e7c3a4413e3ca1c4b0",
+LEGACY_SCRIPT = ("e542a4f7f2aed17fc49b494e979743bd71ac691a",
                  "tools/measurements/data-pipeline/data_oracle_legacy.py")
 """The capture script, as Dew last held it: it drives the reference checkout's own loader API, which no
 later Dew has, so it runs there and is read from that commit rather than kept beside this one."""
