@@ -48,8 +48,7 @@ def torch_side(args) -> None:
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32,
                                                                   attn_implementation="sdpa")
     # Its own `cuda` (PreTrainedModel's), read through Module's signature, which its functools.wraps hides.
-    module: torch.nn.Module = model
-    model = cast(PreTrainedModel, module.cuda())
+    model = cast(PreTrainedModel, cast(torch.nn.Module, model).cuda())
     bf16_residual(model)
     kept = {}
     model.model.norm.register_forward_hook(lambda module, inputs, output: kept.__setitem__("hidden", output))

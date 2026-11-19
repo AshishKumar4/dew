@@ -33,6 +33,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -42,6 +43,9 @@ COHORT = "laya"
 tools/check_tool_types.py checks it in."""
 
 LAYA_COMMIT = "a4a8921afebfd852bba0000475cfb6ab737a124c"
+GLOBAL_EVERY_THIRD: dict[str, Any] = {"global_attn_every_n_layers": 3}
+"""ModernBERT's layer pattern by its legacy keyword, which ModernBertConfig's __post_init__ reads into its
+layer types though its signature names no such field (transformers 5.16.1)."""
 LAYA_REPO = "convaiinnovations/laya"
 LAYA_REVISION = "7b928d828b7b0e022f929d9bd2e44165aa270148"
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "laya"
@@ -112,7 +116,7 @@ def write_tiny(directory: Path) -> None:
     torch.manual_seed(0)
     encoder = ModernBertModel(ModernBertConfig(
         vocab_size=len(tokenizer), hidden_size=128, intermediate_size=96, num_hidden_layers=3,
-        num_attention_heads=2, global_attn_every_n_layers=3, local_attention=8, max_position_embeddings=256,
+        num_attention_heads=2, local_attention=8, max_position_embeddings=256, **GLOBAL_EVERY_THIRD,
         pad_token_id=tokenizer.pad_token_id, cls_token_id=tokenizer.cls_token_id,
         sep_token_id=tokenizer.sep_token_id, bos_token_id=tokenizer.cls_token_id,
         eos_token_id=tokenizer.sep_token_id))

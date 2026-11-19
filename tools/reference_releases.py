@@ -58,6 +58,9 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     # The suite's locked PEFT, which tests/test_lora_peft.py and tests/test_lora.py run in the test.
     "peft": {"peft": "0.21.2", "transformers": tested("transformers"), "torch": "2.14.0"},
     "verl": {"verl": "0.9.0"},
+    # verl at the revision its agentic tools require of their install (verl_interop_reference's REVISION).
+    "verl-agentic": {
+        "verl": "git+https://github.com/volcengine/verl@12ebe0cb4d300c58449fb6c675379e8700015c51"},
     # The serving engines Dew's serving bench runs in-process (tools/serving_vllm_engine.py,
     # tools/serving_sglang_engine.py), each in its own interpreter, as the fleet builds them
     # (tools/gateway_capture.py's PACKAGES).
@@ -80,6 +83,13 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "flaxdiff": {
         "flaxdiff": "git+https://github.com/AshishKumar4/FlaxDiff@3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a",
         "jax": "0.5.3", "flax": "0.10.6"},
+    # FlaxDiff's source beside Dew's own JAX, for the tools that import Dew too (flaxdiff_pipeline_reference).
+    "flaxdiff-source": {
+        "flaxdiff": "git+https://github.com/AshishKumar4/FlaxDiff@3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a"},
+    # FlaxDiff's trainer beside Dew's own JAX (reference_runs/diffusion.py, which records its checkout):
+    # a commit holding the trainer API the run calls (get_diffusion_preset, DiffusionObjective).
+    "flaxdiff-trainer": {
+        "flaxdiff": "git+https://github.com/AshishKumar4/FlaxDiff@15c55b001304604147a2a8002a76cf5d4c32092f"},
     "laya": {
         "laya": "git+https://github.com/NandhaKishorM/laya@a4a8921afebfd852bba0000475cfb6ab737a124c",
         "transformers": "5.16.1"},

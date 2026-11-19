@@ -141,8 +141,8 @@ def tiny(*, mixed: bool = False) -> None:
     config.architectures = ["Qwen3ForCausalLM"]
     ids = torch.tensor([[2, 8, 17, 5, 23, 9, 51, 43], [31, 16, 3, 19, 42, 11, 78, 39]], device="cuda")
     # Its own `to` (PreTrainedModel's), read through Module's signature, which its functools.wraps hides.
-    module: torch.nn.Module = Qwen3ForCausalLM(config)
-    model = cast(Qwen3ForCausalLM, module.to("cuda", dtype=torch.bfloat16)).eval()
+    model = cast(Qwen3ForCausalLM, cast(torch.nn.Module, Qwen3ForCausalLM(config)).to("cuda", dtype=torch.bfloat16))
+    model = model.eval()
     scheme = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
     if mixed:
         scheme = {'algorithm': 'max', 'quant_cfg': [

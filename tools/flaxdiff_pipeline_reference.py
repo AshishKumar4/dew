@@ -54,7 +54,7 @@ import numpy as np
 # Importing Dew sets its numerical policy before the JAX backend opens, as in a test.
 from dew.diffusion.presets import EDM
 
-COHORTS = ["flaxdiff", "diffusers-0.34"]
+COHORTS = ["flaxdiff-source", "diffusers-0.34"]
 """The reference releases this tool runs against (tools/reference_releases.py), and the environment
 tools/check_tool_types.py checks it in."""
 

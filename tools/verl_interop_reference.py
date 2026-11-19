@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
-COHORT = "verl"
+COHORT = "verl-agentic"
 """The reference releases this tool runs against (tools/reference_releases.py), and the environment
 tools/check_tool_types.py checks it in."""
 

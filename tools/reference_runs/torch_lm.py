@@ -220,8 +220,7 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
         extra["experts_implementation"] = args.experts
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, **extra)
     # Its own `to` (PreTrainedModel's), read through Module's signature, which its functools.wraps hides.
-    module: torch.nn.Module = model
-    model = cast(PreTrainedModel, module.to(place.device))
+    model = cast(PreTrainedModel, cast(torch.nn.Module, model).to(place.device))
     model.config.use_cache = False
     model.train()
     if args.precision == "autocast-bf16-residual":

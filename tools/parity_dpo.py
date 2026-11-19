@@ -25,7 +25,7 @@ import dataclasses
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -61,7 +61,8 @@ def trl_loss(arrays: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
     """TRL's DPO loss over `arrays`, its gradient in the policy logits and
     the chosen and rejected rewards it logs."""
     import torch
-    from trl import DPOConfig, DPOTrainer
+    from trl.trainer.dpo_config import DPOConfig
+    from trl.trainer.dpo_trainer import DPOTrainer
 
     defaults: dict[str, Any] = {
         field.name: field.default if field.default is not dataclasses.MISSING
@@ -93,7 +94,8 @@ def trl_loss(arrays: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
     inputs = {"input_ids": torch.tensor(arrays["input_ids"]),
               "attention_mask": torch.ones(arrays["input_ids"].shape, dtype=torch.long),
               "completion_mask": torch.tensor(arrays["completion_mask"], dtype=torch.long)}
-    loss = DPOTrainer._compute_loss(trainer, Fixed(policy), inputs, return_outputs=False)
+    # The trainer's loss over a stand-in holding the fields it reads, not a DPOTrainer built whole.
+    loss = DPOTrainer._compute_loss(cast(DPOTrainer, trainer), Fixed(policy), inputs, return_outputs=False)
     loss.backward()
     assert policy.grad is not None
     metrics = trainer._metrics["train"]

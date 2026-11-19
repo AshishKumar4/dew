@@ -25,6 +25,7 @@ by check 1's rule, tests/reference_error.py):
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 
@@ -74,7 +75,9 @@ def verl_loss(arrays: dict[str, np.ndarray], dtype) -> tuple[float, np.ndarray]:
     config = ActorConfig(strategy="fsdp", rollout_n=1, ppo_micro_batch_size_per_gpu=1)
     policy, _ = compute_policy_loss_vanilla(tensor["old_log_probs"], current, tensor["advantages"],
                                             tensor["response_mask"], "token-mean", config, None)
-    kl = agg_loss(kl_penalty(current, tensor["ref_log_probs"], "k3"), tensor["response_mask"], "token-mean")
+    # verl annotates its log-probabilities FloatTensor, which names float32 alone, for any floating tensor.
+    logprob, reference = (cast(torch.FloatTensor, each) for each in (current, tensor["ref_log_probs"]))
+    kl = agg_loss(kl_penalty(logprob, reference, "k3"), tensor["response_mask"], "token-mean")
     loss = policy + BETA * kl
     loss.backward()
     assert current.grad is not None

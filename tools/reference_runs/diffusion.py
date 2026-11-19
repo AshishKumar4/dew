@@ -61,7 +61,7 @@ from common import (
 from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_source import dew_revision
 
-COHORT = "flaxdiff"
+COHORT = "flaxdiff-trainer"
 """The reference releases this tool runs against (tools/reference_releases.py), and the environment
 tools/check_tool_types.py checks it in."""
 
