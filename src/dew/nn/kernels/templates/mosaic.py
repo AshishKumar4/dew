@@ -1618,17 +1618,17 @@ class Transport[Allocated, Opened](abc.ABC):
         (setmaxnreg's least where None: a launch states more where its producer's issue loop holds more)."""
 
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
-                  exclusive: bool = False, issuer: Callable | None = None):
-        """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)` on its compute
-        roles, `producer()` on its producer's where it has one, and `issuer()` on its issuing role where its
-        products are issued on one (`Issuer.places_on_role`), each a branch of one switch where `exclusive`
-        (`handoffs.Schedule.run`); the consumers' value where they are its every warpgroup."""
+                  exclusive: bool = False, issuer: Callable | None = None, reducer: Callable | None = None):
+        """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)`, `producer()`,
+        `issuer()` where it issues on a role (`Issuer.places_on_role`) and `reducer()` on a warp of its own
+        (`handoffs.REDUCER`), each a branch of one switch where `exclusive`; the consumers' value, if any."""
         schedule = self.roles(consumers, floor)
-        # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
-        bodies = {"consumer": consumer, "producer": lambda index: producer()}
-        if issuer is not None:
-            bodies["issuer"] = lambda index: issuer()
-        return schedule.run(exclusive=exclusive, **{role.name: bodies[role.name] for role in schedule.roles})
+        schedule = schedule if reducer is None else schedule.joined(handoffs.REDUCER)
+        # The producer, the issuer and the reducer one unit each, of no index (`handoffs.Schedule.run`'s).
+        units = {"producer": producer, "issuer": issuer, "reducer": reducer}
+        return schedule.run(exclusive=exclusive, **{role.name: consumer if role.name == "consumer" else
+                                                    (lambda index, body=units[role.name]: body())
+                                                    for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
         """A program's `streams` (`streams`') by lifetime (`resources.Scope`): those the program holds whole,

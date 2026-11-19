@@ -38,6 +38,11 @@ class Role:
         return 1 if self.warp else self.count
 
 
+REDUCER = Role("reducer", warp=True, weight=0)
+"""A launch's reducer: a warp of its last warpgroup issuing the TMA adds its compute roles stage into a ring
+for it (`Family.scheduled`'s `reducer`), so no compute role waits on its own adds' reads."""
+
+
 @dataclasses.dataclass(frozen=True)
 class HandOff:
     """A buffer between a program's roles (`Schedule`): `shape`, an allocation that states its barriers'
@@ -86,6 +91,12 @@ class Schedule:
 
     def role(self, name: str) -> Role:
         return next(role for role in self.roles if role.name == name)
+
+    def joined(self, role: Role) -> "Schedule":
+        """The schedule with `role` among its last warpgroup's warp roles (a launch's `REDUCER`)."""
+        if not role.warp or not any(other.warp for other in self.roles):
+            raise ValueError(f"{role.name} joins a schedule's warp roles, which {self.roles} holds none of")
+        return dataclasses.replace(self, roles=(*self.roles, role))
 
     def warpgroups(self) -> int:
         """The warpgroups a program of this schedule runs (`kernel`'s `warpgroups`)."""
