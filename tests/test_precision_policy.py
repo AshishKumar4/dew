@@ -35,6 +35,7 @@ from dew.nn.precision import (
     exact_products,
     float_bits,
     fp32_result_dot_general,
+    lowered_rounded,
     raised_exactly,
     two_product,
     two_sum,
@@ -1168,14 +1169,22 @@ def test_an_aligned_sum_along_an_axis_sums_each_rows_terms():
     np.testing.assert_array_equal(np.asarray(found)[:, 0], 2.0 ** (120 + rows))
 
 
-def _edge_values(dtype) -> np.ndarray:
-    """A dtype's normal, subnormal and zero values of both signs: its least and largest normals, values
-    between, its least subnormal and subnormals of every leading bit's place."""
+def edge_values(dtype) -> np.ndarray:
+    """A float format's values across every binade, of both signs, from their bits: zeros, subnormals of
+    every leading bit's place and the least and largest, the least normal and the largest, normals across
+    every exponent, and significands of ties to even at every shift (1.5, 3 and an ulp, a subnormal's 0b11
+    and 0b101 leads): every edge of a reading or a scaling of its bits."""
     limits = np.finfo(dtype)
+    word = np.dtype(f"uint{limits.bits}")
     width = limits.nmant
-    subnormals = [float(limits.smallest_subnormal) * 2.0 ** i * (1 + (i % 3) / 4) for i in range(width)]
-    normals = [float(limits.tiny), 1.0, 1.5, 3.0 ** 5, float(limits.max), 2.0 ** -100, 2.0 ** 100 * 1.25]
-    values = np.asarray([0.0, *subnormals, *normals], np.float64).astype(dtype)
+    infinite = int(np.asarray(np.inf, dtype).view(word)[()])
+    one, three = (int(np.asarray(value, dtype).view(word)[()]) for value in (1.5, 3.0))
+    bits = np.concatenate([
+        np.arange(0, 1 << width, ((1 << width) // 2047) | 1, dtype=word),
+        np.arange(1 << width, infinite, ((infinite - (1 << width)) // 2047) | 1, dtype=word),
+        np.asarray([0, 1, 2, 3, (1 << width) - 1, 1 << width, infinite - 1, 3 << (width - 1),
+                    5 << (width - 3), one, three + 1], word)])
+    values = bits.view(dtype)
     return np.concatenate([values, -values])
 
 
@@ -1248,7 +1257,7 @@ def test_a_floats_bits_read_as_its_exponent_and_significand(dtype):
     exponent `floor(log2 |x|)` (numpy's `frexp`, less one) and its significand in [1, 2) with its sign, the
     value exactly their product, a subnormal's read from its bits; zero's significand zero."""
     with jax.enable_x64(new_val=dtype == np.float64):
-        values = _edge_values(dtype)
+        values = edge_values(dtype)
         significand, exponent = (np.asarray(part, np.float64) for part in _binades(jnp.asarray(values)))
         reported = np.asarray(float_bits(jnp.asarray(values))[4])
     nonzero = values != 0
@@ -1260,22 +1269,28 @@ def test_a_floats_bits_read_as_its_exponent_and_significand(dtype):
     np.testing.assert_array_equal(significand[~nonzero], 0.0)
 
 
-def test_binade_of_reads_an_fp32s_exponent_minus_1024_at_zero():
-    """`binade_of` of fp32's normal, subnormal and zero values: numpy's `frexp` exponent less one, a
-    subnormal's by its leading bit, -1024 at zero, int32."""
-    values = _edge_values(np.float32)
-    found = np.asarray(binade_of(jnp.asarray(values)))
-    expected = np.where(values == 0, -1024, np.frexp(values.astype(np.float64))[1] - 1)
-    assert found.dtype == np.int32
-    np.testing.assert_array_equal(found, expected)
-
-
-def test_raised_exactly_raises_an_fp32_by_a_power_of_two_without_a_flush():
-    """`raised_exactly` of fp32's normal, subnormal and zero values by powers of two to its largest: each
-    `x 2^k` exactly (numpy's `ldexp` in float64, every one an fp32), a subnormal raised from its bits, where
-    a multiply XLA's CPU flushes read zero, zero kept zero."""
-    values = _edge_values(np.float32)
-    exponents = np.where(values == 0, -1024, np.frexp(values.astype(np.float64))[1] - 1)
-    raises = np.clip(127 - np.maximum(exponents, -149), 0, 60).astype(np.int32)
-    found = np.asarray(raised_exactly(jnp.asarray(values), jnp.asarray(raises)), np.float64)
-    np.testing.assert_array_equal(found, np.ldexp(values.astype(np.float64), raises))
+def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flushing_cpu():
+    """On XLA's CPU, whose fp32 multiply flushes a subnormal operand and result (row 4023):
+    `dew.nn.precision.raised_exactly` is `x * 2^k` and `lowered_rounded` `x * 2^-k` rounded once to nearest
+    even, bitwise numpy's IEEE `ldexp`, across every binade, subnormals both ways, at shifts 0 to 300, zero
+    kept zero; and `binade_of` is `floor(log2|x|)`, -1024 at zero, int32 (row 6302's finish,
+    `algebra.quotient`, and an initial state's gradient)."""
+    values = edge_values(np.float32)
+    shifts = np.asarray([0, 1, 2, 23, 24, 25, 63, 64, 126, 127, 149, 150, 151, 252, 300], np.int32)
+    on_cpu = jax.devices("cpu")[0]
+    x, k = (jax.device_put(each, on_cpu) for each in (values[:, None], shifts[None, :]))
+    lowered = np.asarray(jax.jit(lowered_rounded)(x, k))
+    rounded = np.ldexp(values[:, None], -shifts[None, :]).astype(np.float32)
+    np.testing.assert_array_equal(lowered.view(np.uint32), rounded.view(np.uint32))
+    raised = np.asarray(jax.jit(raised_exactly)(x, k))
+    assert raised.dtype == np.float32
+    exact = np.ldexp(values[:, None].astype(np.float64), shifts[None, :])
+    held = np.abs(exact) <= np.finfo(np.float32).max
+    expected = exact[held].astype(np.float32)
+    np.testing.assert_array_equal(raised[held].view(np.uint32), expected.view(np.uint32))
+    binades = np.asarray(jax.jit(binade_of)(jax.device_put(values, on_cpu)))
+    assert binades.dtype == np.int32
+    nonzero = values != 0
+    np.testing.assert_array_equal(binades[nonzero],
+                                  np.floor(np.log2(np.abs(values[nonzero].astype(np.float64)))).astype(np.int32))
+    np.testing.assert_array_equal(binades[~nonzero], -1024)
