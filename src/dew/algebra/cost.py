@@ -89,8 +89,9 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
     if (args := get_callable_args(node, Term.reduce)) is not None:
         operand = shape_of(graph, args[0], held)
         _, params = region.params[integer(args[3])]
-        kept = 0 if operand is None else 2 * LANE_BYTES * math.prod(operand) // math.prod(
-            operand[axis] for axis in params["axes"])
+        # Its result's elements: its operand's unreduced extents (an empty reduction's too).
+        kept = 0 if operand is None else 2 * LANE_BYTES * math.prod(
+            size for axis, size in enumerate(operand) if axis not in params["axes"])
         return Work(operations=made(graph, args[:1], held), kernels=1.0, kept_bytes=kept)
     if (args := get_callable_args(node, Term.dot)) is not None:
         left, right = (shape_of(graph, operand, held) for operand in args[:2])

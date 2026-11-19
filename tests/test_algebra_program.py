@@ -845,6 +845,7 @@ def test_xlas_schedule_on_a_tpu_prices_what_its_kernels_keep_in_vmem(target_name
     product, summed = kept(jnp.dot, (64, 128), (128, 256)), kept(lambda x: jnp.sum(x, axis=-1), (64, 128))
     assert product.kept_bytes == 4 * (64 * 128 + 128 * 256 + 2 * 64 * 256)
     assert summed.kept_bytes == 4 * (64 * 128 + 2 * 64)
+    assert kept(lambda x: jnp.sum(x, axis=-1), (4, 0)).kept_bytes == 2 * 4 * 4
     assert cost.product_work(64, 128, 256, count=3).kept_bytes == 3 * 2 * 64 * 256 * 4
     # On-chip memory's unit (`templates.cost.units`' fourth): exact, one quotient beside a zero.
     on_chip = 3
@@ -872,6 +873,19 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     assert priced.price.work.kept_bytes > 0
     assert unmeasured.price.work.kept_bytes in unmeasured.price.schedule.unpriced(unmeasured.price.work)
     assert priced.price.value > unmeasured.price.value
+
+
+@pytest.mark.parametrize("apart", [0, 1, 4], ids=["as written", "a group of one", "apart from its group"])
+def test_a_token_loops_states_are_kept_each_token(apart):
+    """A scan's token loop keeps its state on chip each token, written and read (`Work.kept_bytes`, row
+    7283), and where a token reads apart from a group of more than one token's writes the state its group
+    entered beside it (`scan._looped`'s two carried states)."""
+    from dew.algebra import linear_scan
+
+    c, k, v = 16, 32, 64
+    work = linear_scan._work(linear_scan.Chunk.plain(linear_scan.Chunk.token("U")),
+                             linear_scan.Extents(c, k, v, 1, apart=apart), lambda value: (0, 0), None)
+    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * cost.LANE_BYTES * k * v
 
 
 def test_device_memory_is_priced_at_the_parts_measured_stream():

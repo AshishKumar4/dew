@@ -805,7 +805,11 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
         # written, and read out, each over the state's keys and values; its dependent steps a reduction and
         # the update that reads it (two launches a token on XLA's path).
         per_token = k * v * (6.0 if corrected else 3.0) + 2.0 * k * v
-        return Work(operations=c * per_token, exponentials=c * d, span=2.0 * c, kept_bytes=c * kept(k, v))
+        # Its states a token: the state, and where a token reads apart from its group's writes the state its
+        # group entered too (`scan._looped`'s `held`), a group of one token's the current state's.
+        states = 2 if extents.apart > 1 else 1
+        return Work(operations=c * per_token, exponentials=c * d, span=2.0 * c,
+                    kept_bytes=c * states * kept(k, v))
     if get_callable_args(node, Chunk.prefix) is not None:
         # The compensated prefix (`scan._decays`): one pass over the tokens' exponents, one kernel.
         return Work(operations=12.0 * c * d, kernels=1.0, kept_bytes=kept(c, d))
