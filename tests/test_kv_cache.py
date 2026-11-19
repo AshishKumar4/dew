@@ -846,8 +846,11 @@ def test_an_offloaded_pools_page_writes_lower_with_the_pool_in_host_memory():
 
 def test_a_pools_page_reads_and_writes_take_an_axis_counted_from_either_end():
     """`pages_read` and `pages_written` over a pool in host memory read and write the same pages along its
-    last axis named `-1` as named by its index, a place past the pool writing nothing (`host_memory`'s
-    entries, each axis counted from the array's own rank)."""
+    last axis named `-1` as named by its index, a place past the pool writing nothing, and a host entry
+    refuses an axis past the pool's rank either way (`host_memory`'s entries, each axis counted from the
+    array's own rank)."""
+    from dew.nn.host_memory import fetched_at
+
     pool = jax.device_put(jnp.arange(2 * 3 * 4, dtype=jnp.float32).reshape(2, 3, 4), jax.memory.Space.Host)
     places = jnp.asarray([2, 0, 7], jnp.int32)
     values = jnp.full((3, 2, 3), -1.0, jnp.float32)
@@ -858,6 +861,9 @@ def test_a_pools_page_reads_and_writes_take_an_axis_counted_from_either_end():
         expected = np.asarray(pool).copy()
         expected[:, :, [2, 0]] = -1.0
         np.testing.assert_array_equal(written, expected)
+    for axis in (3, -4):
+        with pytest.raises(np.exceptions.AxisError):
+            fetched_at(pool, 0, axis)
 
 
 @pytest.mark.parametrize(("layout", "rebuilds", "row"), [(KVCache(page_size=2, groups=2), False, 8493),

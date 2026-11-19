@@ -12,6 +12,7 @@ optimization barrier, so the slice stays the dynamic one a scanned layer takes.
 
 import jax
 import jax.numpy as jnp
+from numpy.lib.array_utils import normalize_axis_tuple
 
 
 def on_host(tree) -> bool:
@@ -47,9 +48,10 @@ def _entry(index: Index | tuple[Index, ...], axis: int | tuple[int, ...]
 
 def _placed(ndim: int, axes: tuple[int, ...], indices: tuple[jax.Array, ...]
             ) -> tuple[tuple[int, ...], list[jax.Array]]:
-    """`axes` of an array of rank `ndim`, each counted from its first (a negative axis from its last), and a
-    slice's starts over its axes: each of `axes` at its index, every other axis at zero."""
-    held = tuple(axis % ndim for axis in axes)
+    """`axes` of an array of rank `ndim`, each counted from its first (a negative axis from its last; one past
+    its rank refused, as NumPy refuses it), and a slice's starts over its axes: each of `axes` at its index,
+    every other axis at zero."""
+    held = normalize_axis_tuple(axes, ndim)
     starts = [jnp.zeros((), jnp.int32)] * ndim
     for axis, index in zip(held, indices, strict=True):
         starts[axis] = index

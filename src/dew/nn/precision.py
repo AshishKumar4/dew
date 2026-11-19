@@ -1862,15 +1862,16 @@ def summed_once(values: Sequence[jax.Array], products: Sequence[tuple[jax.Array,
 
 
 def _summed_once_value(values, products):
-    total, carried, plain = values[0], jnp.zeros_like(values[0]), values[0]
+    total, carried = values[0], jnp.zeros_like(values[0])
     for left, right in products:
         product, lost = two_product(left, right, bit_split=True)
         total, dropped = two_sum(total, product)
-        carried, plain = carried + (lost + dropped), plain + product
+        carried = carried + (lost + dropped)
     for value in values[1:]:
         total, dropped = two_sum(total, value)
-        carried, plain = carried + dropped, plain + value
-    return compensated_total((total, carried), plain)
+        carried = carried + dropped
+    # Each sum's rounded half the plain running sum, which reads an infinity as `jnp.sum` does.
+    return compensated_total((total, carried), total)
 
 
 def _summed_once_tangent(primals, tangents):
