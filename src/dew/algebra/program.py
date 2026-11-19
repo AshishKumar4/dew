@@ -805,8 +805,11 @@ def _reclosed(jaxpr: jcore.Jaxpr, spans: Sequence[_Span], spliced: Mapping[int, 
     calls: dict[int, jcore.JaxprEqn] = {}
     removed: set[int] = set()
     for span in spans:
+        # A splice of any of its equations keeps it open: a replaced equation is in the program no more.
+        if span.inlined & spliced.keys():
+            continue
         inlined = {made for made in span.inlined if made in position}
-        if not inlined or inlined & spliced.keys() or inlined & removed:
+        if not inlined or inlined & removed:
             continue
         inside = {var for made in inlined for var in jaxpr.eqns[position[made]].outvars}
         returned = span.returned

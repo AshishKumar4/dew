@@ -1258,6 +1258,27 @@ def test_an_algebra_span_no_rewrite_crosses_keeps_its_marker():
                     "a span no rewrite crosses beside joined sums", seeds=8)
 
 
+def test_an_algebra_span_a_rewrite_lands_inside_stays_rewritten():
+    """An Algebra span whose body joins two sums (`two_sums`) and takes their cumulative sum, an equation no
+    rule rewrites: the join lands inside the span, which stays opened, so the program holds one sum where it
+    held two; closing the span again, its replaced equations being in the program no more, restored its body
+    as written and undid the join the pass had reported (head review). It computes what it computes
+    (check 1)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def program_of(x, y, a):
+        return marked(Algebra(), lambda x, y, a: jnp.cumsum(two_sums(x, y, a), axis=-1))(x, y, a)
+
+    def summed(closed) -> int:
+        return [equation.primitive for equation in equations(closed.jaxpr)].count(jax.lax.reduce_sum_p)
+
+    shapes = SHAPES_MARKED
+    assert summed(jax.make_jaxpr(algebra.rewritten(program_of))(*rows(16, *shapes))) < summed(
+        jax.make_jaxpr(program_of)(*rows(16, *shapes)))
+    assert_as_exact(jax.jit(algebra.rewritten(program_of)), jax.jit(program_of),
+                    lambda seed: rows(seed, *shapes), "a span a join lands inside", seeds=8)
+
+
 def test_an_algebra_span_returning_one_value_twice_stays_open_beside_a_splice():
     """An Algebra span returning one value as two outputs, both read, beside sums the pass joins elsewhere:
     the program the pass writes is a valid program (JAX's own check), the span left opened, where calling
