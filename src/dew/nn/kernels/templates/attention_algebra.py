@@ -45,6 +45,7 @@ from dew.nn.kernels.templates.attention import (
     Dropout,
     Initial,
     coded,
+    dropped_reach,
     drops_in_place,
     kept,
     within,
@@ -115,7 +116,7 @@ class Forward:
     @property
     def reach(self) -> float:
         """The power of two a dropping call's kept weights are narrowed at (`Dropout.reach`)."""
-        return reach_of(self.dropped)
+        return dropped_reach(self.dropped)
     whole: bool = False
     """Whether a spans call's every query sees every key (`attention.KeySpans.whole`): priced as full."""
 
@@ -1658,9 +1659,9 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
         parts, rest, own_tile, anchor = _split_tile(keys, taken, value.dtype, arg, multiplier, held,
                                                     spec.reach)
         if held is None:
-            summed = None if keys.accumulate is not None else in_units(spec, summed_products(parts, value,
-                                                                                            keys.dot))
-            acc = state.acc + summed if summed is not None else keys.accumulate(state.acc, None, parts, value)
+            accumulate = keys.accumulate
+            acc = (accumulate(state.acc, None, parts, value) if accumulate is not None
+                   else state.acc + in_units(spec, summed_products(parts, value, keys.dot)))
             return (Partial(acc, state.m, state.total + p.sum(axis=-1), scale), anchor, own + own_tile,
                     others_total + rest())
         drop = held.drop
@@ -1924,9 +1925,8 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
 
 
 def dropped_total(spec: Forward, total: jax.Array) -> jax.Array:
-    """A walk's denominator `total` over the rest of a dropping call's multiplier its sums keep out
-    (`Forward.dropped` over `units`, at most 1), so the one division takes it: an output divided and then
-    multiplied passed fp32's largest where it is 2.27e38 (the base review of a648b3279, F1)."""
+    """A walk's `total` over the rest of a dropping call's multiplier (`dropped` over `units`), in the one
+    division: divided then multiplied, 2.27e38 passed fp32's largest (the base review of a648b3279, F1)."""
     return total if spec.dropped == 1.0 else total * np.float32(spec.units / spec.dropped)
 
 

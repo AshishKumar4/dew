@@ -851,8 +851,8 @@ class Draw:
 
     @property
     def reach(self) -> float:
-        """The least power of two at or above `bound` (`reach_of`)."""
-        return reach_of(self.bound)
+        """The least power of two at or above `bound` (`dropped_reach`)."""
+        return dropped_reach(self.bound)
 
     def keep(self, queries: jax.Array, keys: jax.Array) -> jax.Array:
         """Whether the draw keeps the entries at `queries` and `keys` (indices that broadcast): the keep bits
@@ -958,11 +958,11 @@ class Dropout:
 
     @property
     def reach(self) -> float:
-        """The least power of two at or above `bound`, every draw's (`reach_of`)."""
-        return reach_of(self.bound)
+        """The least power of two at or above `bound`, every draw's (`dropped_reach`)."""
+        return dropped_reach(self.bound)
 
 
-def reach_of(bound: float) -> float:
+def dropped_reach(bound: float) -> float:
     """The least power of two at or above a dropout multiplier `bound`, the units a walk's sums hold a kept
     weight in (`attention_algebra.Forward.units`), the most its bounds take one by (`frexp`'s exponent,
     less one where `bound` is a power of two)."""
