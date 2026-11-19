@@ -210,12 +210,14 @@ def _form(equation: jcore.JaxprEqn) -> Form | None:
     """`equation`'s form as a product the template takes (`Form`): a `dot_general` of rank-2 operands (x @ W,
     dy @ Wᵀ, xᵀ @ dy) or a `ragged_dot_general` of rows ragged by group (`GROUPED_FORMS`), each of floating
     operands, no batch axes; None for any other equation (an integer product is XLA's own,
-    `fused_gemm.product`)."""
+    `fused_gemm.product`), and of one dtype: the template casts its right operand to its left's
+    (`gemm.gemm`), so a product of two dtypes stays JAX's, which multiplies each as it is (a float16 of 2^-8
+    by a bfloat16 of 2^16 cast to float16 was infinite: base review 7754e5fde F1)."""
     primitive = equation.primitive
     if primitive not in (jax.lax.dot_general_p, jcore.primitives.ragged_dot_general_p):
         return None
-    if not all(jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.invars[:2]
-               if isinstance(var.aval, ShapedArray)):
+    dtypes = {var.aval.dtype for var in equation.invars[:2] if isinstance(var.aval, ShapedArray)}
+    if len(dtypes) != 1 or not all(jnp.issubdtype(dtype, jnp.inexact) for dtype in dtypes):
         return None
     if primitive is jax.lax.dot_general_p:
         (left, right), batch = equation.params["dimension_numbers"]

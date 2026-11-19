@@ -7,6 +7,7 @@ import os
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 from model_support import TINY_DECODER
@@ -28,7 +29,7 @@ def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path
 
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.templates import report
-    from dew.training.ahead import compile_programs
+    from dew.training.ahead import AheadPrograms, BuildTarget, compile_programs
 
     serialized = tmp_path / "topology.bin"
     serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
@@ -65,6 +66,18 @@ def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path
     read = compile_programs({"conv": (convolved, [image, kernel]),
                              "dot": (lambda x, y: x @ y, [square, square])}, "sm80", memory_only=True)
     assert read.at_run == ("conv",)
+    # Saved and loaded, as a process of their target takes them, at the autotuner's level 0 (where an
+    # untuned file is taken): the file holding the convolution is refused, its product alone's is loaded
+    # (row 8785). This host's own target stands for the GPU's.
+    here = BuildTarget.of(jax.devices()[:1])
+    for name, at_run, loads in (("conv", ("conv",), False), ("dot", (), True)):
+        dataclasses.replace(read, target=here, programs={}, at_run=at_run).save(tmp_path / f"{name}.dew-aot")
+        handed = AheadPrograms.load(tmp_path / f"{name}.dew-aot")
+        if loads:
+            assert handed.loaded() == {}
+        else:
+            with pytest.raises(ValueError):
+                handed.loaded()
 
 
 class ConvolvedStart(LMObjective):
@@ -93,7 +106,8 @@ def test_a_step_file_whose_start_alone_holds_a_convolution_is_compiled_on_the_ru
     (`report.DEVICELESS_CONVOLUTION_PICKS`): its file says so (`AheadOfTime.at_run`, read over every
     executable it holds), and a run never takes it, at the autotuner's level 0 too, where an untuned step
     is taken (row 8687)."""
-    from dew.training.ahead import AheadOfTime, BuildTarget, compile_ahead
+    from dew._cache import uncached
+    from dew.training.ahead import AheadOfTime, BuildTarget, Executable, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
@@ -105,3 +119,15 @@ def test_a_step_file_whose_start_alone_holds_a_convolution_is_compiled_on_the_ru
     here = jax.devices()[:1]
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
     assert dataclasses.replace(handed, built=BuildTarget.of(here)).runnable(here) is None
+    # Loaded direct, as a tool or a caller of `taken` loads it, it is refused alike (row 8957): a step of
+    # this host's own, which loads here as it is, refused where it says it leaves a choice to run time.
+    every = jax.devices()
+    replicated = jax.sharding.NamedSharding(jax.sharding.Mesh(np.asarray(every), ("devices",)),
+                                            jax.sharding.PartitionSpec())
+    with uncached():
+        doubled = jax.jit(lambda x: x * 2.0, out_shardings=replicated).lower(
+            jax.ShapeDtypeStruct((4,), jnp.float32, sharding=replicated)).compile()
+    own = dataclasses.replace(handed, built=BuildTarget.of(every), executable=Executable.of(doubled))
+    assert dataclasses.replace(own, at_run=False).loaded() is not None
+    with pytest.raises(ValueError):
+        own.loaded()
