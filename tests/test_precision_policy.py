@@ -1790,14 +1790,14 @@ def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
 
 
 def power2_rounds_a_subnormal_result_once():
-    """`dew.nn.precision.power2` by `2^o 2^(k-2o) 2^o` rounds a result below the least normal once, at its last
-    factor, on a device that keeps subnormals (a GPU's XLA, whose fp32 arithmetic keeps them where XLA:CPU's
-    flushes them): `(0.5 + 2^-24) 2^-149` is `2^-149`, where a whole factor first rounded the partial product
-    to `2^-127` and the remainder's then rounded its tie to zero (base review 54bb1f61a F2). Its pullback
-    applies the factors in reverse and rounds once too, a broadcast operand's cotangent summed after each
-    term is scaled: the cotangent `0.5 + 2^-24` to `1` by `2^-149` is `2^-149`, and to a scalar by two such
-    terms `2^-148`, where the remainder applied last rounded it to zero (base review 44e282c4f F1). A GPU
-    numerics cell (tests/test_gpu_numerics.py)."""
+    """`dew.nn.precision.power2` by `2^o 2^(k-2o) 2^o` rounds a result below the least normal once, at its
+    last factor, on a device that keeps subnormals (a GPU's XLA, whose fp32 arithmetic keeps them where
+    XLA:CPU's flushes them): `(0.5 + 2^-24) 2^-149` is `2^-149`, where a whole factor first rounded the
+    partial product to `2^-127` and the remainder's then rounded its tie to zero (base review 54bb1f61a F2).
+    Its pullback applies the factors in reverse and rounds once too, a broadcast operand's cotangent summed
+    after each term is scaled: the cotangent `0.5 + 2^-24` to `1` by `2^-149` is `2^-149`, and to a scalar by
+    two such terms `2^-148`, where the remainder applied last rounded it to zero (base review 44e282c4f F1).
+    A GPU numerics cell (tests/test_gpu_numerics.py)."""
     from dew.nn.precision import power2
 
     found = np.asarray(jax.jit(power2)(jnp.float32(0.5 + 2.0 ** -24), jnp.int32(-149)))
