@@ -785,7 +785,7 @@ def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact():
 
     def truth(operands, seeded):
         with jax.enable_x64(new_val=True):
-            return wide(widened(operands), widened(seeded))
+            return wide(*traced_wide(operands, seeded))
 
     rounded = as_given(lambda operands, seeded: jax.tree.map(np.float32, truth(operands, seeded)))
     assert_as_exact(jax.jit(leaves(ours)), rounded, levels_entered_draw,
@@ -1126,16 +1126,22 @@ def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alo
     wide = jax.jit(with_gradients(lambda operands: document_by_document(hooks, operands, documents=documents,
                                                                         added=added)))
 
-    def widened(leaf):
-        floating = jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating)
-        return jnp.asarray(leaf, jnp.float64) if floating else leaf
-
     def truth(operands, seeded):
         with jax.enable_x64(new_val=True):
-            return wide(jax.tree.map(widened, operands), jax.tree.map(widened, seeded))
+            return wide(*traced_wide(operands, seeded))
 
     assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)), draw, site, seeds=seeds,
                     truth_fn=truth)
+
+
+def traced_wide(*trees):
+    """`trees` with their floating leaves float64, as a traced truth widens them (within `jax.enable_x64`;
+    `arm_arithmetic.widened` reads host values), their integer leaves as they are."""
+    def wide(leaf):
+        floating = jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating)
+        return jnp.asarray(leaf, jnp.float64) if floating else leaf
+
+    return jax.tree.map(wide, trees)
 
 
 def test_the_ssd_port_refuses_a_forked_call_named_to_it():

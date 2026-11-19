@@ -29,7 +29,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from arm_arithmetic import widened
 from contract_support import CANCELLING_LEVELS, REVERSE_ONLY, assert_contract, normal_float32
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
 from ssd_support import ssd_orbit, stepwise_scan
@@ -494,7 +493,7 @@ def test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel():
 
     def truth(operands, seeded):
         with jax.enable_x64(new_val=True):
-            return wide(widened(operands), widened(seeded))
+            return wide(*jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded)))
 
     rounded = as_given(lambda operands, seeded: jax.tree.map(np.float32, truth(operands, seeded)))
     assert_as_exact(without_ynn(leaves(documents_on_the_kernel)), rounded, levels_documents_draw,
