@@ -697,7 +697,8 @@ def test_a_host_placed_arm_is_prepared_and_run_on_the_host(tmp_path, monkeypatch
     monkeypatch.setattr(CompiledTruths, "device", lambda store: jax.devices()[1])
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
         ahead_arm(jax.jit(scaled), "a host-placed product", host=True)(a, b)
-    assert traced == [host]
+    # Traced, and retraced where its compile lowers it, on the host's CPU alone.
+    assert traced and set(traced) == {host}
     traced.clear()
     listed = jax.devices
     monkeypatch.setattr(jax, "devices", lambda backend=None: listed(backend) if backend else listed()[1:])
