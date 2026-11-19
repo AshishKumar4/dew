@@ -51,9 +51,12 @@ def dilated_form(form):
                 or module.conv_general_dilated is not conv._conv_general_dilated):
             return call(*args, **kwargs)
         # The same layer in its own scope, rewound so a layer called twice reads
-        # its parameters again, the form its convolution's argument: a bound layer's.
-        assert module.scope is not None, "an intercepted call is a bound layer's"
-        return module.clone(parent=module.scope.rewound(), conv_general_dilated=convolve)(*args, **kwargs)
+        # its parameters again, the form its convolution's argument.
+        scope = module.scope
+        if scope is None:
+            raise ValueError(f"{type(module).__name__} is unbound: dilated_form reruns a layer in its own "
+                             "scope, which an unbound layer has none of")
+        return module.clone(parent=scope.rewound(), conv_general_dilated=convolve)(*args, **kwargs)
 
     with nn.intercept_methods(substituted):
         yield
