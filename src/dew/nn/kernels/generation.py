@@ -1706,8 +1706,20 @@ def _linear_primitive() -> type:
             if not all_zero(d_moving):
                 terms.append(self(residuals, instantiated(d_moving)))
             if not all_zero(d_residuals):
-                terms.append(jax.jvp(lambda held: self.apply(held, moving), (residuals,),
-                                     (instantiated(d_residuals),))[1])
+                # Only the residuals a tangent reaches move, the others held as constants: a zero tangent of
+                # an infinite residual was a 0 inf, NaN (base review 0c6ef9c11 F2).
+                flat, tree = jax.tree.flatten(residuals)
+                directions = jax.tree.leaves(d_residuals, is_leaf=zero)
+                live = [index for index, direction in enumerate(directions) if not zero(direction)]
+
+                def moved(*held):
+                    leaves = list(flat)
+                    for index, leaf in zip(live, held, strict=True):
+                        leaves[index] = leaf
+                    return self.apply(jax.tree.unflatten(tree, leaves), moving)
+
+                terms.append(jax.jvp(moved, tuple(flat[index] for index in live),
+                                     tuple(directions[index] for index in live))[1])
             if not terms:
                 return self(residuals, moving), jax.tree.map(
                     lambda aval: hijax.Zero(aval.to_tangent_aval()), self.out_aval)

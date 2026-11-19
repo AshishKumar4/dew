@@ -1720,9 +1720,8 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
 
 
 def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Array:
-    """`aligned_sum` of `terms`, `spec` each term's `(axis, laid)`: its product summed over `axis` (kept;
-    none where None), then, where `laid` gives `(held, shape)`, broadcast to `held` and reshaped to `shape`
-    (a gradient's term in its factor's shape, `_aligned_directions`), the value these summed."""
+    """`aligned_sum` of `terms`, each product summed over its `spec` entry's axis (kept) and, where it gives
+    `(held, shape)`, broadcast to `held` and reshaped to `shape` (a gradient's term in its factor's)."""
     dtype = jnp.result_type(jnp.float32, *(factor for term in terms for factor in term))
     # Each factor once, by identity: a shared factor's gradient sums its terms' together, aligned.
     factors, places, shape = [], {}, []
@@ -1734,7 +1733,10 @@ def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Arr
                 factors.append(jnp.asarray(factor, dtype))
             indices.append(places[id(factor)])
         shape.append(tuple(indices))
-    return _aligned(tuple(shape), tuple(spec), *factors)
+    from dew.nn.kernels.launches import interpreting
+
+    # A kernel's body takes no derivative, and Mosaic lowers no symbolic zeros' rule (base review 0c6ef9c11).
+    return (_aligned if interpreting() is None else _aligned_value)(tuple(shape), tuple(spec), *factors)
 
 
 def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
@@ -1763,7 +1765,7 @@ def _product(term: Sequence[jax.Array], ints) -> _Product:
     its bits, convolved and carried a factor at a time (`k` factors `k` limbs); NaN, or a signed infinity, as
     IEEE's, no finite factors' rounded product (`2^-75 2^-75` zero) meeting the infinity (row 8757)."""
     limits = jnp.finfo(term[0].dtype)
-    half, top = _limb_bits(term[0].dtype) // 2, 2 * limits.maxexp - 1
+    half, top = _split_bits(term[0].dtype)[2], 2 * limits.maxexp - 1
     low = (1 << half) - 1
     read = [float_bits(factor) for factor in term]
     special = [biased == top for _, biased, *_ in read]
@@ -1796,11 +1798,6 @@ def _product(term: Sequence[jax.Array], ints) -> _Product:
                     jnp.broadcast_to(negative, shape), nan | (infinite & zero), infinite, zero)
 
 
-def _limb_bits(dtype) -> int:
-    """The bits of a product's limb (`_product`), two of `_split_bits`' low halves."""
-    return 2 * _split_bits(dtype)[2]
-
-
 def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
     """A term's reduction to the sum's value, `op` over its axes (kept) and laid, and its count."""
     axes = () if axis is None else tuple(sorted({int(a) % len(shape) for a in np.atleast_1d(axis)}))
@@ -1814,10 +1811,9 @@ def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
 
 def _exact_sum(terms, spec, dtype) -> jax.Array:
     """The sum `_aligned_terms` states, exact: every product exact (`_product`), its bits summed as whole
-    digits of a radix-`2^w` grid across every place a product holds, carried and rounded once to nearest,
-    ties to even, every lower bit sticky (`_nearest`), whatever its terms cancel, where floats summed lost a
-    smaller one, `[2^153, 2^128, -2^103, -2^128, 2^103, -2^153, fp32's largest]` inf (row 8757); non-finite
-    products as IEEE sums them, negative zeros' sum negative zero, none's positive."""
+    digits of a radix-`2^w` grid, carried and rounded once to nearest, ties to even (`_nearest`), whatever
+    its terms cancel, where floats summed lost a smaller one (row 8757); non-finite products as IEEE sums
+    them, negative zeros' sum negative zero, none's positive."""
     limits = jnp.finfo(dtype)
     ints = jnp.dtype(f"int{limits.bits}")
     factors = max(map(len, terms))
@@ -1834,12 +1830,11 @@ def _exact_sum(terms, spec, dtype) -> jax.Array:
     count = sum(extent for _, _, extent in parts)
     if not count:
         live = True
-    # The widest digit whose sum with a carry (at most `count + 2`) and a term's digits the integers hold,
-    # each term carried as added (`_nearest`): 2^30 tangent products were refused (row 8757).
-    widest = max(extent for _, _, extent in parts)
-    digit = max([0] + [w for w in range(1, limits.bits - 1)
-                       if count + 2 + (1 << w) + widest * ((1 << w) - 1) < 1 << (limits.bits - 1)])
-    if digit < 1:
+    # The widest digit whose partial sum `(widest + 1) (2^w - 1)` the integers hold, its carry apart, each
+    # term carried as added (`_nearest`): 2^30 terms were refused (row 8757).
+    widest, most = max(extent for _, _, extent in parts), (1 << (limits.bits - 1)) - 1
+    digit = max([0] + [w for w in range(1, limits.bits - 1) if (widest + 1) * ((1 << w) - 1) <= most])
+    if digit < 1 or count + 1 > most:  # A level's carry lies in [-(count + 1), count] (row 8757).
         raise ValueError(f"an aligned sum of {count} products a value, past its integers' digits")
     lowest = factors * (limits.minexp - 2 * limits.nmant)
     highest = factors * (limits.maxexp + 1) + count.bit_length() + 2
@@ -1857,7 +1852,8 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
     last carry its sign; of the magnitude's, its highest digits and whether any under them is nonzero, kept
     as the carry passes, then written as the float's bits (`_written`); each reduction its integers'."""
     ints = jnp.dtype(f"int{limits.bits}")
-    bits, mask, width = limits.bits, (1 << digit) - 1, _limb_bits(limits.dtype)
+    # A limb's bits, two of `_split_bits`' low halves (`_product`).
+    bits, mask, width = limits.bits, (1 << digit) - 1, 2 * _split_bits(limits.dtype)[2]
     held = 2 + -(-(limits.nmant + 3) // digit)
 
     def digit_sums(level):
@@ -1877,7 +1873,7 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
     def rolled(state, sums, level):
         # Each term's sum carried as added; the window's last into its sticky part; kept where it leads.
         carry, window, under, lead, kept, sticky = state
-        value, carry = carry, 0
+        value, carry = carry & mask, carry >> digit
         for total in sums:
             value = value + total
             carry, value = carry + (value >> digit), value & mask
@@ -1912,7 +1908,7 @@ def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
     if interpreting() is not None:
         return 0, levels
     ints = jnp.dtype(f"int{limits.bits}")
-    width = _limb_bits(limits.dtype)
+    width = 2 * _split_bits(limits.dtype)[2]
     least, most = jnp.iinfo(ints).max, jnp.iinfo(ints).min
     for product, _, _ in parts:
         for at, limb in enumerate(product.limbs):
@@ -1957,10 +1953,15 @@ def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> j
 
 def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents):
     """`_aligned_terms`' value and tangent (`_aligned_directions`), the value the declared sum's (`_aligned`)
-    so an outer order takes its tangent: formed from bits, which carry none, a second order lost its loss's
-    curvature, zero for `sum((a c)^2)` along `a` where `2 c^2` (base review d2d45bd6f F2)."""
+    so an outer order takes its tangent: formed from bits, a second order lost its curvature (row 8757)."""
+    from jax.custom_derivatives import SymbolicZero
+
     value = _aligned(shape, spec, *primals)
-    return value, _aligned_directions(shape, spec, primals, tangents, value)
+    # Only factors a tangent reaches move: a constant's zero beside an infinity was NaN (row 8757).
+    live = tuple(index for index, direction in enumerate(tangents) if not isinstance(direction, SymbolicZero))
+    if not live:
+        return value, jnp.zeros_like(value)
+    return value, _aligned_directions(shape, spec, primals, [tangents[index] for index in live], value, live)
 
 
 def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.Array) -> tuple:
@@ -1987,30 +1988,29 @@ def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.
     return products, laid(term[spot]).shape
 
 
-def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents, value):
-    """`aligned_sum`'s tangent, the linear map of its factors' `tangents` it is (`generation.linear_map`):
-    each factor's direction in its place in each of its terms, every one summed aligned (over `axis` too
-    where given), and its transpose each factor's cotangent the aligned sum, over the terms it is in and the
-    axes it is broadcast across, of the cotangent times its terms' other factors, so neither leaves float32's
-    range where its sum is in it (row 8501)."""
+def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents, value,
+                        live: tuple[int, ...]):
+    """`aligned_sum`'s tangent in its `live` factors' `tangents`, a linear map (`generation.linear_map`):
+    each direction in its places, summed aligned, transposed to an aligned sum of the cotangent times each
+    place's other factors, neither leaving float32's range where its sum is in it (row 8501)."""
     from dew.nn.kernels import generation
 
     def applied(factors, directions):
-        # A place's terms side by side (the first factor's direction in every term, then the second's...),
-        # so terms that cancel across a shared factor (an entry write's ranks) meet before smaller ones.
+        # A place's terms side by side, the first factor's direction in every term, then the second's...
+        moving = dict(zip(live, directions, strict=True))
         placed = [(spot, index) for spot in range(max(map(len, shape)))
-                  for index, term in enumerate(shape) if spot < len(term)]
-        moved = [(*(factors[at] for at in shape[index][:spot]), directions[shape[index][spot]],
+                  for index, term in enumerate(shape) if spot < len(term) and term[spot] in moving]
+        moved = [(*(factors[at] for at in shape[index][:spot]), moving[shape[index][spot]],
                   *(factors[at] for at in shape[index][spot + 1:])) for spot, index in placed]
-        return _aligned_terms(moved, tuple(spec[index] for _, index in placed))
+        # In the value's layout, which the moving terms alone may not span (base review 0c6ef9c11 F1).
+        return jnp.broadcast_to(_aligned_terms(moved, tuple(spec[index] for _, index in placed)), value.shape)
 
     def pulled(factors, cotangent):
         gradients = []
-        for place, factor in enumerate(factors):
+        for place in live:
+            factor = factors[place]
             # Each of the factor's places a term of one aligned sum in its shape (`_transposed_term`), the
-            # cotangent inside its products: summed first, 3 2^127 past float32's largest (base review
-            # d6c1b2c1a F1); held scaled until every place's is summed (base review db30f3e80 F1), and
-            # differentiated as an aligned sum is (base review d2d45bd6f F2: bits carry no tangent).
+            # cotangent inside its products, so an overflowing partial sum or one bit-formed is none.
             terms, laid = [], []
             for index, term in enumerate(shape):
                 axis, value = spec[index]
@@ -2023,8 +2023,7 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
                         terms.append(products)
                         laid.append((along if along else None, (held, factor.shape)))
             gradient = _aligned_terms(terms, tuple(laid)).astype(factor.dtype)
-            # Placed as the factor's type places it, whole too, where its mesh has an Explicit axis: a
-            # transpose's cotangent takes its operand's type (base review 8d59803fd F1).
+            # Placed as the factor's type, whole too, where its mesh has an Explicit axis (its operand's).
             placed = jax.typeof(factor).sharding
             typed = isinstance(placed, jax.sharding.NamedSharding) and placed.mesh.explicit_axes
             gradients.append(jax.sharding.reshard(gradient, placed) if typed else gradient)
@@ -2036,7 +2035,8 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
 
 
 _aligned = contracted("test_an_aligned_sum_holds_every_order")(
-    declared_tangent(Protected(), _aligned_value, _aligned_tangent, nondiff_argnums=(0, 1)))
+    declared_tangent(Protected(), _aligned_value, _aligned_tangent, nondiff_argnums=(0, 1),
+                     symbolic_zeros=True))
 
 
 def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax.Array:
