@@ -534,19 +534,31 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
     for seed in range(staged_units(seeds)):
         inputs = drawn_on_the_host(draw, seed)
         shaped.setdefault(named("truth", widened(inputs)), inputs)
-    programs, held = {}, {}
-    with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(store.device()),
-          evaluated_on([])):
-        for index, inputs in enumerate(shaped.values()):
-            wide = widened(inputs)
-            # A truth the gate runs as given has its value alone to read, held to float64 in its run on its
-            # first draw (`_drawn`): the prepare computes none (bible section 8; on its default device, a
-            # compile-only GPU, its eager operations raised "'Executable' object has no attribute
-            # 'local_devices'", row 4881's class).
-            if index == 0 and not _given(truth):
-                _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
-            _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
-        store.compile_site(label, programs, held)
+
+    def compiled(device, *, host: bool) -> bool:
+        """The site traced for `device` and compiled for it (`host`: the host's CPU), or, where `host` is
+        not, whether its target's GPU would leave a choice to run time, then left uncompiled."""
+        programs, held = {}, {}
+        with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(device), evaluated_on([])):
+            for index, inputs in enumerate(shaped.values()):
+                wide = widened(inputs)
+                # A truth the gate runs as given has its value alone to read, held to float64 in its run on
+                # its first draw (`_drawn`): the prepare computes none (bible section 8; on its default device,
+                # a compile-only GPU, its eager operations raised "'Executable' object has no attribute
+                # 'local_devices'", row 4881's class).
+                if index == 0 and not _given(truth):
+                    _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
+                _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
+            if not host and _left_to_run_time(store, programs):
+                return False
+            store.compile_site(label, programs, held, host=host)
+        return True
+
+    # A truth its target's GPU would leave a choice of to run time (a convolution's algorithm,
+    # `report.at_run_time`), which its compile there cannot hold, computes on the host's CPU: traced for it,
+    # as a CPU's run traces it, and compiled for it (row 7941's UNet truths).
+    if not compiled(store.device(), host=False):
+        compiled(jax.devices("cpu")[0], host=True)
     # A qualification run sizes a plain site first (`_qualified`), on its sizing draws through its arms.
     sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and plain else range(0)
     # A library arm (`library_fn`) one of them, run on Dew's own inputs as a further reference is (row 8468).
@@ -554,6 +566,19 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
                           **({} if library_fn is None else {"library": (library_fn, True)}),
                           **{f"further {name}": (fn, True) for name, fn in also.items()}},
                   draw, label, seeds=seeds, orders=orders, sizing=sizing)
+
+
+def _left_to_run_time(store: CompiledTruths, programs: Mapping[str, tuple[Callable, Sequence]]) -> bool:
+    """Whether a program of `programs`, lowered for `store`'s GPU target as its compile lowers it, leaves a
+    choice to run time its device's own compile makes (`report.at_run_time`); none where the store compiles
+    for this process's devices."""
+    from dew.nn.kernels.templates import report
+
+    if store.target is None:
+        return False
+    with store.tracing():
+        return any(report.at_run_time(jax.jit(function).lower(*shapes))
+                   for function, shapes in programs.values())
 
 
 def armed(label: str) -> str:
