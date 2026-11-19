@@ -149,7 +149,8 @@ class Candidate:
     prepared: TrainState
     held: int
     built: int
-    """The bytes of `held` the step's arguments hold: the copies and accumulator its first call builds."""
+    """The bytes the step's arguments hold of what `held` charges, as XLA counts them, one allocation's
+    rounding short of their charge (`allocated_bytes`): the copies and accumulator its first call builds."""
     program: jax.stages.Lowered | None
     kernels: KernelReport
     sampled: Callable[[], jax.stages.Lowered] | None = None

@@ -29,7 +29,7 @@ from dew._cleanup import attempted
 from dew._coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.batch import Batch
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable, row_field
-from dew.distributed.placement import Placement, placeable, placed_bytes, placed_shapes
+from dew.distributed.placement import Placement, allocated_bytes, placeable, placed_shapes
 from dew.mesh import SEQUENCE_AXIS, batch_axes
 from dew.nn.inputs import filled_validity
 from dew.telemetry.profile import region
@@ -297,13 +297,13 @@ PREFETCH_DEPTH = 2
 
 
 def prefetched_bytes(batch: Batch, shardings: Placement[Batch], depth: int = PREFETCH_DEPTH) -> int:
-    """Return the bytes a device holds of the batches `fit` places while a step runs.
+    """Return the bytes a device's pool holds of the batches `fit` places while a step runs.
 
     These are the batches next to the one the step reads: the `depth` it queues
     (`fit(device_prefetch=)`) and the one it is placing, each laid out as
-    `shardings` places `batch`.
+    `shardings` places `batch`, each shard an allocation (`allocated_bytes`).
     """
-    return (depth + 1) * placed_bytes(placed_shapes(batch, shardings))
+    return (depth + 1) * allocated_bytes(placed_shapes(batch, shardings))
 
 
 def restore_position(source: Checkpointable, saved: bytes) -> None:

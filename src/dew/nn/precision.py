@@ -54,6 +54,7 @@ from dew.nn.derivatives import (
     with_gradients_formed_at,
     with_tangents_formed,
 )
+from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, two_factor_reach
 from dew.nn.nested import nested
 from dew.nn.programs import UNROUNDED, equations
 from dew.nn.sharding import explicit_spec
@@ -472,16 +473,56 @@ def _exp_value(base2: bool, x) -> jax.Array:
         n = jnp.round(x * (1.0 / math.log(2.0)))
         r = (x - n * _LN2_HI) - n * _LN2_LO
     summed = functools.reduce(lambda p, term: p * r + term, _EXP_TERMS[1:], jnp.full_like(r, _EXP_TERMS[0]))
-    half = jnp.floor(n * 0.5)
-    return summed * _power_of_two(half) * _power_of_two(n - half)
+    return power2(summed, n, reach=150)
 
 
-def _power_of_two(n, dtype=jnp.float32) -> jax.Array:
-    """`2^n` in `dtype` (fp32 or float64), of an integral `n` within its normal exponents, set in its
-    exponent bits."""
+def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None) -> jax.Array:
+    """`x * 2^k` for an integral `k` of any size, exactly wherever `x` and the result are normal values of
+    its format (`x`'s, at least float32's, `at_least_fp32`), by exact powers of two of `k`'s sign
+    (`exact_power2`), `k` held within `reach` (by default the format's saturating bound, 279 in float32):
+    the one owner of scaling by a power of two (`scalar_power2` a Mosaic kernel's scalar `k`). A backend that
+    flushes subnormals flushes a subnormal `x` first (`raised_exactly` raises one from its bits).
+
+    Past `two_factor_reach`, `x` takes `2^o 2^(k - 2o) 2^o`, its own reverse: `o` zero where `k` is a normal
+    exponent, else `k`'s half held within the normal exponents, at least half of `-minexp` (float32's 63),
+    past `nmant`. So on a backend that keeps subnormals a result below the least normal rounds once, at the
+    last factor (the product before it is normal wherever the result rounds to no zero), and so does its
+    pullback, which applies the same factors in reverse before it sums a broadcast operand's cotangent
+    (base review 44e282c4f F1).
+    Within it, a caller stating its `reach` takes `k`'s two halves, each built as its product takes it, one
+    integer tile live, not two (row 2519's register measurements), a subnormal result rounded at each half."""
+    # Held at least in float32: an 8-bit float promotes implicitly to nothing.
+    dtype = at_least_fp32(jnp.asarray(x).dtype)
+    x = jnp.asarray(x, dtype)
     limits = jnp.finfo(dtype)
-    signed = jnp.dtype(f"int{limits.bits}")
-    return jax.lax.bitcast_convert_type((n.astype(signed) + (limits.maxexp - 1)) << limits.nmant, dtype)
+    least, largest = limits.minexp, limits.maxexp - 1
+    held = (largest + 1) - (least - limits.nmant) + 2 if reach is None else min(
+        reach, (largest + 1) - (least - limits.nmant) + 2)
+    # A Python integer held before it converts: one past float32's range raised in its host conversion.
+    if isinstance(k, int):
+        k = min(max(k, -held), held)
+    # Held as float32, which holds every exponent within the bound exactly: no narrow integer `k` wraps.
+    k = jnp.clip(jnp.asarray(k, jnp.float32), -held, held)
+    if held <= two_factor_reach(dtype):
+        # The half truncated by its conversion, an integer only at each factor's bias: an int32 half or a
+        # float `trunc` spilled the A100's recurrence and attention launches (row 2519).
+        half = (k * np.float32(0.5)).astype(jnp.int32)
+        return (x * exact_power2(half, dtype)
+                * exact_power2((k - half.astype(jnp.float32)).astype(jnp.int32), dtype))
+    # The middle `k - 2o` within `nmant + 4` of zero wherever `o` is held: `held` is at most three times
+    # `-minexp`.
+    outer = jnp.where(jnp.abs(k) <= -least, 0,
+                      jnp.clip((k * np.float32(0.5)).astype(jnp.int32), least, -least))
+    side = exact_power2(outer, dtype)
+    return x * side * exact_power2(k.astype(jnp.int32) - 2 * outer, dtype) * side
+
+
+def scalar_power2(x: jax.Array, k: jax.Array) -> jax.Array:
+    """`x` times `2^k` for a scalar integral `k` from -252 to 254, as two scalar normal powers of two
+    (`floor(k/2)` and the rest; `exp2` of an integer, a GPU's exactly): `power2`'s form for a Mosaic GPU
+    kernel's scalar `k`, which takes no bitcast of a scalar and no tile of exponent bits (et-c7512)."""
+    half = jnp.floor(k * 0.5)
+    return x * jnp.exp2(half) * jnp.exp2(k - half)
 
 
 def _exp_jvp(base2: bool, primals, tangents) -> tuple[jax.Array, jax.Array]:
@@ -1319,26 +1360,6 @@ def _two_sum(left, right):
     return total, (left - (total - part)) + (right - part)
 
 
-def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
-    """A float `x` (fp32 or float64) from its bits, each a signed integer of its width: its sign bit, its
-    biased exponent, its fraction, its fraction normalized as a normal one's (a subnormal's leading bit moved
-    up to the implicit bit's place and dropped) and its binary exponent `floor(log2 |x|)`, a subnormal's
-    below the least normal: `(sign, biased, fraction, normalized, exponent)`. Read from its bits, a
-    subnormal is kept where a process's float multiply flushes a subnormal operand (XLA's CPU, row 4023):
-    the one reading `binade_of`, `raised_exactly` and `aligned_sum` take."""
-    limits = jnp.finfo(x.dtype)
-    signed = jnp.dtype(f"int{limits.bits}")
-    bias, width = limits.maxexp - 1, limits.nmant
-    bits = jax.lax.bitcast_convert_type(x, signed)
-    biased = (bits >> width) & (2 * limits.maxexp - 1)
-    fraction = bits & ((1 << width) - 1)
-    sign = bits & np.array(-(1 << (limits.bits - 1)), signed)
-    up = jnp.clip(width - (limits.bits - 1 - jax.lax.clz(fraction)), 0, width)
-    normalized = jnp.where(biased > 0, fraction, (fraction << up) & ((1 << width) - 1))
-    exponent = jnp.where(biased > 0, biased - bias, limits.minexp - up)
-    return sign, biased, fraction, normalized, exponent
-
-
 def uncontracted(*values):
     """`values` each read as the one value it is, never fused into the arithmetic that reads it: an error-free
     transform reads each operand more than once and holds only where every read sees the same rounded value,
@@ -1359,57 +1380,6 @@ def uncontracted(*values):
 
     in_tpu_kernel = interpreting() is False and backend() == "tpu"
     return values if in_tpu_kernel else jax.lax.optimization_barrier(values)
-
-
-def binade_of(x: jax.Array) -> jax.Array:
-    """`floor(log2(|x|))` of an fp32 `x` from its bits (`float_bits`), int32, a subnormal's by its
-    significand's leading bit (its arithmetic on a process that flushes subnormal operands reads none of
-    it), -1024 for zero."""
-    _, biased, fraction, _, exponent = float_bits(x.astype(jnp.float32))
-    return jnp.where((biased == 0) & (fraction == 0), -1024, exponent).astype(jnp.int32)
-
-
-def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
-    """An fp32 `x` times `2^k` (`k` int32, at least 0, broadcast against `x`), exactly, from its bits: a
-    subnormal `x` normalized by its significand's leading bit, so a process whose float32 multiply flushes a
-    subnormal operand (XLA's CPU, row 4023) still raises it. The result at most fp32's largest; an infinity
-    or NaN as it is."""
-    sign, biased, fraction, normalized, exponent = float_bits(x.astype(jnp.float32))
-    target = exponent + k
-    normal = sign | (jnp.clip(target + 127, 1, 254) << 23) | normalized
-    # Still below the least normal: the subnormal's significand shifted up by `k`.
-    below = sign | (fraction << jnp.clip(k, 0, 31))
-    raised = jnp.where(target >= -126, normal, below)
-    kept = (biased == 0xFF) | ((biased == 0) & (fraction == 0))
-    return jnp.where(kept, x.astype(jnp.float32), jax.lax.bitcast_convert_type(raised, jnp.float32))
-
-
-def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
-    """`x` (fp32) times `2^-k` (`k` int32, at least 0, broadcast against `x`) rounded once to nearest even
-    into fp32 however far below its least normal, in integer arithmetic on its bits: a process whose
-    float32 multiply or conversion flushes a subnormal result (XLA's CPU, per primitive, row 4023) still
-    returns it, as an IEEE multiply by the power of two would. A finite `x` alone; an infinity or NaN
-    returns as it is."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    sign = bits & np.uint32(0x80000000)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
-    # A subnormal `x` holds its significand at the least normal's exponent, its leading bit none.
-    held = jnp.maximum(biased, 1)
-    significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
-    target = held - k
-    normal = sign | (jnp.maximum(target, 1).astype(jnp.uint32) << 23) | fraction
-    # Below the least normal: the significand shifted right by the binades past it, rounded to nearest even.
-    shift = jnp.clip(1 - target, 0, 31).astype(jnp.uint32)
-    kept = significand >> shift
-    rest = significand & ((np.uint32(1) << shift) - np.uint32(1))
-    half = np.uint32(1) << (jnp.maximum(shift, np.uint32(1)) - np.uint32(1))
-    even = (kept & np.uint32(1)) == np.uint32(1)
-    up = (shift > 0) & ((rest > half) | ((rest == half) & even))
-    subnormal = sign | (kept + up.astype(jnp.uint32))
-    lowered = jnp.where((target >= 1) & (biased > 0), normal, subnormal)
-    rounded = jax.lax.bitcast_convert_type(lowered, jnp.float32)
-    return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
 
 
 def _split_bits(dtype) -> tuple[type, int, int]:
