@@ -337,13 +337,12 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         others, own, others_total, prior = (part[row, head, rows] for part in sums)
         m = maxima
         if draw is not None:
-            # Dropout's D: each dropped product centred about its query's at the forward's anchor key, its
-            # heaviest, summed as the tiles' dP are (`interpreted_rows`).
+            # Dropout's D: each dropped product centred about its query's heaviest key.
             def terms(j):
                 columns, seen, _, v_tile, logits, _ = formed(j)
                 products = gradient.dropped_products(interpreted_dot(do, v_tile.T),
                                                     draw(q_pos, columns[None, :]))
-                return gradient.below(logits, m, how), products, seen
+                return gradient.below(logits, m, how), products, seen, columns[None, :]
 
             centre = gradient.dropped_products(interpreted_rows(anchor_rows, do)[:, None],
                                                draw(q_pos, chosen[:, None]))[:, 0]
