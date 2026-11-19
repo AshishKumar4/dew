@@ -16,8 +16,6 @@ What the route serves is read from the product's own selector: the product trace
 case's generation with the packed kernel named, the route its choice reports the packed kernel.
 """
 
-import contextlib
-
 import generation_support
 import jax
 import jax.numpy as jnp
@@ -128,15 +126,11 @@ def per_shard(choice: str, kernel: str) -> dict:
     and the biases whole, the products `kernel` (interpreted on the CPU's devices) and every other GEMM at XLA
     (`XLA`): the output and the gradients of the tokens, the routing weights and the biases on par with one
     device's, from the experts in float64 over each bank's exact matrix (`model_flows.exact_banks`)."""
-    from flax import linen as nn
     from jax.sharding import PartitionSpec
     from model_flows import exact_banks, packed_variables
-    from sharded import Shard
+    from sharded import Shard, layer_scope
 
-    from dew.distributed.placement import Layout
-    from dew.mesh import DEFAULT_RULES
     from dew.nn.gpt_oss import GptOssExperts
-    from dew.nn.sharding import placing
     from dew.quantization import QUANTIZATION
 
     del choice, kernel
@@ -172,14 +166,6 @@ def per_shard(choice: str, kernel: str) -> dict:
                                                             strict=True))
         return held["params"], tokens, weights, cotangent
 
-    def scope():
-        # The trainer's step traces under its layout (`placing`), which the experts' dispatch reads.
-        stack = contextlib.ExitStack()
-        for context in (generation.chosen(**XLA), nn.logical_axis_rules(DEFAULT_RULES),
-                        placing(Layout(min_shard=1))):
-            stack.enter_context(context)
-        return stack
-
     rows = PartitionSpec("data")
     return {"data": Shard(with_gradients(call), draw, lambda mesh: [PartitionSpec(), rows, rows, rows], truth,
-                          SEEDS, "data", context=scope)}
+                          SEEDS, "data", context=lambda: layer_scope(**XLA))}
