@@ -1118,6 +1118,9 @@
 "tests/test_contracts_gemm.py": [
 "tests/test_contracts_gemm.py::test_a_quantized_convolution_holds_every_order_it_takes[1-normal]"
 ],
+"tests/test_contracts_norms.py": [
+"tests/test_contracts_norms.py::test_the_fused_norms_and_products_hold_every_order[near the largest]"
+],
 "tests/test_contracts_objectives.py": [
 "tests/test_contracts_objectives.py::test_a_node_perturbation_estimate_holds_every_order[normal]",
 "tests/test_contracts_objectives.py::test_the_categorical_losses_hold_every_order[near the largest]",
@@ -2721,9 +2724,6 @@
 "tests/test_norm_swiglu.py::test_rms_variants_and_every_gradient[True-False-float16-bfloat16]",
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float16-repeated]",
 "tests/test_norm_swiglu.py::test_stream_seam_takes_the_add_and_the_stream_cotangent[shape0-float32-False]"
-],
-"tests/test_online_loader.py": [
-"tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[streamed-processes-flat_map]"
 ],
 "tests/test_optim.py": [
 "tests/test_optim.py::test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix[output-whole]",
