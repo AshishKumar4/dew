@@ -2,6 +2,7 @@
 inside the loop (row 6739)."""
 
 import gc
+import sys
 
 from affine_run import dataset
 from recording import RecordingTracker
@@ -43,21 +44,31 @@ def _fit_events(trainer, tracker: Reported, steps: int) -> list[tuple[str, int]]
 
 
 def test_no_full_collection_runs_among_a_fits_steps_and_a_held_steps_fit_forces_none():
-    """No full collection runs among a fit's steps after its step is compiled (row 6739: one walking what the
-    start made ran inside a 4B fit's loop, 0.75 to 0.9 s): where its compile made a quarter of the heap the
-    fit collects there, before its steps. A second fit of the same trainer, whose step the process holds,
-    forces none at all, the collector left to its own thresholds, where every fit walked the whole heap at
-    its compile (a warm 3-step fit's 0.48 s of its 0.72)."""
+    """No full collection runs among a fit's steps (row 6739: one walking what the start made ran inside a 4B
+    fit's loop, 0.75 to 0.9 s): a fresh trainer's first fit, whose compiles grew the heap by more than a
+    quarter since the last full collection, collects before its step is reported compiled. A second fit of
+    the same trainer, whose step the process holds and whose heap grew little, forces none, and none of the
+    collector's own runs among its steps either, the collector enabled throughout (rows 8511, 8545: the
+    growth read against the last full collection, a plan's compile and an earlier fit's counted)."""
     tracker = Reported()
     trainer = make_trainer(tracker=tracker)
     first = _fit_events(trainer, tracker, 12)
     compiled = first.index(("compiled", 0))
     steps = [index for index, event in enumerate(first) if event[0] == "step"]
     assert len(steps) == 12 and steps[0] > compiled
+    assert ("collection", 2) in first[:compiled], first[:compiled]
     assert ("collection", 2) not in first[compiled:], first[compiled:]
-    gc.disable()
+    again = _fit_events(trainer, tracker, 3)
+    assert ("collection", 2) not in again, again
+    # Objects made between fits, more than a quarter of the heap the last full collection left, are pending:
+    # a fit whose step the process holds collects them before its steps, not among them (row 8511).
+    gc.disable()  # Made pending, none collected while made.
     try:
-        again = _fit_events(trainer, tracker, 3)
+        made = [[index] for index in range(sys.getallocatedblocks() // 2)]
     finally:
         gc.enable()
-    assert not [event for event in again if event[0] == "collection"], again
+    grown = _fit_events(trainer, tracker, 3)
+    first_step = grown.index(("step", 0))
+    assert ("collection", 2) in grown[:first_step], grown
+    assert ("collection", 2) not in grown[first_step:], grown
+    del made

@@ -74,7 +74,7 @@ from jax._src import config as jax_config
 from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
-from dew import _cache, _coordination, _records
+from dew import _cache, _cgroups, _coordination, _records
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.algebra.terms import opaque, parameter_key
@@ -1182,7 +1182,8 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     read = {}
     configs = _candidates(op, ba)
-    with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
+    # As many as the CPUs this process may use, its affinity and container quota (`_cgroups.usable_cpus`).
+    with concurrent.futures.ThreadPoolExecutor(_cgroups.usable_cpus()) as pool:
         futures = {config: pool.submit(compiled, config) for config in configs}
     # CUPTI reads every run, the flush's own first. It takes one subscriber, so
     # where a profile capture holds it, from the first run or any later one,

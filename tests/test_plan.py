@@ -35,6 +35,7 @@ from sharded import collectives
 from token_support import write_token_corpus
 
 from dew import _cache
+from dew._records import JSON
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, Memory, presets
 from dew.data.compile import compile
@@ -1389,7 +1390,7 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
     pytest.param("decoder", "cpu", id="decoder-cpu"),
     pytest.param("decoder", "h100", id="decoder-h100"),
     pytest.param("delta-scanned", "h100", id="delta-scanned-h100",
-                 marks=pytest.mark.shards(units=18, per_task=3)),
+                 marks=pytest.mark.shards(units=18, per_task=2)),
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request):
@@ -1403,8 +1404,8 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
     What a rung keeps orders its residuals, not XLA's peak (the scanned delta decoder needed more recomputing
     its scans and convolutions too than not), so a search that passed over a rung for one seen to miss
     settled a heavier plan than one that fits. The scanned delta decoder's walk of its 18 places runs over
-    CI's map tasks, 3 a task: compiled in one it took 262 to 350 s of a train's task (row 8438), 6 a task
-    469 s, its judge 168 s after (row 8524)."""
+    CI's map tasks, 2 a task: compiled in one it took 262 to 350 s of a train's task (row 8438), 6 a task
+    469 s, its judge 168 s after (row 8524), 3 a task 299 s for its first, the heaviest (row 8557)."""
     fields, batch, room_of = CENSUS[shape]
     with row_names_port("gated_delta_rule", "fla"):
         climb = climbed(monkeypatch, target, fields, batch, room_of, request)
@@ -1770,31 +1771,48 @@ def fitted_once(trainer: Trainer) -> None:
     trainer.fit(Pipeline(Memory({"text": np.asarray(BATCH["text"][:2])})).repeat().batch(2), steps=1)
 
 
+@functools.cache
+def muon_needs() -> tuple[int, int, JSON]:
+    """What the Muon step (`muon_lm`) needs beside what a device holds with its Newton-Schulz stacks joined
+    and parted (`ns_group` 1), and the parted step's remat: measured once for the cells below."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
+        parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
+    return joined, parted, trainer.plan["remat"]
+
+
 def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_recomputing(monkeypatch):
     """A Muon step whose joined Newton-Schulz stacks' copies leave it short of the devices' room, and which
     fits with them parted, its split fixed: its plan parts them, joining one at a time (`ns_group` 1, the
     climb's release after the narrow copies, `FitSearch.searched`), and recomputes nothing more, where it
     climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a
     step)."""
-    joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
-    parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
+    joined, parted, remat = muon_needs()
     assert parted < joined, (parted, joined)
     free(monkeypatch, (parted + joined) // 2)
     planned = muon_lm()
     fitted_once(planned)
     assert planned.plan["ns_group"] == 1, planned.plan
-    assert planned.plan["remat"] == trainer.plan["remat"], planned.plan
+    assert planned.plan["remat"] == remat, planned.plan
 
 
 def test_a_muon_run_that_states_its_stacks_group_keeps_it(monkeypatch):
-    """A Muon run that states its Newton-Schulz group keeps it: the release of its joined stacks asked of no
-    step of it (`FitSearch.searched`), the plan recording none (apart from the parting cell above, which
-    took 148 s with it, row 8546)."""
-    stated = muon_lm(ns_group=2)
-    free(monkeypatch, LIMIT)
-    fitted_once(stated)
-    assert stated.plan["ns_group"] is None
-
+    """A Muon run that states its Newton-Schulz group keeps it, in the room where an unstated run's plan
+    parts its stacks (the cell above's): its group joins every stack, as the joined step does, and the
+    planner asks no step of it to join them one at a time (`FitSearch.searched`), whether it then fits
+    or is refused (row 8696: in all of the room no release was ever asked, so a stated group overridden
+    failed nothing)."""
+    joined, parted, _ = muon_needs()
+    free(monkeypatch, (parted + joined) // 2)
+    stated = muon_lm(ns_group=4)
+    try:
+        fitted_once(stated)
+    except PlanRefused as refused:
+        groups = [probe.rung["ns_group"] for probe in refused.probes]
+    else:
+        assert stated.plan["ns_group"] is None, stated.plan
+        groups = [probe["ns_group"] for probe in stated.plan["probes"]]
+    assert groups and 1 not in groups, groups
 
 def lowered_and_compiled(run: Callable[[], object]) -> tuple[int, int]:
     """How many times `run` lowered the step (JAX's lowering of `jit(step)`) and compiled it (`Compiles`)."""
