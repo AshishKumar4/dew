@@ -129,5 +129,6 @@ def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed(
     plain = arm_role("dew", jax.jit(scaled), "a scaled arm")
     with jax.default_device("gpu"):
         on_a_gpu = arm_role("dew", without_ynn(scaled), "a scaled arm")
-    on_a_cpu = arm_role("dew", without_ynn(scaled), "a scaled arm")
+    with jax.default_device("cpu"):
+        on_a_cpu = arm_role("dew", without_ynn(scaled), "a scaled arm")
     assert on_a_gpu == plain != on_a_cpu
