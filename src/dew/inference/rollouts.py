@@ -888,8 +888,8 @@ class OpenAIRolloutServer(_RequestServer):
                  routing: bool = False, decode: Callable[[Sequence[int]], str] | None = None):
         engine = completion.provider
         if engine == "openai":
-            raise ValueError(f"token rollouts need a provider of {', '.join(ENGINE_PROVIDERS)}: ids, seeds and "
-                             "EOS controls are engine request fields")
+            raise ValueError(f"token rollouts need a provider of {', '.join(ENGINE_PROVIDERS)}: ids, seeds "
+                             "and EOS controls are engine request fields")
         if engine == "vllm" and replace(sampling, temperature=1.0).transforms():
             raise ValueError("a filtering Sampling trains on the kept ids of every draw, which vLLM returns "
                              "only on its token route; use VLLMGenerateServer")
