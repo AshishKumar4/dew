@@ -1190,6 +1190,38 @@ def test_an_aligned_sums_derivative_reduces_each_term_before_it_adds():
     assert float(jax.grad(lambda y: summed(x, y)[0, 0])(y)[0, 0]) == 1.0
 
 
+def test_an_aligned_sums_derivatives_hold_a_cancelling_shared_factors_range():
+    """`aligned_sum` of an entry write's two terms sharing their weight and key, a key of `(2^80, 0, 0)` and
+    values of 2^80 and -2^80 (each term 2^160, their sum zero): its tangent along the shared factors and
+    every factor's gradient float64's exactly, where its tangent summed each term's 2^160 plainly, inf - inf,
+    and a shared factor's gradient took each term's apart, the same (row 8501)."""
+    weight, key = np.ones((1, 1)), np.asarray([[2.0 ** 80], [0.0], [0.0]])
+    up = np.full((1, 4), 2.0 ** 80)
+    factors = (weight, key, up, -up)
+    directions = (np.ones((1, 1)), np.ones((3, 1)), np.zeros((1, 4)), np.zeros((1, 4)))
+    cotangent = np.arange(12.0).reshape(3, 4) - 5.0
+
+    def summed(weight, key, up, down):
+        return aligned_sum([(weight, key, up), (weight, key, down)])
+
+    narrow = [tuple(jnp.asarray(x, jnp.float32) for x in group) for group in (factors, directions)]
+    _, tangent = jax.jvp(summed, *narrow)
+    gradients = jax.grad(lambda *given: jnp.sum(summed(*given) * jnp.asarray(cotangent, jnp.float32)),
+                         argnums=(0, 1, 2, 3))(*narrow[0])
+    # float64's: the tangent each factor's direction in its place, the gradients the cotangent times the
+    # other factors summed over each one's broadcast, each exact here.
+    weight_d, key_d, up_d, down_d = directions
+    exact_tangent = (weight_d * key * (up - up) + weight * key_d * (up - up)
+                     + weight * key * (up_d + down_d))
+    exact = (np.sum(cotangent * key * (up - up), keepdims=True).reshape(1, 1),
+             np.sum(cotangent * weight * (up - up), axis=1, keepdims=True),
+             np.sum(cotangent * weight * key, axis=0, keepdims=True),
+             np.sum(cotangent * weight * key, axis=0, keepdims=True))
+    np.testing.assert_array_equal(np.asarray(tangent, np.float64), exact_tangent)
+    for found, expected in zip(gradients, exact, strict=True):
+        np.testing.assert_array_equal(np.asarray(found, np.float64), expected)
+
+
 def test_an_aligned_sum_of_a_subnormal_factor_raises_it_by_its_bits():
     """`aligned_sum` of a term whose factor is fp32-subnormal (`2^-140`) and whose product is in range
     (`2^-140 2^100`): `2^-40` exactly, the factor normalized by its bits, where lifted by a multiply XLA:CPU
