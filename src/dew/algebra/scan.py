@@ -423,12 +423,14 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
     before, after, own = walked
 
     def hooked(state, step):
-        (h, apart, index, own), (t, step) = state, step
+        # A document's memory taken up at its first token, which begins a group (a position's ranks, a
+        # group, are one document's), so its group's state is that memory (`token`'s `apart`).
+        ((h, apart, index), own), (t, step) = state, step
         h, own = before(t, h, own)
         (h, apart, index), output = token((h.astype(carried), apart, index), step)
-        return (h, apart, index, after(t, h, own)), output
+        return ((h, apart, index), after(t, h, own)), output
 
-    (h, _, _, own), outputs = lax.scan(hooked, (h, h, 0, own), (jnp.arange(count), along))
+    ((h, _, _), own), outputs = lax.scan(hooked, ((h, h, 0), own), (jnp.arange(count), along))
     return outputs, h, own
 
 
