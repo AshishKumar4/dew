@@ -391,19 +391,24 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
         "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
 
 
+def green_task_row(ci, tmp_path, name: str, source: str) -> dict:
+    """The row of a task of one test file, `name` under tests/ holding `source`, which is green."""
+    (tmp_path / "tests" / name).write_text(source)
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    ci.task("3.12", [f"tests/{name}"], "", out, 600.0)
+    [row] = json.loads(out.read_text())["rows"]
+    assert row["exitCode"] == 0, row["output"]
+    return row
+
+
 def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
     """A task's pytest arms no timed dump of every thread's stack, which killed a multithreaded test mid-dump
     (exit 245, a SIGSEGV, 2026-10-25): the test process CI starts carries no dump timer, its stacks written
     only once its task is past its deadline (test_armada_deadlines). A test running past the old ten minutes
     through a task is green with no dump (armada receipt in the head's review)."""
-    (tmp_path / "tests/test_timer.py").write_text(
-        "def test_no_dump_timer(request):\n"
-        "    assert request.config.getini('faulthandler_timeout') == 0\n")
-    interpreter(tmp_path, "3.12")
-    out = tmp_path / "verdict.json"
-    ci.task("3.12", ["tests/test_timer.py"], "", out, 600.0)
-    [row] = json.loads(out.read_text())["rows"]
-    assert row["exitCode"] == 0, row["output"]
+    green_task_row(ci, tmp_path, "test_timer.py", "def test_no_dump_timer(request):\n"
+                   "    assert request.config.getini('faulthandler_timeout') == 0\n")
 
 
 def test_a_tasks_pytest_keeps_its_temp_dirs_under_a_root_of_its_own(ci, tmp_path, monkeypatch):
@@ -413,15 +418,8 @@ def test_a_tasks_pytest_keeps_its_temp_dirs_under_a_root_of_its_own(ci, tmp_path
     shared = tmp_path / "shared"
     shared.mkdir()
     monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(shared))  # The root every process would inherit.
-    (tmp_path / "tests/test_temp.py").write_text(
-        "from pathlib import Path\n"
-        "def test_temp(tmp_path):\n"
-        "    Path('temp.txt').write_text(str(tmp_path))\n")
-    interpreter(tmp_path, "3.12")
-    out = tmp_path / "verdict.json"
-    ci.task("3.12", ["tests/test_temp.py"], "", out, 600.0)
-    [row] = json.loads(out.read_text())["rows"]
-    assert row["exitCode"] == 0, row["output"]
+    green_task_row(ci, tmp_path, "test_temp.py", "from pathlib import Path\n"
+                   "def test_temp(tmp_path):\n    Path('temp.txt').write_text(str(tmp_path))\n")
     # Under its root: pytest's per-user directory, then its numbered one.
     root = Path((tmp_path / "temp.txt").read_text()).parents[2]
     assert root != shared

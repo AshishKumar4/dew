@@ -8,11 +8,14 @@ installed."""
 
 import ast
 import bisect
+import contextlib
 import functools
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
@@ -115,15 +118,29 @@ def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
             "--tb=short", "--continue-on-collection-errors", "-p", "no:cacheprovider", f"--junitxml={report}"]
 
 
-def pytest_environment(environ: Mapping[str, str]) -> dict[str, str]:
+def pytest_environment(environ: Mapping[str, str], hub_open: bool = False) -> dict[str, str]:
     """What CI's pytest runs under: this process's environment but what pytest reads as its own arguments
-    (`UNKEYED`), `environ` over it, the Hub closed, and tools/armada on the path, where the plugins a task
-    loads (split.py, executed.py) import from: what a run selects and loads is its command's alone, which
-    every row's key holds (row 2558: an inherited PYTEST_ADDOPTS could reuse a green row its run would not
-    give)."""
+    (`UNKEYED`), `environ` over it, the Hub closed (none of its variables set with `hub_open`, the network
+    lane's), and tools/armada on the path, where the plugins a task loads (split.py, executed.py) import
+    from: what a run selects and loads is its command's alone, which every row's key holds (row 2558: an
+    inherited PYTEST_ADDOPTS could reuse a green row its run would not give)."""
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
     inherited = {name: value for name, value in os.environ.items() if name not in UNKEYED}
-    return {**inherited, **environ, **CLOSED_HUB, "PYTHONPATH": path}
+    environment = {**inherited, **environ, **CLOSED_HUB, "PYTHONPATH": path}
+    return ({key: value for key, value in environment.items() if key not in CLOSED_HUB} if hub_open
+            else environment)
+
+
+@contextlib.contextmanager
+def temp_root() -> Iterator[str]:
+    """A temp root of one pytest process's own (its PYTEST_DEBUG_TEMPROOT, row 8298): pytest's default,
+    /tmp/pytest-of-<user>, is one per node, and a process's exit, pruning it, resolves the `pytest-current`
+    link another is replacing. Its name is short, so a test's Unix socket under tmp_path stays within
+    sun_path's 108 bytes. Removed once the process has returned; an interrupted supervisor leaves it, under a
+    process its lifeline has yet to stop."""
+    root = tempfile.mkdtemp(prefix="p")
+    yield root
+    shutil.rmtree(root, ignore_errors=True)
 
 
 UNKEYED = ("PYTEST_ADDOPTS", "PYTEST_PLUGINS")
