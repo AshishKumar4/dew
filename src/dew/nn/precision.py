@@ -55,14 +55,7 @@ from dew.nn.derivatives import (
     with_gradients_formed_at,
     with_tangents_formed,
 )
-from dew.nn.float_bits import (
-    exact_power2,
-    float_bits,
-    lowered_rounded,
-    raw_fields,
-    two_factor_reach,
-    widened_exactly,
-)
+from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, raw_fields, two_factor_reach
 from dew.nn.nested import nested
 from dew.nn.programs import UNROUNDED, equations
 from dew.nn.sharding import explicit_spec
@@ -1699,21 +1692,18 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
     return _aligned_terms(terms, ((axis, None),) * len(terms))
 
 
-def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple, dtype: DTypeLike | None = None
-                   ) -> jax.Array:
+def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Array:
     """`aligned_sum` of `terms`, each product summed over its `spec` entry's axis (kept) and, where it gives
-    `(held, shape)`, broadcast to `held` and reshaped to `shape` (a gradient's term in its factor's), in
-    `dtype` where given (a tangent's, its primal sum's type, whose float64 term no direction moves), else
-    its factors' widest, at least float32."""
-    # Each factor once, by identity: a shared factor's gradient sums its terms' together, aligned. Each its
-    # own type here, widened within the value (`_aligned_value`), so its tangent is the declared rule's.
+    `(held, shape)`, broadcast to `held` and reshaped to `shape` (a gradient's term in its factor's)."""
+    dtype = jnp.result_type(jnp.float32, *(factor for term in terms for factor in term))
+    # Each factor once, by identity: a shared factor's gradient sums its terms' together, aligned.
     factors, places, shape = [], {}, []
     for term in terms:
         indices = []
         for factor in term:
             if id(factor) not in places:
                 places[id(factor)] = len(factors)
-                factors.append(jnp.asarray(factor))
+                factors.append(jnp.asarray(factor, dtype))
             indices.append(places[id(factor)])
         shape.append(tuple(indices))
     from dew.nn.kernels.launches import interpreting
@@ -1724,9 +1714,8 @@ def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple, dtype: DTy
     ranks = [max(map(np.ndim, term)) for term in terms]
     spec = tuple((axis if axis is None else _normalized_axes(axis, rank), laid)
                  for rank, (axis, laid) in zip(ranks, spec, strict=True))
-    dtype = jnp.result_type(jnp.float32, *factors) if dtype is None else jnp.dtype(dtype)
     # A compiled kernel's body bare, as Mosaic lowers no symbolic zeros' rule; an interpreted one declared.
-    return (_aligned_value if interpreting() is False else _aligned)(tuple(shape), spec, dtype, *factors)
+    return (_aligned_value if interpreting() is False else _aligned)(tuple(shape), spec, *factors)
 
 
 def _normalized_axes(axis: int | Sequence[int], rank: int) -> tuple[int, ...]:
@@ -1744,12 +1733,9 @@ def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) ->
     return [tuple(flat[at] for at in term) for term in shape]
 
 
-def _aligned_value(shape: tuple[tuple[int, ...], ...], spec: tuple, dtype: jnp.dtype,
-                   *flat: jax.Array) -> jax.Array:
-    """`_aligned_terms` of its terms' factors in a row (`_regrouped`), each widened to the sum's `dtype` from
-    its bits (a cast flushes a subnormal factor on XLA:CPU, row 8966; `widened_exactly`), summed exactly
-    (`_exact_sum`)."""
-    return _exact_sum(_regrouped(shape, [widened_exactly(factor, dtype) for factor in flat]), spec, dtype)
+def _aligned_value(shape: tuple[tuple[int, ...], ...], spec: tuple, *flat: jax.Array) -> jax.Array:
+    """`_aligned_terms` of its terms' factors in a row (`_regrouped`), summed exactly (`_exact_sum`)."""
+    return _exact_sum(_regrouped(shape, flat), spec, flat[0].dtype)
 
 
 class _Product(NamedTuple):
@@ -1951,11 +1937,11 @@ def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> j
     return jax.lax.bitcast_convert_type(signed, jnp.dtype(limits.dtype))
 
 
-def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, dtype: jnp.dtype, primals, tangents):
+def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents):
     """`_aligned_terms`' value (`_aligned`'s) and tangent in the factors it reaches."""
     from jax.custom_derivatives import SymbolicZero
 
-    value = _aligned(shape, spec, dtype, *primals)
+    value = _aligned(shape, spec, *primals)
     live = tuple(index for index, direction in enumerate(tangents) if not isinstance(direction, SymbolicZero))
     if not live:
         return value, jnp.zeros_like(value)
@@ -2009,7 +1995,7 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
         # In the value's layout inside the sum, which reverse mode then sums inside it too (row 8757).
         laid = tuple((axis, (value.shape, value.shape) if held is None else held)
                      for axis, held in (spec[index] for _, index in placed))
-        return _placed_as(_aligned_terms(moved, laid, value.dtype), value)
+        return _placed_as(_aligned_terms(moved, laid), value)
 
     def pulled(factors, cotangent):
         gradients = []
@@ -2028,8 +2014,8 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
                         along = tuple(d for d, size in enumerate(held) if size == 1)
                         terms.append(products)
                         laid.append((along if along else None, (held, factor.shape)))
-            summed = _aligned_terms(terms, tuple(laid), cotangent.dtype)
-            gradients.append(_placed_as(summed.astype(factor.dtype), jax.typeof(factor)))
+            gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype),
+                                        jax.typeof(factor)))
         return gradients
 
     return generation.linear_map(applied, pulled, list(primals), list(tangents),
@@ -2037,7 +2023,7 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
 
 
 _aligned = contracted("test_an_aligned_sum_holds_every_order")(
-    declared_tangent(Protected(), _aligned_value, _aligned_tangent, nondiff_argnums=(0, 1, 2),
+    declared_tangent(Protected(), _aligned_value, _aligned_tangent, nondiff_argnums=(0, 1),
                      symbolic_zeros=True))
 
 
