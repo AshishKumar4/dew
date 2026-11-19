@@ -42,7 +42,6 @@ from dew.nn.kernels.templates.attention import (
     REFERENCE_PRECISION,
     Capped,
     Draw,
-    Dropout,
     Initial,
     coded,
     dropped_reach,
@@ -2301,7 +2300,6 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     held_by, plain = keys.accumulate, state.low is None
     drop = keys.coords.drop
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
-    bound = 1.0 if drop is None else drop.bound
     after: list[Partial] = []
 
     def own(states, parts):
