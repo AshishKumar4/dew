@@ -1748,8 +1748,7 @@ def _aligned_value(shape: tuple[tuple[int, ...], ...], spec: tuple, *flat: jax.A
 
 
 class _Product(NamedTuple):
-    """A term's product, exactly (`_product`): its significand's limbs, the place of its lowest bit, its
-    sign, and its IEEE class where a factor is not finite or zero."""
+    """A term's product, exactly (`_product`): its limbs, its lowest bit's place, its sign and IEEE class."""
 
     limbs: tuple[jax.Array, ...]
     place: jax.Array
@@ -1760,11 +1759,9 @@ class _Product(NamedTuple):
 
 
 def _product(term: Sequence[jax.Array], ints) -> _Product:
-    """`term`'s product (`_Product`), exactly, from its factors' bits alone: each significand two digits of
-    half its bits, their convolution carried after each factor, so `k` factors make `k` limbs and no bit
-    rounds; NaN where a factor is NaN or an infinity meets a zero, else a signed infinity where one is, as
-    IEEE's product, so no finite factors' rounded product (`2^-75 2^-75` zero) meets the infinity (base
-    review 6c68b90ad F3)."""
+    """`term`'s product (`_Product`), exactly, from its factors' bits: each significand two digits of half
+    its bits, convolved and carried a factor at a time (`k` factors `k` limbs); NaN, or a signed infinity, as
+    IEEE's, no finite factors' rounded product (`2^-75 2^-75` zero) meeting the infinity (row 8757)."""
     limits = jnp.finfo(term[0].dtype)
     half, top = _limb_bits(term[0].dtype) // 2, 2 * limits.maxexp - 1
     low = (1 << half) - 1
@@ -1800,13 +1797,12 @@ def _product(term: Sequence[jax.Array], ints) -> _Product:
 
 
 def _limb_bits(dtype) -> int:
-    """The bits of a product's limb (`_product`): two digits of `_split_bits`' low half's bits."""
+    """The bits of a product's limb (`_product`), two of `_split_bits`' low halves."""
     return 2 * _split_bits(dtype)[2]
 
 
 def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
-    """A term's reduction from its products' `shape` to the sum's value, `op` over its axes (kept), laid
-    where `laid` gives `(held, shape)`, and the count of products a value takes."""
+    """A term's reduction to the sum's value, `op` over its axes (kept) and laid, and its count."""
     axes = () if axis is None else tuple(sorted({int(a) % len(shape) for a in np.atleast_1d(axis)}))
 
     def reduced(x: jax.Array, op: Callable = jnp.sum, **options) -> jax.Array:
@@ -1835,13 +1831,16 @@ def _exact_sum(terms, spec, dtype) -> jax.Array:
         negative = negative | reduced(product.infinite & product.negative, jnp.any)
         # A sum of negative zeros alone is one, of none positive zero (base review 6c68b90ad F4).
         live = live | reduced(~(product.zero & product.negative), jnp.any)
-    if not sum(extent for _, _, extent in parts):
-        live = True
-    # The widest digit whose sum and carry the integers hold, a product's limbs' bits disjoint (row 8757).
     count = sum(extent for _, _, extent in parts)
-    digit = (((1 << (limits.bits - 1)) - 1) // max(count, 1)).bit_length() - 1
+    if not count:
+        live = True
+    # The widest digit whose sum with a carry (at most `count + 2`) and a term's digits the integers hold,
+    # each term carried as added (`_nearest`): 2^30 tangent products were refused (row 8757).
+    widest = max(extent for _, _, extent in parts)
+    digit = max([0] + [w for w in range(1, limits.bits - 1)
+                       if count + 2 + (1 << w) + widest * ((1 << w) - 1) < 1 << (limits.bits - 1)])
     if digit < 1:
-        raise ValueError(f"an aligned sum of {count} limbs a value, past its integers' digits")
+        raise ValueError(f"an aligned sum of {count} products a value, past its integers' digits")
     lowest = factors * (limits.minexp - 2 * limits.nmant)
     highest = factors * (limits.maxexp + 1) + count.bit_length() + 2
     levels = -(-(highest - lowest) // digit)
@@ -1861,9 +1860,9 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
     bits, mask, width = limits.bits, (1 << digit) - 1, _limb_bits(limits.dtype)
     held = 2 + -(-(limits.nmant + 3) // digit)
 
-    def digit_sum(level):
+    def digit_sums(level):
         low = lowest + level * digit
-        total = 0
+        sums = []
         for product, reduced, _ in parts:
             taken = 0
             for at, limb in enumerate(product.limbs):
@@ -1872,25 +1871,27 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
                 kept = limb & ((1 << jnp.clip(digit + shift, 0, bits - 1)) - 1)
                 left = kept << jnp.clip(-shift, 0, bits - 1)
                 taken = taken + jnp.where(shift >= 0, right, jnp.where(digit + shift > 0, left, 0))
-            total = total + reduced(jnp.where(product.negative, -taken, taken), jnp.sum, dtype=ints)
-        return jnp.asarray(total, ints)
+            sums.append(reduced(jnp.where(product.negative, -taken, taken), jnp.sum, dtype=ints))
+        return sums
 
-    def rolled(state, value, level):
-        # A digit carried in, the window's last out into its sticky part, the window kept where it leads.
+    def rolled(state, sums, level):
+        # Each term's sum carried as added; the window's last into its sticky part; kept where it leads.
         carry, window, under, lead, kept, sticky = state
-        value = value + carry
+        value, carry = carry, 0
+        for total in sums:
+            value = value + total
+            carry, value = carry + (value >> digit), value & mask
         under = under | (window[-1] != 0)
-        window = (value & mask, *window[:-1])
+        window = (value, *window[:-1])
         nonzero = window[0] != 0
-        return (value >> digit, window, under, jnp.where(nonzero, level, lead),
+        return (carry, window, under, jnp.where(nonzero, level, lead),
                 tuple(jnp.where(nonzero, new, old) for new, old in zip(window, kept, strict=True)),
                 jnp.where(nonzero, under, sticky))
 
     def step(level, states):
-        value = digit_sum(level)
-        return rolled(states[0], value, level), rolled(states[1], -value, level)
+        sums = digit_sums(level)
+        return rolled(states[0], sums, level), rolled(states[1], [-total for total in sums], level)
 
-    # Zeros of the value's shape and placement, as each digit's sum is: a loop's carry keeps its type.
     zeros = functools.reduce(jnp.add, [reduced(jnp.zeros_like(product.place), jnp.sum, dtype=ints)
                                        for product, reduced, _ in parts])
     start = (zeros, (zeros,) * held, zeros != 0, zeros - 1, (zeros,) * held, zeros != 0)
@@ -1905,7 +1906,7 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
 
 
 def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
-    """The digits `_nearest` walks: a kernel's every one, else the nonzero limbs' and a carry's room above."""
+    """The digits `_nearest` walks: a kernel's every one, else the nonzero limbs' and a carry's room."""
     from dew.nn.kernels.launches import interpreting
 
     if interpreting() is not None:
@@ -1926,8 +1927,7 @@ def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
 
 def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> jax.Array:
     """The magnitude's digits from its highest nonzero one at `lead` (`kept`), `sticky` where any under them
-    is nonzero, as the nearest float's bits, ties to even, signed where `negative`: its leading bit, the
-    significand's bits from it (none below the least subnormal's) and two more, rounded in integers."""
+    is nonzero, as the nearest float's bits, ties to even, signed where `negative`, rounded in integers."""
     ints = lead.dtype
     bits = jnp.iinfo(ints).bits
     length = bits - jax.lax.clz(kept[0])
