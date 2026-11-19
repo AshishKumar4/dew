@@ -112,3 +112,21 @@ def test_two_instances_of_an_overriding_trainer_each_build_their_own_state():
     trainers = [Offset(objective, optimizer, key=jax.random.key(0), offset=offset) for offset in (1, 2)]
     assert [int(trainer.place()[0].step) for trainer in trainers] == [1, 2]
     assert [int(trainer.initial_state().step) for trainer in trainers] == [1, 2]
+
+
+def test_a_kept_draw_over_trees_alike_under_other_keys_draws_each_tree_its_own():
+    """Two held trees of leaves alike, shapes and dtypes, under other keys are two kept draws
+    (`dew.objectives.drawn.held_signature`): each call builds its own tree from its own values, where keyed
+    by the leaves alone the second replayed the first's structure over its values (row 8989)."""
+    from dew.objectives.drawn import WHOLE, drawn_once
+
+    def doubled(tree, key):
+        return jax.tree.map(lambda leaf: 2 * leaf, tree)
+
+    first = {"a": jnp.full(3, 1.0), "b": jnp.full(3, 0.0)}
+    second = {"c": jnp.full(3, 5.0), "d": jnp.full(3, 7.0)}
+    key = jax.random.key(0)
+    assert sorted(drawn_once(doubled, first, key, WHOLE, kept="doubled")) == ["a", "b"]
+    drawn = drawn_once(doubled, second, key, WHOLE, kept="doubled")
+    assert sorted(drawn) == ["c", "d"], drawn
+    assert float(drawn["c"][0]) == 10.0 and float(drawn["d"][0]) == 14.0, drawn

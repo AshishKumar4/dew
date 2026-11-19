@@ -93,6 +93,17 @@ KEPT_DRAWS = 8
 _TRACED: collections.OrderedDict[Hashable, TracedDraw] = collections.OrderedDict()
 
 
+def held_signature[Tree](tree: Tree) -> Hashable:
+    """What a kept trace over `tree` is keyed by: each leaf's path in it, as a string, and the leaves'
+    abstract signatures (`abstract_signature`). The paths and not the tree's structure, which holds what
+    its nodes bind (an initializer's objective, its bound init), so a trace held past its trainer keeps none
+    of it alive; the paths all the same, so two trees of leaves alike under other keys are two keys (row
+    8989: flattened first, they shared one trace, the second replaying the first's structure)."""
+    flat = jax.tree_util.tree_flatten_with_path(tree)[0]
+    return (tuple(jax.tree_util.keystr(path) for path, _ in flat),
+            abstract_signature([leaf for _, leaf in flat]))
+
+
 def traced_draw[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array], Built], held: Tree,
                                            key: jax.Array, parts: Parts[Built, Rest, Picked],
                                            kept: Hashable | None = None) -> TracedDraw[Built]:
@@ -100,9 +111,8 @@ def traced_draw[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array],
     (`dew.training.distributed.start_build`, `placed_start`) and an eager draw runs (`drawn_once`). A 4B
     decoder's init traced twice took 41 and 36 s on a B200 host before its first step. Where `kept` states
     what it traces from beside its arguments, the trace its equal made under the same context
-    (`held_context`) over arguments of the same shapes in this process is read (`dew._cache.holding`), the
-    arguments by their leaves alone (the held tree holds its objective's bound init, which a key held past
-    its trainer would keep alive): a trainer's refit traces its start once (PF03)."""
+    (`held_context`) over arguments of the same paths and shapes in this process is read
+    (`dew._cache.holding`, `held_signature`): a trainer's refit traces its start once (PF03)."""
     def made() -> TracedDraw[Built]:
         traced, through = passed_through(function, lambda built: parts.split(built)[1])
         trace = owned_program(traced).trace(held, key)
@@ -111,7 +121,7 @@ def traced_draw[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array],
 
     if kept is None:
         return made()
-    signature = (kept, held_context(), abstract_signature(jax.tree.leaves((held, key))))
+    signature = (kept, held_context(), held_signature((held, key)))
     return holding(_TRACED, signature, made, KEPT_DRAWS)
 
 
