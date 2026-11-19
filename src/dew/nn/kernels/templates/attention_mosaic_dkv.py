@@ -335,8 +335,8 @@ class _PlacedDq:
             first = 0
             for half in halves:
                 columns = half.shape[1]
-                family.added(half, self._view(q_first, slots.turn).at[:, pl.ds(first, columns)], True,
-                             smem=stage.at[slots.turn, 0])
+                family.added(half, self._view(q_first, slots.turn).at[:, pl.ds(first, columns)],
+                             interpret=True, smem=stage.at[slots.turn, 0])
                 first += columns
             return
         ordinal = slots.n // placed.TURNS
@@ -684,13 +684,11 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     each); a later share's program writes no hook gradient."""
     _, queries, heads, width = query.shape
     kv_heads, value_width = key.shape[2], value.shape[-1]
-    program, consumers, kinds = walk.program, walk.consumers, walk.kinds
-    family = program.family
+    program, consumers, kinds, family = walk.program, walk.consumers, walk.kinds, walk.program.family
     block_q, block_k = program.tiles.block_q, program.tiles.block_k
     split, placing = split_queries(family), family.places_on_role
     pair, count = holders(family, consumers) * block_k, block_q // consumers if split else block_q
-    q_steps = queries // block_q
-    stages = min(program.tiles.stages, q_steps)
+    q_steps, stages = queries // block_q, min(program.tiles.stages, queries // block_q)
     graded, buffers, groups = _graded(score_params, kinds, shares, query.shape, key.shape[1],
                                       adds_vectors=family.adds_vectors)
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
@@ -708,11 +706,9 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         dq_ref, dk_ref, dv_ref = outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
-        relayed = family.relay_bytes(block_k, count) > 0
-        relay, rest = (rest[-1:], rest[:-1]) if relayed else ([], rest)
-        tile_stage, rest = (rest[-1], rest[:-1]) if tiled else (None, rest)
-        fused = (4 if placing else 2) if walk.fused else 0
-        fused_stages, logits_stages = rest[:fused], rest[fused:]
+        relay, tile_stage, fused_stages, logits_stages = _held_stages(
+            rest, relayed=family.relay_bytes(block_k, count) > 0, tiled=tiled,
+            fused=(4 if placing else 2) if walk.fused else 0)
         row, head = family.program_index("batch"), family.program_index("heads")
 
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
@@ -722,7 +718,6 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                               for index in range(holders(family, consumers))])
 
         rows_of = functools.partial(_statistics_of, family, stat_refs, (row, head))
-        # A placed fused walk's dQ ring, which its compute warpgroups fill and its reducer drains.
         ring = _PlacedDq(walk, dq_ref, tuple(fused_stages), (row, head)) if placing and walk.fused else None
 
         def consumer(index):
@@ -795,6 +790,15 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     return _dkv_launched(walk, launch, operands, graded, buffers, groups)
+
+
+def _held_stages(rest: list, *, relayed: bool, tiled: bool, fused: int) -> tuple:
+    """A dK/dV program's stages past its resident blocks and output stages, as `_dkv_allocations` lays them:
+    its consumers' relay tiles where `relayed` and its tile gradients' stage where `tiled` (the last), a
+    fused launch's `fused` stages and barriers (its placed walk's dQ ring, `_PlacedDq`), then its logits'."""
+    relay, rest = (rest[-1:], rest[:-1]) if relayed else ([], rest)
+    tile_stage, rest = (rest[-1], rest[:-1]) if tiled else (None, rest)
+    return relay, tile_stage, rest[:fused], rest[fused:]
 
 
 def _block_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: tuple, place: tuple,
