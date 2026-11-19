@@ -1831,10 +1831,23 @@ def _kept_sum(pairs, axis) -> tuple[jax.Array, jax.Array]:
 
 
 def _halved_over(pair, axis) -> tuple[jax.Array, jax.Array]:
-    """A `(high, low)` pair summed over `axis` (kept; none where None) in halves, each addition's rounding
-    kept in the low part (`two_sum`): elementwise and slices alone, which a Pallas TPU kernel forms."""
+    """A `(high, low)` pair summed over `axis` (kept; none where None), each addition's rounding kept in the
+    low part: one XLA reduction of pairs (`_renormalized`), which partitions as any reduction does, so an
+    axis a mesh shards is summed a shard at a time and then across (sliced in halves, its shards split at
+    a size their count does not divide, base review 9e56c760b F1), an empty axis its identity; in a compiled
+    launch's body (`launches.interpreting` False), in halves (`two_sum`), elementwise and slices alone, which
+    a Pallas TPU kernel forms."""
+    from dew.nn.kernels.launches import interpreting
+
     high, low = pair
-    for along in () if axis is None else np.atleast_1d(axis) % high.ndim:
+    axes = () if axis is None else tuple(sorted({int(a) % high.ndim for a in np.atleast_1d(axis)}))
+    if axes and interpreting() is not False:
+        zero = jnp.zeros((), high.dtype)
+        high, low = jax.lax.reduce((high, low), (zero, zero), _renormalized, axes)
+        return jnp.expand_dims(high, axes), jnp.expand_dims(low, axes)
+    for along in axes:
+        if high.shape[along] == 0:
+            high, low = (jnp.zeros((*x.shape[:along], 1, *x.shape[along + 1:]), x.dtype) for x in (high, low))
         while high.shape[along] > 1:
             size, half = high.shape[along], high.shape[along] // 2
             first, second = ([jax.lax.slice_in_dim(x, start, start + half, axis=along) for x in (high, low)]
@@ -1855,7 +1868,7 @@ def _band(products, held, axis, dtype):
     width = _band_width(dtype)
     top = functools.reduce(jnp.maximum, [
         jnp.where(kept, exponent, -jnp.inf) if axis is None
-        else jnp.max(jnp.where(kept, exponent, -jnp.inf), axis=axis, keepdims=True)
+        else jnp.max(jnp.where(kept, exponent, -jnp.inf), axis=axis, keepdims=True, initial=-jnp.inf)
         for kept, (_, exponent) in zip(held, products, strict=True)])
     top = jnp.where(jnp.isfinite(top), top, 0.0)
     taken = [kept & (exponent - top >= -width) for kept, (_, exponent) in zip(held, products, strict=True)]
@@ -1964,7 +1977,10 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
                         along = tuple(d for d, size in enumerate(held) if size == 1)
                         terms.append(products)
                         laid.append((along if along else None, (held, factor.shape)))
-            gradients.append(_aligned_terms(terms, tuple(laid)).astype(factor.dtype))
+            gradient = _aligned_terms(terms, tuple(laid)).astype(factor.dtype)
+            # Placed as the factor is where an Explicit axis splits it: a transpose's cotangent its type's.
+            placed = explicit_spec(factor)
+            gradients.append(gradient if placed is None else jax.sharding.reshard(gradient, placed))
         return gradients
 
     return generation.linear_map(applied, pulled, list(primals), list(tangents))
