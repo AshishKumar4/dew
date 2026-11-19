@@ -8,6 +8,7 @@ import pytest
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from kernel_compile import lowered_for
 
 from dew.nn import derivatives, programs
 from dew.nn.kernels.templates import emission
@@ -43,6 +44,24 @@ def _walked(work):
 def _emitted(fn, *args) -> emission.Emitted:
     """`fn` counted as each of two warpgroups along `wg` runs it."""
     return emission.emitted(jax.make_jaxpr(fn, axis_env=[("wg", 2)])(*args), 2, "wg")
+
+
+def _semantics(predicate) -> plgpu.CompilerParams:
+    """The lowering a kernel holding `predicate` takes: Warpgroup's, Dew's own kernels', unless an operation
+    of it states an output dtype, which Warpgroup refuses and Lane alone holds, typing it by rules of its own
+    (`emission._typed_alike`)."""
+    stated = any(equation.params.get("out_dtype") is not None
+                 for equation in programs.equations(jax.make_jaxpr(predicate)(jnp.int32(0)).jaxpr))
+    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Lane if stated
+                                else plgpu.LoweringSemantics.Warpgroup)
+
+
+def _kernel(body, predicate):
+    """`body` as a kernel of two warpgroups along `wg`, lowered as one holding `predicate` is
+    (`_semantics`)."""
+    return plgpu.kernel(body, out_type=_ROW, num_threads=2, thread_name="wg",
+                        scratch_types=[plgpu.SMEM((128,), jnp.float32)],
+                        compiler_params=_semantics(predicate))
 
 
 @pytest.mark.parametrize("operation", [jnp.exp, jnp.sqrt, lax.rsqrt, jnp.tanh], ids=lambda f: f.__name__)
@@ -131,7 +150,7 @@ def test_a_switch_on_the_warpgroups_role_counts_each_warpgroups_branch_alone():
         (128, 0), (0, 2 * 128)]
 
 
-@pytest.mark.parametrize("predicate, exponentials", [
+SCALAR_PREDICATES = [
     # An integer quotient truncates toward zero: -1 over 2 is 0 at every warpgroup.
     (lambda wg: lax.div(1 - lax.clamp(2, wg, 3), 2) == 0, [128, 128]),
     # By a negative divisor too: 7 over -2 is -3 at the first warpgroup, 8 over -2 -4 at the second.
@@ -142,17 +161,72 @@ def test_a_switch_on_the_warpgroups_role_counts_each_warpgroups_branch_alone():
     (lambda wg: (wg + 127).astype(jnp.int8) < 0, [0, 128]),
     # A logical shift of -1 by 31 is 1; of 0, 0.
     (lambda wg: lax.shift_right_logical(wg - 1, 31) == 1, [128, 0]),
-    # A shift past the width is 0, an arithmetic one's of a negative value -1.
+    # A shift past the width is poison where Mosaic GPU computes it (MLIR's `shli` and `shrsi`), whatever
+    # XLA's saturating fold would give: unknown, both branches at every warpgroup (base review bb25f261d F1).
     (lambda wg: lax.shift_left(wg + 1, 32) == 0, [128, 128]),
-    (lambda wg: lax.shift_right_arithmetic(wg - 1, 40) == -1, [128, 0]),
+    (lambda wg: lax.shift_right_arithmetic(wg - 1, 40) == -1, [128, 128]),
+    # A 4-bit integer's shift within its width folds at its own width (ml_dtypes' int4, which NumPy's
+    # iinfo refuses): 1 << 1 is 2 at the first warpgroup, 2 << 1 is 4 at the second.
+    (lambda wg: lax.shift_left((wg + 1).astype(jnp.int4), jnp.int4(1)) == jnp.int4(4), [0, 128]),
     # A float predicate is no warpgroup arithmetic the fold computes: both branches at every warpgroup.
     (lambda wg: wg.astype(jnp.float32) == jnp.float32(0), [128, 128]),
-], ids=["truncated-quotient", "negative-divisor", "remainder-sign", "int8-wrap", "logical-shift",
-        "shift-past-width", "arithmetic-shift-past-width", "float-unknown"])
+    # A quotient by zero is undefined on the GPU (LLVM's `sdiv`): unknown, both branches at every warpgroup,
+    # where the host's XLA defines it -1 and would count neither.
+    (lambda wg: lax.div(wg + 1, wg * 0) == 0, [128, 128]),
+    # A remainder by zero, an unsigned quotient by zero and a signed least integer's quotient and remainder
+    # by -1 are undefined too, each where the host's value would take neither branch.
+    (lambda wg: lax.rem(wg + 1, wg * 0) == 0, [128, 128]),
+    (lambda wg: lax.div(wg.astype(jnp.uint32) + 1, wg.astype(jnp.uint32) * 0) == 0, [128, 128]),
+    (lambda wg: lax.div(wg * 0 + jnp.int32(-2 ** 31), wg * 0 - 1) == 0, [128, 128]),
+    (lambda wg: lax.rem(wg * 0 + jnp.int32(-2 ** 31), wg * 0 - 1) == 1, [128, 128]),
+    # A minimum stating a dtype apart from its operands' is one Mosaic GPU types by rules of its own: unknown,
+    # both branches at every warpgroup.
+    (lambda wg: lax.min_p.bind(wg, jnp.int32(-1), out_dtype=jnp.dtype(jnp.uint32)).astype(jnp.int32) >= 0,
+     [128, 128]),
+    # A maximum at the stated dtype its operands hold folds (Mosaic Lane's guard): 1 at both warpgroups.
+    (lambda wg: lax.max_p.bind(wg, jnp.int32(1), out_dtype=jnp.dtype(jnp.int32)) == 0, [0, 0]),
+    # A maximum at its operands' width converted to a narrower one: int16's 255 at the second warpgroup is
+    # int8's -1.
+    (lambda wg: lax.max((wg * 254).astype(jnp.int16) + jnp.int16(1), jnp.int16(1)).astype(jnp.int8) == -1,
+     [0, 128]),
+    # A clamp of a product stated unsigned of signed operands, between unsigned bounds: its product unknown,
+    # both branches (Lane's own typing takes the upper bound at both warpgroups, base review 117cc9088 F1).
+    (lambda wg: lax.clamp((wg - 5).astype(jnp.uint32),
+                          lax.mul_p.bind(wg - 2, jnp.int32(1), out_dtype=jnp.dtype(jnp.uint32)),
+                          (wg - 4).astype(jnp.uint32)) == (wg - 4).astype(jnp.uint32),
+     [128, 128]),
+    # A weak literal beside an int16 operand: Lane materializes it at int16, XLA's fold at int32. Unknown,
+    # both branches (base review 7e470364e F1).
+    (lambda wg: lax.mul_p.bind(256, (wg + 256).astype(jnp.int16), out_dtype=jnp.dtype(jnp.int16))
+     == jnp.int16(0), [128, 128]),
+    # A select of a known arm and a product stated unsigned of signed operands: the product unknown, so the
+    # select is too, and both warpgroups take the exponential, as Lane's does (base review 7e470364e F2).
+    (lambda wg: lax.select_n(wg != 0, jnp.uint32(3),
+                             lax.mul_p.bind(wg - 1, jnp.int32(1), out_dtype=jnp.dtype(jnp.uint32)))
+     >= jnp.uint32(2), [128, 128]),
+    # Products stated boolean of integer operands are integers to Lane (2 and 3 times wg + 1, never equal),
+    # not booleans: unknown, both branches, as the GPU's inequality takes it (base review 7e470364e F3).
+    (lambda wg: lax.ne(lax.mul_p.bind(wg + 1, jnp.int32(2), out_dtype=jnp.dtype(jnp.bool_)),
+                       lax.mul_p.bind(wg + 1, jnp.int32(3), out_dtype=jnp.dtype(jnp.bool_))), [128, 128]),
+]
+"""Integer and boolean predicates on a warpgroup's index, each with the exponentials each of two warpgroups'
+programs prices where its row is exponentiated as it holds (`emission.emitted`)."""
+
+SCALAR_IDS = ["truncated-quotient", "negative-divisor", "remainder-sign", "int8-wrap", "logical-shift",
+        "shift-past-width", "arithmetic-shift-past-width", "int4-shift", "float-unknown",
+        "quotient-by-zero-unknown",
+        "remainder-by-zero-unknown", "unsigned-quotient-by-zero-unknown",
+        "least-quotient-by-minus-one-unknown", "least-remainder-by-minus-one-unknown",
+        "min-at-another-signedness", "max-at-its-own-dtype", "max-converted-narrower",
+        "clamp-of-a-signed-product", "weak-literal-product", "select-of-a-stated-product",
+        "stated-boolean-products"]
+
+
+@pytest.mark.parametrize("predicate, exponentials", SCALAR_PREDICATES, ids=SCALAR_IDS)
 def test_scalar_arithmetic_on_the_warpgroup_folds_as_the_program_computes_it(predicate, exponentials):
     """A conditional on integer arithmetic over the warpgroup's index (a quotient by either sign, a
-    remainder, a narrower integer's wrap, shifts within and past the width) counts the branch each
-    warpgroup's program takes, folded as `lax` computes it at its own dtype, where Python's arithmetic floored
+    remainder, a narrower integer's wrap, shifts within the width) counts the branch each warpgroup's program
+    takes, folded as `lax` computes it at its own dtype, where Python's arithmetic floored
     an integer quotient (base review 951e3f9e7 F3); a float predicate, which no warpgroup's index arithmetic
     is, counts both branches at every warpgroup, never one dropped: the fold computes integers and booleans
     alone, where IEEE semantics' edges (subnormals, signed zeros, float64, a complex value) were where its
@@ -161,35 +235,81 @@ def test_scalar_arithmetic_on_the_warpgroup_folds_as_the_program_computes_it(pre
         wg = lax.axis_index("wg").astype(jnp.int32)
         return lax.cond(predicate(wg), jnp.exp, lambda row: row, row)
 
+    def body(x_ref, o_ref, row):
+        row[...] = walk(row[...])
+
+    lowered_for(_kernel(body, predicate), (_ROW,), "sm90")
     assert [role.fixed.exponentials for role in _emitted(walk, _ROW).roles] == exponentials
 
 
-@pytest.mark.parametrize("wide, predicate, exponentials", [
-    # The second warpgroup's int8 16 times itself at int32 is 256, which int8 wraps to 0.
-    (False, lambda wg: lax.mul(*[(wg * 16).astype(jnp.int8)] * 2, out_dtype=jnp.int32) == 256, 128),
-    # The first warpgroup's 2**63 + 2048 times 3 at uint64 wraps to 2**63 + 6144, under x64.
-    (True, lambda wg: lax.mul(wg.astype(jnp.uint64) + jnp.uint64(2 ** 63 + 2048), jnp.uint64(3))
-     == jnp.uint64(2 ** 63 + 6144), 128),
+def _known(predicate) -> list[bool | None]:
+    """Each of two warpgroups' predicate as the fold knows it (`emission.emitted`): true where only its
+    branch is priced, false where only the other's is, None where both are (an unknown predicate)."""
+    def priced(*, taken: bool) -> list[bool]:
+        def walk(row):
+            wg = lax.axis_index("wg").astype(jnp.int32)
+            exponentiated = (jnp.exp, lambda value: value) if taken else (lambda value: value, jnp.exp)
+            return lax.cond(predicate(wg), *exponentiated, row)
+
+        return [role.fixed.exponentials > 0 for role in _emitted(walk, _ROW).roles]
+
+    return [None if held and other else held
+            for held, other in zip(priced(taken=True), priced(taken=False), strict=True)]
+
+
+@pytest.mark.gpu(reason="runs each predicate on the warpgroups of this GPU")
+@pytest.mark.generations("sm90", "sm100")
+@pytest.mark.parametrize("predicate, exponentials", SCALAR_PREDICATES, ids=SCALAR_IDS)
+def test_a_folds_known_predicate_is_the_one_each_warpgroup_computes(predicate, exponentials):
+    """Each predicate the fold knows at a warpgroup (`_known`: its branch alone priced, or the other's alone)
+    is the one that warpgroup computes on this GPU, the kernel lowered by the semantics holding it
+    (`_semantics`), each warpgroup writing its predicate to its own part of the output: the fold priced
+    against the GPU, not against expectations stated by hand (base review 117cc9088 F4, row 8799). An
+    unknown predicate, both branches priced, holds whatever the GPU computes."""
+    del exponentials
+
+    def body(out_gmem, staged):
+        wg = lax.axis_index("wg").astype(jnp.int32)
+        at = pl.ds(wg * 128, 128)
+        staged[at] = jnp.full((128,), predicate(wg).astype(jnp.int32))
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(staged.at[at], out_gmem.at[at])
+        plgpu.wait_smem_to_gmem(0)
+
+    computed = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((256,), jnp.int32), num_threads=2,
+                            thread_name="wg", scratch_types=[plgpu.SMEM((256,), jnp.int32)],
+                            compiler_params=_semantics(predicate))()
+    on_the_gpu = [bool(value) for value in np.asarray(computed).reshape(2, 128)[:, 0]]
+    known = _known(predicate)
+    assert all(held is None or held == gpu for held, gpu in zip(known, on_the_gpu, strict=True)), (
+        known, on_the_gpu)
+
+
+@pytest.mark.parametrize("predicate, exponentials", [
+    # A product stated unsigned of signed operands is one Mosaic GPU types by rules of its own: unknown, both
+    # branches at both warpgroups (Lane keeps its -1 signed, base review 68aa03836 F2).
+    (lambda wg: lax.ge(lax.mul_p.bind(wg - 1, jnp.int32(1), out_dtype=jnp.dtype(jnp.uint32)), jnp.uint32(2)),
+     256),
     # The second warpgroup's 10 wraps to int4's -6.
-    (False, lambda wg: (wg * 10).astype(jnp.int4) == -6, 128),
+    (lambda wg: (wg * 10).astype(jnp.int4) == -6, 128),
     # A float predicate counts both branches at both warpgroups.
-    (False, lambda wg: wg.astype(jnp.float32) == jnp.float32(2.0 ** -140), 256),
-], ids=["product-out-dtype", "uint64-wrap", "int4-wrap", "float-unknown"])
-def test_a_launchs_cost_counts_a_scalar_predicate_as_the_gpu_computes_it(wide, predicate, exponentials):
+    (lambda wg: wg.astype(jnp.float32) == jnp.float32(2.0 ** -140), 256),
+], ids=["product-at-another-signedness", "int4-wrap", "float-unknown"])
+def test_a_launchs_cost_counts_a_scalar_predicate_as_the_gpu_computes_it(predicate, exponentials):
     """A kernel of two warpgroups exponentiating its row where a predicate on the warpgroup's index holds:
     its launch's cost (`emission.costed`, the estimate XLA and Dew's FLOP count read) states the
     exponentials of the warpgroups an integer predicate holds for, folded as the GPU computes it (a product
-    at the output dtype it names, base review f9953e23a F1; a uint64's wrap, edd99fc1d F1; int4's, 0f72bd41c
-    F1), and both branches of each warpgroup where the predicate is a float's, which the fold computes none
-    of."""
+    at the output dtype it names, base review f9953e23a F1; int4's wrap, 0f72bd41c F1), and both branches of
+    each warpgroup where the predicate is a float's, which the fold computes none of. Each kernel lowered for
+    a GPU: a uint64's wrap (edd99fc1d F1) is no cell, as Mosaic GPU lowers no uint64 arithmetic of a
+    warpgroup's index (std::bad_cast, Lane's and Warpgroup's alike)."""
     def body(x_ref, o_ref, row):
         wg = lax.axis_index("wg").astype(jnp.int32)
         row[...] = lax.cond(predicate(wg), jnp.exp, lambda value: value, row[...])
 
-    with jax.enable_x64(new_val=wide):
-        launch = plgpu.kernel(body, out_type=_ROW, num_threads=2, thread_name="wg",
-                              scratch_types=[plgpu.SMEM((128,), jnp.float32)])
-        traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=0)))(_ROW)
+    launch = _kernel(body, predicate)
+    lowered_for(launch, (_ROW,), "sm90")
+    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=0)))(_ROW)
     assert [equation.params["cost_estimate"].transcendentals for equation in programs.equations(traced.jaxpr)
             if "cost_estimate" in equation.params] == [exponentials]
 
@@ -209,51 +329,6 @@ def test_a_launchs_cost_folds_a_bodys_64_bit_arithmetic_at_its_width():
     traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=0)))(_ROW)
     assert [equation.params["cost_estimate"].transcendentals for equation in programs.equations(traced.jaxpr)
             if "cost_estimate" in equation.params] == [0]
-
-
-def _convert(dtype) -> dict:
-    return {"new_dtype": np.dtype(dtype), "weak_type": False, "sharding": None}
-
-
-@pytest.mark.parametrize("primitive, operands, params", [
-    (lax.div_p, (np.int32(-7), np.int32(2)), {}), (lax.div_p, (np.int32(7), np.int32(-2)), {}),
-    (lax.div_p, (np.int32(-7), np.int32(-2)), {}), (lax.rem_p, (np.int32(-7), np.int32(2)), {}),
-    (lax.rem_p, (np.int32(7), np.int32(-2)), {}), (lax.add_p, (np.int32(2 ** 31 - 1), np.int32(1)), {}),
-    (lax.sub_p, (np.uint32(0), np.uint32(1)), {}), (lax.neg_p, (np.int32(-2 ** 31),), {}),
-    (lax.mul_p, (np.int8(16), np.int8(16)), {"out_dtype": np.dtype(np.int32)}),
-    (lax.mul_p, (np.int32(2), np.int32(1)), {"out_dtype": np.dtype(np.bool_)}),
-    (lax.and_p, (np.int32(6), np.int32(3)), {}), (lax.xor_p, (np.int32(6), np.int32(3)), {}),
-    (lax.not_p, (np.int32(5),), {}), (lax.not_p, (np.bool_(1),), {}),
-    (lax.or_p, (np.bool_(0), np.bool_(1)), {}),
-    (lax.max_p, (np.int32(-3), np.int32(2)), {}), (lax.clamp_p, (np.int32(0), np.int32(9), np.int32(4)), {}),
-    (lax.shift_left_p, (np.int32(3), np.int32(30)), {}), (lax.shift_left_p, (np.int32(3), np.int32(32)), {}),
-    (lax.shift_right_arithmetic_p, (np.int32(-8), np.int32(1)), {}),
-    (lax.shift_right_arithmetic_p, (np.int32(-8), np.int32(40)), {}),
-    (lax.shift_right_arithmetic_p, (np.uint32(2 ** 31), np.uint32(1)), {}),
-    (lax.shift_right_arithmetic_p, (np.uint32(2 ** 31), np.uint32(40)), {}),
-    (lax.shift_right_logical_p, (np.int32(-1), np.int32(28)), {}),
-    (lax.shift_right_logical_p, (np.int32(-1), np.int32(32)), {}),
-    (lax.convert_element_type_p, (np.int32(10),), _convert(jnp.int4)),
-    (lax.convert_element_type_p, (np.int32(200),), _convert(np.int8)),
-    (lax.convert_element_type_p, (np.int32(-2),), _convert(np.bool_)),
-    (lax.convert_element_type_p, (np.bool_(1),), _convert(np.int32)),
-], ids=lambda value: getattr(value, "name", None))
-def test_an_integer_scalar_folds_as_its_primitive_computes_it(primitive, operands, params):
-    """A quotient and a remainder by either sign, a width's wrap (int32's, uint32's, int8's, int4's, a
-    product at the output dtype it names, a boolean's among them), bitwise and boolean logic, an extremum and
-    a clamp, shifts within and past the width (an unsigned value's arithmetic one reading it as signed) and
-    conversions among integer and boolean dtypes fold as the primitive bound at its operands' dtypes computes
-    them (`emission.scalar_evaluated` against `lax`'s own evaluation; base review 4608795fd F1, F2), and
-    lower no program to fold: bound, each kernel's index arithmetic compiled a one-primitive program a process
-    (18 beside a 4B step's first trace, row 8612)."""
-    from dew.telemetry.compiles import executable_only
-
-    bound = np.asarray(primitive.bind(*map(jnp.asarray, operands), **params))
-    # JAX's in-memory caches cleared, so a fold that binds the primitive traces its program again.
-    jax.clear_caches()
-    with executable_only():
-        folded = emission.scalar_evaluated(primitive, operands, params, bound.dtype)
-    assert folded is not None and folded.dtype == bound.dtype and folded == bound[()], (folded, bound)
 
 
 def test_an_unknown_branch_counts_the_most_of_each_unit_any_branch_issues():

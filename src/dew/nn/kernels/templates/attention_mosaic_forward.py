@@ -1804,14 +1804,13 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
     # A value of the keys' columns names its block statically (`_Program.value_columns`), no index read.
     block = (None if column_width is None or value_columns is not None
              else jnp.full((1,), (columns or 0) // column_width, jnp.int32))
-    target = generation.gpu_target()
     return _launched(query, key, value,
                      _Read(spans, hooked, anchors, None if table is None else table[0],
                            None if walks is None else walks.blocks, sources, block, into, kept=keeping),
                      hooks=jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), hooks),
                      spec=spec, tiles=tiles, family=family, training=training, interpret=interpret,
                      peaks=peaks, out_dtype=None if out_dtype is None else jnp.dtype(out_dtype),
-                     counted=counted, finishes=finishes, target=target,
+                     counted=counted, finishes=finishes,
                      name=name if splits == 1 else f"{name}_split", splits=splits,
                      page=None if table is None else table[1],
                      column_width=column_width, shared_by=shared_by,
@@ -1983,21 +1982,23 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
-                      "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by",
+                      "counted", "finishes", "name", "splits", "page", "column_width", "shared_by",
                       "certified", "flags", "walk_rows", "parts", "registers", "value_columns", "decides"))
 def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
-              peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
-              name: str, splits: int = 1, page: int | None = None,
-              column_width: int | None = None, shared_by: int = 1,
+              peaks: bool, out_dtype, counted: bool, finishes: bool, name: str, splits: int = 1,
+              page: int | None = None, column_width: int | None = None, shared_by: int = 1,
               certified: bool = False, flags: bool = False, walk_rows: int | None = None, parts: int = 1,
               registers: int | None = None, value_columns: int | None = None, decides: bool = False):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
-    and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
-    `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it) and `registers` its
-    consumer's, which it states with it (`Family.kernel`)."""
+    and its operands' shapes and dtypes (`tuning.lowered_once`); `name` its kernel's (`mosaic.kernel` reports
+    it as the launch tracing it names it) and `registers` its consumer's, which it states with it
+    (`Family.kernel`). Not the target its config is derived for: its emission reads none of it but what the
+    launch's digest keys (`report._identity`'s generation and size), and a part's name and prices in its
+    static facts named its kernels apart on every part of a generation (an H100's build and a GH200's run,
+    row 8372)."""
     leaves, treedef = jax.tree.flatten(read)
     batch, queries, heads, width, value_width, keys_count, kv_heads = _extents(
         query, key, value, read, page=page, column_width=column_width, parts=parts)
@@ -2036,9 +2037,11 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                         kinds=kinds, peaks=peaks, training=training, finishes=finishes, certified=certified,
                         interpret=interpret, value_width=value_width)
 
+    # The generation's own target, which the launch's digest keys, not the placed part's (row 8372).
+    tmem_columns = generation.gpu_target(generation.device_generation()).tmem_columns
     products = forward_products(family, tiles, value_width, query.dtype, peaks=peaks, parts=parts,
                                 ahead=bool(program.ahead), scaled=spec.headroom, training=training,
-                                query_width=width, tmem_columns=target.tmem_columns)
+                                query_width=width, tmem_columns=tmem_columns)
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,

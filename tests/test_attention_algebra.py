@@ -329,10 +329,11 @@ def test_a_resumed_state_carried_far_is_as_exact_as_the_references(natural):
         return template.Hooks(initial=template.Initial(jnp.zeros((4, 1, 1)), jnp.ones((4, 1, 1)), acc))
 
     def triton(distance, value, acc):
+        from generation_support import interprets
+
         with tuning.pinned({attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}):
             return attention_triton.forward(distance, jnp.ones_like(distance), value, spans, state(acc),
-                                            scale=1.0, natural=natural,
-                                            interpret=jax.default_backend() != "gpu")
+                                            scale=1.0, natural=natural, interpret=interprets())
 
     def portable(distance, value, acc):
         return attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK),

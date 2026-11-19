@@ -352,6 +352,9 @@ class Region[Node: (Term, Skeleton)]:
     magnitudes: Mapping[Hashable, Magnitude | None]
     products: dict[int, tuple[np.dtype | None, ...]] = dataclasses.field(default_factory=dict)
     """Each product's parameters' index (`Term.dot`'s), its operands' dtypes (a rule's product its own's)."""
+    made: dict[int, np.dtype] = dataclasses.field(default_factory=dict)
+    """Each product's parameters' index, the dtype it makes as traced (`product_dtype`; a rule's product its
+    source's), apart from its parameters, which the region replays as they were traced."""
     literal_keys: frozenset[Hashable] = frozenset()
     """Each literal's term's key (`literals`' terms)."""
     indexed: dict[Hashable, int] = dataclasses.field(default_factory=dict)
@@ -366,11 +369,13 @@ class Region[Node: (Term, Skeleton)]:
         for term, extent in self.shapes:
             self.extents.setdefault(key(term), extent)
 
-    def interned(self, primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None) -> int:
+    def interned(self, primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None,
+                 made: np.dtype | None = None) -> int:
         """The index of `primitive` at `values` in the region's table (`params`), added where it holds none
         (`_interned`): a rule set's own parameters (a transposed product's plain one) by the rule the
         region's equations were interned by."""
-        return _interned(self.params, self.products, self.indexed, primitive, values, operands)
+        return _interned(self.params, (self.products, self.made), self.indexed, primitive, values, operands,
+                         made)
 
     def shape(self, term: Node) -> tuple[int, ...]:
         """`term`'s shape as its equation states it, a term of the region's: the one lookup of the shapes its
@@ -403,18 +408,23 @@ def key(term: BaseExpr | Skeleton) -> Hashable:
     return term.__egg_typed_expr__
 
 
-def _interned(params: list, products: dict, indexed: dict[Hashable, int], primitive: jcore.Primitive,
-              values: Mapping, operands: tuple | None = None) -> int:
+def _interned(params: list, tables: tuple[dict, dict], indexed: dict[Hashable, int],
+              primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None,
+              made: np.dtype | None = None) -> int:
     """The index of `primitive` at `values` in a region's table `params`, added where it holds none: two
     entries are one where their primitive and parameters are (`parameters_key`) and, of a product, its
-    `operands`' dtypes too, which key its mode (`cost.work`) and are kept in `products`. The one interning
-    of a region's parameters, while it is built (`_region`) and after (`Region.interned`)."""
+    `operands`' dtypes too, which key its mode (`cost.work`), each kept in `tables` (`Region.products`), with
+    the dtype it `made` (`Region.made`, which its operands' dtypes and parameters fix). The one interning of
+    a region's parameters, while it is built (`_region`) and after (`Region.interned`)."""
+    products, made_by = tables
     entry = (*parameters_key(primitive, values), operands)
     if entry not in indexed:
         indexed[entry] = len(params)
         params.append((primitive, dict(values)))
         if operands is not None:
             products[indexed[entry]] = operands
+        if made is not None:
+            made_by[indexed[entry]] = np.dtype(made)
     return indexed[entry]
 
 
@@ -618,8 +628,9 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     depths: dict[jcore.Var, int] = {}
 
     products: dict[int, tuple[np.dtype | None, ...]] = {}
+    made: dict[int, np.dtype] = {}
 
-    param = functools.partial(_interned, params, products, indexed)
+    param = functools.partial(_interned, params, (products, made), indexed)
 
     env: dict[jcore.Var, Node] = {}
     dtypes: dict[Hashable, np.dtype] = {}
@@ -715,7 +726,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     literal_outputs = [atom.val if isinstance(atom, jcore.Literal) else None for atom in jaxpr.outvars]
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
-                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
+                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products, made,
                   frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed,
                   {var: magnitudes.get(key(node)) for var, node in env.items()})
 
@@ -1238,15 +1249,17 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
     return None
 
 
-def product_dtype(params: Mapping, operands: tuple) -> np.dtype:
-    """The dtype a product (`Term.dot`) of operands of `operands`' dtypes at `params` makes: its preferred
-    element type, which a product of two dtypes always states (`_term`: its traced result's), else its
-    operands' one dtype; never another library's promotion of theirs (NumPy's refuses a bfloat16 beside a
-    float16, base review 0b8b7ed98 F1)."""
-    preferred = params.get("preferred_element_type")
+def product_dtype(region: Region, index: int) -> np.dtype:
+    """The dtype the product (`Term.dot`) at parameters `index` makes: as traced (`Region.made`, a rule's
+    product its source's), else its preferred element type, else its operands' one dtype; never another
+    library's promotion of theirs (NumPy's refuses a bfloat16 beside a float16, base review 0b8b7ed98 F1),
+    nor a trace of a product made for it (base review 7754e5fde F3)."""
+    if index in region.made:
+        return region.made[index]
+    preferred = region.params[index][1].get("preferred_element_type")
     if preferred is not None:
         return np.dtype(preferred)
-    (dtype,) = set(map(np.dtype, operands))
+    (dtype,) = {np.dtype(each) for each in region.products[index] if each is not None}
     return dtype
 
 
@@ -1487,14 +1500,12 @@ def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., 
         if dtypes == {given.get("preferred_element_type")}:
             # A product accumulating in its operands' own dtype is one of no preferred type (`rules.plain`).
             given["preferred_element_type"] = None
-        elif len(dtypes) > 1 and given.get("preferred_element_type") is None:
-            # A product of two dtypes states the dtype it makes, its traced result's (`product_dtype`), and is
-            # no plain one a rule may move.
-            (made,) = (var.aval for var in equation.outvars if isinstance(var.aval, ShapedArray))
-            given["preferred_element_type"] = made.dtype
         operands = tuple(np.dtype(var.aval.dtype) if isinstance(var.aval, ShapedArray) else None
                          for var in equation.invars)
-        return write(others[0], param(primitive, given, operands))
+        # The dtype it makes as traced (`Region.made`), kept apart from its parameters, which the region
+        # replays as traced (a product of two dtypes' unset preferred type stays so, base review 3232beb7c).
+        (traced,) = (var.aval for var in equation.outvars if isinstance(var.aval, ShapedArray))
+        return write(others[0], param(primitive, given, operands, traced.dtype))
     return write(operation.symbol, *others, param(primitive, equation.params))
 
 

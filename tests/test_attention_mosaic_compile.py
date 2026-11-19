@@ -759,6 +759,46 @@ compile-only H100: each certification's op, whether its verdict was read back, a
 
 
 @COMPILES_ON_CPU
+def test_a_launchs_kernels_are_named_alike_on_every_part_of_one_generation_and_size():
+    """An attention forward traced for an H100 and for a GH200, two parts of sm90 of one size (their
+    multiprocessors and shared memory), emits the same kernels, and names them alike: a kernel's name
+    digests what its emission reads (`report.named`), not the part's name nor its prices, so a step compiled
+    ahead on a compile-only H100 (the generation's canonical part) is the program a GH200 runs. The forward's
+    launch held the target whole among its static facts, and a GH200's run named all six of its forward
+    kernels apart from its build's, every program holding them missed (row 8372, M-MC-27-3f)."""
+    from dew.nn.kernels.lowered import kernel_calls
+
+    tokens, heads, kv_heads, width = 640, 4, 2, 128
+    spans = template.spans(tokens, tokens, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
+
+    def named(part: str) -> list[tuple[str, str | None]]:
+        # Lowered for a compile-only GPU of the generation as `kernel_compile.lowered_for` lowers, within the
+        # part's own facts (`assumed` of its target, which `lowered_for`'s generation would replace).
+        from jax.experimental.mosaic.gpu import core as mgpu_core
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+        target = generation.gpu_target(part)
+        mesh = Mesh([generation.compile_only_gpus("sm90")[0]], ("x",))
+        placed = [jax.ShapeDtypeStruct(spec.shape, spec.dtype, sharding=NamedSharding(mesh, PartitionSpec()))
+                  for spec in (query, key, key)]
+        with (generation.assumed(target), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
+              mgpu_core.artificial_shared_memory_limit(target.shared_limit)):
+            lowered = jax.jit(lambda q, k, v: attention_mosaic.forward(q, k, v, spans, None)).trace(
+                *placed).lower()
+        # Each kernel by its name and the digest of its launch the name carries (`report.named`).
+        return sorted((call.name, call.launch) for call in kernel_calls(lowered, unrun=True))
+
+    h100, gh200 = generation.gpu_target("NVIDIA H100 80GB HBM3"), generation.gpu_target("NVIDIA GH200 480GB")
+    assert (h100.generation, h100.multiprocessors, h100.shared_limit) == (
+        gh200.generation, gh200.multiprocessors, gh200.shared_limit)
+    names = named("NVIDIA H100 80GB HBM3")
+    assert names and all(launch for _, launch in names), names
+    assert names == named("NVIDIA GH200 480GB"), names
+
+
+@COMPILES_ON_CPU
 def test_a_launch_is_certified_once_a_machine(tmp_path):
     """A launch certified by one process (`report.certified`: compiled alone, its verdict stored with the
     kernel picks) is certified in the next on the same machine by its stored verdict, nothing compiled, the
@@ -949,7 +989,10 @@ grouped 256-wide heads, whose backward on an H100 adds its dQ and dK/dV into acc
 
 def _stack_temp(layers: int) -> int:
     """The temporaries of a training step of `layers` checkpointed layers (each a grouped causal attention
-    through the template, then a wide MLP), compiled for a compile-only H100."""
+    through the template, then a wide MLP), compiled for a compile-only H100 stating 128 MiB, below the step's
+    need, so XLA's scheduler holds the least it can and the temporaries are its buffers' lifetimes alone (an
+    H100's 80 GB lets it overlap the layers, 244 MB at two; a compile-only GPU stated 0 bytes before row
+    8768)."""
     batch, tokens, heads, groups, width, hidden = STACK
 
     def layer(x, weights):
@@ -969,7 +1012,8 @@ def _stack_temp(layers: int) -> int:
            jax.ShapeDtypeStruct((heads * width, hidden), jnp.bfloat16),
            jax.ShapeDtypeStruct((hidden, heads * width), jnp.bfloat16))
     with generation.assumed("sm90"):
-        compiled = lowered_for(jax.grad(loss, argnums=(0, 1)), (x, (one,) * layers), "sm90").compile()
+        compiled = lowered_for(jax.grad(loss, argnums=(0, 1)), (x, (one,) * layers), "sm90",
+                               memory=2**27).compile()
     return compiled.memory_analysis().temp_size_in_bytes
 
 
