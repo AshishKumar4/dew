@@ -213,10 +213,10 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
 
         @as_given
         def run(x, kernel, dy):
-            from generation_support import interprets
+            from generation_support import here
 
-            # A CPU interprets the kernels as the A100 it states; a GPU (or GPU-tier prepare) runs its own.
-            with generation.assumed("sm80") if interprets() else contextlib.nullcontext():
+            # A CPU interprets the kernels as the A100 it states; a GPU/TPU (or GPU-tier prepare) runs its own.
+            with generation.assumed("sm80") if here() == "cpu" else contextlib.nullcontext():
                 (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(x, kernel, dy)
             return y, dk, dx
         return run

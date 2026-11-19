@@ -162,17 +162,19 @@ def check_each(case: dict, names: frozenset, dtype, configs, *, residuals: bool 
             return out
         return out[0], spec.naturalized(out[1]) if spec.raw else out[1], out[2]
 
+    def setup():
+        return (template.spans(queries, keys, ROWS, **arguments(case)),
+                hooks_for(names, queries, value_width, gate))
+
     def ours(query, key, value):
-        spans = template.spans(queries, keys, ROWS, **arguments(case))
-        hooks = hooks_for(names, queries, value_width, gate)
+        spans, hooks = setup()
         spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=scale,
                                score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None,
                                prescale=power)
         return {str(config): at(config, query, key, value, spans, hooks, spec) for config in configs}
 
     def xla(query, key, value):
-        spans = template.spans(queries, keys, ROWS, **arguments(case))
-        hooks = hooks_for(names, queries, value_width, gate)
+        spans, hooks = setup()
         return dict.fromkeys(map(str, configs), template.reference(query, key, value, spans, hooks,
                                                                    residuals=residuals))
 
