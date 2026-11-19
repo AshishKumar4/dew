@@ -138,14 +138,15 @@ class Tcgen05Placed(Tcgen05Rings):
         # and sums within 512 columns at 64 keys and width 128). Its one walk's sums kept across it (`SUMS`),
         # and its hand-offs: the logits' (`scored`, two turns, the issuer's commit), the weights' (`weighed`,
         # two, the consumer's threads, their tensor-memory stores ordered before the products that read them)
-        # and the sums' (`summed`, one, the commit). The products it places are those alone
+        # and the sums' (`summed`, two, the commit: a turn's weighted values, the product that last read the
+        # turn's weights, `accumulating`). The products it places are those alone
         # (`placed_products`).
         del widths, together
         ((logits,), (left,), (kept,)) = ahead, tuple(dict.fromkeys(lefts)), sums
         rows, (depth, dtype) = self.rows, left
         return {"scored": tuple(self.signals(2).scratch() for _ in range(consumers)),
                 "weighed": tuple(self.signals(2).scratch() for _ in range(consumers)),
-                "summed": tuple(self.signals(1).scratch() for _ in range(consumers)),
+                "summed": tuple(self.signals(2).scratch() for _ in range(consumers)),
                 LOGITS: tuple(tuple(plgpu.RefUnion(self.tensor_memory((rows, logits)),
                                                    self.tensor_memory((rows, depth), dtype))
                                     for _ in range(2)) for _ in range(consumers)),
@@ -170,7 +171,7 @@ class Tcgen05Placed(Tcgen05Rings):
         weights', the sums'."""
         found, role = self._scoped(), mosaic.ROLE.get() if consumer is None else consumer
         return (self.signals(2).opened(found["scored"][role]), self.signals(2).opened(found["weighed"][role]),
-                self.signals(1).opened(found["summed"][role]))
+                self.signals(2).opened(found["summed"][role]))
 
     def _turns(self, name: str, consumer: int | None = None) -> tuple[Accumulator, ...]:
         """A consumer's two turns of the `name` tiles (`product_scratch`'s `LOGITS`, or the `WEIGHTS` over
@@ -188,11 +189,14 @@ class Tcgen05Placed(Tcgen05Rings):
         return self.read(self._turns(declared.into)[slots.turn], layout=TMEM)
 
     def accumulating(self, declared: mosaic.Product | None, slots, inline: Callable) -> Callable:
-        # The step's weights given the issuer: once the step before's weighted values are done (its weights'
-        # turn free, the sums settled), written narrowed into their turn's tile, the sums taken by the step's
-        # factor in place a block of columns at a time where its product adds onto them (`declared`'s
-        # `accumulate`), both published together (`weighed`); the walk's first step rescales nothing (its sums
-        # are the issuer's first product's, fresh).
+        # The step's weights given the issuer: written narrowed into their turn's tile once the weighted
+        # values that last read it are done (two steps back, `summed` at that turn), the sums taken by the
+        # step's factor in place a block of columns at a time where its product adds onto them (`declared`'s
+        # `accumulate`) once the step before's weighted values are done, both published together
+        # (`weighed`); the walk's first step rescales nothing (its sums are the issuer's first product's,
+        # fresh). A step whose factor moves no row (`Taken.moves`, a lazy walk's most) waits on no product
+        # of the step before: its softmax runs under that step's weighted values, where waiting on them
+        # before every step's weights held its chain behind them.
         del inline
         _, weighed, summed = self._signals()
         adds = declared is not None and declared.accumulate
@@ -201,12 +205,16 @@ class Tcgen05Placed(Tcgen05Rings):
             del value
             (weights,) = parts
             if not slots.first:
-                summed.wait(summed.turn(slots.n - 1))
+                pl.when(slots.n >= 2)(lambda: summed.wait(summed.turn(slots.n - 2)))
             self.write(self._turns(WEIGHTS)[slots.turn], weights)
             if scale is not None and adds and not slots.first:
                 # A pass over the sums in tensor memory only where the step moves some row's (`Taken.moves`):
                 # a lazy walk keeps its anchor most steps (one warpgroup vote, `bar.red.or.pred`).
-                pl.when(scale.moves)(lambda: _rescaled(self, acc, scale))
+                def rescaled():
+                    summed.wait(summed.turn(slots.n - 1))
+                    _rescaled(self, acc, scale)
+
+                pl.when(scale.moves)(rescaled)
             weighed.published(weighed.turn(slots.n))
             return acc
 
@@ -251,7 +259,9 @@ class Tcgen05Placed(Tcgen05Rings):
                  mosaic.Loop(last, 0, jnp.where((count > 0) & (count % 2 == 0), 1, 0)))
         carry, kept = self.accumulated(loops, start, shapes, interpret, initial)
         _, _, summed = self._signals()
-        pl.when(hi > lo)(lambda: summed.wait(summed.turn(hi - lo - 1)))
+        # Its last two steps' weighted values, each turn's last phase observed in order.
+        for back in (2, 1):
+            pl.when(count >= back)(lambda back=back: summed.wait(summed.turn(count - back)))
         return carry, kept
 
     def issuing(self, streams, products: Sequence[mosaic.Product], lo, hi, *, first,
