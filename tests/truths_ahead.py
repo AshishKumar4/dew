@@ -231,12 +231,15 @@ class CompiledTruths:
 
     def ran(self, label: str, role: str, inputs):
         """The site's arm `role` run on `inputs` (`called`), reporting the routes its prepare's trace of it
-        reported (`generation.reported`), as a trace of it in the run would report them: the run calls its
-        executable and traces none (row 8374: a matrix cell's routes were empty on its GPU)."""
-        from dew.nn.kernels import generation
+        reported (`generation.reported`) and recording the launches it took and their configs
+        (`tuning.noted`), as a trace of it in the run would: the run calls its executable and traces none
+        (row 8374: a matrix cell's routes were empty on its GPU; row 8580: a pinned cell's launches)."""
+        from dew.nn.kernels import generation, tuning
 
         found = self.called(label, role, inputs)
-        generation.reported(self._site(label)[1][named(role, inputs)]["routes"])
+        record = self._site(label)[1][named(role, inputs)]
+        generation.reported(record["routes"])
+        tuning.noted(record["launches"])
         return found
 
     def walked(self, label: str, role: str, inputs) -> bool:

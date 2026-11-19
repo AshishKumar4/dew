@@ -111,7 +111,7 @@ from truths_ahead import AT_RUN, COMPILED, CompiledTruths, arm_role, judged, nam
 from dew._accuracy import distance, reduction_bound, within
 from dew.algebra import passes
 from dew.nn import programs
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import report
 from dew.parity import (
     CONFIDENCE,
@@ -656,11 +656,12 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
             raise ValueError(f"{name}: an arm compiled with its own compiler options is held whole, over its "
                              "inputs as arrays, and these inputs are a tree of them")
         programs[name] = (_Whole(traced_fn), [*map(jax.typeof, leaves)])
-        with generation.routes() as reported:
+        with generation.routes() as reported, tuning.seen() as launched:
             out = traced_fn.trace(*inputs).out_info
-        held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported)}
+        held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported),
+                      "launches": launched.held()}
         return out
-    with generation.routes() as reported:
+    with generation.routes() as reported, tuning.seen() as launched:
         closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
     structure = jax.tree.structure(inputs)
     schema = [jax.typeof(constant) for constant in closed.consts]
@@ -677,9 +678,9 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         return retraced
 
     _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
-    # The routes its trace reported, which its run, calling the program and tracing none, reports at each call
-    # (`truths_ahead.CompiledTruths.ran`).
-    held[name]["routes"] = list(reported)
+    # The routes its trace reported and the launches it took, which its run, calling the program and tracing
+    # none, reports at each call (`truths_ahead.CompiledTruths.ran`).
+    held[name]["routes"], held[name]["launches"] = list(reported), launched.held()
     return shapes
 
 
