@@ -478,11 +478,13 @@ class StartBuild:
 
 
 def start_build(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                shardings: Placement[TrainState], through: Mapping[int, int]) -> StartBuild:
+                shardings: Placement[TrainState], through: Mapping[int, int], built: tuple[int, ...]
+                ) -> StartBuild:
     """The one way a fresh state is built and placed, which a run's start runs (`placed_start`) and a run
     compiled ahead compiles (`start_compiled`): where its init passes no frozen leaf through, one program
     builds the state; where it does, the passed leaves are the held arrays placed where the state keeps them,
-    and the program builds the rest (`_rest`). One build a process keeps for each init (`initial_state`, by
+    and the program builds the rest (`drawn_rest`), the frozen leaves at `built` among it (`traced_draw`'s
+    `TracedDraw.built`). One build a process keeps for each init (`initial_state`, by
     the object itself: a refit's start traced once, `traced_draw`), placement and held arrays it passes
     through, held weakly (`Held`, `_cache.holding`), so a trainer's refits compile and lower its program
     once (PF03): their start's program keeps the executable their call runs (`start_compiling`)."""
@@ -490,18 +492,18 @@ def start_build(initial_state: Callable[[Initializer, jax.Array], TrainState], i
     where = jax.tree.flatten(shardings)
     passed = tuple((index, Held(inputs[given])) for index, given in sorted(through.items()))
     return holding(_BUILDS, (Held(initial_state), where[1], tuple(where[0]), passed),
-                   lambda: _built(initial_state, initializer, shardings, through), KEPT_STARTS)
+                   lambda: _built(initial_state, initializer, shardings, through, built), KEPT_STARTS)
 
 
 def _built(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-           shardings: Placement[TrainState], through: Mapping[int, int]) -> StartBuild:
+           shardings: Placement[TrainState], through: Mapping[int, int], built: tuple[int, ...]
+           ) -> StartBuild:
     """`start_build`'s build, made."""
     moving, frozen = apart(shardings)
     if not frozen or not through:
         return StartBuild(initial_state, shardings, {}, through)
     inputs = jax.tree.leaves(initializer)
     where, structure = jax.tree.flatten(frozen)
-    built = tuple(index for index in range(len(where)) if index not in through)
     # Each passed leaf is placed once, where the state keeps it, whatever path the init moves it to.
     return StartBuild(drawn_rest(initial_state, HELD_APART, built),
                       (moving, tuple(where[index] for index in built)),

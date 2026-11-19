@@ -1252,13 +1252,14 @@ def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int]
 @dataclasses.dataclass(frozen=True)
 class Start:
     """What `Trainer.place` reads before it places the state (`Trainer._started`): the objective's
-    held tree and the key, the state's shapes and which frozen leaves its init passes through
-    (`traced_draw`), the checkpoint step a run resumes from, the state's placement and its build."""
+    held tree and the key, the state's shapes, which frozen leaves its init passes through and which it
+    builds (`traced_draw`), the checkpoint step a run resumes from, the state's placement and its build."""
 
     initializer: Initializer
     key: jax.Array
     abstract: TrainState
     through: dict[int, int]
+    built: tuple[int, ...]
     resume: int | None
     shardings: Placement[TrainState]
     build: Callable[[Initializer, jax.Array], TrainState]
@@ -1295,7 +1296,7 @@ class Start:
         (`placed_host`)."""
         from dew.training.distributed import start_build
 
-        return start_build(self.build, self.initializer, self.shardings, self.through)
+        return start_build(self.build, self.initializer, self.shardings, self.through, self.built)
 
 
 def _rollout_admitted(rollout: Rollout | None) -> Rollout | None:

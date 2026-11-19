@@ -250,8 +250,8 @@ def location(directory: str) -> epath.Path:
 class Envelope(TypedDict):
     """What a checkpoint of a run's state holds on every tier, as `Checkpoints.save` and `save_local` each
     take it, their own metadata beside it: the state as saved, its data position (`saved`), the partition
-    it was read by, the stop control, the rung, the artifact, the boxed axes and the rollout's tree
-    (`dew.training.Trainer`'s one envelope, row 4126)."""
+    it was read by, the stop control, the rung, the artifact, what its objective's loss computes
+    (`training`), the boxed axes and the rollout's tree (`dew.training.Trainer`'s one envelope, row 4126)."""
 
     state: TrainState
     saved: bytes | None
@@ -259,6 +259,7 @@ class Envelope(TypedDict):
     control: dict | None
     rung: JSON
     artifact: JSON
+    training: JSON
     boxed: Mapping[tuple[str, ...], LogicalAxes] | None
     rollout: Mapping[str, object] | None
 
@@ -1130,6 +1131,14 @@ class Checkpoints:
                   else self._custom(step))
         return json_value(custom.get('artifact'), 'artifact')
 
+    def training(self, step: int) -> JSON:
+        """What the objective's loss computed at `step` (`Objective.training_record`), which a resume holds
+        the run to (`dew.training.startup.computation_differs`); None for a step saved outside `fit` or before
+        Dew recorded it. Read from the tier `artifact` reads."""
+        custom = (self._step_metadata(step, local=True).custom_metadata or {} if step == self._local_latest()
+                  else self._custom(step))
+        return json_value(custom.get('training'), 'training')
+
     def control(self, step: int) -> dict:
         if step == self._local_latest():
             custom = self._step_metadata(step, local=True).custom_metadata or {}
@@ -1416,6 +1425,7 @@ class Checkpoints:
         primary: str | None = None,
         rung: JSON = None,
         artifact: JSON = None,
+        training: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
         tokenizer: Tokenizer | None = None,
@@ -1432,7 +1442,8 @@ class Checkpoints:
         which the state holds unboxed; `variables` places with them. A mapping is
         written as it is, with `metrics`, `ranking` and `control` as a train state's are,
         and `restore` reads it back through a mapping template; it takes no
-        data position, share, weights-only split, rung or artifact. It is
+        data position, share, weights-only split, rung, artifact or training record (`training`, what the
+        objective's loss computes, `Objective.training_record`, which a resume compares). It is
         written whole at every step, without the store a train state's
         static collections go to (`FROZEN_STORE`), so large arrays no step
         changes are better kept out of it.
@@ -1458,9 +1469,11 @@ class Checkpoints:
         """
         mapping = isinstance(state, Mapping)
         if mapping and (saved is not None or share is not None or weights_only or rung is not None
-                        or artifact is not None or rollout is not None or tokenizer is not None):
+                        or artifact is not None or training is not None or rollout is not None
+                        or tokenizer is not None):
             raise ValueError("a mapping is saved as it is: it takes no data position, share, weights-only "
-                             "split, rung, artifact or rollout, which a train state's save records")
+                             "split, rung, artifact, training record or rollout, which a train state's save "
+                             "records")
         if not mapping:
             # No tier writes a non-finite state, before any write or retention (`refuse_non_finite`).
             from dew.training.transaction import refuse_non_finite
@@ -1484,7 +1497,7 @@ class Checkpoints:
         scores = {**(metrics or {}), **({'checkpoint/weights_only': 1.0} if weights_only else {})}
         rankings = () if ranking is None else (ranking,) if isinstance(ranking, Ranking) else ranking
         rules = self._ranked(rankings, scores)
-        custom = {**step_record(deltas, control, rung, artifact, boxed, state_tree),
+        custom = {**step_record(deltas, control, rung, artifact, training, boxed, state_tree),
                   "profiles": profile_metadata, "rankings": rules,
                   "primary": primary or (rankings[0].metric if rankings else None),
                   "weights_only": weights_only, "frozen": frozen, "tree": mapping}
@@ -1818,6 +1831,7 @@ class Checkpoints:
         control: dict | None = None,
         rung: JSON = None,
         artifact: JSON = None,
+        training: JSON = None,
         boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
     ) -> None:
@@ -1852,7 +1866,7 @@ class Checkpoints:
                 args=ocp.args.PyTreeSave(state_tree),
                 force=True,
                 custom_metadata={
-                    **step_record(deltas, control, rung, artifact, boxed, state_tree),
+                    **step_record(deltas, control, rung, artifact, training, boxed, state_tree),
                     "processes": jax.process_count(),
                     "placement": written,
                     "grid": None if grid is None else to_record(grid, Grid),

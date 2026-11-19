@@ -970,8 +970,13 @@ class Objective(ABC, Generic[Loss, Effects]):
     student, passes as that one does."""
     resumable: ClassVar[tuple[str, ...]] = ()
     """The arguments that weigh how the objective learns rather than say what it trains, which a run resumed
-    under its name may change (`dew.config.RunConfig.check_resume`), as a later phase of training lowers a
-    coefficient; every other argument the resume must keep."""
+    under its name may change (`dew.config.RunConfig.check_resume`, a direct resume's `training_record`), as
+    a later phase of training lowers a coefficient; every other argument the resume must keep. A class's
+    own, beside its bases' (`resumed_freely`)."""
+    executed: ClassVar[tuple[str, ...]] = ()
+    """The settings that say how its programs execute and not what they compute (a head's tiling, which a
+    fit's ladder sets), which a resume may change, as a model's `RunConfig.EXECUTED` fields; a class's own,
+    beside its bases' (`resumed_freely`)."""
     ema_is_reference: ClassVar[bool] = False
     """Whether the objective's average is the frozen reference its loss compares against (an RL
     policy's), which validation, `pipeline` and a saved run's loader never read as the trained weights."""
@@ -1162,6 +1167,24 @@ class Objective(ABC, Generic[Loss, Effects]):
             return None
         own = self.traced_by({name: value for name, value in state.items() if name not in held})
         return None if own is None else (own, tuple(sorted(held.items())))
+
+    @classmethod
+    def resumed_freely(cls) -> frozenset[str]:
+        """The settings a resume may change, its own class's and its bases' (`resumable`, `executed`)."""
+        return frozenset(name for klass in cls.__mro__ for name in (*vars(klass).get("resumable", ()),
+                                                                   *vars(klass).get("executed", ())))
+
+    def training_record(self) -> dict[str, JSON]:
+        """What its loss computes beside its model, as a step records it (`dew.checkpoints.Checkpoints.save`'s
+        `training`), which a direct resume holds a run to (`dew.training.startup.computation_differs`; row
+        9020: an LM's `z_loss` changed and resumed): each public setting its trace key states by value
+        (`trace_key`) that is a number, a string, a truth value, None or a sequence of them, but those a
+        resume may change (`resumed_freely`). A setting of another kind, its modules and held trees among
+        them, which its model's record and its draw state, is left out: a record refuses by what it states."""
+        left = {*type(self)._untraced(), *type(self).resumed_freely(), *HELD}
+        return {name: recorded for name, value in sorted(vars(self).items())
+                if not name.startswith("_") and name not in left
+                and (recorded := _setting_record(value)) is not _UNRECORDED}
 
     @classmethod
     def _untraced(cls) -> dict[str, str]:
@@ -2154,6 +2177,23 @@ def stated_trace[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> Hash
 
 _ABSENT = object()
 """What a class states of a name it does not hold (`Objective._classes`)."""
+
+class _Unrecorded:
+    """A setting no training record states (`_setting_record`)."""
+
+
+_UNRECORDED = _Unrecorded()
+
+
+def _setting_record(value: TracedSetting) -> JSON | _Unrecorded:
+    """`value` as a training record states it (`Objective.training_record`): a number, a string, a truth value
+    or None as itself, a sequence of them as a list; anything else `_UNRECORDED`."""
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    if type(value) in (list, tuple):
+        parts = [_setting_record(part) for part in value]
+        return _UNRECORDED if any(part is _UNRECORDED for part in parts) else parts
+    return _UNRECORDED
 
 HELD = frozenset({"variables", "ema"})
 """The attributes every objective's key states its own way (`Objective.traced_by`): the tree it starts

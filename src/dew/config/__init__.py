@@ -485,11 +485,11 @@ def _model_changes(saved: ModelConfig, before: JSON, now: JSON) -> list[str]:
 
 def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -> bool:
     """Whether an objective `now` trains what `before` trained: one class, every argument the same but
-    those its class lets a resume change (`dew.objectives.base.Objective.resumable`), a stated argument
+    those its class lets a resume change (`dew.objectives.base.Objective.resumed_freely`), a stated argument
     the same as the default it states again."""
     if before is None or now is None or before.name != now.name:
         return False
-    resumable = objectives[now.name].resumable
+    resumable = objectives[now.name].resumed_freely()
 
     def kept(config: ObjectiveConfig) -> dict:
         return {name: value for name, value in {**config.defaults, **config.fields}.items()

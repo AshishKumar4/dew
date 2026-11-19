@@ -767,7 +767,7 @@ class Trainer(Generic[Loss, Effects]):
             abstract = self._staging.state(abstract.with_window(checkpoints.accumulation_template(step)),
                                           self._staging.staged_shapes)
         shardings, validation = self._validated(abstract)
-        return Start(initializer, key, abstract, draw.through, step, shardings, draw.replay,
+        return Start(initializer, key, abstract, draw.through, draw.built, step, shardings, draw.replay,
                      validation.device_bytes)
 
     def _placed(self, start: Start, *, positioned: bool
@@ -825,11 +825,12 @@ class Trainer(Generic[Loss, Effects]):
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         self._compiler.resume_rung(checkpoints.rung(resume))
         # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
-        differs = computation_differs(checkpoints.artifact(resume), self._artifact())
+        differs = computation_differs(checkpoints.artifact(resume), self._artifact(),
+                                      checkpoints.training(resume), self.objective.training_record())
         if differs:
             raise ValueError(f"the checkpoint at step {resume} in {checkpoints.directory} trained another "
-                             f"computation ({', '.join(differs)}); resume it with the objective and model "
-                             "it recorded, or train in another directory")
+                             f"computation ({', '.join(differs)}); resume it with the objective, its "
+                             "settings and model it recorded, or train in another directory")
         # The code and machine that wrote the step's data position, which decide none of its rows: warned of.
         wrote = checkpoints.environment(resume)
         if wrote is not None:
@@ -2339,7 +2340,7 @@ class Trainer(Generic[Loss, Effects]):
         return {"state": self._staging.saved(state), "saved": position, "share": share, "control": control,
                 # The rung beside the layout's host fields, which a resume lays out alike (`resumed_layout`).
                 "rung": {**self._compiler.checkpoint_rung(), "host": list(self.layout.host)},
-                "artifact": self._artifact(),
+                "artifact": self._artifact(), "training": self.objective.training_record(),
                 "boxed": self._boxed_axes(),
                 "rollout": None if weights_only else _rollout_saved(self.rollout)}
 
