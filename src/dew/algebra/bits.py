@@ -792,8 +792,14 @@ def restored(pattern: jax.Array, dtype=jnp.float32) -> jax.Array:
     a code of 0.5. The one definition of the decoded value: the portable decode's (`nvfp4_decoded`), the
     native staged decode's, whatever lanes each extracts, and a truth's."""
     sign = pattern & jnp.uint32(0x8000)
-    normal = jax.lax.bitcast_convert_type((pattern << jnp.uint32(16)) + jnp.uint32(126 << 23),
-                                          jnp.float32).astype(dtype)
+    rebased = (pattern << jnp.uint32(16)) + jnp.uint32(126 << 23)
+    normal = jax.lax.bitcast_convert_type(rebased, jnp.float32)
+    if np.dtype(dtype) != np.float32:
+        # Widened from the rebased bits themselves where they hold a float32 subnormal (a pattern outside the
+        # format's codes), which a flushing lane's cast would zero: its fraction times 2^-149, exact.
+        fraction = (rebased & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** -149, dtype)
+        tiny = jnp.where(rebased >> jnp.uint32(31) != 0, -fraction, fraction)
+        normal = jnp.where(rebased & jnp.uint32(0x7F800000) == 0, tiny, normal.astype(dtype))
     mantissa = (pattern & jnp.uint32(0x7F)).astype(dtype) * jnp.asarray(2.0 ** -7, dtype)
     subnormal = jnp.where(sign != 0, -mantissa, mantissa)
     return jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
