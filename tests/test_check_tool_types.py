@@ -90,3 +90,17 @@ def test_a_tools_key_covers_what_it_imports_through_their_imports_and_nothing_el
     assert len({moved, gate.key(tool, ["torch==2.14.0"], b"shared"), gate.key(tool, [], b"other")}) == 3
     (tmp_path / "locks" / "cpu.txt").write_text("jax==2\n")
     assert gate.key(tool, [], b"shared") != moved
+
+
+def test_the_shards_check_every_tool_once(gate) -> None:
+    """Every tool falls in exactly one of the gate's shards, Dew's own split among them and each other
+    environment whole in one."""
+    dew = [Path(f"tools/d{index}.py") for index in range(7)]
+    groups = [((gate.DEW, ()), dew), (("a", ("x==1",)), [Path("tools/a.py")]),
+              (("b", ("y==1",)), [Path("tools/b1.py"), Path("tools/b2.py")]),
+              (("c", ("z==1",)), [Path("tools/c.py")])]
+    shards = [gate.sharded(groups, index, 3) for index in range(3)]
+    checked = [(group, path) for shard in shards for group, paths in shard for path in paths]
+    assert sorted(checked) == sorted((group, path) for group, paths in groups for path in paths)
+    assert all(len([1 for shard in shards for group, _ in shard if group == other]) == 1
+               for other, _ in groups[1:])

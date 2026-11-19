@@ -18,6 +18,7 @@ runs no pyright here.
     python tools/check_tool_types.py --list     # each cohort set's tools, checking nothing
     python tools/check_tool_types.py --environment dew    # one environment's tools alone
     python tools/check_tool_types.py tools/x.py tools/y.py  # these tools alone
+    python tools/check_tool_types.py --shard 2/4    # the second of four shards (tools/check_gates' gates)
 
 """
 
@@ -305,11 +306,31 @@ def records() -> types.ModuleType | None:
     return records
 
 
+def shard_of(spelled: str) -> tuple[int, int]:
+    """`K/N` as the zero-based shard index and the shard count."""
+    index, _, count = spelled.partition("/")
+    if not (index.isdigit() and count.isdigit() and 1 <= int(index) <= int(count)):
+        raise argparse.ArgumentTypeError(f"{spelled} is no K/N with 1 <= K <= N")
+    return int(index) - 1, int(count)
+
+
+def sharded(groups: list[tuple[tuple[str, tuple[str, ...]], list[Path]]], index: int, count: int
+            ) -> list[tuple[tuple[str, tuple[str, ...]], list[Path]]]:
+    """Shard `index` of `count` of the environments' tools: every `count`-th of Dew's own (`DEW`), whose one
+    pyright run over all of them outlasts a CI gate (1713 s on armada, 2026-11-19), and every `count`-th other
+    environment whole, as each is built for its tools alone."""
+    dew = [(group, paths[index::count]) for group, paths in groups if group[0] == DEW]
+    others = [entry for entry in groups if entry[0][0] != DEW][index::count]
+    return [entry for entry in dew + others if entry[1]]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="each cohort set's tools, checking nothing")
     parser.add_argument("--environment", action="append", default=[],
                         help="check only this environment's tools (a name --list prints); repeatable")
+    parser.add_argument("--shard", type=shard_of, default=(0, 1), metavar="K/N",
+                        help="check the K-th of N shards (`sharded`), one CI gate each; K counts from 1")
     parser.add_argument("paths", nargs="*", type=Path, help="check only these tools")
     args = parser.parse_args()
     if sys.prefix == sys.base_prefix:
@@ -337,7 +358,7 @@ def main() -> int:
             print(f"{name}: {len(paths)} tools: {' '.join(str(path.relative_to(ROOT)) for path in paths)}")
         return 0
     token = os.environ.get("DEW_XLA_CACHE_TOKEN", "")
-    for (name, requirements), paths in sorted(groups.items()):
+    for (name, requirements), paths in sharded(sorted(groups.items()), *args.shard):
         if args.environment and name not in args.environment:
             continue
         keys = {path: key(path, requirements, shared) for path in paths}
