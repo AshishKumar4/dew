@@ -49,6 +49,40 @@ def nested(kind: str):
 KINDS = ("jit", "checkpoint", "scan", "cond", "while")
 
 
+def test_an_infinite_scale_stays_inside_a_maximum():
+    """`max(x * inf)` over `x = [0, 1, ..., 1023]`: `0 * inf` is NaN, so the maximum is NaN; the pass took an
+    infinite scale for a positive one and hoisted it out of the maximum, `max(x) * inf`, infinite, its work
+    the less (spec alignment, 8992). A scale out of an extremum is a finite positive real's alone."""
+    def scaled(x):
+        return jnp.max(x * jnp.inf)
+
+    x = jnp.arange(1024, dtype=jnp.float32)
+    assert np.isnan(np.asarray(jax.jit(algebra.rewritten(scaled))(x)))
+
+
+def test_a_window_proves_nothing_of_a_value_its_program_proves_no_number():
+    """`sum(tanh(a / b) * c)`, its quotient outside the window a reduction heads (three equations deep):
+    `a / b` may be `0 / 0`, so the program proves `tanh` of it no number and bounds nothing it makes; each
+    window cut from it holds no bound the program does not (`program._declared`: the quotient declared
+    `terms.UNPROVEN`), where the window took its input for a finite real and bounded the tanh, its product and
+    its sum, which a reordering reads (spec alignment, 8993)."""
+    from jax.extend import core as jcore
+
+    def program_of(a, b, c):
+        return jnp.sum(jnp.tanh(a / b) * c)
+
+    closed = jax.make_jaxpr(program_of)(*(jnp.ones(8, jnp.float32) for _ in range(3)))
+    whole = terms.region(closed).held
+    windows = program._windows(closed.jaxpr)
+    assert windows
+    proven = program._held(closed.jaxpr)
+    for window, _ in windows:
+        held = terms.region(jcore.ClosedJaxpr(window, []), program._declared(window, proven)).held
+        made = [var for equation in window.eqns for var in equation.outvars]
+        assert [held.get(var) for var in made if whole.get(var) is None] == [None] * sum(
+            whole.get(var) is None for var in made)
+
+
 @pytest.mark.parametrize("kind", KINDS)
 def test_a_bodys_math_is_rewritten_in_place(kind):
     """Two sums inside a nested jit, a checkpoint, a scan, a conditional or a loop are rewritten inside that
@@ -292,6 +326,23 @@ def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
     return jnp.dot(a, x) + jnp.dot(a, y)
+
+
+def test_two_roots_of_one_shared_product_are_made_once():
+    """Two outputs reading products of a shared operand, `a x + a y` and `a y + a x` (`_shared_products`'s
+    terms, in either order): the pass prices them together as one factored product, and the program it
+    writes makes that product once, the second output the first's value; each traced apart wrote the
+    product twice, so the program computed what extraction priced as shared twice (spec alignment, 8995).
+    Its values are the written program's on par from float64 (check 1)."""
+    def both(a, x, y):
+        a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
+        return jnp.dot(a, x) + jnp.dot(a, y), jnp.dot(a, y) + jnp.dot(a, x)
+
+    shapes = ((256, 64), (64, 64), (64, 64))
+    written = jax.make_jaxpr(algebra.rewritten(both))(*rows(1, *shapes))
+    assert [equation.primitive for equation in equations(written.jaxpr)].count(jax.lax.dot_general_p) == 1
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *shapes),
+                    "two roots of one shared product", seeds=16)
 
 
 def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
@@ -1176,6 +1227,23 @@ def test_an_algebra_span_joins_the_windows_around_it():
     assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(spanning))(*rows(13, *SHAPES_MARKED))) == []
     assert_as_exact(jax.jit(algebra.rewritten(spanning)), jax.jit(two_sums),
                     lambda seed: rows(seed, *SHAPES_MARKED), "an opened span", seeds=8)
+
+
+def test_an_algebra_span_no_rewrite_crosses_keeps_its_marker():
+    """An Algebra span that no rewrite reaches into (`cumsum(sin(x))`, nothing the rules lower) beside two
+    sums the pass joins elsewhere in the program: the joined sums are spliced, and the span stays one marked
+    call of its kind, as written, where one splice anywhere had opened every span for good (spec alignment,
+    8998, §6.10); the program computes what it computes (check 1)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def both(x, y, a):
+        kept = marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x), axis=-1))(x)
+        return kept, two_sums(x, y, a)
+
+    assert cheaper_spliced(lambda x, y, a: both(x, y, a)[1], *rows(14, *SHAPES_MARKED))
+    assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(both))(*rows(14, *SHAPES_MARKED))) == [Algebra()]
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a span no rewrite crosses beside joined sums", seeds=8)
 
 
 def test_an_algebra_span_with_effects_is_rewritten_within_its_call():

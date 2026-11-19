@@ -14,7 +14,8 @@ import functools
 import math
 import time
 import weakref
-from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +27,7 @@ from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
 from dew import _cache
-from dew._cache import ALGEBRA, KERNEL_CHOICES
+from dew._cache import ALGEBRA
 from dew.algebra import cost, extract, fusion, rules, terms
 from dew.algebra.extract import Linear
 from dew.nn.derivatives import Activation, Algebra, KernelGlue, Surrogate, marked_call_p
@@ -235,19 +236,21 @@ egglog's recursion however a program chains its heads: windows past it are held 
 of another read from outside it."""
 
 
-def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
+def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation,
+              spliced: dict[int, list[jcore.JaxprEqn]] | None = None) -> jcore.Jaxpr:
     """`jaxpr` with the values its windows yield (`_windows`) computed in their cheapest forms, where those
     are cheaper than the windows as traced: each cluster saturated in an e-graph of its own (one e-graph of
     every window's terms grew its extraction with the program, past 500 seconds a gemma3n training step's),
     each cheaper value's form traced and spliced in where its equation stood, the rest of the program kept as
     traced, so a body is never traced again. Two clusters whose union passes `CLUSTER` stay apart though they
     share an equation: a value both yield is made by the first's form (`_splices`' `taken`), each form
-    writing the value it replaces under its own name, so readers of either read one value."""
+    writing the value it replaces under its own name, so readers of either read one value. Its splices are
+    kept in `spliced`, by the id of the equation each replaces, where given (`_reclosed` reads them)."""
     made_by = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
-    spliced: dict[int, list[jcore.JaxprEqn]] = {}
+    spliced = {} if spliced is None else spliced
     windows = _windows(jaxpr)
     deriving = _deriving(accurate, saturation) if windows else None
-    held = _held(jaxpr) if windows else {}
+    held = _held(jaxpr) if windows else None
     for window, yielded in windows:
         began = time.perf_counter()
         done, reused = _derived(window, accurate, saturation, deriving, _declared(window, held))
@@ -312,22 +315,30 @@ def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
             rules.admitted_names(accurate))
 
 
-def _held(jaxpr: jcore.Jaxpr) -> dict[jcore.Var, terms.Magnitude | None]:
-    """Each value's magnitude `jaxpr` proves (`terms.Region.held`, its structure's alone, `terms.Skeleton`),
-    its constants taken as inputs: what its windows read of the values they take from outside them."""
+def _held(jaxpr: jcore.Jaxpr) -> terms.Region:
+    """What `jaxpr` proves of each value (`terms.Region.held`, its magnitudes, and `terms.Region.unproven`,
+    those it proves no finite number), its structure's alone (`terms.Skeleton`), its constants taken as
+    inputs: what its windows read of the values they take from outside them."""
     opened = jaxpr.replace(constvars=[], invars=[*jaxpr.constvars, *jaxpr.invars])
-    return terms.region(opened, forms=terms.Skeleton).held
+    return terms.region(opened, forms=terms.Skeleton)
 
 
-def _declared(window: jcore.Jaxpr, held: Mapping[jcore.Var, terms.Magnitude | None]) -> dict[int, float]:
+def _declared(window: jcore.Jaxpr, proven: terms.Region | None) -> dict[int, float | object]:
     """The ranges `window`'s inputs hold (`terms.Ranges`, by input index): each one's magnitude the program
     proves where it bounds one (`_held`), as its power of two, so a bound a window cuts its equations below
     holds within it: a rule's operand made outside a window is bounded as the program bounds it (a scale's
-    under a broadcast, three equations below the sum that reads it), where it would read no bound at all."""
-    declared = {}
+    under a broadcast, three equations below the sum that reads it), where it would read no bound at all;
+    and one the program proves no finite number (a NaN's tanh made outside the window) declared so
+    (`terms.UNPROVEN`), where the window would take it as every input is taken, a finite real, and bound
+    what it makes of it (spec alignment, 8993)."""
+    declared: dict[int, float | object] = {}
+    if proven is None:
+        return declared
     for index, var in enumerate(window.invars):
-        bound = held.get(var)
-        if bound is not None and bound < 1024:
+        bound = proven.held.get(var)
+        if var in proven.unproven:
+            declared[index] = terms.UNPROVEN
+        elif bound is not None and bound < 1024:
             declared[index] = 0.0 if bound == terms.NOTHING else math.ldexp(1.0, bound)
     return declared
 
@@ -350,36 +361,79 @@ def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation, derivi
 
 def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
              made_by: Mapping[jcore.Var, jcore.JaxprEqn], taken: Mapping[int, list]) -> dict[int, list]:
-    """The equations each value `window` yields (`yielded`, as the program names them) is made by in its
-    cheapest form (`done`), by the id of the program's equation they stand in for (`made_by`): a value another
-    window's form made already (`taken`) kept as that one made it."""
+    """The equations each value `window` yields (`yielded`, as the program names them, in program order) is
+    made by in its cheapest form (`done`), by the id of the program's equation they stand in for (`made_by`):
+    a value another window's form made already (`taken`) kept as that one made it. The forms are traced
+    together, each term the roots share made once (`terms.forms_value`), and each equation spliced in at the
+    first root that reads it, so a value two roots read is computed once, as extraction priced the roots
+    together (spec alignment, 8995: each root traced apart emitted a shared product twice); a root of the
+    form an earlier root makes is that root's value (`_placed`)."""
     leaves = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype, weak_type=var.aval.weak_type)
               for var in window.invars if isinstance(var.aval, ShapedArray)]
     if len(leaves) != len(window.invars):
         return {}
-    spliced: dict[int, list[jcore.JaxprEqn]] = {}
+    chosen = []
     for out, root in zip(yielded, done.region.outputs, strict=True):
-        if root is None:
-            continue
-        form = done.picked.get(terms.key(root))
+        form = None if root is None else done.picked.get(terms.key(root))
         made_at = id(made_by[out])
-        if form is None or terms.key(form) == terms.key(root) or made_at in taken or made_at in spliced:
+        if form is None or terms.key(form) == terms.key(root) or made_at in taken:
             continue
-        traced = jax.make_jaxpr(lambda *values, form=form: terms.form_value(done.region, form, list(values)))(
-            *leaves)
-        made, = traced.jaxpr.outvars
-        if traced.consts or not isinstance(made, jcore.Var) or made in traced.jaxpr.invars or (
-                traced.out_avals[0].strip_weak_type() != out.aval.strip_weak_type()):
+        if made_at not in {at for _, _, at in chosen}:
+            chosen.append((out, form, made_at))
+    while chosen:
+        traced = jax.make_jaxpr(lambda *values, forms=tuple(form for _, form, _ in chosen):
+                                terms.forms_value(done.region, list(forms), list(values)))(*leaves)
+        kept = [(out, form, made_at, made) for (out, form, made_at), made, aval
+                in zip(chosen, traced.jaxpr.outvars, traced.out_avals, strict=True)
+                if isinstance(made, jcore.Var) and made not in traced.jaxpr.invars
+                and aval.strip_weak_type() == out.aval.strip_weak_type()]
+        if traced.consts or len(kept) != len(chosen):
+            chosen = [(out, form, made_at) for out, form, made_at, _ in kept] if not traced.consts else []
             continue
-        renamed = {**dict(zip(traced.jaxpr.invars, window.invars, strict=True)), made: out}
+        return _placed(window, traced.jaxpr, kept)
+    return {}
 
-        def renaming(atom, renamed=renamed):
-            return atom if isinstance(atom, jcore.Literal) else renamed.get(atom, atom)
 
-        spliced[made_at] = [equation.replace(invars=[renaming(atom) for atom in equation.invars],
-                                             outvars=[renaming(var) for var in equation.outvars])
-                            for equation in traced.jaxpr.eqns]
-    return spliced
+def _placed(window: jcore.Jaxpr, traced: jcore.Jaxpr, kept: list) -> dict[int, list]:
+    """`traced`'s equations (the window's forms made together, `_splices`) each placed at the first of
+    `kept`'s roots (in program order) that reads it, renamed to the program's values: its inputs the
+    window's, each root's value the one it replaces; a root whose value an earlier root's form made already
+    (two roots of one form) that value, held as it is (a conversion to its own type, which compiles to
+    nothing)."""
+    producer = {var: place for place, equation in enumerate(traced.eqns) for var in equation.outvars}
+    named: dict[jcore.Var, jcore.Var] = {}
+    aliases: dict[int, list[jcore.JaxprEqn]] = {}
+    for out, _, made_at, made in kept:
+        if made in named:
+            aliases[made_at] = [jcore.new_jaxpr_eqn(
+                [named[made]], [out], jax.lax.convert_element_type_p,
+                {"new_dtype": out.aval.dtype, "weak_type": out.aval.weak_type, "sharding": None},
+                jcore.no_effects)]
+        else:
+            named[made] = out
+    kept = [each for each in kept if each[2] not in aliases]
+    first: dict[int, int] = {}
+    for spot, (_, _, _, made) in enumerate(kept):
+        frontier = [producer[made]] if made in producer else []
+        while frontier:
+            place = frontier.pop()
+            if place in first:
+                continue
+            first[place] = spot
+            frontier += [producer[atom] for atom in traced.eqns[place].invars
+                         if not isinstance(atom, jcore.Literal) and atom in producer]
+    renamed = {**dict(zip(traced.invars, window.invars, strict=True)), **named}
+
+    def renaming(atom):
+        return atom if isinstance(atom, jcore.Literal) else renamed.get(atom, atom)
+
+    spliced: dict[int, list[jcore.JaxprEqn]] = {made_at: [] for _, _, made_at, _ in kept}
+    for place, equation in enumerate(traced.eqns):
+        if place in first:
+            spliced[kept[first[place]][2]].append(
+                equation.replace(invars=[renaming(atom) for atom in equation.invars],
+                                 outvars=[renaming(var) for var in equation.outvars]))
+    return {**spliced, **aliases}
 
 
 def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
@@ -601,7 +655,10 @@ def _products(region: terms.Region) -> list:
         literal = terms.Term.literal(i64(index))
         if _power_of_two(value):
             facts.append(rules.exact_scale(literal))
-        if np.ndim(value) == 0 and jnp.issubdtype(np.asarray(value).dtype, jnp.inexact) and value > 0:
+        # A finite positive real alone: an infinite scale keeps no order (a zero times it is NaN, where the
+        # maximum taken first is finite), so an extremum takes it out of none (spec alignment, 8992).
+        if (np.ndim(value) == 0 and jnp.issubdtype(np.asarray(value).dtype, jnp.inexact) and value > 0
+                and np.isfinite(value)):
             facts.append(rules.positive_scale(literal))
         if np.ndim(value) == 0 and jnp.issubdtype(np.asarray(value).dtype, jnp.inexact) and value == 1:
             facts.append(rules.unit(literal))
@@ -732,6 +789,30 @@ def _marked(equation: jcore.JaxprEqn, kinds: tuple[type, ...]) -> bool:
     return equation.primitive is marked_call_p and isinstance(equation.params["kind"], kinds)
 
 
+def _reclosed(jaxpr: jcore.Jaxpr, spans: Sequence[_Span], spliced: Mapping[int, list]) -> jcore.Jaxpr:
+    """`jaxpr`, the windowed program (`_windowed`, `spliced` its splices by the id of the equation each
+    replaced), with each opened span (`spans`) no splice crosses called again as it was: none of its body's
+    equations replaced, none of their values read by a spliced form but its outputs, its outputs each a value
+    its body made, so an Algebra marker stands wherever no rewrite lands across its boundary (spec alignment,
+    8998: one splice anywhere kept every span of the program opened)."""
+    read = {atom for made in spliced.values() for equation in made for atom in equation.invars
+            if not isinstance(atom, jcore.Literal)}
+    equations = list(jaxpr.eqns)
+    for span in spans:
+        inside = {var for equation in jaxpr.eqns if id(equation) in span.inlined for var in equation.outvars}
+        outputs = set(span.returned)
+        if (span.inlined & spliced.keys() or (read & inside) - outputs
+                or not all(isinstance(atom, jcore.Var) and atom in inside for atom in span.returned)):
+            continue
+        places = [place for place, equation in enumerate(equations) if id(equation) in span.inlined]
+        if not places:
+            continue
+        called_again = span.call.replace(outvars=list(span.returned))
+        equations = [*equations[:places[0]], called_again,
+                     *(equation for equation in equations[places[0]:] if id(equation) not in span.inlined)]
+    return jaxpr.replace(eqns=equations)
+
+
 def _opening(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     """The body of an Algebra span the pass opens into the region around it (`_opened`), the program its
     call runs on its operands one for one (`called`), None for any other equation: a span of no effects
@@ -754,9 +835,11 @@ def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kern
     read = _read(closed)
     made = _within(read, accurate, saturation, kernels)
     if _saturating(accurate):
-        opened = _opened(made)
-        windowed = _windowed(opened, accurate, saturation)
-        made = made if windowed is opened else windowed
+        spans: list[_Span] = []
+        opened = _opened(made, spans)
+        spliced: dict[int, list[jcore.JaxprEqn]] = {}
+        windowed = _windowed(opened, accurate, saturation, spliced)
+        made = made if windowed is opened else _reclosed(windowed, spans, spliced)
     made = fusion.fused_program(made) if kernels else made
     return closed if made is read else made
 
@@ -773,10 +856,21 @@ def _read(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     return jaxpr.replace(eqns=kept.eqns)
 
 
-def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
+class _Span(NamedTuple):
+    """An Algebra span `_opened` opened: its call as the program reads it, the ids of the equations its body
+    was inlined as, and the values its outputs became."""
+
+    call: jcore.JaxprEqn
+    inlined: frozenset[int]
+    returned: list
+
+
+def _opened(jaxpr: jcore.Jaxpr, spans: list[_Span] | None = None) -> jcore.Jaxpr:
     """`jaxpr` with each Algebra span's call it opens (`_opening`) replaced by its body's equations, nested
     spans opened too, over the call's operands, its body's constants the program's, and each reader of the
-    call's results reading what its body computes them as; `jaxpr` itself where it holds none."""
+    call's results reading what its body computes them as; `jaxpr` itself where it holds none. Each span it
+    opens recorded in `spans` (`_Span`), where given, so one no rewrite crosses is closed again
+    (`_reclosed`)."""
     if all(_opening(equation) is None for equation in jaxpr.eqns):
         return jaxpr
     constvars, consts = list(jaxpr.constvars), list(jaxpr.consts)
@@ -800,6 +894,8 @@ def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
         made, returned = inlined(body, equation.invars, fresh)
         equations += made
         computed.update(zip(equation.outvars, returned, strict=True))
+        if spans is not None:
+            spans.append(_Span(equation, frozenset(map(id, made)), list(returned)))
     return jaxpr.replace(constvars=constvars, consts=consts, eqns=equations,
                          outvars=[outer(atom) for atom in jaxpr.outvars])
 
@@ -822,18 +918,44 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         return closed
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
-    from dew.algebra import derive
+    from dew.nn.kernels import tuning
 
     rewrites = _REWRITTEN.setdefault(closed, {})
-    # With kernels, the context the substitutions are decided in too (`fusion._decided`'s: the mesh, the
-    # numerics, the kernel choices a call names), so a body rewritten under one choice is none of another's.
-    key = (_deriving(accurate, saturation), kernels,
-           (derive.context(), KERNEL_CHOICES.value) if kernels else None)
-    if key not in rewrites:
-        made = _rewritten(closed, accurate, saturation, kernels)
-        rewrites[key] = None if made is closed else made
-    made = rewrites[key]
-    return closed if made is None else made
+    # With kernels, the context the substitutions are decided in too (`fusion.choice_context`: the mesh, the
+    # numerics, the kernel choices a call names and the launches the compiles refused), so a body rewritten
+    # under one choice is none of another's (spec alignment, 8994).
+    key = (_deriving(accurate, saturation), kernels, fusion.choice_context() if kernels else None)
+    body = rewrites.get(key)
+    reused = body is not None and generation.still(body.reads)
+    if not reused:
+        with (generation.routes(alone=True) as routes, tuning.seen() as seen, generation.recording() as reads,
+              kernel_report.recording() as recorded):
+            made = _rewritten(closed, accurate, saturation, kernels)
+        body = rewrites[key] = _Body(None if made is closed else made, tuple(routes), seen.held(), reads,
+                                     tuple(recorded.rewritten))
+    # Its routes, launches and facts reported where it is written, as its rewrite reported them, and on a
+    # reuse its regions' reports too, so a report around the program holds the body's however often it is
+    # written (`fusion._traced`'s, a region's).
+    generation.reported(body.routes)
+    tuning.noted(body.launches)
+    generation.replay(body.reads)
+    if reused:
+        for made_report in body.rewrites:
+            kernel_report.record_rewrite(dataclasses.replace(made_report, reused=True))
+    return closed if body.made is None else body.made
+
+
+@dataclasses.dataclass(frozen=True)
+class _Body:
+    """A body's rewrite as `_closed` holds it: its program (None where nothing changed), and what its rewrite
+    reported (its routes, its launches, the facts it read, its regions' rewrites), replayed where it is
+    written again."""
+
+    made: jcore.Jaxpr | None
+    routes: tuple
+    launches: Hashable
+    reads: Mapping
+    rewrites: tuple
 
 
 def _power_of_two(value) -> bool:

@@ -359,6 +359,9 @@ class Region[Node: (Term, Skeleton)]:
     held: dict[jcore.Var, Magnitude | None] = dataclasses.field(default_factory=dict)
     """Each value's magnitude (`magnitudes`') by the jaxpr's variable that names it: what a window cut from
     the jaxpr declares of its inputs (`dew.algebra.program._windowed`)."""
+    unproven: frozenset[jcore.Var] = frozenset()
+    """The jaxpr's variables naming values it proves no finite number (`Apart.finite`: an equation outside
+    the language's output, a NaN's tanh): what a window cut from it declares `UNPROVEN`."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -578,8 +581,14 @@ NOTHING = -(2 ** 20)
 """A zero's magnitude: under every other."""
 
 
-type Ranges = Mapping[int, float | tuple[float, float]] | None
-"""Declared ranges by input index (`region`'s): a bound on an input's magnitude, or an interval."""
+UNPROVEN = type("Unproven", (), {"__repr__": lambda self: "UNPROVEN"})()
+"""An input's declaration that nothing is proven of it (`Ranges`): no finite number, no bound, its `Apart`
+none (`NOWHERE`), as a value a window takes from outside it that its program proves no finite number
+(`dew.algebra.program._declared`, spec alignment 8993)."""
+
+type Ranges = Mapping[int, float | tuple[float, float] | object] | None
+"""Declared ranges by input index (`region`'s): a bound on an input's magnitude, an interval, or
+`UNPROVEN`."""
 
 
 @overload
@@ -717,7 +726,8 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
                   max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
                   frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed,
-                  {var: magnitudes.get(key(node)) for var, node in env.items()})
+                  {var: magnitudes.get(key(node)) for var, node in env.items()},
+                  frozenset(var for var in env if not apart.get(var, NOWHERE).finite))
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)
@@ -840,6 +850,8 @@ def _declared_apart(declared: float | tuple[float, float] | None) -> Apart:
     of zero it lies on."""
     if declared is None:
         return WHOLE
+    if declared is UNPROVEN:
+        return NOWHERE
     if not isinstance(declared, tuple):
         return Apart(number=True, finite=math.isfinite(declared))
     low, high = declared
@@ -1311,7 +1323,7 @@ def _magnitude(value) -> Magnitude | None:
 def _declared(declared: float | tuple[float, float] | None) -> Magnitude | None:
     """An input's magnitude from its declared range (an interval's larger end's), None where it declares
     none."""
-    if declared is None:
+    if declared is None or declared is UNPROVEN:
         return None
     largest = max(abs(declared[0]), abs(declared[1])) if isinstance(declared, tuple) else declared
     return _log2(largest) if math.isfinite(largest) else None
@@ -1367,6 +1379,13 @@ def spoken_as(equation: jcore.JaxprEqn) -> str | None:
 def form_value(region_: Region, form: Term, values: list) -> jax.Array:
     """One chosen `form`'s value over `region_`'s leaves' `values` (a region of the language alone, whose
     leaves are its inputs), each shared term evaluated once."""
+    (made,) = forms_value(region_, [form], values)
+    return made
+
+
+def forms_value(region_: Region, forms: list[Term], values: list) -> list[jax.Array]:
+    """Chosen `forms`' values over `region_`'s leaves' `values` together, each term any of them shares
+    evaluated once (`dew.algebra.program._splices`: roots priced together are made together)."""
     known: dict[Hashable, jax.Array] = {}
 
     def value(term: Term) -> jax.Array:
@@ -1375,7 +1394,7 @@ def form_value(region_: Region, form: Term, values: list) -> jax.Array:
             known[named] = value_of(term, value, region_, values)
         return known[named]
 
-    return value(form)
+    return [value(form) for form in forms]
 
 
 def _held(value: np.ndarray | complex) -> np.ndarray | complex:
