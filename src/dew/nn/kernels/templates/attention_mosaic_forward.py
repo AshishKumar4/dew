@@ -2037,9 +2037,11 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                         kinds=kinds, peaks=peaks, training=training, finishes=finishes, certified=certified,
                         interpret=interpret, value_width=value_width)
 
+    # The generation's own target, which the launch's digest keys, not the placed part's (row 8372).
+    tmem_columns = generation.gpu_target(generation.device_generation()).tmem_columns
     products = forward_products(family, tiles, value_width, query.dtype, peaks=peaks, parts=parts,
                                 ahead=bool(program.ahead), scaled=spec.headroom, training=training,
-                                query_width=width, tmem_columns=generation.gpu_target().tmem_columns)
+                                query_width=width, tmem_columns=tmem_columns)
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
