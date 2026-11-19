@@ -980,32 +980,47 @@ def _differentiated(forward: Callable, backward: Callable) -> Callable:
     return attend
 
 
-def _differentiable(family: Family, forward: Callable, backward: Callable) -> Callable:
+def _differentiable(family: Family, forward: Callable, backward: Callable, *, dropping: bool = False
+                    ) -> Callable:
     """A mainloop's `forward` and `backward` as `(query, key, value, extra) -> out` over `family`'s spans,
     its derivative the mainloop's own backward, the sinks' or resumed state's gradient through the softmax's
-    initial state."""
+    initial state; under `_dropping`'s draw where `dropping`."""
     def run(query, key, value, extra):
         spans, hooks = _spans(family, query, key), _hooks(query, extra)
+        drop = _dropping(query).drop if dropping else None
 
         def ahead(query, key, value, initial):
-            return forward(query, key, value, spans, template.Hooks(initial=initial))
+            return forward(query, key, value, spans, template.Hooks(initial=initial, drop=drop))
 
         def back(query, key, value, initial, dout):
-            return backward(query, key, value, spans, template.Hooks(initial=initial), dout)
+            return backward(query, key, value, spans, template.Hooks(initial=initial, drop=drop), dout)
 
         initial = None if hooks is None else hooks.initial
         return _differentiated(ahead, back)(query, key, value, initial)
     return run
 
 
-def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
+DROP_RATE = 0.25
+"""The dropout rate a dropping family's call takes (`_dropping`): a kept key's multiplier 4/3, inexact in
+every format, so a walk that weighs it per key rounds where the reference's does not (row 8652)."""
+
+
+def _dropping(query) -> template.Hooks:
+    """A dropout draw at `DROP_RATE` over `query`'s rows and heads, its key fixed."""
+    batch, _, heads, _ = query.shape
+    return template.Hooks(drop=template.Dropout(jax.random.bits(jax.random.PRNGKey(7), (2,), jnp.uint32),
+                                                jnp.arange(batch, dtype=jnp.int32),
+                                                jnp.arange(heads, dtype=jnp.int32), DROP_RATE))
+
+
+def _mainloops(family: Family, options: dict, *, dropping: bool = False) -> dict[str, Callable]:
     """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
     or none for the default), its derivative the mainloop's own backward (`_differentiable`); on an H100 the
     Mosaic one's default form in both schedules, its derived one (one launch where the call is hookless) and
     deterministic mode's two launches (`TWO_LAUNCHES`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
     tiles = attention_portable.Tiles(32, 32, attention_triton.BLOCK)
-    mainloop = functools.partial(_differentiable, family)
+    mainloop = functools.partial(_differentiable, family, dropping=dropping)
 
     def triton_forward(*operands):
         with tuning.pinned(PINS):
@@ -1027,7 +1042,9 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
 
     portable = mainloop(functools.partial(attention_portable.xla_mainloop, tiles, **forward_options),
                         functools.partial(attention_portable.backward, tiles, **options))
-    mainloops = {"triton": mainloop(triton_forward, triton_backward), "portable": portable}
+    # The Pallas-Triton mainloop takes no probability dropout (ledger row 1521).
+    mainloops = {"portable": portable} if dropping else {"triton": mainloop(triton_forward, triton_backward),
+                                                         "portable": portable}
     def two_launch_backward(*operands):
         with tuning.pinned({attention_mosaic.MosaicBackward: TWO_LAUNCHES}):
             return mosaic_backward(*operands)
@@ -1142,6 +1159,24 @@ def default_is_finite(family_name: str, mainloop_name: str) -> None:
     differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
     assert_finite(differentiated, truth, draw, label, seeds=seeds)
     _held_empty(family, differentiated(*draw(0)), label)
+
+
+@pytest.mark.parametrize("family", [name for name in TEMPLATE_FAMILIES if _drawn_first(name)[3] is None])
+def test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges(family):
+    """The plain-JAX mainloop, and on an H100 the Mosaic one in both schedules, under dropout (`_dropping`)
+    over every family that starts from no state: output and gradients finite wherever the float64 truth's
+    (the reference's own dropping call, its draw the same) rounded to their dtype are. A kept key's
+    multiplier taken per weight and on the walk's sums before the division passed fp32's largest where the
+    output is finite, and on D's sums before their product with dO overflowed dQ (row 8652)."""
+    seeds, family_spec = min(SEEDS[family], 16), FAMILIES[family]
+    draw = _cast(family_spec, family_spec.draw)
+
+    def truth(query, key, value, extra):
+        return template.reference(query, key, value, _spans(family_spec, query, key), _dropping(query))
+
+    for name, mainloop in _mainloops(family_spec, {}, dropping=True).items():
+        assert_finite(jax.jit(with_gradients(mainloop)), with_gradients(truth), draw,
+                      f"{name} dropping {family_spec.dtype}", seeds=seeds)
 
 
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
