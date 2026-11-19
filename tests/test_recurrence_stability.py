@@ -453,43 +453,45 @@ TPU_ACCELERATED = [pytest.param(name, regime, id=f'{name}-{regime}-tpu',
                    for name, regime in ACCELERATED]
 
 
-LONG_GRADIENT = [('rated', 'a fading memory'), ('turned', 'decays near zero')]
-"""The gradient's cases past two minutes in one process (246 s, train 270's CI on 66a222273, ledger 2125; the
-turned state's decays near zero 167 s, train 1080's on 1ee8fe13e, ledger 8937), their check 1's draws run
-as armada's map tasks and a judge (`check1_shards`), each within two minutes."""
-
-
-@pytest.mark.parametrize('name, regime', [case for case in CASES + TPU_ACCELERATED
-                                          if tuple(case.values) not in LONG_GRADIENT])
-def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
-    """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
-    token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""
-    _gradient_holds_check_1(name, regime)
-
-
 CHECK1_SHARDS = {
     "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[rated-a-fading-memory]":
         {"seeds": 256, "per_task": 64},
     "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[turned-decays-near-zero]":
         {"seeds": 128, "per_task": 32},
 }
-"""`LONG_GRADIENT`'s sites by node id, a literal the CI plan reads as it reads a mark's (tools/armada/ci.py):
-each its case's `GRADIENT_SEEDS`, its draws in map tasks of a quarter of them."""
+"""The gradient's cases past two minutes in one process (246 s, train 270's CI on 66a222273, ledger 2125; the
+turned state's decays near zero 167 s, train 1080's on 1ee8fe13e, ledger 8937), by node id, a literal the
+CI plan reads as it reads a mark's (tools/armada/ci.py): their check 1's draws, each its case's
+`GRADIENT_SEEDS`, run as armada's map tasks of a quarter of them and a judge. The one list of them: a case
+is long where its id is here (`long_gradient`)."""
+
+LONG_GRADIENT = "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences"
+"""The long cases' test (`CHECK1_SHARDS`)."""
 
 
-def long_gradient_cases() -> list:
-    """`LONG_GRADIENT` as parameters, each marked from `CHECK1_SHARDS` by its node id."""
-    test = "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences"
-    cases = [(name, regime, f"{name}-{regime}".replace(" ", "-")) for name, regime in LONG_GRADIENT]
-    return [pytest.param(name, regime, id=ident,
-                         marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{ident}]"]))
-            for name, regime, ident in cases]
+def long_gradient(case) -> str | None:
+    """`case`'s (a `CASES` parameter's) node id among the long cases (`CHECK1_SHARDS`), None where it is
+    none."""
+    name, regime = case.values
+    node = f"{LONG_GRADIENT}[{name}-{regime.replace(' ', '-')}]"
+    return node if node in CHECK1_SHARDS else None
 
 
-@pytest.mark.parametrize('name, regime', long_gradient_cases())
+@pytest.mark.parametrize('name, regime', [case for case in CASES + TPU_ACCELERATED
+                                          if long_gradient(case) is None])
+def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
+    """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
+    token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""
+    _gradient_holds_check_1(name, regime)
+
+
+@pytest.mark.parametrize('name, regime', [
+    pytest.param(*case.values, id=node.removeprefix(f"{LONG_GRADIENT}[").removesuffix("]"),
+                 marks=pytest.mark.check1_shards(**CHECK1_SHARDS[node]))
+    for case in CASES if (node := long_gradient(case)) is not None])
 def test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences(name, regime, request):
-    """`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences` at its long cases (`LONG_GRADIENT`),
-    over the seeds their marks declare (`CHECK1_SHARDS`)."""
+    """`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences` at its long cases (`CHECK1_SHARDS`),
+    over the seeds their marks declare."""
     _gradient_holds_check_1(name, regime, marked_seeds(request))
 
 

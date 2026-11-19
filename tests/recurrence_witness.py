@@ -684,17 +684,22 @@ def laid_chunks(length: int, starts, max_segments: int | None, chunk: int) -> np
     """The chunks of `chunk` tokens a call of one row of `length` tokens lays its tokens in, `[N, 2]`: each
     chunk's first token and its count, in the launches' order (`chunked_launch.sequences`, the mainloop's
     layout): a row's own chunks, or each document's (its first token marked in `starts` `[1, T]`, up to
-    `max_segments` a row) its own, so a document beginning inside a chunk starts a chunk of its own."""
+    `max_segments` a row) its own, so a document beginning inside a chunk starts a chunk of its own. Laid on
+    the host's CPU: a GPU tier's prepare's device computes nothing (row 8497)."""
+    import jax
+
     from dew.nn.inputs import cu_seqlens
     from dew.nn.kernels import chunked_launch
 
-    if starts is None:
-        table = chunked_launch.sequences(1, length, chunk=chunk).chunks
-    else:
-        documents = length if max_segments is None else max_segments
-        table = chunked_launch.sequences(1, length, np.asarray(cu_seqlens(starts, documents + 1)),
-                                         chunk=chunk).chunks
-    chunks = tables.unpacked(chunked_launch.ChunkSpan, lambda i: np.asarray(table)[:, i])
+    with jax.default_device(jax.devices("cpu")[0]):
+        if starts is None:
+            table = chunked_launch.sequences(1, length, chunk=chunk).chunks
+        else:
+            documents = length if max_segments is None else max_segments
+            table = chunked_launch.sequences(1, length, np.asarray(cu_seqlens(starts, documents + 1)),
+                                             chunk=chunk).chunks
+        table = np.asarray(table)
+    chunks = tables.unpacked(chunked_launch.ChunkSpan, lambda i: table[:, i])
     kept = chunks.taken > 0
     return np.stack([chunks.start[kept], chunks.taken[kept]], axis=1)
 
@@ -1008,11 +1013,9 @@ def shifted_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray,
 def shared_decay_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """A decay a key dimension dropped for its head's mean (a kernel that reads one decay a head,
     `refusals`): the call run on the mean of each token's decays over its key dimensions, each record held
-    to the step on the call's own per-key decays."""
-    import jax.numpy as jnp
-
+    to the step on the call's own per-key decays (NumPy's, as a GPU tier's prepare computes nothing)."""
     q, k, v, g, beta, h0 = operands
-    shared = jnp.broadcast_to(jnp.mean(g, -1, keepdims=True), g.shape)
+    shared = np.broadcast_to(np.mean(g, -1, keepdims=True, dtype=np.float32), g.shape).copy()
     faulty = recorded(q, k, v, shared, beta, h0)
     return refusals(faulty, dataclasses.replace(faulty, **hosted(operands)), lane)
 
