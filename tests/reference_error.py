@@ -75,7 +75,7 @@ import arm_arithmetic
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import FORMATTED, Truth, as_written, rounds_nothing, summed_as_run, unrewritten, widened
+from arm_arithmetic import FORMATTED, Truth, rounds_nothing, summed_as_run, unrewritten, widened
 from arm_forms import (
     _arms,
     _arms_with,
@@ -86,13 +86,11 @@ from arm_forms import (
     _layers,
     _mode_of,
     _one_draws_program,
-    _own_function,
     _refuse_numpy_arms,
     _RunToRun,
     _varies,
     _window_count,
     _Windowed,
-    _with_options,
     _written_twin,
     _ynn_decided,
     as_given as as_given,
@@ -110,9 +108,9 @@ from arm_store import (
     _arm_program,
     _compile_arms,
     _hold,
+    _holds_program,
     _stored_arm,
     _stored_arms,
-    _truth_compile,
     _written_references,
     _written_role,
     armed,
@@ -292,22 +290,22 @@ def _own_truth(prepared, followed, result, inputs, truth):
 def _truth_program(fn, device=None):
     """`fn`, a check's float64 truth, as the gate runs it, unrewritten (`arm_arithmetic.unrewritten`):
     compiled, once a signature, so the truth runs as one float64 program on the device's FP64 units rather
-    than one eager dispatch an equation, every primitive at its own float64 semantics (`Truth`), as written
-    (`arm_arithmetic.as_written`) at every site: a jit's program within it, one compiled with options of its
-    own (`without_ynn`, which no jit nests) from its own function, one that runs Dew's own programs
-    (`dew_programs`) with them compiled so through Dew's seam. On a named `device` (a GPU run's sizing's, the
-    host's: `_qualified`) where one is, one placed already staying where it is. A truth the gate runs as given
-    (`as_given`: NumPy, torch, a recording, a host loop), or none, as it is; a window loop's by its own. A
-    truth with host work inside that does not state it fails at its trace, loudly, and passes `as_given`."""
+    than one eager dispatch an equation, every primitive at its own float64 semantics (`Truth`), with XLA's
+    passes, whose rewrites move a float64 value within its own rounding (a reference's twin as written is a
+    float32 arm's bound, `_written_twin`; a whole model's float64 truth compiled as written took 30 times its
+    run, test_edm2's 1755 s against 57). A truth the gate runs as given (`as_given`: NumPy, torch, a
+    recording, a host loop), one of Dew's own programs (`dew_programs`), or none, as it is (`_holds_program`);
+    one compiled already (a jit) as it is too, but on a named `device` (a GPU run's sizing's, the host's:
+    `_qualified`), where it is that device's program as a plain one is, and one placed already stays where it
+    is; a window loop's by its own. A truth with host work inside that does not state it fails at its trace,
+    loudly, and passes `as_given`."""
     if isinstance(fn, Truth):
         return fn if device is None or fn.device is not None else Truth(fn.fn, device)
     if isinstance(fn, _Windowed):
         return _Windowed(_truth_program(fn.fn, device))
-    if fn is None or _given(fn):
+    if fn is None or not _holds_program(fn) or (device is None and hasattr(fn, "lower")):
         return unrewritten(fn)
-    if getattr(fn, "dew_programs", False):
-        return unrewritten(_with_options(fn, as_written))
-    return Truth(_own_function(fn), device)
+    return Truth(fn, device)
 
 
 def with_gradients(fn, *, has_aux: bool = False):
@@ -624,9 +622,7 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
     recording) has no program."""
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
                            library_row=None, library_leaves=(), also=also, terms=terms)
-    # A jit's own function (`arm_forms._own_function`), as its run compiles it: one of compiler options of its
-    # own nests in no trace of the prepare's.
-    truth = _own_function(truth_fn if truth_fn is not None else reference_fn)
+    truth = truth_fn if truth_fn is not None else reference_fn
     shaped = {}
     for seed in range(staged_units(seeds)):
         inputs = drawn_on_the_host(draw, seed)
@@ -645,14 +641,14 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
                 _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
             _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
         try:
-            store.compile_site(label, programs, held, compiled=_truth_compile(store))
+            store.compile_site(label, programs, held)
         except report.CompiledOnDevice as refused:
             # A truth its target's GPU would leave a choice of to run time (a convolution's algorithm,
             # `report.at_run_time`), which no compile without that GPU holds: its run compiles its truths
             # on the GPU, their float64 on its FP64 units, as its arms (`_compile_arms`), named
             # (`truths_ahead.running`); the choice moves a float64 truth by float64's rounding alone
             # (row 8576).
-            store.compile_site(label, programs, held, compiled=_truth_compile(store), at_run=str(refused))
+            store.compile_site(label, programs, held, at_run=str(refused))
     # A qualification run sizes a plain site first (`_qualified`), on its sizing draws through its arms.
     sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and plain else range(0)
     compile = _compile_for(dew_fn, reference_fn)
@@ -1173,8 +1169,8 @@ def _cancelling_terms(draw, truth, program=None):
     run it (`_truth_program`: a Truth, or a truth compiled already, a jit or Dew's own programs), evaluates
     the first draw's truth, so its first call's run and compiles serve the draws too, once a process (a
     map task's draws, DRAWS): a truth compiled apart here compiled the float64 truth twice a site
-    (pass_weights' 10 s). None, a reference standing for it, runs compiled as written, as every truth
-    (`_truth_program`), not eagerly (ledger 3774)."""
+    (pass_weights' 10 s). None, a reference standing for it, runs compiled (`_truth_program`), not eagerly
+    (ledger 3774)."""
     if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
         return None
     # The truth on the site's first draw, and its terms only where it holds a zero row: only a zero row whose
@@ -1271,7 +1267,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     two Dew paths without YNNPACK's fusions, a Dew arm beside an arm run `as_given` with them. A reference
     written apart from Dew, an accuracy claim's, is compiled as written too (`_written_twin`), Dew's arm held
     within PARITY to the power WRITTEN of it, each of check 1's factors so raised; one of Dew's own paths
-    (`dew_path`, `dew_programs`) is not. A site naming no truth takes its reference as written as truth.
+    (`dew_path`, `dew_programs`) is not.
 
     Where a computation has an orbit of summation orders, `orders(inputs)` lists a draw's inputs at K
     of them, the draw itself first: an exact symmetry of the result (a batch's rows in another order
@@ -1540,17 +1536,16 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     if judging():
         _judged_pooled(label, verdict)
         return
-    # Its truth, where it names none its reference as compiled here as written, resolved once, before its
-    # terms are sized by it and before the store's programs take the arms' place: a reference arm read from
-    # the store is its own program at its own inputs alone, which a truth its run computes (its truths at
-    # run, `truths_ahead.running`) never is.
-    own = _written_twin(dew_fn, reference_fn)
-    truth_program = _truth_program(truth_fn) or own
+    truth_program = _truth_program(truth_fn)
     terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
                            truth_program)
     narrow_leaves: list[str] = []
     compiled = _arms_with(dew_fn, reference_fn, list(also.values()), label)
-    twins = [own if name is None else _written_twin(dew_fn, fn) for name, fn in written]
+    twins = [_written_twin(dew_fn, reference_fn if name is None else fn) for name, fn in written]
+    # Its truth, where it names none its reference's arm as compiled here, resolved before the store's
+    # programs take the arms' place: a reference arm read from the store is its own program at its own
+    # inputs alone, which a truth its run computes (its truths at run, `truths_ahead.running`) never is.
+    truth_program = truth_program if truth_program is not None else compiled[1]
     # The arms read from the store wherever its prepare reached the site, its truths' at run or not.
     if (ahead := reading()) is None:
         _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
@@ -1655,9 +1650,8 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
     says enough and this is not needed."""
     _enough_seeds(seeds, label)
     _refuse_numpy_arms(draw, changed_fn, original_fn)
-    # The truth, the original compiled as written where none is named (`_written_twin`), as every truth is.
-    truth_fn = _truth_program(truth_fn) or _written_twin(changed_fn, original_fn)
     changed_fn, original_fn = _arms(changed_fn, original_fn)
+    truth_fn = _truth_program(truth_fn)
     [draws] = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
@@ -1741,24 +1735,18 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     paired = dew_fn is not None
     if arms is None:
         _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
-    # The truth, the reference compiled as written where none is named, as every truth is (`_written_twin`),
-    # resolved once before a weighing reads it.
-    own = _written_twin(dew_fn if paired else reference_fn, reference_fn)
-    truth_program = _truth_program(truth_fn) or own
+    # Dew paired with the reference compiled as written where `written` (`_written_twin`), else alike; the
+    # pair as given (`arms`, a store's: its twin where `written`) in place of compiling one here.
+    twin = _written_twin(dew_fn, reference_fn) if written and paired and arms is None else None
     # A weighed site (`assert_as_exact`'s `conditioning`) is sized as it is judged, weighed, its heavy
     # elements classed over its first stages' draws.
-    weighing = (_conditioning(reference_fn, truth_program, draw,
-                              range(staged_units(max(start, FEWEST_SEEDS))), scale=conditioning_scale)
-                if conditioning else None)
-    truth_fn = truth_program
-    # The pair as given (`arms`, the one `written` names where it is given, a store's twin), else compiled
-    # here: Dew paired with the reference compiled as written where `written`.
-    if arms is not None:
-        dew_fn, reference_fn = arms
-    else:
-        dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
-        reference_fn = own if written and paired else reference_fn
+    weighing = (_conditioning(reference_fn, truth_fn, draw, range(staged_units(max(start, FEWEST_SEEDS))),
+                              scale=conditioning_scale) if conditioning else None)
+    dew_fn, reference_fn = (arms if arms is not None
+                            else _arms(dew_fn if paired else reference_fn, reference_fn))
+    reference_fn = twin or reference_fn
     dew_fn = dew_fn if paired else None
+    truth_fn = _truth_program(truth_fn)
     first = 0 if dew_fn is None else SIZING_FROM
 
     def drawn(start_at: int, stop: int):

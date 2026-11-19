@@ -1,7 +1,7 @@
 """A check-1 site's arms compiled ahead into a store of programs (`truths_ahead.CompiledTruths`, a GPU tier's
 prepare) and run from it (`_stored_arms`): each arm's program traced as its run traces it and compiled as the
 gate compiles it (`arm_forms._compiled`), its references' twins as written (`arm_forms._written_twin`) held
-apart; a site's truths and terms compiled so too (`_truth_compile`), as written."""
+apart."""
 
 import contextlib
 import dataclasses
@@ -37,18 +37,6 @@ def _written_references(reference_fn, also: Mapping) -> list[tuple[str | None, C
 def _written_role(name: str | None) -> str:
     """The role of reference `name`'s twin compiled as written in a site's store (`_written_references`)."""
     return "written" if name is None else f"written {name}"
-
-
-def _truth_compile(store: CompiledTruths) -> Callable:
-    """How `store` compiles a site's truths and terms (`CompiledTruths.compile_site`'s `compiled`): as their
-    run's compile does (Dew's compile point for a GPU's, `jax.jit` on this process's devices), as written on
-    the platform they compute on (`arm_arithmetic.as_written`), as every truth the gate runs is."""
-    written = as_written(store.device().platform)
-    if store.target is None:
-        return functools.partial(jax.jit, compiler_options=written)
-    from dew.nn.kernels.options import owned_program
-
-    return functools.partial(owned_program, step=written)
 
 
 def _arm_compile(compile: Callable, written: dict | None) -> Callable:

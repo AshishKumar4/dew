@@ -246,9 +246,9 @@ class Unrewritten:
 class Written:
     """`fn` compiled by `compile` (`jax.jit`, or an arm's pairing's: `arm_forms.without_ynn`) as written
     (`as_written`) for the platform each call runs on (`_platform_of`: where its inputs lie, a GPU-committed
-    draw's under a CPU default included), once a platform: a truth's program (`Truth`) and an accuracy
-    claim's reference as written (`arm_forms._written_twin`), the one rule both take. Its `lower` and `trace`
-    are the program an uncommitted call runs, for the platform the context places a call on."""
+    draw's under a CPU default included), once a platform: an accuracy claim's reference as written
+    (`arm_forms._written_twin`). Its `lower` and `trace` are the program an uncommitted call runs, for the
+    platform the context places a call on."""
 
     def __init__(self, fn, compile: Callable = jax.jit):
         self.fn, self.compile, self._made = fn, compile, {}
@@ -278,16 +278,15 @@ class Written:
 
 class Truth:
     """A check's float64 truth as the gate runs it (`reference_error._truth_program`): its own function
-    compiled as written for the platform its call runs on (`Written`), which every site of it shares, run
-    unrewritten (`unrewritten`), compiled from its first call and never run eagerly, so a seed's truth is
-    the same whichever seed a process draws first (a map task's, DRAWS) and a large truth pays no eager run.
-    A truth that does host work on its values (NumPy, torch, a fetch to the host) states it, `as_given`, and
-    the gate runs it so; unstated, its trace fails at its first seed, naming it (ledger 3198). On `device`
-    where one is named (a GPU run's sizing, whose truths its host computes as a prepare's do, the GPU's memory
-    left to the arms): a truth rewritten into another value makes every ratio meaningless."""
+    jitted, which every site of it shares, run unrewritten (`unrewritten`), compiled from its first call and
+    never run eagerly, so a seed's truth is the same whichever seed a process draws first (a map task's,
+    DRAWS) and a large truth pays no eager run. A truth that does host work on its values (NumPy, torch, a
+    fetch to the host) states it, `as_given`, and the gate runs it so; unstated, its trace fails at its
+    first seed, naming it (ledger 3198). On `device` where one is named (a GPU run's sizing, whose truths its
+    host computes as a prepare's do, the GPU's memory left to the arms)."""
 
     def __init__(self, fn, device=None):
-        self.fn, self.device, self.run = fn, device, unrewritten(Written(fn))
+        self.fn, self.run, self.device = fn, unrewritten(jax.jit(fn)), device
 
     def __call__(self, *inputs):
         # On `device` where one is named: a GPU run's sizing computes its truths on the host, as a prepare
@@ -297,7 +296,7 @@ class Truth:
 
     @property
     def trace(self):
-        """Its program's trace (JAX's `jit(...).trace`), the one an uncommitted call runs."""
+        """Its program's trace (JAX's `jit(...).trace`), the one its calls run."""
         return self.run.trace
 
 
