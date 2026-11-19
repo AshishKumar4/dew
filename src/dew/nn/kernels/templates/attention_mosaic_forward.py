@@ -152,8 +152,8 @@ def _stores_through_query(family: mosaic.Family, width: int, value_width: int, d
 
 
 def forward_products(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, *, peaks: bool = False,
-                     parts: int = 1, ahead: bool = False, scaled: bool = False, training: bool = False
-                     ) -> tuple:
+                     parts: int = 1, ahead: bool = False, scaled: bool = False, training: bool = False,
+                     query_width: int | None = None, tmem_columns: int | None = None) -> tuple:
     """A forward program's products as its scope takes its issuer's scratch (`Family.scoped`'s `products`):
     each consumer's logits, a key tile wide, and, but a peak walk's, its weighted values, the values' width,
     whose left operand, the weights a key tile deep in the values' dtype (an fp32 call's bf16 parts), is a
@@ -178,7 +178,14 @@ def forward_products(family: mosaic.Family, tiles: Tiles, value_width: int, dtyp
     if not (training or family.rescales_kept):
         return (tiles.consumers, (*logits, value_width), lefts, ahead_logits)
     fresh = (value_width,) if scaled or jnp.dtype(dtype) == jnp.dtype(jnp.float16) else ()
-    return (tiles.consumers, (*logits, *fresh), lefts, ahead_logits, (value_width,))
+    base = (tiles.consumers, (*logits, *fresh), lefts, ahead_logits, (value_width,))
+    if family.places_on_role and query_width is not None and parts == 1:
+        columns = generation.gpu_target().tmem_columns if tmem_columns is None else tmem_columns
+        with_query = (tiles.consumers, (*logits, *fresh), (*lefts, (query_width, dtype)),
+                      ahead_logits, (value_width,))
+        if family.product_columns(with_query) <= (columns or 0):
+            return with_query
+    return base
 
 
 def logits_ahead(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, *, stages: int,
@@ -2005,7 +2012,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                         interpret=interpret, value_width=value_width)
 
     products = forward_products(family, tiles, value_width, query.dtype, peaks=peaks, parts=parts,
-                                ahead=bool(program.ahead), scaled=spec.headroom, training=training)
+                                ahead=bool(program.ahead), scaled=spec.headroom, training=training,
+                                query_width=width, tmem_columns=target.tmem_columns)
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,

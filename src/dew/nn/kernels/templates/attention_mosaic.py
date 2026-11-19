@@ -619,7 +619,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # Its products' accumulators within the multiprocessor's tensor memory, where its issuer keeps them
         # there (`Issuer.product_columns`: tcgen05's chunks, each consumer's sums across its walk beside its
         # logits).
-        if family.product_columns(self._products(ba, config)) > (target.tmem_columns or 0):
+        if family.product_columns(self._products(ba, config, target)) > (target.tmem_columns or 0):
             return False
         # Its products' right operands, the keys' tile in S = Q·Kᵀ (the heads' width deep, a key tile's
         # columns) and the values' in P·V (a key tile's rows of the launch's value columns, `Tiles.columns`),
@@ -901,19 +901,24 @@ class MosaicForward(_Mainloop[Tiles]):
                            magnitudes=(cached and self.scales_in_kernel(ba)) or self.deciding(ba, config))
         return resources.shared_bytes(family, launch_scope(family, allocations, reduced,
                                                            reduces=forward_reduces(family, reduced),
-                                                           products=self._products(ba, config),
+                                                           products=self._products(ba, config, target),
                                                            over_rings=True))
 
-    def _products(self, ba: tokamax.BoundArguments, config: Tiles) -> tuple:
+    def _products(self, ba: tokamax.BoundArguments, config: Tiles,
+                  target: generation.GpuTarget | None = None) -> tuple:
         """The launch's products at `config` as its program scopes them (`forward_products`): its logits a
         step ahead where it issues them so (`_ahead`), a scaled walk's small weights' accumulator beside its
-        sums where its kernel walks scaled (`scales_in_kernel`)."""
+        sums where its kernel walks scaled (`scales_in_kernel`), and its query in tensor memory where
+        tensor memory holds it beside them (`placed.QUERY`)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
+        query_width = _width(query.shape[-1], family, query.dtype)
         value_width = config.columns or _width(value.shape[-1], family, query.dtype)
         return forward_products(family, config, value_width, query.dtype, parts=self.parts,
                                 scaled=self.scales_in_kernel(ba), ahead=self._ahead(ba, config),
-                                training=ba.arguments.get("residuals") is Kept.SPLIT)
+                                training=ba.arguments.get("residuals") is Kept.SPLIT,
+                                query_width=query_width,
+                                tmem_columns=None if target is None else target.tmem_columns)
 
     def _ahead(self, ba: tokamax.BoundArguments, config: Tiles) -> bool:
         """Whether the launch at `config` issues its logits a step ahead of their read (`logits_ahead`)."""

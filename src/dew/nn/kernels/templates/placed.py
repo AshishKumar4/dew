@@ -14,8 +14,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import after_walk, handoffs, mosaic, resources, swizzling
+from dew.nn.kernels.templates import after_walk, handoffs, mosaic, resources, rings, swizzling
 from dew.nn.kernels.templates.mosaic_sm100 import (
+    STORED,
     TMEM,
     Accumulator,
     Signal,
@@ -136,32 +137,60 @@ class Tcgen05Placed(Tcgen05Rings):
         # formed from, and the turn's next logits issued after the product reading those weights, the tensor
         # core taking its products in their issue order (FlashAttention 4's P over S, two consumers' turns
         # and sums within 512 columns at 64 keys and width 128). Its one walk's sums kept across it (`SUMS`),
-        # and its hand-offs: the logits' (`scored`, two turns, the issuer's commit), the weights' (`weighed`,
-        # two, the consumer's threads, their tensor-memory stores ordered before the products that read them)
-        # and the sums' (`summed`, two, the commit: a turn's weighted values, the product that last read the
-        # turn's weights, `accumulating`). The products it places are those alone
-        # (`placed_products`).
+        # its query tile in tensor memory where tensor memory holds it beside them (`QUERY`, 16-bit two to a
+        # column, so every key tile's logits product reads Q from tensor memory instead of re-reading shared
+        # memory, row 5368), and its hand-offs: the logits' (`scored`, two turns, the issuer's commit), the
+        # weights' (`weighed`, two, the consumer's threads, their tensor-memory stores ordered before the
+        # products that read them), the sums' (`summed`, two, the commit: a turn's weighted values, the
+        # product that last read the turn's weights, `accumulating`), and the query's (`q_ready`, one turn,
+        # where `QUERY` is held). The products it places are those alone (`placed_products`).
         del widths, together
-        ((logits,), (left,), (kept,)) = ahead, tuple(dict.fromkeys(lefts)), sums
+        ((logits,), (kept,)) = ahead, sums
+        left, *query_left = lefts
         rows, (depth, dtype) = self.rows, left
-        return {"scored": tuple(self.signals(2).scratch() for _ in range(consumers)),
-                "weighed": tuple(self.signals(2).scratch() for _ in range(consumers)),
-                "summed": tuple(self.signals(2).scratch() for _ in range(consumers)),
-                LOGITS: tuple(tuple(plgpu.RefUnion(self.tensor_memory((rows, logits)),
-                                                   self.tensor_memory((rows, depth), dtype))
-                                    for _ in range(2)) for _ in range(consumers)),
-                SUMS: tuple(self.tensor_memory((rows, kept)) for _ in range(consumers))}
+        scratch = {"scored": tuple(self.signals(2).scratch() for _ in range(consumers)),
+                   "weighed": tuple(self.signals(2).scratch() for _ in range(consumers)),
+                   "summed": tuple(self.signals(2).scratch() for _ in range(consumers)),
+                   LOGITS: tuple(tuple(plgpu.RefUnion(self.tensor_memory((rows, logits)),
+                                                      self.tensor_memory((rows, depth), dtype))
+                                       for _ in range(2)) for _ in range(consumers)),
+                   SUMS: tuple(self.tensor_memory((rows, kept)) for _ in range(consumers))}
+        if query_left:
+            ((q_width, q_dtype),) = query_left
+            scratch["q_ready"] = tuple(self.signals(1).scratch() for _ in range(consumers))
+            scratch[QUERY] = tuple(self.tensor_memory((rows, q_width), q_dtype) for _ in range(consumers))
+        return scratch
 
     def product_columns(self, products: tuple | None) -> int:
         if products is None:
             return 0
         scratch = self.product_scratch(*products)
-        held = tuple(scratch[name] for name in (LOGITS, SUMS))
+        held = tuple(scratch[name] for name in (LOGITS, SUMS, QUERY) if name in scratch)
         return resources.tensor_memory_columns(jax.tree.leaves(held))
 
     def product_shared(self, scratch) -> tuple:
         # Its accumulators and tiles are tensor memory; its hand-offs' barriers shared memory.
-        return tuple(barrier for name in ("scored", "weighed", "summed") for barrier in scratch[name])
+        return tuple(barrier for name in ("scored", "weighed", "summed", "q_ready")
+                     if name in scratch for barrier in scratch[name])
+
+    def held(self, ref):
+        # The query block moved into tensor memory once before the walk where tensor memory holds it beside
+        # the logits and sums (`product_scratch`'s `QUERY`), so every key tile's logits product reads Q from
+        # tensor memory (tcgen05's TS form) instead of re-reading shared memory (`issuing`, row 5368).
+        found = self._scoped()
+        if QUERY not in found:
+            return ref
+        role = mosaic.ROLE.get()
+        q_ref = found[QUERY][role]
+        q_tmem = Accumulator(q_ref, tuple(q_ref.shape), dtype=q_ref.dtype)
+        dtype, width = ref.dtype, ref.shape[1]
+        chunk = min(width, swizzling.swizzle_columns(dtype, swizzling.swizzle_for(dtype, width)))
+        for column in range(0, width, chunk):
+            src = ref if chunk == width else ref.at[:, pl.ds(column, chunk)]
+            tile = plgpu.load(src, layout=STORED, optimized=False)
+            self.write(q_tmem, tile, first=column)
+        self.signals(1).opened(found["q_ready"][role]).published(rings.Turn.of(0, 1))
+        return q_tmem
 
     def product_addresses(self, products: tuple | None) -> int:
         return 0 if products is None else resources.TMEM_ADDRESS_BYTES
@@ -282,9 +311,16 @@ class Tcgen05Placed(Tcgen05Rings):
         signals = tuple(self._signals(consumer) for consumer in served)
         logits = tuple(self._turns(scores.into, consumer) for consumer in served)
         weights = tuple(self._turns(WEIGHTS, consumer) for consumer in served)
-        held = self._scoped()[weighted.into][:len(lefts)]
+        found = self._scoped()
+        held = found[weighted.into][:len(lefts)]
         sums = tuple(Accumulator(each_held, tuple(each_held.shape)) for each_held in held)
-        lhs = tuple(left[scores.left] for left in lefts)
+        if QUERY in found:
+            lhs = tuple(Accumulator(found[QUERY][c], tuple(found[QUERY][c].shape),
+                                    dtype=found[QUERY][c].dtype) for c in served)
+            waited = tuple(self.signals(1).opened(found["q_ready"][c]) for c in served)
+        else:
+            lhs = tuple(left[scores.left] for left in lefts)
+            waited = None
 
         def each(index, turn: int, consumer: int, issue: Callable[[jax.Array, int], None]) -> None:
             # A consumer's product of step `index`: at the program's own turn where it walks every step (one
@@ -327,8 +363,12 @@ class Tcgen05Placed(Tcgen05Rings):
                 each(index, turn, consumer, weighted_values)
             values.release(ring)
 
-        for barrier in ready:
-            plgpu.barrier_wait(barrier)
+        if waited is not None:
+            for signal in waited:
+                signal.wait(rings.Turn.of(0, 1))
+        else:
+            for barrier in ready:
+                plgpu.barrier_wait(barrier)
         mosaic.looped(issued(score, weigh, lo, hi), None, ())
 
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
@@ -365,7 +405,7 @@ RESCALED_COLUMNS = 32
 """The sums' columns a consumer of tcgen05's rows takes by a factor at once in tensor memory (a row's 32 a
 thread, beside its step's logits and weights)."""
 
-LOGITS, WEIGHTS, SUMS = "logits", "weights", "sums"
+LOGITS, WEIGHTS, SUMS, QUERY = "logits", "weights", "sums", "query"
 """The scratch of tcgen05's rows' products (`Tcgen05Placed.product_scratch`): the logits' two accumulators,
 the weights' two tiles, the sums kept across the walk; a declared product's by its accumulator
 (`placed_products`)."""

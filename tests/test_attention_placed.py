@@ -36,7 +36,7 @@ a step."""
 
 
 @INTERPRETS
-@pytest.mark.parametrize("width", [64, 128])
+@pytest.mark.parametrize("width", [64, 128, 256])
 @pytest.mark.parametrize("natural", [True, False], ids=["natural", "folded"])
 @pytest.mark.parametrize("call", ["full", "causal"])
 def test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted(call, natural, width):
@@ -90,6 +90,24 @@ def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving
             return attention_mosaic.forward(query, key, key, spans, interpret=False)
 
     threads, arrivals = programs(forward, query, key, threads=tiles.consumers + 1, rare=moves)
+    assert explore(threads, arrivals) > 0
+
+
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_interleaving(call):
+    """The forward on a B200's tcgen05 rows at width 256 (1 consumer: SUMS 256 + LOGITS 128 + QUERY 128 =
+    512 TMEM columns, row 5368): every interleaving of its consumer, producer and issuer warps explored
+    (`ring_protocol.explore`), including the query-in-TMEM hand-off (`q_ready`)."""
+    from ring_protocol import explore, programs
+
+    query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 256, 1, 256), jnp.bfloat16)
+    spans = template.spans(256, 256, 1, **CALLS[call])
+
+    def forward(query, key):
+        with generation.assumed("sm100"), _pinned(ROWS_TILES):
+            return attention_mosaic.forward(query, key, key, spans, interpret=False)
+
+    threads, arrivals = programs(forward, query, key, threads=ROWS_TILES.consumers + 1, rare=False)
     assert explore(threads, arrivals) > 0
 
 
