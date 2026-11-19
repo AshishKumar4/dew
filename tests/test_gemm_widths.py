@@ -80,25 +80,46 @@ def test_a_tma_family_runs_a_partial_step_and_column_tile_where_its_rows_are_who
 
 @INTERPRETS
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "v5e"])
-@pytest.mark.parametrize(("depth", "width"), WIDTHS, ids=["96x100", "200x72"])
-def test_a_product_of_unaligned_widths_runs_on_the_template(generation_name, depth, width):
+def test_a_product_of_unaligned_widths_runs_on_the_template(generation_name):
     """`unaligned_widths_run_on_the_template`, interpreted on the CPU as each family."""
     with generation.assumed(generation_name):
-        unaligned_widths_run_on_the_template(depth, width, interpret=True)
+        unaligned_widths_run_on_the_template(WIDTHS, interpret=True)
 
 
-def unaligned_widths_run_on_the_template(depth: int, width: int, *, interpret: bool) -> None:
-    """A grouped forward, its input gradient and its kernel gradient, and a dense forward, at a depth and a
-    width no tile of the family divides, the template's launch named (`'mosaic'`): over integers from -1 to
+def unaligned_widths_run_on_the_template(widths: list, *, interpret: bool) -> None:
+    """At each of `widths`' depth and width, which no tile of the family divides, a grouped forward, its input
+    gradient and its kernel gradient, and a dense forward, all one program (traced and compiled once, bible
+    §8, in a tier's prepare: `ahead_arm`), the template's launch named (`'mosaic'`): over integers from -1 to
     1, every product and sum exact, bitwise numpy's, groups of rows no tile divides and one empty; on a GPU
     itself too (tests/test_gpu_gemm.py's cell), where a TMA family runs a product's last step and column
     tile partial (`mosaic_gpu.partial_runs`), its loads past the call zero-filled, interpreted padded to
     whole tiles (`grouped_matmul._Mosaic._aligned`), as the kernel gradient is everywhere."""
     from reference_error import ahead_arm
 
+    calls, inputs = {}, []
+    for depth, width in widths:
+        each, operands = _unaligned_calls(depth, width, interpret=interpret)
+        calls.update({name: (call, len(inputs), expected) for name, (call, expected) in each.items()})
+        inputs.append(operands)
+
+    def products(*flat):
+        return tuple(call(*flat[3 * at:3 * at + 3]) for call, at, _ in calls.values())
+
+    label = "unaligned widths " + ", ".join(f"{depth}x{width}" for depth, width in widths)
+    with generation.chosen(grouped_matmul="mosaic"), generation.routes() as routes:
+        got = ahead_arm(jax.jit(products), label)(*(array for operands in inputs for array in operands))
+    launched = [route.kernel for route in routes if route.choice == "grouped_matmul"]
+    assert len(launched) >= len(calls) and set(launched) == {"mosaic"}, launched
+    for (name, (_, _, expected)), value in zip(calls.items(), got, strict=True):
+        np.testing.assert_array_equal(np.asarray(value, np.float32), expected, err_msg=name)
+
+
+def _unaligned_calls(depth: int, width: int, *, interpret: bool) -> tuple[dict, tuple]:
+    """`unaligned_widths_run_on_the_template`'s calls at a depth and a width, each a function of its
+    operands with numpy's product, and those operands: NumPy's, as a site's draws are (a GPU tier's prepare
+    computes on no device)."""
     sizes = [70, 0, 129, 57]
     starts = np.cumsum([0, *sizes])
-    # NumPy's, as a site's draws are: a GPU tier's prepare computes on no device.
     rng = np.random.default_rng(4)
     x, w, dy = (rng.integers(-1, 2, shape).astype(jnp.bfloat16)
                 for shape in ((sum(sizes), depth), (len(sizes), depth, width), (sum(sizes), width)))
@@ -109,26 +130,19 @@ def unaligned_widths_run_on_the_template(depth: int, width: int, *, interpret: b
         return np.concatenate([np.asarray(lhs[a:b], np.float32) @ np.asarray(matrices[g], np.float32)
                                for g, (a, b) in enumerate(itertools.pairwise(starts))])
 
-    calls = {
-        "grouped forward": (lambda x, w, dy: gemm.gemm(x, w, group_sizes, **options), grouped(x, w)),
-        "grouped input gradient": (
+    shape = f"{depth}x{width}"
+    return {
+        f"{shape} grouped forward": (lambda x, w, dy: gemm.gemm(x, w, group_sizes, **options), grouped(x, w)),
+        f"{shape} grouped input gradient": (
             lambda x, w, dy: gemm.gemm(dy, w, group_sizes, transpose_rhs=True, **options),
             grouped(dy, np.swapaxes(w, 1, 2))),
-        "grouped kernel gradient": (lambda x, w, dy: gemm.gemm_t(x, dy, group_sizes, **options), np.stack(
-            [np.asarray(x[a:b], np.float32).T @ np.asarray(dy[a:b], np.float32)
-             for a, b in itertools.pairwise(starts)])),
-        "dense forward": (lambda x, w, dy: gemm.gemm(x, w[0], None, **options),
-                          np.asarray(x, np.float32) @ np.asarray(w[0], np.float32)),
-    }
-    # Every product one program, traced and compiled once, in a tier's prepare (bible §8, `ahead_arm`), each
-    # one's launch the template's.
-    products = jax.jit(lambda x, w, dy: tuple(call(x, w, dy) for call, _ in calls.values()))
-    with generation.chosen(grouped_matmul="mosaic"), generation.routes() as routes:
-        got = ahead_arm(products, f"unaligned widths {depth}x{width}")(x, w, dy)
-    launched = [route.kernel for route in routes if route.choice == "grouped_matmul"]
-    assert len(launched) >= len(calls) and set(launched) == {"mosaic"}, launched
-    for (name, (_, expected)), value in zip(calls.items(), got, strict=True):
-        np.testing.assert_array_equal(np.asarray(value, np.float32), expected, err_msg=name)
+        f"{shape} grouped kernel gradient": (lambda x, w, dy: gemm.gemm_t(x, dy, group_sizes, **options),
+                                             np.stack([np.asarray(x[a:b], np.float32).T
+                                                       @ np.asarray(dy[a:b], np.float32)
+                                                       for a, b in itertools.pairwise(starts)])),
+        f"{shape} dense forward": (lambda x, w, dy: gemm.gemm(x, w[0], None, **options),
+                                   np.asarray(x, np.float32) @ np.asarray(w[0], np.float32)),
+    }, (x, w, dy)
 
 
 def test_a_dense_products_partial_depth_lowers_with_its_matrix_prefetched():

@@ -631,20 +631,6 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
             anchors[:, :, :queries], split)
 
 
-def _whole(array: jax.Array, parts: int) -> jax.Array:
-    """An fp32 call's operand `[P·B, ...]` from its bf16 `parts` stacked along the batch axis
-    (`MosaicForward.parts`), the largest first, summed exactly in fp32 (`product.formed`'s parts are its
-    remainders) from the smallest up: at fp32's largest the leading two parts sum past it, the third's
-    negative remainder taking it back (row 6842); itself where it enters whole."""
-    if parts == 1:
-        return array
-    stacked = array.astype(jnp.float32).reshape(parts, -1, *array.shape[1:])
-    whole = stacked[parts - 1]
-    for part in range(parts - 2, -1, -1):
-        whole = stacked[part] + whole
-    return whole
-
-
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
               scale: float, natural: bool, tiles: Tiles, family: mosaic.Family,
               table: jax.Array | None = None, inference: bool = False, subtracted: bool = False,
@@ -1343,11 +1329,18 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                            for ref, param in zip(hooked.output, hooks.output_params, strict=True))
         if isinstance(state.acc, mosaic.Kept):
             # Sums its issuer keeps past the walk (`Issuer.accumulated`'s `mosaic.Kept`: a plain walk's, its
-            # hooks refused and its rows all its own, `MosaicForward._placed_refusal`): the walk's ratio
-            # (`finish`'s), each row's factor its store takes in place a block of columns at a time
-            # (`Family.stored`).
+            # hooks refused and its rows all its own, `MosaicForward._placed_refusal`): the walk's ratio, as
+            # `algebra.quotient` takes it (a subnormal kept interpreted, row 6302), its store taking each
+            # block of columns in place (`Family.stored`), zero in a row that saw no key, whose sums its walk
+            # never wrote.
             maximum, denominator = algebra.finished_rows(spec, state, initial=False)
-            kept = state.acc.scaled(algebra.inverse(state.total))
+            total, factor = state.total, algebra.inverse(state.total)
+
+            def ratio(block: jax.Array) -> jax.Array:
+                taken = algebra.quotient(lambda held: held * factor[:, None], block, total)
+                return jnp.where(factor[:, None] != 0, taken, 0.0)
+
+            kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
@@ -1487,8 +1480,8 @@ def _largest(program: _Program, hooked: _Hooked, place: tuple, k_first, slots, c
 
 def _magnitudes(value: jax.Array, hooked: _Hooked, parts: int) -> jax.Array:
     """A launch's keys' value magnitudes (`_Hooked.magnitudes`): each key's largest over `value`'s
-    columns `[B, K, Hk, Dv]` (an fp32 call's whole, `_whole`), `[B, Hk, K]` fp32."""
-    return jnp.swapaxes(jnp.max(jnp.abs(_whole(value, parts).astype(jnp.float32)), axis=-1), 1, 2)
+    columns `[B, K, Hk, Dv]` (an fp32 call's whole, `product.joined`), `[B, Hk, K]` fp32."""
+    return jnp.swapaxes(jnp.max(jnp.abs(product.joined(value, parts)), axis=-1), 1, 2)
 
 
 def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partial, known: algebra.Argmax,
@@ -1914,7 +1907,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
-                                peaks=peaks, training=training, counted=counted, shared_by=shared_by)
+                                peaks=peaks, training=training, counted=counted, shared_by=shared_by,
+                                in_key=value_columns is not None)
     grid = (heads, queries // pair * splits, batch)
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
@@ -2013,19 +2007,20 @@ def _program_views(program: _Program, refs, read: _Read, *, peaks: bool, group: 
 
 def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, value, keys_count: int,
                   value_width: int, tiles: Tiles, *, peaks: bool, training: bool, counted: bool,
-                  shared_by: int) -> tuple:
+                  shared_by: int, in_key: bool) -> tuple:
     """A launch's cost and the model's FLOPs it owns (`_launched`'s `cost` and `model_flops`): its walk's
     statement, its work its emission's (`stated`), and the model's products it owns (`modelled`): the
     forward's two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of
     an inference call's columns its `P V` and its share of `Q K^T` (`shared_by`); a launch not `counted`
     none: a rerun (a guarded launch, the fold's natural walk), whose loop of at most one trip the FLOP count
     bounds by its trip, and a rare call's scaled op (`MosaicForward.scaled`), whose branch it takes where it
-    is the larger, either counting work every step that runs at most rarely."""
+    is the larger, either counting work every step that runs at most rarely. A launch whose values are its
+    keys' columns (`in_key`, `MosaicForward.in_key`) reads one stream, the key buffer counted once: a
+    statement, as the launch's arrays reach it under `tuning.lowered_once`'s jit as distinct tracers."""
     batch, queries, heads, width = query.shape
     owned_value = 0 if peaks else value_width
     owned_query = 0 if training and not peaks else width
-    # The key buffer counted once where it is the values' too (`MosaicForward.in_key`, one stream).
-    streamed = (query, key) if value is key else (query, key, value)
+    streamed = (query, key) if in_key else (query, key, value)
     cost = (stated(spec, batch, heads, *streamed,
                    tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
                                       common=family.feeds_itself)) if counted

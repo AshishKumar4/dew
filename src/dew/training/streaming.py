@@ -65,7 +65,9 @@ class Choice:
     (`held`) and whether they hold the streamed step (`fits`), each one's step price where its part rates
     it (`device`, `streamed`; None otherwise), why the streamed one was not a candidate (`refused`), and
     whether it was taken (`streams`); or, for a run resuming a checkpoint (`resumed`), the layout that
-    checkpoint trained in, laid out alike (`resumed_layout`), no plan priced."""
+    checkpoint trained in, laid out alike (`resumed_layout`), no plan priced. `streamed_headroom` is the
+    bytes the streamed step's fit check found its tightest device had to spare (`step_fits`, negative where
+    short), as a plan's probes record the device ladder's; None where that check did not run or read none."""
 
     held: bool
     fits: bool
@@ -74,12 +76,14 @@ class Choice:
     refused: str | None
     streams: bool
     resumed: bool = False
+    streamed_headroom: int | None = None
 
     def record(self) -> dict[str, JSON]:
         return {"held": self.held, "fits": self.fits,
                 "device": None if self.device is None else self.device.record(),
                 "streamed": None if self.streamed is None else self.streamed.record(),
-                "refused": self.refused, "streams": self.streams, "resumed": self.resumed}
+                "refused": self.refused, "streams": self.streams, "resumed": self.resumed,
+                "streamed_headroom": self.streamed_headroom}
 
     def noted(self, error: BaseException) -> None:
         """`error`, a plan or a layout the devices do not hold, noted with what this choice found of the
@@ -106,9 +110,9 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
     `dew.training.rollout.on_devices`), or a process holding no CPU companion of the devices, which JAX
     makes only before it initializes. And what it is not
     built for yet (`NOT_BUILT`; DiLoCo's groups by row `DILOCO_ON_HOST`): DiLoCo, a step compiled `ahead`,
-    a pass count drawn per microbatch, and a part whose table
-    states no host link to price it by (`GpuTarget.host_links`: a TPU's but v6e's). Read before any plan
-    is built."""
+    a pass count drawn per microbatch, a part whose table
+    states no host link to price it by (`GpuTarget.host_links`: a TPU's but v6e's), and a frozen stack a
+    plain loop runs (`frozen_loops`). Read before any plan is built."""
     unbuilt = (
         (trainer.diloco is not None, "DiLoCo's groups", DILOCO_ON_HOST),
         (ahead, "a step compiled ahead", NOT_BUILT),
@@ -135,7 +139,10 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
         companion_mesh(trainer.device_mesh)
     except ValueError as missing:
         return f"the process holds no CPU companion of its devices: {missing}"
-    return None
+    # A frozen stack a plain loop runs, which no host layout holds in bank memory (`unscanned`), read from
+    # the objective's draw's shapes (row 8336: a LoRA fit over an unscanned decoder raised where its
+    # streamed start placed its frozen base; row 8765: one site refuses by name).
+    return frozen_loops(trainer, trainer.objective.drawn_shapes())
 
 
 def frozen_loops(trainer, variables) -> str | None:
@@ -154,15 +161,17 @@ def priced(plan, dtype) -> StepPrice:
     return device_price(None if flops is None else plan.split * flops, gpu_target(), dtype)
 
 
-def streamed(trainer, start: Start, batch, dtype, device_steps: tuple) -> tuple[bool, StepPrice | None]:
+def streamed(trainer, start: Start, batch, dtype, device_steps: tuple
+             ) -> tuple[bool, int | None, StepPrice | None]:
     """Whether the devices hold the step of `trainer`, laid out streamed, that streams `start`'s parameters
     from the host over `batch`, the loader's `device_steps` run in it, traced in the run's own context
     (`Trainer._traced_on`; `HostExecution.compiled_whole`), admitted before anything is placed as a
     plan's candidate is (`_candidates._candidate`: `step_fits`, the inputs each realization places counted
     as built, and the batches the run prefetches beside them, `prefetched_bytes`), and its price
-    (`streamed_price`), None where its part rates no step computing in `dtype`. Its bytes are each device's:
-    the shards its link moves, and the shards its process's update reads and writes on its host, every local
-    device's."""
+    (`streamed_price`), None where its part rates no step computing in `dtype`, with the bytes its fit check
+    found the tightest device had to spare (`step_fits`'s headroom, None where it read none). Its bytes are
+    each device's: the shards its link moves, and the shards its process's update reads and writes on its
+    host, every local device's."""
     mesh, abstract = trainer.device_mesh, start.abstract
     # The batch read in the split the run states, each microbatch an attempt of its own that fetches the
     # parameters again (`StepCompiler._compile_host`).
@@ -185,9 +194,9 @@ def streamed(trainer, start: Start, batch, dtype, device_steps: tuple) -> tuple[
                                   trainer._shape.prefetch)
     # A process whose compile XLA refused for memory (None) takes part in the agreement as one that does
     # not fit, as a plan's candidate's does: every process answers alike, and none waits on another.
-    fits, _ = step_fits(compiled, mesh, prefetched + built, built, placed=False)
+    fits, headroom = step_fits(compiled, mesh, prefetched + built, built, placed=False)
     if not fits or compiled is None:
-        return False, None
+        return False, headroom, None
     # The parameters the step trains, the vjp's primal, moved there and back each attempt.
     parameters = max(_shard_bytes(primal, device, memory=None) for device in devices)
     # Read once an attempt, beside them, and differentiated by nothing: the averaged weights the step reads
@@ -207,7 +216,7 @@ def streamed(trainer, start: Start, batch, dtype, device_steps: tuple) -> tuple[
                                read_once=split * averaged)
     except Unpriced:
         price = None
-    return fits, price
+    return fits, headroom, price
 
 
 def host_updated(start: Start, companion: Mesh) -> int:
@@ -344,25 +353,11 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     phases = trainer.phase_passes
     active = phases.objective_for(phases.at(first))
     rung = Rung.of(active, xla_defaults=False, narrow=True)
-    # A frozen stack a plain loop runs, which no host layout holds in bank memory (`unscanned`): the
-    # streamed step is no candidate, read from the device start's shapes before its plan (row 8336: a LoRA
-    # fit over an unscanned decoder raised where its streamed start placed its frozen base). Where the device
-    # plan is refused too, no layout runs: its refusal, said with why the streamed step was not considered
-    # (row 8639).
-    start, loops = None, None
     try:
         start = trainer._started(resume)
-        loops = frozen_loops(trainer, start.abstract.variables)
         trainer._planned_unplaced(start, batch)
-    except LayoutRefused as refused:
-        if loops is not None:
-            raise LayoutRefused(f"{refused}; the streamed step is not considered: {loops}") from refused
+    except LayoutRefused:
         start = None
-    if start is not None and loops is not None:
-        trainer.layout_choice = Choice(held=True, fits=False, device=None, streamed=None, refused=loops,
-                                       streams=False)
-        said(trainer.layout_choice)
-        return start
     plan = trainer._compiler.unplaced if start is not None else None
     trainer._laid_out(dataclasses.replace(given, host=STREAMED))
     # The device plan's climb and plans undone: the streamed step is priced at the objective's own rung.
@@ -387,9 +382,10 @@ def laid_start(trainer, run, dataset, resume) -> Start:
             f"({update:.3g} s)"), streams=False)
     else:
         with phases.scoped(trainer, trainer._compiler):
-            fits, price = streamed(trainer, laid, model_batch(batch), dtype, trainer._shape.device)
+            fits, headroom, price = streamed(trainer, laid, model_batch(batch), dtype, trainer._shape.device)
         trainer.layout_choice = Choice(held, fits, device, price, None,
-                                       streams=broadcast_from_process_zero(chosen(held, fits, device, price)))
+                                       streams=broadcast_from_process_zero(chosen(held, fits, device, price)),
+                                       streamed_headroom=headroom)
     said(trainer.layout_choice)
     if trainer.layout_choice.streams:
         return laid

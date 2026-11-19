@@ -51,13 +51,13 @@ from jax.extend import core as jax_core
 from jax.extend.core import primitives
 
 from dew import _cache, algebra
-from dew.algebra import cost as algebra_cost
+from dew.algebra import cost as algebra_cost, program as algebra_program
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
-from dew.nn.kernels.templates import cost
+from dew.nn.kernels.templates import cost, emission
 
 FUSION_ROW = 'ledger 1295'
 """The fusion analysis's limits."""
@@ -205,11 +205,17 @@ class Region:
 @dataclasses.dataclass(frozen=True)
 class Formed:
     """A prologue's priced parts (`priced`): its element stage's work on the whole operand, which the kernel's
-    prologue does tile by tile (`stage`), the work XLA does whole for the row or depth values it reads beside
-    (`sides`, a norm's statistics), and the bytes those values hold (`side_bytes`)."""
+    prologue does tile by tile (`stage`, counted as a kernel's body is, `emission.emitted`); the program XLA
+    runs whole for the row or depth values beside it (`sides`, a norm's statistics, its outputs those values,
+    `side_bytes` their bytes; None where the stage reads its inputs alone); and the producer's whole program
+    (`whole`), XLA's where the operand is formed
+    before the launch. Each program XLA runs is priced by the algebra's one path (`algebra.program.priced`:
+    a reduction of an exponential an exponential an element, of a sum none), never by a kernel body's
+    counter, which prices only what a kernel runs (row 7260)."""
 
     stage: cost.Work
-    sides: cost.Work
+    sides: jax_core.Jaxpr | None
+    whole: jax_core.Jaxpr
     side_bytes: float
 
 
@@ -221,11 +227,11 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     """`region`'s seconds on `target`, fused and unfused, from one model (`templates.cost`): the launch's
     units overlapped at the whole device's rates (its products in their tensor mode, its operands, captured
     arrays and outputs in device memory), plus its fixed launch (`GpuTarget.launch_seconds`), with its
-    producer's element stage and its consumers' work in it, beside XLA's fusion of the producer's row or
-    depth values where it has a prologue (a norm's statistics, reading the operand's base); and unfused, XLA's
-    fusion forming the operand whole (reading its base, writing it), the plain launch writing the product at
-    its result dtype, then XLA's fusion of the consumers reading it (`algebra.cost.fused`). None where the
-    target states no tensor rate."""
+    producer's element stage and its consumers' work in it, beside XLA's program of the producer's row or
+    depth values where it has a prologue (a norm's statistics); and unfused, XLA's program forming the
+    operand whole and writing it, the plain launch writing the product at its result dtype, then XLA's
+    fusion of the consumers reading it (`algebra.cost.fused`), each XLA program as the algebra prices it
+    (`algebra.program.priced`). None where the target states no tensor rate."""
     rates = cost.rates(target, device=True)
     if rates[0] is None:
         return None, None
@@ -244,8 +250,11 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     prologue, forming, sides = cost.Work(), 0.0, 0.0
     if formed is not None:
         prologue = formed.stage + cost.Work(device_bytes=formed.side_bytes)
-        forming = xla(formed.sides + formed.stage + cost.Work(device_bytes=2 * base, kernels=1.0))
-        sides = xla(formed.sides + cost.Work(device_bytes=base + formed.side_bytes, kernels=1.0))
+        # XLA's programs as the algebra prices them, beside the arrays they write: the operand formed whole,
+        # or its sides alone.
+        forming = _written(algebra_program.priced(formed.whole, target), base, xla)
+        if formed.sides is not None:
+            sides = _written(algebra_program.priced(formed.sides, target), formed.side_bytes, xla)
     fused_seconds = sides + launched(product + region.chain + prologue + cost.Work(
         device_bytes=operands + region.captured_bytes + region.output_bytes))
     unfused_seconds = forming + launched(product + cost.Work(device_bytes=operands + written))
@@ -255,24 +264,17 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     return fused_seconds, unfused_seconds
 
 
+def _written(program: algebra_cost.Seconds, written: float, xla: algebra_cost.Fused) -> float:
+    """An XLA program's seconds as the algebra prices it (`algebra.program.priced`) with the `written` bytes
+    of the arrays it stores beside its reads, its unreadable terms' seconds (`Seconds.extra`) kept."""
+    return xla(program.work + cost.Work(device_bytes=written)) + program.extra
+
+
 def _chain(consumer, values, acc) -> cost.Work:
-    """The consumers' elementwise work on the whole product (`_work` of their program)."""
-    return _work(jax.make_jaxpr(consumer)(values, acc).jaxpr.eqns)
-
-
-def _work(eqns) -> cost.Work:
-    """`eqns`' elementwise work: each equation an operation an element of its result, one the special-function
-    units evaluate on them (the algebra's declaration of it, `dew.algebra.terms.Operation.exponential`), a
-    conversion's apart."""
-    work = cost.Work()
-    for eqn in eqns:
-        elements = float(sum(math.prod(shape) for var in eqn.outvars
-                             if (shape := getattr(var.aval, 'shape', None)) is not None))
-        spoken = algebra.terms.OPERATIONS.get(eqn.primitive)
-        work = work + (cost.Work(exponentials=elements) if spoken is not None and spoken.exponential
-                       else cost.Work(conversions=elements) if eqn.primitive is jax.lax.convert_element_type_p
-                       else cost.Work(operations=elements))
-    return work
+    """The consumers' work on the whole product, their program counted as a kernel's body is
+    (`emission.emitted`): each operation of the CUDA cores, of the special-function units and each
+    conversion an element of its result, each reduction an element of its input."""
+    return emission.emitted(jax.make_jaxpr(consumer)(values, acc).jaxpr, 1, None).fixed
 
 
 def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared: tuple, *fusions):
@@ -289,20 +291,32 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype)
     operand_bytes = float(sum(operand.size * operand.dtype.itemsize for operand in (lhs, rhs)))
     collected = _PRICED.get()
-    if out_fusion is None:
-        # A product with no producer the prologue takes and no consumer has nothing fused to price.
+
+    def plain():
+        # The product with no consumer the launch takes: its prologue alone priced, where it takes one.
         if collected is not None and formed is not None:
             collected.append(Region(lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype),
                                     jnp.dtype(out_dtype), precision, operand_bytes, cost.Work(), 0.0,
                                     float(math.prod(acc.shape) * acc.dtype.itemsize), formed, consumed=False))
         return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
                          precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
+
+    if out_fusion is None:
+        return plain()
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     # The program's names lifted first (`_named`): the algebra's rewriting reads a name as an identity.
     named_consumer = consumer
     consumer, names = _named(consumer, values, acc)
     written, consumer = _rewritten_consumer(consumer, values, acc)
     leaves, treedef = jax.tree.flatten(values)
+    axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
+                  if prefetch else _axes(consumer, values, acc))
+    if axes is None:
+        # A consumer the launch takes not runs after the plain product, XLA's, unpriced, the program's
+        # names where it wrote them.
+        return _rewritten_consumer(named_consumer, values, acc)[0](values, plain())
+    # A consumer the launch takes as its epilogue is priced (`priced`), its work counted as the launch's
+    # body counts it.
     if collected is not None:
         outs = jax.tree.leaves(jax.eval_shape(consumer, values, acc))
         collected.append(Region(
@@ -310,12 +324,6 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
             operand_bytes, _chain(consumer, values, acc),
             float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
             float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs)), formed))
-    axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
-                  if prefetch else _axes(consumer, values, acc))
-    if axes is None:
-        summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
-                           precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
-        return _rewritten_consumer(named_consumer, values, acc)[0](values, summed)
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
     epilogue = _declared(functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc), written,
@@ -511,10 +519,14 @@ def _split(producer, values):
     function = functools.partial(_prologue_tile, whole, tuple(jax.typeof(array) for array in arrays), axes)
     places = tuple(given.get(var) for var in (base, *sides))
     jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
-    # Priced (`Formed`): the element stage the prologue runs, the rest XLA runs whole for its sides.
-    staged = {id(eqn) for eqn in stage}
-    formed = Formed(_work(stage), _work(eqn for eqn in jaxpr.eqns if id(eqn) not in staged),
-                    float(sum(array.size * array.dtype.itemsize for array in squeezed)))
+    # Priced (`Formed`): the element stage the prologue runs, counted as a kernel's body is
+    # (`emission.emitted`, which prices every operation the fuser tiles), and XLA's programs beside it.
+    work = emission.emitted(jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage), 1, None).fixed
+    # XLA's program of the sides: the producer's, read back from them (its extraction prices what they read
+    # alone); none where every side is an input the stage reads as given.
+    computed = any(not isinstance(var, jax_core.Literal) and var not in jaxpr.invars for var in sides)
+    formed = Formed(work, closed.replace(jaxpr=jaxpr.replace(outvars=list(sides))) if computed else None,
+                    closed, float(sum(array.size * array.dtype.itemsize for array in squeezed)))
     return arrays[0], function, squeezed, named, jvp, formed
 
 

@@ -1,4 +1,6 @@
 """The narrow copies of the parameters the forward reads (`dew.training.narrow`)."""
+import gc
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -535,6 +537,7 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     same with the copies on as off: the copies are the plan's first rung, dropped where the step does
     not fit with them. On devices of that capacity, whose free bytes lie between the step's footprints
     with and without its copies, fit trains, its plan without them."""
+    from model_support import allocating
     from token_support import repeated_token_batch
 
     from dew.data.dataset import Loader
@@ -543,20 +546,34 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     from dew.telemetry.compiles import Compiles
     from dew.training import Layout, MeshSpec, Trainer
 
+    # Every device an allocator counting what the run places on it, its copies as its search builds them
+    # (`Building.fits`), `free` bytes free before the run: a need measured so holds all of the run's.
     free, limit = 2 ** 39, 2 ** 40
-    monkeypatch.setattr(jax.Device, "memory_stats",
-                        lambda device: {"bytes_limit": limit, "bytes_in_use": limit - free})
-    geometry = {"steps": 1, "accumulation": 2, "split": 1, "remat": "full"}
-    narrow, _, trainer = _trained(ADAM_3, copies=True, **geometry)
-    with_copies = free - trainer.plan["probes"][0]["headroom"]
-    without = free - _trained(ADAM_3, copies=False, **geometry)[2].plan["probes"][0]["headroom"]
-    copies = placed_bytes(jax.tree.map(
-        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), narrow.compute))
 
     def built() -> tuple[Trainer, dict]:
         objective, batch = _decoder(remat="full")
         return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
                        layout=Layout(min_shard=1, tolerance=1.0), accumulation=2, split=1), batch
+
+    def streamed() -> Loader:
+        return Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+
+    def need(*, copies: bool) -> int:
+        """The bytes the run's fit needs placed with or without its copies (its state and the batches it
+        prefetches among them), as its plan measured them: each run apart, nothing of the one before it
+        live."""
+        gc.collect()
+        allocating(monkeypatch, limit, limit, limit - free)
+        run, _ = built()
+        with chosen(narrow_copies='on' if copies else 'off'):
+            run.fit(streamed(), steps=1)
+        return free - run.plan["probes"][0]["headroom"]
+
+    with_copies, without = need(copies=True), need(copies=False)
+    narrow, _, _ = _trained(ADAM_3, copies=True, steps=1, accumulation=2, split=1, remat="full")
+    copies = placed_bytes(jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), narrow.compute))
+    del narrow
 
     def held(*, copies: bool) -> int:
         run, batch = built()
@@ -566,16 +583,17 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     state = held(copies=False)
     assert copies > 0 and held(copies=True) == state
     run, _ = built()
-    # Devices whose allocator holds the state and, beside it, free bytes between the step's needs with and
-    # without its copies, as each plan measured them: the state fits (`validate` checks it alone against
+    # Devices free, before the run places anything, between the step's needs with and without its copies,
+    # as each plan measured them (the state among them): the state fits (`validate` checks it alone against
     # the limit), the step fits only without its copies. Both stated from the needs the cell measured, not
     # the state's bytes, which a GPU step's temporaries dwarf (M-MC-22: a 349,744 B state, a 68 MB step).
     # The plan made before the state is placed (`Trainer._planned_unplaced`), which reads those bytes as
     # holding the state too, holds none, and the step is planned once the state is placed.
     free = (with_copies + without) // 2
-    limit = state + free
-    assert without < free < with_copies, (without, free, with_copies)
-    stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+    assert without < free < with_copies and state < free, (without, free, with_copies, state)
+    gc.collect()
+    allocating(monkeypatch, limit, limit, limit - free)
+    stream = streamed()
     with chosen(narrow_copies='on'):
         run.fit(stream, steps=2)
     # It trains without its copies, at its own rung: dropping them freed what it was short, and nothing is
@@ -649,15 +667,18 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
                   layout=Layout(min_shard=1, tolerance=1.0))
     with chosen(narrow_copies='off'):
         state = max(run.validate(batch).device_bytes.values())
+    # The pool's largest free block, and what it can still grow by, between the step's needs at two
+    # microbatches and at one: twice what a request placed beside the step takes, so each splits it
+    # (`memory.placeable_beside`).
     room = (one + two) // 2
     total = 2 * (state + one)
     grown = {"bytes_limit": total, "bytes_in_use": 0, "pool_bytes": total - room,
-             "largest_free_block_bytes": room // 2}
+             "largest_free_block_bytes": room}
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: grown)
     stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
     with chosen(narrow_copies='off'):
         run.fit(stream, steps=2)
-    assert run.plan["probes"][-1]["split"] == 2
+    assert run.plan["split"] == 2, run.plan["probes"]
 
 
 def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_only_where_dropping_them_helped(monkeypatch):
@@ -765,3 +786,55 @@ def test_a_gpu_of_the_memory_a_step_needs_admits_it_and_one_byte_less_does_not(r
         return spare
 
     assert headroom(least) >= 0 > headroom(least - 1)
+
+
+@pytest.mark.parametrize("built", ["copies", "window"])
+def test_a_steps_buffers_built_before_it_runs_are_judged_where_they_land(monkeypatch, built):
+    """A step whose narrow copies, or window of two microbatches, are built before its program runs, on
+    devices whose allocator holds one free block that its temporaries fit before those buffers are placed
+    and not after, nor in the pool's growth: its fit counts those bytes placed beside its temporaries where
+    they leave the least room (`memory.placeable_beside`: in the largest free block, the one the pool can
+    give its temporaries), so its first rung misses, where a reading of the block as it stood admitted it
+    (M-MC-24c: an H100's 7.27 GB of copies took the one 21.64 GB block its 20.76 GB of temporaries were
+    admitted to, and its first step was refused)."""
+    from model_support import allocating
+
+    from dew.distributed.batches import batch_shardings
+    from dew.distributed.placement import placed_bytes
+    from dew.training import MeshSpec, Trainer
+    from dew.training.planning import PlanRefused, Trials
+
+    copies, split = built == "copies", 2 if built == "window" else 1
+    objective, batch = _decoder(remat="full")
+
+    def compiled(**allocator):
+        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec().build(
+            jax.devices()[:1]), accumulation=1, split=split)
+        state, _, _ = trainer.place()
+        placed = jax.device_put(batch, batch_shardings(trainer.device_mesh, batch))
+        allocating(monkeypatch, **allocator)
+        trials = Trials(state, placed)
+        with chosen(narrow_copies="on" if copies else "off"):
+            step = trainer.compile(state, placed, trials)
+        return trainer, step, trials, placed
+
+    roomy, step, trials, placed = compiled(limit=2 ** 40, pool=2 ** 39)
+    probe = roomy.plan["probes"][0]
+    # Its buffers as its step holds them once run.
+    stepped, *_ = step(trials.state, placed)
+    held = stepped.compute if copies else stepped.accumulation
+    buffers = placed_bytes(jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
+        leaf.shape, leaf.dtype, sharding=leaf.sharding), held))
+    del roomy, step, trials, placed, stepped, held
+    assert probe["fits"] and buffers > 0, probe
+    temporaries = probe["temp"]
+    # One block holding the temporaries and half the buffers, the pool's growth less than the temporaries:
+    # the buffers built, no block holds the temporaries.
+    pool = temporaries + buffers // 2
+    try:
+        tight = compiled(limit=pool + temporaries - 1, pool=pool)[0]
+        first = tight.plan["probes"][0]
+    except PlanRefused as refused:
+        first = refused.probes[0].record()
+    assert first["fits"] is False, first
+
