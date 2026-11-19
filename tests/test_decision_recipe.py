@@ -1054,6 +1054,7 @@ def test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to
                                   checkpoint_every=1, eval_every=None, log_every=1, multi_host=False,
                                   compilation_cache_dir=None, stop=Pause(0.5))
     paused = dataclasses.replace(run, trainer=trainer).run()
-    resumed = dataclasses.replace(run, trainer=dataclasses.replace(trainer, stop=None, resume="require")).run()
+    resumed = dataclasses.replace(run, trainer=dataclasses.replace(trainer, stop=None,
+                                                                   resume="require")).run()
     assert (int(paused.step), int(resumed.step)) == (2, 4), name
 
