@@ -2117,7 +2117,8 @@ def _lineage(checkout: Path, walk: list[tuple[str, list[str]]]) -> dict[str, dic
         traced = [(lineage[parent], _changes(checkout, parent, commit)[0])
                   for parent in parents if parent in lineage]
         lineage[commit] = {}
-        for name in mine["files"]:
+        files: list[str] = mine["files"]
+        for name in files:
             inherited = [held.get(renamed.get(name, name), frozenset()) for held, renamed in traced]
             lineage[commit][name] = frozenset().union(*inherited) or frozenset({f"{commit}:{name}"})
     return lineage

@@ -53,18 +53,11 @@ TORCH_CPU = "https://download.pytorch.org/whl/cpu"
 PYTHON = "3.12"
 
 
-def loaded(path: Path) -> types.ModuleType:
-    """The module at `path`, loaded by its path, as tools/armada/ci.py loads its neighbours."""
-    spec = importlib.util.spec_from_file_location(f"check_tool_types_{path.stem}", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def releases() -> Mapping[str, Mapping[str, str]]:
     """tools/reference_releases.py's RELEASES."""
-    return loaded(ROOT / "tools" / "reference_releases.py").RELEASES
+    from reference_releases import RELEASES  # A neighbour: this script's own directory leads its path.
+
+    return RELEASES
 
 
 def cohorts_of(path: Path) -> tuple[tuple[str, ...], ...] | None:
@@ -308,7 +301,9 @@ def records() -> types.ModuleType | None:
     """tools/armada/records.py, the CI store the verdicts are kept in, or None where this run has no token."""
     if not os.environ.get("DEW_XLA_CACHE_TOKEN") or not os.environ.get("DEW_XLA_CACHE_URL"):
         return None
-    return loaded(ROOT / "tools" / "armada" / "records.py")
+    from armada import records  # tools/armada, a namespace package beside this script.
+
+    return records
 
 
 def main() -> int:
