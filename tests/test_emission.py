@@ -3,6 +3,7 @@ counted from its body, as each warpgroup runs it."""
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from jax import lax
 from jax.experimental import pallas as pl
@@ -149,7 +150,7 @@ def test_a_switch_on_the_warpgroups_role_counts_each_warpgroups_branch_alone():
         (128, 0), (0, 2 * 128)]
 
 
-@pytest.mark.parametrize("predicate, exponentials", [
+SCALAR_PREDICATES = [
     # An integer quotient truncates toward zero: -1 over 2 is 0 at every warpgroup.
     (lambda wg: lax.div(1 - lax.clamp(2, wg, 3), 2) == 0, [128, 128]),
     # By a negative divisor too: 7 over -2 is -3 at the first warpgroup, 8 over -2 -4 at the second.
@@ -204,13 +205,20 @@ def test_a_switch_on_the_warpgroups_role_counts_each_warpgroups_branch_alone():
     # not booleans: unknown, both branches, as the GPU's inequality takes it (base review 7e470364e F3).
     (lambda wg: lax.ne(lax.mul_p.bind(wg + 1, jnp.int32(2), out_dtype=jnp.dtype(jnp.bool_)),
                        lax.mul_p.bind(wg + 1, jnp.int32(3), out_dtype=jnp.dtype(jnp.bool_))), [128, 128]),
-], ids=["truncated-quotient", "negative-divisor", "remainder-sign", "int8-wrap", "logical-shift",
+]
+"""Integer and boolean predicates on a warpgroup's index, each with the exponentials each of two warpgroups'
+programs prices where its row is exponentiated as it holds (`emission.emitted`)."""
+
+SCALAR_IDS = ["truncated-quotient", "negative-divisor", "remainder-sign", "int8-wrap", "logical-shift",
         "shift-past-width", "arithmetic-shift-past-width", "float-unknown", "quotient-by-zero-unknown",
         "remainder-by-zero-unknown", "unsigned-quotient-by-zero-unknown",
         "least-quotient-by-minus-one-unknown", "least-remainder-by-minus-one-unknown",
         "min-at-another-signedness", "max-at-its-own-dtype", "max-converted-narrower",
         "clamp-of-a-signed-product", "weak-literal-product", "select-of-a-stated-product",
-        "stated-boolean-products"])
+        "stated-boolean-products"]
+
+
+@pytest.mark.parametrize("predicate, exponentials", SCALAR_PREDICATES, ids=SCALAR_IDS)
 def test_scalar_arithmetic_on_the_warpgroup_folds_as_the_program_computes_it(predicate, exponentials):
     """A conditional on integer arithmetic over the warpgroup's index (a quotient by either sign, a
     remainder, a narrower integer's wrap, shifts within the width) counts the branch each warpgroup's program
@@ -228,6 +236,48 @@ def test_scalar_arithmetic_on_the_warpgroup_folds_as_the_program_computes_it(pre
 
     lowered_for(_kernel(body, predicate), (_ROW,), "sm90")
     assert [role.fixed.exponentials for role in _emitted(walk, _ROW).roles] == exponentials
+
+
+def _known(predicate) -> list[bool | None]:
+    """Each of two warpgroups' predicate as the fold knows it (`emission.emitted`): true where only its
+    branch is priced, false where only the other's is, None where both are (an unknown predicate)."""
+    def priced(*, taken: bool) -> list[bool]:
+        def walk(row):
+            wg = lax.axis_index("wg").astype(jnp.int32)
+            exponentiated = (jnp.exp, lambda value: value) if taken else (lambda value: value, jnp.exp)
+            return lax.cond(predicate(wg), *exponentiated, row)
+
+        return [role.fixed.exponentials > 0 for role in _emitted(walk, _ROW).roles]
+
+    return [None if held and other else held
+            for held, other in zip(priced(taken=True), priced(taken=False), strict=True)]
+
+
+@pytest.mark.gpu(reason="runs each predicate on the warpgroups of this GPU")
+@pytest.mark.parametrize("predicate, exponentials", SCALAR_PREDICATES, ids=SCALAR_IDS)
+def test_a_folds_known_predicate_is_the_one_each_warpgroup_computes(predicate, exponentials):
+    """Each predicate the fold knows at a warpgroup (`_known`: its branch alone priced, or the other's alone)
+    is the one that warpgroup computes on this GPU, the kernel lowered by the semantics holding it
+    (`_semantics`), each warpgroup writing its predicate to its own part of the output: the fold priced
+    against the GPU, not against expectations stated by hand (base review 117cc9088 F4, row 8799). An
+    unknown predicate, both branches priced, holds whatever the GPU computes."""
+    del exponentials
+
+    def body(out_gmem, staged):
+        wg = lax.axis_index("wg").astype(jnp.int32)
+        at = pl.ds(wg * 128, 128)
+        staged[at] = jnp.full((128,), predicate(wg).astype(jnp.int32))
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(staged.at[at], out_gmem.at[at])
+        plgpu.wait_smem_to_gmem(0)
+
+    computed = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((256,), jnp.int32), num_threads=2,
+                            thread_name="wg", scratch_types=[plgpu.SMEM((256,), jnp.int32)],
+                            compiler_params=_semantics(predicate))()
+    on_the_gpu = [bool(value) for value in np.asarray(computed).reshape(2, 128)[:, 0]]
+    known = _known(predicate)
+    assert all(held is None or held == gpu for held, gpu in zip(known, on_the_gpu, strict=True)), (
+        known, on_the_gpu)
 
 
 @pytest.mark.parametrize("predicate, exponentials", [
