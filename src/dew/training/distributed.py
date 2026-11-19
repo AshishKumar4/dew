@@ -577,4 +577,4 @@ def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, ab
         held = placed[start.through[index]]
         return held if held.sharding == where[index] else jax.device_put(held, where[index])
 
-    return reassembled(HELD_APART, state, made, start.built, structure, held_at)
+    return reassembled(HELD_APART, state, made, start.built, structure.unflatten, len(where), held_at)

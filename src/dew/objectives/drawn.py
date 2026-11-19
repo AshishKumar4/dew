@@ -11,7 +11,6 @@ from collections.abc import Callable, Hashable, Sequence
 
 import jax
 from jax._src import config as jax_config
-from jax.tree_util import PyTreeDef
 
 from dew._cache import holding
 from dew.algebra.program import replaying
@@ -135,13 +134,15 @@ def drawn_rest[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array], 
 
 
 def reassembled[Built, Rest, Picked](parts: Parts[Built, Rest, Picked], other: Rest,
-                                     made: Sequence[jax.Array], built: Sequence[int], structure: PyTreeDef,
+                                     made: Sequence[jax.Array], built: Sequence[int],
+                                     unflatten: Callable[[list[jax.Array]], Picked], leaves: int,
                                      held_at: Callable[[int], jax.Array]) -> Built:
     """What a draw builds, from its program's rest and the leaves it made (`made`, at `built`), the picked
-    part's other leaves the held arrays it passes through (`held_at`, by their index among its leaves)."""
+    part's other leaves the held arrays it passes through (`held_at`, by their index among its `leaves`),
+    the picked part made of them by `unflatten` (its tree structure's)."""
     drawn = dict(zip(built, made, strict=True))
-    return parts.join(other, jax.tree.unflatten(structure, [
-        drawn[index] if index in drawn else held_at(index) for index in range(structure.num_leaves)]))
+    return parts.join(other, unflatten([drawn[index] if index in drawn else held_at(index)
+                                        for index in range(leaves)]))
 
 
 def drawn_once[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array], Built], held: Tree,
@@ -161,4 +162,5 @@ def drawn_once[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array], 
     with drawing():
         other, made = draw.programs[built](held, key)
     given = jax.tree.leaves(held)
-    return reassembled(parts, other, made, built, structure, lambda index: given[draw.through[index]])
+    return reassembled(parts, other, made, built, structure.unflatten, structure.num_leaves,
+                       lambda index: given[draw.through[index]])
