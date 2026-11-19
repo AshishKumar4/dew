@@ -415,16 +415,20 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """Why the launch takes no call of `ba` on `family`, or None (`refused`)."""
         raise NotImplementedError
 
+    def tmem_columns(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> int:
+        """The tensor-memory columns `config` allocates on `target` (0 where its family allocates none)."""
+        del ba, config, target
+        return 0
+
     def resident(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> int:
         """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
-        its registers (`Family.programs`) and its shared memory's, each program's reservation its own
-        (`resources.shared_programs`); one at the least, a legal config's."""
+        its registers, shared memory and rounded tensor memory (`resources.register_model`); one at the
+        least, a legal config's (row 9105)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
-        resident = family.programs(config.consumers, self.registers(ba, config))
-        if target.shared_limit:
-            staged = self.staged_bytes(ba, config, target)
-            resident = max(1, resources.shared_programs(resident, staged, target.shared_limit))
-        return resident
+        staged = self.staged_bytes(ba, config, target) if target.shared_limit else None
+        tmem = self.tmem_columns(ba, config, target)
+        return max(1, resources.register_model(family, config.consumers, self.registers(ba, config),
+                                               shared=staged, target=target, tmem=tmem).programs)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -837,15 +841,11 @@ class MosaicForward(_Mainloop[Tiles]):
                       for consumers in range(config.consumers, 0, -1)
                       for block in walked_extents(family, query.dtype, config.block_k)
                       if config.block_k % block == 0)
-        def fits_rewalk(tiles: Tiles) -> bool:
-            if not self._launch_legal(ba, tiles, target, decides=decides):
-                return False
-            if self.ranks_alone(ba, target):
-                return True
-            priced = self.registers(ba, tiles, decides=decides)
-            return priced is None or priced <= self.register_budget(tiles)
-
-        relaunch = next((tiles for tiles in relaunches if fits_rewalk(tiles)), None)
+        relaunch = next((tiles for tiles in relaunches
+                         if self._launch_legal(ba, tiles, target, decides=decides)
+                         and self.proposes(ba, tiles, target,
+                                           registers=self.registers(ba, tiles, decides=decides))),
+                        None)
         if relaunch is None:
             return None
         return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers,
@@ -953,6 +953,12 @@ class MosaicForward(_Mainloop[Tiles]):
                                 training=ba.arguments.get("residuals") is Kept.SPLIT,
                                 query_width=query_width,
                                 tmem_columns=None if target is None else target.tmem_columns)
+
+    def tmem_columns(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
+        family = bundle_of(config, ba.arguments["query"].dtype)
+        if not scopes_products(family):
+            return 0
+        return family.product_columns(self._products(ba, config, target))
 
     def _ahead(self, ba: tokamax.BoundArguments, config: Tiles) -> bool:
         """Whether the launch at `config` issues its logits a step ahead of their read (`logits_ahead`)."""

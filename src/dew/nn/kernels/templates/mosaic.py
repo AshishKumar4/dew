@@ -1562,7 +1562,7 @@ class Transport[Allocated, Opened](abc.ABC):
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
-               producer: int | None = None, shared: int | None = None,
+               producer: int | None = None, shared: int | None = None, tmem: int = 0,
                moves: bool | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
@@ -2179,7 +2179,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
-               producer: int | None = None, shared: int | None = None,
+               producer: int | None = None, shared: int | None = None, tmem: int = 0,
                moves: bool | None = None) -> Callable:
         # Its programs read a table from global memory as any operand.
         del scalars
@@ -2191,8 +2191,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                       model_flops=model_flops, resident=resident, prefetched=prefetched,
                       model=(None if registers is None
                              else resources.register_model(self, consumers, registers, producer=producer,
-                                                           programs=resident, shared=shared, moves=moves)),
-                      # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
+                                                           programs=resident, shared=shared, tmem=tmem,
+                                                           moves=moves)),
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       reduction_scratch=((self.reduction_scratch if reduces else 0)
                                          + self.warpgroup_reduction_scratch * reducing_warpgroups))

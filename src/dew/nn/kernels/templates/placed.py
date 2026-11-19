@@ -345,7 +345,9 @@ class Tcgen05Placed(Tcgen05Rings):
             plgpu.barrier_wait(barrier)
         if QUERY in found:
             for c in served:
-                plgpu.async_copy_smem_to_tmem(lefts[c][scores.left], found[QUERY][c])
+                start, end = reaches[c]
+                pl.when(start < end)(
+                    lambda c=c: plgpu.async_copy_smem_to_tmem(lefts[c][scores.left], found[QUERY][c]))
         mosaic.looped(issued(score, weigh, lo, hi), None, ())
 
     def stored_row(self, vector: jax.Array, smem) -> jax.Array:

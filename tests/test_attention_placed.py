@@ -98,39 +98,77 @@ def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving
     assert explore(threads, arrivals) > 0
 
 
+@pytest.mark.parametrize(("tiles", "width"), [(ROWS_TILES, 256), (ROWS_PAIR_TILES, 64)],
+                         ids=["one-d256", "two-d64"])
 @pytest.mark.parametrize("call", ["full", "causal"])
-def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_interleaving(call):
-    """The forward on a B200's tcgen05 rows at width 256 (1 consumer: SUMS 256 + LOGITS 128 + QUERY 128 =
-    512 TMEM columns, row 5368): every interleaving of its consumer, producer and issuer warps explored
-    (`ring_protocol.explore`), including the query-in-TMEM hand-off (`q_ready`), and Q placement derived
-    from `tmem_columns` (placed at d256/1-consumer and d64/2-consumers, kept in SMEM at d128/2-consumers)."""
+def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_interleaving(tiles, width, call):
+    """The forward on a B200's tcgen05 rows where Q fits in TMEM (1-consumer d256 and 2-consumer d64, rows
+    5368, 9103-9105): every interleaving explored (`ring_protocol.explore`), every consumer's distinct SMEM Q
+    copied to its own TMEM ref before any score MMA reads it, every score MMA reading an initialized Q ref,
+    and rounded TMEM allocation (320 -> 512 columns at 1-consumer d128) bounding residency to 1."""
     from ring_protocol import explore, programs
 
     from dew.nn.kernels.templates import attention_mosaic_forward as forward_mod, placed
 
     tmem = generation.gpu_target("sm100").tmem_columns
-    for tiles, width, expected in ((ROWS_TILES, 256, True), (ROWS_PAIR_TILES, 64, True),
-                                   (ROWS_PAIR_TILES, 128, False)):
-        products = forward_mod.forward_products(placed.ROWS, tiles, width, jnp.bfloat16, ahead=True,
-                                                query_width=width, tmem_columns=tmem)
+    for candidate, cand_width, expected in ((ROWS_TILES, 256, True), (ROWS_PAIR_TILES, 64, True),
+                                            (ROWS_PAIR_TILES, 128, False)):
+        products = forward_mod.forward_products(placed.ROWS, candidate, cand_width, jnp.bfloat16, ahead=True,
+                                                query_width=cand_width, tmem_columns=tmem)
         assert (placed.QUERY in placed.ROWS.product_scratch(*products)) is expected
         assert placed.ROWS.product_columns(products) <= tmem
 
-    query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 256, 1, 256), jnp.bfloat16)
+    query = jnp.ones((1, 256, 1, width), jnp.bfloat16)
+    key = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
+    threads, arrivals = programs(_placed_forward(tiles, spans), query, key,
+                                 threads=tiles.consumers + 1, rare=False)
+    (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
+    # Every consumer's distinct Q SMEM tile is copied to its own TMEM ref (`async_copy_smem_to_tmem`) before
+    # any score MMA reads it; deleting or misrouting any consumer's copy fails here (row 9104).
+    written_at = {}
+    copied_smem = set()
+    for i, event in enumerate(issuer):
+        if event.kind == "write":
+            written_at.setdefault(event.at, i)
+        elif event.kind == "product" and not event.at:
+            copied_smem.update(event.argument)
+    assert len(written_at) == tiles.consumers
+    assert len(copied_smem) == tiles.consumers
+    # Score MMAs are products that write into logits (not weigh MMAs that write into sums and read weights).
+    score_mmas = [(i, event) for i, event in enumerate(issuer)
+                  if event.kind == "product" and event.at
+                  and any(src in written_at for src in event.argument)]
+    assert len(score_mmas) >= tiles.consumers
+    read_q = set()
+    for i, event in score_mmas:
+        q_srcs = [src for src in event.argument if src in written_at]
+        assert len(q_srcs) == 1 and written_at[q_srcs[0]] < i
+        read_q.add(q_srcs[0])
+    assert read_q == set(written_at)
+    assert explore(threads, arrivals) > 0
+
+
+def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy_and_rounds_tmem_residency():
+    """An empty walk (`lengths=[0]`) on B200 `tcgen05.rows` skips `async_copy_smem_to_tmem` so the epilogue's
+    store through the Q stage is race-free (row 9103), and a 1-consumer d128 call (320 -> 512 TMEM columns)
+    reports residency 1 (row 9105)."""
+    from ring_protocol import explore, programs
+
+    target = generation.gpu_target("sm100")
+    query = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
+    key = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
+    spans = template.spans(128, 128, 1, lengths=jnp.zeros((1,), jnp.int32))
     threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key,
                                  threads=ROWS_TILES.consumers + 1, rare=False)
-    (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
-    # The issuer writes Q into TMEM (`async_copy_smem_to_tmem`) before the first score MMA reads that TMEM
-    # ref (deleting the copy fails this assertion, row 9081).
-    written_tmem = {event.at for event in issuer if event.kind == "write"}
-    score_mmas = [i for i, event in enumerate(issuer)
-                  if event.kind == "product" and any(src in written_tmem for src in event.argument)]
-    assert score_mmas, "expected score MMAs to read the TMEM query ref written by async_copy_smem_to_tmem"
-    first_write = next(i for i, event in enumerate(issuer)
-                       if event.kind == "write" and event.at in issuer[score_mmas[0]].argument)
-    assert first_write < score_mmas[0]
+    assert not any(event.kind == "write" for thread in threads for event in thread
+                   if any(ev.kind == "product" for ev in thread))
     assert explore(threads, arrivals) > 0
+    # 1-consumer d128 allocates 320 TMEM columns -> rounds to 512 -> residency 1 on B200 (row 9105).
+    q128 = jax.ShapeDtypeStruct((1, 256, 1, 128), jnp.bfloat16)
+    op = attention_mosaic.MosaicForward(scale=128 ** -0.5, keys=256, form="full")
+    ba = op.bind(q128, q128, q128, None, None, None, None, (), (), None)
+    assert op.resident(ba, ROWS_TILES, target) == 1
 
 
 @INTERPRETS
