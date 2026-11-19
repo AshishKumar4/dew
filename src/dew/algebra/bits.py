@@ -779,16 +779,18 @@ def _restored(decoded: jax.Array) -> jax.Array:
     return restored(jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32))
 
 
-def restored(pattern: jax.Array) -> jax.Array:
+def restored(pattern: jax.Array, dtype=jnp.float32) -> jax.Array:
     """The NVFP4 form's decoded value (`NVFP4_BFLOAT16_FORM`: each code times 2^-126 as a bfloat16) of each of
-    `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in float32 by integer
-    arithmetic: a subnormal (a code of 0 or 0.5) as its mantissa's integer times 2^-7 with its sign, every
-    other value's exponent raised by 126 (its bits moved to a float32's high half), so no lane that flushes
-    subnormals (XLA:CPU's, a GPU's) zeroes a code of 0.5. The one definition of the decoded value: the
-    portable decode's (`nvfp4_decoded`) and the native staged decode's, whatever lanes each extracts."""
+    `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in `dtype` (float32, or a
+    wider float a float64 truth computes in) by integer arithmetic: a subnormal (a code of 0 or 0.5) as its
+    mantissa's integer times 2^-7 with its sign, every other value's exponent raised by 126 (its bits moved to
+    a float32's high half, then cast, exactly), so no lane that flushes subnormals (XLA:CPU's, a GPU's) zeroes
+    a code of 0.5. The one definition of the decoded value: the portable decode's (`nvfp4_decoded`), the
+    native staged decode's, whatever lanes each extracts, and a truth's."""
     sign = pattern & jnp.uint32(0x8000)
-    normal = jax.lax.bitcast_convert_type((pattern << jnp.uint32(16)) + jnp.uint32(126 << 23), jnp.float32)
-    mantissa = (pattern & jnp.uint32(0x7F)).astype(jnp.float32) * jnp.float32(2.0 ** -7)
+    normal = jax.lax.bitcast_convert_type((pattern << jnp.uint32(16)) + jnp.uint32(126 << 23),
+                                          jnp.float32).astype(dtype)
+    mantissa = (pattern & jnp.uint32(0x7F)).astype(dtype) * jnp.asarray(2.0 ** -7, dtype)
     subnormal = jnp.where(sign != 0, -mantissa, mantissa)
     return jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
 

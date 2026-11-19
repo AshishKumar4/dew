@@ -381,15 +381,14 @@ def exact_banks(taken) -> dict:
 def exact_codes(words: jax.Array, dtype) -> jax.Array:
     """The E2M1 values of an NVFP4 matrix's stored words (`[..., depth / 8, width]`, `NvFp4`'s staged order)
     in `dtype`, in the depths' own order: the stored form's decode (`bits.NVFP4_BFLOAT16_FORM`, each code
-    times 2^-126 as a bfloat16's bits) restored to the code by `bits.restored`, exactly (an E2M1 code is a
-    float32), and cast."""
+    times 2^-126 as a bfloat16's bits) restored to the code by `bits.restored`, in `dtype`."""
     from dew.algebra import bits
     from dew.nn.kernels.formats import staged_rows
 
     def one(words: jax.Array) -> jax.Array:
         decoded = bits.NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T
         pattern = jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32)
-        codes = bits.restored(pattern).astype(dtype)
+        codes = bits.restored(pattern, dtype)
         return codes[np.argsort(staged_rows(codes.shape[0]))]
 
     for _ in range(words.ndim - 2):
