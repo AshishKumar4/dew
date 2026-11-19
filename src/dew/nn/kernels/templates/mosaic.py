@@ -1618,16 +1618,16 @@ class Transport[Allocated, Opened](abc.ABC):
         (setmaxnreg's least where None: a launch states more where its producer's issue loop holds more)."""
 
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
-                  exclusive: bool = False, issuer: Callable | None = None):
-        """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)` on its compute
-        roles, `producer()` on its producer's where it has one, and `issuer()` on its issuing role where its
-        products are issued on one (`Issuer.places_on_role`), each a branch of one switch where `exclusive`
-        (`handoffs.Schedule.run`); the consumers' value where they are its every warpgroup."""
+                  exclusive: bool = False, issuer: Callable | None = None, reducer: Callable | None = None):
+        """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)`, `producer()`,
+        `issuer()` where it issues on a role (`Issuer.places_on_role`) and `reducer(index)` on a warp a
+        consumer (`handoffs.REDUCER`), each a branch of one switch where `exclusive`; the consumers' value."""
         schedule = self.roles(consumers, floor)
+        schedule = schedule if reducer is None else schedule.joined(handoffs.REDUCER, consumers)
         # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
-        bodies = {"consumer": consumer, "producer": lambda index: producer()}
-        if issuer is not None:
-            bodies["issuer"] = lambda index: issuer()
+        units = {"producer": producer, "issuer": issuer}
+        bodies = {"consumer": consumer, "reducer": reducer, **{name: lambda index, body=body: body()
+                                                               for name, body in units.items()}}
         return schedule.run(exclusive=exclusive, **{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:

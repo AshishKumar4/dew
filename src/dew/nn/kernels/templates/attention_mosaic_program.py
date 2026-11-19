@@ -144,11 +144,13 @@ def backward_layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family,
 
 
 def scheduled_roles(family: mosaic.Family, consumers: int, consumer: Callable[[int], tuple | None],
-                    producer: Callable[[], None], issued: Callable[[placed.Tcgen05Walked], None]):
+                    producer: Callable[[], None], issued: Callable[[placed.Tcgen05Walked], None], *,
+                    reducer: Callable[[int], None] | None = None):
     """A backward launch's roles (`Family.scheduled`): its consumers, its producer's loads, and where its
     family places its products on a role (`placed.Tcgen05Walked`) its compute warpgroups `consumer(role)`,
-    each built at its static role, its turns and its store its own (`mosaic.per_role`), and its issuer
-    (`issued(family)`)."""
+    each built at its static role, its turns and its store its own (`mosaic.per_role`), its issuer
+    (`issued(family)`) and its reducers, `reducer(role)`, where it hands its adds to them
+    (`handoffs.REDUCER`)."""
     if not family.places_on_role:
         return family.scheduled(consumers, consumer, producer)
     walked = placed.walked(family)
@@ -158,7 +160,7 @@ def scheduled_roles(family: mosaic.Family, consumers: int, consumer: Callable[[i
         consumer(role)
 
     return walked.scheduled(consumers, functools.partial(mosaic.per_role, roles=consumers, run=compute),
-                            producer, issuer=lambda: issued(walked))
+                            producer, issuer=lambda: issued(walked), reducer=reducer)
 
 
 def placed_scratch(family: mosaic.Family, walked: int, dtype, fused: tuple[int, ...], kept: tuple[int, ...]

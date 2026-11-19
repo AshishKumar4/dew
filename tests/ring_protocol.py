@@ -251,18 +251,24 @@ def _slot(ref, treedef, leaves) -> tuple:
 
 
 def _located(ref, transforms) -> tuple:
-    """A ref's location through `transforms`: the ref and its leading index where it is one value (a ring's
-    slot, or a one-entry slice of its leading axis: a gathered ring's slot mbarrier, `gathered.Ring`), else
-    the ref whole."""
+    """A ref's location through `transforms`: the ref and its leading indices each one value (a ring's slot,
+    or a one-entry slice of its leading axis: a gathered ring's slot mbarrier, `gathered.Ring`; a role's
+    ring's, `[role, slot]`), else the ref whole. A location of fewer indices covers every one beneath it
+    (`_overlaps`: `[role]` each of the role's slots)."""
     for transform in transforms or ():
         indices = getattr(transform, "indices", None)
         if indices:
-            first = indices[0]
-            if hasattr(first, "start") and first.size == 1 and first.start is not None:
-                return (ref.name, int(np.asarray(first.start)))
-            if not hasattr(first, "start") and first is not None:
-                return (ref.name, int(np.asarray(first)))
+            leading = tuple(itertools.takewhile(lambda index: index is not None, map(_one_value, indices)))
+            return (ref.name, *leading) if leading else (ref.name, None)
     return (ref.name, None)
+
+
+def _one_value(index) -> int | None:
+    """An indexer's index where it names one entry of its axis (a value, or a one-entry slice), else None (a
+    slice of more, or an array of indices: a gathered tile's rows)."""
+    if hasattr(index, "start"):
+        return int(np.asarray(index.start)) if index.size == 1 and index.start is not None else None
+    return None if index is None or np.size(index) != 1 else int(np.asarray(index))
 
 
 def _governing(value, what: str):

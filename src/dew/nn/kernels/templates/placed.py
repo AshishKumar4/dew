@@ -772,6 +772,12 @@ class Tcgen05Walked(Tcgen05Placed):
         for barrier in ready:
             plgpu.barrier_wait(barrier)
         mosaic.looped(issued(score, weigh, lo, hi), None, ())
+        if placed.fused is not None:
+            # The last turns' frees, which no step after them waits for: observed, so no phase of `freed`
+            # completes unseen (the ring protocol's checker, tests/test_attention_placed.py).
+            _, freed = hand_offs.fused()
+            for back in range(TURNS, 0, -1):
+                pl.when(hi - lo >= back)(lambda back=back: freed.wait(freed.turn(hi - lo - back)))
         finished.committed(finished.turn(0))
 
 
