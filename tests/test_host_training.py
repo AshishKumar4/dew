@@ -1741,18 +1741,31 @@ def test_a_distillations_streamed_price_reads_its_teachers_banks():
     assert distilled > alone, links
 
 
-def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companions_here(tmp_path):
+def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companions_here(tmp_path, monkeypatch):
     """A host step prepared for GPUs this process lacks (one compile-only H100, `prepare_host_step`), over its
-    fresh state's shapes, compiles the accelerator's programs for them and its CPU companion's on this
-    host's CPUs, nothing placed: what fills the shared cache its run's startup reads (the GPU tier's
-    `test_gpu_host_startup`)."""
+    fresh state's shapes, compiles the accelerator's programs for them as a device will run them
+    (`report.for_devices`: the options its run's compile takes, rows 8372, 8446) and its CPU companion's on
+    this host's CPUs, nothing placed: what fills the shared cache its run's startup reads (the GPU tier's
+    `test_gpu_host_startup`). Its GPU programs take the tuned choices a run of the GPU left, refused where
+    none has (`report.Untuned`), and compile untuned where the run tunes nothing either (the autotuner's
+    level 0, a repeatable lane's)."""
+    from lane_environment import without_flags
+
     from dew.data.dataset import Loader
     from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates import report
     from dew.training.ahead import prepare_host_step
 
+    tokens = np.stack([np.arange(row, row + 9) % 256 for row in range(1)]).astype(np.int32)
     trainer = streaming_decoder(HOST, dtype=jnp.bfloat16)
     trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus("sm90", 1, 80 * 2 ** 30)))
-    tokens = np.stack([np.arange(row, row + 9) % 256 for row in range(1)]).astype(np.int32)
+    unstated = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level")
+    monkeypatch.setenv("XLA_FLAGS", unstated)
+    with pytest.raises(report.Untuned):
+        prepare_host_step(trainer, {"text": tokens})
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ['XLA_FLAGS']} --xla_gpu_autotune_level=0")
+    trainer = streaming_decoder(HOST, dtype=jnp.bfloat16)
+    trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus("sm90", 1, 80 * 2 ** 30)))
     startup = prepare_host_step(trainer, {"text": tokens})
     assert startup.by_backend["gpu"]["programs"] > 0 and startup.by_backend["cpu"]["programs"] > 0, startup
     # A configured run compiling ahead reaches it (`AheadTarget.compiled`, row 8380), a step of many programs

@@ -1565,33 +1565,37 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     capacity = stated_limit(devices)
     # The GPU XLA compiles for, as its compile-only devices state it.
     stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity)
-    start = trainer._started()
-    if start.resume is not None and trainer.checkpoints is not None:
-        # A resumed run's step compiles at the rung its checkpoint records and the split its state was saved
-        # at (a checkpoint keeps a window only part filled, `dew.state.without_empty_window`), as its resume
-        # would: a split-2 checkpoint compiled at split 1 was another program than the resume's.
-        from dew.training.compiler import resumed_stepping
-
-        trainer._compiler.resume_rung(trainer.checkpoints.rung(start.resume))
-        resumed = resumed_stepping(
-            trainer._stepping(), trainer.checkpoints.window_size(start.resume),
-            held=start.abstract.window is not None, pools=start.abstract.window is not None,
-            replicas=start.abstract.inner is not None and start.resume > 0)
-        trainer._shape = resumed.shape
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
     portable = not on_tpus and not set(devices) <= _HOSTS_GPUS
-    # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
-    trainer.phase_passes.at(batch)
     # Each launch's derived config certified on one of the compile-only devices it compiles for
     # (`report.certified`), as a run on that GPU certifies it: the cache it prepares holds that run's.
     certifying = contextlib.nullcontext() if on_tpus else report.certifying(devices[0])
     # A library that reads the GPU it is traced for (JAX's cuDNN attention gates, row 5894) reads the
     # target's from the concrete mesh the step traces on (`Trainer._traced_on`); made the process's default
     # device besides, the compile-only GPU changed the program a run on that GPU compiles first, which then
-    # refused the step (row 6163).
-    with assumed(on, portable=portable), certifying, trainer.phase_passes.scoped(trainer, trainer._compiler):
-        yield _Targeted(devices, generation, capacity, start)
+    # refused the step (row 6163). The start is traced within it too, as a run on that GPU traces it: traced
+    # before, in a build that sees no GPU, its initializer's launches took the CPU's routes and certified
+    # nothing, so the run certified them on its GPU (rows 7322, 8299: five init-shape launches).
+    with assumed(on, portable=portable), certifying:
+        start = trainer._started()
+        if start.resume is not None and trainer.checkpoints is not None:
+            # A resumed run's step compiles at the rung its checkpoint records and the split its state was
+            # saved at (a checkpoint keeps a window only part filled, `dew.state.without_empty_window`), as
+            # its resume would: a split-2 checkpoint compiled at split 1 was another program than its
+            # resume's.
+            from dew.training.compiler import resumed_stepping
+
+            trainer._compiler.resume_rung(trainer.checkpoints.rung(start.resume))
+            resumed = resumed_stepping(
+                trainer._stepping(), trainer.checkpoints.window_size(start.resume),
+                held=start.abstract.window is not None, pools=start.abstract.window is not None,
+                replicas=start.abstract.inner is not None and start.resume > 0)
+            trainer._shape = resumed.shape
+        # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
+        trainer.phase_passes.at(batch)
+        with trainer.phase_passes.scoped(trainer, trainer._compiler):
+            yield _Targeted(devices, generation, capacity, start)
 
 
 def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
@@ -1685,7 +1689,11 @@ def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch:
     if not trainer.host_master:
         raise ValueError("prepare_host_step prepares a step that keeps its variables on the host "
                          "(Layout(host=('variables',))); compile a device step ahead with compile_ahead")
-    with _targeted(trainer, batch, what="prepare_host_step", platforms=(frozenset({"gpu"}),)) as targeted:
+    # For a device to run, as its run compiles them there (`report.for_devices`): every option a device's
+    # compile takes, so each program keys the persistent cache alike (rows 8372, 8446: compiled as read
+    # offline, its programs took no CUB sort mode, which the run's took, and the run missed them).
+    with report.for_devices(), _targeted(trainer, batch, what="prepare_host_step",
+                                         platforms=(frozenset({"gpu"}),)) as targeted:
         return trainer._compiler.prepared_host(trainer._stepping(), targeted.start.abstract,
                                                step_batch(trainer, batch))
 
