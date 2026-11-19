@@ -69,6 +69,15 @@ def test_the_forward_on_tcgen05s_rows_at_two_consumers_holds_check_1_interpreted
                    value_width=64, tiles=ROWS_PAIR_TILES, target=generation.gpu_target("sm100"))
 
 
+def _placed_forward(tiles: attention_mosaic.Tiles, spans: template.KeySpans):
+    """A traced sm100 forward call pinned at `tiles` over `spans` for `ring_protocol.programs`."""
+    def forward(query, key):
+        with generation.assumed("sm100"), _pinned(tiles):
+            return attention_mosaic.forward(query, key, key, spans, interpret=False)
+
+    return forward
+
+
 @pytest.mark.parametrize("moves", [False, True], ids=["kept", "moved"])
 @pytest.mark.parametrize("call", ["full", "causal"])
 @pytest.mark.parametrize("tiles", [ROWS_TILES, ROWS_PAIR_TILES], ids=["one", "two"])
@@ -84,12 +93,8 @@ def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving
 
     query, key = jnp.ones((1, 256, 1, 128), jnp.bfloat16), jnp.ones((1, 256, 1, 128), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
-
-    def forward(query, key):
-        with generation.assumed("sm100"), _pinned(tiles):
-            return attention_mosaic.forward(query, key, key, spans, interpret=False)
-
-    threads, arrivals = programs(forward, query, key, threads=tiles.consumers + 1, rare=moves)
+    threads, arrivals = programs(_placed_forward(tiles, spans), query, key,
+                                 threads=tiles.consumers + 1, rare=moves)
     assert explore(threads, arrivals) > 0
 
 
@@ -113,17 +118,14 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
 
     query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 256, 1, 256), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
-
-    def forward(query, key):
-        with generation.assumed("sm100"), _pinned(ROWS_TILES):
-            return attention_mosaic.forward(query, key, key, spans, interpret=False)
-
-    threads, arrivals = programs(forward, query, key, threads=ROWS_TILES.consumers + 1, rare=False)
+    threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key,
+                                 threads=ROWS_TILES.consumers + 1, rare=False)
     (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
     first_mma = next(i for i, event in enumerate(issuer) if event.kind == "product")
     assert ({event.at for event in issuer[:first_mma] if event.kind == "wait"}
             & {event.at for event in threads[0] if event.kind == "arrive"})
     assert explore(threads, arrivals) > 0
+
 
 @INTERPRETS
 @pytest.mark.parametrize("tokens", [64, 128, 256, 320])

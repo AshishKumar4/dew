@@ -173,7 +173,7 @@ class Tcgen05Placed(Tcgen05Rings):
         return tuple(barrier for name in ("scored", "weighed", "summed", "q_ready")
                      if name in scratch for barrier in scratch[name])
 
-    def held(self, ref):
+    def held(self, ref: Any) -> Any:
         # The query block moved into tensor memory once before the walk where tensor memory holds it beside
         # the logits and sums (`product_scratch`'s `QUERY`), so every key tile's logits product reads Q from
         # tensor memory (tcgen05's TS form) instead of re-reading shared memory (`issuing`, row 5368).
@@ -183,7 +183,7 @@ class Tcgen05Placed(Tcgen05Rings):
         role = mosaic.ROLE.get()
         q_ref = found[QUERY][role]
         q_tmem = Accumulator(q_ref, tuple(q_ref.shape), dtype=q_ref.dtype)
-        dtype, width = ref.dtype, ref.shape[1]
+        dtype, width = ref.dtype, int(ref.shape[1])
         chunk = min(width, swizzling.swizzle_columns(dtype, swizzling.swizzle_for(dtype, width)))
         for column in range(0, width, chunk):
             src = ref if chunk == width else ref.at[:, pl.ds(column, chunk)]
@@ -364,8 +364,7 @@ class Tcgen05Placed(Tcgen05Rings):
             values.release(ring)
 
         if waited is not None:
-            for signal in waited:
-                signal.wait(rings.Turn.of(0, 1))
+            tuple(signal.wait(rings.Turn.of(0, 1)) for signal in waited)
         else:
             for barrier in ready:
                 plgpu.barrier_wait(barrier)

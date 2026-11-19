@@ -1095,7 +1095,9 @@ def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded
         if hooks.query_mod is not None:
             _prologued(family, hooks.query_mod, hooks, hooked.query, place, first, q_smem, spec.prescale)
         elif spec.prescale != 1.0 and _powered_in_kernel(family, q_smem.dtype, hooks, parts=program.parts):
-            across.scale_smem(q_smem, spec.prescale, swizzle=query_swizzle(family), interpret=interpret)
+            swizzle = query_swizzle(family)
+            assert swizzle is not None
+            across.scale_smem(q_smem, spec.prescale, swizzle=swizzle, interpret=interpret)
             family.published()
         return family.held(q_smem)
     family.loaded(tuple((view, q_smem.at[pl.ds(part * block_q, block_q)], barrier)
@@ -1254,21 +1256,27 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             state, bound = _merged_initial(spec, _initial(family, spec, hooked, state_rows), state, bound)
         return state, trained, bound
 
-    def store(spec: algebra.Forward, state: algebra.Partial, trained) -> None:
-        keep = None if kept is None else _kept_of(program, kept, rows=(row, head, first))
-        if training:
-            # The split sums as the walk left them (at its rows' scale, `algebra.split_residuals`).
-            def split_sums(stage):
-                others = stored().residuals.others
-                family.stored((_kept_rows(family, keep, state.acc, others),), (others,), smem=stage)
-
-            out_stage(split_sums)
-        _status_stored(family, spec, state, stored().status, row_smem, first)
-        _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks,
-                     training=training, out=(out_view, out_stage), rows=(stored, row_smem), keep=keep,
-                     interpret=interpret)
-
+    store = functools.partial(_store_consumer, program, hooked, (row, head, first), hooks=hooks,
+                              training=training, out=(out_view, out_stage), rows=(stored, row_smem),
+                              kept=kept, interpret=interpret)
     _walks_stored(walk, store, spec, consumer, turn, decided=decided, past=past_walks, streamed=streamed)
+
+
+def _store_consumer(program: _Program, hooked: _Hooked, place: tuple, spec: algebra.Forward,
+                    state: algebra.Partial, trained, *, hooks: Hooks, training: bool, out: tuple,
+                    rows: tuple, kept, interpret: bool) -> None:
+    """Store a consumer's finished walk state and optional split sums (`_consumer`'s store callback)."""
+    family, (out_view, out_stage), (stored, row_smem) = program.family, out, rows
+    keep = None if kept is None else _kept_of(program, kept, rows=place)
+    if training:
+        def split_sums(stage):
+            others = stored().residuals.others
+            family.stored((_kept_rows(family, keep, state.acc, others),), (others,), smem=stage)
+
+        out_stage(split_sums)
+    _status_stored(family, spec, state, stored().status, row_smem, place[2])
+    _stored_walk(program, spec, state, trained, hooked, place, hooks=hooks, training=training,
+                 out=(out_view, out_stage), rows=(stored, row_smem), keep=keep, interpret=interpret)
 
 
 def _bound_unit(spec: algebra.Forward, drop, decided: after_walk.Decided | None) -> float | None:
@@ -1455,11 +1463,9 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             # never wrote.
             maximum, denominator = algebra.finished_rows(spec, state, initial=False)
             total, factor = state.total, algebra.inverse(state.total)
-            if hasattr(family, "stored_row"):
-                factor = family.stored_row(factor, row_smem)
-                if interpret:
-                    total = family.stored_row(total, row_smem)
-
+            factor = family.stored_row(factor, row_smem)
+            if interpret:
+                total = family.stored_row(total, row_smem)
             def ratio(block: jax.Array) -> jax.Array:
                 taken = algebra.quotient(lambda held: held * factor[:, None], block, total)
                 return jnp.where(factor[:, None] != 0, taken, 0.0)

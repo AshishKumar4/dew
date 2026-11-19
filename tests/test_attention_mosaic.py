@@ -950,8 +950,10 @@ def test_a_scaled_or_resumed_forward_near_fp32s_largest_is_on_par_interpreted(pr
     draw = (_second_review_draw(31.0, 0.0) if probe == "raw"
             else _second_review_draw(1.0, 1 / 64, scale=2.0 ** 117))
     if probe == "initial":
-        from dew.nn.kernels.templates import attention_algebra as algebra
-        from dew.nn.kernels.templates import attention_mosaic_forward as mosaic_forward
+        from dew.nn.kernels.templates import (
+            attention_algebra as algebra,
+            attention_mosaic_forward as mosaic_forward,
+        )
 
         _, _, value0, _ = draw(0)
         cutoff = np.float32(2.0 ** (algebra.HEADROOM - 1 - algebra.BOUND_UNIT))

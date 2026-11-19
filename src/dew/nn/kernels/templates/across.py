@@ -14,6 +14,7 @@ from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, util
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith
+
 from dew.nn.kernels.templates import emission, resources, swizzling
 from dew.nn.kernels.templates.cost import Work
 
@@ -108,12 +109,12 @@ class ScaleSmem:
         for word in range(0, self.words, resources.THREADS):
             offset = arith.addi(thread, mgpu_utils.c(word, i32))
             ptr = mgpu_utils.getelementptr(base, [offset], i32)
-            val = llvm.load(i32, ptr)
+            loaded = llvm.load(i32, ptr)
             if self.bf16:
-                scaled = mgpu_utils.inline_ptx("fma.rn.bf16x2 $0, $1, $2, $3;", val, pair, zero,
+                scaled = mgpu_utils.inline_ptx("fma.rn.bf16x2 $0, $1, $2, $3;", loaded, pair, zero,
                                                result_types=i32)
             else:
-                scaled = mgpu_utils.inline_ptx("mul.rn.f16x2 $0, $1, $2;", val, pair, result_types=i32)
+                scaled = mgpu_utils.inline_ptx("mul.rn.f16x2 $0, $1, $2;", loaded, pair, result_types=i32)
             llvm.store(scaled, ptr)
         mgpu_utils.warpgroup_barrier()
 
@@ -137,11 +138,12 @@ def scale_smem(ref, power: float, *, swizzle: int, interpret: bool = False) -> N
     bits = (int(np.float32(power).view(np.uint32) >> 16) if bf16
             else int(np.float16(power).view(np.uint16)))
     pair = bits | (bits << 16)
-    transforms = swizzling.staged(ref.shape, dtype, swizzle).transforms
+    transforms = () if swizzle == swizzling.UNSWIZZLED else swizzling.swizzle_transforms(dtype, swizzle)
     ref_type = plgpu.RefType(transforms) if transforms else plgpu.RefType()
     body = emission.stating(lambda r: Work(operations=elements, shared_bytes=2 * elements * 2))(
         ScaleSmem(words, pair, bf16))
     plgpu.inline_mgpu(arg_types=(ref_type,))(body)(ref)
+
 
 def lane_value(value: ir.Value, lane: int) -> ir.Value:
     """The int32 `value` (an MLIR value of a lane-level body, `plgpu.inline_mgpu`'s) that the warp's lane
