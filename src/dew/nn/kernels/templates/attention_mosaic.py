@@ -1692,20 +1692,26 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return None
         residing = [] if dq.products_overlap else [
             lambda config: fits(config) and self.resident(ba, config, target) >= 2]
-        for wanted in (*residing, fits):
-            for columns in (1, 2, 4):
-                fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, self.score_reads[0], dq) else ()
-                for rows in (None, *fewer):
-                    walks = _query_walk(rows)
-                    for staged in (False, True):
-                        def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
-                                  ) -> BackwardTiles:
-                            return BackwardTiles(walked, rows, 2, consumers, family=dq.name,
-                                                 columns=columns, staged_logits=staged, **dkv)
+        # The accurate form's keyed sums in a dQ launch of their own (`BackwardTiles.keyed_apart`) where no
+        # config of the one launch carrying both holds: each launch one accumulator, the keyed launch its
+        # logits' product alone (an H100's accurate dQ 64 wide under a score hook, a width no column split
+        # takes, spilled at every query tile, and the Pallas-Triton backward took the call, row 7938).
+        for apart in (False, True) if self.accurate else (False,):
+            for wanted in (*residing, fits):
+                for columns in (1, 2, 4):
+                    fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, self.score_reads[0], dq) else ()
+                    for rows in (None, *fewer):
+                        walks = _query_walk(rows)
+                        for staged in (False, True):
+                            def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged,
+                                      apart=apart) -> BackwardTiles:
+                                return BackwardTiles(walked, rows, 2, consumers, family=dq.name,
+                                                     columns=columns, staged_logits=staged, keyed_apart=apart,
+                                                     **dkv)
 
-                        if config := derive(dq, query.dtype, key.shape[1], query.shape[1], tiles, wanted,
-                                              overlapped=False, walks=walks, rows=rows):
-                            return config
+                            if config := derive(dq, query.dtype, key.shape[1], query.shape[1], tiles, wanted,
+                                                  overlapped=False, walks=walks, rows=rows):
+                                return config
         return None
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,

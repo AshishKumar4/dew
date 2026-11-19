@@ -272,7 +272,8 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
 def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tuple = ((), ()), heads: int,
                    kv_heads: int, queries: int, consumers: int) -> tuple:
     """A program over query tiles' place and key streams (the dQ launch's and dropout's first pass's): its
-    batch row and query head, its key and value views (`_views_of`) and those of its score hook's parameters
+    batch row and query head, its key and value views (`_views_of`; no values' where `v_ref` is None) and
+    those of its score hook's parameters
     that ride them (`score`, their refs and kinds: `score_views`), their streams opened, its consumers'
     first query (`_Program.query_tile`, a tile each) and the key tiles any of them reads (`_Program.reach`,
     `_streamed`)."""
@@ -280,7 +281,9 @@ def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tu
     row, head = family.program_index("batch"), family.program_index("heads")
     pair = consumers * block_q
     refs, kinds = score
-    views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
+    # A launch reading no values (the keyed sums' alone, `BackwardTiles.keyed_apart`) streams none.
+    streamed_refs = {"keys": k_ref} if v_ref is None else {"keys": k_ref, "values": v_ref}
+    views = _views_of(streamed_refs, row, lax.div(head, heads // kv_heads))
     if riding(family, kinds, "keys"):
         views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair))
     if spans is not None and spans.walk_count is not None:
