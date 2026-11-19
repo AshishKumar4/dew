@@ -1622,7 +1622,10 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
     assert pcie.target.memory == allocator_limit(int(float(capacity_gib(room)) * 2**30))
     assert 0 < pcie.built.memory <= pcie.target.memory
-    assert pcie.sampled is not None and again.built == pcie.built
+    # One target, its need the programs each carries: the inspected build's sampled step beside its step.
+    assert pcie.sampled is not None
+    assert again.built == dataclasses.replace(pcie.built, memory=again.built.memory)
+    assert again.built.memory <= pcie.built.memory
     assert canonical.built.multiprocessors == gpu_target("sm90").multiprocessors
     held = dataclasses.replace(gpu_target("sm90"), device_kind="NVIDIA H100 PCIe", multiprocessors=114)
     assert pcie.derived_for(held) == pcie.target

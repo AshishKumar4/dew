@@ -51,7 +51,7 @@ import pickle
 import platform
 import tempfile
 import time
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -65,7 +65,7 @@ from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import carried, cuda_libraries, plugin_builds, topology_digest, uncached
-from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, device_memory
+from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu, allocator_limit, device_memory, stated_share
 from dew._records import JSON, boolean, record
 from dew._stated import Unestablished, traceback_frames
 from dew.batch import Batch
@@ -587,10 +587,12 @@ class BuildTarget:
     flags: tuple[str, ...]
     host: str
     memory: int | None = None
-    """The allocator's limit a device holds that the build's plan held each call to, derived from the
-    memory stated for its GPUs (`dew._devices.allocator_limit`; `built_target`'s `memory`): a device whose
-    limit is lower runs past what the plan kept and is refused, naming both limits; a build stating none
-    planned for the least of its target's parts."""
+    """The allocator's limit a device must hold to admit every program built (`programs_need`), each as
+    XLA analysed its memory where it compiled it, or, a target's own (`of`), the limit its devices hold: a
+    device whose limit is lower than a build's need is refused, naming both. Not the room the plan was
+    allowed (`AheadOfTime.capacity`): a step built for a whole GPU runs on a smaller one that admits it
+    (the GPU tier's part, its pool sized by its tests' peaks, refused a tiny step built for 80 GiB, rows
+    8094 and 8371). A build stating none planned for the least of its target's parts."""
     cpu: str | None = None
     """A CPU target's own processor (`host_cpu`): XLA compiles a CPU's program to the instruction sets of
     the host that compiles it, so its executable runs on a host of the same ones. None for a GPU's or a
@@ -672,6 +674,22 @@ class BuildTarget:
         if differences := self.differences(BuildTarget.of(devices)):
             raise ValueError(f"these programs were compiled for another target than this process's: "
                              f"{'; '.join(differences)}")
+
+
+def programs_need(device, programs: Iterable[tuple[CompiledMemory | None, int, int]]) -> int | None:
+    """The least allocator limit a GPU like `device` must hold to admit each of `programs`, the most of
+    them: each a program's memory as XLA analysed it, the bytes a loop keeps beside it and those of them its
+    first call builds, admitted as the planner admits a step (`memory.admission`, `memory.needed`) and read
+    as the limit that GPU's pool holds (`allocator_limit` at its stated share). None for a device of no GPU
+    pool (a TPU's, whose topology states its own) and where a program states no memory."""
+    from dew.training.memory import admission, needed
+
+    programs = list(programs)
+    stated = [(memory, held, built) for memory, held, built in programs if memory is not None]
+    if device.platform != "gpu" or not programs or len(stated) < len(programs):
+        return None
+    return max(allocator_limit(needed(device, *admission(memory, held, built)), stated_share(device))
+               for memory, held, built in stated)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -980,7 +998,8 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
             raise ValueError(f"program {name!r} cannot be compiled ahead (an array it closed over is a "
                              "constant of its program, which no executable serializes: pass it as an "
                              f"argument): {refused}") from refused
-    return AheadPrograms(BuildTarget.built(target, 1), built, tuned=tuned)
+    need = programs_need(gpus[0], [(executable.memory, 0, 0) for executable in built.values()])
+    return AheadPrograms(BuildTarget.built(target, 1, need), built, tuned=tuned)
 
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
@@ -1516,9 +1535,9 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
             planned = trainer._compiled_plan(start.abstract, stepped, None, frontier)
             with attempting(begun):
                 starts = started(trainer, start, planned, plan)
-            counts = {} if trainer.phase_passes.sampled is None else {
-                count: _held_ahead(each) for count, each in trainer._compiler.admitted_counts(
-                    trainer, trainer._stepping, planned, start.abstract, stepped)}
+            admitted = {} if trainer.phase_passes.sampled is None else dict(trainer._compiler.admitted_counts(
+                trainer, trainer._stepping, planned, start.abstract, stepped))
+            counts = {count: _held_ahead(each) for count, each in admitted.items()}
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
     # The sampled step as the search compiled it, its program what it lowered then (the plan unreleased, its
@@ -1533,6 +1552,7 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
     memory = compiled_memory(compiled)
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
+    need = _step_need(planned, admitted.values(), starts, devices[0])
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), program_digest(lowered),
         Executable.of(compiled),
@@ -1541,8 +1561,22 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         temp_bytes=memory.temp, code_bytes=memory.generated_code, live_bytes=memory.live, plan=trainer.plan,
         planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
-        built=BuildTarget.built(target, len(devices), capacity, topology=topology),
+        built=BuildTarget.built(target, len(devices), need, topology=topology),
         refusals=report.refused_launches(), sampled=sampled, starts=starts, counts=counts)
+
+
+def _step_need(planned: Planned, counts: Iterable[Planned], starts: Mapping[str, Executable],
+               device) -> int | None:
+    """What a device must hold to run a step compiled ahead (`programs_need`): its step and every pass
+    count's, each with its sampled step, beside the bytes their loop keeps (`Candidate.held`), and the
+    programs that build its fresh state before it (`AheadOfTime.starts`), beside none."""
+    steps = [planned, *counts]
+    programs = [(compiled_memory(each.executable), each.candidate.held, each.candidate.built)
+                for each in steps]
+    programs += [(compiled_memory(each.sampled.executable), each.candidate.held, each.candidate.built)
+                 for each in steps if each.sampled is not None]
+    programs += [(executable.memory, 0, 0) for executable in starts.values()]
+    return programs_need(device, programs)
 
 
 def _held_ahead(planned: Planned) -> tuple[AheadProgram, AheadProgram | None]:
