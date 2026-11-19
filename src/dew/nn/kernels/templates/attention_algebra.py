@@ -34,6 +34,7 @@ import numpy as np
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, raised_exactly
 from dew.nn.kernels.templates import bodies, layout, product
 from dew.nn.kernels.templates.attention import (
     LN2,
@@ -47,17 +48,7 @@ from dew.nn.kernels.templates.attention import (
     coded,
     within,
 )
-from dew.nn.precision import (
-    TWO_FACTOR_REACH,
-    binade_of,
-    float32_einsum,
-    lowered_divide,
-    power2,
-    raised_exactly,
-    scalar_power2,
-    two_product,
-    two_sum,
-)
+from dew.nn.precision import float32_einsum, lowered_divide, power2, scalar_power2, two_product, two_sum
 
 
 def folds(scale: float, prescale: float, *, natural: bool, score_mod) -> bool:
@@ -1792,7 +1783,7 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
     """`ratio(acc)`, the weighted values `acc` `[..., Dv]` over their rows' `total` `[...]` as its caller
     divides them; where the arithmetic flushes a subnormal result (`bodies.subnormals`: XLA's CPU, per
     primitive, row 4023), each element whose quotient may fall below fp32's least normal divided raised to
-    its row's total's binade (`dew.nn.precision.raised_exactly`, from its bits) and taken back in the one
+    its row's total's binade (`dew.nn.float_bits.raised_exactly`, from its bits) and taken back in the one
     rounding of the correctly rounded division (`lowered_divide`): a subnormal one kept (row 6302); every
     other element's bits the plain ratio's. Wider sums (a float64 truth's) keep their subnormals as they
     are. Where `held` (an fp32 call's walk, `MosaicForward.parts`: dropout-free inference), a quotient of

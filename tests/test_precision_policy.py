@@ -16,6 +16,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dense import Dense
 from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
+from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, float_bits, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
@@ -24,19 +25,14 @@ from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import (
     ACCURATE,
-    TWO_FACTOR_REACH,
     Numerics,
     _binades,
     _rounded_significand,
     aligned_sum,
-    binade_of,
     compensated_add,
     compensated_difference,
     exact_products,
-    float_bits,
     fp32_result_dot_general,
-    lowered_rounded,
-    raised_exactly,
     two_product,
     two_sum,
 )
@@ -1489,9 +1485,9 @@ def edge_values(dtype) -> np.ndarray:
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
                                    jnp.float8_e5m2])
 def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
-    """`dew.nn.precision.exact_power2` is `2^n` in its format, bit for bit, at every normal exponent from the
+    """`dew.nn.float_bits.exact_power2` is `2^n` in its format, bit for bit, at every normal exponent from the
     least to the largest, and +0 one below them (a zero a caller encodes so), compiled."""
-    from dew.nn.precision import exact_power2
+    from dew.nn.float_bits import exact_power2
 
     with jax.enable_x64(new_val=dtype == jnp.float64):
         limits = jnp.finfo(dtype)
@@ -1716,7 +1712,7 @@ def test_a_compensated_primitive_under_jit_is_its_eager_arithmetic(shape):
 
 def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flushing_cpu():
     """On XLA's CPU, whose fp32 multiply flushes a subnormal operand and result (row 4023):
-    `dew.nn.precision.raised_exactly` is `x * 2^k` and `lowered_rounded` `x * 2^-k` rounded once to nearest
+    `dew.nn.float_bits.raised_exactly` is `x * 2^k` and `lowered_rounded` `x * 2^-k` rounded once to nearest
     even, bitwise numpy's IEEE `ldexp`, across every binade, subnormals both ways, at shifts 0 to 300, zero
     kept zero; and `binade_of` is `floor(log2|x|)`, -1024 at zero, int32 (row 6302's finish,
     `algebra.quotient`, and an initial state's gradient)."""

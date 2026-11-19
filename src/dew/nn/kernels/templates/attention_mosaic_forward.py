@@ -31,6 +31,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
+from dew.nn.float_bits import TWO_FACTOR_REACH
 from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
@@ -99,7 +100,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 )
 from dew.nn.kernels.templates.cost import estimate
 from dew.nn.kernels.templates.rings import Ref
-from dew.nn.precision import TWO_FACTOR_REACH, power2
+from dew.nn.precision import power2
 
 
 def _out_types(query, value, value_width: int | None, out_dtype, *, parts: int, splits: int, peaks: bool,

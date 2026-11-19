@@ -26,15 +26,14 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn import derivatives
+from dew.nn.float_bits import TWO_FACTOR_REACH, exact_power2
 from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import (
-    TWO_FACTOR_REACH,
     compensated_add,
     compensated_sum,
     exact_float32,
-    exact_power2,
     float32_einsum,
     float32_matmul,
     power2,

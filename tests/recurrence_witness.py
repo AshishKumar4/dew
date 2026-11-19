@@ -81,7 +81,7 @@ PAIR_FRACTION = 2.0 ** -21
 distance from its floor rounds), their difference and its sum with the low halves', each under 2."""
 ZERO_WHOLE = -127
 """A pair whose integers differ by this or less weighs zero (`algebra.between`'s exact power of two at its
-zero exponent bits, `precision.exact_power2`)."""
+zero exponent bits, `float_bits.exact_power2`)."""
 
 
 @dataclasses.dataclass(frozen=True)
