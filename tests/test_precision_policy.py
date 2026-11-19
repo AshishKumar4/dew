@@ -1278,6 +1278,27 @@ def test_an_aligned_sums_tangent_over_four_factors_and_2_28_terms_traces():
     assert lowered.out_info.shape == (1,)
 
 
+def test_an_aligned_sums_tangent_moves_only_the_factors_it_reaches():
+    """The tangent along `x` of `aligned_sum([(x,), (inf, 1)])` on fp32 scalars, and the gradient of `x`:
+    one each, the constant term's infinity moving nothing, where its zero direction met the other constant's
+    infinity, NaN (base review ee7d1e761 F1, row 8757)."""
+    infinite, one = jnp.float32(jnp.inf), jnp.float32(1.0)
+
+    def summed(x):
+        return aligned_sum([(x,), (infinite, one)])
+
+    assert float(jax.jvp(summed, (one,), (one,))[1]) == 1.0
+    assert float(jax.grad(summed)(one)) == 1.0
+
+
+def test_an_aligned_sum_over_2_30_terms_lowers():
+    """`aligned_sum([(x,)], axis=0)` over 2^30 fp32 terms, lowered: one-bit digits whose partial sum the
+    integers hold, the carry apart, where it was refused (base review ee7d1e761 F2, row 8757)."""
+    lowered = jax.jit(lambda x: aligned_sum([(x,)], axis=0)).trace(
+        jax.ShapeDtypeStruct((2 ** 30,), jnp.float32)).lower()
+    assert lowered.out_info.shape == (1,)
+
+
 def test_an_aligned_sum_over_an_empty_axis_is_positive_zero():
     """`aligned_sum` over an empty fp32 axis: positive zero, IEEE's sum of no terms, where a sum of none
     counted as of negative zeros alone, negative zero (base review 6c68b90ad F4)."""
