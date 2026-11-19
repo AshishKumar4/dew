@@ -1834,7 +1834,7 @@ def _exact_sum(terms, spec, dtype) -> jax.Array:
     # term carried as added (`_nearest`): 2^30 terms were refused (row 8757).
     widest, most = max(extent for _, _, extent in parts), (1 << (limits.bits - 1)) - 1
     digit = max([0] + [w for w in range(1, limits.bits - 1) if (widest + 1) * ((1 << w) - 1) <= most])
-    if digit < 1 or count + 1 > most:  # A level's carry lies in [-(count + 1), count] (row 8757).
+    if digit < 1 or count > most + 1:  # A level's carry lies in [-count, count - 1] (row 8757).
         raise ValueError(f"an aligned sum of {count} products a value, past its integers' digits")
     lowest = factors * (limits.minexp - 2 * limits.nmant)
     highest = factors * (limits.maxexp + 1) + count.bit_length() + 2
@@ -1848,9 +1848,8 @@ def _exact_sum(terms, spec, dtype) -> jax.Array:
 
 def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
     """The parts' exact sum as the nearest float, ties to even: each of `levels` digits of `digit` bits from
-    bit `lowest` the sum of every limb's bits there, carried as the number's and its negation's digits, the
-    last carry its sign; of the magnitude's, its highest digits and whether any under them is nonzero, kept
-    as the carry passes, then written as the float's bits (`_written`); each reduction its integers'."""
+    bit `lowest` every limb's bits there summed, carried as the number's and its negation's, the last carry
+    its sign; the magnitude's highest digits and a sticky bit kept, then written as its bits (`_written`)."""
     ints = jnp.dtype(f"int{limits.bits}")
     # A limb's bits, two of `_split_bits`' low halves (`_product`).
     bits, mask, width = limits.bits, (1 << digit) - 1, 2 * _split_bits(limits.dtype)[2]
@@ -1952,16 +1951,21 @@ def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> j
 
 
 def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents):
-    """`_aligned_terms`' value and tangent (`_aligned_directions`), the value the declared sum's (`_aligned`)
-    so an outer order takes its tangent: formed from bits, a second order lost its curvature (row 8757)."""
+    """`_aligned_terms`' value, the declared sum's (`_aligned`), and tangent in the factors it reaches."""
     from jax.custom_derivatives import SymbolicZero
 
     value = _aligned(shape, spec, *primals)
-    # Only factors a tangent reaches move: a constant's zero beside an infinity was NaN (row 8757).
     live = tuple(index for index, direction in enumerate(tangents) if not isinstance(direction, SymbolicZero))
     if not live:
         return value, jnp.zeros_like(value)
     return value, _aligned_directions(shape, spec, primals, [tangents[index] for index in live], value, live)
+
+
+def _placed_as(x: jax.Array, like: jax.Array) -> jax.Array:
+    """`x` placed as `like`'s type, whole too, where its mesh has an Explicit axis (row 8757)."""
+    placed = jax.typeof(like).sharding
+    typed = isinstance(placed, jax.sharding.NamedSharding) and placed.mesh.explicit_axes
+    return jax.sharding.reshard(x, placed) if typed else x
 
 
 def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.Array) -> tuple:
@@ -1991,8 +1995,7 @@ def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.
 def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents, value,
                         live: tuple[int, ...]):
     """`aligned_sum`'s tangent in its `live` factors' `tangents`, a linear map (`generation.linear_map`):
-    each direction in its places, summed aligned, transposed to an aligned sum of the cotangent times each
-    place's other factors, neither leaving float32's range where its sum is in it (row 8501)."""
+    each direction in its places summed aligned, its transpose the cotangent times their other factors."""
     from dew.nn.kernels import generation
 
     def applied(factors, directions):
@@ -2002,8 +2005,9 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
                   for index, term in enumerate(shape) if spot < len(term) and term[spot] in moving]
         moved = [(*(factors[at] for at in shape[index][:spot]), moving[shape[index][spot]],
                   *(factors[at] for at in shape[index][spot + 1:])) for spot, index in placed]
-        # In the value's layout, which the moving terms alone may not span (base review 0c6ef9c11 F1).
-        return jnp.broadcast_to(_aligned_terms(moved, tuple(spec[index] for _, index in placed)), value.shape)
+        # In the value's layout and placement, which the moving terms alone may not span (row 8757).
+        return _placed_as(jnp.broadcast_to(_aligned_terms(moved, tuple(spec[index] for _, index in placed)),
+                                           value.shape), value)
 
     def pulled(factors, cotangent):
         gradients = []
@@ -2022,11 +2026,7 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
                         along = tuple(d for d, size in enumerate(held) if size == 1)
                         terms.append(products)
                         laid.append((along if along else None, (held, factor.shape)))
-            gradient = _aligned_terms(terms, tuple(laid)).astype(factor.dtype)
-            # Placed as the factor's type, whole too, where its mesh has an Explicit axis (its operand's).
-            placed = jax.typeof(factor).sharding
-            typed = isinstance(placed, jax.sharding.NamedSharding) and placed.mesh.explicit_axes
-            gradients.append(jax.sharding.reshard(gradient, placed) if typed else gradient)
+            gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype), factor))
         return gradients
 
     # Typed as the value it perturbs, so a reverse pass traces no forward mode for its type alone.

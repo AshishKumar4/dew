@@ -1709,7 +1709,8 @@ def _linear_primitive() -> type:
                 # Only the residuals a tangent reaches move, the others held as constants: a zero tangent of
                 # an infinite residual was a 0 inf, NaN (base review 0c6ef9c11 F2).
                 flat, tree = jax.tree.flatten(residuals)
-                directions = jax.tree.leaves(d_residuals, is_leaf=zero)
+                # Paired by the residuals' structure, which raises where the tangents' differs.
+                directions = tree.flatten_up_to(d_residuals)
                 live = [index for index, direction in enumerate(directions) if not zero(direction)]
 
                 def moved(*held):
