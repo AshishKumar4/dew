@@ -4,7 +4,6 @@ buffer and its rows stored by a ladder of static-extent copies (`staged_rows`, `
 row by row where a table says (`Scattered`)."""
 
 import dataclasses
-import functools
 import math
 from collections.abc import Callable
 from typing import Any
@@ -65,7 +64,8 @@ def buffer_waits(chunks: int, buffers: int) -> tuple[int, ...]:
     """For each of a tile's `chunks` chunks staged through `buffers` buffers in turn (chunk c in buffer
     c % buffers, `output_staging`), the TMA store groups that may still be reading shared memory as the
     chunk's buffer is written again (`plgpu.wait_smem_to_gmem`'s count): the fewest groups any run issues
-    after that buffer's last store, each chunk's copies one group (`staged_rows`). Before a buffer is
+    after that buffer's last store, each chunk at least one group (`staged_rows`: a group a copy its rows
+    take, an empty one where they take none). Before a buffer is
     rewritten its last group is older than those, so it has been read; another output's groups between
     them only make it older. A chunk past the first `buffers` (c >= buffers) wrote its buffer `buffers`
     chunks before, `buffers - 1` groups since; one of the first rewrites the buffer the tile before last
@@ -114,8 +114,12 @@ def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column
                 least: int = 1, *, write: Callable = written) -> None:
     """`value` written to the shared buffer `smem` in its dtype (`write`: its issuer's, `Issuer.written`),
     made visible to TMA, and its rows `first` to `first + stored` stored to `o_gmem` at row
-    `row_start + first` and `column` (`store_rows`), its copies one TMA store group (`buffer_waits` counts
-    a chunk's stores so); the copies stay in flight (the caller waits before `smem` is written again). A
+    `row_start + first` and `column` (`store_rows`), each copy its own TMA store group, as CUTLASS's
+    epilogue commits each of its stores (`tma_store_arrive`), and an empty group where `stored` is none, so
+    each chunk commits at least one (`buffer_waits` counts a chunk's stores so). One group over a chunk's
+    ladder (its copies uncommitted, one commit after them) left Hopper's warpgroup-MMA consumer a register
+    short under CUDA 13's ptxas at 128x256 tiles, the persistent walk's bound spilled (row 8669). The
+    copies stay in flight (the caller waits before `smem` is written again). A
     `Scattered` output's rows each land where its table says, copied by the warpgroup's threads
     (`gathered.scattered_rows`), done when it returns, its value written unoptimized (no TMA copy reads the
     buffer, whose plain layout has no optimized transfer from a warpgroup MMA's)."""
@@ -128,9 +132,11 @@ def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column
         return
     write(smem, value)
     plgpu.commit_smem()
-    store_rows(smem, o_gmem, row_start, first, stored, column, most, least,
-               copy=functools.partial(plgpu.copy_smem_to_gmem, commit_group=False))
-    plgpu.commit_smem_to_gmem_group()
+    store_rows(smem, o_gmem, row_start, first, stored, column, most, least)
+
+    @pl.when(stored == 0)
+    def _():
+        plgpu.commit_smem_to_gmem_group()
 
 
 def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, least: int = 1,

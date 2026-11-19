@@ -2174,7 +2174,7 @@ def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loo
 
 
 def test_a_staged_outputs_launch_states_its_cost():
-    """The staged output's launch (`_staged_launch`, its chunks' stores committed a group a chunk) costed as
+    """The staged output's launch (`_staged_launch`, each of its chunks' copies its own store group) costed as
     the toolkit's launches are (`emission.costed`, the estimate XLA and Dew's FLOP count read): it states the
     bytes it is given and no arithmetic, a store group's commit priced as the synchronization it is."""
     from reference_error import equations
