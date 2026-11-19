@@ -42,6 +42,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import struct
+from jax._src import core as jax_core
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
@@ -76,6 +77,7 @@ from dew.nn.precision import (
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectsParameters, StagedStacks
 from dew.nn.sharding import LogicalAxes, abstract, boxed_axes, rows_taken
+from dew.objectives.drawn import drawn_once
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -1296,6 +1298,14 @@ class Objective(ABC, Generic[Loss, Effects]):
         objective of several networks overrides this whole.
         """
         held = self.held_variables() if variables is None else variables
+        if jax_core.trace_state_clean():
+            # Outside any trace, one program, not each operation's, its held arrays kept (row 8682): this
+            # body's, which an override calling it then changes once (row 8730's class).
+            return drawn_once(lambda tree, draw: self._initialized(draw, tree), held, key)
+        return self._initialized(key, held)
+
+    def _initialized(self, key: jax.Array, held: Variables | None) -> Variables:
+        """`init`'s body over the held tree it resolved, which an override reaches through the base alone."""
         if held is not None and "params" in held:
             # A store a stage-local run handed on is read on its stored layers, whatever this run keeps.
             from dew.nn.backbones.layer_names import stored_layers

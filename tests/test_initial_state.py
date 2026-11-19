@@ -82,3 +82,37 @@ def test_an_initial_state_override_changes_the_state_once_eager_or_traced():
         jax.monitoring.unregister_event_duration_listener(heard)
     assert shapes.step.shape == () and not compiles, len(compiles)
     assert int(jax.jit(trainer.initial_state)().step) == 100
+
+
+def test_an_objectives_init_outside_a_trace_is_one_program_its_held_arrays_kept():
+    """An objective's init called outside any trace (a config's LoRA run drawing its base, a test's) compiles
+    one program, where each operation of the model's draw compiled alone (row 8682, its `Objective.init`
+    half; row 8732: `dew.config`'s LoRA runs from scratch), and a held base's frozen leaves are the held
+    arrays themselves."""
+    from dew._cache import uncached
+    from dew.batch import FROZEN
+    from dew.lora import LoRA
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=8)
+    compiles = []
+
+    def heard(event, seconds, **_):
+        if event == "/jax/core/compile/backend_compile_duration":
+            compiles.append(seconds)
+
+    objective = LMObjective(model, seq_len=8)
+    jax.monitoring.register_event_duration_secs_listener(heard)
+    with uncached():
+        try:
+            objective.init(jax.random.key(0))
+        finally:
+            jax.monitoring.unregister_event_duration_listener(heard)
+    assert len(compiles) <= 2, len(compiles)
+    variables = nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+    adapted = LoRA(rank=2, modules=("q_proj",)).apply(model, variables, key=2)
+    held = LMObjective(adapted.model, seq_len=8, variables=adapted.variables)
+    drawn = held.init(jax.random.key(0))
+    given = {id(leaf) for leaf in jax.tree.leaves(held.held_variables())}
+    frozen = jax.tree.leaves(drawn[FROZEN])
+    assert frozen and all(id(leaf) in given for leaf in frozen)
