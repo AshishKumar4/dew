@@ -137,7 +137,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
                              pltpu.SMEM((1,), ref.dtype))
 
     def key_magnitudes(self, tile) -> jax.Array:
-        return jnp.max(jnp.abs(tile[...]), axis=1).astype(jnp.float32)
+        held = jnp.abs(tile[...])
+        return jnp.max(jnp.where(held < jnp.inf, held, 0), axis=1).astype(jnp.float32)
 
     def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
         del scratch, interpret

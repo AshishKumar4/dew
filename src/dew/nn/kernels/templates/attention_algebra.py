@@ -1342,9 +1342,14 @@ def chunk_of(spec: Forward) -> int | None:
     return CHUNK if spec.compensated else None
 
 
-def magnitudes(value: jax.Array) -> jax.Array:
-    """Each key's values' largest magnitude, `[bk]` of a tile's `[bk, Dv]`, fp32 (`weighed_reach`)."""
-    return jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1)
+def magnitudes(value: jax.Array, *, axis: int = -1) -> jax.Array:
+    """Each key's values' largest finite magnitude over `axis` (its columns), `[bk]` of a tile's `[bk, Dv]`,
+    fp32 (`weighed_reach`): a value that is no finite number weighs nothing in a row's bound, its column's
+    sums no finite number at any scale, where its magnitude made every column's bound infinite and left the
+    row unscaled (a dropping call over values near fp32's largest, one of a dropped key's infinite: its kept
+    key's sums passed fp32's largest where the output is finite, row 8652)."""
+    held = jnp.abs(value)
+    return jnp.max(jnp.where(finite(held), held, 0), axis=axis).astype(jnp.float32)
 
 
 def weighed_reach(keys: Keys, value: jax.Array, p: jax.Array, *, axis: int = -1) -> jax.Array:

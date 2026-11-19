@@ -1545,7 +1545,7 @@ def _largest(program: _Program, hooked: _Hooked, place: tuple, k_first, slots, c
 def _magnitudes(value: jax.Array, hooked: _Hooked, parts: int) -> jax.Array:
     """A launch's keys' value magnitudes (`_Hooked.magnitudes`): each key's largest over `value`'s
     columns `[B, K, Hk, Dv]` (an fp32 call's whole, `product.joined`), `[B, Hk, K]` fp32."""
-    return jnp.swapaxes(jnp.max(jnp.abs(product.joined(value, parts)), axis=-1), 1, 2)
+    return jnp.swapaxes(algebra.magnitudes(product.joined(value, parts)), 1, 2)
 
 
 def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partial, known: algebra.Argmax,
