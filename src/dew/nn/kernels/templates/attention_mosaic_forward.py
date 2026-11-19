@@ -1272,30 +1272,28 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
 
 def _bound_unit(spec: algebra.Forward, drop, decided: after_walk.Decided | None) -> float | None:
-    """The unit a deciding launch's unscaled walk bounds its rows' sums at as the host's bound would
-    (`algebra.bounded_past`, its verdict's, `_walks_stored`): `2^-BOUND_UNIT` times the most a weight reaches
-    (a dropping call's multiplier, `drop`); None where it decides nothing or walks scaled."""
+    """The amplification factor a deciding launch's unscaled walk passes to `algebra.bound_sum` (a dropping
+    call's multiplier, `drop`, else 1.0); None where it decides nothing or walks scaled (row 8813 F5)."""
     if decided is None or spec.headroom:
         return None
-    return 2.0 ** -algebra.BOUND_UNIT * (1.0 if drop is None else drop.bound)
+    return 1.0 if drop is None else drop.bound
 
 
-def _bounded(reached: jax.Array, logits: jax.Array, magnitudes: jax.Array, unit: float) -> jax.Array:
-    """A walk's bound `reached` `[bq]` after a step: its visible keys' (`logits` past -inf) largest value
-    magnitudes (`magnitudes`, `algebra.magnitudes`'s finite ones) at `unit` (`_bound_unit`) added."""
+def _bounded(reached: jax.Array, logits: jax.Array, magnitudes: jax.Array, amplified: float) -> jax.Array:
+    """A walk's bound `reached` `[bq]` after a step: supplies visible key magnitudes in the mainloop's layout
+    to `algebra.bound_sum` (row 8813 F5)."""
     seen = jnp.where(logits > -jnp.inf, algebra.across(magnitudes, logits), 0.0)
-    return reached + jnp.sum(seen * unit, axis=-1)
+    return reached + algebra.bound_sum(seen, amplified=amplified)
 
 
 def _merged_initial(spec: algebra.Forward, initial: algebra.Partial, state: algebra.Partial, bound
                     ) -> tuple[algebra.Partial, jax.Array | None]:
     """A walk's `state` with the call's `initial` state merged in past it (`algebra.merge`), and its `bound`
-    (`_bounded`'s, where it bounds) with the state's sums' largest at the bound's unit, as the host's takes
-    them (`algebra.bounded_past`)."""
+    (`_bounded`'s, where it bounds) updated through `algebra.bound_initial` (row 8813 F5)."""
     state = algebra.merge(spec, initial, state)
     if bound is None:
         return state, None
-    return state, bound + jnp.max(jnp.abs(initial.acc), axis=-1) * 2.0 ** -algebra.BOUND_UNIT
+    return state, algebra.bound_initial(bound, initial.acc)
 
 
 def _walks_stored(walk: Callable, store: Callable, spec: algebra.Forward, consumer, turn: Callable, *,
@@ -1332,7 +1330,7 @@ def _walks_stored(walk: Callable, store: Callable, spec: algebra.Forward, consum
     # warpgroup's vote (`bar.red.or.pred`, a vector's alone: a tile's own refused layouts).
     rows = jnp.isnan(jnp.sum(state.acc * 0.0, axis=-1))
     if bound is not None:
-        rows = rows | (bound >= 2.0 ** (algebra.HEADROOM - 1 - algebra.BOUND_UNIT))
+        rows = rows | algebra.bound_exceeds(bound)
     taken = decided.stated(consumer, jnp.any(rows))
     pl.when(jnp.logical_not(taken))(lambda: stored(spec, state, trained))
 
