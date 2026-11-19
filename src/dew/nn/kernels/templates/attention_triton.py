@@ -614,7 +614,7 @@ def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundAr
     for warps in (WARPS, 2 * WARPS):
         legal = [config for rows in (extent for extent in EXTENTS if held % extent == 0)
                  for config in (tiles(rows, walk, warps) for walk in EXTENTS if walked % walk == 0)
-                 if launch.legal(ba, config, target)]
+                 if launch.takes(ba, config, target)]
         if legal and fp32:
             return next((config for config in legal if _resident(launch, ba, config, target) >= 2), legal[0])
         if legal:

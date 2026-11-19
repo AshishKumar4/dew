@@ -16,6 +16,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   logged (`train/rollout_copied_gib`). The streamed layout's choice keeps a run with a rollout on its
   devices: its stream's first batch is the rollout's input, no step's, so no step is priced before a
   rollout runs.
+- A step's fit counts the bytes placed beside its temporaries (its copies, its window, its batches) where a
+  BFC allocator may put them, its largest free block among the places, and a fresh run's first step builds
+  its narrow copies before it is judged on the allocator holding them. An H100's 4B run was admitted with
+  its copies in the one block its temporaries needed, and refused on its first step.
 - A fresh fit plans its step once over the batch its loop hands the step, where the layout's choice
   planned over the batch as read and the first compile planned and compiled it again, and compiles no
   streamed step where the device plan is priced no dearer than the streamed step's update on the host

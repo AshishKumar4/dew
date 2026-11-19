@@ -140,7 +140,15 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     the final state; `replay(chunk, h)` the chunk walked token by token from the state `h` entering it, its
     outputs and the state leaving it (`_replayed`), and `backward(chunk, state, d_state, d_outputs)` its
     derivative, the chunk's adjoint: the cotangent of the state entering it and of each operand but the
-    reset's. Refused (`Refused`) where the update or the readout is not of the module's form. `init(shapes)`
+    reset's. `prepare(chunk, window=(origin, through))` prepares a document's segment of the chunk, a
+    memory entering its token `origin` and its state left after `through` (`_windowed`: every other token
+    the identity, its resets cleared), whose `mapped` and `step` from that memory are the segment's
+    outputs and the state it leaves, as a forked walk loads and stores a document's memory mid-chunk: its
+    values differ from the chunk's in content alone, so one split serves both (the split's key is its
+    operands' shapes). `replay` and `backward` take a walk's own hooks around each token (`walked`,
+    `_replayed`), `backward`'s with the cotangent of what the walk carries after the chunk, and give its
+    cotangent before it besides. Refused (`Refused`) where the update or the readout is not of the module's
+    form. `init(shapes)`
     given a chunk's operands (or their shapes and dtypes) starts a walk that merges (`Walk`), its transfer
     carried where its tokens correct the state; given none, one that steps alone. `prepare`, `step`, `mapped`
     and `merge` each take a mainloop's issuer, `issue(role, lhs, rhs)` (`lhs @ rhs`), which makes every matrix
@@ -167,9 +175,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             _traced(declaration, declaration.update, names, chunk),
             _traced(declaration, declaration.readout, names, chunk), saturation), derive.FORMS_HELD)
 
-    def parts(chunk: Mapping):
+    def parts(chunk: Mapping, window=None):
         affine = affine_of(chunk)
-        return affine, _token_parts(declaration, names, affine, chunk)
+        return affine, _segment_parts(declaration, names, affine, chunk, window)
 
     # A walk's decay and state carried in its chunks' accumulation (`parts`' float32 at least; a float64
     # state's, float64), the state rounded to its declared dtype once, at the finish: a 16-bit state carried
@@ -185,11 +193,12 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     splits: collections.OrderedDict = collections.OrderedDict()  # the least recently prepared first
 
-    def prepare(chunk, issue=None, transition: bool = False):
-        affine, (exponent, *values) = parts(chunk)
+    def prepare(chunk, issue=None, transition: bool = False, window=None):
+        affine, (exponent, *values) = parts(chunk, window)
         decays = _decays(exponent, affine.base2)
         natural = _walked(exponent, affine.base2)
-        tokens, entering = _read_entering(declaration, chunk, dict(zip(TOKENS, values, strict=True)))
+        read = declaration if window is None else _unreset(declaration)
+        tokens, entering = _read_entering(read, chunk, dict(zip(TOKENS, values, strict=True)))
         apart = _apart(declaration, affine, tokens["B"].shape[0])
         extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1],
                                       affine.values_read, apart)
@@ -226,18 +235,47 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         del operands
         return state[1].astype(dtype)
 
-    def replay(chunk, h):
-        return _replayed(declaration, names, affine_of(chunk), chunk, h)
-
-    def backward(chunk, state, d_state, d_outputs):
-        # The reset's booleans held, no operand of the derivative.
-        _, pullback = jax.vjp(lambda h, operands: replay({**chunk, **operands}, h), state[1],
-                              {name: chunk[name] for name in names})
-        return pullback((d_outputs, d_state))
+    def replay(chunk, h, walked=None):
+        if walked is None:
+            return _replayed(declaration, names, affine_of(chunk), chunk, h)
+        # A walk's hooks take its documents' memories up where a reset would have zeroed them.
+        return _replayed(_unreset(declaration), names, affine_of(chunk), chunk, h, walked)
 
     return Derived(init, _stepped, merge, finish, mapped,
-                   {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare,
-                   replay=replay)
+                   {"rounding": "compensated prefix", "walked": declaration.walked},
+                   functools.partial(_replay_backward, replay, names), prepare, replay=replay)
+
+
+def _segment_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, window=None):
+    """A chunk's token parts (`_token_parts`), or where `window` is given (`(origin, through)`) a document's
+    segment of it (`_windowed`, `_unreset`'s): every token before its origin the identity, so a token
+    reading the state entering it (`Scan.reads`) at the origin reads the memory the window enters with."""
+    if window is None:
+        return _token_parts(declaration, names, affine, chunk)
+    return _windowed(_token_parts(_unreset(declaration), names, affine, chunk), window)
+
+
+def _unreset(declaration: Scan) -> Scan:
+    """`declaration` with no reset, as a window takes it: its segment ends before the next document's first
+    token, and its origin takes its own exponent and reads the memory entering it, decayed and read as a
+    row's entering state is, not zero."""
+    return dataclasses.replace(declaration, reset=None)
+
+
+def _replay_backward(replay: Callable, names: Sequence[str], chunk, state, d_state, d_outputs, walked=None):
+    """A chunk's adjoint (`derive_scan`'s `backward`) through its token walk (`replay`): the cotangent of the
+    state entering it and of each operand but the reset's, and with a walk's hooks (`walked`, theirs and the
+    cotangent of what the walk carries after the chunk) the cotangent of what it carries before."""
+    # The reset's booleans held, no operand of the derivative.
+    operands = {name: chunk[name] for name in names}
+    if walked is None:
+        _, pullback = jax.vjp(lambda h, operands: replay({**chunk, **operands}, h), state[1], operands)
+        return pullback((d_outputs, d_state))
+    before, after, carried, d_carried = walked
+    _, pullback = jax.vjp(lambda h, operands, carried: replay({**chunk, **operands}, h,
+                                                               (before, after, carried)),
+                          state[1], operands, carried)
+    return pullback((d_outputs, d_state, d_carried))
 
 
 def _apart(declaration: Scan, affine, tokens: int) -> int:
@@ -309,7 +347,17 @@ def _with_reader_scale(affine, parts: tuple) -> tuple:
     return exponent, b, u, strength, c, affine.reader_scale * q, r
 
 
-def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h) -> tuple:
+def _windowed(parts: tuple, window) -> tuple:
+    """A chunk's token parts (`_token_parts`) with every token outside `window` (`(origin, through)`, its
+    first and last, inclusive) the identity token: exponent 0 (a unit decay), no input, correction, reader or
+    free readout, so its update leaves the state as it was and its output is zero."""
+    origin, through = window
+    place = jnp.arange(parts[0].shape[0])
+    inside = (place >= origin) & (place <= through)
+    return tuple(jnp.where(inside.reshape(-1, *([1] * (jnp.ndim(part) - 1))), part, 0) for part in parts)
+
+
+def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h, walked=None) -> tuple:
     """`chunk` walked token by token from the state `h` entering it by the affine map's parts at each token
     (`_at_token`): `(outputs, h)`, each token's output and the state leaving the chunk, in the state's
     carried dtype. A scalar decay follows the transition, so its cotangent reads the corrected state; a
@@ -324,7 +372,12 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
     The chunk's shared operands (`every`) are laid a copy a token, so their cotangents leave the scan a
     token each and are summed outside it, as fla sums RWKV6's bonus gradient (chunk_rwkv6's du): closed
     over, the scan's reverse added them a token at a time in its carry, 1.67 times fla's error from
-    float64."""
+    float64.
+
+    A walk's own hooks (`walked`, `(before, after, carried)`) take part in the tokens' steps:
+    `before(t, h, carried)` the state token `t` enters and the walk's own values (a forked walk's document
+    taking its memory up from its table), `after(t, h, carried)` its values after the token (a document
+    leaving its memory in a slot); then `(outputs, h, carried)`."""
     along, every = _walked_tokens(declaration, chunk)
     count = next(iter(along.values())).shape[0]
     along.update({name: jnp.broadcast_to(value, (count, *value.shape)) for name, value in every.items()})
@@ -364,8 +417,21 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
 
     carried = at_least_fp32(h.dtype)
     h = h.astype(carried)
-    (h, _, _), outputs = lax.scan(token, (h, h, 0), along)
-    return outputs, h
+    if walked is None:
+        (h, _, _), outputs = lax.scan(token, (h, h, 0), along)
+        return outputs, h
+    before, after, own = walked
+
+    def hooked(state, step):
+        # A document's memory taken up at its first token, which begins a group (a position's ranks, a
+        # group, are one document's), so its group's state is that memory (`token`'s `apart`).
+        ((h, apart, index), own), (t, step) = state, step
+        h, own = before(t, h, own)
+        (h, apart, index), output = token((h.astype(carried), apart, index), step)
+        return ((h, apart, index), after(t, h, own)), output
+
+    ((h, _, _), own), outputs = lax.scan(hooked, ((h, h, 0), own), (jnp.arange(count), along))
+    return outputs, h, own
 
 
 @functools.partial(jax.tree_util.register_dataclass,
@@ -716,7 +782,15 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
     elif (args := get_callable_args(node, Chunk.rows)) is not None:
         value = of(args[1])[:, None] * of(args[0])
     elif (args := get_callable_args(node, Chunk.times)) is not None:
-        value = of(args[0]) * of(args[1])
+        left, right = of(args[0]), of(args[1])
+        # A decay across a document's start (`_crossed`) takes its factor out by select before the product,
+        # so a memory past the largest read before its reset is no 0 times inf, nor its gradient (row 8560);
+        # a live span's that underflows multiplies as the recurrence does.
+        if get_callable_args(args[1], Chunk.decay) is not None:
+            left = jnp.where(_crossed(right), 0.0, left)
+        elif get_callable_args(args[0], Chunk.decay) is not None:
+            right = jnp.where(_crossed(left), 0.0, right)
+        value = left * right
     elif (args := get_callable_args(node, Chunk.matmul)) is not None:
         # The chunk's scores (a pairing of its tokens through their decays, not the solve's) applied to its
         # tokens' values is its local readout, `readout_local` (`carry.EMIT_ROLES`), as the hand form's.
@@ -1165,14 +1239,24 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     joined = below & (segments[:, None] == segments[None, :])
     started, ending = segments == 0, segments == segments[-1]
     # Each exponent masked before its exponential, as each span's: one across a vanished token is no sum
-    # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN).
-    return _Decays(entering=jnp.where(started, _exp(base2, jnp.where(started, high + low, 0.0)), 0.0),
+    # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN), and its
+    # decay negative zero, which no exponential is (`_crossed`).
+    return _Decays(entering=jnp.where(started, _exp(base2, jnp.where(started, high + low, 0.0)), -0.0),
                    to_last=jnp.where(ending, _exp(base2, jnp.where(ending,
                                                                    (high[-1] - high) + (low[-1] - low), 0.0)),
-                                     0.0),
+                                     -0.0),
                    whole=jnp.where(started[-1], _exp(base2, jnp.where(started[-1], high[-1] + low[-1], 0.0)),
-                                   0.0),
-                   between=jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), 0.0))
+                                   -0.0),
+                   between=jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), -0.0))
+
+
+def _crossed(decay: jax.Array) -> jax.Array:
+    """Where a chunk's decay (`_decays_value`'s) spans a vanished token, a document's start: negative zero,
+    which a live span's decay that underflows (positive zero) is not."""
+    # The sign bit read as the integer of its width's: `jnp.signbit` shifts by a constant, which a checked
+    # `shard_map` refuses beside a varying decay.
+    bits = jax.lax.bitcast_convert_type(decay, jnp.dtype(f"int{jnp.finfo(decay.dtype).bits}"))
+    return (decay == 0) & (bits < 0)
 
 
 def _decays_of(exponents, base2: bool) -> _Decays:
