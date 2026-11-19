@@ -288,8 +288,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     each query's denominator and `D - c` from the forward's split `sums` (`gradient.split_delta`), or without
     `split` from a first pass at the forward's maximum and its rows' shift (`gradient.off_anchor_delta`) but
     for the rows whose split sums are normalized (shift -1, `algebra.normalized_rows`), which the first pass
-    cannot recompute without the forward's denominator; under dropout (`drop`) from the split sums about its
-    anchor's value where its draw keeps it, or without them from its own centred first pass
+    cannot recompute without the forward's denominator; under dropout (`drop`) from its own centred first pass
     (`gradient.dropout_centre`); then dQ and the dQ program's hook gradients under it, `D` refined once from
     its own sums (`gradient.refinement`)."""
     batch, queries, heads, _ = query.shape
@@ -334,19 +333,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         before, state_total = gradient.off_anchor_start(peak0, total0, maxima, value.shape[-1], shifts)
         others, own, others_total, prior = (part[row, head, rows] for part in sums)
         m = maxima
-        if draw is not None and split:
-            # Dropout's D from the forward's split sums too, about its anchor's value where its draw keeps
-            # it, as the Mosaic mainloop takes it (`attention_mosaic_backward`): its anchor key's term is
-            # exactly 0 about it. About its first visible tile's least product, the dominant key's term
-            # rounded at the scale of its product and a key 2^30 large made dQ infinite where it is 1e-127
-            # (row 8652).
-            kept_rows = algebra.kept(anchor_rows, draw(q_pos[:, 0], jnp.maximum(chosen, 0))[:, None])
-            anchor, delta, chosen = gradient.split_delta(others, own, others_total, prior, state_total,
-                                                         kept_rows, do, chosen, shifts, rows=interpreted_rows,
-                                                         dropped=drop.bound)
-        elif draw is not None:
-            # Dropout's D without the split sums: each dropped product centred about its query's first
-            # visible tile's least one.
+        if draw is not None:
+            # Dropout's D: each dropped product centred about its query's first visible tile's least one.
             def terms(j):
                 columns, seen, _, v_tile, logits, _ = formed(j)
                 products = gradient.dropped_products(interpreted_dot(do, v_tile.T),

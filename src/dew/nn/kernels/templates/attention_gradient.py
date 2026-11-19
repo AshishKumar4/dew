@@ -515,9 +515,10 @@ def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: t
 
 
 class Centre(NamedTuple):
-    """Dropout's first pass over a query's keys (`centre_step`): `centre`, the least-magnitude product in
-    the query's first visible tile, the shift each dropped product is centred about; `seen`, whether a key
-    is visible yet; and the centred running sums (`running_sum`) at the scale `centre_scale` gives:
+    """Dropout's first pass over a query's keys (`centre_step`): `centre`, the product at the largest
+    weight in the query's first visible tile, the shift each dropped product is centred about; `seen`,
+    whether a key is visible yet; and the centred running sums (`running_sum`) at the scale `centre_scale`
+    gives:
     `residual`, the weights' sum of the products less the centre, and `mass`, the weights' sum. A product
     equal to the centre contributes exactly zero, so identical products cancel before any reduction, and
     the sums stay finite for finite products."""
@@ -546,19 +547,24 @@ def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: ja
                 exponent: float) -> Centre:
     """A key tile's part of dropout's centre (`Centre`): `weights` `[bq, bk]` (unnormalized, `exp(s - m)`),
     the tile's dropped `products` (`dropped_products`), `seen` where a key counts, and each entry's key index
-    `positions` (broadcasting). A query's centre is its first visible tile's product nearest zero, ties
-    broken by position, selected exactly: the sum of one nonzero term and zeros is that term. D is the
-    centre plus the weighted mean about it whatever the centre, and the least one keeps the mean's two
-    rounded sums from carrying a large common offset that their quotient cancels back (a centre of -21.3
-    left D 2.8e-6 from float64's at -2.43); identical products still subtract exactly. The sums run as
-    the loop's running sums (`added_to`), each tile's rows summed compensated where loops are
-    (`compensates_loops`). Each product is taken at `2^exponent` before the subtraction; no difference or
-    sum overflows, and a power of two is exact where the product is normal."""
+    `positions` (broadcasting). A query's centre is its first visible tile's product at its largest weight,
+    ties broken by the product nearest zero and then by position, selected exactly: the sum of one nonzero
+    term and zeros is that term. D is the centre plus the weighted mean about it whatever the centre; the
+    heaviest key's term about itself is exactly zero, so a query whose weight one key holds takes D as that
+    key's product, where about a lighter key's its term rounded at the scale of the products (a product
+    near 2^123 against a key near 2^30 made dQ infinite where it is 1e-127, row 8652). Among the heaviest,
+    the least keeps the mean's two rounded sums from carrying a large common offset that their quotient
+    cancels back (a centre of -21.3 left D 2.8e-6 from float64's at -2.43); identical products still
+    subtract exactly. The sums run as the loop's running sums (`added_to`), each tile's rows summed
+    compensated where loops are (`compensates_loops`). Each product is taken at `2^exponent` before the
+    subtraction; no difference or sum overflows, and a power of two is exact where the product is
+    normal."""
     # The scale a Python float, exact (`centre_scale`'s exponent is within fp32's normal range), so no
     # scalar arithmetic runs in a kernel (Mosaic GPU holds no rank-0 vector).
     factor = 2.0 ** exponent
-    nearest = jnp.min(jnp.where(seen, jnp.abs(products), jnp.inf), axis=-1)
-    first = jnp.min(jnp.where(seen & (jnp.abs(products) == expand(nearest, products)), positions,
+    heaviest = seen & (weights == expand(jnp.max(jnp.where(seen, weights, -jnp.inf), axis=-1), weights))
+    nearest = jnp.min(jnp.where(heaviest, jnp.abs(products), jnp.inf), axis=-1)
+    first = jnp.min(jnp.where(heaviest & (jnp.abs(products) == expand(nearest, products)), positions,
                               jnp.iinfo(jnp.int32).max), axis=-1)
     picked = seen & (positions == expand(first, products))
     tile_centre = jnp.sum(jnp.where(picked, products, 0.0), axis=-1)
@@ -601,8 +607,9 @@ def dropout_centre(lo, hi, terms: Callable[[jax.Array], tuple[jax.Array, jax.Arr
                    most: int | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Dropout's first pass over a query block (`Centre`): `terms(j)` gives key tile `j`'s unnormalized
     weights `exp(s - m)`, its dropped products (`dropped_products`), where its entries are seen, and their
-    key indices. Each product is centred about its query's least-magnitude product in its first visible
-    tile and scaled before any sum (`centre_step`), and D is rebuilt from that centre (`centre_finish`).
+    key indices. Each product is centred about its query's product at the largest weight in its first
+    visible tile and scaled before any sum (`centre_step`), and D is rebuilt from that centre
+    (`centre_finish`).
     Returns the second sweep's `(anchor, delta, chosen)`: no anchor, D about zero, and no key chosen, so
     identical products cancel exactly in its cotangents. Its tiles at most `most` (`tiles_walked`)."""
     exponent = centre_scale(keys)
