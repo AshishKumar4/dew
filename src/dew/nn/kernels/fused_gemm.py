@@ -39,6 +39,7 @@ import contextvars
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -306,15 +307,14 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     # The program's names lifted first (`_named`): the algebra's rewriting reads a name as an identity.
     named_consumer = consumer
     consumer, names = _named(consumer, values, acc)
-    written = _rewritten_consumer(consumer, values, acc, inlined=False)
-    consumer = _rewritten_consumer(consumer, values, acc, inlined=True)
+    written, consumer = _rewritten_consumer(consumer, values, acc)
     leaves, treedef = jax.tree.flatten(values)
     axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
                   if prefetch else _axes(consumer, values, acc))
     if axes is None:
         # A consumer the launch takes not runs after the plain product, XLA's, unpriced, the program's
         # names where it wrote them.
-        return _rewritten_consumer(named_consumer, values, acc, inlined=False)(values, plain())
+        return _rewritten_consumer(named_consumer, values, acc)[0](values, plain())
     # A consumer the launch takes as its epilogue is priced (`priced`), its work counted as the launch's
     # body counts it.
     if collected is not None:
@@ -399,23 +399,24 @@ def _prologue(fusion) -> tuple[jax.Array, dict, Formed | None]:
                   'prologue_jvp': jvp}, formed
 
 
-def _rewritten_consumer(consumer, values, acc, *, inlined: bool):
-    """The consumer as the algebra pass rewrites it (docs/design/algebra.md §2), traced once at the whole
-    product `acc` beside its captured `values`: the one program the analysis tiles (`_axes`), the epilogue
-    runs on each tile (`_tiled`, pulled at the whole product) and XLA runs whole where the kernels refuse
-    it, as the producer's stage is (`_split`). Where `inlined`, each call it makes is read through to its
-    body (`_inlined`: a marked span's, Dew's one logistic in a gated product's arithmetic, as a kernel's
-    body lowers a call), where the fuser has no rule to tile a call (`_pulled`); else each call kept, its
-    declared tangent its derivative (`_declared`)."""
+def _rewritten_consumer(consumer, values, acc) -> tuple[Callable, Callable]:
+    """The consumer as the algebra pass rewrites it (docs/design/algebra.md §2), traced and rewritten once at
+    the whole product `acc` beside its captured `values`, evaluated two ways from that one program: as
+    written, each call it makes kept, its declared tangent its derivative (`_declared`), what XLA runs whole
+    where the kernels refuse it; and inlined, each call read through to its body (`_inlined`: a marked
+    span's, Dew's one logistic in a gated product's arithmetic, as a kernel's body lowers a call), where the
+    fuser has no rule to tile a call (`_pulled`): the program the analysis tiles (`_axes`) and the epilogue
+    runs on each tile (`_tiled`, pulled at the whole product), as the producer's stage is (`_split`)."""
     closed, shapes = jax.make_jaxpr(algebra.rewritten(consumer), return_shape=True)(values, acc)
     structure = jax.tree.structure(shapes)
 
-    def rewritten(values, acc):
-        leaves = jax.tree.leaves((values, acc))
-        return jax.tree.unflatten(structure, _inlined(closed, *leaves) if inlined
-                                  else jax_core.jaxpr_as_fun(closed)(*leaves))
+    def written(values, acc):
+        return jax.tree.unflatten(structure, jax_core.jaxpr_as_fun(closed)(*jax.tree.leaves((values, acc))))
 
-    return rewritten
+    def inlined(values, acc):
+        return jax.tree.unflatten(structure, _inlined(closed, *jax.tree.leaves((values, acc))))
+
+    return written, inlined
 
 
 def _declared(tiled, written, treedef, out_treedef, whole: jax.ShapeDtypeStruct):

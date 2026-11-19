@@ -21,6 +21,9 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
+"tests/test_algebra_fuzz.py": [
+"tests/test_algebra_fuzz.py::test_a_rewritten_program_is_on_par_with_the_program"
+],
 "tests/test_algebra_scan.py": [
 "tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[gated_delta-before]",
 "tests/test_algebra_scan.py::test_a_turned_scans_adjoint_is_the_token_scans_gradient[apart-ranks]",
@@ -298,8 +301,8 @@
 "tests/test_attention_mosaic_compile.py::test_a_short_training_calls_backward_compiles_spill_free_for_an_a100[16-one-launch]",
 "tests/test_attention_mosaic_compile.py::test_a_short_training_calls_backward_compiles_spill_free_for_an_a100[32-one-launch]",
 "tests/test_attention_mosaic_compile.py::test_a_start_runs_the_kernels_its_launches_certified",
-"tests/test_attention_mosaic_compile.py::test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block[default]",
-"tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm100-128]",
+"tests/test_attention_mosaic_compile.py::test_an_a100_forward_counts_the_shared_memory_its_lowering_asks_for[inference-bfloat16]",
+"tests/test_attention_mosaic_compile.py::test_an_fp16_backward_compiles_spill_free_as_its_model_decides[64]",
 "tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm90-128]",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[decision-training]",
 "tests/test_attention_mosaic_compile.py::test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200[step-inference]",
@@ -1634,6 +1637,9 @@
 "tests/test_diffusion_run_sources.py::test_diffusion_nft_trains_from_the_run_config_on_a_registered_reward",
 "tests/test_diffusion_run_sources.py::test_flow_grpo_trains_from_the_run_config_on_a_registered_reward"
 ],
+"tests/test_discrete.py": [
+"tests/test_discrete.py::test_masked_diffusion_lm_memorises_the_toy_corpus"
+],
 "tests/test_disk_banks.py": [
 "tests/test_disk_banks.py::test_disk_moe_logits_and_cached_decode_equal_resident[False-None]"
 ],
@@ -1832,9 +1838,6 @@
 "tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[memory hybrid]",
 "tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[windowed attention]"
 ],
-"tests/test_fp8_base.py": [
-"tests/test_fp8_base.py::test_every_named_site_computes_from_its_packed_kernel_inside_the_branch[here]"
-],
 "tests/test_fp8_preset.py": [
 "tests/test_fp8_preset.py::test_a_training_step_in_the_fp8_preset_is_on_par_with_a_fake_quantized_model",
 "tests/test_fp8_preset.py::test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference[experts-mxfp8]",
@@ -2031,6 +2034,9 @@
 ],
 "tests/test_imports.py": [
 "tests/test_imports.py::test_a_module_imports_its_own_domain_alone[dew.config]"
+],
+"tests/test_in_backward.py": [
+"tests/test_in_backward.py::test_a_scanned_step_holds_no_more_than_a_layer_at_a_time[sm90-float32]"
 ],
 "tests/test_indexer_training.py": [
 "tests/test_indexer_training.py::test_padding_the_model_inputs_mask_leaves_out_counts_no_query[sparse-4]"
@@ -2258,6 +2264,9 @@
 "tests/test_kimi_linear.py": [
 "tests/test_kimi_linear.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference"
 ],
+"tests/test_kv_cache.py": [
+"tests/test_kv_cache.py::test_a_pool_split_into_groups_reads_what_each_row_wrote"
+],
 "tests/test_layer_stack.py": [
 "tests/test_layer_stack.py::test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop",
 "tests/test_layer_stack.py::test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop",
@@ -2304,6 +2313,9 @@
 ],
 "tests/test_live_bridge.py": [
 "tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
+],
+"tests/test_llama4.py": [
+"tests/test_llama4.py::test_a_paged_cache_draws_what_the_dense_cache_draws[paged]"
 ],
 "tests/test_lm_objective.py": [
 "tests/test_lm_objective.py::test_evaluation_correctness_is_the_same_full_forward_argmax",
@@ -2902,6 +2914,9 @@
 "tests/test_perturbation.py::test_an_indexer_warmup_trains_its_indexer_alone_without_backpropagation",
 "tests/test_perturbation.py::test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does",
 "tests/test_perturbation.py::test_the_estimate_is_the_gradient_in_expectation[trailing-general]"
+],
+"tests/test_pipeline_core.py": [
+"tests/test_pipeline_core.py::test_a_validation_pass_starts_at_most_one_worker_per_batch"
 ],
 "tests/test_pipeline_golden.py": [
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_hf-workers=2,shares=1]",

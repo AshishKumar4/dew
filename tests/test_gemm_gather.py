@@ -193,21 +193,29 @@ def a_gathered_kernel_gradient_is_its_gathered_rows_gradient(interpret=False, sp
     past them, its depth split or not, at 257 rows (a table padded to whole steps, an ungathered operand to
     8 rows), at `tiles` (Hopper's by default; `KERNEL_GRADIENT_TILES`). Integers, every sum exact. Its
     tokens, cotangent and table."""
+    from reference_error import ahead_arm
+
     tiles = dataclasses.replace(tiles or KERNEL_GRADIENT_TILES["sm90"], splits=splits)
-    sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
+    sizes = np.asarray([70, 0, 129, 51], np.int32)
+    # NumPy's, as a site's draws are: a GPU tier's prepare computes on no device.
     rng = np.random.default_rng(11)
-    tokens = jnp.asarray(rng.integers(-3, 4, size=(200, 256)), jnp.bfloat16)
-    table = rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 107)]))
-    table = jnp.asarray(table, jnp.int32)
-    cotangent = jnp.asarray(rng.integers(-3, 4, size=(257, 128)), jnp.bfloat16)
-    slots = jnp.asarray(rng.permutation(257), jnp.int32)
-    gradient = jax.jit(functools.partial(mosaic_gpu.tgmm, group_sizes=sizes, tiles=tiles,
-                                         out_dtype=jnp.float32, multiprocessors=4 if interpret else 132,
-                                         interpret=interpret))
-    for tables, rows, columns in (((table, None), tokens[table], cotangent),
-                                  ((table, slots), tokens[table], cotangent[slots])):
-        np.testing.assert_array_equal(np.asarray(gradient(tokens, cotangent, gather=tables)),
-                                      np.asarray(gradient(rows, columns)))
+    tokens = rng.integers(-3, 4, size=(200, 256)).astype(jnp.bfloat16)
+    table = rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 107)])).astype(np.int32)
+    cotangent = rng.integers(-3, 4, size=(257, 128)).astype(jnp.bfloat16)
+    slots = rng.permutation(257).astype(np.int32)
+    gradient = functools.partial(mosaic_gpu.tgmm, group_sizes=sizes, tiles=tiles, out_dtype=jnp.float32,
+                                 multiprocessors=4 if interpret else 132, interpret=interpret)
+
+    def gathered(rows, columns, *tables):
+        return gradient(rows, columns, gather=(*tables, None)[:2])
+
+    # Each program compiled in a tier's prepare (`ahead_arm`), one a label.
+    for name, tables, rows, columns in (("tokens", (table,), tokens[table], cotangent),
+                                        ("both", (table, slots), tokens[table], cotangent[slots])):
+        label = f"a gathered kernel gradient of {name}: {splits} splits"
+        found = ahead_arm(jax.jit(gathered), label)(tokens, cotangent, *tables)
+        expected = ahead_arm(jax.jit(gradient), f"{label}, gathered first")(rows, columns)
+        np.testing.assert_array_equal(np.asarray(found), np.asarray(expected))
     return tokens, cotangent, table
 
 

@@ -391,7 +391,7 @@ class AheadOfTime:
         is (`loaded`), where it would have compiled it (`dew.nn.kernels.options.taking`)."""
         def load(executable: Executable) -> Callable[[], jax.stages.Compiled]:
             def loaded() -> jax.stages.Compiled:
-                found = jax.devices()
+                found = jax.devices() if self.built is None else self.built.own_devices()
                 self.held(found)
                 return executable.loaded(found)
             return loaded
@@ -464,7 +464,7 @@ class AheadOfTime:
         """The executable, loaded onto this process's devices, which must be `devices` GPUs or TPUs of
         `generation`: called with the state and batch the step was compiled for, it runs the step. It is
         admitted as a compiled one is (`dew.communicators.admit`)."""
-        found = jax.devices()
+        found = jax.devices() if self.built is None else self.built.own_devices()
         self.held(found)
         return self.executable.loaded(found)
 
@@ -647,6 +647,12 @@ class BuildTarget:
             found.append(f"memory {self.memory} bytes, not {other.memory}")
         return found
 
+    def own_devices(self) -> list:
+        """This process's devices of the build's platform, which its loaders load onto and check (`held`):
+        the host's CPUs for a CPU's build (`cpu`), which a GPU's process holds beside its GPUs, else the
+        process's own."""
+        return jax.devices("cpu") if self.cpu is not None else jax.devices()
+
     def held(self, devices: Sequence) -> None:
         """Refused, naming what differs, where `devices` under this process's JAX, XLA flags and host are not
         this target."""
@@ -689,12 +695,13 @@ class AheadPrograms:
         return programs
 
     def loaded(self) -> dict[str, jax.stages.Compiled]:
-        """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices, the ones
-        it was compiled for: each called with the arguments it was compiled for runs it. Refused, naming what
-        differs, where those devices, this JAX, its XLA flags or its host are not the target they were built
-        for, and where they are untuned and this process's own compile would tune (`tuned`,
-        `report.autotuned`); each is admitted as a compiled program is (`dew.communicators.admit`)."""
-        devices = jax.devices()[:self.target.devices]
+        """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices of its
+        platform (`BuildTarget.own_devices`), the ones it was compiled for: each called with the arguments it
+        was compiled for runs it. Refused, naming what differs, where those devices, this JAX, its XLA flags
+        or its host are not the target they were built for, and where they are untuned and this process's
+        own compile would tune (`tuned`, `report.autotuned`); each is admitted as a compiled program is
+        (`dew.communicators.admit`)."""
+        devices = self.target.own_devices()[:self.target.devices]
         self.target.held(devices)
         if not self.tuned and report.autotuned(devices):
             raise ValueError(f"these programs were compiled for {self.target.generation}'s canonical GPUs, "

@@ -1222,15 +1222,21 @@ def test_a_node_two_places_share_goes_to_each_places_own_target():
     assert held["params"]["kernel"] is placed["params"]["kernel"]
 
 
+STREAMING_ADAM = optax.adam(.001)
+"""The streaming decoders' one Adam, an object of theirs alike: a decoder built again, as a resumed run's
+is, keys its step as its equal's (`Trainer._step_key`) and reads the step its equal traced (row 8411)."""
+
+
 def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | None = None,
                       dtype=None, rollout=None) -> Trainer:
-    """A decoder of four scanned layers computing in `dtype` (its parameters' where None) trained by Adam,
-    whose optimizer state the devices hold beside its parameters, laid out as `layout` states, else as its
-    run chooses, checkpointed by `checkpoints`, its batches drawn through `rollout` where one is given."""
+    """A decoder of four scanned layers computing in `dtype` (its parameters' where None) trained by Adam
+    (`STREAMING_ADAM`), whose optimizer state the devices hold beside its parameters, laid out as `layout`
+    states, else as its run chooses, checkpointed by `checkpoints`, its batches drawn through `rollout`
+    where one is given."""
     model = CausalTransformer(vocab_size=256, emb_features=64, num_layers=4, num_heads=2, mlp_features=256,
                               max_seq_len=8, scan_layers=True, dtype=dtype)
     given = {} if layout is None else {"layout": layout}
-    return Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.001),
+    return Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), STREAMING_ADAM,
                    key=jax.random.key(6), checkpoints=checkpoints, rollout=rollout, **given)
 
 
