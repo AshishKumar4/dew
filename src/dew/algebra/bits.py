@@ -788,15 +788,17 @@ def restored(pattern: jax.Array, dtype=jnp.float32) -> jax.Array:
     `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in `dtype` (float32 by
     default; a float64 truth's float64) by integer arithmetic: a subnormal (a code of 0 or 0.5) as its
     mantissa's integer times 2^-7 with its sign, every other value's exponent raised by 126 (its bits moved to
-    a float32's high half, then cast, exactly), so no lane that flushes subnormals (XLA:CPU's, a GPU's) zeroes
-    a code of 0.5. The one definition of the decoded value: the portable decode's (`nvfp4_decoded`), the
-    native staged decode's, whatever lanes each extracts, and a truth's."""
+    a float32's high half, then cast, a format wider than float32's taking its subnormals exactly), so no
+    lane that flushes subnormals (XLA:CPU's, a GPU's) zeroes a code of 0.5. The one definition of the decoded
+    value: the portable decode's (`nvfp4_decoded`), the native staged decode's, whatever lanes each extracts,
+    and a truth's."""
     sign = pattern & jnp.uint32(0x8000)
     rebased = (pattern << jnp.uint32(16)) + jnp.uint32(126 << 23)
     normal = jax.lax.bitcast_convert_type(rebased, jnp.float32)
-    if np.dtype(dtype) != np.float32:
+    if jnp.finfo(dtype).bits > 32:
         # Widened from the rebased bits themselves where they hold a float32 subnormal (a pattern outside the
-        # format's codes), which a flushing lane's cast would zero: its fraction times 2^-149, exact.
+        # format's codes), which a flushing lane's cast would zero: its fraction times 2^-149, exact in a
+        # wider format. A narrower one casts the float32 as it casts any.
         fraction = (rebased & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** -149, dtype)
         tiny = jnp.where(rebased >> jnp.uint32(31) != 0, -fraction, fraction)
         normal = jnp.where(rebased & jnp.uint32(0x7F800000) == 0, tiny, normal.astype(dtype))
