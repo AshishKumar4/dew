@@ -147,10 +147,11 @@ def split_executable(run, args, specs, mesh: jax.sharding.Mesh):
 
 
 def _whole_axes(specs, mesh: jax.sharding.Mesh) -> list[frozenset[str]]:
-    """Each operand's mesh axes of more than one device that its spec (`specs`' leaves) splits it along
-    none of: the axes its gradient is summed over."""
+    """Each operand's mesh axes of more than one device that its spec (`specs`' leaves, each a tuple of axis
+    names or tuples of them, whose leaves are its names) splits it along none of: the axes its gradient is
+    summed over."""
     sized = {name for name, size in mesh.shape.items() if size > 1}
-    return [frozenset(sized - _names(spec))
+    return [frozenset(sized - set(jax.tree.leaves(tuple(spec))))
             for spec in jax.tree.leaves(specs, is_leaf=lambda leaf: isinstance(leaf, PartitionSpec))]
 
 
@@ -162,22 +163,26 @@ def split_checked(fn, draw, specs, mesh, *, moves=(), reductions=None, donate=()
     compile-time half. A sum it intends is one of `reductions`, `(op, axes)` over the mesh axes it sums
     along (`collective_axes`), where given; else the gradient's of an operand whole along those axes (its
     spec naming none of them: `_whole_axes`), as a call of operands to outputs and gradients sums a weight's
-    over the rows a mesh splits. A sum on an axis no operand is whole along, which a per-shard program
-    should not take, fails, where every reduction passed whole (spec alignment, 9001); a group of one
-    device sums nothing across devices."""
+    over the rows a mesh splits, or of an operand a gather `moves` allows ran along them (the gather's
+    transpose). A sum on an axis no operand is whole or gathered along, which a per-shard program should not
+    take, fails, where every reduction passed whole (spec alignment, 9001); a group of one device sums
+    nothing across devices."""
     run = without_ynn(fn, donate_argnums=donate)
     compiled = split_executable(run, draw(0), specs, mesh)
     text = compiled.as_text()
     moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]
     assert not moved, f"the step moves operands between devices: {moved}"
-    whole = _whole_axes(specs, mesh)
+    found = collective_axes(compiled, mesh)
+    # An operand's gradient sums over the axes it is whole along, and a gathered operand's over the axes its
+    # gather ran along (the gather's transpose, an fsdp weight's reduce-scatter).
+    along = [*_whole_axes(specs, mesh), *(axes for op, axes in found if op in MOVES and op in moves)]
 
     def intended(op: str, axes: frozenset[str]) -> bool:
         if reductions is not None:
-            return (op, axes) in {(each, frozenset(along)) for each, along in reductions}
-        return any(axes <= along for along in whole)
+            return (op, axes) in {(each, frozenset(named)) for each, named in reductions}
+        return any(axes <= each for each in along)
 
-    summed = sorted((op, sorted(axes)) for op, axes in collective_axes(compiled, mesh)
+    summed = sorted((op, sorted(axes)) for op, axes in found
                     if op in REDUCTIONS and axes and not intended(op, axes))
     assert not summed, f"the step sums across devices where no operand's gradient is summed: {summed}"
     copies = boundary_copies(text)
@@ -286,12 +291,6 @@ def interprets(choice: str, kernel: str, shard: Shard) -> bool:
     return kernel in {found.kernel for found in routes if found.choice == choice}
 
 
-def _names(spec: PartitionSpec) -> set[str]:
-    """The mesh axes a PartitionSpec splits along."""
-    return {name for axes in spec if axes is not None
-            for name in ((axes,) if isinstance(axes, str) else axes)}
-
-
 def assert_kernel_runs_per_shard(choice: str, kernel: str, shard: Shard) -> None:
     """`kernel`, `choice`'s, runs per shard (`assert_runs_per_shard`) on two devices of a run's mesh
     splitting `shard.split` (`MeshSpec`, its other axes one device each), its choice named
@@ -305,7 +304,7 @@ def assert_kernel_runs_per_shard(choice: str, kernel: str, shard: Shard) -> None
     # The data axis takes the devices the others leave (`MeshSpec`).
     mesh = MeshSpec(**({} if shard.split == "data" else {shard.split: 2})).build(jax.devices()[:2])
     specs = shard.specs(mesh)
-    named = set().union(*(_names(spec) for spec in jax.tree.leaves(
+    named = set().union(*(jax.tree.leaves(tuple(spec)) for spec in jax.tree.leaves(
         specs, is_leaf=lambda leaf: isinstance(leaf, PartitionSpec))))
     assert shard.split in named and mesh.shape[shard.split] > 1, (shard.split, sorted(named), mesh.shape)
     from generation_support import here

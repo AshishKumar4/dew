@@ -264,15 +264,15 @@ def _truth_read(truth_fn, followed, result):
     return _truth_program(as_given(bound) if _given(followed.truth) else bound)
 
 
-def _own_truth(prepared, followed, result, inputs, truth, *, recorded: bool):
-    """An arm's result and its truth on `inputs`: at a site of followed roundings (`prepared`, its truth as
+def _own_truth(prepared, followed, result, inputs, truth, arm):
+    """`arm`'s result and its truth on `inputs`: at a site of followed roundings (`prepared`, its truth as
     the gate runs it) its judged leaves and the truth of its own decisions (`_followed_truth`), each live
     arm's a `Rounded` (a reference or a further arm returning bare leaves would be held to Dew's truth with
-    no decision of its own: spec alignment, 8999); a recording's (`recorded`) its recorded decisions where it
-    holds them, else its leaves held to Dew's; at any other site the two as given."""
+    no decision of its own: spec alignment, 8999); a recording's its recorded decisions where it holds them,
+    else its leaves held to Dew's; at any other site the two as given."""
     if isinstance(result, Rounded):
         return result.judged, _followed_truth(prepared, followed, result, inputs)
-    if prepared is not None and not recorded:
+    if prepared is not None and not getattr(arm, "recorded", False):
         raise AssertionError("a live arm at a site of followed roundings returns its judged leaves and its "
                              "roundings' decisions (`Rounded`)")
     return result, truth
@@ -1229,8 +1229,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                     if not at and arm is not dew_fn and mine_at is ordered[0][0]:
                         _of_its_inputs(label, _arm_name(arm, reference_fn, library_fn, at_arm), arm, here,
                                        other)
-                other, true_here = _own_truth(prepared_followed, followed, other, here, true_here,
-                                              recorded=getattr(arm, "recorded", False))
+                other, true_here = _own_truth(prepared_followed, followed, other, here, true_here, arm)
                 shared = true_here is truth
                 if weighed is not None:
                     terms_here = weighed[id(true_here)].ones
