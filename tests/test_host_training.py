@@ -4,6 +4,7 @@ Streamed-bank ownership and placement are Dew execution policies; Optax oracles 
 """
 import contextlib
 import dataclasses
+import functools
 import json
 import os
 
@@ -1275,23 +1276,38 @@ def streaming_data():
     return Memory(rows).repeat().batch(jax.device_count()).read("memory").loading(Loading(workers=0))
 
 
+@functools.cache
 def streamed_only() -> int:
-    """The memory a stand-in H100 states (`stand_in_gpus`) where it holds the decoder's step that streams
-    its parameters from the host and not the step keeping its state on it: midway between the two needs,
-    each its compiled program's arguments and temporaries."""
-    from dew.telemetry import instrumentation as memory
+    """The allocator limit a stand-in H100 states (`memory_limited_to`, `stand_in_gpus`) where the decoder's
+    fresh fit streams its parameters from the host, the one plan it holds: midway between what the planner
+    needs of each, read as its own checks read them on a roomy stand-in, each need its stated limit less the
+    headroom the check found. Below: the streamed step's fit check (`Choice.streamed_headroom`) and the given
+    layout's state between steps (`Layout.validate`'s `device_bytes`), which the fit refuses first. Above: the
+    device plan's compiled rung (its plan's probe), at most the least its ladder reaches beneath it. The
+    planner is asserted to stream there, so a change that closes the gap fails here."""
+    from model_support import memory_limited_to
+
+    from dew._devices import DEW_SHARE, allocator_limit
     from dew.training.ahead import stand_in_gpus
 
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+    roomy_memory = 80 * 2 ** 30
+    limit = allocator_limit(roomy_memory, DEW_SHARE)
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), roomy_memory):
         roomy = streaming_decoder()
         roomy.fit(streaming_data(), steps=1, log_every=100)
-        device = memory.compiled_memory(roomy.executable)
-        held = streaming_decoder(Layout(host=("variables",)))
-        start = held.place()[0]
-        whole = memory.compiled_memory(streamed_program(held, start, *memory_streamed_arguments(held, start)))
-    device_need, streamed_need = device.argument + device.temp, whole.argument + whole.temp
-    assert streamed_need < device_need, (streamed_need, device_need)
-    return (device_need + streamed_need) // 2
+    choice, validation = roomy.layout_choice, roomy.validation
+    assert choice is not None and choice.streamed_headroom is not None and validation is not None, choice
+    (fitted,) = [probe for probe in roomy.plan["probes"] if probe["fits"]]
+    below = max(limit - choice.streamed_headroom, max(validation.device_bytes.values()))
+    above = limit - fitted["headroom"]
+    assert below < above, (below, above)
+    midway = (below + above) // 2
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to(midway)):
+        tight = streaming_decoder()
+        tight.fit(streaming_data(), steps=1, log_every=100)
+    assert tight.layout_choice is not None and tight.layout_choice.streams, (below, midway, above,
+                                                                              tight.layout_choice)
+    return midway
 
 
 def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_states():
@@ -1437,8 +1453,8 @@ def streamed_priced(trainer: Trainer, batch):
 
     trainer._laid_out(Layout(host=streaming.STREAMED))
     start = trainer._started("never")
-    fits, price = streaming.streamed(trainer, start, placed_abstract(trainer.device_mesh, batch),
-                                     jnp.bfloat16, ())
+    fits, _, price = streaming.streamed(trainer, start, placed_abstract(trainer.device_mesh, batch),
+                                        jnp.bfloat16, ())
     assert fits and price is not None
     return price
 
@@ -1754,7 +1770,7 @@ def test_a_streamed_step_on_gpus_is_priced_over_the_hosts_cpu_companion():
     trainer._laid_out(Layout(host=streaming.STREAMED))
     start = trainer._started("never")
     rows = placed_abstract(trainer.device_mesh, {"text": np.zeros((1, 8), np.int32)})
-    fits, _ = streaming.streamed(trainer, start, rows, jnp.bfloat16, ())
+    fits, _, _ = streaming.streamed(trainer, start, rows, jnp.bfloat16, ())
     assert fits
 
 
