@@ -533,33 +533,39 @@ def test_an_integer_parameter_keys_and_runs():
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw, "triton integer parameter", seeds=SEEDS)
 
 
-def test_a_lazy_triton_walk_past_its_kept_anchor_walks_scaled_on_par():
+@pytest.mark.parametrize("beside", ["alone", "nan head"])
+def test_a_lazy_triton_walk_past_its_kept_anchor_walks_scaled_on_par(beside):
     """A bf16 Triton forward over two 64-key tiles, the second's logits 14 nats past the first's (within its
     lazy walk's margin, so its anchor stays), over values of 2^109 to 2^110: on par with the reference
     (check 1), finite. Its host's bound takes the lazy weights' reach (`algebra.walk_reach`), so the call
     walks scaled; taking every weight at most 1 its unscaled walk's sums passed 2^135 (the base review of
-    a71e85d7a, F1)."""
+    a71e85d7a, F1). Beside a second head one of whose values is NaN (`nan head`), the first head's still is:
+    the bound takes finite magnitudes alone, where the NaN left the whole call unscaled and the first head
+    infinite (the base review of a648b3279, F5)."""
     spans = template.spans(128, 128, 1)
     pins = {attention_triton.TritonForward: PINNED[1]}
+    heads = 1 if beside == "alone" else 2
 
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 3)
-        query = jax.random.uniform(streams[0], (1, 128, 1, 64), jnp.float32, -1 / 64, 1 / 64)
-        key = jax.random.uniform(streams[1], (1, 128, 1, 64), jnp.float32, -1 / 64, 1 / 64)
+        query = jax.random.uniform(streams[0], (1, 128, heads, 64), jnp.float32, -1 / 64, 1 / 64)
+        key = jax.random.uniform(streams[1], (1, 128, heads, 64), jnp.float32, -1 / 64, 1 / 64)
         # The logits natural at the call's scale of 1/8: the second tile's 14 above the first's.
         query = query.at[..., 0].set(8).astype(jnp.bfloat16)
         key = key.at[..., 0].set(0).at[:, 64:, :, 0].set(14).astype(jnp.bfloat16)
-        value = 2.0 ** 109 * jax.random.uniform(streams[2], (1, 128, 1, 64), jnp.float32, 1, 2)
+        value = 2.0 ** 109 * jax.random.uniform(streams[2], (1, 128, heads, 64), jnp.float32, 1, 2)
+        if heads > 1:
+            value = value.at[0, 5, 1, 3].set(jnp.nan)
         return query, key, value.astype(jnp.bfloat16)
 
     def ours(query, key, value):
         with tuning.pinned(pins):
-            return attention_triton.forward(query, key, value, spans, None, interpret=not ON_GPU)
+            return attention_triton.forward(query, key, value, spans, None, interpret=not ON_GPU)[:, :, :1]
 
     def xla(query, key, value):
-        return template.reference(query, key, value, spans)
+        return template.reference(query, key, value, spans)[:, :, :1]
 
-    assert_as_exact(jax.jit(ours), jax.jit(xla), draw, "triton lazy walk's bound", seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(xla), draw, f"triton lazy walk's bound, {beside}", seeds=SEEDS)
 
 
 def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():

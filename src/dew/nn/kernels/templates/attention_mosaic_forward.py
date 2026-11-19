@@ -686,7 +686,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                        query_block=tiles.consumers * tiles.block_q if inference else None,
                        widths=head_width)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
-                           score_mod=hooks.score_mod, natural=natural,
+                           score_mod=hooks.score_mod, natural=natural, whole=spans.whole,
                            # A quantized model's codes and values, each at most 127, sum far within fp32.
                            headroom=scaled and hooks.rounds is None and algebra.headroom(
                                query.dtype if scales is not None else value.dtype),
@@ -1167,13 +1167,19 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     # The values' tiles as the products read them: a quantized call's in the query's dtype (`_Codes`), an
     # fp32 call's its parts (`_Program.parted`).
-    values = functools.partial(_value_tile, program, (tiles.block_k, value_width),
-                               q_smem.dtype if codes is not None else _stream_dtype(
-                                   views["values" if "values" in views else "keys"]), turn)
+    weights = (q_smem.dtype if codes is not None
+               else _stream_dtype(views["values" if "values" in views else "keys"]))
+    values = functools.partial(_value_tile, program, (tiles.block_k, value_width), weights, turn)
     dot = functools.partial(_dot, family, interpret)
 
     def walk(spec: algebra.Forward, turns) -> tuple:
         start, merged = _started(program, spec, hooked, state_rows, value_width, training=training)
+        # A deciding launch's unscaled walk bounds its rows' sums as the host's bound would
+        # (`algebra.bounded_past`): its visible keys' largest value magnitudes summed at the bound's unit,
+        # times the most a weight reaches (`algebra.walk_reach`, a dropping call's multiplier's), and its
+        # initial state's sums', which its verdict reads (`_walks_stored`).
+        bounding = decided is not None and not spec.headroom
+        unit = 2.0 ** -algebra.BOUND_UNIT * algebra.walk_reach(weights, hooks.drop, natural=spec.natural)
 
         def scored(index, slots, product=None):
             return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
@@ -1189,7 +1195,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             tile = values(slots, converted)
             # The sums are the accumulator's, which the step takes the tile into (`Keys.accumulate`); the
             # rows' maxima, denominators and a scaled walk's scale the carry (`algebra.exported`).
-            state = algebra.imported((accumulators[0], *carry))
+            state = algebra.imported((accumulators[0], *(carry[:-1] if bounding else carry)))
             largest = (_largest(program, hooked, (row, place[2]), k_first, slots, converted,
                                 value_width=value_width) if spec.headroom else None)
             accumulate = family.accumulating(mosaic.declared_into(program.products, "sums"), slots,
@@ -1198,14 +1204,23 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             state = algebra.plain_step(spec, state, keys)
             if certified is not None:
                 _certified_step(family, certified, index, state, row_smem)
-            return algebra.exported(state)[1:], (state.acc,)
+            if not bounding:
+                return algebra.exported(state)[1:], (state.acc,)
+            magnitudes = _largest(program, hooked, (row, place[2]), k_first, slots, converted,
+                                  value_width=value_width)()
+            seen = jnp.where(logits > -jnp.inf, algebra.across(magnitudes, logits), 0.0)
+            reached = carry[-1] + jnp.sum(seen * unit, axis=-1)
+            return (*algebra.exported(state)[1:], reached), (state.acc,)
 
         def inference(walk):
             # An inference walk through `walk(step, start, shapes, initial=)` (`_walk_of`): its sums the
-            # accumulator's.
-            rows, (acc,) = walk(step, algebra.exported(start)[1:], ((tiles.block_q, value_width),),
-                                initial=(start.acc,))
-            return algebra.imported((acc, *rows)), None
+            # accumulator's, and a bounding walk's bound (`bounding`) beside its rows.
+            rows = algebra.exported(start)[1:]
+            rows = (*rows, jnp.zeros_like(start.total)) if bounding else rows
+            rows, (acc,) = walk(step, rows, ((tiles.block_q, value_width),), initial=(start.acc,))
+            if not bounding:
+                return algebra.imported((acc, *rows)), None
+            return algebra.imported((acc, *rows[:-1])), rows[-1]
 
         def walked(streams, lo, hi, counted):
             if not training:
@@ -1223,10 +1238,15 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         # (`Family.walk_own`), `turns` past the rings' first.
         state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
                                          between=lambda: (turn(), turn()), counted=turns)
+        # A bounding walk's second result its bound (`inference`), a training walk's its anchor's terms.
+        bound, trained = (trained, None) if bounding else (None, trained)
         if merged:
             # The initial state merged in at the walk's end, before a decided walk's verdict reads the sums.
-            state = algebra.merge(spec, _initial(family, spec, hooked, state_rows), state)
-        return state, trained
+            initial = _initial(family, spec, hooked, state_rows)
+            state = algebra.merge(spec, initial, state)
+            if bounding:
+                bound = bound + jnp.max(jnp.abs(initial.acc), axis=-1) * 2.0 ** -algebra.BOUND_UNIT
+        return state, trained, bound
 
     def store(spec: algebra.Forward, state: algebra.Partial, trained) -> None:
         keep = None if kept is None else _kept_of(program, kept, rows=(row, head, first))
@@ -1268,20 +1288,24 @@ def _walks_stored(walk: Callable, store: Callable, spec: algebra.Forward, consum
             past()
         store(spec, state, trained)
 
-    state, trained = walked(spec, 0)
+    state, trained, bound = walked(spec, 0)
     if decided is None:
         stored(spec, state, trained)
         return
-    # A row's verdict its sums times zero summed along it, no number exactly where one of them is none; the
-    # rows' then the warpgroup's vote (`bar.red.or.pred`, a vector's alone: a tile's own refused layouts).
+    # A row's verdict its sums times zero summed along it, no number exactly where one of them is none, or
+    # its bound (`walk`'s) where the host's would scale it (`algebra.bounded_past`: sums of 2^127 that
+    # cancelled left a weight of e^-100 flushed, the base review of b872d1849, F4); the rows' then the
+    # warpgroup's vote (`bar.red.or.pred`, a vector's alone: a tile's own refused layouts).
     rows = jnp.isnan(jnp.sum(state.acc * 0.0, axis=-1))
+    if bound is not None:
+        rows = rows | (bound >= 2.0 ** (algebra.HEADROOM - 1 - algebra.BOUND_UNIT))
     taken = decided.stated(consumer, jnp.any(rows))
     pl.when(jnp.logical_not(taken))(lambda: stored(spec, state, trained))
 
     @pl.when(taken)
     def _():
         scaled = dataclasses.replace(spec, headroom=True)
-        stored(scaled, *walked(scaled, streamed[1] - streamed[0]))
+        stored(scaled, *walked(scaled, streamed[1] - streamed[0])[:2])
 
 
 class _Written(NamedTuple):

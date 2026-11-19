@@ -97,6 +97,8 @@ class Forward:
     walked_keys: int | None = None
     approximate: bool = True
     rounds: float | None = None
+    whole: bool = False
+    """Whether a spans call's every query sees every key (`attention.KeySpans.whole`): priced as full."""
     subtracted: bool = False
     """Whether the fold (`base2`) takes its exponent as the accurate form's raw one does (`raw`), a difference
     of the raw products scaled after it is taken, `exp2((s - m) * scale * log2(e))`: no logit the reference
@@ -1473,8 +1475,8 @@ def may_scale(value: jax.Array, *, keys_axis: int, initial: jax.Array | None = N
     (`resumed`), so where the largest such sum of any key head is below `2^(HEADROOM - 1)` (a binade for the
     bound's own rounding) no row's is past `2^HEADROOM`, and the unscaled walk is the scaled one bit for bit:
     a call there launches its mainloop's unscaled kernels, one pass over its values before them."""
-    # Each key's largest. A call of no keys or rows reads no value: its bound is 0.
-    largest = jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1, initial=0)
+    # Each key's largest finite one (`magnitudes`). A call of no keys or rows reads no value: its bound is 0.
+    largest = magnitudes(value) if value.shape[-1] else jnp.zeros(value.shape[:-1], jnp.float32)
     return bounded_past(largest, keys_axis=keys_axis, initial=initial, amplified=amplified)
 
 
@@ -1484,11 +1486,18 @@ def bounded_past(largest: jax.Array, *, keys_axis: int, initial: jax.Array | Non
     its keys along `keys_axis`) are given: a cache's, which states each written key's as it writes it
     (`attention_decode.attend`'s `bounds`), so a call over it reads no value to choose its kernel."""
     unit = np.float32(2.0 ** -BOUND_UNIT)
+
+    def held(x: jax.Array) -> jax.Array:
+        # A magnitude that is no finite number bounds nothing (`magnitudes`): one head's NaN left every
+        # head's bound NaN, no head scaled (the base review of a648b3279, F5).
+        x = jnp.abs(x.astype(jnp.float32))
+        return jnp.where(finite(x), x, 0.0)
+
     # Each key's largest at the bound's unit, summed over the keys: a key head's bound.
-    bound = jnp.max(jnp.sum(largest.astype(jnp.float32) * unit, axis=keys_axis), initial=0)
+    bound = jnp.max(jnp.sum(held(largest) * unit, axis=keys_axis), initial=0)
     bound = bound * np.float32(amplified)
     if initial is not None:
-        bound = bound + jnp.max(jnp.abs(initial.astype(jnp.float32)), initial=0) * unit
+        bound = bound + jnp.max(held(initial), initial=0) * unit
     return bound >= np.float32(2.0 ** (HEADROOM - 1 - BOUND_UNIT))
 
 

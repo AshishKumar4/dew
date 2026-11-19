@@ -931,12 +931,26 @@ def test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_ste
                                             page_size=page_size)
 
     dense, longer, paged = priced(4096), priced(8192), priced(4096, page_size=64)
+    assert dense is not None and longer is not None and paged is not None
     assert dense.kernels >= 1 and dense.device_bytes > 0
     assert longer.device_bytes > dense.device_bytes and longer.span >= dense.span
     assert paged.span >= dense.span
     # Its seconds on the device (`cost.seconds`), the server's comparison, grow with the keys it reads.
     target = generation.gpu_target("sm90")
     assert cost.seconds(longer, target) > cost.seconds(dense, target) > 0
+
+
+def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
+    """A decode step of 256 rows of one query, 8 heads over 2 key heads 128 wide in bf16, on an H100 over
+    4096 keys (`attention_decode.priced_step`): its programs, 512, pass the multiprocessors' count, so no
+    split merge's reads hide its walk's, which price at least its keys and values read once, where its
+    launch, packed into spans of every key, stated none and the step's price was Work() (the base review of
+    56a716c95, F3)."""
+    rows, keys, kv_heads, width = 256, 4096, 2, 128
+    priced = attention_decode.priced_step(generation.gpu_target("sm90"), rows=rows, queries=1, keys=keys,
+                                          heads=8, kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
+    assert priced is not None
+    assert priced.device_bytes >= 2 * rows * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
 
 
 @COMPILES_ON_CPU
