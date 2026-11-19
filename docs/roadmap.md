@@ -37,9 +37,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests/ring_protocol.py:422-435 reads gathered.Gathers' bodies by their fields (fill, fill_wait, read events written by hand) and test_ring_protocol.py:557-568…. [8657]
 - Tests/ring_protocol.py:838-839 accepts a read of an entries parity whose contents are a stale step's. [8678]
 - Tests/test_gemm_gather.py:200-242 (the strided-table gathers kernel) duplicates tests/test_ring_protocol.py:382-424's gathered walk fixture. [8679]
-- Tests/test_gemm_paired.py:649-669 passes a two-launch chained gradient to ring_protocol.programs, which explores only the first mpmd_map. [8680]
 - A launch's certification traces it a second time. [8720]
-- Jax fork, Pallas Mosaic GPU lowering cache. [8793]
+- Pallas Mosaic GPU lowering cache, certification against the step. [8793]
+- The recurrence suite's wall: every case within CI's group target. [8835]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -61,7 +61,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Src/dew/nn/kernels/templates/gathered.py:325-326 and 403. [8658]
 - Src/dew/nn/kernels/templates/gathered.py:325-326 and 413-421. [8667]
 - Jax fork, Pallas Mosaic GPU lowering cache. [8721]
-- The wgmma consumer's register model misses the GEMM epilogue's live set by ~16 registers. [8723]
+- The wgmma consumer's register model against ptxas on the GEMM gate's sm90 tiles. [8723]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
@@ -78,7 +78,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646, 1446]
 - Precision's error-free transforms marked where the compilers honour the fork's no-contract mark. [8378]
-- In-backward scanned walk loses its saving at scale. [8389]
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [1506, 1437]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
@@ -94,7 +93,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
-- Objective.init and Trainer.initial_state, called outside a trace, run the model's draw eagerly, so every operation compiles alone. [8682]
 - step_fits reads each device's allocator (step_headroom, Device.memory_stats) before its agreement. [8767]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
@@ -119,6 +117,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - A ratio's transpose sums landed quotients along an axis its denominator varies over. [8292]
 - The merge law's derivative programs nearly doubled since the base review's fixes. [8427]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
+- Py `_holds_regions`: 'any other holder of a program (a manual mesh's, a native kernel's) is an opaque leaf'), so a projection mapped per shard…. [6578]
 - Bit-level synthesis in dew.algebra. [3733]
 - The merge law's placed sum keeps two bands of a term's span, not three. [8061]
 - TPU attention precision, sinks and VMEM. [8729]
@@ -132,7 +131,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - One token layout, and every layout and placement trains and serves. [1903]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
-- Py `_holds_regions`: 'any other holder of a program (a manual mesh's, a native kernel's) is an opaque leaf'), so a projection mapped per shard…. [6578]
 - Check 2's ratio contract reads the law's bound looser than its spec states. [7980]
 
 ## Tutorials and docs
@@ -142,6 +140,5 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
-- A GPU node's run of a kernel-marked CPU-suite cell fails for want of CUDA 13's ptxas. [8769]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]

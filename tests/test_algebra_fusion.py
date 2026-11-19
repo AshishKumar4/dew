@@ -485,6 +485,31 @@ def _template_routes(trace) -> list:
     return [route for route in found if route.choice == "grouped_matmul" and route.kernel == "mosaic"]
 
 
+@pytest.mark.parametrize("order", ["float16 by bfloat16", "bfloat16 by float16"])
+def test_a_product_of_two_16_bit_formats_is_jaxs_own_through_dew_jit(order):
+    """A product of a float16 and a bfloat16 matrix, no preferred type stated, in either order: through
+    `dew.jit` (the algebra's pass, which prices it) its value is `512 2^-8 2^16 = 2^17` exactly, every product
+    and partial sum a power of two; under the pass on an H100 whose template a call names, it is no launch of
+    the template, which casts its right operand to its left's dtype (a bfloat16 `2^16` an infinite float16:
+    base review 7754e5fde F1), but JAX's own product, which multiplies each as it is. Pricing it, NumPy's
+    promotion of the pair raised (base review 0b8b7ed98 F1)."""
+    import dew
+
+    small, large = jnp.full((256, 512), 2.0 ** -8, jnp.float16), jnp.full((512, 256), 2.0 ** 16, jnp.bfloat16)
+    left, right = (small, large) if order == "float16 by bfloat16" else (large.T, small.T)
+
+    def product(left, right):
+        return jax.lax.dot_general(left, right, (((1,), (0,)), ((), ())))
+
+    made = jax.eval_shape(product, left, right)
+    value = np.asarray(dew.jit(product)(left, right), np.float64)
+    assert (value.shape, value.min(), value.max()) == (made.shape, 2.0 ** 17, 2.0 ** 17)
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+          generation.routes() as passed):
+        jax.jit(algebra.rewritten(product, kernels=True)).trace(left, right)
+    assert not any(route.choice == "grouped_matmul" for route in passed)
+
+
 def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew_jit():
     """`dew.jit` over a plain JAX loss on an H100 whose template a call names: its gradient's products run
     the template whether `jax.grad` is taken of the compiled program (inside a plain jit, the pass reads the

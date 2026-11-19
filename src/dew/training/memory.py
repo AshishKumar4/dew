@@ -399,20 +399,22 @@ def admitted(devices: Sequence, resident: int, beside: int, temporaries: int, *,
 def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: int,
               temporaries: int, *, placed: bool = True) -> int | None:
     """The headroom at a fixed reading of the allocators: the least, over `devices`, of two margins. XLA
-    takes a step's temporaries in one allocation, so they need one free block that large (`placeable`);
-    the bytes beside them (the outputs no donated argument holds, the copies, window and batches the loop
-    keeps) are allocations of their own, so with the temporaries they need the free bytes in all
-    (`available`), not that block: a GH200's 4B step, its 17.05 GiB of temporaries and 16.73 GiB of window
-    read in one 25.52 GiB block of 53.6 GiB free, was refused 8.26 GiB short (M-MC-3q). Where the state is
+    takes a step's temporaries in one allocation, after the bytes placed beside them (the outputs no
+    donated argument holds, and what the loop keeps that the allocators do not hold yet: the batches, and
+    a step's copies and window where no search built them, `Building.fits`), so the temporaries need
+    one free block that large once those are placed wherever they may land (`placeable_beside`); with the
+    temporaries they need the free bytes in all (`available`). A search that builds what its step builds
+    before it runs reads where those landed (M-MC-24c: an H100's 7.27 GB of copies took the one 21.64 GB
+    block its 20.76 GB of temporaries were admitted to by a reading made before them). Where the state is
     not `placed` yet, placing it reshapes the blocks, so the free bytes in all judge the temporaries too."""
     if not stated(memory):
         return None
-    block = placeable if placed else available
     margins = []
     for device, held in zip(devices, memory, strict=True):
         free = unclaimed(device, held)
         needed = temporaries * stranding(device, held)
-        margins.append(min(block(held, free) - needed, available(held, free) - beside - needed))
+        block = placeable_beside(held, free, beside) if placed else available(held, free)
+        margins.append(min(block - needed, available(held, free) - beside - needed))
     return min(margins)
 
 
@@ -553,6 +555,37 @@ def unclaimed(device, memory: Mapping[str, int]) -> int | None:
     return gpu_free_bytes(device.local_hardware_id)
 
 
+BFC_SPLIT = 128 << 20
+"""The bytes past a request a BFC pool's free chunk must leave for the pool to split it, where it is under
+twice the request (openxla/xla's tsl/framework/bfc_allocator.cc, `max_internal_fragmentation_bytes_`'s
+default): a chunk short of both is handed out whole."""
+
+
+def placeable_beside(memory: Mapping[str, int], unclaimed: int | None, beside: int) -> int:
+    """The largest allocation a device can satisfy, its `memory` read, once `beside` bytes more are placed
+    wherever its allocator may put them, a BFC pool's rules bounding where (`placeable`, none beside). A BFC
+    pool takes each request from the smallest free chunk that holds it, and splits that chunk where it is
+    at least twice the request or leaves `BFC_SPLIT` past it, else hands it out whole. Where the largest
+    free block `L` is at least twice the bytes `B` beside, or leaves `BFC_SPLIT` past them, every request
+    finds what `L` still holds twice its size or that much past it: each taken from `L` is charged its own
+    bytes, `L - B` at least stays, and none grows the pool, whose growth `G` stays a block it can still
+    give: `max(L - B, G)`. Otherwise one may take `L` whole (a chunk under twice a request charged under
+    twice it) and grow the pool by regions it sizes apart from them, each a chunk charged as any other;
+    what the growth leaves, `G - 2B` at least, lies in at most the last region's rest and the growth past
+    it, so half of it is one block: `(G - 2B) / 2`. `B` is what the pool charges, each request rounded up to
+    its allocation unit (`dew.distributed.placement.allocated_bytes`, as a step's held bytes count them)."""
+    free = memory['bytes_limit'] - memory['bytes_in_use']
+    if 'pool_bytes' not in memory:
+        return free - beside
+    largest = memory['largest_free_block_bytes']
+    growth = memory['bytes_limit'] - memory['pool_bytes']
+    if unclaimed is not None:
+        growth = min(growth, unclaimed)
+    if 2 * beside <= largest or largest - beside >= BFC_SPLIT:
+        return min(free - beside, max(largest - beside, growth))
+    return min(free - 2 * beside, (growth - min(2 * beside, growth)) // 2)
+
+
 def placeable(memory: Mapping[str, int], unclaimed: int | None = None) -> int:
     """Return the largest allocation a device can satisfy, given the `memory` its allocator reports.
 
@@ -565,13 +598,7 @@ def placeable(memory: Mapping[str, int], unclaimed: int | None = None) -> int:
     the GPU's `unclaimed` free bytes. cuda_async and a TPU's allocator report no
     pool, so their free bytes are all there is to read.
     """
-    free = memory['bytes_limit'] - memory['bytes_in_use']
-    if 'pool_bytes' not in memory:
-        return free
-    growth = memory['bytes_limit'] - memory['pool_bytes']
-    if unclaimed is not None:
-        growth = min(growth, unclaimed)
-    return min(free, max(memory['largest_free_block_bytes'], growth))
+    return placeable_beside(memory, unclaimed, 0)
 
 
 def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:

@@ -1169,8 +1169,11 @@ def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, m
     its window's gradient sum, needs room for that sum once: the stated pool holds the step's arguments,
     the sum among them, and beside them the outputs that alias none, the temporaries and the batches
     prefetched next to the step (the 2113 review: the sum was counted among the arguments and again
-    beside them, so an offline plan could refuse a step that fits)."""
+    beside them, so an offline plan could refuse a step that fits). The pool charges what the first call
+    builds by allocation, each shard rounded up (`allocated_bytes`), past what its arguments count; the
+    same step run here builds the same buffers."""
     from dew.distributed.batches import batch_shardings, prefetched_bytes
+    from dew.distributed.placement import allocated_bytes, placed_bytes
     from dew.training.ahead import compile_ahead, step_batch
     from dew.training.memory import temporaries_factor
 
@@ -1183,9 +1186,11 @@ def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, m
     batch = step_batch(trainer, rows)
     prefetched = prefetched_bytes(batch, batch_shardings(trainer.device_mesh, batch))
     temporaries = ahead.temp_bytes * temporaries_factor(trainer.device_mesh)
+    run = fine_tune(MeshSpec().build(jax.devices()[:1]), split=2).fit(rows, steps=1)
+    built = [part for part in (run.compute, run.window) if part is not None]
     assert probe["fits"] is True
     assert probe["headroom"] == (capacity - ahead.argument_bytes - (ahead.output_bytes - ahead.alias_bytes)
-                                 - prefetched - temporaries)
+                                 - prefetched - temporaries - (allocated_bytes(built) - placed_bytes(built)))
 
 
 @pytest.mark.mesh(devices=8)
