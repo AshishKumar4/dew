@@ -34,6 +34,7 @@ from typing import ClassVar, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted
@@ -848,6 +849,11 @@ class Draw:
         """The multiplier a kept entry takes, `1 / (1 - rate)`, the largest an entry's weight takes."""
         return 1.0 / (1.0 - self.rate)
 
+    @property
+    def reach(self) -> float:
+        """The least power of two at or above `bound` (`reach_of`)."""
+        return reach_of(self.bound)
+
     def keep(self, queries: jax.Array, keys: jax.Array) -> jax.Array:
         """Whether the draw keeps the entries at `queries` and `keys` (indices that broadcast): the keep bits
         every mainloop and the reference share, each taking its own scale for a kept entry. Where the draw
@@ -949,6 +955,52 @@ class Dropout:
     def bound(self) -> float:
         """The multiplier a kept entry takes, every draw's (`Draw.bound`)."""
         return 1.0 / (1.0 - self.rate)
+
+    @property
+    def reach(self) -> float:
+        """The least power of two at or above `bound`, every draw's (`reach_of`)."""
+        return reach_of(self.bound)
+
+
+def reach_of(bound: float) -> float:
+    """The least power of two at or above a dropout multiplier `bound`, the units a walk's sums hold a kept
+    weight in (`attention_algebra.Forward.units`), the most its bounds take one by (`frexp`'s exponent,
+    less one where `bound` is a power of two)."""
+    mantissa, exponent = math.frexp(bound)
+    return float(2.0 ** (exponent - 1 if mantissa == 0.5 else exponent))
+
+
+def kept(weights: jax.Array, multiplier: jax.Array | None, power: float = 1.0) -> jax.Array:
+    """`weights` where a dropout draw's `multiplier` keeps their keys, zero where it drops them, each kept one
+    taken exactly by `power` (`Forward.units`; a value's 1); `weights` where no call drops."""
+    return weights if multiplier is None else jnp.where(multiplier > 0, weights * np.float32(power), 0.0)
+
+
+def drops_in_place(dtype, reach: float) -> bool:
+    """Whether dropped weights taken by a multiplier's `reach` (`Dropout.reach`) narrow to `dtype` as they
+    are, the forward's (`kept_parts`) and the backward's for dV's product (`value_parts`, `value_weights`):
+    `reach` within its largest binade (fp16's 2^15)."""
+    return reach <= float(2.0 ** (jnp.finfo(dtype).maxexp - 1))
+
+
+def sums_units(drop: "Dropout | None", *, headroom: bool, initial: bool) -> float:
+    """`Forward.units`, what a dropping call's sums hold a kept weight by: its multiplier's reach, a state's
+    sums taken up into it by less than 2 on a walk whose headroom scales them; beside a state on a walk of
+    none, the multiplier, the products taken down to it (`in_units`) and the state's as they are (taken up,
+    3 2^126 overflowed, the base review of a648b3279, F2), which no in-place mainloop takes (`refused`)."""
+    if drop is None:
+        return 1.0
+    return drop.bound if initial and not headroom else drop.reach
+
+
+def anchor_multipliers(drop: Dropout, anchors: jax.Array) -> jax.Array:
+    """Each row's anchor's dropout multiplier (`Draw`) at its query and its anchor key `anchors`
+    `[B, H, Qp]`, every batch row and query head its draw's: the factor its own weight takes in the output
+    (`joined`) and its value in D (a dropping backward's `gradient.split_delta`)."""
+    batch, heads, queries = anchors.shape
+    draw = Draw((drop.seed[0], drop.seed[1]), drop.rows.reshape(batch, 1, 1), drop.heads.reshape(1, heads, 1),
+                drop.rate, drop.queries, drop.keys)
+    return draw(jnp.arange(queries, dtype=jnp.int32), anchors)
 
 
 def coded(p: jax.Array, bound: float) -> jax.Array:

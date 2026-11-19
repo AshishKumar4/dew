@@ -50,14 +50,17 @@ from dew.nn.kernels.templates.attention import (
     PaddedCall,
     Param,
     Split,
+    anchor_multipliers,
     by_power,
     head_width,
+    kept,
     output_hooked,
     output_split,
     padded_call,
     prescale,
     prologued,
     shared_place,
+    sums_units,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
     ForwardRegisters,
@@ -625,15 +628,16 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         kv_of = jnp.arange(q.shape[2]) // (q.shape[2] // kv_heads)
         places = ((jnp.arange(batch)[:, None, None] * kv_heads + kv_of[None, :, None]) * keys_count + anchors)
         value_rows = jnp.take(jnp.swapaxes(v, 1, 2).reshape(-1, v.shape[-1]), places, axis=0)
-        # Under dropout the anchor's own weight where its draw keeps it, as `algebra.joined` takes it.
+        # Under dropout the anchor's own weight where its draw keeps it, by the sums' units, as
+        # `algebra.joined` takes it.
         own = (split.own if hooks.drop is None
-               else algebra.kept(split.own, algebra.anchor_multipliers(hooks.drop, anchors)))
+               else kept(split.own, anchor_multipliers(hooks.drop, anchors), form.units))
         acc = algebra.split_output(split.others, own, value_rows)
-        # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`), times a
-        # dropping call's multiplier past the division (`algebra.dropped_output`).
+        # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`), a dropping
+        # call's over the rest of its multiplier too, in the one division (`algebra.dropped_total`).
         total = rows[1] if not form.headroom else algebra.power2(rows[1], -split.shift, reach=2 * 127)
-        out = algebra.output_of(acc, total, guarded=form.guarded or hooks.initial is not None)
-        out = algebra.dropped_output(form, out)
+        out = algebra.output_of(acc, algebra.dropped_total(form, total),
+                                guarded=form.guarded or hooks.initial is not None)
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None
 
@@ -687,16 +691,19 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                        _block(tiles), table, by_position=True,
                        query_block=tiles.consumers * tiles.block_q if inference else None,
                        widths=head_width)
+    weights = query.dtype if scales is not None else value.dtype
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
                            score_mod=hooks.score_mod, natural=natural, whole=spans.whole,
                            # A quantized model's codes and values, each at most 127, sum far within fp32.
-                           headroom=scaled and hooks.rounds is None and algebra.headroom(
-                               query.dtype if scales is not None else value.dtype),
+                           headroom=scaled and hooks.rounds is None and algebra.headroom(weights),
                            initial=hooks.initial is not None,
                            queries=(call.queries if call.query.shape[1] > call.queries or call.per_span > 1
                                     else None),
                            prescale=power / taken, subtracted=subtracted, rounds=hooks.rounds,
-                           dropped=1.0 if hooks.drop is None else hooks.drop.bound)
+                           dropped=1.0 if hooks.drop is None else hooks.drop.bound,
+                           # Its sums hold the reach: no state beside a walk of no headroom (`refused`).
+                           units=sums_units(hooks.drop, headroom=algebra.headroom(weights),
+                                                    initial=hooks.initial is not None))
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     hooked = _hooked_of(hooks, call, unit)
     if scales is not None:
@@ -1254,7 +1261,7 @@ def _bound_unit(spec: algebra.Forward, drop, decided: after_walk.Decided | None)
     (a dropping call's multiplier, `drop`); None where it decides nothing or walks scaled."""
     if decided is None or spec.headroom:
         return None
-    return 2.0 ** -algebra.BOUND_UNIT * (1.0 if drop is None else drop.bound)
+    return 2.0 ** -algebra.BOUND_UNIT * (1.0 if drop is None else drop.reach)
 
 
 def _bounded(reached: jax.Array, logits: jax.Array, magnitudes: jax.Array, unit: float) -> jax.Array:

@@ -44,6 +44,7 @@ from dew.nn.kernels.templates.attention import (
     Param,
     block_map,
     differentiable,
+    drops_in_place,
     floating_params,
     head_width,
     kept_dtype,
@@ -603,9 +604,16 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if hooks.rounds is not None and (backward or hooks.drop is not None or hooks.initial is not None):
         return ROUNDED
-    if hooks.drop is not None and not algebra.drops_in_place(dtype, hooks.drop.bound):
-        # The backward's dropped weights for dV's product past the dtype's largest would take scaled parts,
-        # which its sums in place do not take back (`mosaic.unscaled_part`).
+    if hooks.drop is not None and hooks.initial is not None and not algebra.headroom(dtype):
+        # A state's sums beside a walk of no headroom hold the multiplier itself, each tile's products taken
+        # down to it (`sums_units`), which sums accumulated in place do not take: the plain-JAX
+        # mainloop takes the call. A scaled walk for such a call (its state's own headroom) would take it.
+        return Refusal('dropout_rate', f"the Mosaic dropping walk takes no initial state beside "
+                       f"{jnp.dtype(dtype).name} values, whose walk has no headroom")
+    if hooks.drop is not None and not drops_in_place(dtype, hooks.drop.reach):
+        # Dropped weights past the dtype's largest binade would take scaled parts (the forward's in its sums'
+        # units, `algebra.kept_parts`; the backward's for dV's product), which its sums in place do not take
+        # back (`mosaic.unscaled_part`).
         return Refusal('dropout_rate', f"the Mosaic dropping walk takes {jnp.dtype(dtype).name} weights "
                        f"within its range, not a multiplier of {hooks.drop.bound:g} (a rate of "
                        f"{hooks.drop.rate:g})")
