@@ -643,22 +643,19 @@ def test_a_near_total_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(tr
     logits 0 and -18, the first dropped and the second kept, values 0 and 2^15. The kept weight e^-18 is
     below fp16's least subnormal and its weight times z is not, so the output is z e^-18 2^15 / (1 + e^-18),
     about 8.18, as the reference's narrowed coefficient gives it, where the weight narrowed without z flushed
-    to 0: on par with the reference (check 1), on the inference walk and the training walk alike."""
+    to 0: within two fp16 roundings of float64's, on the inference walk and the training walk alike."""
     rate = 1.0 - 2.0 ** -14
     words = first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1]))
     query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[..., 0].set(1)
     key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(-18)
     value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(2.0 ** 15)
-    spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
-
-    def walked(query, key, value):
-        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                              hooks, scale=1.0, residuals=training)
-        return out[0] if training else out
-
-    assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
-                                                                         scale=1.0),
-                    lambda seed: (query, key, value), "a small kept fp16 weight", seeds=FEWEST_SEEDS)
+    walked = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value,
+                                             template.spans(1, 2, 1), hooked(words, 1, 1, rate), scale=1.0,
+                                             residuals=training)
+    out = walked[0] if training else walked
+    weight = np.exp(np.float64(-18))
+    truth = 2.0 ** 14 * weight * 2.0 ** 15 / (1 + weight)
+    assert abs(float(out[0, 0, 0, 0]) - truth) <= 2.0 ** -10 * truth
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])

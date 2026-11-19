@@ -698,8 +698,8 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                                     else None),
                            prescale=power / taken, subtracted=subtracted, rounds=hooks.rounds,
                            dropped=1.0 if hooks.drop is None else hooks.drop.bound,
-                           kept_power=1.0 if hooks.drop is None else algebra.kept_power(
-                               hooks.drop.bound, query.dtype if scales is not None else value.dtype))
+                           kept_power=1.0 if hooks.drop is None else algebra.kept_power(hooks.drop.bound,
+                                                                                        value.dtype))
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     hooked = _hooked_of(hooks, call, unit)
     if scales is not None:
