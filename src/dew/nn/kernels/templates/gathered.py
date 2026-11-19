@@ -410,7 +410,7 @@ class Held:
             filled(self.entries, rows, self.parity, positions)
             mgpu_scf.YieldOp([])
         mgpu_nvvm.cp_async_wait_group(0)
-        mgpu_nvvm.bar_warp_sync(mgpu_utils.c(-1, mgpu_ir.IntegerType.get_signless(32)))
+        mgpu_utils.warp_barrier()
 
     def entry(self, row):
         """Row `row`'s entry of this step, from shared memory at its parity (`awaited`)."""
@@ -432,7 +432,7 @@ class Filled:
     def __call__(self, ctx, entries, rows, parity) -> None:
         del ctx
         tiles = len(warp_tiles(self.share, self.height // swizzling.TILE_ROWS))
-        mgpu_nvvm.bar_warp_sync(mgpu_utils.c(-1, mgpu_ir.IntegerType.get_signless(32)))
+        mgpu_utils.warp_barrier()
         filled(entries, rows, splat_value(parity), _positions(self.share, tiles, swizzling.TILE_ROWS))
 
 

@@ -176,6 +176,10 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
                native={"launch": "chained", "generation": name, "case": case})
           for name in ("sm90", "sm100") for case in gemm_paired.CHAINED_CASES),
+        *(Cell("a chained input gradient's overflowing sum is walked again",
+               gemm_paired.a_chained_input_gradient_is_as_finite_as_its_products_sum, name,
+               native={"launch": "chained", "generation": name, "case": "overflow"})
+          for name in ("sm90", "sm100")),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",
