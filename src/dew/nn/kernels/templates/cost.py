@@ -89,7 +89,6 @@ class Work:
                     self.kept_bytes + other.kept_bytes)
 
 
-@functools.cache
 class Rates(NamedTuple):
     """A target's rate of each unit `units` prices, per second (`rates`), read by name: the tensor cores'
     16-bit, TF32 and FP8 modes, the CUDA cores, the special-function units, shared memory, the on-chip memory
@@ -106,6 +105,7 @@ class Rates(NamedTuple):
     device: float | None
 
 
+@functools.cache
 def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
     """`target`'s rate of each unit `units` prices, per second: the tensor cores' 16-bit, TF32 and FP8 modes
     (FP8's the 16-bit one's where the generation states none, its codes unpacked into 16-bit products), the
@@ -152,8 +152,8 @@ def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
                ((work.exponentials, at.special),),
                ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
                ((work.device_bytes, at.device),))
-    priced = [sum(amount / per_second for amount, per_second in unit if amount and per_second is not None)
-              for unit in grouped]
+    priced = [sum((amount / per_second for amount, per_second in unit if amount and per_second is not None),
+                  0.0) for unit in grouped]
     unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped for amount, per_second in unit)
     return priced, unpriced
 
