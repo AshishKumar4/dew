@@ -264,10 +264,11 @@ def _located(ref, transforms) -> tuple:
 
 
 def _one_value(index) -> int | None:
-    """An indexer's index where it names one entry of its axis (a value, or a one-entry slice), else None."""
+    """An indexer's index where it names one entry of its axis (a value, or a one-entry slice), else None (a
+    slice of more, or an array of indices: a gathered tile's rows)."""
     if hasattr(index, "start"):
         return int(np.asarray(index.start)) if index.size == 1 and index.start is not None else None
-    return None if index is None else int(np.asarray(index))
+    return None if index is None or np.size(index) != 1 else int(np.asarray(index))
 
 
 def _governing(value, what: str):
