@@ -10,12 +10,24 @@ import numpy as np
 import pytest
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through, float64_twin
-from reference_error import FEWEST_SEEDS, assert_as_exact
-from selective_support import near_the_largest, rate_past_the_range, stepwise
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
+from selective_support import (
+    DIFFERENTIATED,
+    FAINT_BESIDE_THE_LARGEST,
+    NEAR_THE_LARGEST,
+    faint_beside_the_largest,
+    near_the_largest,
+    rate_past_the_range,
+    recurred,
+    second_beside_the_largest,
+    starts_near_the_largest,
+    stepwise,
+)
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 
 from dew.interop import Pretrained
 from dew.nn.mixers.mamba import Mamba, selective_scan
+from dew.nn.ssm import affine_states
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 TINY = ROOT / 'mamba-tiny'
@@ -47,21 +59,79 @@ def test_the_chunked_scan_is_the_recurrence_from_any_state(chunk):
 
 
 @pytest.mark.parametrize('chunk', [16, 64])
-def test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence(chunk):
-    """The chunked scan's output and final state near float32's largest (`near_the_largest`'s entering state:
-    two writes past it together over a state entering near its negative, every state finite) on par from
-    float64 with the recurrence a token at a time (`stepwise`, check 1, which refuses a value not finite
-    where float64's is), where its spans summed the writes from a zero state past float32's largest, inf
-    (row 8465). Its gradients there, and a faint write after them, are row 8486's."""
+@pytest.mark.parametrize('case', list(NEAR_THE_LARGEST))
+def test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence(case, chunk):
+    """The chunked scan near float32's largest (`near_the_largest`), its output and final state, and every
+    input's gradient where a float32 recurrence holds them (`DIFFERENTIATED`), on par from float64 with the
+    recurrence a token at a time (`stepwise`, check 1, which refuses a value not finite where float64's is):
+    its spans summed the writes from a zero state past float32's largest, inf (row 8465), its cotangents'
+    spans did so too, and a halving of them lost a faint write (row 8486)."""
+    starts = starts_near_the_largest(case)
+
     def scan(x, dt, A, B, C, D, state):
-        return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=chunk)
+        return selective_scan(x, dt, A, B, C, D, state=state, starts=starts, chunk_size=chunk)
+
+    def reference(x, dt, A, B, C, D, state):
+        return stepwise(x, dt, A, B, C, D, state, starts)
 
     def draw(seed):
-        return near_the_largest("an entering state", seed)[:-1]
+        *inputs, cotangents = near_the_largest(case, seed)
+        return (*inputs, cotangents) if case in DIFFERENTIATED else tuple(inputs)
 
-    exact = jax.jit(stepwise)
-    assert_as_exact(jax.jit(scan), exact, draw, f"the chunked scan near float32's largest, chunks of {chunk}",
-                    seeds=FEWEST_SEEDS, truth_fn=exact)
+    arm = with_gradients if case in DIFFERENTIATED else (lambda fn: fn)
+    exact = jax.jit(arm(reference))
+    # A gradient's leaves resolve over more draws than the states alone (its skip's at 40 was inconclusive).
+    assert_as_exact(jax.jit(arm(scan)), exact, draw,
+                    f"the chunked scan near float32's largest, {case}, chunks of {chunk}",
+                    seeds=160 if case in DIFFERENTIATED else FEWEST_SEEDS, truth_fn=exact)
+
+
+@pytest.mark.parametrize('axis', [1, -2])
+@pytest.mark.parametrize('case', FAINT_BESIDE_THE_LARGEST)
+def test_an_affine_scans_faint_values_beside_float32s_largest_are_as_exact_as_the_recurrence(case, axis):
+    """Mamba's affine scan (`ssm.affine_states`) along its tokens, named by a positive or a negative axis,
+    over faint values beside sums past float32's largest (`faint_beside_the_largest`): its states, and with
+    a faint cotangent every gradient, on par from float64 with the recurrence a token at a time (`recurred`,
+    check 1): a recurrence halved where it reached the largest flushed its faint half (row 8486), and its
+    transpose reversed a negative axis JAX had not made positive (the head review of 29231f794)."""
+    def scan(decay, write, entering):
+        return affine_states(decay, write, entering, axis=axis)
+
+    def reference(decay, write, entering):
+        return recurred(decay, write, entering, axis=1)
+
+    differentiated = case == "a faint cotangent"
+
+    def draw(seed):
+        *inputs, cotangent = faint_beside_the_largest(case, seed)
+        return (*inputs, cotangent) if differentiated else tuple(inputs)
+
+    arm = with_gradients if differentiated else (lambda fn: fn)
+    exact = jax.jit(arm(reference))
+    assert_as_exact(jax.jit(arm(scan)), exact, draw,
+                    f"an affine scan beside float32's largest, {case}, along axis {axis}", seeds=FEWEST_SEEDS,
+                    truth_fn=exact)
+
+
+def test_an_affine_scans_second_derivative_beside_float32s_largest_is_as_exact_as_the_recurrence():
+    """The decays' gradient of Mamba's affine scan's writes' cotangent along a direction, under a cotangent of
+    2^127 beside a reset (`second_beside_the_largest`): on par from float64 with the recurrence's a token at
+    a time (`recurred`, check 1), every order of the scan its own ranged recurrence, where autodiff of a
+    halving's scaling doubled the cotangent past the largest, NaN (the head review of 29231f794)."""
+    def second(fn):
+        def run(decay, write, entering, cotangent, direction):
+            def along(decay):
+                _, pull = jax.vjp(lambda write: fn(decay, write, entering, axis=1), write)
+                return jnp.sum(pull(cotangent)[0] * direction)
+
+            return jax.grad(along)(decay)
+
+        return run
+
+    exact = jax.jit(second(recurred))
+    assert_as_exact(jax.jit(second(affine_states)), exact, second_beside_the_largest,
+                    "an affine scan's second derivative beside float32's largest", seeds=FEWEST_SEEDS,
+                    truth_fn=exact)
 
 
 def decayed(fn):
