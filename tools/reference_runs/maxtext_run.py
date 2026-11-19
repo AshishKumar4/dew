@@ -48,7 +48,7 @@ tools/check_tool_types.py checks it in."""
 
 
 def arguments(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="the HF checkpoint the reference compares against")
     parser.add_argument("--model-name", required=True, help="MaxText's config for the same shape")
     parser.add_argument("--out", required=True)

@@ -35,6 +35,7 @@ import struct
 import sys
 import types
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import requests
@@ -95,8 +96,9 @@ def validate_conversion() -> None:
     tensor = torch.from_numpy(values).cuda()
     global_scale = torch.tensor([1 / 6], device="cuda", dtype=torch.float32)
     output = torch.empty_like(tensor)
+    # Triton's compile-time arguments, typed tl.constexpr by its signature and taken as values at launch.
     conversion_probe[(triton.cdiv(tensor.numel(), 256),)](
-        tensor, output, global_scale, tensor.numel(), BLOCK=256)
+        tensor, output, global_scale, tensor.numel(), **dict[str, Any](BLOCK=256))
     expected = tensor.clamp(max=448).to(torch.float8_e4m3fn).float() * global_scale
     np.testing.assert_array_equal(output.cpu().numpy().view(np.uint32),
                                   expected.cpu().numpy().view(np.uint32))
@@ -122,8 +124,9 @@ def author_qdq(x: torch.Tensor, global_scale: torch.Tensor, *, corrected: bool =
     kernel = fp4_fake_quant_kernel if corrected else sm89_kernel
     kernel[(triton.cdiv(rows, 4), triton.cdiv(columns, 128))](
         values, out, rows, columns, global_scale, values.stride(0), values.stride(1),
-        out.stride(0), out.stride(1), BLOCK_SIZE=16, TILE_M=4, TILE_N=128,
-        NUM_FP4_BLOCKS=8, OUT_DTYPE={torch.float32: tl.float32, torch.bfloat16: tl.bfloat16}[values.dtype])
+        out.stride(0), out.stride(1), **dict[str, Any](
+            BLOCK_SIZE=16, TILE_M=4, TILE_N=128, NUM_FP4_BLOCKS=8,
+            OUT_DTYPE={torch.float32: tl.float32, torch.bfloat16: tl.bfloat16}[values.dtype]))
     return out.reshape(shape)
 
 
@@ -137,7 +140,9 @@ def tiny(*, mixed: bool = False) -> None:
     config._attn_implementation = "eager"
     config.architectures = ["Qwen3ForCausalLM"]
     ids = torch.tensor([[2, 8, 17, 5, 23, 9, 51, 43], [31, 16, 3, 19, 42, 11, 78, 39]], device="cuda")
-    model = Qwen3ForCausalLM(config).to("cuda", dtype=torch.bfloat16).eval()
+    # Its own `to` (PreTrainedModel's), read through Module's signature, which its functools.wraps hides.
+    module: torch.nn.Module = Qwen3ForCausalLM(config)
+    model = cast(Qwen3ForCausalLM, module.to("cuda", dtype=torch.bfloat16)).eval()
     scheme = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
     if mixed:
         scheme = {'algorithm': 'max', 'quant_cfg': [

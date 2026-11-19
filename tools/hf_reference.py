@@ -388,12 +388,14 @@ def write_minimax_m2() -> None:
 
     require("minimax-m2")
     torch.manual_seed(0)
+    # Its rotary fields as the released config spells them, keywords MiniMaxM2Config takes into its rope
+    # parameters though its signature names neither.
+    rotary: dict[str, Any] = {"rotary_dim": 8, "rope_theta": 5000000.0}
     model = MiniMaxM2ForCausalLM(MiniMaxM2Config(
         vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
         num_key_value_heads=2, head_dim=16, intermediate_size=24, num_local_experts=4,
-        num_experts_per_tok=2, rotary_dim=8, max_position_embeddings=64,
-        rope_theta=5000000.0, rms_norm_eps=1e-6, tie_word_embeddings=False,
-        bos_token_id=1, eos_token_id=2))
+        num_experts_per_tok=2, max_position_embeddings=64, rms_norm_eps=1e-6, tie_word_embeddings=False,
+        bos_token_id=1, eos_token_id=2, **rotary))
     model.set_experts_implementation('eager')
     write_tiny('minimax-m2-tiny', model, padded=True)
     directory = FIXTURES / 'minimax-m2-tiny'

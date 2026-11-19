@@ -96,7 +96,7 @@ def minimal_truth(minimal, arrays, chunk):
     for row in range(batch):
         cuts = ([0, length] if seq is None else
                 [0, *(1 + np.flatnonzero(seq[row, 1:] != seq[row, :-1])), length])
-        outputs = []
+        outputs, final = [], None
         for start, end in itertools.pairwise(cuts):
             reset = seq is not None and (start > 0 or seq[row, 0] > 0)
             initial = h0[row:row + 1, None] * (0 if reset else 1)
@@ -108,6 +108,7 @@ def minimal_truth(minimal, arrays, chunk):
             output, final = minimal(*blocked, chunk, initial_states=initial)
             outputs.append(output[:, :end - start] + x[row:row + 1, start:end] * D[None, None, :, None])
         rows.append(torch.cat(outputs, dim=1))
+        assert final is not None  # A row is one segment at least (`cuts`).
         finals.append(final)
     output, final = torch.cat(rows, dim=0), torch.cat(finals, dim=0)
     cotangents = tuple(torch.tensor(arrays[name], dtype=torch.float64, device="cuda")
@@ -130,7 +131,8 @@ def write_seeded(scan, minimal, version, revision):
     from ssd_support import mamba_ssd_draw, mamba_ssd_xla, ssd_orbit
 
     stored = {"precision": np.asarray("ieee")}
-    for case, (*shape, chunk, dtype, documents) in SEEDED_CASES.items():
+    for case, (batch, tokens, heads, width, groups, state, chunk, dtype, documents) in SEEDED_CASES.items():
+        shape = (batch, tokens, heads, width, groups, state)
         narrow_dtype, dtype = jnp.dtype(dtype), getattr(torch, dtype)
         exact_run = jax.jit(lambda arrays, chunk=chunk: mamba_ssd_xla(arrays, chunk))
 
@@ -165,10 +167,10 @@ def write_seeded(scan, minimal, version, revision):
             return reference, truth
 
         stored.update(record_case(case, draw, evaluate, store_inputs=False, summary=True))
-        stored[f"{case}.chunk"] = np.int32(chunk)
+        stored[f"{case}.chunk"] = np.asarray(chunk, np.int32)
         stored[f"{case}.dtype"] = np.asarray(str(narrow_dtype))
         stored[f"{case}.shape"] = np.asarray(shape, np.int32)
-        stored[f"{case}.documents"] = np.bool_(documents)
+        stored[f"{case}.documents"] = np.asarray(documents, np.bool_)
     stored["provenance"] = provenance(
         f"mamba_ssm {version}", revision, torch.cuda.get_device_name(),
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu "
@@ -198,9 +200,10 @@ def main() -> None:
 
     rng = np.random.default_rng(SEED)
     stored = {}
-    for name, (*shape, chunk, dtype, documents) in CASES.items():
+    for name, (batch, tokens, heads, width, groups, state, chunk, dtype, documents) in CASES.items():
+        shape = (batch, tokens, heads, width, groups, state)
         dtype = getattr(torch, dtype)
-        arrays = operands(rng, *shape,
+        arrays = operands(rng, batch, tokens, heads, width, groups, state,
                            lambda value, dtype=dtype: torch.tensor(value, dtype=dtype).float().numpy(),
                            documents)
         cuda = {key: torch.tensor(value, device="cuda") for key, value in arrays.items()}
