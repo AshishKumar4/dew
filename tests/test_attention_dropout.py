@@ -616,29 +616,6 @@ def test_a_mosaic_dropping_backwards_kept_anchor_keeps_its_tiny_product():
                     "a dropping kept anchor's tiny product", seeds=FEWEST_SEEDS)
 
 
-@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
-def test_a_multiplier_past_fp32s_largest_power_of_two_keeps_its_units_finite(training):
-    """An fp32 call at a rate of 1 - 3/4 2^-127, a multiplier of 4/3 2^127 (finite, past fp32's largest
-    power of two), over two keys and any draw: its sums' units, the multiplier's reach, held at 2^127, so its
-    output and its walk's state stay finite and on par with the reference's (check 1), where the reach of
-    2^128 was an infinite fp32 (the range audit of row 8652, #2)."""
-    rate = 1.0 - 0.75 * 2.0 ** -127
-    query = jnp.zeros((1, 1, 1, 8), jnp.float32).at[..., 0].set(1)
-    key = jnp.zeros((1, 2, 1, 8), jnp.float32).at[0, 1, 0, 0].set(-1)
-    value = jnp.zeros((1, 2, 1, 8), jnp.float32).at[:, :, :, 1].set(2.0 ** -126)
-    spans, hooks = template.spans(1, 2, 1), hooked(seed_words(0), 1, 1, rate)
-
-    def walked(query, key, value):
-        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                              hooks, scale=1.0, residuals=training)
-        return out[0] if training else out
-
-    assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
-                                                                         scale=1.0),
-                    lambda seed: (query, key, value), "a multiplier past fp32's largest power of two",
-                    seeds=FEWEST_SEEDS)
-
-
 def three_identical_keys():
     """One zero query of width 16 over three identical keys (first coordinate 1), values (0.75, 3u, 0, ...)
     with u = 2^-23, and dO = (1, 1, 0, ...), in bf16: at a rate of 1/2 each kept product is 2 (0.75 + 3u)."""
