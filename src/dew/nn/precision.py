@@ -479,10 +479,16 @@ def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax
     return jax.lax.bitcast_convert_type(bits, dtype)
 
 
-TWO_FACTOR_REACH = 2 * min(-jnp.finfo(jnp.float32).minexp, jnp.finfo(jnp.float32).maxexp - 1)
-"""The largest `reach` `power2` takes as two factors in float32, 252: twice the least of its normal
-exponents' bounds, so both halves of any `k` within it are normal powers. A caller whose `k` stays within it
-states it and takes the measured two-factor form."""
+def _two_factor_reach(dtype: DTypeLike) -> int:
+    """The largest `reach` `power2` takes as two factors in `dtype`: twice the least of its normal exponents'
+    bounds, so both halves of any `k` within it are normal powers."""
+    limits = jnp.finfo(dtype)
+    return 2 * min(-limits.minexp, limits.maxexp - 1)
+
+
+TWO_FACTOR_REACH = _two_factor_reach(jnp.float32)
+"""The largest `reach` `power2` takes as two factors in float32, 252 (`_two_factor_reach`). A caller whose
+`k` stays within it states it and takes the measured two-factor form."""
 
 
 def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None) -> jax.Array:
@@ -512,7 +518,7 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     # Held as float32, which every exponent within a format's saturating bound is exactly, so no narrow
     # integer `k` wraps at the bound.
     k = jnp.clip(jnp.asarray(k, jnp.float32), -held, held)
-    if held <= 2 * min(-least, largest):
+    if held <= _two_factor_reach(dtype):
         # The half truncated from an exact multiply by its conversion, `k` an integer only at each factor's
         # bias: an int32 `k` halved (a shift or a floored division alike) spilled an A100's recurrence
         # query_key launch 32 bytes at the 27B gated delta net's training tiles, the float half none

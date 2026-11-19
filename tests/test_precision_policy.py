@@ -24,6 +24,7 @@ from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import (
     ACCURATE,
+    TWO_FACTOR_REACH,
     Numerics,
     _binades,
     _rounded_significand,
@@ -1197,17 +1198,16 @@ def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():
     """`dew.nn.precision.power2` at a reach past `TWO_FACTOR_REACH` (254, float32's twice its largest
     exponent) takes `2^127` and `1.5 2^127` by `2^-253` to the normal `2^-126` and `1.5 2^-126` exactly,
     compiled: two halves there hold a -127, no normal power, whose encoding is +0, and gave zero."""
-    from dew.nn.precision import TWO_FACTOR_REACH, power2
+    from dew.nn.precision import power2
 
-    assert TWO_FACTOR_REACH == 252
     found = np.asarray(jax.jit(lambda x, k: power2(x, k, reach=2 * 127))(
         jnp.asarray([2.0 ** 127, 1.5 * 2.0 ** 127, 2.0 ** 127], jnp.float32), jnp.asarray([-253, -253, 254])))
     np.testing.assert_array_equal(found, np.asarray([2.0 ** -126, 1.5 * 2.0 ** -126, np.inf], np.float32))
 
 
 @pytest.mark.parametrize(("dtype", "reach", "exponent"), [
-    (jnp.float32, None, jnp.int32), (jnp.float32, 2 * 126, jnp.int32), (jnp.float32, None, jnp.int8),
-    (jnp.float32, 2 * 126, jnp.int8), (jnp.float32, None, jnp.uint8), (jnp.float32, None, jnp.float32),
+    (jnp.float32, None, jnp.int32), (jnp.float32, TWO_FACTOR_REACH, jnp.int32), (jnp.float32, None, jnp.int8),
+    (jnp.float32, TWO_FACTOR_REACH, jnp.int8), (jnp.float32, None, jnp.uint8), (jnp.float32, None, jnp.float32),
     (jnp.float64, None, jnp.int32), (jnp.bfloat16, None, jnp.int32)])
 def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach, exponent):
     """`dew.nn.precision.power2` (the one owner of scaling by a power of two: a kernel template's, a scaled
