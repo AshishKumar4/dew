@@ -16,7 +16,7 @@ GPU_HEADROOM = (1.25, 2 ** 30)
 fragmentation, which can leave a share its own size short of a block it needs."""
 
 
-def measured(recorded: dict | None) -> bool:
+def measured(recorded: dict | None) -> TypeGuard[dict]:
     """Whether `recorded`, a run's record, measured what its file held on the GPU: a run that followed every
     process it started and left its report."""
     return recorded is not None and recorded.get("depends") is not None and recorded.get("peak") is not None

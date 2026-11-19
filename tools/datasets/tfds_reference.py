@@ -18,14 +18,17 @@ from pathlib import Path
 
 import numpy as np
 import tensorflow_datasets as tfds
+from tensorflow_datasets.core.dataset_builder import GeneratorBasedBuilder
+from tensorflow_datasets.core.dataset_info import DatasetInfo
+from tensorflow_datasets.core.utils.version import Version
 from passages import PASSAGES
 
 
-class DewImages(tfds.core.GeneratorBasedBuilder):
-    VERSION = tfds.core.Version("1.0.0")
+class DewImages(GeneratorBasedBuilder):
+    VERSION = Version("1.0.0")
 
     def _info(self):
-        return tfds.core.DatasetInfo(
+        return DatasetInfo(
             builder=self, disable_shuffling=True,
             features=tfds.features.FeaturesDict({
                 "image": tfds.features.Image(shape=(8, 8, 3), encoding_format="png"),
@@ -43,11 +46,11 @@ class DewImages(tfds.core.GeneratorBasedBuilder):
                           "label": index % 2}
 
 
-class DewPassages(tfds.core.GeneratorBasedBuilder):
-    VERSION = tfds.core.Version("1.0.0")
+class DewPassages(GeneratorBasedBuilder):
+    VERSION = Version("1.0.0")
 
     def _info(self):
-        return tfds.core.DatasetInfo(builder=self, disable_shuffling=True,
+        return DatasetInfo(builder=self, disable_shuffling=True,
                                      features=tfds.features.FeaturesDict({"text": tfds.features.Text()}))
 
     def _split_generators(self, dl_manager):

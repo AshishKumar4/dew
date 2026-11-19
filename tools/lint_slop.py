@@ -386,7 +386,7 @@ def contracts(module: Module) -> Iterator[Finding]:
             continue
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
-        for name, annotation in scopes.annotations(node):
+        for name, annotation in scopes.annotated(node):
             claimed, open_dictionaries = _mappings(annotation)
             for mapping in open_dictionaries:
                 yield report(mapping, "SLOP002",
@@ -492,7 +492,7 @@ def _declared(function: ast.AST | None, unions: set[str]) -> dict[str, str]:
     """
     if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
         return {}
-    written: dict[str, ast.expr] = dict(scopes.annotations(function))
+    written: dict[str, ast.expr] = dict(scopes.annotated(function))
     for node in scopes.own(function):
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             written[node.target.id] = node.annotation

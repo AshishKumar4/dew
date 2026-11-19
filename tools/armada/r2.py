@@ -102,6 +102,8 @@ def urllib_send(method: str, url: str, headers: Mapping[str, str], body: bytes |
     runs before any environment exists (ci.py, remote_cache) can use. Its socket is held from the request
     on, so each read of the answer's body waits as long as the `Body` reading it allows."""
     parts = urllib.parse.urlsplit(url)
+    if parts.hostname is None:
+        raise ValueError(f"{url} names no host")
     opened = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
     connection = opened(parts.hostname, parts.port, timeout=timeout)
     connection.request(method, f"{parts.path or '/'}{f'?{parts.query}' if parts.query else ''}", body=body,
@@ -135,7 +137,10 @@ class KeptSend:
     def __call__(self, method: str, url: str, headers: Mapping[str, str], body: bytes | None,
                  timeout: float) -> tuple[int, Mapping[str, str], Stream]:
         parts = urllib.parse.urlsplit(url)
-        place = (parts.scheme, parts.hostname, parts.port)
+        host = parts.hostname
+        if host is None:
+            raise ValueError(f"{url} names no host")
+        place = (parts.scheme, host, parts.port)
         kept = getattr(self.local, "connections", None)
         if kept is None:
             kept = self.local.connections = {}
@@ -143,7 +148,7 @@ class KeptSend:
         opened = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
         held = kept.pop(place, None)
         while True:
-            connection = held or opened(parts.hostname, parts.port, timeout=timeout)
+            connection = held or opened(host, parts.port, timeout=timeout)
             connection.timeout = timeout
             if connection.sock is not None:
                 connection.sock.settimeout(timeout)

@@ -414,7 +414,9 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
                 negative_prompt_3=[row["third"] for row in NEGATIVES],
                 device=torch.device("cpu"), num_images_per_prompt=1,
                 do_classifier_free_guidance=True)
-        assert negative_embeds is not None and negative_pooled is not None  # Guided.
+        # Every embedding made: the prompts are given and guided.
+        assert embeds is not None and pooled is not None
+        assert negative_embeds is not None and negative_pooled is not None
         arrays[f"{label}.context"] = embeds.numpy()
         arrays[f"{label}.pooled"] = pooled.numpy()
         arrays[f"{label}.negative_context"] = negative_embeds.numpy()
@@ -431,7 +433,9 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
         policy: dict[str, Any] = dict(num_inference_steps=PIPELINE_STEPS, guidance_scale=PIPELINE_GUIDANCE)
         with torch.no_grad():
             walked = latents_of(pipe, **prompts, **policy, latents=latents.clone())
-            output = pipe(**prompts, **policy, latents=latents.clone(), output_type="np", return_dict=True)
+            # The latents as a keyword its signature names no tensor type of (it names FloatTensor).
+            output = pipe(**prompts, **policy, **dict[str, Any](latents=latents.clone()), output_type="np",
+                          return_dict=True)
             assert isinstance(output, StableDiffusion3PipelineOutput)  # return_dict=True.
             images = output.images
             assert isinstance(images, np.ndarray)  # output_type="np".
