@@ -1261,16 +1261,38 @@ def test_an_aligned_sums_derivatives_keep_smaller_terms_below_cancelling_ones(sm
     assert float(summed(jnp.float32(1.0))) == small
 
 
-def test_an_aligned_sums_gradient_reduces_a_term_before_its_value_broadcasts_it():
-    """`aligned_sum([(x,), (y,)], axis=0)` of `x` `[2]` and `y` `[1, 2]`: `x` summed to one value broadcast
-    across the value's two, so under a cotangent of `[[1, 2]]` its gradient is 3 at each element and `y`'s
-    the cotangent, where the transpose laid `x` against the value's axis and gave it `[1, 2]` (base review
-    f5e6e678d F2)."""
-    x, y = jnp.zeros((2,), jnp.float32), jnp.zeros((1, 2), jnp.float32)
-    _, pulled = jax.vjp(lambda x, y: aligned_sum([(x,), (y,)], axis=0), x, y)
+def test_an_aligned_sum_reduces_a_term_before_its_value_broadcasts_it():
+    """`aligned_sum([(x,), (y,)], axis=0)` of `x` `[1, 2]` and `y` `[[10, 20]]`: `x` summed to one value
+    broadcast across the value's two, `[[13, 23]]`, its tangent along `x`'s direction `[1, 2]` 3 at each, and
+    under a cotangent of `[[1, 2]]` `x`'s gradient 3 at each element and `y`'s the cotangent, where the
+    transpose laid `x` against the value's axis and gave it `[1, 2]` (base review f5e6e678d F2), and the
+    value and tangent reduced it against a top broadcast to the value's shape, `[[11, 22]]` and `[[1, 2]]`
+    (base review db30f3e80 F2)."""
+    x, y = jnp.asarray([1.0, 2.0], jnp.float32), jnp.asarray([[10.0, 20.0]], jnp.float32)
+
+    def summed(x, y):
+        return aligned_sum([(x,), (y,)], axis=0)
+
+    value, pulled = jax.vjp(summed, x, y)
+    np.testing.assert_array_equal(np.asarray(value), [[13.0, 23.0]])
+    tangent = jax.jvp(summed, (x, y), (jnp.asarray([1.0, 2.0], jnp.float32), jnp.zeros_like(y)))[1]
+    np.testing.assert_array_equal(np.asarray(tangent), [[3.0, 3.0]])
     dx, dy = pulled(jnp.asarray([[1.0, 2.0]], jnp.float32))
     np.testing.assert_array_equal(np.asarray(dx), [3.0, 3.0])
     np.testing.assert_array_equal(np.asarray(dy), [[1.0, 2.0]])
+
+
+def test_an_aligned_sums_shared_factors_gradient_holds_its_groups_scaled_until_they_sum():
+    """`aligned_sum([(f, x), (f, y)], axis=1)` of `f` ones `[2, 3]` beside `x` `[2, 3]` of 2^125 and `y`
+    `[4, 2, 3]` of -1.25 2^125, each reduced over its own second axis (`f`'s second in the first, its first
+    in the second), under a unit cotangent: every element of `f`'s gradient 2^126, where its two terms'
+    gradients, laid apart, were scaled back apart, 3 2^127 and -2.5 2^127 opposite infinities, and summed to
+    zero (base review db30f3e80 F1)."""
+    f = jnp.ones((2, 3), jnp.float32)
+    x = jnp.full((2, 3), 2.0 ** 125, jnp.float32)
+    y = jnp.full((4, 2, 3), -1.25 * 2.0 ** 125, jnp.float32)
+    value, pulled = jax.vjp(lambda f: aligned_sum([(f, x), (f, y)], axis=1), f)
+    np.testing.assert_array_equal(np.asarray(pulled(jnp.ones_like(value))[0]), np.full((2, 3), 2.0 ** 126))
 
 
 def test_an_aligned_sums_gradient_scales_a_cotangent_before_its_broadcast_sum():
