@@ -446,11 +446,11 @@ class Trainer(Generic[Loss, Effects]):
         ready_process()  # A key given here opens the backend as the run's does (`key`).
         key = self.key if key is None else request_key(key)
         if not self.host_master and jax_core.trace_state_clean():
-            # Outside any trace one program of this body, the frozen tree the held arrays (`drawn_once`;
-            # rows 8682, 8730). A state held on the host takes the arrays over as it is placed.
+            # Outside any trace one program of this body, which reads no override's field, so kept by the
+            # class (row 8985), its frozen tree the held arrays (`drawn_once`; rows 8682, 8730).
             stated = self._step_key(self.objective, self._compiler)
             return drawn_once(self._fresh_state, initializer, key, HELD_APART,
-                              kept=stated and (stated, self._start_owner(), "fresh"))
+                              kept=stated and (stated, type(self), "fresh"))
         return self._fresh_state(initializer, key)
 
     def _fresh_state(self, initializer: Initializer, key: jax.Array) -> TrainState:
