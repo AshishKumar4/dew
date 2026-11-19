@@ -434,23 +434,24 @@ def test_the_selective_scan_holds_its_orders(edge, taken):
 
 @pytest.mark.parametrize("taken", [
     pytest.param(("primal", "jvp", "vjp"), id="first-orders",
-                 marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
     pytest.param(("jvp of grad",), id="jvp-of-grad",
-                 marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
     pytest.param(("second jvp",), id="second-jvp",
                  marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
     pytest.param(("grad of grad",), id="grad-of-grad",
-                 marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
     pytest.param(("jvp of grad, remat", "second jvp, remat", "jvp of grad, nested jit"),
-                 id="staged-and-nested", marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
+                 id="staged-and-nested", marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
     pytest.param(("jvp of grad, scanned",), id="scanned",
-                 marks=pytest.mark.check1_shards(seeds=8, per_task=8))])
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=4))])
 def test_the_selective_scan_holds_its_orders_over_normal_draws(taken, request):
     """`assert_selective_contract` in the normal domain, check 1 over its declared draws: a site an order,
-    the first orders together, whose programs one map task compiles once for all its draws (an interpreted
-    second order's 60 to 170 s; the five order sets in two tasks of four draws each ran past 20 minutes a
-    task), the remat orders, which an interpreted kernel takes none of (`INTERPRETED_REMAT`), beside the
-    nested one."""
+    the first orders together, whose programs a map task compiles once for its draws (an interpreted
+    second order's 60 to 170 s, then 30 to 40 s a draw: the five order sets in two tasks of four draws each
+    ran past 20 minutes a task, a site's eight draws in one 141 to 421 s), four draws a task but the second
+    jvp's eight; the remat orders, which an interpreted kernel takes none of (`INTERPRETED_REMAT`), beside
+    the nested one."""
     assert_selective_contract("normal", taken, seeds=marked_seeds(request))
 
 
