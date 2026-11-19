@@ -844,9 +844,10 @@ def _launch_binaries(lowered: jax.stages.Lowered, modules: dict) -> dict[str, tu
     and launch, none for a launch of none."""
     if not modules:
         return {}
-    # Compiled to be read, never run (`read_offline`): its kernels' binaries are what it states, so a prepare
-    # for devices no run has tuned (`for_devices`) certifies as any compile does, its fusions untuned.
-    with read_offline():
+    # Compiled to be read, never run (`kernels_read`): its kernels' binaries are what it states, so a prepare
+    # for devices no run has tuned (`for_devices`) certifies as any compile does, its fusions untuned, and an
+    # attached GPU's certification is the compile a deviceless build of its generation made (row 8372).
+    with kernels_read():
         compiled = xla_compiled(lowered, None)
     return {name: (modules[name], binary) for binary in binaries(compiled)
             if (name := launch_name(binary.kernel, binary.launch)) in modules}
@@ -1273,11 +1274,28 @@ def read_offline() -> Iterator[None]:
         _FOR_DEVICES.reset(held)
 
 
+_KERNELS_READ: contextvars.ContextVar[bool] = contextvars.ContextVar("dew_kernels_read", default=False)
+
+
+@contextlib.contextmanager
+def kernels_read() -> Iterator[None]:
+    """Within the block, a GPU compile is one read for its kernels' binaries alone and run nowhere (a
+    certification's, `_launch_binaries`): read offline on an attached GPU as on a compile-only one
+    (`offline`), so a run's certifications and a deviceless build's are one compile under one key."""
+    held = _KERNELS_READ.set(True)
+    try:
+        yield
+    finally:
+        _KERNELS_READ.reset(held)
+
+
 def offline(devices: Sequence) -> bool:
     """Whether a program compiled for `devices` is read offline, for its memory or text alone, no device to
-    run it (`targeted`): compile-only GPUs outside `for_devices` (or within `read_offline`)."""
+    run it (`targeted`): compile-only GPUs outside `for_devices` (or within `read_offline`), and any GPU's
+    compile read for its kernels alone (`kernels_read`)."""
     device = next(iter(devices), None)
-    return device is not None and device.platform == "gpu" and deviceless(device) and not _FOR_DEVICES.get()
+    return device is not None and device.platform == "gpu" and (
+        _KERNELS_READ.get() or (deviceless(device) and not _FOR_DEVICES.get()))
 
 
 def compiled_as_here(devices: Sequence, *, tuned: bool, at_run: bool) -> bool:
