@@ -30,29 +30,29 @@
 "tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[hierarchical_mmdit-1-step-fsdp-one device]",
 "tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[hierarchical_mmdit-2-steps-data-layout]",
 "tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[hierarchical_mmdit-2-steps-data-one device]",
+"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[unet_3d-1-step-data-layout]",
 "tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[unet_3d-1-step-data-one device]",
+"tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[unet_3d-2-steps-fsdp-layout]",
 "tests/test_architectures.py::test_a_fit_on_a_layout_leaves_what_its_drawn_steps_leave[unet_3d-2-steps-fsdp-one device]",
-"tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer]",
+"tests/test_architectures.py::test_a_residual_order_is_the_same_decoder[causal_transformer+gpt_oss]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+deepseek_v2-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+deepseek_v2-2-steps-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+gemma3n-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+gemma3n-2-steps-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+gemma4_moe-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+llama4-1-step-fsdp]",
+"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+llama4-2-steps-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+mla-1-step-data]",
+"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+moe-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+moe-2-steps-fsdp]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer-2-steps-data]",
+"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[hybrid_dit-1-step-data]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[hybrid_dit-2-steps-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[jepa_encoder-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[jepa_encoder-2-steps-data]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_dit-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_dit-1-step-stage]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_dit-2-steps-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_mmdit-1-step-data]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_mmdit-2-steps-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_udit-1-step-data]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_udit-2-steps-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[uvit-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[uvit-2-steps-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[video_dit-2-steps-data]"
@@ -112,7 +112,7 @@
 ],
 "tests/test_attention_dropout.py": [
 "tests/test_attention_dropout.py::test_a_dropping_template_call_is_on_par_with_the_reference_path_forward_and_backward[packed-documents-float32]",
-"tests/test_attention_dropout.py::test_the_mosaic_walk_drops_a_slice_at_its_global_places[inference-queries-and-keys]"
+"tests/test_attention_dropout.py::test_the_mosaic_walk_drops_a_slice_at_its_global_places[training-keys]"
 ],
 "tests/test_attention_metamorphic.py": [
 "tests/test_attention_metamorphic.py::test_a_causal_calls_first_queries_are_the_call_cut_to_them",
@@ -297,7 +297,7 @@
 "tests/test_attention_mosaic_compile.py::test_a_short_training_calls_backward_compiles_spill_free_for_an_a100[16-deterministic]",
 "tests/test_attention_mosaic_compile.py::test_a_short_training_calls_backward_compiles_spill_free_for_an_a100[16-one-launch]",
 "tests/test_attention_mosaic_compile.py::test_a_short_training_calls_backward_compiles_spill_free_for_an_a100[32-one-launch]",
-"tests/test_attention_mosaic_compile.py::test_a_start_runs_the_kernels_its_launches_certified",
+"tests/test_attention_mosaic_compile.py::test_a_start_runs_the_kernels_its_launches_certified[temperature]",
 "tests/test_attention_mosaic_compile.py::test_an_a100_forward_counts_the_shared_memory_its_lowering_asks_for[inference-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_an_fp16_backward_compiles_spill_free_as_its_model_decides[64]",
 "tests/test_attention_mosaic_compile.py::test_an_fp32_forward_compiles_spill_free_as_its_model_decides[sm90-128]",
@@ -907,6 +907,9 @@
 "tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-chunk-places-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
 "tests/test_attention_triton.py::test_the_plain_backward_is_on_par_over_runs[runs-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]"
 ],
+"tests/test_attention_witness.py": [
+"tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-causal]"
+],
 "tests/test_barren_reads.py": [
 "tests/test_barren_reads.py::test_a_mixture_edit_that_moves_a_kept_corpus_to_other_workers_reads_on",
 "tests/test_barren_reads.py::test_a_mixture_of_corpora_each_kept_in_one_workers_inputs_reads_on[streamed]",
@@ -1173,8 +1176,11 @@
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[near the least normal-second orders, staged]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-grad of grad]"
 ],
-"tests/test_contracts_sampling.py": [
-"tests/test_contracts_sampling.py::test_a_transitions_quadratic_term_holds_every_order[near the least normal]"
+"tests/test_counted_passes.py": [
+"tests/test_counted_passes.py::test_a_run_whose_cadences_read_no_pass_compiles_as_before_and_a_counting_one_steps_its_batches"
+],
+"tests/test_cpu_only_jax.py": [
+"tests/test_cpu_only_jax.py::test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not[prepare-cpu]"
 ],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_cached_document_reads_its_own_context_without_it[the layer's attention]",
@@ -1278,6 +1284,9 @@
 "tests/test_decision_laya.py": [
 "tests/test_decision_laya.py::test_padded_rows_score_as_they_do_alone",
 "tests/test_decision_laya.py::test_the_rule_catches_a_head_that_ignores_the_question_type"
+],
+"tests/test_decision_letters_context.py": [
+"tests/test_decision_letters_context.py::test_a_slot_readout_pools_each_option_line_from_the_context_that_holds_it"
 ],
 "tests/test_decision_objective.py": [
 "tests/test_decision_objective.py::test_a_head_reads_none_of_its_rows_padding[True]",
@@ -1580,7 +1589,7 @@
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[keys near fp32's largest at equal logits-float16-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[small values beside unseen ones near fp32's largest, float32-float16-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[ties at scale 1/4, cotangents near 2**125-float16-fast]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[values near fp32's largest over 2 equal keys-float16-accurate]"
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[values near fp32's largest over 2 equal keys-float16-fast]"
 ],
 "tests/test_diffusion_gemma_workflow.py": [
 "tests/test_diffusion_gemma_workflow.py::test_public_pipeline_source_storage_and_saved_block_compute_are_independent",
@@ -1808,6 +1817,12 @@
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_groups_rate[a fresh group]"
 ],
+"tests/test_gated_mlp.py": [
+"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-1.5-sm90]"
+],
+"tests/test_gemm_formed.py": [
+"tests/test_gemm_formed.py::test_a_composed_mlps_training_step_compiles_within_its_resources[sm90]"
+],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_kernel_gradient_lowers_for_cuda"
 ],
@@ -1816,6 +1831,9 @@
 ],
 "tests/test_gemm_paired.py": [
 "tests/test_gemm_paired.py::test_the_templates_paired_product_holds_check_1[grouped-sm100]"
+],
+"tests/test_gemm_tcgen05.py": [
+"tests/test_gemm_tcgen05.py::test_tcgen05s_epilogues_hold_check_1[plain-128x2]"
 ],
 "tests/test_gemm_template.py": [
 "tests/test_gemm_template.py::test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1[2048-1024-False-sm90]",
@@ -2195,6 +2213,9 @@
 "tests/test_kimi_k3.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference",
 "tests/test_kimi_k3.py::test_situ_matches_the_released_activation"
 ],
+"tests/test_kimi_linear.py": [
+"tests/test_kimi_linear.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference"
+],
 "tests/test_layer_stack.py": [
 "tests/test_layer_stack.py::test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop",
 "tests/test_layer_stack.py::test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop",
@@ -2213,11 +2234,17 @@
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[deepseek_widths]",
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[gemma4]"
 ],
+"tests/test_layout_counts.py": [
+"tests/test_layout_counts.py::test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read[first-fit-2-indexed]"
+],
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_tensor2]"
 ],
 "tests/test_level_stacking.py": [
 "tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[one-layer-scanned]"
+],
+"tests/test_lfm3.py": [
+"tests/test_lfm3.py::test_plain_and_looped_lfm3_train_through_a_decision_run[looped]"
 ],
 "tests/test_linear_attention.py": [
 "tests/test_linear_attention.py::test_a_cached_layer_traced_for_a_jvp_decodes_its_token[plain]",
@@ -2326,7 +2353,17 @@
 "tests/test_lowering.py::test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh[sm90-attention]"
 ],
 "tests/test_mamba.py": [
-"tests/test_mamba.py::test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones[right_padded]"
+"tests/test_mamba.py::test_a_rate_past_float32s_range_scans_as_the_recurrence[16-a decay of e^-3]",
+"tests/test_mamba.py::test_a_rate_past_float32s_range_scans_as_the_recurrence[64-a decay of e^-3]",
+"tests/test_mamba.py::test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence[128]",
+"tests/test_mamba.py::test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence[130]",
+"tests/test_mamba.py::test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence[194]",
+"tests/test_mamba.py::test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence[65]",
+"tests/test_mamba.py::test_an_affine_scans_second_order_past_a_block_is_zero_where_it_is_structurally[194]",
+"tests/test_mamba.py::test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence[a cotangent near the largest-16]",
+"tests/test_mamba.py::test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence[a cotangent near the largest-64]",
+"tests/test_mamba.py::test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence[a faint write after it-16]",
+"tests/test_mamba.py::test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence[an entering state-16]"
 ],
 "tests/test_mamba2.py": [
 "tests/test_mamba2.py::test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones[empty_shard]",
@@ -2476,94 +2513,94 @@
 "tests/test_model_flows.py::test_a_training_step_on_the_templates_plain_jax_mainloop_does_not_reach_its_route"
 ],
 "tests/test_model_protocols.py": [
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[deepseek-v4-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[deepseek-v41-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[dory-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[gemma3n-vision-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[gemma4-unified-native-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[granitemoe-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[kimi-k3-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[kimi-linear-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[llama4-native-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[mimo-v2-flash-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[modernbert-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[qwen35-blocks-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[qwen35-native-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[qwen38-moe-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[qwen4-exp-native-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[qwen4-exp-tiny]",
+"tests/test_model_protocols.py::test_a_decoders_gradients_through_its_logits_match_its_forwards[sensenova-loop-tiny]",
+"tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[edm2_unet]",
 "tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[flux2_transformer]",
-"tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[qwen_image_transformer]",
 "tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[unet]",
 "tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[unet_2d_condition]",
 "tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[unet_3d]",
-"tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[uvit]",
+"tests/test_model_protocols.py::test_a_denoiser_reads_the_text_interval_and_time_it_declares[video_dit]",
 "tests/test_model_protocols.py::test_a_kl_autoencoder_gives_the_posterior_end_to_end_tuning_trains_through[bfloat16]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_computes_the_models_logits[deepseek-v41-tiny]",
-"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_computes_the_models_logits[glm5-next-tiny]",
-"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_computes_the_models_logits[modernbert-tiny]",
+"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_computes_the_models_logits[gptj-tiny]",
+"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_computes_the_models_logits[phi3-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_computes_the_models_logits[starcoder2-tiny]",
+"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[deepseek-v4-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[deepseek-v41-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[diffusion-gemma-sft]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[dory-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[gemma3n-vision-tiny]",
-"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[gemma4-tiny-mm]",
+"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[gemma4-unified-native-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[glm5-next-tiny]",
-"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[gpt-bigcode-tiny]",
-"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[k2-horizon-mova-tiny]",
+"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[gpt-neo-tiny]",
+"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[k2-horizon-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[kimi-k3-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[kimi-linear-tiny]",
-"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[lfm3-tiny]",
+"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[lfm3-vl-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[llama4-tiny]",
-"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[minimax-m2-fp8-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[minimax-tiny]",
-"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[mixtral-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[nemotron-h-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[qwen35-blocks-tiny]",
-"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[qwen35-moe-native-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[qwen35-native-tiny]",
-"tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[qwen35-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[qwen38-moe-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[qwen4-exp-native-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[qwen4-exp-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[sensenova-loop-tiny]",
 "tests/test_model_protocols.py::test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it[starcoder2-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[deepseek-v4-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[deepseek-v41-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[diffusion-gemma-sft]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[dream-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[gemma3n-vision-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[gemma4-moe-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[glm5-next-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[gpt-bigcode-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[k2-horizon-mova-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[kimi-k3-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[kimi-linear-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[lfm3-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[llama4-native-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[mamba2-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[minimax-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[mixtral-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[nemotron-h-moe-latent-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[olmo3-yarn-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[qwen35-blocks-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[qwen35-moe-native-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[qwen35-native-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[qwen35-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[qwen38-moe-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[qwen4-exp-native-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[qwen4-exp-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[sensenova-loop-tiny]",
-"tests/test_model_protocols.py::test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward[starcoder2-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[deepseek-v4-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[deepseek-v41-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[diffusion-gemma-sft]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[gemma3n-vision-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[glm5-next-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[gptj-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[kimi-k3-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[kimi-linear-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[lfm3-vl-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[mimo-v2-flash-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[nemotron-h-moe-latent-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[qwen35-blocks-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[qwen35-moe-native-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[qwen35-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[qwen4-exp-native-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[qwen4-exp-tiny]",
+"tests/test_model_protocols.py::test_a_token_models_reads_and_cache_invariance_match_its_forward[starcoder2-tiny]",
 "tests/test_model_protocols.py::test_media_reach_the_logits_through_the_fused_reads[llama4-native-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[deepseek-v3-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[deepseek-v4-tiny]",
+"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[deepseek-v32-tiny]",
 "tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[deepseek-v41-tiny]",
 "tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[dory-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[gemma3-native-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[gemma4-tiny-mm]",
+"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[gemma3n-vision-tiny]",
+"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[gemma4-unified-native-tiny]",
 "tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[glm5-next-tiny]",
 "tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[gptj-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[k2-horizon-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[kimi-k3-tiny]",
+"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[kimi-k25-tiny]",
 "tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[kimi-linear-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[lfm3-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[llama4-native-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[mimo-v2-flash-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[minimax-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[nemotron-h-moe-latent-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[phi3-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[qwen35-native-tiny]",
-"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[qwen38-moe-tiny]",
+"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[lfm3-vl-tiny]",
+"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[mamba2-tiny]",
+"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[mixtral-tiny]",
+"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[phi-tiny]",
+"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[qwen35-moe-native-tiny]",
+"tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[qwen35-tiny]",
 "tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[qwen4-exp-native-tiny]",
 "tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[qwen4-exp-tiny]",
 "tests/test_model_protocols.py::test_packed_projections_score_as_the_model_does[sensenova-loop-tiny]",
 "tests/test_model_protocols.py::test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree[diffusion-gemma-sft-bfloat16]",
-"tests/test_model_protocols.py::test_trainable_layer_scalars_read_the_frozen_tree_moved_without_a_copy[diffusion-gemma-sft]"
+"tests/test_model_protocols.py::test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree[diffusion-gemma-workflow-float32]"
 ],
 "tests/test_models.py": [
 "tests/test_models.py::test_a_scan_order_model_traces_under_jit[hilbert]",
@@ -2841,17 +2878,17 @@
 "tests/test_placement.py::test_each_parameter_is_placed_by_its_declared_axes[causal_transformer+glm5-next-tiny]"
 ],
 "tests/test_plan.py": [
+"tests/test_plan.py::test_a_fit_whose_step_fits_only_recomputing_searches_it_once_and_compiles_its_plan_once[planned]",
 "tests/test_plan.py::test_a_fits_start_traces_its_loss_once_for_its_fit_check_and_its_plan",
 "tests/test_plan.py::test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_recomputing",
 "tests/test_plan.py::test_a_pinned_split_is_read_as_given_and_its_state_holds_it",
-"tests/test_plan.py::test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_placed_devices_cover_a_miss",
-"tests/test_plan.py::test_a_resumed_run_continues_its_admitted_plan_without_timing",
-"tests/test_plan.py::test_a_run_trains_only_its_requested_steps_without_timing_a_frontier",
+"tests/test_plan.py::test_a_plan_with_no_second_point_to_fit_is_not_timed[1]",
+"tests/test_plan.py::test_a_run_that_sets_its_remat_compiles_its_step_once",
+"tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[decoder-cpu]",
 "tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[decoder-h100]",
-"tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[delta-scanned-h100]",
-"tests/test_plan.py::test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle[two-microbatches]",
+"tests/test_plan.py::test_a_step_handed_a_state_another_split_left_at_an_updates_end_reads_it_in_its_own",
 "tests/test_plan.py::test_each_probe_of_a_held_plan_states_its_own_headroom",
-"tests/test_plan.py::test_fit_keeps_an_explicit_policy_without_a_frontier_probe[save_qkv_proj]"
+"tests/test_plan.py::test_fit_keeps_an_explicit_policy_without_a_frontier_probe[save_dot_except_mlp]"
 ],
 "tests/test_ppo.py": [
 "tests/test_ppo.py::test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged[default]",
@@ -3642,6 +3679,9 @@
 "tests/test_ssd_kernel.py": [
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk-resets]"
 ],
+"tests/test_stage_blocks.py": [
+"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[hybrid_dit-fsdp2_stage2]"
+],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
 "tests/test_stage_local.py::test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one",
@@ -3870,6 +3910,12 @@
 "tests/test_wan_source.py": [
 "tests/test_wan_source.py::test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone",
 "tests/test_wan_source.py::test_pipeline_walk_matches_the_source[streamed]"
+],
+"tests/test_wan_vae.py": [
+"tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
+],
+"tests/test_weighed_check.py": [
+"tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
