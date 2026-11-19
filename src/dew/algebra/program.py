@@ -345,7 +345,7 @@ def _declared(window: jcore.Jaxpr, proven: terms.Region | None) -> dict[int, ter
 
 
 def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation, deriving: Hashable,
-             ranges: Mapping[int, float]) -> tuple[Rewrite, bool]:
+             ranges: Mapping[int, terms.Proven]) -> tuple[Rewrite, bool]:
     """`window`'s rewrite (`_region`, its inputs' `ranges`) and whether an earlier window derived it: one
     derivation for each structure (`structure`), its inputs' ranges and what else it reads (`deriving`,
     `_deriving`), the process's latest `WINDOWS_HELD` kept. The planner's candidates and a resumed run's
@@ -375,9 +375,11 @@ def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
         return {}
     chosen = []
     for out, root in zip(yielded, done.region.outputs, strict=True):
-        form = None if root is None else done.picked.get(terms.key(root))
         made_at = id(made_by[out])
-        if form is None or terms.key(form) == terms.key(root) or made_at in taken:
+        if root is None or made_at in taken:
+            continue
+        form = done.picked.get(terms.key(root))
+        if form is None or terms.key(form) == terms.key(root):
             continue
         if made_at not in {at for _, _, at in chosen}:
             chosen.append((out, form, made_at))
