@@ -1002,19 +1002,20 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Pa
     row of no key (a maximum of -inf: a padded row, a slice carrying no sink) resumes at the walk's start
     (`LEAST`), exact for every other."""
     m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
-    # A dropping call's sums hold its multiplier's power of two (`Forward.kept_power`), a state's the whole
-    # multiplier: divided by it, 2^-120 at a rate of 1 - 2^-32 flushed (the base review of 56a716c95, F2).
-    if spec.dropped != 1.0:
-        acc = acc * np.float32(spec.kept_power / spec.dropped)
+    # A dropping call's sums hold its multiplier's power of two at or above it (`Forward.kept_power`), a
+    # state's the multiplier: taken up to it by less than 2, after its scale, so none flushes (divided by a
+    # power below the multiplier, 2^-120 at a rate of 1 - 2^-53 did, the base review of 4e2eb287e, F2).
+    factor = np.float32(spec.kept_power / spec.dropped)
     if spec.base2:
         m = raw_maximum(m, spec.scale) if spec.raw else base2_maximum(m)
     m = jnp.maximum(m, LEAST)
     if not spec.headroom:
-        return Partial(acc, m, total)
-    bound = scale_of(Partial(acc, m, total)).bound
+        return Partial(acc * factor if spec.dropped != 1.0 else acc, m, total)
+    bound = scale_of(Partial(acc, m, total)).bound * factor
     exponent = exponent_of(bound)
-    return Partial(power2(acc, expand(-exponent, acc), reach=2 * 127), m,
-                   power2(total, -exponent, reach=2 * 127), Scale(exponent, bound))
+    acc = power2(acc, expand(-exponent, acc), reach=2 * 127)
+    return Partial(acc * factor if spec.dropped != 1.0 else acc, m, power2(total, -exponent, reach=2 * 127),
+                   Scale(exponent, bound))
 
 
 def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
@@ -1315,13 +1316,12 @@ def kept(weights: jax.Array, multiplier: jax.Array | None, power: float = 1.0) -
     return weights if multiplier is None else jnp.where(multiplier > 0, taken, 0.0)
 
 
-def kept_power(bound: float, weights) -> float:
-    """`Forward.kept_power` of a multiplier `bound` over weights narrowed to `weights`' dtype: the largest
-    power of two at most `bound` (`frexp`'s exponent less one), at most `2^min(maxexp - 1, BOUND_UNIT - 1 -
-    KEY_BINADES)`, so a lazy walk's weights (`lazy_binades`, which leaves the multiplier's binades) times it
-    stay within the dtype's largest binade (fp16's 2^15); 1 below 2."""
-    most = min(jnp.finfo(weights).maxexp - 1, BOUND_UNIT - 1 - KEY_BINADES)
-    return float(2.0 ** min(math.frexp(bound)[1] - 1, most))
+def kept_power(reach: float, weights) -> float:
+    """`Forward.kept_power` over weights narrowed to `weights`' dtype: the multiplier's `reach` (`Dropout`'s,
+    so no weight its product makes representable rounds to 0, as e^-17.34 at a rate of 127/256 did at the
+    power below, the base review of 4e2eb287e, F1), at most the dtype's largest binade (fp16's 2^15), which
+    lazy weights (`lazy_binades`) leave the multiplier's binades below."""
+    return min(reach, float(2.0 ** (jnp.finfo(weights).maxexp - 1)))
 
 
 def drops_in_place(dtype, bound: float) -> bool:
@@ -1383,14 +1383,14 @@ def rescaled(state: Partial, factor: jax.Array, weighed: Callable[[], jax.Array]
              ) -> Scale | None:
     """The rows' scale after a tile (`SCALED_WALK`), from the state's before it, the tile's maximum's
     `factor` `[bq]` and its rows' weighted values' bound `weighed()` (`weighed_reach`, at `2^-BOUND_UNIT`):
-    the bound taken by the factor with the tile's added, times the largest multiplier a dropping call's draw
-    takes a weight's product by (`drop`'s `bound`), and the exponent the binades it passes `2^HEADROOM` by,
-    never less than the state's; None where the walk holds no scale."""
+    the bound taken by the factor with the tile's added, times the most a dropping call's sums take a weight
+    by (`drop`'s `reach`), and the exponent the binades it passes `2^HEADROOM` by, never less than the
+    state's; None where the walk holds no scale."""
     before = state.scale
     if before is None:
         return None
     term = weighed()
-    bound = factor * before.bound + (term if drop is None else term * np.float32(drop.bound))
+    bound = factor * before.bound + (term if drop is None else term * np.float32(drop.reach))
     return Scale(jnp.maximum(before.exponent, exponent_of(bound)), bound)
 
 
@@ -2327,12 +2327,12 @@ def lazy_binades(natural: bool, *, compensated: bool, weights, bound: float = 1.
 def walk_reach(weights, drop: Dropout | None = None, *, natural: bool) -> float:
     """The most a walk's weight reaches, which every host's bound on an unscaled walk's sums takes
     (`may_scale`'s and `bounded_past`'s `amplified`: the template's, the decode's and Triton's walks alike):
-    a dropping call's largest multiplier (`Dropout.bound`) times a lazy walk's kept anchor's reach,
+    the most a dropping call's sums take a weight by (`Dropout.reach`) times a lazy walk's kept anchor's,
     `2^binades` (`lazy_binades`, 1 where it anchors exactly), a kept anchor's tile whose maximum is past it
     by the margin weighing its values up to it (two tiles at logits 0 and 112, values 2^110: the second's
     sums 2^136 against a bound of 2^117 that took every weight at most 1; Triton's walk at 14 nats over
     2^109 the same, the base review of a71e85d7a, F1)."""
-    multiplied = 1.0 if drop is None else drop.bound
+    multiplied = 1.0 if drop is None else drop.reach
     binades = lazy_binades(natural, compensated=False, weights=weights, bound=multiplied)
     return multiplied * (1.0 if binades is None else 2.0 ** binades)
 

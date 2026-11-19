@@ -78,11 +78,11 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     # D's and the anchor's products with dO, summed as the launch's issuer sums dP
     # (`gradient.off_anchor_delta`).
     # The forward's split sums hold its multiplier's power of two (`algebra.kept_power`, its values' dtype's).
-    bound = 1.0 if drop is None else drop.bound
+    bound, reach = (1.0, 1.0) if drop is None else (drop.bound, drop.reach)
     anchor, delta, chosen = gradient.split_delta(others, own, others_total, forward_total, state_total,
                                                 values, cotangent, key_index, shift,
                                                 rows=interpreted_rows if interpret else gradient.summed_rows,
-                                                dropped=bound, power=algebra.kept_power(bound, value.dtype))
+                                                dropped=bound, power=algebra.kept_power(reach, value.dtype))
     # The family's swizzled tiles hold whole rows (`Family.column_unit`).
     query, key, value, dout = (_columns(array, family.column_unit(array.dtype))
                                for array in (query, key, value, dout))
