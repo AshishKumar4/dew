@@ -56,8 +56,8 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed(target), jax.default_matmul_precision(flow.precision):
-        dew = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
-        reference = [route for kind in model_flows.KINDS
+        dew = {kind: _routes(programs[f"{kind} dew"]) for kind in flow.kinds}
+        reference = [route for kind in flow.kinds
                      for route in _routes(programs[f"{kind} reference"], reference=True)]
         model_flows.held_routes(flow, dew, target)
         model_flows.held_reference(flow, reference)
@@ -73,7 +73,7 @@ def test_a_training_step_on_the_templates_plain_jax_mainloop_does_not_reach_its_
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed("sm90"), jax.default_matmul_precision(flow.precision):
-        native = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
+        native = {kind: _routes(programs[f"{kind} dew"]) for kind in flow.kinds}
         with generation.chosen(attention_mainloop="portable"):
             forced = _routes(programs["train dew"])
     model_flows.held_routes(flow, native, "sm90")
@@ -112,11 +112,11 @@ def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
     this CPU, a node's for its GPU): each program's first draw's truth held to float64 (check 1's
     `_of_float64`, a narrow one refused) and every program its sites' truths and terms take compiled into the
     store, at the fewest seeds check 1 takes (`parity.FEWEST_SEEDS`)."""
-    fewest = dict.fromkeys(model_flows.KINDS, FEWEST_SEEDS)
-    flow = dataclasses.replace(model_flows.flow_named(name), seeds=fewest)
+    named = model_flows.flow_named(name)
+    flow = dataclasses.replace(named, seeds=dict.fromkeys(named.kinds, FEWEST_SEEDS))
     monkeypatch.setenv(tier_wire.TRUTHS, str(store))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
-    for kind in model_flows.KINDS:
+    for kind in flow.kinds:
         model_flows.judge(flow, {}, kind)
 
 
@@ -167,6 +167,30 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     filed = json.loads(needs.read_text())
     stated = json.loads((store / model_flows.NEED).read_text())["programs"]
     assert (filed["unit"], filed["programs"]) == ("a selective scan's unit", stated)
+
+
+def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monkeypatch):
+    """A flow whose programs hold convolutions (the UNet denoiser's), prepared over a compile-only A100's
+    topology, prepares none of them: a convolution compiled without its GPU leaves its algorithm to run
+    time (`report.CompiledOnDevice`), so its store names each program its run compiles on its GPU
+    (`model_flows.ON_DEVICE`) and holds none of them, its truths compiled all the same."""
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = store / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.TRUTHS, str(store / "tier"))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    monkeypatch.setenv(tier_wire.UNIT, "a UNet's unit")
+    flow = model_flows.flow_named("UNet denoiser fp32")
+    assert model_flows.prepared_apart(flow) is not None
+    held = model_flows.store_of(flow)
+    on_device = json.loads((held / model_flows.ON_DEVICE).read_text())["programs"]
+    assert sorted(on_device) == sorted(f"{kind} {arm}" for kind in flow.kinds for arm in ("dew", "reference"))
+    assert not (held / "dew.programs").exists() and not (held / "reference.programs").exists()
+    assert len(list((held / "truths").iterdir())) == len(flow.kinds)
 
 
 def _site(salt: int = 5461):
