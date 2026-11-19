@@ -168,9 +168,10 @@ class DPOObjective(TokenScorer):
         width = inputs + self.finals
         # The batch is windows of packed pairs, two halves' tokens a window, or a pair a row, its halves
         # a window each (`segments=1`); windows of pairs a caller holds are as wide as their pairs read
-        # (`preferences.windows`), at most this.
-        self.inputs = InputSpec(sample=Field(IDS_KEY, (2, width)) if segments == 1
-                                else Field(IDS_KEY, (width,), variable_axes=(0,)))
+        # (`preferences.windows`), at most this. Its ids index the model's embedding table, so a batch's id
+        # outside it is refused before scoring, as an LM run's is (`Field.indexing`, row 9018).
+        self.inputs = InputSpec(sample=Field.indexing(IDS_KEY, (2, width), self.model) if segments == 1
+                                else Field.indexing(IDS_KEY, (width,), self.model, variable_axes=(0,)))
         self.segments = segments
 
     @property
