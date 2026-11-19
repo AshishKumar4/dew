@@ -33,10 +33,12 @@ This page is generated from the maintainers' findings ledger as each change land
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
 - A decode step's query and output pass through grouped_rows' transpose ([B,T,KV,G,D] to [B,T,G,KV,D] and back, attention.py:1113-1128) and a pad to the launch's…. [7926]
 - Attention tests to the bible's §6 and §7 test rules. [8437]
-- Time to first step: the compile path's re-derivations. [8612]
 - Certification's stored verdict is keyed by Dew's whole package digest (report._verdict_key: package_digest beside the launch identity, config, direction, the…. [8650]
 - Tests/ring_protocol.py:422-435 reads gathered.Gathers' bodies by their fields (fill, fill_wait, read events written by hand) and test_ring_protocol.py:557-568…. [8657]
 - Tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm90-gated forward ...]. [8669]
+- Tests/ring_protocol.py:838-839 accepts a read of an entries parity whose contents are a stale step's. [8678]
+- Tests/test_gemm_gather.py:200-242 (the strided-table gathers kernel) duplicates tests/test_ring_protocol.py:382-424's gathered walk fixture. [8679]
+- Tests/test_gemm_paired.py:649-669 passes a two-launch chained gradient to ring_protocol.programs, which explores only the first mpmd_map. [8680]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -90,6 +92,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
+- Objective.init and Trainer.initial_state, called outside a trace, run the model's draw eagerly, so every operation compiles alone. [8682]
 
 ## Data
 
