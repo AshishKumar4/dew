@@ -24,7 +24,7 @@ import tier_wire
 from arm_forms import WITHOUT_YNN, without_ynn
 from process_support import relayed
 from reference_error import ahead_arm, assert_as_exact, over_windows, run_to_run, windows
-from truths_ahead import UNPREPARED, MissingTruth, compiled_truths
+from truths_ahead import AT_RUN, UNPREPARED, MissingTruth, compiled_truths
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
@@ -120,6 +120,61 @@ def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
         model_flows.judge(flow, {}, kind)
 
 
+def test_a_packed_flows_exact_banks_are_its_banks_values():
+    """A packed flow's truths read each bank's exact matrix from its bits (`model_flows.exact_banks`, by
+    integer arithmetic and casts, its products in the truth's float64): each value its bfloat16 decode (code
+    times block scale over 2^8, exact) times its factor (2^8 times its expert's scale), multiplied on the
+    host in float64, where their product is exact, bit for bit."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.nn.kernels.formats import NvFp4
+    from dew.quantization import QUANTIZATION
+
+    flow = next(flow for flow in model_flows.FLOWS if isinstance(flow, model_flows.Flow) and flow.packed)
+    drawn = flow.taken(flow.model.init(jax.random.key(0), *flow.initialized()))
+    banks = flatten_dict(dict(drawn[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
+
+    def widened(leaf):
+        # As check 1 widens a draw's floats for its truth.
+        return jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+
+    with jax.enable_x64(new_val=True):
+        exact = flatten_dict(model_flows.exact_banks(jax.tree.map(widened, drawn))[QUANTIZATION])
+        assert exact.keys() == banks.keys()
+        for path, matrix in exact.items():
+            bank = banks[path]
+            want = (np.asarray(bank.decoded(), np.float64)
+                    * np.asarray(bank.factor, np.float64)[..., None, None])
+            assert matrix.dtype == jnp.float64
+            np.testing.assert_array_equal(np.asarray(matrix), want)
+
+
+def test_a_packed_flows_training_moves_its_parameters_and_never_its_banks():
+    """A flow whose experts are packed NVFP4 banks (`Flow.packed`, row 8492) trains its parameters alone: two
+    SGD steps over its training step's gradients, on the CPU's portable route, move its parameters and leave
+    every bank's words and scales bit for bit as drawn, the banks frozen beside them as a packed load holds
+    them (`model_flows.packed_variables`)."""
+    from dew.quantization import QUANTIZATION
+
+    flow = next(flow for flow in model_flows.FLOWS if isinstance(flow, model_flows.Flow) and flow.packed)
+    flow = dataclasses.replace(flow, rows=1, length=32, prefill=24)
+    drawn = flow.taken(flow.model.init(jax.random.key(0), *flow.initialized()))
+    # The flow's own training step (`programs_of`'s), its Dew arm's named kernel a GPU's alone.
+    step = jax.jit(flow.program("train", flow.model))
+    ids = np.random.default_rng(0).integers(0, flow.vocab, (flow.rows, flow.length), np.int32)
+    trained = drawn
+    for _ in range(2):
+        _, gradients = step(trained, ids)
+        assert jax.tree.structure(gradients) == jax.tree.structure(trained["params"])
+        moved = jax.tree.map(lambda held, gradient: held - 0.1 * gradient, trained["params"], gradients)
+        assert any(not np.array_equal(np.asarray(held), np.asarray(after)) for held, after in
+                   zip(jax.tree.leaves(trained["params"]), jax.tree.leaves(moved), strict=True))
+        trained = {**trained, "params": moved}
+        for held, kept in zip(jax.tree.leaves(drawn[QUANTIZATION]), jax.tree.leaves(trained[QUANTIZATION]),
+                              strict=True):
+            assert np.array_equal(np.asarray(kept), np.asarray(held))
+
+
 @pytest.mark.parametrize("lane", [True, False], ids=["the lane's", "a user's"])
 def test_a_flow_holds_in_a_process_of_its_variant_alone(lane):
     """A flow holds only in a process opened under its variant's XLA flags and matmul precision
@@ -172,8 +227,10 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
 def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monkeypatch):
     """A flow whose programs hold convolutions (the UNet denoiser's), prepared over a compile-only A100's
     topology, prepares none of them: a convolution compiled without its GPU leaves its algorithm to run
-    time (`report.CompiledOnDevice`), so its store names each program its run compiles on its GPU
-    (`model_flows.ON_DEVICE`) and holds none of them, its truths compiled all the same."""
+    time (`report.CompiledOnDevice`), so its store names each program its run compiles on its GPU by the
+    refusal's reason (`model_flows.ON_DEVICE`) and holds none of them, its truths compiled all the same;
+    its run names each in the run's summary as its prepare declared (`truths_ahead.AT_RUN`), as an at-run
+    site's truths are (row 8636)."""
     from jax.experimental import topologies
 
     from dew.nn.kernels.generation import compile_only_gpus
@@ -189,8 +246,13 @@ def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monk
     held = model_flows.store_of(flow)
     on_device = json.loads((held / model_flows.ON_DEVICE).read_text())["programs"]
     assert sorted(on_device) == sorted(f"{kind} {arm}" for kind in flow.kinds for arm in ("dew", "reference"))
+    assert all("convolution compiled without its GPU" in why for why in on_device.values())
     assert not (held / "dew.programs").exists() and not (held / "reference.programs").exists()
     assert len(list((held / "truths").iterdir())) == len(flow.kinds)
+    assert sorted(model_flows.loaded(flow)) == sorted(on_device)
+    named = json.loads((held / "truths" / AT_RUN).read_text())["reasons"]
+    assert sorted(reason["error"] for reason in named) == sorted(
+        f"{flow.name} {name}: {why}" for name, why in on_device.items())
 
 
 def _site(salt: int = 5461):
@@ -413,6 +475,8 @@ def test_a_convolution_sites_truths_and_arms_compile_on_its_gpu_in_its_run(tmp_p
     sites = [json.loads(site.read_text()) for site in store.glob("*/site.json")]
     assert sorted((site["arms"], site["host"], "at_run" in site) for site in sites) == [
         (False, False, True), (True, False, True)], sites
+    # Their memory read offline, by which the lane sizes the run's worker (`compiled_memory`).
+    assert all(site["memory"] for site in sites), sites
     with compiled_truths(store, prepare=False, stamp="a"):
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
     # Its truths and its two arms, each named once.
@@ -913,7 +977,7 @@ def test_a_site_whose_truths_alone_are_at_run_computes_its_reference_as_its_trut
 
     def refusing_truths(store, label, programs, held, **options):
         # A choice its GPU makes, which no compile without that GPU holds, in its truths' programs alone.
-        if programs and not options.get("arms", False):
+        if programs and not options.get("arms", False) and options.get("at_run") is None:
             raise report.CompiledOnDevice(jax.jit(lambda x: x).lower(np.zeros(1, np.float32)), ["truth"])
         return real(store, label, programs, held, **options)
 

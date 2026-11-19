@@ -1375,11 +1375,11 @@ def template_call(query, key, value, g, beta, state=None, starts=None, firsts=No
     return base.call((template.MOSAIC,), *arguments, **keywords)
 
 
-def _launched_template(query, key, value, g, beta, state, skip, entry, turning, *, starts, firsts, forked,
-                       **options):
-    """`template_rule`'s `(output, final memory)` with its operands first (`turned.call`'s launch), a forked
-    call's entry write `entry` and load rotation `turning` its documents' (`Forked.entry`,
-    `Forked.turning`)."""
+def _launched_template(context, query, key, value, g, beta, state, skip, entry, turning, **options):
+    """`template_rule`'s `(output, final memory)` with its operands first (`turned.call`'s launch), its call's
+    `context` `(starts, firsts, forked)` an operand too, a forked call's entry write `entry` and load rotation
+    `turning` its documents' (`Forked.entry`, `Forked.turning`)."""
+    starts, firsts, forked = context
     if forked is not None:
         forked = dataclasses.replace(forked, entry=entry, turning=turning)
     return template_rule(query, key, value, g, beta, state, starts, firsts, skip, forked=forked, **options)
@@ -1389,10 +1389,9 @@ def _on_template(query, key, value, g, beta, state, skip, turn, *, starts, first
                  apart: int, **options):
     """The chunked op's `(output, final memory)` on the template (`template_rule`, a turned call's through
     `_turned_or_plain`)."""
-    launch = functools.partial(_launched_template, starts=starts, firsts=firsts, forked=forked, scale=scale,
-                               apart=apart, **options)
+    launch = functools.partial(_launched_template, scale=scale, apart=apart, **options)
     return _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, starts=starts,
-                            forked=forked, scale=scale, group=max(apart, 1))
+                            firsts=firsts, forked=forked, scale=scale, group=max(apart, 1))
 
 
 def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, turn, *, starts, firsts, forked,
@@ -1400,37 +1399,40 @@ def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, tur
     """The chunked op's `(output, final memory)` on the portable math (`_portable`, its chunk `held_chunk`'s
     under the delta rule; a turned call's through `_turned_or_plain`)."""
     size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
-    launch = functools.partial(_portable_launch, hooks, Tiles(size), starts=starts, firsts=firsts,
-                               scale=scale, dtype=dtype, forked=forked, own=own)
+    launch = functools.partial(_portable_launch, hooks, Tiles(size), scale=scale, dtype=dtype, own=own)
     return _turned_or_plain(launch, query, key, value, g, beta, state, None, turn, starts=starts,
-                            forked=forked, scale=scale, group=hooks.ranks if hooks.reads == 'apart' else 1)
+                            firsts=firsts, forked=forked, scale=scale,
+                            group=hooks.ranks if hooks.reads == 'apart' else 1)
 
 
-def _portable_launch(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, skip, entry,
-                     turning, *, starts, firsts, scale: float, dtype, forked, own):
-    """`_portable`'s `(output, final memory)` with its operands first (`turned.call`'s launch), a forked
-    call's entry write `entry` and load rotation `turning` its documents' (`Forked.entry`,
-    `Forked.turning`), the skip the caller's."""
+def _portable_launch(hooks: recurrence.Hooks, tiles: Tiles, context, query, key, value, g, beta, state, skip,
+                     entry, turning, *, scale: float, dtype, own):
+    """`_portable`'s `(output, final memory)` with its operands first (`turned.call`'s launch), its call's
+    `context` `(starts, firsts, forked)` an operand too, a forked call's entry write `entry` and load rotation
+    `turning` its documents' (`Forked.entry`, `Forked.turning`), the skip the caller's."""
     del skip
+    starts, firsts, forked = context
     if forked is not None:
         forked = dataclasses.replace(forked, entry=entry, turning=turning)
     return _portable(hooks, tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
                      dtype=dtype, forked=forked, own=own)
 
 
-def _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, *, starts, forked, scale: float,
-                     group: int):
-    """`launch(query, key, value, g, beta, state, skip, entry, turning)`'s `(output, final memory)`, a
+def _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, *, starts, firsts, forked,
+                     scale: float, group: int):
+    """`launch(context, query, key, value, g, beta, state, skip, entry, turning)`'s `(output, final
+    memory)`, its call's arrays `context` `(starts, firsts, forked)` passed in, never closed over (a turned
+    call's rule a `generation.linear_tangent`, whose maps take no traced value but their operands): a
     kernel's unturned chunked op, a forked call's entry write its documents' (`Forked.entry`); a turned
-    call's (`turn`
-    given, `Hooks.turns`) every kernel's alike, its keys and queries turned into its documents' frames, a
-    value head's each (its turns'), a forked one's documents' entry keys too, and its turns' gradient in the
-    crossing form (`templates.recurrence.turned`): the kernel's own speed and its turns' gradient exact."""
+    call's (`turn` given, `Hooks.turns`) every kernel's alike, its keys and queries turned into its
+    documents' frames, a value head's each (its turns'), a forked one's documents' entry keys too, and its
+    turns' gradient in the crossing form (`templates.recurrence.turned`): the kernel's own speed and its
+    turns' gradient exact."""
     from .templates.recurrence import turned
 
     entry = None if forked is None else forked.entry
     if turn is None:
-        return launch(query, key, value, g, beta, state, skip, entry, None)
+        return launch((starts, firsts, forked), query, key, value, g, beta, state, skip, entry, None)
     if forked is not None and forked.adds is not None:
         raise ValueError("a turned call's documents add no second slot (`Chunk.adds`, row 8284): its turns' "
                          "gradient composes each document's frames from the one slot it loads "
@@ -1441,8 +1443,11 @@ def _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, *, s
         entry = (jnp.repeat(entry[0], heads // entry[0].shape[3], axis=3), *entry[1:])
     documents = None if forked is None else (forked.firsts, forked.loads, forked.stores)
     held = 0 if forked is None else forked.held
+    # The call's arrays its launch reads, the entry write and rotation its own operands (`turned.call`'s).
+    unrotated = None if forked is None else dataclasses.replace(forked, entry=None, turning=None)
+    context = (starts, firsts, unrotated)
     return turned.call(launch, query, key, value, g, beta, state, skip, turn, starts, scale=scale,
-                       group=group, documents=documents, held=held, entry=entry)
+                       group=group, documents=documents, held=held, entry=entry, context=context)
 
 
 def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, forked: Forked | None,

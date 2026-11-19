@@ -1242,11 +1242,14 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
 
 
 def selective_decay(step, rate, kept=None):
-    """Mamba's selective scan's decay of a state by a token, `exp2(dt rate)` of its rate in base 2 (`A
-    log2(e)`), zero at a document's first token (`kept` 0, where given): the token and adjoint functions'
+    """Mamba's selective scan's decay of a state by a token, `exp(dt A)` of its `rate` `A`, as `exp2((dt A)
+    log2(e))`, zero at a document's first token (`kept` 0, where given): the one decay form of the scan's
+    every path (the template's forward and backward, the portable scan), the token and adjoint functions'
     `a` (`selective_token`, `selective_adjoint`), which the scan's schedules take a token or a block of
-    tokens at a time (`templates.recurrence.selective`)."""
-    decay = jnp.exp2(step * rate)
+    tokens at a time (`templates.recurrence.selective`). The rate is taken to base 2 after the step
+    multiplies it, so a rate past float32's range times a padded token's zero step is zero, not `0 * -inf`
+    (row 8491: A = -3 2^126 made `A log2(e)` -inf and a padded token's decay NaN)."""
+    decay = jnp.exp2((step * rate) * LOG2_E)
     return decay if kept is None else decay * kept
 
 
@@ -1272,11 +1275,11 @@ def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rat
     """One state's gradients of the selective scan through a token, from the cotangent the token's state
     takes `cotangent` (`g_t = C_t dy_t + a_{t+1} g_{t+1}`, its read and what the tokens after pass back),
     the state before it `before` (`h_{t-1}`), its `decay` (`selective_decay`'s), `written` (`dt x B`), and the
-    token's `step`, `value`, `b`, `dy` and the state's `rate` (base 2): `(dx, ddt, dB, dC, drate)`, the
-    rate's a token's term its schedule sums. `exp2(dt rate)`'s derivative in `dt` is `rate ln(2)` times
-    it, in the rate `dt ln(2)` (taken in `drate`'s sum's `ln(2)` where the rate's own is `A log2(e)`)."""
+    token's `step`, `value`, `b`, `dy` and the state's `rate` `A`: `(dx, ddt, dB, dC, drate)`, the rate's
+    a token's term its schedule sums. `exp(dt A)`'s derivative in `dt` is `A` times it, in `A` `dt` times
+    it."""
     through = cotangent * before * decay
-    return (cotangent * b * step, cotangent * b * value + through * (rate * math.log(2.0)),
+    return (cotangent * b * step, cotangent * b * value + through * rate,
             cotangent * step * value, dy * (decay * before + written), through * step)
 
 

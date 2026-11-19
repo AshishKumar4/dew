@@ -1266,17 +1266,44 @@ def at_run_time(lowered: jax.stages.Lowered) -> bool:
     devices = target_devices(lowered)
     if DEVICELESS_CONVOLUTION_PICKS or not devices or not deviceless(next(iter(devices))):
         return False
+    return any_op(lowered, lambda op: op.name == "stablehlo.convolution")
+
+
+def any_op(lowered: jax.stages.Lowered, holds: Callable[[ir.Operation], bool]) -> bool:
+    """Whether an operation of `lowered`'s StableHLO `holds`, its walk stopped at the first."""
     found = False
 
     def visit(op: ir.Operation) -> ir.WalkResult:
         nonlocal found
-        found = op.name == "stablehlo.convolution"
+        found = holds(op)
         return ir.WalkResult.INTERRUPT if found else ir.WalkResult.ADVANCE
 
     module = lowered.compiler_ir("stablehlo")
     assert module is not None, "a lowered program states its StableHLO module"
     module.operation.walk(visit)
     return found
+
+
+def left_at_run(compiled: jax.stages.Compiled) -> bool:
+    """Whether `compiled` holds a cuDNN convolution whose algorithm its compile left to run time (its backend
+    config's `algo_id` -1), as every compile without the GPU leaves it (`DEVICELESS_CONVOLUTION_PICKS`):
+    an executable compiled ahead that its load must not take (`dew.training.ahead.AheadOfTime.at_run`),
+    each module's instructions read through XLA's own schema (`jax.extend.xla.instructions`) and a call's
+    kind by the one table of custom call targets (`instrumentation.custom_call_kind`)."""
+    from jax.extend import xla
+
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    executable = compiled.runtime_executable()
+    for module in [] if executable is None else executable.hlo_modules():
+        for read in xla.instructions(module):
+            proto = read.proto
+            if read.opcode != "custom-call" or custom_call_kind(proto.custom_call_target) != "convolution":
+                continue
+            config = json.loads(proto.backend_config or "{}")
+            if config.get("cudnn_conv_backend_config", {}).get("algorithm", {}).get("algo_id") == "-1":
+                return True
+    return False
 
 
 def target_devices(lowered: jax.stages.Lowered) -> Sequence | None:
@@ -1340,13 +1367,27 @@ def xla_compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
     devices = target_devices(lowered)
     if devices is not None and not offline(devices) and at_run_time(lowered):
         raise CompiledOnDevice(lowered)
+    compiled_with = targeted(lowered, options)
+    # Its options as JAX's persistent cache keys its compile by them (tests/cache_keys.py reads them),
+    # written only where the log is read.
+    _log.debug("a compile's options: %s", Said(compiled_with))
     try:
         with compile_slots().held(background=background):
-            return lowered.compile(targeted(lowered, options))
+            return lowered.compile(compiled_with)
     except jax.errors.JaxRuntimeError as error:
         if untuned(error.error_code_string, str(error)):
             raise Untuned(str(error), lowered) from error
         raise
+
+
+class Said:
+    """A compile's options as a log line writes them, made only where the line is written (`str`)."""
+
+    def __init__(self, options: jax.stages.CompilerOptions | None):
+        self.options = options
+
+    def __str__(self) -> str:
+        return json.dumps(sorted((self.options or {}).items()), default=str)
 
 
 CUB_NO_FALLBACK = 3
@@ -1458,32 +1499,27 @@ def triton_wrong(lowered: jax.stages.Lowered, target: generation.GpuTarget) -> b
     from dew.nn.precision import FP32_PRODUCTS, declares_fp32_products
     from dew.nn.programs import algorithm_arithmetic, dot_arithmetic
 
-    wrong = False
-
-    def visit(op: ir.Operation) -> ir.WalkResult:
-        nonlocal wrong
+    def wrong(op: ir.Operation) -> bool:
         if op.name != "stablehlo.dot_general":
-            return ir.WalkResult.ADVANCE
+            return False
         types = [ir.RankedTensorType(operand.type).element_type for operand in list(op.operands)[:2]]
         if any(isinstance(each, ir.IntegerType) and ir.IntegerType(each).width == 8 for each in types):
-            wrong = not target.int8_triton_gemm
-        elif all(isinstance(each, ir.F32Type) for each in types):
-            attributes = op.attributes
-            if "precision_config" in attributes:
-                # Each operand's precision as JAX's enum names it, the pair read as a run's precision is.
-                lhs, rhs = (jax.lax.Precision[stablehlo.PrecisionAttr(each).value]
-                            for each in ir.ArrayAttr(attributes["precision_config"]))
-                wrong = declares_fp32_products((lhs, rhs))
-            if not wrong and "algorithm" in attributes:
-                stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
-                wrong = any(stated == dot_arithmetic(name, jnp.float32, jnp.float32)
-                            for name in FP32_PRODUCTS)
-        return ir.WalkResult.INTERRUPT if wrong else ir.WalkResult.ADVANCE
+            return not target.int8_triton_gemm
+        if not all(isinstance(each, ir.F32Type) for each in types):
+            return False
+        attributes = op.attributes
+        if "precision_config" in attributes:
+            # Each operand's precision as JAX's enum names it, the pair read as a run's precision is.
+            lhs, rhs = (jax.lax.Precision[stablehlo.PrecisionAttr(each).value]
+                        for each in ir.ArrayAttr(attributes["precision_config"]))
+            if declares_fp32_products((lhs, rhs)):
+                return True
+        if "algorithm" in attributes:
+            stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
+            return any(stated == dot_arithmetic(name, jnp.float32, jnp.float32) for name in FP32_PRODUCTS)
+        return False
 
-    module = lowered.compiler_ir("stablehlo")
-    assert module is not None, "a lowered program states its StableHLO module"
-    module.operation.walk(visit)
-    return wrong
+    return any_op(lowered, wrong)
 
 
 def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]]

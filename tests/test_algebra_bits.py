@@ -79,6 +79,21 @@ def test_nvfp4_words_stored_in_the_forms_layout_decode_to_their_codes_in_order()
     np.testing.assert_array_equal(got, expected)
 
 
+def test_a_decoded_value_restored_wide_is_its_float32_restoring_widened():
+    """`bits.restored` in float64, a float64 truth's, is its float32 restoring widened exactly (NumPy's
+    widening on the host, a float32 subnormal kept), bit for bit, at every 16-bit pattern, a NaN as a NaN:
+    one definition of the decoded value at every dtype (row 8661)."""
+    patterns = jnp.arange(1 << 16, dtype=jnp.uint32)
+    narrow = np.asarray(jax.jit(bits.restored)(patterns))
+    with jax.enable_x64(new_val=True):
+        wide = np.asarray(jax.jit(lambda pattern: bits.restored(pattern, jnp.float64))(patterns))
+    assert wide.dtype == np.float64
+    numbers = ~np.isnan(narrow)
+    np.testing.assert_array_equal(np.isnan(wide), ~numbers)
+    np.testing.assert_array_equal(wide[numbers].view(np.uint64),
+                                  narrow[numbers].astype(np.float64).view(np.uint64))
+
+
 def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
     """An NVFP4 tile (`nvfp4_decoded`): every code in every place of a word, under E4M3 block scales from the
     least subnormal to the largest, decodes to the code times its block's scale over `NVFP4_OWED`, exactly,
@@ -99,6 +114,29 @@ def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
     block = np.repeat(np.asarray(scales.astype(jnp.float32), np.float64), 16, axis=0)
     np.testing.assert_array_equal(np.asarray(decoded.astype(jnp.float32), np.float64) * bits.NVFP4_OWED,
                                   values * block)
+
+
+def test_a_block_scales_declared_decode_is_the_formats_on_every_code():
+    """The block scale's declared decode (`bits.E4M3_SCALE`, a fixed layout), its checked-in form proven
+    (`bits.proven`) and no dearer than the search's, restored by its one rule (`bits.scales_decoded`), is
+    the format's integer decode (`bits.decoded`) on every E4M3 code, bit for bit under a jit: subnormal
+    scales, both zeros and the NaN code (read as 480) among them."""
+    bits.proven(bits.E4M3_SCALE, bits.E4M3_SCALE_FORM)
+    assert bits.E4M3_SCALE_FORM.price <= bits.synthesized(bits.E4M3_SCALE).price
+    codes = jnp.arange(256, dtype=jnp.uint32)
+    declared = jax.jit(bits.scales_decoded)(codes)
+    integer = jax.jit(lambda codes: bits.decoded(codes, bits.E4M3))(codes)
+    np.testing.assert_array_equal(np.asarray(declared).view(np.uint32), np.asarray(integer).view(np.uint32))
+
+
+def test_a_forms_version_is_its_stored_layouts():
+    """A form's version (`BitForm.version`, what a packed checkpoint records) is its encoder's: forms of one
+    encoder share it whatever their steps, and another encoder's differs, so words stored in another
+    layout are told apart from the checked-in form's."""
+    form = bits.NVFP4_BFLOAT16_FORM
+    restepped = dataclasses.replace(form, steps=form.steps[:-1])
+    reencoded = dataclasses.replace(form, encoder=(*form.encoder[1:], form.encoder[0]))
+    assert restepped.version == form.version != reencoded.version
 
 
 def test_an_fp8_decode_reads_back_every_finite_code_in_every_place():
@@ -233,6 +271,7 @@ FORMS = {
     "encode-e4m3": lambda: bits.encode_form(bits.E4M3),
     "encode-e5m2": lambda: bits.encode_form(bits.E5M2),
     "encode-e2m1": lambda: bits.encode_form(bits.E2M1),
+    "e4m3-scale": lambda: bits.E4M3_SCALE_FORM,
 }
 """Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx`): a rotation, left
 and right shifts on either pipe, and a mask of one value and of two values' XOR; and an encode's (every

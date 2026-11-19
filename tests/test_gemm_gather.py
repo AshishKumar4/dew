@@ -266,13 +266,16 @@ issuing warpgroup's load warps)."""
 
 def a_gathered_ring_reads_a_strided_tables_entries() -> None:
     """A Blackwell's gathered ring (`gathered.Committed`: its load warps' gathers, each step's table entries
-    read a step ahead) whose table is column zero of a row-major int32 `[128, 2]` table, every row `[0, 1]`
-    (a view of stride two, `_strided_gathers`): every gathered row is token 0's. Two steps of 64 gathered
-    rows times a plain block, on par with the product of its rows gathered first (check 1); entries read at
-    stride one gather token 1's for half the rows (base review ae8a242ed F1). On this GPU (test_gpu_gemm's
-    Blackwell cell): its load warps' code runs on none other."""
+    read a step ahead) whose table is column zero of a row-major int32 `[128, 2]` table, the first step's
+    rows `[0, 1]` and the second's `[1, 0]` (a view of stride two, `_strided_gathers`): the first step
+    gathers token 0's rows, the second token 1's. Two steps of 64 gathered rows times a plain block, on par
+    with the product of its rows gathered first (check 1); entries read at stride one gather the other token's
+    for half the rows (base review ae8a242ed F1), and the first step's entries read again for the second
+    gather token 0's (base review 51d5c0f0a F2). On this GPU (test_gpu_gemm's Blackwell cell): its load
+    warps' code runs on none other."""
     (height, width), steps, rows = STRIDED_BLOCK, 2, 128
-    table = jnp.asarray(np.tile([0, 1], (steps * height, 1)), jnp.int32)
+    table = jnp.asarray(np.concatenate([np.tile([0, 1], (height, 1)), np.tile([1, 0], (height, 1))]),
+                        jnp.int32)
 
     def gathered(tokens, plain):
         return _strided_gathers(tokens, table, plain)

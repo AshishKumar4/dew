@@ -695,7 +695,9 @@ register(Rules.declared("contracted", "exact", _contracted(),
                         f"docs/design/algebra.md §6.5; the scaled softmax's maximum, ledger 3721; "
                         f"{_MEASURED}", aid=True))
 register(Rules.declared("stable", "bounded", _stable(),
-                        "docs/design/algebra.md §1.5; the log-sum-exp fold, feat/attention-derived 12f9398ba",
+                        "docs/design/algebra.md §1.5; the log-sum-exp fold, feat/attention-derived "
+                        "12f9398ba; a dev-time set, each form it proposes measured from the float64 truth "
+                        "before it is taken (dew.algebra.error.choose)",
                         dev=True))
 register(Rules.declared("linear", "reorders", _linear(),
                         "docs/design/algebra.md §1; ledger 1308; measured M-DC-3 (six GPU flows' training "

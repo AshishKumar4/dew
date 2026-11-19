@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import scan
-from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
+from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels.chunked_launch import entry_write
 from dew.nn.precision import at_least_fp32, compensated_add
 
@@ -102,30 +102,31 @@ def _prefix(values, restarts) -> tuple[jax.Array, jax.Array]:
 
 
 def call(launch: Callable, query, key, value, g, beta, state, skip, turn, starts, *, scale: float,
-         group: int, documents=None, held: int = 0, entry=None) -> tuple[jax.Array, jax.Array]:
-    """`launch(query, key, value, g, beta, state, skip, entry, turning)`'s `(output, final memory)` (the
-    template's,
-    its memories `[B, H, K, V]`) of a call whose state turns its first `A` key pairs each token by `turn` `[B,
-    T, H, A]` (`recurrence.Hooks.turns`), `starts` `[B, T]` each document's first token or None, a readout
-    `apart` from its token's `group` of writes where `group` is past one (`mainloop.Call.apart`): each
+         group: int, documents=None, held: int = 0, entry=None,
+         context=None) -> tuple[jax.Array, jax.Array]:
+    """`launch(context, query, key, value, g, beta, state, skip, entry, turning)`'s `(output, final memory)`
+    (the template's, `context` the arrays it reads beside them, an operand of the rule, closed over by none of
+    its maps; its memories `[B, H, K, V]`) of a call whose state turns its first `A` key pairs each token by
+    `turn` `[B, T, H, A]` (`recurrence.Hooks.turns`), `starts` `[B, T]` each document's first token or None, a
+    readout `apart` from its token's `group` of writes where `group` is past one (`mainloop.Call.apart`): each
     document read in its own last token's frame, its queries and keys turned by their own turns less its
     last's (`frames`, `_in_last_frame`), in at least fp32 and rounded once to their dtype, and the memory it
     enters turned in by minus its own turns, so a document's arithmetic reads no other's turns and the final
     memory each leaves is in its own last frame, the recurrence's. A forked call (`documents`, its `(firsts,
     loads, stores)` `[B, D]` and `held` stored slots, `chunked_launch.Forked`'s; `state` its table's given
-    memories `[B, S', H, K, V]`; `entry` its documents' entry writes `(key [B, D, R, H, K], value [B, D, R,
-    H, V], weight [B, D, H])` or None) has its walk turn each memory a document takes up as it loads it
-    (`launch`'s `turning`, `chunked_launch.Forked.turning`) and its entry keys with it. Its gradient takes
-    the launch's through the frames, its cotangents halved into the launch and its gradients doubled out
-    (exact), so a gradient's components in a frame, up to its norm, stay finite where the true frame's
-    are; its turns' in the crossing form (`turn_gradient`) from frames each root's first token composes
-    (`_forked_frames`), its final memory's cotangent turned into them."""
+    memories `[B, S', H, K, V]`; `entry` its documents' entry writes `(key [B, D, R, H, K], value [B, D, R, H,
+    V], weight [B, D, H])` or None) has its walk turn each memory a document takes up as it loads it
+    (`launch`'s `turning`, `chunked_launch.Forked.turning`) and its entry keys with it. Its gradient takes the
+    launch's through the frames, its cotangents halved into the launch and its gradients doubled out (exact),
+    so a gradient's components in a frame, up to its norm, stay finite where the true frame's are; its turns'
+    in the crossing form (`turn_gradient`) from frames each root's first token composes (`_forked_frames`),
+    its final memory's cotangent turned into them."""
     if documents is not None:
         # A forked call's documents begin at their first slots (`documents`' `firsts`), whatever `starts` it
         # gave (base review fbb1c2f71 F4: a call giving its firsts alone read as one document).
         starts = _first_tokens(documents[0], value.shape[1])
-    return _turned(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
-                   documents)
+    rule = _turned(launch, scale, group, held)
+    return rule(query, key, value, g, beta, state, skip, entry, turn, starts, documents, context)
 
 
 def _first_tokens(firsts, length: int) -> jax.Array:
@@ -137,10 +138,10 @@ def _first_tokens(firsts, length: int) -> jax.Array:
 
 
 def _turned_primal(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
-                   documents) -> tuple[jax.Array, jax.Array]:
+                   documents, context) -> tuple[jax.Array, jax.Array]:
     del scale, group, held
     framed, turning, _ = _framed(query, key, state, entry, turn, starts, documents)
-    return launch(*framed[:2], value, g, beta, framed[2], skip, framed[3], turning)
+    return launch(context, *framed[:2], value, g, beta, framed[2], skip, framed[3], turning)
 
 
 def _in_last_frame(local, starts, documents):
@@ -201,14 +202,14 @@ def _framed(query, key, state, entry, turn, starts, documents):
 
 
 def _turned_forward(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
-                    documents) -> tuple[tuple[jax.Array, jax.Array], tuple]:
+                    documents, context) -> tuple[tuple[jax.Array, jax.Array], tuple]:
     """`_turned_primal` with its launch's pullback: the derivative's forward alone traces the launch for one
     (a forward-only call launches as inference does, audit KPM-04)."""
     del scale, group, held
     (q, k, framed_state, framed_entry), turning, ((cos, sin), owned) = _framed(query, key, state, entry, turn,
                                                                               starts, documents)
-    (out, final), pullback = jax.vjp(lambda *operands: launch(*operands, turning), q, k, value, g, beta,
-                                     framed_state, skip, framed_entry)
+    (out, final), pullback = jax.vjp(lambda *operands: launch(context, *operands, turning), q, k, value, g,
+                                     beta, framed_state, skip, framed_entry)
     kind = jnp.zeros((), turn.dtype)
     return (out, final), (pullback, query, key, value, g, beta, state, entry, turn, starts, documents, cos,
                           sin, owned, kind)
@@ -263,11 +264,38 @@ def _turned_backward(launch, scale, group, held, residuals, cotangents):
             d_turn.astype(turn_kind.dtype), None, None)
 
 
-_turned = contracted("test_a_turned_template_call_holds_every_order")(
-    declared_derivative(KernelGlue(), _turned_primal, _turned_forward, _turned_backward,
-                        nondiff_argnums=(0, 1, 2, 3)))
-"""`call`'s rule: the template's launches opaque within (`KernelGlue`), its turns' gradient the crossing
-form's."""
+def _none_along(mark):
+    """A cotangent of none along `mark`: float0 zeros of an integer or boolean mark, a float one's zeros."""
+    if jnp.issubdtype(jnp.result_type(mark), jnp.inexact):
+        return jnp.zeros_like(mark)
+    return np.zeros(np.shape(mark), jax.dtypes.float0)
+
+
+def _turned(launch, scale: float, group: int, held: int) -> Callable:
+    """`call`'s rule over `launch` (`generation.linear_tangent`): its reverse mode the crossing form's
+    (`_turned_forward`, `_turned_backward`), the launches opaque within (`KernelGlue`), and its tangent
+    `_turned_primal`'s, the frames' and the launch's own (the portable walk's token replay), so forward mode
+    and every higher order run where the launch's derivative does, where a custom VJP alone refused a
+    jvp of the portable math (row 8573). A call no derivative reaches runs `_turned_primal`, launching as
+    inference does, saving nothing (audit KPM-04); every order past the first differentiates the crossing
+    form as written (`traced`), its launches by their own rules."""
+    from dew.nn.kernels import generation
+
+    def forward(*operands):
+        return _turned_forward(launch, scale, group, held, *operands)
+
+    def backward(saved, operands, cotangent):
+        # The marks' (starts, documents' and the launch's context's) cotangents none, as their leaves:
+        # `linear_tangent` reads the cotangents leaf by leaf beside the operands'.
+        *cotangents, _, _ = _turned_backward(launch, scale, group, held, saved, cotangent)
+        return (*cotangents, *jax.tree.map(_none_along, operands[-3:]))
+
+    def portable(*operands):
+        return _turned_primal(launch, scale, group, held, *operands)
+
+    return contracted("test_a_turned_template_call_holds_every_order")(
+        generation.linear_tangent(forward, backward, portable, kind=KernelGlue(), primal=portable,
+                                  traced=True))
 
 
 def _taken(x, index):

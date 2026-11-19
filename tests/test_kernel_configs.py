@@ -1206,7 +1206,7 @@ def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, name
     decoded once a call): its program launches the template's packed product (`kernel_compile.Expected`, its
     route evidence), which ptxas compiles, its E2M1 codes decoded by their form's PTX inline
     (`inline_forms.registers`, row 3733), its E4M3 block scales by integer arithmetic
-    (`packed.e4m3_values`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
+    (`bits.scales_decoded`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
     refused the kernel (W8-a100, M-NS-8; row 3621)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 

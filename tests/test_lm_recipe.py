@@ -863,8 +863,9 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     for wanted, actual in zip(jax.tree.leaves(state.variables), jax.tree.leaves(rebuilt), strict=True):
         np.testing.assert_array_equal(actual, wanted)
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(1), ema=None)
-    np.testing.assert_array_equal(restored.scalar_loss(rebuilt, batch, step)[0],
-                                  objective.scalar_loss(state.variables, batch, step)[0])
+    # Each loss one program, not its model's operations dispatched alone (368 compiles, row 8416).
+    np.testing.assert_array_equal(jax.jit(restored.scalar_loss)(rebuilt, batch, step)[0],
+                                  jax.jit(objective.scalar_loss)(state.variables, batch, step)[0])
 
 
 def test_a_pretrained_run_loops_its_decoder_as_a_decision_run_does(tmp_path):
