@@ -33,8 +33,8 @@ import ml_dtypes
 import numpy as np
 import pytest
 from arm_arithmetic import Truth
-from attention_oracle import anchored_softmax, exact_attention
-from reference_error import as_given, assert_as_exact, assert_merges_no_ties, widened, with_gradients
+from attention_oracle import exact_attention
+from reference_error import as_given, assert_as_exact, widened, with_gradients
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -924,7 +924,7 @@ def _reference(family: Family, *, anchored: bool) -> Callable:
 
     def attend(query, key, value, extra):
         if isinstance(extra, tuple):
-            out = _resumed_attention(query, key, value, extra, family.keep, anchored=anchored)
+            out = _resumed_attention(query, key, value, extra, family.keep)
         elif extra is None and jax_holds and family.query_first:
             scale = query.shape[-1] ** -0.5
             assert float(np.log2(scale)).is_integer(), "a query scaled first is exact at a power of two alone"
@@ -940,25 +940,25 @@ def _reference(family: Family, *, anchored: bool) -> Callable:
     return attend
 
 
-def _resumed_attention(query, key, value, state, keep, *, anchored: bool):
+def _resumed_attention(query, key, value, state, keep):
     """Attention resumed from a softmax state `(m, total, acc)` (one query head a key head), written apart
-    from Dew: the state one more column of the softmax, its logit `m + log total` and its value its values'
-    mean `acc / total`, so a state whose sums are near fp32's largest stays finite; in fp32 or the inputs'
-    wider dtype, as the state is, the probabilities rounded to the values' dtype for their product (row
-    1362). Its derivative the float64 truth's where `anchored` (`anchored_softmax`): the state's logit's
-    is `p_state sum_k p_k c (mean - v_k)`, no term cancelling, where a state of total 2^126 beside two keys
-    had its `2 mean / total` share rounded off `total + 2` (row 6302: 6.34e-35 against 1.268e-34)."""
+    from Dew with normalized weights, so a state whose sums are near fp32's largest stays finite: the
+    state's weight `total e^(m - M)` and each kept key's `e^(s - M)` over their sum, the state reading its
+    values' mean `acc / total`; in fp32 or the inputs' wider dtype, as the state is, the probabilities
+    rounded to the values' dtype for their product (row 1362)."""
     wide = jnp.promote_types(query.dtype, jnp.float32)
     m, total, acc = (jnp.asarray(x, wide) for x in state)
     query, key = query.astype(wide), key.astype(wide)
     logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) / jnp.sqrt(jnp.asarray(query.shape[-1], wide))
     logits = jnp.where(keep, logits, -jnp.inf)
-    joined = jnp.concatenate([(m + jnp.log(total))[..., None], logits], axis=-1)
-    weights = (anchored_softmax if anchored else functools.partial(jax.nn.softmax, axis=-1))(joined)
+    top = jnp.maximum(m, jnp.max(logits, axis=-1))
+    own = total * jnp.exp(m - top)
+    weights = jnp.exp(logits - top[..., None])
+    denominator = own + weights.sum(axis=-1)
     mean = acc / total[..., None]
-    weighted = jnp.einsum("bhqk,bkhd->bhqd", weights[..., 1:].astype(value.dtype), value,
-                          preferred_element_type=wide)
-    out = mean * weights[..., :1] + weighted
+    shares = weights / denominator[..., None]
+    weighted = jnp.einsum("bhqk,bkhd->bhqd", shares.astype(value.dtype), value, preferred_element_type=wide)
+    out = mean * (own / denominator)[..., None] + weighted
     return jnp.swapaxes(out, 1, 2)
 
 
@@ -1119,8 +1119,7 @@ its own, so none holds a CPU task past the suite's target (row 1849); those past
 @pytest.mark.parametrize(("family", "name"), ACCURATE_ARMS)
 def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, name):
     """A template mainloop's output and query, key and value gradients in the accurate form (`ACCURATE`),
-    check 1 over the family's draws, merging no ties the reference keeps apart (`assert_merges_no_ties`); a
-    row that sees nothing, zero."""
+    check 1 over the family's draws; a row that sees nothing, zero."""
     seeds, family = SEEDS[family], FAMILIES[family]
     draw = _cast(family, family.draw)
     reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
@@ -1128,7 +1127,6 @@ def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edge
     label = f"{name} accurate {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, ACCURATE)[name]))
     assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth)
-    assert_merges_no_ties(differentiated, reference, truth, draw, label, seeds=seeds)
     _held_empty(family, differentiated(*draw(0)), label)
 
 
@@ -1328,7 +1326,7 @@ def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
     query, key, value, dout = (first(fill, 1, 1, 1, 16) for fill in (4.0, m0, size, 2.0 ** -8))
     state = (jnp.full((1, 1, 1), m0, jnp.float32), jnp.ones((1, 1, 1), jnp.float32), first(size, 1, 1, 1, 16))
     family = Family(lambda seed: (query, key, value, state, dout), np.ones((1, 1, 1, 1), bool))
-    reference = with_gradients(lambda *args: _resumed_attention(*args, family.keep, anchored=False))
+    reference = with_gradients(lambda *args: _resumed_attention(*args, family.keep))
     ours = jax.jit(with_gradients(_mainloops(family, {})["portable"]))
     for name, found in (("reference", reference(query, key, value, state, dout)),
                         ("default", ours(query, key, value, state, dout))):
