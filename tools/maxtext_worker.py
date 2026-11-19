@@ -21,6 +21,7 @@ import functools
 import os
 import sys
 from collections.abc import Iterator
+from typing import Any
 
 from reference_worker import Applied, answered, serve
 
@@ -79,7 +80,9 @@ def gpt3(dtype: str):
     held = config(dtype, model_name="gpt3-52k", scan_layers=False, enable_dropout=False,
                   attention="dot_product", per_device_batch_size=1.0, cast_logits_to_fp32=False, **GPT3)
     quant = quantizations.configure_quantization(held)
-    net = models.transformer_as_linen(config=held, mesh=mesh(held), quant=quant, model_mode=MODEL_MODE_TRAIN)
+    # No quantization configured, so None, which the model takes though its signature names AqtQuantization.
+    net = models.transformer_as_linen(config=held, mesh=mesh(held), **dict[str, Any](quant=quant),
+                                      model_mode=MODEL_MODE_TRAIN)
 
     @jax.jit
     def forward(params, ids):

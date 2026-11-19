@@ -85,7 +85,8 @@ def checked(export: Path):
     """The export loaded whole by `QwenImage21Pipeline`, each weighted component loading with nothing in its
     loading report; returns its transformer in float32 and float64."""
     import torch
-    from diffusers import QwenImage21Pipeline, QwenImage21Transformer2DModel
+    from diffusers.models.transformers.transformer_qwenimage21 import QwenImage21Transformer2DModel
+    from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import QwenImage21Pipeline
 
     from _dew_torch.precision import float64
 

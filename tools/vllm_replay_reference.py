@@ -68,6 +68,8 @@ def generated(prompts: np.ndarray, seed: int) -> dict[str, np.ndarray]:
     sampled, behavior, support, routed = [], [], [], []
     for request in requests:
         output = request.outputs[0]
+        # Both asked of every request (logprobs and the sampling mask), so both held.
+        assert output.logprobs is not None and output.sampling_mask is not None
         ids = list(output.token_ids)
         sampled.append(ids)
         behavior.append([entry[token].logprob for entry, token in zip(output.logprobs, ids, strict=True)])

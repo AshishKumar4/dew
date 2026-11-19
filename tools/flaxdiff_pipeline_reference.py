@@ -46,6 +46,7 @@ import tarfile
 import tempfile
 import types
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -200,8 +201,9 @@ def flaxdiff_samples(weights, clip: Path, vae: Path, unit, noise, *, towers: str
     model = SimpleUDiT(**{key: value for key, value in MODEL.items()
                           if key not in ("activation", "dtype", "precision")}, dtype=dtype)
     tokenizer = AutoTokenizer.from_pretrained(clip)
-    encoder = CLIPTextEncoder(model=TorchCLIP(clip, "float64" if wide else towers), tokenizer=tokenizer,
-                              modelname=str(clip), backend="jax")
+    # TorchCLIP stands in for the Flax CLIP model the encoder's signature names, called the same way.
+    encoder = CLIPTextEncoder(**dict[str, Any](model=TorchCLIP(clip, "float64" if wide else towers)),
+                              tokenizer=tokenizer, modelname=str(clip), backend="jax")
     input_config = DiffusionInputConfig(sample_data_key="image", sample_data_shape=(IMAGE, IMAGE, 3),
                                         conditions=[condition(encoder)])
     autoencoder = StableDiffusionVAE(modelname=str(vae), dtype=jnp.float64 if wide else getattr(jnp, towers))

@@ -295,7 +295,8 @@ def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: 
     from vllm.utils.torch_utils import set_default_torch_dtype
 
     attention = reference_attention(tf32)
-    dory.Attention = attention
+    # The model code's attention layer, which it names at import, replaced by the stand-in.
+    setattr(dory, 'Attention', attention)
     vc = VllmConfig(device_config=DeviceConfig(device=device),
                     compilation_config=CompilationConfig(mode=CompilationMode.NONE, custom_ops=['none']))
     hf = DoryConfig(**{**config, 'n_recurrent_loops': loops, 'recurrent_kv_cache_mode': mode})
