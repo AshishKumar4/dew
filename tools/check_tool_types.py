@@ -284,7 +284,10 @@ def checked(environment: Path, paths: list[Path]) -> dict[Path, list[str]]:
         if diagnostic["severity"] == "error":
             at, line = Path(diagnostic["file"]), diagnostic["range"]["start"]["line"] + 1
             said = f"{diagnostic['message'].splitlines()[0]} ({diagnostic.get('rule', '')})"
-            found.setdefault(at, []).append(f"{at.relative_to(ROOT)}:{line}: {said}")
+            # A file outside the checkout is named whole (an interpreter's library pyright read through a
+            # tool), red against the tools it was checked with.
+            named = at.relative_to(ROOT) if at.is_relative_to(ROOT) else at
+            found.setdefault(at, []).append(f"{named}:{line}: {said}")
     return found
 
 
@@ -302,6 +305,11 @@ def main() -> int:
                         help="check only this environment's tools (a name --list prints); repeatable")
     parser.add_argument("paths", nargs="*", type=Path, help="check only these tools")
     args = parser.parse_args()
+    if sys.prefix == sys.base_prefix:
+        # Dew's own tools are checked in this interpreter's environment, which a bare interpreter is not
+        # (2026-11-19: a system python3.14 read every Dew tool against its standard library alone).
+        parser.error(f"{sys.executable} is no virtual environment: run this with Dew's "
+                     "(.venv-3.12/bin/python)")
     pins, shared, store = releases(), common(), records()
     groups: dict[tuple[str, tuple[str, ...]], list[Path]] = {}
     red = 0
