@@ -246,22 +246,14 @@ def test_an_integer_scalar_folds_as_its_primitive_computes_it(primitive, operand
     them (`emission.scalar_evaluated` against `lax`'s own evaluation; base review 4608795fd F1, F2), and
     lower no program to fold: bound, each kernel's index arithmetic compiled a one-primitive program a process
     (18 beside a 4B step's first trace, row 8612)."""
+    from dew.telemetry.compiles import executable_only
+
     bound = np.asarray(primitive.bind(*map(jnp.asarray, operands), **params))
-    lowered = []
-
-    def heard(event: str, seconds: float, **_) -> None:
-        if event == "/jax/core/compile/jaxpr_to_mlir_module_duration":
-            lowered.append(event)
-
-    # JAX's in-memory caches cleared, so a fold that binds the primitive lowers its program again.
+    # JAX's in-memory caches cleared, so a fold that binds the primitive traces its program again.
     jax.clear_caches()
-    jax.monitoring.register_event_duration_secs_listener(heard)
-    try:
+    with executable_only():
         folded = emission.scalar_evaluated(primitive, operands, params, bound.dtype)
-    finally:
-        jax.monitoring.unregister_event_duration_listener(heard)
     assert folded is not None and folded.dtype == bound.dtype and folded == bound[()], (folded, bound)
-    assert not lowered, lowered
 
 
 def test_an_unknown_branch_counts_the_most_of_each_unit_any_branch_issues():
