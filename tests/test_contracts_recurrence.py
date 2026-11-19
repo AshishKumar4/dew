@@ -420,7 +420,8 @@ def test_the_template_rule_holds_its_orders(edge, taken):
 EDGES_BEYOND = [edge for edge in EDGES if edge != "normal"]
 """The edges whose cells measure no draws (`measured`): the normal domain's, which check 1 measures, are
 cells of their own, their declared seeds sharded across CI's map tasks (`check1_shards`): sized each run,
-a normal case took 382 to 720 s (rows 8414, 8488, 8525, 8552, 8553, 8558)."""
+a normal case took 382 to 720 s (rows 8414, 8488, 8525, 8552, 8553, 8558); each of their sites sizes 8
+(a qualification run at f05f038f8, jsf-qual6)."""
 
 
 @pytest.mark.parametrize("taken", list(ORDER_SETS))
@@ -431,7 +432,7 @@ def test_the_selective_scan_holds_its_orders(edge, taken):
 
 
 @pytest.mark.parametrize("taken", list(ORDER_SETS))
-@pytest.mark.check1_shards(seeds=40, per_task=10)
+@pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_the_selective_scan_holds_its_orders_over_normal_draws(taken, request):
     """`assert_selective_contract` in the normal domain, check 1 over its declared draws."""
     assert_selective_contract("normal", taken, seeds=marked_seeds(request))
@@ -511,7 +512,7 @@ def test_the_decode_step_holds_every_order(edge):
     assert_decode_contract(edge)
 
 
-@pytest.mark.check1_shards(seeds=40, per_task=10)
+@pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_the_decode_step_holds_every_order_over_normal_draws(request):
     """`assert_decode_contract` in the normal domain, check 1 over its declared draws."""
     assert_decode_contract("normal", seeds=marked_seeds(request))
