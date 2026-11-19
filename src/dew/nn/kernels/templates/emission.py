@@ -175,8 +175,16 @@ def _folded(equation, values: list) -> list:
                 for value, atom in zip(values, equation.invars, strict=True)]
     if equation.primitive in (lax.div_p, lax.rem_p) and _undefined(*operands):
         return [None]
+    if equation.primitive in _SHIFTS and not 0 <= int(operands[1]) < np.iinfo(operands[0].dtype).bits:
+        # Poison where Mosaic GPU computes it (MLIR's `shli`, `shrsi`, `shrui`), XLA's saturating fold apart.
+        return [None]
     (out,) = equation.outvars
     return [programs.scalar_folded(equation.primitive, operands, equation.params, out.aval.dtype)]
+
+
+_SHIFTS = frozenset({lax.shift_left_p, lax.shift_right_logical_p, lax.shift_right_arithmetic_p})
+"""The shifts, which Mosaic GPU lowers to MLIR's own (`shli`, `shrsi`, `shrui`): poison by an amount past the
+operand's width (base review bb25f261d F1)."""
 
 
 def _typed_alike(equation) -> bool:
