@@ -193,6 +193,37 @@ def test_a_runs_start_reports_each_phase_it_took_once():
     assert sorted(started) == sorted(seconds | {"startup/start_overlapped"})
 
 
+
+def test_a_state_built_outside_a_trace_is_one_program_its_frozen_tree_the_held_arrays():
+    """A fresh state built outside any trace (`Trainer.initial_state`, a caller's or a test's) compiles one
+    program, its traced start's (`distributed.built_start`), where run eagerly each operation of the
+    model's draw compiled alone (row 8682); its frozen tree is the held arrays themselves and its moving
+    tree buffers of its own, which the step's donation may free."""
+    from dew.batch import FROZEN
+    from dew.lora import LoRA
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=8)
+    variables = nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+    adapted = LoRA(rank=2, modules=("q_proj",)).apply(model, variables, key=2)
+    objective = LMObjective(adapted.model, seq_len=8, variables=adapted.variables)
+    compiles = []
+
+    def heard(event, seconds, **_):
+        if event == "/jax/core/compile/backend_compile_duration":
+            compiles.append(seconds)
+
+    jax.monitoring.register_event_duration_secs_listener(heard)
+    try:
+        state = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0)).initial_state()
+    finally:
+        jax.monitoring.unregister_event_duration_listener(heard)
+    assert len(compiles) <= 2, len(compiles)
+    held = {id(leaf) for leaf in jax.tree.leaves(objective.held_variables())}
+    frozen = jax.tree.leaves(state.variables[FROZEN])
+    assert frozen and all(id(leaf) in held for leaf in frozen)
+    assert not any(id(leaf) in held for leaf in jax.tree.leaves(state.variables["params"]))
+
 def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
     """One budget (row 5725): a fit given both `steps` and `tokens` is refused before it reads, as one given
     steps and epochs is; tokens alone bound it."""
