@@ -1206,7 +1206,43 @@ def test_an_aligned_sum_rounds_its_exact_sum_once_to_nearest_ties_to_even(case):
     terms, total = ROUNDED_CASES[case]
     found = np.asarray(aligned_sum([(jnp.float32(term),) for term in terms]))
     np.testing.assert_array_equal(found, np.float32(total))
-    assert np.signbit(found) == np.signbit(np.float32(total))
+    # A zero's sign is IEEE's; a NaN's is none it states (base review 6c68b90ad F5).
+    assert total != 0 or np.signbit(found) == np.signbit(np.float32(total))
+
+
+def test_an_aligned_sum_of_fp32_terms_under_x64_keeps_fp32():
+    """`aligned_sum` of three fp32 ones with x64 on: fp32 3, where its integer digits' sums widened to int64
+    and their bits read as fp32 pairs (base review 6c68b90ad F1)."""
+    with jax.enable_x64(new_val=True):
+        found = aligned_sum([(jnp.ones((3,), jnp.float32),)], axis=0)
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), [3.0])
+
+
+def test_an_aligned_sum_of_three_factors_over_a_long_axis_is_its_exact_sum():
+    """`aligned_sum([(x, x, x)], axis=0)` of 2^20 fp32 ones: 2^20, its digits as narrow as its count of limbs
+    needs, where four million pieces were refused (base review 6c68b90ad F2)."""
+    x = jnp.ones((2 ** 20,), jnp.float32)
+    np.testing.assert_array_equal(np.asarray(aligned_sum([(x, x, x)], axis=0)), [2.0 ** 20])
+
+
+@pytest.mark.parametrize(("term", "total"), [((2.0 ** -75, 2.0 ** -75, float("inf")), float("inf")),
+                                             ((0.0, float("inf"), 1.0), float("nan"))],
+                         ids=["an infinity beside a product that underflows", "an infinity times zero"])
+def test_an_aligned_sums_non_finite_product_is_ieees(term, total):
+    """`aligned_sum` of one three-factor fp32 term with an infinite factor: `2^-75 2^-75 inf` infinite, where
+    the finite factors' rounded product, zero, met the infinity, NaN; and `0 inf` NaN (base review 6c68b90ad
+    F3)."""
+    found = aligned_sum([tuple(jnp.float32(factor) for factor in term)])
+    np.testing.assert_array_equal(np.asarray(found), np.float32(total))
+
+
+def test_an_aligned_sum_over_an_empty_axis_is_positive_zero():
+    """`aligned_sum` over an empty fp32 axis: positive zero, IEEE's sum of no terms, where a sum of none
+    counted as of negative zeros alone, negative zero (base review 6c68b90ad F4)."""
+    found = np.asarray(aligned_sum([(jnp.zeros((0,), jnp.float32),)], axis=0))
+    np.testing.assert_array_equal(found, [0.0])
+    assert not np.signbit(found).any()
 
 
 @pytest.mark.parametrize(("terms", "total"), [
