@@ -203,7 +203,13 @@ with the packed windows as `dew_fn`: 16 and 8 on 2026-10-30, the lettered rows' 
 [0.901, 1.580])."""
 
 
-@pytest.mark.parametrize("layout", [JOINT, LETTERED], ids=["joint", "lettered"])
+@pytest.mark.parametrize("layout", [
+    # The joint rows' second stage drawn by CI's map tasks, 16 seeds a task: a host whose XLA:CPU rounds
+    # otherwise draws it (an EPYC 9965's first 16 seeds, 47 s, left its verdict open, and its next 64 took
+    # 137 s, where a 9684X's decided at 16; armada 11-19), the task CI's CPU set lands on (row 6625).
+    pytest.param(JOINT, id="joint", marks=pytest.mark.check1_shards(seeds=16, per_task=16)),
+    pytest.param(LETTERED, id="lettered"),
+])
 def test_packed_rows_in_two_streams_decide_each_row_as_the_row_alone(layout):
     """Rows in two streams, packed a window, decide each row's options as the row does in a window of its
     own, through the unmodified objective: each row's tokens read its own streams and no other row's, the

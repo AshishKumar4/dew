@@ -2414,13 +2414,17 @@ def test_programs_built_for_the_host_cpu_load_onto_it_whatever_the_process_lists
     (`BuildTarget.own_devices`) in a process whose devices list another first, as a GPU's process lists its
     GPUs before the CPUs it holds beside them: loaded onto the process's first devices, a CPU's program went
     to them (row 8376's CPU-placed arms, `reference_error.ahead_arm(host=True)`)."""
+    from dew._cache import uncached
     from dew.training.ahead import AheadPrograms, BuildTarget, Executable
 
     host = jax.devices("cpu")
     x = np.arange(4.0, dtype=np.float32)
     placed = jax.sharding.SingleDeviceSharding(host[0])
-    doubled = jax.jit(lambda x: x * 2.0, out_shardings=placed).lower(
-        jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=placed)).compile()
+    # Compiled here, as every program compiled ahead is (`compile_programs`): one XLA loaded from the
+    # persistent cache serializes without its kernels, and loading it fails ("Function ... not found").
+    with uncached():
+        doubled = jax.jit(lambda x: x * 2.0, out_shardings=placed).lower(
+            jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=placed)).compile()
     programs = AheadPrograms(BuildTarget.of(host[:1]), {"doubled": Executable.of(doubled)})
     listed = jax.devices
     # A process listing another device first, the host's first CPU among its CPUs.

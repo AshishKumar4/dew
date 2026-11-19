@@ -398,10 +398,17 @@ def turn_gradient(query, key, value, d_out, g, beta, state, d_final, starts, *, 
     else:
         walked = _laid_documents(*rows, state, d_final, documents, entry, scale=scale, turned=turned,
                                  held=held, group=group, chunk=chunk)
-    (q, k, v, do, log, b, ids, teams, readers, writers, memories, leaving, passes), unlaid = walked
+    (q, k, v, do, log, b, ids, teams, sides, memories, leaving, passes), unlaid = walked
+    (readers, reads), (writers, writes) = sides
     own = _halves(q, k, v, do, log, b, ids, teams, scale=scale, group=group)
-    entered = _suffix(_crossed(readers, jnp.einsum('bhnkv,bhncv->bhnck', memories, do)), axis=-2)
-    terms = -_crossed(writers, jnp.einsum('bhnkv,bhncv->bhnck', leaving, v))
+    # A memory's contraction over the tokens of its document that read it, a cotangent's over those that
+    # write it (`reads`, `writes`, each chunk's document's alone, a structure, not the readers' values, so
+    # every order's derivative stays): another document's token taken out before the products, where a
+    # discarded memory of 2^127 times its cotangent was inf and its zero reader made it NaN (row 8519).
+    read_out = jnp.where(reads[..., None], do, 0.0)
+    written_in = jnp.where(writes[..., None], v, 0.0)
+    entered = _suffix(_crossed(readers, jnp.einsum('bhnkv,bhncv->bhnck', memories, read_out)), axis=-2)
+    terms = -_crossed(writers, jnp.einsum('bhnkv,bhncv->bhnck', leaving, written_in))
     left = _before(terms, axis=-2)
     through = jnp.sum(_crossed(jnp.swapaxes(leaving, -1, -2), jnp.swapaxes(passes * memories, -1, -2)),
                       axis=-2)
@@ -470,7 +477,8 @@ def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale:
     # Each token's group: a row's tokens' ranks in turn from its first, each document beginning a token.
     teams = laid(jnp.broadcast_to(jnp.arange(length) // group, (batch, length)), mode='edge')[:, None]
     before = jnp.concatenate([jnp.zeros_like(ids[..., :1, -1]), ids[..., :-1, -1]], axis=-1)
-    readers, writers = _sides(q, k, log, b, ids == before[..., None], ids == ids[..., -1:], scale)
+    reads, writes = ids == before[..., None], ids == ids[..., -1:]
+    readers, writers = _sides(q, k, log, b, reads, writes, scale)
     # A chunk its memory passes through whole: one document's, no decay of it vanished.
     whole = jnp.where(ids[..., -1] == before, log[0][..., -1] + log[1][..., -1], -jnp.inf)
     passes = jnp.exp(whole)[..., None, None]
@@ -494,7 +502,8 @@ def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale:
         total = jnp.reshape(jnp.moveaxis(total, 1, 3), (batch, chunks * chunk, heads, total.shape[-1]))
         return total[:, :length]
 
-    return (q, k, v, do, log, b, ids, teams, readers, writers, memories, leaving, passes), unlaid
+    sides = ((readers, reads), (writers, writes))
+    return (q, k, v, do, log, b, ids, teams, sides, memories, leaving, passes), unlaid
 
 
 def _document_of(firsts, length: int):
@@ -539,7 +548,8 @@ def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents
     seen = jnp.cumsum(laid(cut).astype(jnp.int32), axis=-1)
     b = laid(jnp.asarray(beta, work))
     on = _chunked(real, chunks, chunk)[:, None]
-    readers, writers = _sides(q, k, log, b, on & (seen == 0), on & (seen == seen[..., -1:]), scale)
+    reads, writes = on & (seen == 0), on & (seen == seen[..., -1:])
+    readers, writers = _sides(q, k, log, b, reads, writes, scale)
     head = _chunked(document, chunks, chunk)[..., 0]
     alive = _chunked(live, chunks, chunk)[..., 0]
     first = alive & (jnp.arange(chunks)[None] * chunk == _taken(offsets, head))
@@ -580,7 +590,8 @@ def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents
     ids = head[:, None, :, None] * (chunk + 1) + seen
     # Each token's group, counted from its document's first token (a chunk's edge).
     teams = _chunked(within // group, chunks, chunk)[:, None]
-    return (q, k, v, do, log, b, ids, teams, readers, writers, memories, leaving, passes), unlaid
+    sides = ((readers, reads), (writers, writes))
+    return (q, k, v, do, log, b, ids, teams, sides, memories, leaving, passes), unlaid
 
 
 def _slot(at, slots: int, dtype):

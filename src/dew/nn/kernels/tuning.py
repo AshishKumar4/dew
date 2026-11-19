@@ -887,10 +887,14 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     alike and takes process 0's config (`_settle`). Never its printed form: JAX's printer took a launch's
     hooks seconds a step (the class of the algebra pass's printed terms). A captured array that is itself
     traced (a value of the enclosing computation) is data the compiled launch reads, so it keys by its shape
-    and dtype alone."""
+    and dtype alone. Traced in no mesh (`programs.meshless`): a launch's function computes a tile at a time,
+    the same under whatever mesh its call traces in, so the launch keys, and names its kernels, alike in its
+    program and in certification's own placement, whose kernels ptxas assembled differently under another
+    name (row 8532)."""
     # A fresh function, which JAX's tracing cache keys by its identity: it keys a callable by equality, so an
     # equal hook of another call would take this one's program.
-    closed = jax.make_jaxpr(lambda *values: function(*values))(*arguments)
+    with programs.meshless():
+        closed = jax.make_jaxpr(lambda *values: function(*values))(*arguments)
     digest = hashlib.sha256()
 
     def update(*parts) -> None:
@@ -898,9 +902,9 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
     def read(parameter) -> Hashable:
         # A parameter as the algebra pass keys it, an object no structural key reads by its type alone: the
-        # same in every process (`terms.opaque`). A mesh (a call's `ctx_mesh`, an equation's context) by its
-        # axes, not the kind of device it was made of, which a step compiled ahead for one GPU and the run on
-        # another of its target share no name of.
+        # same in every process (`terms.opaque`). A mesh (a call's `ctx_mesh`) by its axes, not the kind of
+        # device it was made of, which a step compiled ahead for one GPU and the run on another of its target
+        # share no name of.
         if isinstance(parameter, jax.sharding.AbstractMesh):
             parameter = parameter.update(abstract_device=None)
         return opaque(parameter_key(parameter))
@@ -932,7 +936,6 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
                    tuple((bound(var), str(var.aval)) for var in equation.outvars),
                    # The configuration an equation evaluates and lowers under (a key's bits' construction).
                    read((context.compute_type, context.threefry_partitionable, context.xla_metadata)),
-                   read(context.cur_abstract_mesh),
                    read((str(context.cur_layout_mode), context.remove_size_one_mesh_axis)))
             for name, parameter in sorted(equation.params.items()):
                 for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):

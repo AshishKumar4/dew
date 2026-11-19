@@ -186,6 +186,19 @@ def test_an_nvfp4_products_packed_kernel_is_its_decoded_product(generation_name)
     np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
 
 
+def test_an_nvfp4_products_packed_kernel_on_a_cpu_uninterpreted_is_its_decoded_product():
+    """`gemm.nvfp4_product` with its packed kernel named for an assumed H100 and not interpreted, in a CPU
+    process: its launch's branch is CUDA's alone (`gemm._dispatched`), the CPU's the decoded product, exact
+    here (small integer rows), where the launch lowered for the CPU raised "Only interpret mode is supported
+    on CPU backend" (row 8492: a packed product's per-shard cell)."""
+    matrix, values = nvfp4(8, 512, 128, scale=0.25)
+    rows = jnp.asarray(np.random.default_rng(11).integers(-3, 4, size=(96, 512)), jnp.float32)
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"), generation.routes() as routes:
+        got = jax.jit(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32))(rows)
+    assert {route.kernel for route in routes if route.choice == "nvfp4"} == {"packed"}, routes
+    np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
+
+
 @INTERPRETS
 def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
     """`gemm.nvfp4_product` at a decode step's 13 rows on an H100, its packed kernel named, derives a tile
