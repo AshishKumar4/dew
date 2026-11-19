@@ -1368,6 +1368,30 @@ def test_an_aligned_sums_second_order_keeps_a_lone_parts_sign():
     assert found == 0.0 and np.signbit(found)
 
 
+def test_an_aligned_sums_reverse_second_order_is_one_exact_sum():
+    """The gradient in `x` of `aligned_sum([(a, b)])`'s tangent along `(-x, b)` at `(x, b)`, `b` 2^70, under a
+    cotangent of 2^70, and the tangent of that tangent's value-and-gradient's value along `(0, -2^70, 2^70,
+    0)` at `(2^70, 2^70, 2^70, 0)`: zero each, the tangent's reverse mode one aligned sum, where its parts in
+    the residuals and the directions, pulled back apart, added to inf - inf, NaN (row 8757)."""
+    b, x, big = jnp.float32(2.0 ** 70), jnp.float32(1.0), jnp.float32(2.0 ** 70)
+
+    def summed(a, b):
+        return aligned_sum([(a, b)])
+
+    _, pulled = jax.vjp(lambda x: jax.jvp(summed, (x, b), (-x, b))[1], x)
+    assert float(pulled(big)[0]) == 0.0
+
+    def tangent(a, b, da, db):
+        return jax.jvp(summed, (a, b), (da, db))[1]
+
+    def value(a, b, da, db):
+        return jax.value_and_grad(tangent)(a, b, da, db)[0]
+
+    point = (big, big, big, jnp.float32(0.0))
+    direction = (jnp.float32(0.0), -big, big, jnp.float32(0.0))
+    assert float(jax.jvp(value, point, direction)[1]) == 0.0
+
+
 def test_an_aligned_sums_tangent_pulls_back_inside_its_sum():
     """The gradient in `b` of `aligned_sum([(a, b), (v,)])`'s tangent along `a`'s direction a quarter, `v`
     a constant `[0, 0]`, under a cotangent of `[fp32's largest] * 2`: half the largest, where the tangent
