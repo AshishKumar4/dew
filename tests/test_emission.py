@@ -258,6 +258,7 @@ def _known(predicate) -> list[bool | None]:
 
 
 @pytest.mark.gpu(reason="runs each predicate on the warpgroups of this GPU")
+@pytest.mark.generations("sm90", "sm100")
 @pytest.mark.parametrize("predicate, exponentials", SCALAR_PREDICATES, ids=SCALAR_IDS)
 def test_a_folds_known_predicate_is_the_one_each_warpgroup_computes(predicate, exponentials):
     """Each predicate the fold knows at a warpgroup (`_known`: its branch alone priced, or the other's alone)
