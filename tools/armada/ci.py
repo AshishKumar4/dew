@@ -183,8 +183,7 @@ progress = _loaded(HERE / "progress.py")
 natives = _loaded(HERE / "natives.py")
 digests = _loaded(HERE / "digests.py")
 grading = _loaded(HERE / "grading.py")
-host = _loaded(HERE / "host.py")
-stalls = _loaded(HERE / "stalls.py")
+host, stalls, temp_roots = (_loaded(HERE / f"{name}.py") for name in ("host", "stalls", "temp_roots"))
 costs = _loaded(HERE / "costs.py")
 cuts = _loaded(HERE / "cuts.py")
 partition = _loaded(HERE / "partition.py")
@@ -1624,15 +1623,15 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     aside = out.with_name(f"{out.name}.set-aside.json")
     aside.write_text(json.dumps(sorted(done_before)))
     command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
-    environment = session.pytest_environment({**environ, **site_environment(site),
-                                              "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
-                                              "DEW_UNRECORDED": str(unrecorded), "DEW_PYTEST_PID": str(pid),
-                                              "DEW_STACKS_READER": str(os.getpid()),
-                                              **({progress.SET_ASIDE: str(aside)} if resumes else {})})
-    if network:
-        environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
-        command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
+    with temp_roots.temp_root() as root:
+        environment = session.pytest_environment({
+            **environ, **site_environment(site), "DEW_EXECUTED_LOG": str(log), "PYTEST_DEBUG_TEMPROOT": root,
+            "DEW_COLLECTED": str(collection), "DEW_UNRECORDED": str(unrecorded), "DEW_PYTEST_PID": str(pid),
+            "DEW_STACKS_READER": str(os.getpid()), **({progress.SET_ASIDE: str(aside)} if resumes else {})})
+        if network:
+            environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
+        returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
+            command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
     # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
     peaks = [found for found in (progress.task_peak(host), peak_before) if found is not None]
     peak = max(peaks, default=None)
