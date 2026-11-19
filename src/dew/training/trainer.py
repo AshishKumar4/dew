@@ -30,6 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.training import dynamic_scale as dynamic_scale_lib
+from jax.core import Tracer
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
@@ -443,7 +444,7 @@ class Trainer(Generic[Loss, Effects]):
         from dew.nn.inputs import request_key
         ready_process()  # A key given here opens the backend as the run's does (`key`).
         key = self.key if key is None else request_key(key)
-        if not self.host_master and not isinstance(key, jax.core.Tracer):
+        if not self.host_master and not isinstance(key, Tracer):
             # One program, not each operation's (`built_start`): the moving state its buffers, the frozen tree
             # the held arrays as they are. A state held on the host takes the arrays over as it is placed.
             return built_start(self.initial_state, initializer, key)
