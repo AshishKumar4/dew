@@ -219,6 +219,13 @@ GEMM's prologue and epilogue graphs are traced the same way, through jax's Palla
 
 Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and prefetched next lists, for attention blocks. Use Megablox's `make_group_metadata` for groups. Use fla's chunk indices for varlen recurrence. These grow into Dew's, and no new builder is written beside them.
 
+Where Splash runs (TPU), its MaskInfo runs as is, built by its own builder from the descriptor Dew hands it. The GPU mainloops take MaskInfo's classes, not its arrays, because those arrays are the dense map this section forbids:
+- `data_next`, `mask_next` and `block_mask` are each `[heads, q_blocks, kv_blocks]`.
+- They are built from a mask: a concrete one on the host (`_process_mask`), or a dense `[heads, Q, K]` device array whose entire mask its `partial_mask_blocks` hold (`_process_dynamic_mask`). At 131072 tokens that is 2³⁴ entries a head.
+- A row's document ids are data on device, which neither builder reads.
+
+A call of spans therefore keeps one `BlockMap` (`templates/attention.py`'s `block_map`). It holds the classes as runs: a query block's full tiles are `[full_lo, full_hi)`, its partial tiles the rest of what it visits, and its empty tiles everything else. It visits `[lo, hi)`, or its `ranges` where its queries hold several runs. Its next list is the walk over them (`ranges_walk`), and its transpose is `q_lo` and `q_hi`. It is built on device from `KeySpans`, O(query blocks × runs) a row (row 5742). The indexed form's lists take MaskInfo's shape restricted to the selected blocks: a block index and its class per entry.
+
 - **One representation per call.** The static form picks it:
   - full and causal store nothing; they derive their ranges from indices;
   - spans: O(query blocks), emitted as contiguous runs of partial, full and partial; a call's key runs, several
