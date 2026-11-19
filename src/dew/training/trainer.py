@@ -83,7 +83,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.objectives.drawn import drawn_once
+from dew.objectives.drawn import drawn_once, traced_draw
 from dew.optim import STACKED_OPTIMIZERS, declaring, with_bounds
 from dew.optim_schedules import (
     ScheduleBase,
@@ -162,6 +162,7 @@ from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, res
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
+    HELD_APART,
     Produced,
     check_batch,
     check_stream,
@@ -172,7 +173,6 @@ from dew.training.distributed import (
     stage_microbatches,
     start_compiling,
     step_reads,
-    traced_start,
     transferred_copy,
 )
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
@@ -449,7 +449,7 @@ class Trainer(Generic[Loss, Effects]):
             # Outside any trace one program of this body, the frozen tree the held arrays (`drawn_once`;
             # rows 8682, 8730). A state held on the host takes the arrays over as it is placed.
             stated = self._step_key(self.objective, self._compiler)
-            return drawn_once(self._fresh_state, initializer, key, lambda state: apart(state)[1],
+            return drawn_once(self._fresh_state, initializer, key, HELD_APART,
                               kept=stated and (stated, self._start_owner(), "fresh"))
         return self._fresh_state(initializer, key)
 
@@ -574,7 +574,7 @@ class Trainer(Generic[Loss, Effects]):
     def _step_key(self, objective: Objective[Loss, Effects], compiler: StepCompiler) -> Hashable | None:
         """A value of everything this trainer's step traces from beside its arguments, equal for two trainers
         whose steps trace alike, so a refit or a resume in the same process reads the step its equal traced
-        (`dew.training._candidates.candidate_for`; row 3873), and the start it traced (`traced_start`): the
+        (`dew.training._candidates.candidate_for`; row 3873), and the start it traced (`traced_draw`): the
         objective's own (`Objective.trace_key`, its EMA among it) at its current rung, the optimizer's config
         and the updates or examples it was built for, or an Optax transformation given built by the object
         given (`Held`: a trainer handed it again reads the step, PF03), the reader's device steps, and every
@@ -785,18 +785,18 @@ class Trainer(Generic[Loss, Effects]):
         # Its kernels certified on the GPU the run targets, outside the mesh its step traces under (row 6824).
         with report.targeting(self.device_mesh):
             stated = self._step_key(self.objective, self._compiler)
-            abstract, through, build = traced_start(self._staged_start, initializer, key,
-                                                    None if stated is None else (stated, self._start_owner()))
-        checkpoints = self.checkpoints
-        # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
-        # another's: every process resumes from one step or none does.
+            draw = traced_draw(self._staged_start, initializer, key, HELD_APART,
+                               stated and (stated, self._start_owner()))
+        abstract, checkpoints = draw.abstract, self.checkpoints
+        # Each process lists the checkpoints itself, one listing may lag another's: all resume or none.
         step = (None if checkpoints is None
                 else agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume)))
         if checkpoints is not None and step is not None:
             abstract = self._staging.state(abstract.with_window(checkpoints.accumulation_template(step)),
                                           self._staging.staged_shapes)
         shardings, validation = self._validated(abstract)
-        return Start(initializer, key, abstract, through, step, shardings, build, validation.device_bytes)
+        return Start(initializer, key, abstract, draw.through, step, shardings, draw.replay,
+                     validation.device_bytes)
 
     def _placed(self, start: Start, *, positioned: bool
                 ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
