@@ -93,7 +93,8 @@ def test_an_objectives_init_outside_a_trace_is_one_program_its_held_arrays_kept(
 def test_two_instances_of_an_overriding_trainer_each_build_their_own_state():
     """Two instances of one Trainer subclass whose `initial_state` reads the instance's own field each build
     their own state, placed as a fit places it and eagerly, not the first instance's kept trace (row 8956:
-    the kept trace was keyed by the class, so the second instance replayed the first's offset)."""
+    the kept trace was keyed by the class, so the second instance replayed the first's offset); the eager
+    draw of the base's body, which reads none of their fields, is one for both (row 8985)."""
 
     class Offset(Trainer):
         def __init__(self, *args, offset, **kwargs):
@@ -111,4 +112,9 @@ def test_two_instances_of_an_overriding_trainer_each_build_their_own_state():
     objective, optimizer = LMObjective(model, seq_len=8), optax.adam(1e-3)
     trainers = [Offset(objective, optimizer, key=jax.random.key(0), offset=offset) for offset in (1, 2)]
     assert [int(trainer.place()[0].step) for trainer in trainers] == [1, 2]
-    assert [int(trainer.initial_state().step) for trainer in trainers] == [1, 2]
+    assert int(trainers[0].initial_state().step) == 1
+    # The base's draw reads no field of theirs, so the second reads the first's draw, compiling none
+    # (row 8985), and adds its own offset.
+    with Compiles(None) as second:
+        assert int(trainers[1].initial_state().step) == 2
+    assert second.count == 0, second.count

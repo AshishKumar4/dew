@@ -471,13 +471,14 @@ class AheadOfTime:
     def loaded(self) -> jax.stages.Compiled:
         """The executable, loaded onto this process's devices, which must be `devices` GPUs or TPUs of
         `generation`: called with the state and batch the step was compiled for, it runs the step. It is
-        admitted as a compiled one is (`dew.communicators.admit`). Refused where it leaves a choice to run
-        time its devices' own compile makes (`at_run`, a convolution's algorithm): a load direct or through
-        `taken` admits it as a run handed it does (`runnable`), never (row 8957)."""
+        admitted as a compiled one is (`dew.communicators.admit`). Refused where it would not run as its
+        devices' own compile of it (`report.compiled_as_here`: untuned where they tune, or a choice left to
+        run time, `at_run`): a load direct or through `taken` admits it as a run handed it does (`runnable`;
+        rows 8957, 8986)."""
         found = jax.devices() if self.built is None else self.built.own_devices()
         self.held(found)
-        if self.at_run:
-            raise ValueError(AT_RUN % self.generation)
+        if not report.compiled_as_here(found, tuned=self.tuned, at_run=self.at_run):
+            raise ValueError((AT_RUN if self.at_run else UNTUNED) % self.generation)
         return self.executable.loaded(found)
 
     def held(self, devices: Sequence) -> None:
