@@ -100,10 +100,24 @@ class CompiledTruths:
     stamp: str
     target: object | None = None
     begun: set[str] = dataclasses.field(default_factory=set)
+    # Each site a check's prepare began to prepare, from before its first trace, and each it finished whole,
+    # its truths and its arms (`preparing`).
+    tried: set[str] = dataclasses.field(default_factory=set)
+    done: set[str] = dataclasses.field(default_factory=set)
     read: dict[str, tuple[dict, dict]] = dataclasses.field(default_factory=dict)
 
     def path(self, label: str) -> Path:
         return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]
+
+    @contextlib.contextmanager
+    def preparing(self, *labels: str) -> Iterator[None]:
+        """Within the block, a check's prepare of its sites `labels` (a site's truths and its arms, `armed`):
+        recorded tried before its first trace, and finished where it ran to its end, every program it
+        compiles written; a cell's later failure, its every tried site finished, checks what its prepare
+        gives in their place (`gpu_flow.run_cells`)."""
+        self.tried.update(labels)
+        yield
+        self.done.update(labels)
 
     def holds(self, label: str) -> bool:
         """Whether the store's prepare reached site `label` (its programs written, at any stamp)."""
