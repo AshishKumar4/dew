@@ -289,11 +289,10 @@ def pytest_terminal_summary(terminalreporter):
         terminalreporter.write_line(f"unprepared, its sites compiled on its GPU: {record['test']}")
         for reason in record["reasons"]:
             terminalreporter.write_line(f"  at {reason['where']}: {reason['error']}")
-    # Each test whose arms compiled on its GPU as its prepare stated (`truths_ahead.compiled_at_run`).
+    # Each test whose programs its run compiled on its GPU as its prepare declared (`truths_ahead.AT_RUN`).
     for record in terminalreporter.config.stash.get(AT_RUN_SITES, []):
         for reason in record["reasons"]:
-            terminalreporter.write_line(
-                f"arms compiled at run on its GPU: {record['test']}: {reason['error']}")
+            terminalreporter.write_line(f"compiled at run on its GPU: {record['test']}: {reason['error']}")
 
 
 def pytest_runtest_setup(item):

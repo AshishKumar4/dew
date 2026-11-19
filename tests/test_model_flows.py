@@ -379,14 +379,14 @@ def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):
     assert all(program["beside"] >= state for program in filed[len(arms):])
 
 
-def test_a_convolution_sites_truths_compute_on_the_host_and_its_arms_compile_on_its_gpu(tmp_path,
-                                                                                         monkeypatch):
+def test_a_convolution_sites_truths_and_arms_compile_on_its_gpu_in_its_run(tmp_path, monkeypatch):
     """A site holding a convolution, prepared for a node's GPU (`truths_ahead.prepared`): no compile without
     that GPU holds the convolution's algorithm, which cuDNN then picks at run time, on an A100 not the same
-    each run (`report.DEVICELESS_CONVOLUTION_PICKS`, row 7941). Its float64 truths compile for the host's CPU
-    and its arms for none, their run compiling them on its GPU as its prepare states, which the run names
-    (`truths_ahead.AT_RUN`) and records nothing unprepared; before, the prepare compiled both for the GPU and
-    its run refused their load."""
+    each run (`report.DEVICELESS_CONVOLUTION_PICKS`, row 7941). Its prepare writes its truths and its arms
+    at run, compiling none, their run compiling both on its GPU, its float64 truths on its FP64 units, as its
+    prepare declared, which the run names (`truths_ahead.AT_RUN`: its truths and each arm), nothing
+    unprepared; before, the prepare compiled both for the GPU and its run refused their load, and then its
+    truths for the host's CPU, dense float64 on the node's CPU in the run (row 8576)."""
     import tier_wire
     from jax.experimental import topologies
     from truths_ahead import AT_RUN, prepared
@@ -412,10 +412,12 @@ def test_a_convolution_sites_truths_compute_on_the_host_and_its_arms_compile_on_
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
     sites = [json.loads(site.read_text()) for site in store.glob("*/site.json")]
     assert sorted((site["arms"], site["host"], "at_run" in site) for site in sites) == [
-        (False, True, False), (True, False, True)], sites
+        (False, False, True), (True, False, True)], sites
     with compiled_truths(store, prepare=False, stamp="a"):
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
-    assert (store / AT_RUN).exists() and not (store / UNPREPARED).exists()
+    # Its truths and its two arms, each named once.
+    assert len(json.loads((store / AT_RUN).read_text())["reasons"]) == 3
+    assert not (store / UNPREPARED).exists()
 
 
 def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
@@ -859,14 +861,15 @@ def test_a_tests_unprepared_record_names_every_reason(tmp_path):
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_walk_its_values_steer_runs_on_the_host_in_a_prepared_run(tmp_path, monkeypatch):
+def test_a_walk_its_values_steer_runs_on_the_runs_device_named_at_run(tmp_path, monkeypatch):
     """A site sized by its truth's terms (`terms=True`) whose float64 truth takes a branch its values pick
     (`lax.cond` on its operands), its terms' walk held by its prepare as one its run walks
-    (`reference_error._held_walk`), walks it in its run on the host's CPU, wherever the run's default device
-    is: a part's run compiles nothing on its GPU, whose lane requires every program's tuning recorded (the
-    deterministic picks theme), where the walk compiled its spans on the run's own device; each output's
-    terms completed there too (`float64_terms._or_size`, a literal's sized apart: the review)."""
+    (`reference_error._held_walk`), walks it in its run on the run's own device, a GPU's FP64 units, each
+    output's terms completed there (`float64_terms._or_size`), and the run names the walk as compiled at run
+    (`truths_ahead.AT_RUN`), nothing unprepared: a float64 truth's terms walked on the host's CPU in the run
+    was dense float64 on the node's CPU (testing.md, bible section 8; row 8576)."""
     import float64_terms
+    from truths_ahead import AT_RUN
 
     dew, reference, draw = _site()
 
@@ -891,4 +894,5 @@ def test_a_walk_its_values_steer_runs_on_the_host_in_a_prepared_run(tmp_path, mo
     assert not walked
     with compiled_truths(tmp_path, prepare=False, stamp="a"), jax.default_device(jax.devices()[1]):
         assert_as_exact(dew, reference, draw, "a steered product", seeds=8, truth_fn=steered, terms=True)
-    assert walked and sized and set(walked) == set(sized) == {jax.devices("cpu")[0]}
+    assert walked and sized and set(walked) == set(sized) == {jax.devices()[1]}
+    assert (tmp_path / AT_RUN).is_file() and not (tmp_path / UNPREPARED).exists()
