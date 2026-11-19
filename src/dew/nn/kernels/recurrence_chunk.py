@@ -476,9 +476,9 @@ PORT_CELLS: dict[tuple[str | None, PortCell], tuple[Kernel[PortCase], str]] = {
                   "Linear's delta attention (js106c)"),
 }
 """The cells, each an instruction family and what a launch's shard computes (`PortCase.cell`: a receipt
-routes the shapes it timed), where a receipt shows Dew's port of fla's kernels (`fla_rule`; "the port" below) faster
-than the recurrence template, each its old route's kernel and that receipt; every time below sets the
-template against that port, not against upstream fla's own kernels or FlashQLA's
+routes the shapes it timed), where a receipt shows Dew's port of fla's kernels (`fla_rule`; "the port"
+below) faster than the recurrence template, each its old route's kernel and that receipt; every time below
+sets the template against that port, not against upstream fla's own kernels or FlashQLA's
 (tools/benchmark_recurrence.py's `fla` and `flashqla` arms): the delta rule's selector runs the port on them
 where it takes the call (`Op.declared`, owner, bible da64ae5); the list shrinks as the template wins its
 cells, and no cell is picked or ranked at run time. A Blackwell's forward at each timed shape is the port's;
