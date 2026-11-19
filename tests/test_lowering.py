@@ -1451,7 +1451,7 @@ def test_a_batchs_token_layout_split_over_its_tokens_compiles_no_loop_a_token():
     from dew.telemetry.instrumentation import hlo_instructions
 
     compiled = jax.jit(layout, in_shardings=(split, split)).lower(*shapes).compile()
-    program = hlo_instructions(compiled.as_text())
+    program = hlo_instructions(compiled)
     loops = [name for name, instruction in program.items() if instruction.op == "while"]
     assert not loops, loops
 
