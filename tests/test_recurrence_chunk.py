@@ -503,7 +503,6 @@ def test_a_turned_forked_calls_turn_curvature_is_as_exact_as_each_document_alone
                     f"xla {TURNED} a forked call's turn curvature", seeds=32, truth_fn=truth)
 
 
-
 def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recurrence():
     """A turned call's turns' gradient differentiated along its queries (`jvp` of `grad`), a third of its
     queries zero, packed: on par from float64 with the recurrence a token at a time's (check 1), where the
@@ -634,42 +633,71 @@ def cancelling_entries_draw(seed: int):
                                entry_value=jnp.concatenate([u, -u, value[:, :, :1]], axis=2)), seeded
 
 
-ENTRY_CASES = {
-    "a tie": ([1.0] * 6, [2.0 ** 127, -(2.0 ** 127), 2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24), -2.0], -2.0),
-    "a band below": ([1.0] * 6, [2.0 ** 127, -(2.0 ** 127), 2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24),
-                                 2.0 ** -100], 2.0 ** -100),
-    "three levels beside the largest": (
-        [2.0 ** 26, 2.0, 1.0, 2.0, 1.0, 2.0 ** 26, 1.0],
-        [2.0 ** 127, 2.0 ** 127, -(2.0 ** 103), -(2.0 ** 127), 2.0 ** 103, -(2.0 ** 127),
-         float(np.finfo(np.float32).max)], float(np.finfo(np.float32).max)),
-}
-"""Entry writes' terms whose sum floats summed in some order lose: each term's key and value, and the
-write."""
-
-
-@pytest.mark.parametrize("case", list(ENTRY_CASES))
+@pytest.mark.parametrize("case", ["a tie", "a band below", "three levels beside the largest"])
 @pytest.mark.parametrize("values_first", [False, True], ids=["keys first", "values first"])
 def test_an_entry_write_of_cancelling_terms_is_its_exact_sum(values_first, case):
-    """A document's entry write (`chunked_launch.entry_write`) of terms of unit weight whose keys' and
-    values' products cancel (`ENTRY_CASES`): its write, its tangent along the weight and the weight's
-    gradient each the exact sum, where each band of the aligned sum rounded its own sum, -2^25 - 2 tied to
-    -2^25 beside 2^25, zero (base review 644ef5535 F1), its bands' totals aligned at once dropped 2^-100
-    (base review f5e6e678d F1), and three levels cancelling beside the largest summed to inf (row 8757);
-    laid as the TPU forked scan lays it too."""
+    """A document's entry write (`chunked_launch.entry_write`) of cancelling terms across exponent bands
+    beside a surviving last term: its write, its tangent along the weight and the weight's gradient on par
+    from float64 with the surviving last term alone (check 1, row 8715), in both layouts, where each band
+    rounded its own sum (base review 644ef5535 F1), its bands' totals aligned at once dropped 2^-100 (base
+    review f5e6e678d F1), and three levels cancelling beside the largest summed to inf (row 8757)."""
     from dew.nn.kernels.chunked_launch import entry_write
 
-    keys, values, total = ENTRY_CASES[case]
-    key = jnp.asarray(keys, jnp.float32)[:, None]
-    terms = jnp.asarray(values, jnp.float32)
-    value = terms[None, :] if values_first else terms[:, None]
+    def draw(seed):
+        case_id = ["a tie", "a band below", "three levels beside the largest"].index(case)
+        rng = np.random.default_rng([8715, seed, int(values_first), case_id])
+        rows = 16
+        if case == "three levels beside the largest":
+            k0 = (2.0 ** 26 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            k1 = (2.0 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            k2 = rng.uniform(0.5, 0.9, (rows, 1, 4)).astype(np.float32)
+            k3 = rng.uniform(0.5, 0.9, (rows, 1, 4)).astype(np.float32)
+            key = np.concatenate([k0, k1, k2, k1, k2, k0, k3], axis=1)
+            v0 = (2.0 ** 127 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            v1 = (2.0 ** 127 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            v2 = (2.0 ** 103 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            last = (0.5 * np.finfo(np.float32).max * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            terms = np.concatenate([v0, v1, -v2, -v1, v2, -v0, last], axis=1)
+        else:
+            scale = 2.0 if case == "a tie" else 2.0 ** -100
+            k0 = rng.uniform(0.5, 1.5, (rows, 1, 4)).astype(np.float32)
+            k1 = rng.uniform(0.5, 1.5, (rows, 1, 4)).astype(np.float32)
+            k2 = rng.uniform(0.5, 1.5, (rows, 1, 4)).astype(np.float32)
+            key = np.concatenate([k0, k0, k1, k1, k1, k2], axis=1)
+            u0 = (2.0 ** 127 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            u1 = (2.0 ** 25 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            last = (scale * rng.uniform(0.5, 1.5, (rows, 1, 4))
+                    * rng.choice([-1.0, 1.0], (rows, 1, 4))).astype(np.float32)
+            terms = np.concatenate([u0, -u0, u1, -0.5 * u1, -0.5 * u1, last], axis=1)
+        value = np.swapaxes(terms, -1, -2) if values_first else terms
+        weight = rng.uniform(0.5, 1.0, (rows, 1, 1)).astype(np.float32)
+        dweight = rng.uniform(0.5, 1.0, (rows, 1, 1)).astype(np.float32)
+        cotangent = (rng.uniform(-0.05, 0.05, (rows, 4, 4)) if case == "three levels beside the largest"
+                     else rng.standard_normal((rows, 4, 4))).astype(np.float32)
+        return (jnp.asarray(key), jnp.asarray(value), jnp.asarray(weight), jnp.asarray(dweight),
+                jnp.asarray(cotangent))
 
-    def written(weight):
-        return entry_write(key, value, weight, values_first=values_first)[0, 0]
+    def evaluated(written):
+        def run(key, value, weight, dweight, cotangent):
+            out, tangent = jax.jvp(lambda w: written(key, value, w), (weight,), (dweight,))
+            _, pull = jax.vjp(lambda w: written(key, value, w), weight)
+            return out, tangent, pull(cotangent)[0]
 
-    weight = jnp.float32(1.0)
-    assert float(written(weight)) == total
-    assert float(jax.jvp(written, (weight,), (jnp.float32(1.0),))[1]) == total
-    assert float(jax.grad(written)(weight)) == total
+        return jax.jit(run)
+
+    def formula(key, value, weight):
+        if values_first:
+            return weight * jnp.einsum("...vr,...rk->...vk", value, key)
+        return weight * jnp.einsum("...rk,...rv->...kv", key, value)
+
+    def surviving(key, value, weight):
+        return formula(key[:, -1:], value[:, :, -1:] if values_first else value[:, -1:], weight)
+
+    ours = evaluated(lambda k, v, w: entry_write(k, v, w, values_first=values_first))
+    exact_surviving = evaluated(surviving)
+    assert_as_exact(ours, exact_surviving, draw,
+                    f"entry_write cancelling bands, values_first={values_first}, case={case}",
+                    seeds=FEWEST_SEEDS, truth_fn=exact_surviving)
 
 
 def test_a_turned_forked_calls_cancelling_entry_write_is_as_exact_as_each_document_alone():

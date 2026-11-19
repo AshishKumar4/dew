@@ -1787,11 +1787,12 @@ def _product(term: Sequence[jax.Array], ints) -> _Product:
 
 
 def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
-    """A term's reduction to the sum's value, `op` over its axes (kept) and laid, and its count."""
+    """A term's reduction over its axes one at a time (Mosaic TPU x64, 8807) and laid, and its count."""
     axes = axis or ()
 
     def reduced(x: jax.Array, op: Callable = jnp.sum, **options) -> jax.Array:
-        x = op(x, axis=axes, keepdims=True, **options) if axes else x
+        for a in axes:
+            x = op(x, axis=a, keepdims=True, **options)
         return x if laid is None else jnp.broadcast_to(x, laid[0]).reshape(laid[1])
 
     return reduced, math.prod(shape[a] for a in axes)
@@ -1808,14 +1809,13 @@ def _exact_sum(terms, spec, dtype) -> jax.Array:
         product = _product(term, ints)
         reduced, extent = _reduction(product.place.shape, axis, laid)
         parts.append((product, reduced, extent))
-        nan = nan | reduced(product.nan, jnp.any)
-        positive = positive | reduced(product.infinite & ~product.negative, jnp.any)
-        negative = negative | reduced(product.infinite & product.negative, jnp.any)
-        # A sum of negative zeros alone is one, of none positive zero (base review 6c68b90ad F4).
-        live = live | reduced(~(product.zero & product.negative), jnp.any)
+        # Sum in `ints` (not `jnp.any`, float64 under Mosaic TPU x64, 8807); negative zeros alone stay -0.
+        flags = (product.nan, product.infinite & ~product.negative, product.infinite & product.negative,
+                 ~(product.zero & product.negative))
+        nan, positive, negative, live = (p | (reduced(f.astype(ints), jnp.sum, dtype=ints) != 0)
+                                         for p, f in zip((nan, positive, negative, live), flags, strict=True))
     count = sum(extent for _, _, extent in parts)
-    if not count:
-        live = True
+    live = True if not count else live
     # The widest digit whose one term's sum `widest (2^w - 1)` the integers hold, its quotient carried apart
     # as it adds (`_nearest`, row 8757).
     widest, most = max(extent for _, _, extent in parts), (1 << (limits.bits - 1)) - 1
