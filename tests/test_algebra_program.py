@@ -83,6 +83,18 @@ def test_a_window_proves_nothing_of_a_value_its_program_proves_no_number():
         assert [var for var in made if cut.apart[var].finite and not whole.apart[var].finite] == []
 
 
+@pytest.mark.parametrize(("function", "finite"), [(jnp.tanh, True), (jax.lax.erf, True), (jnp.sin, False)],
+                         ids=["tanh", "erf", "sin"])
+def test_a_saturating_function_of_a_product_that_may_overflow_keeps_its_bound(function, finite):
+    """`f(a * b)` of two inputs, finite reals whose product may overflow to an infinity: a tanh's and an erf's
+    is finite, so its bound stands (a bound is stated of a finite value alone; an infinity's tanh is its
+    side's 1), and a window reading the product as its program proves it bounds them still; a sine's of an
+    infinity is no number, and stays unbounded (spec alignment, 8993)."""
+    closed = jax.make_jaxpr(lambda a, b: function(a * b))(*(jnp.ones(8, jnp.float32) for _ in range(2)))
+    made = closed.jaxpr.outvars[0]
+    assert (terms.region(closed).held.get(made) is not None) is finite
+
+
 @pytest.mark.parametrize("kind", KINDS)
 def test_a_bodys_math_is_rewritten_in_place(kind):
     """Two sums inside a nested jit, a checkpoint, a scan, a conditional or a loop are rewritten inside that
