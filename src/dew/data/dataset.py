@@ -22,7 +22,6 @@ import itertools
 import json
 import logging
 import math
-import os
 import statistics
 import subprocess
 import sys
@@ -387,10 +386,8 @@ class Host:
         import psutil
 
         group = cgroups.own(root) if cgroup is None else cgroup
-        cpus, memory = len(os.sched_getaffinity(0)), psutil.virtual_memory().available
+        cpus, memory = cgroups.usable_cpus(group, root), psutil.virtual_memory().available
         for level in cgroups.levels(group, root):
-            if (quota := cgroups.cpus(level)) is not None:
-                cpus = min(cpus, quota)
             limit, held = cgroups.memory(level), cgroups.memory_held(level)
             if limit is not None and held is not None:
                 memory = min(memory, max(0, limit - held))
