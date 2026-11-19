@@ -568,30 +568,28 @@ class Trainer(Generic[Loss, Effects]):
 
     def _step_key(self, objective: Objective[Loss, Effects], compiler: StepCompiler) -> Hashable | None:
         """A value of everything this trainer's step traces from beside its arguments, equal for two trainers
-        whose steps trace alike, so a refit or a resume in the same process that builds its trainer and
-        objective anew reads the step its equal traced (`dew.training._candidates.candidate_for`; row 3873):
-        the objective's own (`Objective.trace_key`, its EMA among it) at its current rung, the optimizer's
-        config and the updates or examples it was built for, the reader's device steps, and every setting the
-        step reads. The links it traces under are the candidate's key's (`trace_context`, their measured
-        figures), its spreads replayed where it is kept (`Candidate.spread`), so the links the last compile
-        decided key nothing (row 6022: every refit on a tensor- or sequence-split mesh traced its step again).
-        None where a value states none of it: an objective that states no trace, an optimizer given built, a
-        custom step, a device step or a setting compared by identity (`frozen_value`), a loss scale given
-        built, stated links, or a run that measures its kernels' configs as it lowers. `objective` and
-        `compiler` are those the step is built from and climbs on (`_stepping`)."""
-        from dew.objectives.base import UNKEYED, frozen_value, stated_trace
+        whose steps trace alike, so a refit or a resume in the same process reads the step its equal traced
+        (`dew.training._candidates.candidate_for`; row 3873), and the start it traced (`traced_start`): the
+        objective's own (`Objective.trace_key`, its EMA among it) at its current rung, the optimizer's config
+        and the updates or examples it was built for, or an Optax transformation given built by the object
+        itself (`Held`: its trainer's refits read their step, PF03), the reader's device steps, and every
+        setting the step reads; its links the candidate's key's (row 6022). None where a value states none of
+        it: an objective that states no trace, a custom step, a device step or a setting compared by identity
+        (`frozen_value`), a loss scale given built, stated links, or a run measuring its kernels' configs."""
+        from dew.objectives.base import UNKEYED, Held, frozen_value, stated_trace
 
         stated = stated_trace(objective)
-        if (stated is None or self._config is None or self.step is not None or self._scaled is None
-                or compiler.stated_links or self.tune_kernels):
+        if (stated is None or self.step is not None or self._scaled is None or compiler.stated_links
+                or self.tune_kernels):
             return None
         settings = frozen_value((self._config, self._shape.device, self.mesh, self.layout, self.inspection,
                                  self.param_dtype, self.diloco))
         if settings is UNKEYED:
             return None
-        return (type(objective), stated, settings, self._shape.updates, self._shape.examples,
-                self._microbatches, self.accumulation, self.split, self._scaled, self.lower_for,
-                compiler.narrow, self.record, self.skip_nonfinite, self.phase_passes.sampled)
+        return (type(objective), stated, settings, Held(self._optimizer) if self._config is None else None,
+                self._shape.updates, self._shape.examples, self._microbatches, self.accumulation, self.split,
+                self._scaled, self.lower_for, compiler.narrow, self.record, self.skip_nonfinite,
+                self.phase_passes.sampled)
 
     def _stepping(self, objective: Objective[Loss, Effects] | None = None,
                   compiler: StepCompiler | None = None) -> Stepping[Loss, Effects]:
@@ -781,7 +779,9 @@ class Trainer(Generic[Loss, Effects]):
             key = transfer(key, NamedSharding(self.state_mesh, P()))
         # Its kernels certified on the GPU the run targets, outside the mesh its step traces under (row 6824).
         with report.targeting(self.device_mesh):
-            abstract, through, build = traced_start(self._staged_start, initializer, key)
+            stated = self._step_key(self.objective, self._compiler)
+            abstract, through, build = traced_start(self._staged_start, initializer, key,
+                                                    None if stated is None else (stated, type(self)))
         checkpoints = self.checkpoints
         # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
         # another's: every process resumes from one step or none does.
