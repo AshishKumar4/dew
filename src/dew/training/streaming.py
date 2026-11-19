@@ -36,7 +36,7 @@ from dew.telemetry.instrumentation import step_flops
 from dew.training._fit import Start, closes_window
 from dew.training.diloco import DILOCO_ON_HOST
 from dew.training.distributed import microbatch_shapes
-from dew.training.execution import HostExecution, frozen_trees, stack_sites
+from dew.training.execution import HostExecution, frozen_trees, stack_sites, unscanned
 from dew.training.memory import (
     StepPrice,
     Unpriced,
@@ -129,6 +129,15 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
     except ValueError as missing:
         return f"the process holds no CPU companion of its devices: {missing}"
     return None
+
+
+def frozen_loops(trainer, variables) -> str | None:
+    """Why a streamed layout of `trainer`'s run over `variables` (shapes alike) cannot place its frozen
+    trees, None where it can: a stack among them a plain loop runs (`execution.unscanned`), which every
+    tree's placement refuses (`execution.resident`)."""
+    reasons = (unscanned(sites) for _, _, sites in frozen_trees(variables, stack_sites(trainer.objective,
+                                                                                         variables)))
+    return next((reason for reason in reasons if reason is not None), None)
 
 
 def priced(plan, dtype) -> StepPrice:
@@ -328,6 +337,15 @@ def laid_start(trainer, run, dataset, resume) -> Start:
         trainer._planned_unplaced(start, batch)
     except LayoutRefused:
         start = None
+    # A frozen stack a plain loop runs, which no host layout holds in bank memory (`unscanned`): the
+    # streamed step is no candidate, read from the device start's shapes (row 8336: a LoRA fit over an
+    # unscanned decoder raised where its streamed start placed its frozen base).
+    loops = None if start is None else frozen_loops(trainer, start.abstract.variables)
+    if loops is not None:
+        trainer.layout_choice = Choice(held=True, fits=False, device=None, streamed=None, refused=loops,
+                                       streams=False)
+        said(trainer.layout_choice)
+        return start
     plan = trainer._compiler.unplaced if start is not None else None
     trainer._laid_out(dataclasses.replace(given, host=STREAMED))
     # The device plan's climb and plans undone: the streamed step is priced at the objective's own rung.
