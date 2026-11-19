@@ -188,13 +188,11 @@ operand's width (base review bb25f261d F1)."""
 
 
 def _typed_alike(equation) -> bool:
-    """Whether `equation`'s operands hold one type (a select's arms, its predicate apart) and it states no
-    output dtype apart from it: where Mosaic GPU's lowerings compute it as XLA does. Mosaic GPU types any
-    other by rules of its own (Lane at its first operand's type whatever dtype it states, a select at its
-    true arm's, a weak literal materialized at its partner's), which the fold declines rather than restates
-    (base reviews 117cc9088 F2 and 7e470364e F1-F3)."""
-    operands = equation.invars[1:] if equation.primitive is lax.select_n_p else equation.invars
-    types = {np.dtype(atom.aval.dtype) for atom in operands}
+    """Whether `equation`'s operands hold one type and it states no output dtype apart from it: where Mosaic
+    GPU's lowerings compute it as XLA does. Mosaic GPU types any other by rules of its own (Lane at its first
+    operand's type whatever dtype it states, a weak literal materialized at its partner's), which the fold
+    declines rather than restates (base reviews 117cc9088 F2 and 7e470364e F1-F3)."""
+    types = {np.dtype(atom.aval.dtype) for atom in equation.invars}
     stated = equation.params.get("out_dtype")
     return len(types) <= 1 and (stated is None or {np.dtype(stated)} == types)
 
