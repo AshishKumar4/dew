@@ -1243,21 +1243,14 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
 
 def product_dtype(params: Mapping, operands: tuple) -> np.dtype:
     """The dtype a product (`Term.dot`) of operands of `operands`' dtypes at `params` makes: its preferred
-    element type where it states one, else JAX's own rule for a `lax.dot_general` of those dtypes (a
-    bfloat16 by a float16 product is bfloat16), the dtype its traced equation's result has: never another
-    library's promotion (NumPy's refuses that pair, base review 0b8b7ed98 F1)."""
+    element type, which a product of two dtypes always states (`_term`: its traced result's), else its
+    operands' one dtype; never another library's promotion of theirs (NumPy's refuses a bfloat16 beside a
+    float16, base review 0b8b7ed98 F1)."""
     preferred = params.get("preferred_element_type")
-    return np.dtype(preferred) if preferred is not None else _dot_dtype(*map(np.dtype, operands))
-
-
-@functools.cache
-def _dot_dtype(left: np.dtype, right: np.dtype) -> np.dtype:
-    """JAX's result dtype of a `lax.dot_general` of operands of `left` and `right` and no preferred type, read
-    with 64-bit types on, so a product traced under x64 and priced outside it keeps its float64 (a
-    `ShapeDtypeStruct` made outside canonicalizes it to float32)."""
-    with jax.enable_x64(new_val=True):
-        shaped = (jax.ShapeDtypeStruct((1, 1), left), jax.ShapeDtypeStruct((1, 1), right))
-        return np.dtype(jax.eval_shape(jax.lax.dot, *shaped).dtype)
+    if preferred is not None:
+        return np.dtype(preferred)
+    (dtype,) = set(map(np.dtype, operands))
+    return dtype
 
 
 def product_slack(region: Region, index: int) -> int | None:
@@ -1497,6 +1490,11 @@ def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., 
         if dtypes == {given.get("preferred_element_type")}:
             # A product accumulating in its operands' own dtype is one of no preferred type (`rules.plain`).
             given["preferred_element_type"] = None
+        elif len(dtypes) > 1 and given.get("preferred_element_type") is None:
+            # A product of two dtypes states the dtype it makes, its traced result's (`product_dtype`), and is
+            # no plain one a rule may move.
+            (made,) = (var.aval for var in equation.outvars if isinstance(var.aval, ShapedArray))
+            given["preferred_element_type"] = made.dtype
         operands = tuple(np.dtype(var.aval.dtype) if isinstance(var.aval, ShapedArray) else None
                          for var in equation.invars)
         return write(others[0], param(primitive, given, operands))

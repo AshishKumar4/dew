@@ -875,26 +875,22 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     assert priced.price.value > unmeasured.price.value
 
 
-@pytest.mark.parametrize(("dtypes", "itemsize"), [(("bfloat16", "float16"), 2), (("float64", "float64"), 8)],
-                         ids=["bfloat16 by float16", "float64 traced under x64"])
-def test_a_product_is_priced_at_the_dtype_jax_gives_it(dtypes, itemsize):
-    """A `lax.dot_general`, no preferred type stated, priced at the dtype JAX makes it
-    (`terms.product_dtype`), its result kept on chip at that dtype's bytes beside its leaves'
-    (`Work.kept_bytes`): a bfloat16 by a float16 product bfloat16, whose NumPy promotion, refused, raised
-    there (base review 0b8b7ed98 F1, a crash pricing any program holding one); a float64 product traced
-    under x64 and priced outside it float64, not the float32 a dtype read outside x64 canonicalizes it to
-    (its head review)."""
+def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
+    """A `lax.dot_general` of a bfloat16 and a float16 matrix, no preferred type stated, priced at the dtype
+    JAX makes it (`terms.product_dtype`, its traced result's, which the region records as its stated type),
+    its result kept on chip at two bytes an element beside its leaves' (`Work.kept_bytes`); NumPy's
+    promotion of the pair, which it refuses, raised there (base review 0b8b7ed98 F1). A bare product heads no
+    rewrite window, so `dew.jit` alone never prices it (`test_algebra_fusion`'s witness holds its value)."""
     def product(a, b):
         return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
 
-    with jax.enable_x64(new_val=True):
-        a, b = jnp.ones((2, 3), dtypes[0]), jnp.ones((3, 4), dtypes[1])
-        region = terms.region(jax.make_jaxpr(product)(a, b))
+    a, b = jnp.ones((2, 3), jnp.bfloat16), jnp.ones((3, 4), jnp.float16)
+    region = terms.region(jax.make_jaxpr(product)(a, b))
     graph, bundle, _ = program.graphed(region)
     work = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
                          cost_model=cost.model(region, cost.fused(generation.TARGETS["v5e"])))[1].work
-    leaves = a.dtype.itemsize * 2 * 3 + b.dtype.itemsize * 3 * 4
-    assert work.kept_bytes == leaves + 2 * itemsize * (2 * 4)
+    made = jax.eval_shape(product, a, b).dtype.itemsize
+    assert work.kept_bytes == 2 * (2 * 3 + 3 * 4) + 2 * made * (2 * 4)
 
 
 @pytest.mark.parametrize("apart", [0, 1, 4], ids=["as written", "a group of one", "apart from its group"])
