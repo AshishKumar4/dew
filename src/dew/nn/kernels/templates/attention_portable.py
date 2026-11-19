@@ -44,6 +44,7 @@ from dew.nn.kernels.templates.attention import (
     sums_units,
     within,
 )
+from dew.nn.precision import power2
 
 
 def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array):
@@ -364,7 +365,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 first = gradient.off_anchor_delta(walked, anchor_rows, do, state_total, mean0,
                                                  key_index[row, head, rows], shifts, rows=interpreted_rows)
                 kept = shifts < 0
-                prior = jnp.where(kept, prior, algebra.power2(walked.total, shifts))
+                prior = jnp.where(kept, prior, power2(walked.total, shifts))
                 anchor, delta, chosen = (jnp.where(kept, ours, theirs)
                                          for ours, theirs in zip((anchor, delta, chosen), first, strict=True))
 

@@ -58,9 +58,12 @@ configuration."""
 import dataclasses
 import itertools
 from collections.abc import Callable, Iterator
+from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
+from jax._src.state import discharge
 from jax.extend import core as jcore
 
 from dew.nn import derivatives
@@ -74,12 +77,14 @@ THREAD_AXIS = "wg"
 @dataclasses.dataclass(frozen=True)
 class Ref:
     """A shared-memory allocation of the kernel: a block of `slots` (its leading axis) or of barriers, each
-    `num_arrivals` arrivals a phase, of `shape`."""
+    `num_arrivals` arrivals a phase, of `shape`; or a global operand, its `value` where the caller states it
+    (`programs`' `known`), which its reads give."""
 
     name: str
     barrier: bool
     num_arrivals: int
     shape: tuple = ()
+    value: np.ndarray | None = dataclasses.field(default=None, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -299,11 +304,13 @@ def _located(ref, transforms) -> tuple:
 
 
 def _one_value(index) -> int | None:
-    """An indexer's index where it names one entry of its axis (a value, or a one-entry slice), else None (a
-    slice of more, or an array of indices: a gathered tile's rows)."""
+    """An indexer's index where it names one entry of its axis (a value, an array of one value broadcast
+    beside a gathered index, or a one-entry slice), else None (a slice of more, or an array of several
+    indices: a gathered tile's rows)."""
     if hasattr(index, "start"):
         return int(np.asarray(index.start)) if index.size == 1 and index.start is not None else None
-    return None if index is None or np.size(index) != 1 else int(np.asarray(index))
+    values = None if index is None else np.unique(np.asarray(index))
+    return None if values is None or values.size != 1 else int(values[0])
 
 
 def _governing(value, what: str):
@@ -384,6 +391,10 @@ def _access(kind: str, indexed: int) -> Callable:
         ref = values[0]
         if isinstance(ref, Ref):
             self.emit(kind, _slot(ref, equation.params["tree"], values[indexed:]))
+            if kind == "read" and ref.value is not None:
+                # A known operand's read, through its transforms as JAX's state discharge reads one.
+                transforms = jax.tree_util.tree_unflatten(equation.params["tree"], values[indexed:])
+                return [np.asarray(discharge.transform_array(jnp.asarray(ref.value), transforms))]
         return [None] * len(equation.outvars)
 
     return access
@@ -399,6 +410,26 @@ def _product_wait(self: _Interpreter, equation, values) -> list:
     return self.emit("product_wait", (), equation.params["n"])
 
 
+def _operand_slots(params, lhs, rhs, leaves) -> tuple:
+    """A product's shared-memory operands, each at its slot (`_slot`, its transforms' leaves of `leaves`,
+    the accumulator's, then `lhs`'s and `rhs`'s, `*_transforms_tree`), an operand in registers none."""
+    trees = [params[name] for name in ("acc_transforms_tree", "a_transforms_tree", "b_transforms_tree")]
+    split = np.cumsum([0, *(tree.num_leaves if tree is not None else 0 for tree in trees)])
+    return tuple(_slot(ref, tree, leaves[split[index]:split[index + 1]])
+                 for index, (ref, tree) in enumerate(zip((lhs, rhs), trees[1:], strict=True), start=1)
+                 if isinstance(ref, Ref))
+
+
+def _wgmma_product(self: _Interpreter, equation, values) -> list:
+    """A warpgroup MMA into its accumulator's ref (`wgmma_ref`, the toolkit's every Hopper product): its
+    shared-memory operands, each at its slot, read asynchronously until a `wgmma_wait` retires its group
+    (`product_wait`). Read as `wgmma` alone, the walks' products were no events at all: no slot of theirs
+    was checked against the loads that refill it (row 8680's bounded walk showed none)."""
+    acc, lhs, rhs = values[:3]
+    del acc
+    return self.emit("product", (), _operand_slots(equation.params, lhs, rhs, values[3:]))
+
+
 def _tcgen05_product(self: _Interpreter, equation, values) -> list:
     """A tcgen05 product (`tcgen05_mma`): its operands, each at its slot, read asynchronously until the
     completion of a commit of its thread after it (a `committed` event); its accumulator tensor memory's.
@@ -411,11 +442,7 @@ def _tcgen05_product(self: _Interpreter, equation, values) -> list:
                          "asynchronous arrival")
     _, lhs, rhs, _ = values[:4]
     leaves = values[4 + 2 * int(params["scaled"]) + int(params["sparse"]):]
-    trees = [params[name] for name in ("acc_transforms_tree", "a_transforms_tree", "b_transforms_tree")]
-    split = np.cumsum([0, *(tree.num_leaves if tree is not None else 0 for tree in trees)])
-    sources = tuple(_slot(ref, tree, leaves[split[index]:split[index + 1]])
-                    for index, (ref, tree) in enumerate(zip((lhs, rhs), trees[1:], strict=True), start=1))
-    return self.emit("product", (), sources)
+    return self.emit("product", (), _operand_slots(params, lhs, rhs, leaves))
 
 
 _tcgen05_commit = _arrival("barrier_transforms_tree", "committed")
@@ -429,7 +456,8 @@ SYNC: dict[str, Callable] = {
     "tcgen05_mma": _tcgen05_product, "tcgen05_commit_arrive": _tcgen05_commit, "copy_gmem_to_smem": _load,
     "copy_smem_to_gmem": _store, "commit_group": _store_group, "wait_smem_to_gmem": _store_wait,
     "commit_smem": _commit,
-    "get": _access("read", 1), "swap": _access("write", 2), "wgmma": _product, "wgmma_wait": _product_wait,
+    "get": _access("read", 1), "swap": _access("write", 2), "wgmma": _product, "wgmma_ref": _wgmma_product,
+    "wgmma_wait": _product_wait,
 }
 """Each primitive of the toolkit's synchronization and shared memory, as an `Event`."""
 
@@ -495,21 +523,25 @@ parity waits at a turn's rotation, and its load warps' gathers. A body of no syn
 register form) takes a reader that emits nothing, its reason beside it; one of no type here is refused."""
 
 
-def programs(kernel: Callable, *operands, threads: int, launch: int = 0, rare: bool = False
+def programs(kernel: Callable, *operands, threads: int, launch: int = 0, rare: bool = False,
+             known: Callable[[int, Any], np.ndarray | None] = lambda index, aval: None
              ) -> tuple[list[list[Event]], dict[str, int]]:
     """Each program of `kernel`'s `launch`-th Mosaic GPU launch (one the toolkit built, `mosaic.kernel`, in
     the order its trace makes them: a chained input gradient's flagged walk, then its bounded one) over
     `operands`, of its `threads` warpgroups, its rare spans taken where `rare` (`derivatives.Rare`: a decided
     walk's second): a warpgroup's events, or where it runs warp roles, each of its warps' in turn
     (`_Interpreter.programs`), by warpgroup index; and each barrier's arrivals a phase, by name: a barrier
-    allocation's, or a shared `uint64`'s its inlined initialization states (`gathered.Initialized`)."""
+    allocation's, or a shared `uint64`'s its inlined initialization states (`gathered.Initialized`).
+    `known(index, aval)`, a global operand's value where the caller states it (a bounded walk's flags, which
+    decide the tiles it walks), else None: its reads give it."""
     closed = jax.make_jaxpr(kernel)(*operands)
     body = list(_bodies(closed.jaxpr))[launch]
     found, arrivals = [], {}
     for thread in range(threads):
         interpreter = _Interpreter(thread, rare)
-        interpreter.run(body.jaxpr, body.consts, [Ref(f"gmem{index}", barrier=False, num_arrivals=0)
-                                                  for index in range(len(body.jaxpr.invars))])
+        interpreter.run(body.jaxpr, body.consts, [
+            Ref(f"gmem{index}", barrier=False, num_arrivals=0, value=known(index, variable.aval.inner_aval))
+            for index, variable in enumerate(body.jaxpr.invars)])
         found += interpreter.programs()
         arrivals.update({ref.name: ref.num_arrivals for ref in interpreter.allocated if ref.barrier})
         arrivals.update(interpreter.initialized)

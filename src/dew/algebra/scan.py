@@ -782,7 +782,15 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
     elif (args := get_callable_args(node, Chunk.rows)) is not None:
         value = of(args[1])[:, None] * of(args[0])
     elif (args := get_callable_args(node, Chunk.times)) is not None:
-        value = of(args[0]) * of(args[1])
+        left, right = of(args[0]), of(args[1])
+        # A decay across a document's start (`_crossed`) takes its factor out by select before the product,
+        # so a memory past the largest read before its reset is no 0 times inf, nor its gradient (row 8560);
+        # a live span's that underflows multiplies as the recurrence does.
+        if get_callable_args(args[1], Chunk.decay) is not None:
+            left = jnp.where(_crossed(right), 0.0, left)
+        elif get_callable_args(args[0], Chunk.decay) is not None:
+            right = jnp.where(_crossed(left), 0.0, right)
+        value = left * right
     elif (args := get_callable_args(node, Chunk.matmul)) is not None:
         # The chunk's scores (a pairing of its tokens through their decays, not the solve's) applied to its
         # tokens' values is its local readout, `readout_local` (`carry.EMIT_ROLES`), as the hand form's.
@@ -1231,14 +1239,24 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     joined = below & (segments[:, None] == segments[None, :])
     started, ending = segments == 0, segments == segments[-1]
     # Each exponent masked before its exponential, as each span's: one across a vanished token is no sum
-    # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN).
-    return _Decays(entering=jnp.where(started, _exp(base2, jnp.where(started, high + low, 0.0)), 0.0),
+    # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN), and its
+    # decay negative zero, which no exponential is (`_crossed`).
+    return _Decays(entering=jnp.where(started, _exp(base2, jnp.where(started, high + low, 0.0)), -0.0),
                    to_last=jnp.where(ending, _exp(base2, jnp.where(ending,
                                                                    (high[-1] - high) + (low[-1] - low), 0.0)),
-                                     0.0),
+                                     -0.0),
                    whole=jnp.where(started[-1], _exp(base2, jnp.where(started[-1], high[-1] + low[-1], 0.0)),
-                                   0.0),
-                   between=jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), 0.0))
+                                   -0.0),
+                   between=jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), -0.0))
+
+
+def _crossed(decay: jax.Array) -> jax.Array:
+    """Where a chunk's decay (`_decays_value`'s) spans a vanished token, a document's start: negative zero,
+    which a live span's decay that underflows (positive zero) is not."""
+    # The sign bit read as the integer of its width's: `jnp.signbit` shifts by a constant, which a checked
+    # `shard_map` refuses beside a varying decay.
+    bits = jax.lax.bitcast_convert_type(decay, jnp.dtype(f"int{jnp.finfo(decay.dtype).bits}"))
+    return (decay == 0) & (bits < 0)
 
 
 def _decays_of(exponents, base2: bool) -> _Decays:

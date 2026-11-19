@@ -81,7 +81,7 @@ PAIR_FRACTION = 2.0 ** -21
 distance from its floor rounds), their difference and its sum with the low halves', each under 2."""
 ZERO_WHOLE = -127
 """A pair whose integers differ by this or less weighs zero (`algebra.between`'s exact power of two at its
-zero exponent bits, `attention_algebra.exact_power2`)."""
+zero exponent bits, `float_bits.exact_power2`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,7 +126,7 @@ class Exponents:
 def raised_exponent(exponents: Iv, lane: Lane) -> Iv:
     """`exp2` of a base-2 exponent within `exponents` as `algebra.raised` forms it: its fraction's exp2 at the
     lane's reach (`exp2`, the fraction an fp32 under 2) scaled by its integer part's power of two
-    (`attention_algebra.power2`), whose last product rounds once to nearest on fp32's grid, below its normal
+    (`precision.power2`), whose last product rounds once to nearest on fp32's grid, below its normal
     range among its subnormals unless the lane flushes them (`fp32`); each end at its own floor (`exp2(x)` is
     monotone in `x`). Taken as one fp32 operand of exp2, an exponent near -40 sat on a grid 2^-18 apart, past
     the fraction's own: legal decays the algebra forms between its points lay outside (778 of 1024 at decays

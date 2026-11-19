@@ -38,16 +38,15 @@ import numpy as np
 
 from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted
+from dew.nn.float_bits import binade_of, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import bodies
 from dew.nn.precision import (
     at_least_fp32,
-    binade_of,
     compensated_sum,
     exact_float32,
     float32_einsum,
     lowered_divide,
-    raised_exactly,
     two_sum,
 )
 

@@ -29,6 +29,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     score_stream,
     score_views,
 )
+from dew.nn.precision import scalar_power2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -226,12 +227,12 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
 
 def _rescaled_parts(walk: _Backward, acc, shift, rhs, refs: tuple, staged: tuple = ()):
     """An fp16 step's accumulator `acc` (dV's or dK's) taken to its walk's new scale (`shift`,
-    `algebra.scaled_by`, a power of two at most 1) before its operand's two fp16 parts' products over `rhs`
-    issue into it from their staged `refs`; `staged` the parts each staged into its ref just before its
+    `precision.scalar_power2`, a power of two at most 1) before its operand's two fp16 parts' products over
+    `rhs` issue into it from their staged `refs`; `staged` the parts each staged into its ref just before its
     product (the fused launch's order, `attention_mosaic_fused._sixteen_step`), none where they are staged
     already (the cooperative launch's exchange, `attention_mosaic_coop._sixteen_step`)."""
     family = walk.program.family
-    acc = family.rescaled_products(acc, lambda value: algebra.scaled_by(value, shift), (), rhs,
+    acc = family.rescaled_products(acc, lambda value: scalar_power2(value, shift), (), rhs,
                                    walk.interpret)
     for index, ref in enumerate(refs):
         if staged:
@@ -272,8 +273,7 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
 def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tuple = ((), ()), heads: int,
                    kv_heads: int, queries: int, consumers: int) -> tuple:
     """A program over query tiles' place and key streams (the dQ launch's and dropout's first pass's): its
-    batch row and query head, its key and value views (`_views_of`; no values' where `v_ref` is None) and
-    those of its score hook's parameters
+    batch row and query head, its key and value views (`_views_of`) and those of its score hook's parameters
     that ride them (`score`, their refs and kinds: `score_views`), their streams opened, its consumers'
     first query (`_Program.query_tile`, a tile each) and the key tiles any of them reads (`_Program.reach`,
     `_streamed`)."""
@@ -281,9 +281,7 @@ def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tu
     row, head = family.program_index("batch"), family.program_index("heads")
     pair = consumers * block_q
     refs, kinds = score
-    # A launch reading no values (the keyed sums' alone, `BackwardTiles.keyed_apart`) streams none.
-    streamed_refs = {"keys": k_ref} if v_ref is None else {"keys": k_ref, "values": v_ref}
-    views = _views_of(streamed_refs, row, lax.div(head, heads // kv_heads))
+    views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
     if riding(family, kinds, "keys"):
         views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair))
     if spans is not None and spans.walk_count is not None:

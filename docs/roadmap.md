@@ -37,9 +37,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests/ring_protocol.py:422-435 reads gathered.Gathers' bodies by their fields (fill, fill_wait, read events written by hand) and test_ring_protocol.py:557-568…. [8657]
 - Tests/ring_protocol.py:838-839 accepts a read of an entries parity whose contents are a stale step's. [8678]
 - Tests/test_gemm_gather.py:200-242 (the strided-table gathers kernel) duplicates tests/test_ring_protocol.py:382-424's gathered walk fixture. [8679]
-- Tests/test_gemm_paired.py:649-669 passes a two-launch chained gradient to ring_protocol.programs, which explores only the first mpmd_map. [8680]
 - A launch's certification traces it a second time. [8720]
-- Jax fork, Pallas Mosaic GPU lowering cache. [8793]
+- Pallas Mosaic GPU lowering cache, certification against the step. [8793]
+- The recurrence suite's wall: every case within CI's group target. [8835]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -78,7 +78,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646, 1446]
 - Precision's error-free transforms marked where the compilers honour the fork's no-contract mark. [8378]
-- In-backward scanned walk loses its saving at scale. [8389]
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [1506, 1437]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
@@ -142,6 +141,5 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
-- A GPU node's run of a kernel-marked CPU-suite cell fails for want of CUDA 13's ptxas. [8769]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]

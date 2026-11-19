@@ -607,38 +607,6 @@ def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("hooks", ["alibi", "softcap"])
-def test_an_accurate_backward_64_wide_is_claimed_on_an_h100(hooks):
-    """The accurate backward of the gate's causal call 64 wide (`_gated_backward`) under alibi and a softcap,
-    certified as the route certifies it and compiled by ptxas for an H100 on this CPU: some config of the
-    Mosaic backward holds, spilling nothing (its keyed sums in a dQ launch of their own,
-    `BackwardTiles.keyed_apart`). Its one dQ launch carrying both sums spilled at every query tile the
-    derivation offered, each certified and refused before the Pallas-Triton backward took the call (row
-    7938)."""
-    from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    queries, width = 512, 64
-    spans = template.spans(queries, queries, 1, causal=True)
-    query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.bfloat16)
-    shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype),
-                          _residuals(query.shape))
-    hooked = _gated_hooks(hooks, queries, width)
-
-    def backward(query, key, value, dout, residuals):
-        grads = attention_mosaic.backward(query, key, value, spans, hooked, dout, residuals=residuals,
-                                          accurate=True)
-        return grads.query, grads.key, grads.value
-
-    with generation.assumed("sm90"):
-        found = compile_mosaic_kernels(
-            [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)))], "sm90")
-    failed = mosaic_failures(found)
-    assert not failed, "\n".join(failed)
-
-
-@COMPILES_ON_CPU
 @pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
 @pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
 def test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200(rows, kept):

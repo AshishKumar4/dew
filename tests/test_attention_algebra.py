@@ -12,7 +12,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import normal_float32
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
 from test_attention_triton import (
@@ -927,57 +926,11 @@ def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at
     _accurate_dq(query, key, value, spans, hooks, dout, 2.0 ** -40, "a tiny weight over a large state")
 
 
-def test_power2_is_exact_under_jit_at_every_exponent():
-    """`algebra.power2` scales by powers of two exactly wherever the result is a normal fp32, compiled
-    (where XLA computes `exp2` as an inexact `exp` and fuses a product of them into one `exp`, past fp32's
-    range), at every integral exponent from -400 to 400 against exact float64 scaling (its split takes thirds
-    by a product with fp32's 1/3, the clip at POWER2_REACH among them), and zero stays zero."""
-    exponents = jnp.arange(-400.0, 401.0, dtype=jnp.float32)
-    mantissas = jnp.asarray([0.0, 0.5, 0.75, 1.0, -0.6], jnp.float32)
-    found = np.asarray(jax.jit(lambda x, k: algebra.power2(x[:, None], k[None, :]))(mantissas, exponents))
-    exact = np.ldexp(np.asarray(mantissas, np.float64)[:, None], np.asarray(exponents, np.int64)[None, :])
-    normal = normal_float32(exact)
-    np.testing.assert_array_equal(found[normal], exact[normal].astype(np.float32))
-    np.testing.assert_array_equal(found[0], 0.0)
-    assert np.all(np.isinf(found[1:][np.abs(exact[1:]) > np.finfo(np.float32).max]))
-
-
-
 def _edge_floats() -> np.ndarray:
-    """fp32 values across every binade, subnormals among them: zeros, the least subnormal and normal, the
-    largest, and significands of ties to even at every shift."""
-    bits = np.concatenate([np.arange(0, 0x800000, 4099, dtype=np.uint32),
-                           np.arange(0x800000, 0x7F800000, 1048573, dtype=np.uint32),
-                           np.asarray([0, 1, 2, 3, 0x7FFFFF, 0x800000, 0x7F7FFFFF, 0x00C00000, 0x00A00000,
-                                       0x3FC00000, 0x40400001], np.uint32)])
-    values = bits.view(np.float32)
-    return np.concatenate([values, -values])
+    """fp32's values across every binade (`test_precision_policy.edge_values`): a quotient's operands."""
+    from test_precision_policy import edge_values
 
-
-def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flushing_cpu():
-    """On XLA's CPU, whose fp32 multiply flushes a subnormal operand and result (row 4023):
-    `dew.nn.precision.raised_exactly` is `x * 2^k` and `lowered_rounded` `x * 2^-k` rounded once to nearest
-    even, bitwise numpy's IEEE `ldexp`, across every binade, subnormals both ways, at shifts 0 to 300, and
-    `binade_of` is `floor(log2|x|)` (row 6302's finish, `algebra.quotient`, and an initial state's
-    gradient)."""
-    from dew.nn import precision
-
-    values = _edge_floats()
-    shifts = np.asarray([0, 1, 2, 23, 24, 25, 63, 64, 126, 127, 149, 150, 151, 252, 300], np.int32)
-    on_cpu = jax.devices("cpu")[0]
-    x, k = (jax.device_put(each, on_cpu) for each in (values[:, None], shifts[None, :]))
-    lowered = np.asarray(jax.jit(precision.lowered_rounded)(x, k))
-    rounded = np.ldexp(values[:, None], -shifts[None, :]).astype(np.float32)
-    np.testing.assert_array_equal(lowered.view(np.uint32), rounded.view(np.uint32))
-    raised = np.asarray(jax.jit(precision.raised_exactly)(x, k))
-    exact = np.ldexp(values[:, None].astype(np.float64), shifts[None, :])
-    held = np.abs(exact) <= np.finfo(np.float32).max
-    expected = exact[held].astype(np.float32)
-    np.testing.assert_array_equal(raised[held].view(np.uint32), expected.view(np.uint32))
-    nonzero = values != 0
-    binades = np.asarray(jax.jit(precision.binade_of)(jax.device_put(values, on_cpu)))
-    np.testing.assert_array_equal(binades[nonzero],
-                                  np.floor(np.log2(np.abs(values[nonzero].astype(np.float64)))).astype(np.int32))
+    return edge_values(np.float32)
 
 
 def test_a_quotient_below_the_least_normal_is_correctly_rounded_on_a_flushing_cpu():

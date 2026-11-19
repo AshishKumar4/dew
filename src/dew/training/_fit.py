@@ -354,20 +354,28 @@ def _full(phase: str, collection: Mapping[str, int]) -> None:
         _FULL[:] = [sys.getallocatedblocks()]
 
 
-gc.callbacks.append(_full)
-
-
-def settled_heap(run: FitRun) -> None:
+def settled_heap(run: FitRun, *, compiled: bool = False) -> None:
     """Collect the whole heap before a fit's steps where it has grown by a quarter since the last full
-    collection, once a fit (`FitRun.settled`): CPython runs one itself once the objects made since outnumber a
-    quarter of those kept (Modules/gcmodule.c: long_lived_pending < long_lived_total / 4), and a start's
-    compiles make millions, so the first after them walked them in the loop, 0.75-0.9 s at a 4B step (row
-    6739). Read against the last full collection, not this fit's compile: what a plan's compile or an
-    earlier fit made is pending too (rows 8511, 8545). A fit whose process has run none collects."""
-    if run.settled:
+    collection: after each compile of its step (`compiled`: its first, a ramp stage's, a phase's), and once
+    a fit whose step the process held (`FitRun.settled`). CPython runs one itself once the objects made
+    since outnumber a quarter of those kept (Modules/gcmodule.c: long_lived_pending < long_lived_total / 4),
+    and a compile makes millions, so the first after it walked them in the loop, 0.75-0.9 s at a 4B step
+    (row 6739; row 8760: a compile mid-fit too). Read against the last full collection, noted by a
+    collector hook this first call installs (`_full`, none at import: row 8761), not the compile: what a
+    plan's compile or an earlier fit made is pending too (rows 8511, 8545). A process that has run none
+    collects. A heap read below that collection's has freed what it held since, and its later growth is
+    counted from the lowest heap read: CPython's own count of what it promoted since grows by what is made
+    after a free too, so counting from the collection's heap would leave it to the collector among the
+    steps."""
+    if run.settled and not compiled:
         return
     run.settled = True
-    if not _FULL or sys.getallocatedblocks() - _FULL[0] > _FULL[0] // 4:
+    if _full not in gc.callbacks:
+        gc.callbacks.append(_full)
+    blocks = sys.getallocatedblocks()
+    if _FULL and blocks < _FULL[0]:
+        _FULL[:] = [blocks]
+    if not _FULL or blocks - _FULL[0] > _FULL[0] // 4:
         gc.collect()
 
 @dataclasses.dataclass

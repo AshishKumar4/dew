@@ -26,9 +26,9 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn import derivatives
+from dew.nn.float_bits import TWO_FACTOR_REACH, exact_power2
 from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
-from dew.nn.kernels.templates.attention_algebra import exact_power2, power2
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import (
     compensated_add,
@@ -36,6 +36,7 @@ from dew.nn.precision import (
     exact_float32,
     float32_einsum,
     float32_matmul,
+    power2,
     two_product,
 )
 
@@ -134,16 +135,16 @@ def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk
 
 def raised(whole, part):
     """`exp2(whole + part)` of a compensated base-2 exponent to fp32's resolution at any size: its integer
-    `n = floor(whole)` an exact power of two (`attention_algebra.power2`, the attention template's) and its
+    `n = floor(whole)` an exact power of two (`precision.power2`) and its
     fraction `(whole - n) + part`, near [0, 1), through exp2. The exponent rounded to one fp32 lost up to half
     its ulp, 1.9e-6 near -43 (a pair of tokens at -30 a token), a decay's relative 1.3e-6, which put the
     port's decay gradient under decays near zero 7 to 10 times the token-by-token recurrence's distance from
     float64; and exp2 of a whole exponent, which a CPU takes as `exp(x ln 2)`, rounds its product with ln 2
-    the same way. Its power of two within twice 127 (`power2`'s two factors): the fraction's exp2 lies in
-    [1, 2), so `n` past fp32's exponents gives zero or infinity at any reach, and the two factors held an
-    A100's query_key launch spill-free where three spilled it (ledger 2519)."""
+    the same way. Its power of two within `TWO_FACTOR_REACH` (`power2`'s two factors, both normal powers): the
+    fraction's exp2 lies in [1, 2), so `n` past fp32's exponents gives zero or infinity at any reach, and the
+    two factors held an A100's query_key launch spill-free where three spilled it (ledger 2519)."""
     n = _floor(whole)
-    return power2(jnp.exp2((whole - n) + part), n, reach=2 * 127)
+    return power2(jnp.exp2((whole - n) + part), n, reach=TWO_FACTOR_REACH)
 
 
 def _floor(x):
