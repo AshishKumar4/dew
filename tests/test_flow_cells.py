@@ -237,12 +237,13 @@ def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unreco
     """In a GPU tier part's prepare, a cell that compiled a site and then raised, checking what its prepare
     gives in its programs' place (`ahead_arm`'s zeros), passes its prepare with nothing recorded, its run
     judging it (row 8555: every such cell was recorded deferred and its test named unprepared, falsely);
-    a cell whose site's compile itself raised, the site begun and unfinished, is deferred, its failure
-    recorded where it raised (the review)."""
+    a cell whose site's prepare did not finish, its compile raised or its arm's trace raised after its
+    truths were written, is deferred, its failure recorded where it raised (the review)."""
     import jax
     import numpy as np
+    import reference_error
     import tier_wire
-    from reference_error import ahead_arm
+    from reference_error import ahead_arm, assert_as_exact
     from truths_ahead import DEFERRED, UNPREPARED, CompiledTruths, compiled_truths
 
     def checked():
@@ -257,8 +258,22 @@ def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unreco
     def unfinished(store, programs, compiled, host=False):
         raise RuntimeError("its compile failed")
 
-    monkeypatch.setattr(CompiledTruths, "_compiled", unfinished)
-    with compiled_truths(tmp_path / "unfinished", prepare=True, stamp="a"):
-        run_cells([Cell("compiles nothing", lambda: ahead_arm(jax.jit(lambda x: x * 2.0), "a failed product")(
-            np.zeros(3, np.float32)))])
+    with monkeypatch.context() as failing:
+        failing.setattr(CompiledTruths, "_compiled", unfinished)
+        failed = ahead_arm(jax.jit(lambda x: x * 2.0), "a failed product")
+        with compiled_truths(tmp_path / "unfinished", prepare=True, stamp="a"):
+            run_cells([Cell("compiles nothing", lambda: failed(np.zeros(3, np.float32)))])
     assert (tmp_path / "unfinished" / DEFERRED).is_file()
+
+    # A site whose truths are written and whose arm's trace then raises.
+    def traced_badly(*arguments, **options):
+        raise RuntimeError("its arm's trace failed")
+
+    def site():
+        assert_as_exact(jax.jit(lambda x: x * 2.0), jax.jit(lambda x: x * 2.0),
+                        lambda seed: (np.full(3, seed, np.float32),), "a product whose arm failed", seeds=8)
+
+    monkeypatch.setattr(reference_error, "_arm_program", traced_badly)
+    with compiled_truths(tmp_path / "arms", prepare=True, stamp="a"):
+        run_cells([Cell("traces its arm badly", site)])
+    assert (tmp_path / "arms" / DEFERRED).is_file()

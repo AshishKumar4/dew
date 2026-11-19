@@ -1464,6 +1464,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     if store is not None and store.prepare:
         _compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms,
                       also=also, orders=orders, plain=plain, library_fn=library_fn)
+        store.finished(label, armed(label))
         return
     if os.environ.get(QUALIFY) and not (drawing() or judging()):
         _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
@@ -1949,6 +1950,7 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False) -> Callable:
                     shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
                 store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True),
                                    arms=True, host=host)
+            store.finished(armed(label))
             # Zeros of the shapes its own trace gave, in the store's tracing: a jit of its own compiler
             # options traced again inside another, `eval_shape`'s, was refused.
             return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)

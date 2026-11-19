@@ -100,10 +100,18 @@ class CompiledTruths:
     stamp: str
     target: object | None = None
     begun: set[str] = dataclasses.field(default_factory=set)
+    # Each site its check's prepare finished whole, its truths and its arms (`finished`).
+    done: set[str] = dataclasses.field(default_factory=set)
     read: dict[str, tuple[dict, dict]] = dataclasses.field(default_factory=dict)
 
     def path(self, label: str) -> Path:
         return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]
+
+    def finished(self, *labels: str) -> None:
+        """Records that a check's prepare of its sites `labels` (a site's truths and its arms, `armed`) ran
+        to its end, every program it compiles written: a later failure in its cell checks what its prepare
+        gives in their place (`gpu_flow.run_cells`)."""
+        self.done.update(labels)
 
     def holds(self, label: str) -> bool:
         """Whether the store's prepare reached site `label` (its programs written, at any stamp)."""

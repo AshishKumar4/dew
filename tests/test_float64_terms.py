@@ -286,15 +286,18 @@ def a_dense_layers_terms_are_its_placements_own_on_a_gpu_host(tmp_path):
 
 def test_a_traced_call_reads_its_platforms_branch_for_the_device_a_store_prepares_for(tmp_path):
     """`float64_terms` traced whole (`jax.jit`) reads the branch its platform picks (`picked`) for the device
-    a store's prepare compiles for (`truths_ahead.CompiledTruths.device`), the CPU's product here, its
-    terms that product's; traced outside a store's prepare, where no trace states the platform its lowering
-    runs on (a CPU's inputs under a GPU's default device took the GPU's branch: the review), it is refused."""
-    from truths_ahead import compiled_truths
+    a store's prepare compiles for (`truths_ahead.CompiledTruths.device`), a CPU's here, its terms that
+    product's, whatever the process's own devices; traced outside a store's prepare, where no trace states
+    the platform its lowering runs on (a CPU's inputs under a GPU's default device took the GPU's branch:
+    the review), it is refused."""
+    from truths_ahead import CompiledTruths, compiled_truths
 
     rng = np.random.default_rng(5)
     x, weight = rng.normal(size=(4, 8)), rng.normal(size=(8, 3))
-    with jax.enable_x64(new_val=True):
-        with compiled_truths(tmp_path, prepare=True, stamp="a"):
+    cpu = jax.devices("cpu")[0]
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
+        with compiled_truths(tmp_path, prepare=True, stamp="a"), pytest.MonkeyPatch.context() as placed:
+            placed.setattr(CompiledTruths, "device", lambda store: cpu)
             value, terms = jax.jit(lambda x, weight: float64_terms(picked, x, weight))(x, weight)
         with pytest.raises(TypeError):
             jax.jit(lambda x, weight: float64_terms(picked, x, weight))(x, weight)

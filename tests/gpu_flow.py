@@ -133,14 +133,15 @@ def _begun() -> frozenset[str] | None:
 
 def _deferred(label: str, text: str, frames: list[tuple[str, int]], begun: frozenset[str] | None) -> bool:
     """Whether a cell that raised is deferred to its run (`run_cells`): in a GPU tier part's prepare
-    (`begun`, its store's sites begun before the cell, `_begun`), where nothing computes. A cell that
-    completed no site before it raised, or left one it began unfinished (its compile raised, its programs
-    unwritten: `truths_ahead.CompiledTruths.holds`), computed past or failed within the programs its prepare
-    holds, and is recorded deferred (`truths_ahead.DEFERRED`, where it raised and why), its run computing
-    and judging it with the flow's other cells served by the store and naming the test unprepared
-    (tests/conftest.py); one whose every site it began is complete and then raised checked what its prepare
-    gives in their place (an `ahead_arm`'s zeros: a later failure in its prepare judges nothing) and passes
-    its prepare unrecorded, its run judging it (row 8555: every such cell was named unprepared, falsely)."""
+    (`begun`, its store's sites begun before the cell, `_begun`), where nothing computes. A cell that began
+    no site before it raised, or one its check's prepare did not finish whole (a compile that raised, an arm
+    whose trace raised after its site's truths were written: `truths_ahead.CompiledTruths.finished`),
+    computed past or failed within the programs its prepare holds, and is recorded deferred
+    (`truths_ahead.DEFERRED`, where it raised and why), its run computing and judging it with the flow's
+    other cells served by the store and naming the test unprepared (tests/conftest.py); one whose every site
+    it began its prepare finished, and then raised, checked what its prepare gives in their place (an
+    `ahead_arm`'s zeros: a later failure in its prepare judges nothing) and passes its prepare unrecorded,
+    its run judging it (row 8555: every such cell was named unprepared, falsely)."""
     import os
 
     import truths_ahead
@@ -149,7 +150,7 @@ def _deferred(label: str, text: str, frames: list[tuple[str, int]], begun: froze
         return False
     store = truths_ahead.COMPILED.get()
     new = store.begun - begun
-    if not new or not all(store.holds(site) for site in new):
+    if not new or not new <= store.done:
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         truths_ahead.unprepared(store.directory, test, frames[::-1],
                                 f"{label}: {text.splitlines()[-1][:400]}", truths_ahead.DEFERRED)
