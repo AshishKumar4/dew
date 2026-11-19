@@ -243,10 +243,25 @@ def test_an_integer_scalar_folds_as_its_primitive_computes_it(primitive, operand
     product at the output dtype it names, a boolean's among them), bitwise and boolean logic, an extremum and
     a clamp, shifts within and past the width (an unsigned value's arithmetic one reading it as signed) and
     conversions among integer and boolean dtypes fold as the primitive bound at its operands' dtypes computes
-    them (`emission.scalar_evaluated` against `lax`'s own evaluation; base review 4608795fd F1, F2)."""
+    them (`emission.scalar_evaluated` against `lax`'s own evaluation; base review 4608795fd F1, F2), and
+    lower no program to fold: bound, each kernel's index arithmetic compiled a one-primitive program a process
+    (18 beside a 4B step's first trace, row 8612)."""
     bound = np.asarray(primitive.bind(*map(jnp.asarray, operands), **params))
-    folded = emission.scalar_evaluated(primitive, operands, params, bound.dtype)
+    lowered = []
+
+    def heard(event: str, seconds: float, **_) -> None:
+        if event == "/jax/core/compile/jaxpr_to_mlir_module_duration":
+            lowered.append(event)
+
+    # JAX's in-memory caches cleared, so a fold that binds the primitive lowers its program again.
+    jax.clear_caches()
+    jax.monitoring.register_event_duration_secs_listener(heard)
+    try:
+        folded = emission.scalar_evaluated(primitive, operands, params, bound.dtype)
+    finally:
+        jax.monitoring.unregister_event_duration_listener(heard)
     assert folded is not None and folded.dtype == bound.dtype and folded == bound[()], (folded, bound)
+    assert not lowered, lowered
 
 
 def test_an_unknown_branch_counts_the_most_of_each_unit_any_branch_issues():

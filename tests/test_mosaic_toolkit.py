@@ -1949,7 +1949,8 @@ def test_a_uniform_read_gives_each_lane_its_warps_lane_zero_value(read):
         each = plgpu.ShapeDtypeStruct((128,), jnp.dtype(jnp.int32), layout=lanes)
         out_gmem[...] = plgpu.inline_mgpu(arg_types=(scalar,), return_type=each)(spread)(read_value)
 
-    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.int32), grid=(1,))()
+    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.int32), grid=(1,),
+                       grid_names=("programs",))()
     threads = np.arange(128, dtype=np.int32)
     expected = (threads // 32 * 32 if read == "uniform" else threads) + 7
     np.testing.assert_array_equal(np.asarray(out), expected)
