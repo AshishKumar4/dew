@@ -624,6 +624,8 @@ class KernelOp(tokamax.Op):
             # Each refused config stepped to the next refused one; the last, to its held rung or the offer.
             climbed, held = self._climbed(ba, config, spilling, seen)
             refused = [(config, spilling), *climbed]
+            if held is None:
+                refused += self._spanned(ba, config, spilling, seen)
             stepped = held if held is not None else offered()
             for (refusal, its), later in zip(refused, [*refused[1:], None], strict=True):
                 report.missed(self, ba, refusal, its, stepped=later is not None or (
@@ -632,6 +634,40 @@ class KernelOp(tokamax.Op):
                 return None
             config = stepped
         return config
+
+    def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
+        """The configs below a refused `config` whose kernels spill too where both `config`'s and the last's
+        do: `config`'s fields at each smaller block its derivation's own walk takes, within `config`'s
+        register cap and residency (ptxas is not monotone across caps, kernel-templates.md), largest first;
+        none unless the launch states them (`_spanned`), as no launch whose ladders were not measured
+        monotone does."""
+        del ba, config
+        return ()
+
+    def _spanned(self, ba: tokamax.BoundArguments, config: Hashable, spilling: tuple, seen: set
+                 ) -> list[tuple[Hashable, tuple]]:
+        """After `config` spilled (`spilling`), its ladder's last rung (`ladder`) certified, and where it
+        spills too every rung between refused unasked: inferred from a launch's spilling being monotone in its
+        block within one cap and residency, which every whole ladder certified held (FS-MONOTONE2 at
+        base/kernels d612ccb2d: the attention backward's and training forward's gate cases at blocks 64 to
+        256, sm90's 111 ladders and sm80's 110, 39 of them holding at some blocks and spilling at others, none
+        spilling below a block that held). An all-spilling ladder of n rungs certifies two, not n (row 7938:
+        the accurate backward's dQ 25 to 100 s cold). A wrong inference costs a tile, never a result. Where
+        the last holds or cannot be certified, nothing is inferred and the derivation walks the rungs in turn;
+        the last's refusal returned for its miss (`_certified`'s), the rungs inferred refused for `config`'s
+        kernels."""
+        rungs = [rung for rung in self.ladder(ba, config) if rung not in seen]
+        if len(rungs) < 2:
+            return []
+        last = rungs[-1]
+        found = report.certified(self, ba, last)
+        if not found:
+            return []
+        for rung, kernels in ((last, found), *((rung, spilling) for rung in rungs[:-1])):
+            seen.add(rung)
+            report.refuse_launch(self, ba, rung, {binary.kernel for binary in kernels},
+                                 {binary.kernel: binary.spilled_in for binary in kernels})
+        return [(last, found)]
 
     def remaining(self, ba: tokamax.BoundArguments) -> Hashable | None:
         """The config the launch's derivation offers `ba` now, its refusals read (`_get_heuristics_config`'s);

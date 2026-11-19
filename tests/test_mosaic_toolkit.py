@@ -17,7 +17,18 @@ from jax.sharding import Mesh
 from kernel_compile import gate_generations, stated_outputs
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, handoffs, mosaic, outputs, product, rings, stores, swizzling
+from dew.nn.kernels.templates import (
+    across,
+    emission,
+    handoffs,
+    mosaic,
+    outputs,
+    product,
+    rings,
+    stores,
+    swizzling,
+)
+from dew.nn.kernels.templates.cost import Stated
 
 pytestmark = pytest.mark.kernel
 
@@ -2121,3 +2132,69 @@ def test_a_values_parts_sum_back_to_it_exactly_fp32s_largest_among_them():
     past = 2.0**128 - 2.0**111
     x = jnp.asarray([largest, past, -largest, -past, 1.0 + 2.0**-23], jnp.float32)
     np.testing.assert_array_equal(np.asarray(product.whole(product.formed(x, 3))), np.asarray(x))
+
+STAGED = (8, 32, 3)
+"""A staged output's tile: its rows, a chunk buffer's columns, and its chunks (two buffers, two tiles)."""
+
+
+def _staged_launch(waits: tuple[int, ...], **launch):
+    """A kernel storing two tiles in turn of an output staged through two chunk buffers, `STAGED`'s chunks
+    a tile (`stores.staged_chunks` at `waits`, chunk c in buffer c % 2), each tile its columns' indices plus
+    a thousand times its own; `launch` the kernel's other arguments."""
+    rows, width, chunks = STAGED
+
+    def body(out_gmem):
+        def scoped(smem):
+            for tile in range(2):
+                value = jax.lax.broadcasted_iota(jnp.float32, (rows, chunks * width), 1) + 1000.0 * tile
+                stores.staged_chunks(smem, value, out_gmem, (tile * rows, 0, jnp.int32(rows), 0, rows, rows),
+                                     waits=waits)
+            plgpu.wait_smem_to_gmem(0)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, rows, width), jnp.float32))
+
+    return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((2 * rows, chunks * width), jnp.float32),
+                        **launch)
+
+
+@pytest.mark.parametrize("loosened", [None, 0, 2], ids=["derived", "first-chunk", "third-chunk"])
+def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loosened):
+    """An output staged through two chunk buffers three chunks a tile, two tiles in turn (`_staged_launch`),
+    under the GPU interpreter's race detection: at the derived waits (`stores.buffer_waits`: none left in
+    flight before a tile's first chunk, whose buffer the tile before stored last, two before its second, one
+    before its third) every buffer is rewritten only once its last TMA store has read it, the output the
+    tiles' values; a wait allowing one group more at a tile's first chunk or its third rewrites a buffer a
+    store still reads, which the detector names (its second's buffer the first's drain already freed)."""
+    from jax._src.pallas.mosaic_gpu.interpret.interpret_pallas_call import reset_gpu_interpret_mode_state
+
+    rows, width, chunks = STAGED
+    waits = list(stores.buffer_waits(chunks, 2))
+    assert waits == [0, 2, 1]
+    if loosened is not None:
+        waits[loosened] += 1
+    kernel = _staged_launch(tuple(waits), interpret=plgpu.InterpretGPUParams(detect_races=True))
+    if loosened is None:
+        tiles = 1000.0 * np.repeat([0, 1], rows)[:, None]
+        columns = np.arange(chunks * width, dtype=np.float32)
+        np.testing.assert_array_equal(np.asarray(kernel()), columns + tiles)
+        return
+    try:
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            kernel()
+    finally:
+        reset_gpu_interpret_mode_state()
+
+
+def test_a_staged_outputs_launch_states_its_cost():
+    """The staged output's launch (`_staged_launch`, its chunks' stores committed a group a chunk) costed as
+    the toolkit's launches are (`emission.costed`, the estimate XLA and Dew's FLOP count read): it states the
+    bytes it is given and no arithmetic, a store group's commit priced as the synchronization it is."""
+    from reference_error import equations
+
+    rows, width, chunks = STAGED
+    stored = 2 * rows * chunks * width * 4
+    launch = _staged_launch(stores.buffer_waits(chunks, 2))
+    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=stored)))()
+    [estimate] = [equation.params["cost_estimate"] for equation in equations(traced.jaxpr)
+                  if "cost_estimate" in equation.params]
+    assert (estimate.bytes_accessed, estimate.flops, estimate.transcendentals) == (stored, 0, 0)

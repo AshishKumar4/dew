@@ -4,6 +4,7 @@ buffer and its rows stored by a ladder of static-extent copies (`staged_rows`, `
 row by row where a table says (`Scattered`)."""
 
 import dataclasses
+import functools
 import math
 from collections.abc import Callable
 from typing import Any
@@ -60,14 +61,64 @@ def written(smem, value: jax.Array) -> None:
     smem[...] = value.astype(smem.dtype)
 
 
+def buffer_waits(chunks: int, buffers: int) -> tuple[int, ...]:
+    """For each of a tile's `chunks` chunks staged through `buffers` buffers in turn (chunk c in buffer
+    c % buffers, `output_staging`), the TMA store groups that may still be reading shared memory as the
+    chunk's buffer is written again (`plgpu.wait_smem_to_gmem`'s count): the fewest groups any run issues
+    after that buffer's last store, each chunk's copies one group (`staged_rows`). Before a buffer is
+    rewritten its last group is older than those, so it has been read; another output's groups between
+    them only make it older. A chunk past the first `buffers` (c >= buffers) wrote its buffer `buffers`
+    chunks before, `buffers - 1` groups since; one of the first rewrites the buffer the tile before last
+    stored, at its chunk L (the last of that buffer's, `L % buffers == c`), `chunks - 1 - L` of that tile's
+    groups and this tile's `c` since. Every tile of a launch stages the same chunks (its value's static
+    width: a ragged last tile's rows and columns clipped by TMA, not fewer chunks), and a tile that stores
+    nothing (an inactive one) issues no group, so the tile before is the last that stored. Waiting for none
+    (each chunk's count 0) drained both buffers before every write: a pair of 32-column chunks of an
+    emulated B200's gathered kernel gradient waited on the other buffer's store too (M-EM-71, em71)."""
+    waits = []
+    for chunk in range(chunks):
+        if chunk >= buffers:
+            waits.append(buffers - 1)
+            continue
+        last = chunk + buffers * ((chunks - 1 - chunk) // buffers)
+        waits.append(chunks - 1 - last + chunk)
+    return tuple(waits)
+
+
+def column_chunks(value: jax.Array, width: int) -> list[tuple[int, jax.Array]]:
+    """`value` `width` of its columns at a time, each chunk with its first column, the whole where it is no
+    wider: a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
+    if width >= value.shape[-1]:
+        return [(0, value)]
+    return [(first, value[..., first:first + width]) for first in range(0, value.shape[-1], width)]
+
+
+def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
+                  waits: tuple[int, ...] | None = None) -> None:
+    """A consumer's share `value` of an output tile staged through its chunk buffers (`smem`, `[buffers,
+    rows, columns]`) a buffer's columns at a time (`column_chunks`) and stored to `ref` at `place`
+    (`(row_start, first, stored, column, *ladder)`, `staged_rows`), each chunk's buffer written once the
+    store groups `waits` leave in flight no longer read it: the caller's own schedule of them, where its
+    chunks' groups run otherwise than one output's tiles in turn, else `buffer_waits`'."""
+    buffers, width = smem.shape[0], smem.shape[-1]
+    row_start, first, stored, column, *ladder = place
+    chunks = column_chunks(value, width)
+    waits = buffer_waits(len(chunks), buffers) if waits is None else waits
+    for chunk, (start, piece) in enumerate(chunks):
+        plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
+        staged_rows(smem.at[chunk % buffers], piece, ref, row_start, first, stored, column + start, *ladder,
+                    write=write)
+
+
 def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column, most: int,
                 least: int = 1, *, write: Callable = written) -> None:
     """`value` written to the shared buffer `smem` in its dtype (`write`: its issuer's, `Issuer.written`),
     made visible to TMA, and its rows `first` to `first + stored` stored to `o_gmem` at row
-    `row_start + first` and `column` (`store_rows`); the copies stay in flight (the caller waits before
-    `smem` is written again). A `Scattered` output's rows each land where its table says, copied by the
-    warpgroup's threads (`gathered.scattered_rows`), done when it returns, its value written unoptimized
-    (no TMA copy reads the buffer, whose plain layout has no optimized transfer from a warpgroup MMA's)."""
+    `row_start + first` and `column` (`store_rows`), its copies one TMA store group (`buffer_waits` counts
+    a chunk's stores so); the copies stay in flight (the caller waits before `smem` is written again). A
+    `Scattered` output's rows each land where its table says, copied by the warpgroup's threads
+    (`gathered.scattered_rows`), done when it returns, its value written unoptimized (no TMA copy reads the
+    buffer, whose plain layout has no optimized transfer from a warpgroup MMA's)."""
     if isinstance(o_gmem, Scattered):
         plgpu.store(smem, value.astype(smem.dtype), optimized=False)
         plgpu.commit_smem()
@@ -77,7 +128,9 @@ def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column
         return
     write(smem, value)
     plgpu.commit_smem()
-    store_rows(smem, o_gmem, row_start, first, stored, column, most, least)
+    store_rows(smem, o_gmem, row_start, first, stored, column, most, least,
+               copy=functools.partial(plgpu.copy_smem_to_gmem, commit_group=False))
+    plgpu.commit_smem_to_gmem_group()
 
 
 def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, least: int = 1,

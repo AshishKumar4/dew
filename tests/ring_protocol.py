@@ -8,14 +8,15 @@ The events are the kernel's own equations: an `mbarrier` wait (`barrier_wait`, a
 without one, Mosaic's tracked phase), an arrival (`barrier_arrive`, or a tcgen05 commit's,
 `tcgen05_commit_arrive`, asynchronous, once the products its thread issued before it complete), a TMA
 load (`copy_gmem_to_smem`: an arrival with its transaction at issue, its bytes landing later, out of order
-with other copies), a TMA store (`copy_smem_to_gmem`, reading shared memory until `wait_smem_to_gmem`
-retires it), a generic proxy's fence (`commit_smem`), a warpgroup product (`wgmma`, reading shared memory
-until `wgmma_wait` retires it) or a tcgen05 one (`tcgen05_mma`, until its thread's next commit completes), a
-shared-memory read or write (`get`, `swap`), and an inlined body's (`inline_mgpu`, lane-level code the
-jaxpr does not show) as its body's own fields state them (`INLINED`: a gathered ring's barriers' arrivals,
-its parity waits, and each load warp's gathers and the first's expecting arrival). Index arithmetic, loops
-and branches are evaluated concretely per warpgroup and warp (`axis_index`), so each program is its own
-fixed sequence of events: no control flow reads shared memory a peer writes.
+with other copies), a TMA store (`copy_smem_to_gmem`, reading shared memory until a `wait_smem_to_gmem`
+retires its group, which it or a `commit_group` commits), a generic proxy's fence (`commit_smem`), a
+warpgroup product (`wgmma`, reading shared memory until `wgmma_wait` retires it) or a tcgen05 one
+(`tcgen05_mma`, until its thread's next commit completes), a shared-memory read or write (`get`, `swap`),
+and an inlined body's (`inline_mgpu`, lane-level code the jaxpr does not show) as its body's own fields
+state them (`INLINED`: a gathered ring's barriers' arrivals, its parity waits, and each load warp's gathers
+and the first's expecting arrival). Index arithmetic, loops and branches are evaluated concretely per
+warpgroup and warp (`axis_index`), so each program is its own fixed sequence of events: no control flow
+reads shared memory a peer writes.
 
 The semantics assumed (PTX ISA, `mbarrier`, `cp.async.bulk`, `fence.proxy.async`):
 - a barrier's phase completes once its arrivals (its `num_arrivals`) and its pending transactions are all in;
@@ -24,7 +25,9 @@ The semantics assumed (PTX ISA, `mbarrier`, `cp.async.bulk`, `fence.proxy.async`
 - an arrival releases, a passing wait acquires: everything before the arrivals of a completed phase happens
   before everything after a wait that observes it; a TMA load's bytes are written after its issue and before
   the transaction completes;
-- a TMA store reads its shared-memory source asynchronously until a `wait_smem_to_gmem` retires it, and
+- a TMA store reads its shared-memory source asynchronously until a `wait_smem_to_gmem` retires its group
+  (the wait's count is the latest committed groups it leaves in flight, an empty one among them; a store no
+  commit has closed it does not retire), and
   reads a generic write only after a `commit_smem` (`fence.proxy.async`) that follows it;
 - a tcgen05 commit completes asynchronously (`tcgen05.commit`): once the products its thread issued before
   it complete, their operands' reads ending then, it arrives at its barrier, ordered to every thread, its
@@ -309,10 +312,18 @@ def _load(self: _Interpreter, equation, values) -> list:
 
 
 def _store(self: _Interpreter, equation, values) -> list:
+    """A TMA store, its argument whether it commits its thread's open store group (`commit_group`: a group of
+    it and every store before it no commit closed)."""
     params = equation.params
     tree = params["src_transforms_treedef"]
     count = tree.num_leaves
-    return self.emit("store", _slot(values[0], tree, values[2:2 + count]))
+    return self.emit("store", _slot(values[0], tree, values[2:2 + count]), bool(params["commit_group"]))
+
+
+def _store_group(self: _Interpreter, equation, values) -> list:
+    """A commit of the thread's open store group (`commit_smem_to_gmem_group`): a group, empty where no store
+    is open, which a wait's count counts as any other."""
+    return self.emit("store_group")
 
 
 def _store_wait(self: _Interpreter, equation, values) -> list:
@@ -373,7 +384,8 @@ too, only through a wait that observes that arrival."""
 SYNC: dict[str, Callable] = {
     "barrier_wait": _wait, "barrier_arrive": _arrival("transforms_treedef"),
     "tcgen05_mma": _tcgen05_product, "tcgen05_commit_arrive": _tcgen05_commit, "copy_gmem_to_smem": _load,
-    "copy_smem_to_gmem": _store, "wait_smem_to_gmem": _store_wait, "commit_smem": _commit,
+    "copy_smem_to_gmem": _store, "commit_group": _store_group, "wait_smem_to_gmem": _store_wait,
+    "commit_smem": _commit,
     "get": _access("read", 1), "swap": _access("write", 2), "wgmma": _product, "wgmma_wait": _product_wait,
 }
 """Each primitive of the toolkit's synchronization and shared memory, as an `Event`."""
@@ -716,6 +728,7 @@ class _Order:
         self.writes: list = []
         self.reads: list = []
         self.pending: list = [[] for _ in threads]
+        self.groups: list = [0 for _ in threads]
         self.unfenced: list = [set() for _ in threads]
         self.issued: dict = {}
         self.committed: list = [[] for _ in threads]
@@ -746,7 +759,7 @@ class _Order:
             # completion has ended) ends after this write, whatever orders the write.
             flying = [entry for entries in self.pending for entry in entries]
             flying += [entry for products in self.committed for entry, done in products if done is None]
-            for _, where, prior_event in flying:
+            for _, where, prior_event, *_ in flying:
                 if _overlaps(where, at):
                     said = f"write of {at} while the {prior_event.kind} reading {where} is in flight"
                     raise Violation("unordered", said, [(None, prior_event), (None, event)])
@@ -754,16 +767,16 @@ class _Order:
     def landed(self, thread, position, event) -> None:
         landing = _joined(self.issued[(thread, position)], {("load", thread, position): 1})
         if event.kind == "committed":
-            # A commit's completion, after every product its thread issued before it completes: a product a
-            # commit landed before completed then, and one none did completes here, its reads ending.
-            covered = self.committing.pop((thread, position))
-            for _, done in covered:
-                if done is not None:
-                    landing = _joined(landing, done)
-            for product in covered:
+            # A commit's completion, after every product its thread issued before it completes. A product's
+            # completion is its own: after its issue and its token (`completed`), no later event of its
+            # thread's, its reads ending there, whichever covering commit lands first; each commit's arrival
+            # joins the completions it covers.
+            for product in self.committing.pop((thread, position)):
                 if product[1] is None:
-                    product[1] = landing
-                    self.reads.append((product[0][1], landing, product[0][2]))
+                    _, source, read, issued, key, _ = product[0]
+                    product[1] = _joined(issued, {("completed", *key): 1})
+                    self.reads.append((source, product[1], read))
+                landing = _joined(landing, product[1])
             self.arrived(event.at, landing, counted=True, transaction=0)
             return
         self.ordered(event.at, landing, event, write=True)
@@ -801,20 +814,37 @@ class _Order:
             self.pending[thread] = [entry for entry in self.pending[thread] if entry[0] != "product"]
             self.committing[(thread, position)] = list(self.committed[thread])
         elif kind in ("store", "product"):
-            self.asynchronous(thread, event, clock)
-        elif kind in ("product_wait", "store_wait"):
-            self.retired(thread, "product" if kind == "product_wait" else "store", int(event.argument), clock)
+            self.asynchronous(thread, position, event, clock)
+            if kind == "store" and event.argument:
+                self.groups[thread] += 1
+        elif kind == "store_group":
+            self.groups[thread] += 1
+        elif kind == "product_wait":
+            self.retired(thread, "product", int(event.argument), clock)
+        elif kind == "store_wait":
+            self.retired_groups(thread, int(event.argument), clock)
 
-    def asynchronous(self, thread, event, clock) -> None:
+    def asynchronous(self, thread, position, event, clock) -> None:
         """An asynchronous read issued: a store's source, fenced, or a product's operands, each read until
-        the wait that retires it (`retired`)."""
+        the wait that retires it (`retired`) or, a tcgen05 product's, its completion (`landed`); each held
+        with its issue's clock and place."""
         sources = (event.at,) if event.kind == "store" else event.argument
         if event.kind == "store" and any(_overlaps(event.at, at) for at in self.unfenced[thread]):
             raise Violation("unfenced", f"a store reads {event.at} past a generic write no fence follows",
                             [(thread, event)])
         for source in sources:
             self.ordered(source, clock, event, write=False)
-            self.pending[thread].append((event.kind, source, event))
+            # A store's read, the group it joins (its thread's open one) after it.
+            self.pending[thread].append((event.kind, source, event, dict(clock), (thread, position),
+                                         self.groups[thread]))
+
+    def retired_groups(self, thread, kept: int, clock) -> None:
+        """A store wait retiring every committed store group but its `kept` latest: each of their reads ends
+        here; a store no commit has closed stays in flight."""
+        retiring = self.groups[thread] - kept
+        for entry in [entry for entry in self.pending[thread] if entry[0] == "store" and entry[5] < retiring]:
+            self.reads.append((entry[1], dict(clock), entry[2]))
+            self.pending[thread].remove(entry)
 
     def retired(self, thread, kind, kept: int, clock) -> None:
         """A wait retiring all but its `kept` latest asynchronous reads of `kind`: each read ends here."""
