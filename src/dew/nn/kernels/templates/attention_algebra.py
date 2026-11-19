@@ -1305,9 +1305,9 @@ def kept_parts(p: jax.Array, multiplier: jax.Array | None, reach: float, dtype) 
     4e2eb287e and a648b3279, F1, F3)."""
     if multiplier is None or drops_in_place(dtype, reach):
         return (narrow(kept(p, multiplier, reach), dtype),)
-    (part,) = weights_parts(kept(p, multiplier, reach), dtype, rows=True)
     # Its row's power of two along the product's columns, as the rows' product reads it.
-    return (product.Scaled(part.value, part.exponent[:, None]),)
+    value, exponent = _fp16_scaled(kept(p, multiplier, reach), rows=True)
+    return (product.Scaled(value, exponent[:, None]),)
 
 
 def in_units(spec: "Forward", products: jax.Array) -> jax.Array:
