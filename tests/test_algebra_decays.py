@@ -165,3 +165,22 @@ def test_the_decay_takes_the_same_tangent_forward_as_backward():
 
     assert_as_exact(paired(between), paired(plain_between), draw, "the decays' tangent paired",
                     seeds=PAIRING_SEEDS)
+
+
+def test_a_per_key_spreads_factored_pair_keeps_a_result_its_whole_decay_loses():
+    """`scan.spread` under a decay a key dimension: a reader at a sub-chunk's first token
+    (`recurrence_algebra.SUB`) and a write of keys 2^120 two tokens earlier, in the sub-chunk before, under
+    log decays of -80 a token and dimension there: its read through the factors to and from the sub-chunk's
+    reference, exp(-80) each, a normal float32 near 2^-111 within a factor of two of float64's, where the
+    pair's whole decay, exp(-160), is zero in float32 and a select on it read zero (head review of 4bc3f5016
+    F1)."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    chunk, width = 2 * SUB, 2
+    readers, values = np.zeros((chunk, 1), np.float32), np.zeros((chunk, 1), np.float32)
+    keys, exponents = np.zeros((chunk, width), np.float32), np.zeros((chunk, width), np.float32)
+    readers[SUB], values[SUB - 2], keys[SUB - 2] = 1.0, 1.0, 2.0 ** 120
+    exponents[SUB - 1:SUB + 1] = -80.0
+    found = np.asarray(scan.spread(readers, values, keys, scan.between(exponents)))
+    exact = 2.0 ** 120 * np.exp(-160.0)
+    assert np.all(found[SUB] > exact / 2) and np.all(found[SUB] < 2 * exact), (found[SUB], exact)
