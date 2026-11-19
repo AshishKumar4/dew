@@ -96,7 +96,9 @@ def rate_past_the_range(case: str, seed: int) -> tuple:
     steps softplus of standard normals, each decay `exp(dt A)` zero, no state entering. A decay of e^-3:
     every step 2^-126, each decay e^-3, the state entering standard normal, which a clamp of the rate taken
     to base 2 first would not give (row 8491's head review)."""
-    rng = np.random.default_rng([8491, RATES_PAST_THE_RANGE.index(case), seed])
+    # The first case's draws as row 8491 drew them, each later case's a stream of its own.
+    index = RATES_PAST_THE_RANGE.index(case)
+    rng = np.random.default_rng([8491, seed, index] if index else [8491, seed])
     rows, length, channels, states = 1, 50, 128, 4
     x = rng.standard_normal((rows, length, channels))
     dt = np.logaddexp(0.0, rng.standard_normal((rows, length, channels)))
