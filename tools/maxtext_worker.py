@@ -24,6 +24,10 @@ from collections.abc import Iterator
 
 from reference_worker import Applied, answered, serve
 
+COHORT = "maxtext"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 GPT3 = {"base_emb_dim": 16, "base_num_query_heads": 2, "base_num_kv_heads": 2, "head_dim": 8,
         "base_mlp_dim": 64, "base_num_decoder_layers": 2, "vocab_size": 64, "trainable_position_size": 64,
         "max_target_length": 16}

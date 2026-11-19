@@ -49,6 +49,10 @@ import torch.nn.functional as F
 from common import WorkloadWork, documents
 from torch_runs import Ranks, Split, finish, record, split, torch_arguments, train
 
+COHORT = "megatron"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 
 def arguments(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(parents=[torch_arguments()])

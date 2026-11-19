@@ -30,6 +30,10 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "fla"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "fla" / "gdn_seeded.npz"
 GRADIENTS = ("q", "k", "v", "g", "beta", "h0")
 """The delta rules' differentiated operands; RWKV6's take its own weight in the write gate's place."""

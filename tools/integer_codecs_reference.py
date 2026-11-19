@@ -51,6 +51,10 @@ from gptqmodel.utils.model import convert_gptq_v1_to_v2_format_module, convert_g
 from reference_source import package, published_files, saved_fixture
 from safetensors.numpy import load_file
 
+COHORT = "gptqmodel"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "integer.npz"
 GPTQMODEL = "7.5.0"

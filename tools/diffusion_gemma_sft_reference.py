@@ -28,6 +28,10 @@ from hackable_diffusion.lib.training.discrete_loss import NoWeightDiscreteLoss
 from hackable_diffusion.lib.training.time_sampling import UniformTimeSampler
 from safetensors.numpy import save_file
 
+COHORT = "gemma-diffusion"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/diffusion-gemma-sft"
 SEED = 2
 

@@ -61,6 +61,10 @@ from common import (
 from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_source import dew_revision
 
+COHORT = "flaxdiff"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 # The DiT both packages define, at 64x64 pixels: 256 patches of 4x4.
 MODEL = {"output_channels": 3, "patch_size": 4, "emb_features": 384, "num_layers": 8,
          "num_heads": 6, "mlp_ratio": 4, "norm_epsilon": 1e-5, "force_fp32_for_softmax": True}

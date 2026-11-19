@@ -45,6 +45,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict
 
+COHORT = "flaxdiff"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 COMMIT = "3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a"
 HYBRID_COMMIT = "94d2d21caeb79aba48a505fa79d9a1a974751234"
 

@@ -77,6 +77,10 @@ from kimi_k3_reference import (
 )
 from reference_source import config_lookups, hub_modules, record_padding
 
+COHORT = "kimi-linear"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 REVISION = "e1df551a447157d4658b573f9a695d57658590e9"
 REMOTE = ("configuration_kimi.py", "modeling_kimi.py")

@@ -31,6 +31,10 @@ from reference_releases import require
 from transformers import CLIPTextConfig, CLIPTokenizer, FlaxCLIPTextModel, FlaxCLIPTextModelWithProjection
 from transformers.models.clip.tokenization_clip import bytes_to_unicode
 
+COHORT = "diffusers-pipelines"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 
 def build(directory, task):
     pins = require("diffusers-pipelines")

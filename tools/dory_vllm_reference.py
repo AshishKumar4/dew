@@ -52,6 +52,10 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "vllm-dory"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURE = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf' / 'dory-1.0-4b'
 PULL = 'vllm-project/vllm#60149 at shan18/vllm 55076950b6c155f384d6766d63563c3bc20a0e3f'
 BASE = '153a17166e5d07bc38184dedeea542d2e8885e55'

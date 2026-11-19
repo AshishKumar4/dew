@@ -55,6 +55,10 @@ from safetensors.torch import save_file
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from triton.language.extra.cuda import libdevice
 
+COHORT = "modelopt-nvfp4"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "modelopt"
 REPO = "nvidia/Qwen3-14B-NVFP4"
 REVISION = "bc39319a4dc265d9bbb9a9731bc52c4988d9ece7"

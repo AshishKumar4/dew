@@ -28,6 +28,10 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "verl"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 VERL = "0.9.0"
 

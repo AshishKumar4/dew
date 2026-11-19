@@ -37,6 +37,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+COHORT = "laya"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 LAYA_COMMIT = "a4a8921afebfd852bba0000475cfb6ab737a124c"
 LAYA_REPO = "convaiinnovations/laya"
 LAYA_REVISION = "7b928d828b7b0e022f929d9bd2e44165aa270148"

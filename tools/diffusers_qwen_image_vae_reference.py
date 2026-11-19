@@ -38,6 +38,10 @@ import torch
 from diffusers_reference_helpers import drawn_wan_vae
 from reference_vjp import recorded_vjp
 
+COHORT = "diffusers-qwen-image"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 DIFFUSERS_COMMIT = "6256aa7666cedd47443adc8f82da9a10e110b09c"
 CONFIG = {"base_dim": 4, "decoder_base_dim": 6, "z_dim": 8, "dim_mult": [1, 2, 2, 4, 4], "num_res_blocks": 1,
           "attn_scales": [], "temperal_downsample": [False, True, True, True], "dropout": 0.0,

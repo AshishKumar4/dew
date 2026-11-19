@@ -84,6 +84,10 @@ import numpy as np
 import torch
 from reference_source import loaded, record_padding, saved_fixture
 
+COHORT = "tilelang"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
 DEEPSEEK_V41_REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
 CODE = ("inference/model.py", "inference/engram.py", "inference/vision.py",

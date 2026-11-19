@@ -41,6 +41,10 @@ from transformers import (
     CLIPVisionConfig,
 )
 
+COHORT = "diffusers-pipelines"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 
 def convert(model_class, config, parameters, *, vae=False):
     model = model_class.from_config(dict(config))

@@ -159,6 +159,10 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from dew.interop.probe import BATCH, probe_ids
 from dew.interop.verify import reference_logits, scatter_weights
 
+COHORT = "minimax-m2"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 REAL_MODEL = "Qwen/Qwen3-0.6B"
 # google/gemma-3-1b-pt is gated; this mirror carries the identical config

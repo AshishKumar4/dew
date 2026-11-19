@@ -67,6 +67,42 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "modelopt": {"nvidia-modelopt": "0.47.0"},
     # MiMo Audio's mel reference (tools/torchaudio_mel_worker.py, tools/venv_reference.py's mimo-mel site).
     "torchaudio": {"torchaudio": "2.11.0"},
+    # The reference environments each tool's own notes install (row 7933: each type-checked in its own,
+    # tools/check_tool_types.py). A release that is a repository at a commit (`git+...@<sha>`) is the
+    # checkout its site runs, which no published release holds; `require` reads none of these.
+    "tilelang": {"torch": "2.10.0", "tilelang": "0.1.8", "transformers": tested("transformers")},
+    "gemma-diffusion": {
+        "gemma": "git+https://github.com/google-deepmind/gemma@bf0b49901a428d13e9c2b2629f0eb9c153d3cbd3",
+        "hackable-diffusion": "1.0.1", "kauldron": "1.4.4"},
+    "dreamerv3": {
+        "dreamerv3": "git+https://github.com/danijar/dreamerv3@e01491fad6434b2245a3b8ca201dd7faedcc458c",
+        "jax": "0.4.33", "ninjax": "3.5.1", "elements": "3.19.1"},
+    "flaxdiff": {
+        "flaxdiff": "git+https://github.com/AshishKumar4/FlaxDiff@3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a",
+        "jax": "0.5.3", "flax": "0.10.6"},
+    "laya": {
+        "laya": "git+https://github.com/NandhaKishorM/laya@a4a8921afebfd852bba0000475cfb6ab737a124c",
+        "transformers": "5.16.1"},
+    "lm-engine": {
+        "lm-engine":
+            "git+https://github.com/open-lm-engine/lm-engine@45b6b57b0deea5b9ef6c9c6f637dc151f1383343",
+        "torch": "2.10.0", "pydantic": "2.13.4", "transformers": "4.57.3"},
+    "mamba-ssm": {"mamba-ssm": "2.3.2.post1", "torch": "2.14.0"},
+    "maxtext": {"maxtext": "0.2.5"},
+    "modelopt-nvfp4": {"nvidia-modelopt": "0.47.0", "torch": "2.13.0", "triton": "3.7.1",
+                       "diffusers": "0.34.0"},
+    "pytorch-fid": {"pytorch-fid": "0.3.0", "torch": "2.14.0"},
+    "megatron": {"megatron-core": "0.19.2", "torch": "2.14.0"},
+    "torch-qwen35": {"torch": "2.10.0", "transformers": "5.3.0", "triton": "3.6.0", "fla-core": "0.5.2",
+                     "flash-linear-attention": "0.5.2", "liger-kernel": "0.8.0"},
+    "kimi-k3": {"torch": "2.8.0", "triton": "3.4.0", "fla-core": "0.5.2", "transformers": "4.56.2",
+                "compressed-tensors": "0.17.1"},
+    "kimi-linear": {"torch": "2.8.0", "triton": "3.4.0", "fla-core": "0.4.0", "transformers": "4.57.1"},
+    "vllm-dory": {"vllm": "git+https://github.com/shan18/vllm@55076950b6c155f384d6766d63563c3bc20a0e3f",
+                  "torch": "2.14.0"},
+    "diffusers-qwen-image": {
+        "diffusers": "git+https://github.com/huggingface/diffusers@6256aa7666cedd47443adc8f82da9a10e110b09c",
+        "transformers": "5.17.0", "torch": "2.14.0"},
 }
 """Each cohort's pins: the distribution and the public release of it, a local
 build label (`+cpu`) aside. The default cohorts' releases are the test extra's

@@ -23,6 +23,10 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+COHORT = "torch-qwen35"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 BASE_PINS = {
     "annotated-doc": "0.0.5", "anyio": "4.15.1", "certifi": "2026.7.22", "click": "8.5.0",
     "filelock": "4.1.0", "fsspec": "2026.9.0", "h11": "0.16.0", "hf-xet": "1.7.0",

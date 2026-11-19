@@ -9,7 +9,8 @@ import pytest
 
 TOOL = Path(__file__).resolve().parents[1] / "tools" / "check_tool_types.py"
 PINS = {"torch": {"torch": "2.14.0"}, "transformers": {"transformers": "5.22.2"},
-        "ouro": {"transformers": "4.56.2"}}
+        "ouro": {"transformers": "4.56.2"},
+        "laya": {"laya": "git+https://github.com/o/laya@" + "a" * 40, "transformers": "5.22.2"}}
 
 
 @pytest.fixture
@@ -56,6 +57,10 @@ def test_a_tools_environment_is_its_cohorts_pins_its_headers_or_dews(gate, tmp_p
         "torch+transformers", ["torch==2.14.0", "transformers==5.22.2"])
     assert gate.environment_of(tools / "script.py", PINS)[1] == ["z3-solver==4.15.4"]
     assert gate.environment_of(tools / "other.py", PINS) == (gate.DEW, [])
+    (tools / "source.py").write_text('COHORT = "laya"\n')
+    name, requirements = gate.environment_of(tools / "source.py", PINS)
+    assert requirements == [f"laya @ git+https://github.com/o/laya@{'a' * 40}", "transformers==5.22.2"]
+    assert gate.SOURCE.match(requirements[0])
     with pytest.raises(ValueError, match="pin transformers at 4.56.2 and 5.22.2.*split it"):
         gate.environment_of(tools / "mixed.py", PINS)
     with pytest.raises(ValueError, match="RELEASES does not"):

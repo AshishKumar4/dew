@@ -65,6 +65,10 @@ import torch
 from reference_source import config_lookups, hub_modules, record_padding
 from safetensors.torch import save_file
 
+COHORT = "kimi-k3"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 REPO = "moonshotai/Kimi-K3"
 REVISION = "f831ab66814297da540d832a5235f8e904f29d06"
 REMOTE = ("configuration_kimi_k3.py", "modeling_kimi_k3.py", "modeling_kimi_linear.py")

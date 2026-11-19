@@ -42,6 +42,10 @@ from lm_engine.training.models import GPTBaseConfig
 from lm_engine.training.optimization.lr_scheduler import LinearScheduler, PowerScheduler
 from lm_engine.training.optimization.params_group import get_param_groups_with_names
 
+COHORT = "lm-engine"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 OUT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "lm_engine"
 M_WIDTH = 4.0
 COEF = 0.01

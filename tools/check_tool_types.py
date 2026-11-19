@@ -113,7 +113,8 @@ def environment_of(path: Path, pins: Mapping[str, Mapping[str, str]]) -> tuple[s
                 raise ValueError(f"{path}: its cohorts {', '.join(cohorts)} pin {distribution} at "
                                  f"{held[distribution]} and {release}; no one environment holds both: "
                                  "split it into a file a cohort")
-    return "+".join(cohorts), sorted(f"{distribution}=={release}" for distribution, release in held.items())
+    return "+".join(cohorts), sorted(f"{distribution} @ {release}" if release.startswith("git+")
+                                     else f"{distribution}=={release}" for distribution, release in held.items())
 
 
 def imported(path: Path) -> set[str]:
@@ -193,18 +194,46 @@ def tools() -> list[Path]:
     return sorted(path for path in (ROOT / "tools").rglob("*.py") if ".venv" not in path.parts)
 
 
+SOURCE = re.compile(r"^(?P<name>[\w.-]+) @ git\+(?P<url>https://github\.com/[\w.-]+/[\w.-]+)"
+                    r"@(?P<sha>[0-9a-f]{40})$")
+"""A RELEASES pin that is a public repository at a commit (`name @ git+https://github.com/org/repo@<sha>`):
+the reference a site runs from its checkout (tools/venv_reference.py's SITES), where no release of it is
+published."""
+
+
 def made(requirements: list[str]) -> Path:
     """The interpreter of the environment holding exactly `requirements`, made once under `ENVIRONMENTS` by
-    their digest (a torch from its CPU index); a failed install raises CalledProcessError."""
+    their digest (a torch from its CPU index, a CUDA extension's build skipped, as pyright reads only its
+    Python); a failed install raises CalledProcessError. A repository pin (`SOURCE`) is never built: it is
+    fetched at its commit beside the environment and put on its path by a .pth file, as its site puts the
+    checkout on its worker's path, which pyright reads as the environment's own; its own dependencies are
+    the cohort's other pins."""
     where = ROOT / ENVIRONMENTS / hashlib.sha256(json.dumps(requirements).encode()).hexdigest()[:16]
     python = where / "bin" / "python"
-    if not (where / "made").is_file():
-        subprocess.run(["uv", "venv", "--quiet", "--clear", "--python", PYTHON, str(where)], check=True)
-        subprocess.run(["uv", "pip", "install", "--quiet", "--python", str(python),
-                        "--extra-index-url", TORCH_CPU, "--index-strategy", "unsafe-best-match",
-                        *requirements], check=True)
-        (where / "made").write_text(json.dumps(requirements))
+    if (where / "made").is_file():
+        return python
+    subprocess.run(["uv", "venv", "--quiet", "--clear", "--python", PYTHON, str(where)], check=True)
+    released = [each for each in requirements if not SOURCE.match(each)]
+    if released:
+        subprocess.run(["uv", "pip", "install", "--quiet", "--python", str(python), "--extra-index-url",
+                        TORCH_CPU, "--index-strategy", "unsafe-best-match", *released], check=True,
+                       env={**os.environ, **SKIPPED_BUILDS})
+    purelib = "import sysconfig; print(sysconfig.get_paths()['purelib'])"
+    site = subprocess.run([str(python), "-c", purelib], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    for source in filter(None, map(SOURCE.match, requirements)):
+        checkout = where / "sources" / source["name"]
+        subprocess.run(["git", "init", "--quiet", str(checkout)], check=True)
+        subprocess.run(["git", "-C", str(checkout), "fetch", "--quiet", "--depth=1", source["url"],
+                        source["sha"]], check=True)
+        subprocess.run(["git", "-C", str(checkout), "checkout", "--quiet", "FETCH_HEAD"], check=True)
+        Path(site, f"_tool_types_{source['name']}.pth").write_text(f"{checkout}\n")
+    (where / "made").write_text(json.dumps(requirements))
     return python
+
+
+SKIPPED_BUILDS = {"MAMBA_SKIP_CUDA_BUILD": "TRUE", "CAUSAL_CONV1D_SKIP_CUDA_BUILD": "TRUE"}
+"""A release that compiles CUDA kernels at install, installed without them: pyright reads its Python alone."""
 
 
 def checked(python: str, paths: list[Path]) -> dict[Path, list[str]]:

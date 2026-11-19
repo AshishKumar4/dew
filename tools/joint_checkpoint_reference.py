@@ -61,6 +61,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+COHORT = "fla"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 ROOT = Path(__file__).resolve().parents[1]
 BACKBONE = ROOT / "tests" / "fixtures" / "hf" / "qwen38-dense-tiny"
 OUT = ROOT / "tests" / "fixtures" / "joint_checkpoint" / "tiny"

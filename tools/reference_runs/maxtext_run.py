@@ -42,6 +42,10 @@ from common import (
     write_record,
 )
 
+COHORT = "maxtext"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 
 def arguments(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])

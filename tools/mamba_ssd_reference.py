@@ -24,6 +24,10 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "mamba-ssm"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba2" / "ssd_mamba_ssm.npz"
 SEED = 2026
 CASES = {

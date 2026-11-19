@@ -22,6 +22,10 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
+COHORT = "verl"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 REVISION = "12ebe0cb4d300c58449fb6c675379e8700015c51"
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/rl"
