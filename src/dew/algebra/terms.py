@@ -1252,9 +1252,12 @@ def product_dtype(params: Mapping, operands: tuple) -> np.dtype:
 
 @functools.cache
 def _dot_dtype(left: np.dtype, right: np.dtype) -> np.dtype:
-    """JAX's result dtype of a `lax.dot_general` of operands of `left` and `right` and no preferred type."""
-    shaped = (jax.ShapeDtypeStruct((1, 1), left), jax.ShapeDtypeStruct((1, 1), right))
-    return np.dtype(jax.eval_shape(jax.lax.dot, *shaped).dtype)
+    """JAX's result dtype of a `lax.dot_general` of operands of `left` and `right` and no preferred type, read
+    with 64-bit types on, so a product traced under x64 and priced outside it keeps its float64 (a
+    `ShapeDtypeStruct` made outside canonicalizes it to float32)."""
+    with jax.enable_x64(new_val=True):
+        shaped = (jax.ShapeDtypeStruct((1, 1), left), jax.ShapeDtypeStruct((1, 1), right))
+        return np.dtype(jax.eval_shape(jax.lax.dot, *shaped).dtype)
 
 
 def product_slack(region: Region, index: int) -> int | None:
