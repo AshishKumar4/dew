@@ -1417,9 +1417,10 @@ def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Cal
     from dew.nn.derivatives import contracted, declared_tangent
 
     def tangent(primals, tangents):
-        # The output's own tangent is zero: it is computed from operands held still.
+        # The output's own tangent is zero: it is computed from operands held still. Its value the attached
+        # output again, so a third order takes its tangent too (8573's head review: 32 where 48).
         output, *operands = primals
-        return output, jax.jvp(portable, tuple(operands), tuple(tangents[1:]))[1]
+        return attached(output, *operands), jax.jvp(portable, tuple(operands), tuple(tangents[1:]))[1]
 
     def holding(output, *operands):
         del operands

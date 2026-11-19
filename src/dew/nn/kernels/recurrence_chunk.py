@@ -904,45 +904,37 @@ def _forked_adjoint(backward, operands, memory, forked, held: int, entering, d_o
     slot, the slot's cotangent (each later chunk that took it up's) joins the walk's; at a chunk taking a
     document up, the cotangent of the memory it entered is its slot's (and its entry write's), and the walk
     before it carries none. Returns the chunks' cotangents and the walk's operands' (`(given, loads, stores,
-    entries?, turning?)`, the integers held in their place). A load rotation turns a slot's cotangent back
-    into its slot's frame, and takes its own from the slot's memory it turned, the memory entering less its
-    entry write turned back: a turned call's first order takes its turns' in the crossing form
-    (`templates.recurrence.turned`), and its higher orders this walk's (row 8573: none here, a turned
-    forked call's turn Hessian lost its load rotation's part)."""
+    entries?, turning?)`, the integers held in their place, the load rotation's cotangent none: a turned
+    call's turns take theirs in the crossing form, `templates.recurrence.turned`). A load rotation turns a
+    slot's cotangent back into its slot's frame."""
     loads, stores, entries, turning = forked
     count = memory.shape[0]
     unit = jnp.zeros((loads.shape[0], 0))
     cos, sin = (unit, unit) if turning is None else turning
-    written = unit if entries is None else entries
 
     def loading(carried, chunk):
         d_h, d_table, d_given = carried
-        chunk, h, d_out, load, store, entry, cos, sin = chunk
+        chunk, h, d_out, load, store, cos, sin = chunk
         if held:
             at = jnp.maximum(store - 1, 0)
             d_h = d_h + jnp.where(store > 0, d_table[at], 0)
             d_table = d_table.at[at].set(jnp.where(store > 0, 0, d_table[at]))
         d_entering, d_chunk = backward(chunk, (None, h), d_h, d_out)
         taking = load >= 0
-        d_slot, d_turning = d_entering, ()
-        if turning is not None:
-            d_slot = scan.rotated(d_entering, cos, -sin, axis=-2)
-            # The slot's memory before its load rotation: the memory entering, less its entry write, back.
-            taken = scan.rotated(h if entries is None else h - entry.astype(h.dtype), cos, -sin, axis=-2)
-            d_turning = jax.vjp(lambda c, s: scan.rotated(taken, c, s, axis=-2), cos, sin)[1](d_entering)
+        d_slot = d_entering if turning is None else scan.rotated(d_entering, cos, -sin, axis=-2)
         given_slot = taking & (load > 0) & (load <= count)
         d_given = d_given.at[jnp.clip(load - 1, 0, count - 1)].add(jnp.where(given_slot, d_slot, 0))
         if held:
             d_table = d_table.at[jnp.clip(load - count - 1, 0, held - 1)].add(
                 jnp.where(taking & (load > count), d_slot, 0))
         carried = (jnp.where(taking, 0, d_entering), d_table, d_given)
-        taken_only = (jnp.where(taking, d, 0) for d in (d_entering, *d_turning))
-        return carried, (d_chunk, *taken_only)
+        return carried, (d_chunk, jnp.where(taking, d_entering, 0))
 
     start = (d_final, jnp.zeros((held, *memory.shape[1:]), d_final.dtype), jnp.zeros_like(memory))
-    (_, _, d_given), (d_operands, d_entered, *d_turning) = jax.lax.scan(
-        loading, start, (operands, entering, d_outputs, loads, stores, written, cos, sin), reverse=True)
-    return d_operands, (d_given, loads, stores, *(() if entries is None else (d_entered,)), *d_turning)
+    (_, _, d_given), (d_operands, d_entered) = jax.lax.scan(
+        loading, start, (operands, entering, d_outputs, loads, stores, cos, sin), reverse=True)
+    return d_operands, (d_given, loads, stores, *(() if entries is None else (d_entered,)),
+                        *(() if turning is None else tuple(jnp.zeros_like(part) for part in turning)))
 
 
 def _walk(forms, width: int, recomputed: bool, held: int = 0, turned: bool = False):
