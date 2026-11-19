@@ -1152,8 +1152,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         with summed_as_run():
             _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms, ran = _draw_truth(truth_and_terms, prepared_followed, followed, dew_fn, inputs)
-        # Compiled ahead, its prepare held it (`_compile_site`); a truth run as given, its run holds it here.
-        if not at and (running() is None or _given(truth_fn or reference_fn)):
+        if not at and (running() is None or _given(truth_fn or reference_fn)):  # else held (`_compile_site`)
             _of_float64(label, _truth_read(truth_fn or reference_fn, followed, ran), inputs, truth)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
