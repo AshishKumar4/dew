@@ -60,10 +60,13 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
+import itertools
 import json
+import logging
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -75,27 +78,41 @@ import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import FORMATTED, Truth, rounds_nothing, summed_as_run, unrewritten, widened
 from arm_forms import (
+    _arms,
+    _arms_with,
+    _declared,
+    _given,
     _layers,
+    _mode_of,
     _one_draws_program,
+    _refuse_numpy_arms,
     _RunToRun,
     _varies,
     _window_count,
     _Windowed,
+    _ynn_decided,
+    as_given as as_given,
+    as_recorded as as_recorded,
+    dew_path as dew_path,
+    dew_programs as dew_programs,
     over_windows as over_windows,
     run_to_run as run_to_run,
     stacked_on_host as stacked_on_host,
     windows as windows,
+    without_ynn as without_ynn,
 )
-from check1_judge import SWITCHED, Verdict, _judged_pooled, _logged, _narrow, _verdicts
-from check1_wire import CENSUS, QUALIFY
+from check1_judge import SWITCHED as SWITCHED, Verdict, _judged_pooled, _logged, _narrow, _verdicts
+from check1_wire import QUALIFY
 from float64_terms import POWER, evaluated, evaluated_on, float64_terms, lowered, scan_groups, static, traced
 from map_judge import drawing, judging, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
-from truths_ahead import COMPILED, CompiledTruths, judged, named, running
+from truths_ahead import AT_RUN, COMPILED, CompiledTruths, arm_role, judged, named, reading, running
 
 from dew._accuracy import distance, reduction_bound, within
 from dew.algebra import passes
 from dew.nn import programs
+from dew.nn.kernels import generation, tuning
+from dew.nn.kernels.templates import report
 from dew.parity import (
     CONFIDENCE,
     FACTOR,
@@ -140,6 +157,7 @@ from dew.telemetry.compiles import Compiles
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
 
+_log = logging.getLogger(__name__)
 
 
 def ieee_fixture(path) -> dict[str, np.ndarray]:
@@ -177,56 +195,6 @@ def _stored_precision(path) -> tuple[dict[str, np.ndarray], str]:
     with np.load(path) as stored:
         arrays = {name: stored[name] for name in stored.files}
     return arrays, str(arrays.pop(PRECISION)) if PRECISION in arrays else "no precision"
-
-
-WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
-"""XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
-ops alike), so that a program runs on XLA's own code, compiled for the host's instruction set with no
-dispatch at run time. YNNPACK picks its microkernels at run time by that instruction set, and both
-the interpreted SSD kernel and XLA's scan fuse parts of themselves to it by default, which moved
-check 1 between the two across PARITY by host; without the fusions the verdicts held on two hosts
-of different instruction sets, though the bits still part with the host (docs/performance.md, "The
-SSD kernel's host check 1 without YNNPACK"); and XLA:CPU's fusion choices are not Dew's (rows 4520, 4522).
-The empty list, not the documented `-individual_dot`, because compiler options take no such spelling and
-that one leaves a scan's reductions fused. The census (`CENSUS`) compiles without it (`switched_off`)."""
-
-
-
-def switched_off() -> dict:
-    """WITHOUT_YNN, or none under the census (`CENSUS`), read when the gate compiles."""
-    return {} if os.environ.get(CENSUS) else WITHOUT_YNN
-
-
-def without_ynn(fn, **jit_options):
-    """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
-    (`jax.default_backend()`), and plain `jax.jit` elsewhere: how the gate compiles both arms of a
-    check 1 between two Dew paths (`_arms`), such as an interpreted kernel and the XLA program it
-    replaces, so that the two run the same kind of code on any host. A program Dew's users run compiles
-    with the fusions, as they do. On the CPU lane its compiler options refuse to be nested in another
-    jit, differentiated through or batched, so the gate compiles an arm whole; a site passes its arms
-    as functions and never calls this. A caller's own compiler options take precedence over
-    WITHOUT_YNN's; `fn` already compiled so is returned as it is."""
-    if getattr(fn, "without_ynn", False):
-        return fn
-    if jax.default_backend() == "cpu":
-        jit_options["compiler_options"] = {**switched_off(), **(jit_options.get("compiler_options") or {})}
-    compiled = jax.jit(fn, **jit_options)
-    compiled.without_ynn = True
-    return compiled
-
-
-def as_given(fn, programs: Callable | None = None):
-    """`fn`, an arm the gate runs as it is given and never compiles: a torch or NumPy reference, or a Dew
-    arm that runs whole programs of its own (a trainer's fit, a placement on a mesh and the program
-    run there, a host loop). The other arm of its check then compiles as Dew's users run it, with the
-    fusions (`_arms`), as the programs this one runs do. `programs`, where `fn` is a float64 truth held to
-    a recorded one (`certifier`): the programs a draw's run calls, `programs(*inputs)`, each a callable
-    and its arguments, which the certifier traces to count the run's roundings (`_draws_roundings`)."""
-    @functools.wraps(fn)
-    def given(*inputs, **options):
-        return fn(*inputs, **options)
-    given.as_given, given.programs = True, programs
-    return given
 
 
 class Rounded(NamedTuple):
@@ -304,301 +272,22 @@ def _own_truth(prepared, followed, result, inputs, truth):
     return result.judged, _followed_truth(prepared, followed, result, inputs)
 
 
-def dew_programs(fn):
-    """`fn`, a Dew arm that runs Dew's own compiled programs (a trainer's step, a task's forward, a
-    server's decode), which the gate cannot compile but which take their XLA options from Dew's one
-    seam (`dew.nn.kernels.options.compiler_options`). Beside another Dew arm, the gate runs it with
-    that seam holding WITHOUT_YNN open (`compiled_with`), so the programs it compiles go without
-    YNNPACK's fusions as the gate's own compile of its other arm does; beside an arm `as_given`, as it
-    is, with the fusions. A program it compiled before its check, or compiles by a bare `jax.jit`
-    outside the seam, keeps its own options."""
-    @functools.wraps(fn)
-    def programs(*inputs, **options):
-        return fn(*inputs, **options)
-    programs.dew_programs = True
-    return programs
-
-
-def dew_path(fn):
-    """`fn`, a reference that is one of Dew's own paths: the same model run another way (rows packed against
-    each row alone, a remat policy against none, another layout), so its site's claim is invariance under
-    what differs, not the algebra's rewrite. The gate runs it as it runs Dew's arm, under the rewrite
-    (`_compiled`), so one function at one shape is one program for both arms (a decision head's `decide`,
-    packed and alone, compiled once, where the reference unrewritten compiled it twice); the rewrite's
-    correctness is held by the sites whose references are written apart from Dew, which run unrewritten. A
-    reference undeclared is written apart. Only a site whose claim is invariance may declare it, as a
-    declaration elsewhere drops the reference's independence (docs/design/algebra.md §3). It keeps the marks
-    of what it wraps (`as_given`), and an adapter's (`run_to_run`, `over_windows`) it declares within, so
-    the adapter stays the gate's to read; a float64 truth the gate takes from the reference stays unrewritten
-    (`_drawn`, `_conditioning`)."""
-    if isinstance(fn, _RunToRun):
-        return _RunToRun(dew_path(fn.fn), fn.why)
-    if isinstance(fn, _Windowed):
-        return _Windowed(dew_path(fn.fn))
-
-    @functools.wraps(fn)
-    def path(*inputs, **options):
-        return fn(*inputs, **options)
-    path.dew_path = True
-    return path
-
-
-def _declared(fn) -> bool:
-    """Whether reference `fn`, or an arm it adapts (`_layers`), is one of Dew's own paths (`dew_path`)."""
-    return any(getattr(layer, "dew_path", False) for layer in _layers(fn))
-
-
-def _given(fn) -> bool:
-    """Whether the gate runs `fn` as it is given (`as_given`, a recorded reference), a window loop's
-    arm by its own (`over_windows`)."""
-    if isinstance(fn, _Windowed):
-        return _given(fn.fn)
-    return bool(getattr(fn, "as_given", False) or getattr(fn, "recorded", False))
-
-
-def _compiles(fn) -> bool:
-    """Whether the gate compiles `fn` itself: a plain function, not an arm it runs as given, a program
-    already compiled (a jit) or an arm of Dew's own programs (`dew_programs`)."""
-    fn = fn.fn if isinstance(fn, _Windowed) else fn
-    return not (_given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"))
-
-
-def _refuse_numpy_arms(draw, *arms) -> None:
-    """Refuse an arm the gate would compile that computes in NumPy on a draw of NumPy inputs: called once as
-    given on them (a window's, for a window loop's arm), an arm returning NumPy arrays is a NumPy reference,
-    compiled computing in JAX, in float32 where its draw is float64; it passes `as_given`. A draw holding no
-    NumPy array runs none: the gate compiles each plain arm (`_compiled`), whose trace refuses a NumPy call on
-    its inputs (a model arm run eagerly here took a minute of a check, ledger 3774)."""
-    plain = [fn for fn in dict.fromkeys(arms) if _compiles(fn)]
-    drawn = draw(0) if plain else ()
-    if not any(isinstance(leaf, np.ndarray | np.generic) for leaf in jax.tree.leaves(drawn)):
-        return
-    for fn in plain:
-        inputs = drawn
-        if isinstance(fn, _Windowed):
-            fn, inputs = fn.fn, jax.tree.map(lambda leaf: leaf[0], drawn)
-        outputs = jax.tree.leaves(fn(*inputs))
-        kinds = {type(leaf).__name__ for leaf in outputs if not isinstance(leaf, jax.Array)}
-        if kinds:
-            raise TypeError(f"{getattr(fn, '__qualname__', repr(fn))} returns {sorted(kinds)}: a NumPy arm, "
-                            f"which the gate would compile in JAX; pass it as_given, or return its JAX "
-                            f"values unconverted")
-
-
-def _compiled(fn, compile, pairing=None, *, reference: bool = False):
-    """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program already
-    (another jit around it would nest its compiler options), or compiled by `compile`, a window loop's arm
-    within it (`over_windows`), without YNNPACK's fusions, paired by `pairing` (`_Paired`); a `reference`
-    unrewritten (`arm_arithmetic.unrewritten`), but one of Dew's own paths (`dew_path`), which runs under the
-    rewrite as Dew's arm does."""
-    run = unrewritten if reference and not _declared(fn) else _as_is
-    if isinstance(fn, _RunToRun):
-        return _RunToRun(_compiled(fn.fn, compile, pairing, reference=reference), fn.why)
-    if _given(fn) or getattr(fn, "without_ynn", False):
-        return run(fn)
-    if getattr(fn, "dew_programs", False):
-        return run(fn) if compile is jax.jit else _Paired(pairing, run(_with_ynn_off(fn)), run(fn))
-    if isinstance(fn, _Windowed):
-        return _Windowed(_compiled(fn.fn, compile, pairing, reference=reference))
-    return run(compile(fn)) if compile is jax.jit else _Paired(pairing, run(compile(fn)), run(jax.jit(fn)))
-
-
-def _as_is(fn):
-    """`fn` itself: a candidate arm, run as its users run it."""
-    return fn
-
-
-@dataclasses.dataclass(eq=False)
-class _Pairing:
-    """Whether a check's paired arms (`_Paired`) run with YNNPACK's fusions, decided once a site before it
-    draws (`_ynn_decided`): `refused`, XLA:CPU's refusal of an arm without them where it gave one."""
-
-    decided: bool = False
-    refused: str | None = None
-
-    @property
-    def with_ynn(self) -> bool:
-        return self.refused is not None
-
-
-@dataclasses.dataclass(frozen=True)
-class _Paired:
-    """An arm of a check between two Dew paths (`_arms`): `without`, the arm without YNNPACK's fusions,
-    unless its site's arms were decided otherwise, then `plain`, the arm as Dew's users compile it
-    (`_ynn_decided`): where XLA:CPU cannot compile an arm of the check without the fusions and can with
-    them, every arm of it takes them, so the two still run the same kind of code, here the kind whose
-    microkernels the host picks."""
-
-    pairing: _Pairing
-    without: Callable
-    plain: Callable
-    ahead: dict = dataclasses.field(default_factory=dict, compare=False)
-    """`without` compiled ahead on the site's first draw to decide its pairing (`_ynn_decided`), by its
-    inputs' signature (`_signature`): the program the arm runs on draws of that signature, never compiled
-    twice."""
-
-    @property
-    def without_ynn(self) -> bool:
-        """Whether the arm runs without YNNPACK's fusions (`without_ynn`'s mark)."""
-        return not self.pairing.with_ynn
-
-    def __call__(self, *inputs, **options):
-        if self.pairing.with_ynn:
-            return self.plain(*inputs, **options)
-        compiled = self.ahead.get(_signature(inputs)) if self.ahead and not options else None
-        return (compiled or self.without)(*inputs, **options)
-
-    @property
-    def trace(self):
-        """The trace of the arm the site runs (JAX's `jit(...).trace`), where it is a compiled program's:
-        an arm of Dew's own programs has none."""
-        return (self.plain if self.pairing.with_ynn else self.without).trace
-
-
-def _signature(inputs) -> tuple:
-    """A draw's inputs as a compiled program takes them: whether JAX's 64-bit types are on (a float of the
-    truth's widened draw is one width or another by it), their tree, and each leaf's type, shape and dtype, a
-    JAX array's weak type and sharding too (a host array or a Python number is placed as the call places
-    it; a leaf of no dtype, which no compile takes, by its type alone)."""
-    leaves, tree = jax.tree.flatten(inputs)
-
-    def taken(leaf) -> tuple:
-        if isinstance(leaf, jax.Array):
-            return type(leaf), leaf.shape, leaf.dtype, leaf.weak_type, leaf.sharding
-        return type(leaf), getattr(leaf, "shape", ()), getattr(leaf, "dtype", None)
-
-    return jax.dtypes.canonicalize_dtype(np.float64), tree, tuple(taken(leaf) for leaf in leaves)
-
-
-def _paired_arms(arms) -> list[_Paired]:
-    """The paired arms among `arms`, through every arm each adapts (`_layers`)."""
-    return [layer for arm in arms for layer in _layers(arm) if isinstance(layer, _Paired)]
-
-
-@functools.cache
-def _ynn_option_held() -> None:
-    """Raise unless XLA:CPU compiles a trivial program with WITHOUT_YNN's options, once a process: where an
-    XLA release refuses the options themselves, every paired site would otherwise move onto the fusions
-    and pass (`_ynn_decided`)."""
-    try:
-        without_ynn(lambda x: x * 2)(jnp.zeros((2, 2), jnp.float32))
-    except jax.errors.JaxRuntimeError as error:
-        raise RuntimeError(f"XLA:CPU refuses WITHOUT_YNN's options {WITHOUT_YNN} on a trivial program: "
-                           f"{str(error).splitlines()[0]}; no check may move its arms onto the fusions"
-                           ) from error
-
-
-def _ynn_decided(label: str, arms, inputs) -> None:
-    """The mode of a site's paired arms (`_Paired`), decided once before its draws: each compiled ahead on
-    its first draw's `inputs` without YNNPACK's fusions; where XLA:CPU refuses one so and compiles it with
-    them (its algebraic simplifier forms a dot of no contracting dimension from a contraction of length
-    one, which only YNNPACK's fusion runs: attention's XLA backward over a single key), every paired arm
-    of the site takes the fusions, logged in its stages' lines (`_logged`), reported (`SWITCHED`) and named in
-    its findings (`_with_mode`). One the fusions refuse too raises, and so does a process whose XLA refuses
-    the options themselves (`_ynn_option_held`). An arm running Dew's own programs through Dew's
-    seam (`dew_programs`) compiles at its call, without them, as does a window loop's arm, whose program
-    takes each window's slices and not the draw (`over_windows`). An arm compiled ahead runs that program on
-    draws of its signature (`_Paired.ahead`), compiled once. Off XLA:CPU, which alone has the fusions,
-    nothing is compiled ahead: the arms run as they compile."""
-    pairings = {arm.pairing for arm in _paired_arms(arms)}
-    if not pairings or all(pairing.decided for pairing in pairings):
-        return
-    if jax.default_backend() != "cpu":
-        # YNNPACK's fusions are XLA:CPU's: elsewhere an arm compiles one way (`without_ynn`), and a compile
-        # ahead to decide them would be its second.
-        for pairing in pairings:
-            pairing.decided = True
-        return
-    _ynn_option_held()
-    refused = None
-    for arm in arms:
-        # Through a declaration alone: a window loop's arm takes each window's slices, which the draw is not.
-        arm = arm.fn if isinstance(arm, _RunToRun) else arm
-        if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
-            continue
-        try:
-            arm.ahead[_signature(inputs)] = arm.without.lower(*inputs).compile()
-        except jax.errors.JaxRuntimeError as error:
-            arm.plain.lower(*inputs).compile()
-            refused = refused or str(error).splitlines()[0]
-    for pairing in pairings:
-        pairing.decided, pairing.refused = True, refused
-    if refused is not None:
-        SWITCHED.append({"label": label, "refused": refused})
-
-
-def _mode_of(arms) -> str | None:
-    """XLA:CPU's refusal that moved a site's arms onto YNNPACK's fusions (`_ynn_decided`), or None."""
-    return next((arm.pairing.refused for arm in _paired_arms(arms) if arm.pairing.refused), None)
-
-
-def _truth_program(fn):
+def _truth_program(fn, device=None):
     """`fn`, a check's float64 truth, as the gate runs it, unrewritten (`arm_arithmetic.unrewritten`):
     compiled, once a signature, so the truth runs as one float64 program on the device's FP64 units rather
     than one eager dispatch an equation, every primitive at its own float64 semantics (`Truth`). A truth the
-    gate runs as given (`as_given`: NumPy, torch, a recording, a host loop), one compiled already (a jit,
-    `dew_programs`), or none, as it is; a window loop's by its own. A truth with host work inside that does
-    not state it fails at its trace, loudly, and passes `as_given`."""
+    gate runs as given (`as_given`: NumPy, torch, a recording, a host loop), one of Dew's own programs
+    (`dew_programs`), or none, as it is (`_holds_program`); one compiled already (a jit) as it is too, but on
+    a named `device` (a GPU run's sizing's, the host's: `_qualified`), where it is that device's program
+    as a plain one is, and one placed already stays where it is; a window loop's by its own. A truth with host
+    work inside that does not state it fails at its trace, loudly, and passes `as_given`."""
     if isinstance(fn, Truth):
-        return fn
-    if fn is None or _given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"):
-        return unrewritten(fn)
+        return fn if device is None or fn.device is not None else Truth(fn.fn, device)
     if isinstance(fn, _Windowed):
-        return _Windowed(_truth_program(fn.fn))
-    return Truth(fn)
-
-
-def _with_ynn_off(fn):
-    """`fn` run with Dew's compile seam holding WITHOUT_YNN open on the CPU lane (`dew_programs`)."""
-    from dew.nn.kernels.options import compiled_with
-
-    @functools.wraps(fn)
-    def run(*inputs, **options):
-        with compiled_with(switched_off() if jax.default_backend() == "cpu" else {}):
-            return fn(*inputs, **options)
-    return run
-
-
-def _arms(dew_fn, reference_fn):
-    """The two arms of a check as the gate runs them (docs/design/testing.md, "the numerical contract"):
-    where both are Dew paths, each without YNNPACK's fusions (`without_ynn`), whose microkernels the host's
-    instruction set picks at run time, so the two run the same kind of code on any host: a plain function
-    the gate compiles so, an arm that runs Dew's own programs (`dew_programs`) with them compiled so through
-    Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a recording, a host loop over
-    programs of its own), the other as Dew's users run it, with the fusions (`jax.jit`). A site passes plain
-    functions; the gate compiles them, so no site can compile one arm otherwise than its other. The
-    reference runs unrewritten (`_compiled`), so one function as both arms compiles twice, but one of Dew's
-    own paths (`dew_path`), which runs under the rewrite as Dew's arm does. A program XLA:CPU
-    cannot compile without the fusions turns both arms over to them, decided once a site (`_ynn_decided`)."""
-    compile, pairing = (jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn), _Pairing()
-    _refuse_owned_policies(compile, dew_fn, reference_fn)
-    return _compiled(dew_fn, compile, pairing), _compiled(reference_fn, compile, pairing, reference=True)
-
-
-def _arms_with(dew_fn, reference_fn, further: list, label: str):
-    """A site's arms and each further reference's, compiled as `_arms` pairs them, Dew's once beside all:
-    refused where, beside a plain Dew arm, a further reference is not of the reference's kind (plain or
-    as given), as no one compilation of Dew's pairs with both."""
-    if not _given(dew_fn) and any(_given(fn) != _given(reference_fn) for fn in further):
-        raise ValueError(f"{label}: beside a plain Dew arm each further reference is of the reference's "
-                         f"kind, plain or as given, so one compilation of Dew's pairs with all")
-    dew, reference = _arms(dew_fn, reference_fn)
-    return dew, reference, [_arms(dew_fn, fn)[1] for fn in further]
-
-
-def _refuse_owned_policies(compile, *arms) -> None:
-    """Refuse an arm compiled with a policy the gate does not own (row 2287): a `without_ynn` program,
-    which `_compiled` runs as it is, beside an arm run `as_given`, where the gate compiles Dew's arm as
-    its users run it, with the fusions (`jax.jit`) — it would run without them, unseen. A plain
-    `jax.jit` arm the gate's own compile nests, which applies the gate's options; a jit with compiler
-    options of its own refuses that nesting itself (`compiler_options` only at top level). Pass the
-    function plain and the gate compiles it as the pairing asks."""
-    for fn in arms:
-        inner = fn.fn if isinstance(fn, _Windowed) else fn
-        if compile is jax.jit and getattr(inner, "without_ynn", False) and not _given(inner):
-            raise TypeError(f"{getattr(inner, '__qualname__', repr(inner))} is compiled without YNNPACK's "
-                            f"fusions, beside an arm run as given, where the gate compiles Dew's arm with "
-                            f"them: pass it plain, and the gate compiles it as the pairing asks")
+        return _Windowed(_truth_program(fn.fn, device))
+    if fn is None or not _holds_program(fn) or (device is None and hasattr(fn, "lower")):
+        return unrewritten(fn)
+    return Truth(fn, device)
 
 
 def with_gradients(fn, *, has_aux: bool = False):
@@ -832,27 +521,266 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
 
 
 def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn,
-                  terms) -> None:
+                  terms, also, orders, plain: bool, library_fn=None) -> None:
     """`assert_as_exact`'s site prepared into `store` (`truths_ahead.compiled_truths`): every program its
     truths and terms take (`_ahead`), at each shape the draws of its stages take, compiled for the devices its
-    run computes on, and its truth held to float64 on its first draw's shapes (`_of_float64`); no truth
-    computed and no arm run. A truth the gate runs as given or replays (a recording) has no program."""
-    terms_fn, _ = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
-                        library_row=None, library_leaves=(), also=None, terms=terms)
+    run computes on, and its truth held to float64 on its first draw's shapes (`_of_float64`); and each of its
+    arms' (`_compile_arms`), at a qualification run's sizing draws too where its verdict is the `plain` pair's
+    (`_qualified`); no truth computed and no arm run. A truth the gate runs as given or replays (a
+    recording) has no program."""
+    terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
+                           library_row=None, library_leaves=(), also=also, terms=terms)
     truth = truth_fn if truth_fn is not None else reference_fn
     shaped = {}
     for seed in range(staged_units(seeds)):
-        inputs = draw(seed)
+        inputs = drawn_on_the_host(draw, seed)
         shaped.setdefault(named("truth", widened(inputs)), inputs)
+
     programs, held = {}, {}
     with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(store.device()),
           evaluated_on([])):
         for index, inputs in enumerate(shaped.values()):
             wide = widened(inputs)
-            if index == 0:
+            # A truth the gate runs as given has its value alone to read, held to float64 in its run on its
+            # first draw (`_drawn`): the prepare computes none (bible section 8; on its default device, a
+            # compile-only GPU, its eager operations raised "'Executable' object has no attribute
+            # 'local_devices'", row 4881's class).
+            if index == 0 and not _given(truth):
                 _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
             _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
-        store.compile_site(label, programs, held)
+        try:
+            store.compile_site(label, programs, held)
+        except report.CompiledOnDevice as refused:
+            # A truth its target's GPU would leave a choice of to run time (a convolution's algorithm,
+            # `report.at_run_time`), which no compile without that GPU holds: its run compiles its truths
+            # on the GPU, their float64 on its FP64 units, as its arms (`_compile_arms`), named
+            # (`truths_ahead.running`); the choice moves a float64 truth by float64's rounding alone
+            # (row 8576).
+            store.compile_site(label, programs, held, at_run=str(refused))
+    # A qualification run sizes a plain site first (`_qualified`), on its sizing draws through its arms.
+    sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and plain else range(0)
+    # A library arm (`library_fn`) one of them, run on Dew's own inputs as a further reference is (row 8468).
+    _compile_arms(store, {"dew": (dew_fn, False), "reference": (reference_fn, True),
+                          **({} if library_fn is None else {"library": (library_fn, True)}),
+                          **{f"further {name}": (fn, True) for name, fn in also.items()}},
+                  draw, label, seeds=seeds, orders=orders, sizing=sizing)
+
+
+def armed(label: str) -> str:
+    """The label a site's arms are held under in a store of programs compiled ahead (`_compile_arms`), apart
+    from its truths' (`_compile_site`): each set compiled in its own arithmetic, the arms' without x64."""
+    return f"{label}, its arms"
+
+
+def _arm_compile(plain: bool) -> Callable:
+    """How the gate compiles a site's arms (`_arms`), its results placed
+    (`dew.training.ahead.compile_programs`' `compiled`): as Dew's users compile them (`jax.jit`) beside an arm
+    run as given (`plain`), else without YNNPACK's fusions (`without_ynn`, `jax.jit` off the CPU lane)."""
+    def compiled(function, *, out_shardings):
+        # An arm held whole (`_Whole`) is a jit of its own compiler options, lowered as itself: no other jit
+        # may hold it.
+        if isinstance(function, _Whole):
+            return function.fn
+        return (jax.jit if plain else without_ynn)(function, out_shardings=out_shardings)
+
+    return compiled
+
+
+def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool]], draw, label: str, *,
+                  seeds: int, orders, sizing: range = range(0)) -> None:
+    """A site's `arms` (each a role's function and whether it is a reference, unrewritten) compiled ahead into
+    `store` at the shapes of every draw of its stages and each of its `orders`, and of every seed of `sizing`
+    where a qualification run sizes the site (`_qualified`, `_sizing_seeds`), each traced as its run traces
+    it, for the store's devices (`CompiledTruths.tracing`, in the arithmetic arms run in, `summed_as_run`),
+    and compiled as the gate compiles it (`_arm_compile`): its run calls each draw's executable
+    (`_ahead_arm`), tracing, lowering and compiling none, its sizing too. An arm the gate runs as given, or
+    one running Dew's own programs (`dew_programs`, a host loop), holds no program. A site its target's
+    compile refuses (`report.CompiledOnDevice`: a convolution's algorithm, which its GPU picks) is written
+    at run (`compile_site`'s `at_run`): its run compiles every arm on its GPU, as given (`_stored_arm`)."""
+    # Each arm named as each process first finds it, before any call of it here (`arm_role`); one no
+    # statement holds runs unprepared in its run.
+    named_arms = {role: (named_role, fn, reference) for role, (fn, reference) in arms.items()
+                  if fn is not None and _holds_program(fn)
+                  and (named_role := arm_role(role, fn, label)) is not None}
+    if store.target is None:
+        # An arm computing in NumPy refused as a run refuses it, by a call on a draw; for a GPU's store the
+        # prepare computes nothing on its host (bible §8), and its trace refuses an arm that cannot trace.
+        _refuse_numpy_arms(draw, *(fn for _, fn, _ in named_arms.values()))
+    inputs: dict[str, tuple] = {}
+    for seed in itertools.chain(range(staged_units(seeds)), sizing):
+        drawn = drawn_on_the_host(draw, seed)
+        for ordered in (drawn,) if orders is None else orders(drawn):
+            inputs.setdefault(named("arms", ordered), ordered)
+    programs: dict = {}
+    held: dict = {}
+    # The arithmetic arms run in on the store's devices: a GPU's own (`summed_as_run`'s, read on the CPU
+    # lane alone), whatever the host the prepare runs on.
+    arithmetic = summed_as_run if store.target is None else contextlib.nullcontext
+    with store.tracing(), arithmetic():
+        for role, fn, reference in named_arms.values():
+            for drawn in inputs.values():
+                _arm_program(programs, held, role, fn, drawn, reference=reference)
+    if programs:
+        plain = any(_given(fn) for fn in (arms["dew"][0], arms["reference"][0]) if fn is not None)
+        with arithmetic():
+            try:
+                store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain), arms=True)
+            except report.CompiledOnDevice as refused:
+                # Check 1 measures the arms as their GPU compiles them, a choice no compile without it
+                # holds: every arm of the site compiles in its run, as the prepare states (`_stored_arm`).
+                store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain), arms=True,
+                                   at_run=str(refused))
+
+
+def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference: bool):
+    """Into `programs` and `held`, arm `fn`'s program at a draw's `inputs` as the gate compiles it
+    (`_compiled`): within a run-to-run declaration and a window loop (at one window's inputs), a reference
+    unrewritten but one of Dew's own paths (an arm that holds a program, `_holds_program`). Traced as its run
+    traces it, and again where its compile lowers it (a launch a spill refused
+    derived at its next config), its constants the first trace's, by place (`_hold`), and the routes that
+    trace reported; held under `role`, its name with its fingerprint (`arm_role`). Its outputs' shapes and
+    dtypes at `inputs`, its trace's (a window loop's at one window's)."""
+    if isinstance(fn, _RunToRun):
+        return _arm_program(programs, held, role, fn.fn, inputs, reference=reference)
+    if isinstance(fn, _Windowed):
+        return _arm_program(programs, held, role, fn.fn, jax.tree.map(lambda leaf: leaf[0], inputs),
+                            reference=reference)
+    name = named(role, inputs)
+    traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
+    if getattr(fn, "without_ynn", False) and hasattr(fn, "trace"):
+        # A jit of its own compiler options (`without_ynn`'s: a library arm's cuBLAS,
+        # `generation_support.cublas_compiled`), which JAX lowers only as a top-level program: held whole
+        # (`_Whole`), never traced inside another, as the gate runs it as it is (`_compiled`), a reference's
+        # trace and lowering unrewritten as its call is (`Unrewritten`'s).
+        leaves = jax.tree.leaves(inputs)
+        if list(inputs) != leaves:
+            raise ValueError(f"{name}: an arm compiled with its own compiler options is held whole, over its "
+                             "inputs as arrays, and these inputs are a tree of them")
+        programs[name] = (_Whole(traced_fn), [*map(jax.typeof, leaves)])
+        with generation.routes() as reported, tuning.seen() as launched:
+            out = traced_fn.trace(*inputs).out_info
+        held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported),
+                      "launches": launched.held()}
+        return out
+    with generation.routes() as reported, tuning.seen() as launched:
+        closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
+    structure = jax.tree.structure(inputs)
+    schema = [jax.typeof(constant) for constant in closed.consts]
+
+    def again(flat):
+        # Its lowering's own trace, whose constants are the program's held (a relowering's, past a spill,
+        # derives its launches afresh: a halved chunk's sequence table), never the first trace's; refused
+        # where they are other arguments than the program was compiled to take.
+        retraced = jax.make_jaxpr(traced_fn)(*jax.tree.unflatten(structure, flat))
+        if [jax.typeof(constant) for constant in retraced.consts] != schema:
+            raise ValueError(f"{name}: relowered, its program holds other constants than its first trace's, "
+                             "which its compile ahead takes as its arguments")
+        held[name]["constants"] = [*map(np.asarray, retraced.consts)]
+        return retraced
+
+    _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
+    # The routes its trace reported and the launches it took, which its run, calling the program and tracing
+    # none, reports at each call (`truths_ahead.CompiledTruths.ran`).
+    held[name]["routes"], held[name]["launches"] = list(reported), launched.held()
+    return shapes
+
+
+@dataclasses.dataclass(frozen=True)
+class _Whole:
+    """An arm's program held whole (`_arm_program`): `fn`, a jit of its own compiler options, which the
+    store's compile lowers as itself (`_arm_compile`) over its inputs' leaves."""
+
+    fn: Callable
+
+    def __call__(self, *leaves):
+        return self.fn(*leaves)
+
+
+def _paired_most(reference_fn, most: int = MOST_SEEDS) -> int | None:
+    """The most seeds a paired sizing of `reference_fn` takes (`seeds_for`'s, its draws from SIZING_FROM to
+    twice it, `parity._sized_count`): `most`, a recording's pilots' half where it holds fewer; None for a
+    recording without pilots, which no sizing takes (`_qualified`), its count its recording's."""
+    if not getattr(reference_fn, "recorded", False):
+        return most
+    pilots = getattr(reference_fn, "pilots", None)
+    return None if pilots is None else min(most, len(pilots) // 2)
+
+
+def _sizing_seeds(reference_fn) -> range:
+    """The seeds a qualification run's paired sizing of a site may draw (`_qualified`, `seeds_for`), none
+    where it takes none (`_paired_most`)."""
+    most = _paired_most(reference_fn)
+    return range(0) if most is None else range(SIZING_FROM, SIZING_FROM + 2 * most)
+
+
+def _stored_arms(store: CompiledTruths, label: str, dew_fn, reference_fn, also: Mapping, compiled: tuple):
+    """A site's arms as compiled (`_arms_with`'s `compiled`) whose every call is its draw's program its
+    prepare compiled into `store` (`_ahead_arm`), each named as its prepare named it, before any call of it
+    (`_compile_arms`); one no statement holds runs unprepared, named, and one that holds no program as it
+    is: the run's verdict's and a qualification run's sizing's (`_qualified`) alike."""
+    return (_stored_arm(store, label, dew_fn, compiled[0], "dew"),
+            _stored_arm(store, label, reference_fn, compiled[1], "reference"),
+            [_stored_arm(store, label, fn, arm, f"further {name}")
+             for (name, fn), arm in zip(also.items(), compiled[2], strict=True)])
+
+
+def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str):
+    """A site's arm `role` (`given_fn` as the site passed it, `arm` as compiled) whose every call is its
+    draw's program its prepare compiled into `store` (`_ahead_arm`), named as its prepare named it; one no
+    statement holds, or whose site's arms its prepare did not finish (its truths written, a failure before
+    its arms': a flow's cell its prepare deferred, `gpu_flow.run_cells`), runs unprepared, named, and one
+    that holds no program as it is (`_stored_arms`). One of a site its prepare wrote at run (`at_run`, before
+    `holds`) runs as given, compiled on its GPU, named (`truths_ahead.AT_RUN`), nothing unprepared."""
+    if not _holds_program(given_fn):
+        return arm
+    named_role = arm_role(role, given_fn, label)
+    if named_role is None:
+        store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
+        return arm
+    at_run = store.at_run(armed(label))
+    if at_run is not None:
+        # Compiled on its GPU in the run, as its prepare stated (`_compile_arms`).
+        store.unprepared(f"{label}: its {role} arm: {at_run}", AT_RUN)
+        return arm
+    if not store.holds(armed(label)):
+        store.unprepared(f"{label}: its {role} arm ran unprepared: its prepare wrote the site's truths and "
+                         "compiled none of its arms")
+        return arm
+    return _ahead_arm(given_fn, arm, functools.partial(store.ran, armed(label)), named_role)
+
+
+def _holds_program(fn) -> bool:
+    """Whether arm `fn`, within a run-to-run declaration and a window loop, is one the store holds programs
+    of (`_compile_arms`): none an arm the gate runs as given or one running Dew's own programs."""
+    while isinstance(fn, (_RunToRun, _Windowed)):
+        fn = fn.fn
+    return not (_given(fn) or getattr(fn, "dew_programs", False))
+
+
+def _ahead_arm(given, compiled, call: Callable, role: str):
+    """A site's arm (`given`, as the site passed it) whose programs a store compiled ahead
+    (`_compile_arms`), as the gate runs it (`compiled`, `_compiled`'s): each plain program's call its draw's
+    executable (`call(role, inputs)`, `truths_ahead.CompiledTruths.ran`), within a run-to-run declaration
+    and a window loop (an arm that holds a program, `_holds_program`)."""
+    if isinstance(given, _RunToRun):
+        return _RunToRun(_ahead_arm(given.fn, compiled.fn, call, role), given.why)
+    if isinstance(given, _Windowed):
+        return _Windowed(_ahead_arm(given.fn, compiled.fn, call, role))
+    return _Ahead(compiled, functools.partial(call, role))
+
+
+class _Ahead:
+    """A compiled arm (`compiled`) whose every call is its draw's executable compiled ahead (`run(inputs)`,
+    `_ahead_arm`), its other attributes the arm's (its marks, its mode)."""
+
+    def __init__(self, compiled, run: Callable):
+        self.compiled, self.run = compiled, run
+
+    def __call__(self, *inputs):
+        return self.run(inputs)
+
+    def __getattr__(self, name):
+        return getattr(self.compiled, name)
 
 
 def _ahead(programs: dict, held: dict, label: str, truth, terms_fn, *, terms, wide) -> None:
@@ -861,7 +789,7 @@ def _ahead(programs: dict, held: dict, label: str, truth, terms_fn, *, terms, wi
     shapes), unless the gate runs it as given or replays it (`_given`); its own terms program's
     (`_SiteTerms`), or the float64 walk of its truth its rows may be sized by (`terms`, unless False: the walk
     a site's first draw decides on, `_cancelling_terms`), where the walk is static: one that takes a branch
-    or loop its values pick is read as it runs, so its run walks it on its own device where it needs it
+    or loop its values pick is read as it runs, so its run walks it on its GPU where it needs it, named
     (`float64_terms._termed`). Each traced as written, its constants arguments held beside it."""
     if isinstance(truth, _Windowed):
         # Its truth window by window; its terms on the whole draw, as its run reads them: a site's own
@@ -905,11 +833,9 @@ def _held_walk(programs: dict, held: dict, fn, wide) -> None:
 
 
 def _shaped_truth(truth, wide):
-    """`truth` on widened inputs `wide` as `_of_float64` reads it, its leaves' dtypes and sizes: its value
-    where the gate runs it as it is (`_given`), else its shapes alone (a window loop's on one window), no
-    float64 computed."""
-    if _given(truth):
-        return truth(*wide)
+    """`truth` (a traced one, not one the gate runs as given) on widened inputs `wide` as `_of_float64` reads
+    it, its leaves' dtypes and sizes: its shapes alone (a window loop's on one window), no float64
+    computed."""
     if isinstance(truth, _Windowed):
         return jax.eval_shape(unrewritten(truth.fn), *jax.tree.map(lambda leaf: leaf[0], wide))
     return jax.eval_shape(unrewritten(truth), *wide)
@@ -919,13 +845,20 @@ def _held_program(programs: dict, held: dict, role: str, fn, wide) -> None:
     """`fn` at `wide` as a program of its constants and inputs, flat (`truths_ahead.CompiledTruths`), traced
     as written (`float64_terms.traced`)."""
     closed, tree = traced(fn, wide)
+    _hold(programs, held, named(role, wide), closed, tree, wide, lambda flat: closed)
+
+
+def _hold(programs: dict, held: dict, name: str, closed, tree, inputs, again: Callable) -> None:
+    """Into `programs` and `held` under `name`, a traced program (`closed`, its outputs' `tree`) as a function
+    of its constants and `inputs`' leaves, flat, its program `again(inputs' leaves)`'s where its compile
+    traces it, and its constants and tree held beside it: no executable serializes an array its program
+    closed over (`truths_ahead`)."""
     count = len(closed.consts)
 
     def run(*flat):
-        return tree.unflatten(jax.core.eval_jaxpr(closed.jaxpr, flat[:count], *flat[count:]))
+        return tree.unflatten(jax.core.eval_jaxpr(again(flat[count:]).jaxpr, flat[:count], *flat[count:]))
 
-    name = named(role, wide)
-    programs[name] = (run, [*map(jax.typeof, closed.consts), *map(jax.typeof, jax.tree.leaves(wide))])
+    programs[name] = (run, [*map(jax.typeof, closed.consts), *map(jax.typeof, jax.tree.leaves(inputs))])
     held[name] = {"constants": [*map(np.asarray, closed.consts)], "tree": tree}
 
 
@@ -1199,25 +1132,25 @@ def _first_timed(timed: dict, rows_at: Callable, seed):
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
            label: str = "", examples: bool = False, conditioning=None, timed: dict | None = None,
-           followed=None):
-    """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
-    `truth_fn` on them (by default `reference_fn` on them widened, unrewritten). With `reference_seeds`,
-    the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
-    row of float64 zero is paired only where the two truths are the same values (an orbit's draws).
-    With `orders`, each arm also runs at every other order of its own draw (`orders(inputs)` past its
-    first, the draw itself), held to that draw's one truth: each arm's worst row is its worst over the
-    orders, measured rows of float64 zero included, and its values finite at every one; its errors and
-    its rows of float64 zero are the draw's own order's. With `library_fn`, the library arm runs beside
-    the reference on Dew's own inputs, held to Dew's truth, and the draws are judged against the larger
-    of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once. With
-    `also`, further references run beside it on Dew's own inputs, each held to Dew's truth, Dew and the
-    truth evaluated once for them all: the reference's draws, then each further reference's, a list. With
-    `terms_fn`, the truth is that program's with each output's terms (`float64_terms`), every row sized by
-    the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own terms program
-    (`_SiteTerms`), the truth is as without and its terms that program's, on the same widened inputs. With
-    `conditioning` (dew.parity's `Conditioning`), every arm's leaves are read as residuals in units of the
-    reference's rounding at its truth's inputs (`Weighed.weighed`). With `followed`, each arm is held to
-    the truth of its own decisions (`_draw_truth`, `_followed_truth`)."""
+           followed=None) -> list[_Draws]:
+    """Every leaf's errors (`_Draws`) over `seeds`, a list (the reference's, each further one's after):
+    both functions run on `draw(seed)`'s inputs, truth `truth_fn` on them (by default `reference_fn` on
+    them widened, unrewritten). With `reference_seeds`, the reference runs on those draws instead, each
+    held to its own draw's truth (`null_runs`), and a row of float64 zero is paired only where the two
+    truths are the same values (an orbit's draws). With `orders`, each arm also runs at every other order
+    of its own draw (`orders(inputs)` past its first, the draw itself), held to that draw's one truth: each
+    arm's worst row is its worst over the orders, measured rows of float64 zero included, and its values
+    finite at every one; its errors and its rows of float64 zero are the draw's own order's. With
+    `library_fn`, the library arm runs beside the reference on Dew's own inputs, held to Dew's truth, and
+    the draws are judged against the larger of the two on `library_leaves` (`_Draws.against_larger`), Dew
+    and the truth evaluated once. With `also`, further references run beside it on Dew's own inputs, each
+    held to Dew's truth, Dew and the truth evaluated once for them all, each further reference's draws
+    after the reference's. With `terms_fn`, the truth is that program's with each output's terms
+    (`float64_terms`), every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with
+    a site's own terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the
+    same widened inputs. With `conditioning` (dew.parity's `Conditioning`), every arm's leaves are read as
+    residuals in units of the reference's rounding at its truth's inputs (`Weighed.weighed`). With
+    `followed`, each arm is held to the truth of its own decisions (`_draw_truth`, `_followed_truth`)."""
     if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
@@ -1244,7 +1177,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         with summed_as_run():
             _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms, ran = _draw_truth(truth_and_terms, prepared_followed, followed, dew_fn, inputs)
-        if not at and running() is None:  # compiled ahead, its prepare held it (`_compile_site`)
+        if not at and (running() is None or _given(truth_fn or reference_fn)):  # else held (`_compile_site`)
             _of_float64(label, _truth_read(truth_fn or reference_fn, followed, ran), inputs, truth)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
@@ -1315,7 +1248,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     drawn = [_drawn_from(names, widths, evidence[at_arm], per_example[at_arm] if examples else None,
                         per_example_rows[at_arm] if examples else None) for at_arm in range(len(arms))]
     first = drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
-    return [first, *drawn[len(arms) - len(also):]] if also else first
+    return [first, *drawn[len(arms) - len(also):]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1522,17 +1455,22 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     (tests/certified.py)."""
     terms = terms if followed is None else _followed_site(label, truth_fn, orders, library_fn, terms,
                                                           conditioning, examples)
+    # Its verdict the plain pair's, the one a qualification run sizes (`_qualified`, and the sizing draws a
+    # prepare compiles its arms at, `_compile_site`): no library arm, further reference, terms of its own or
+    # weighed check beside Dew and its reference.
+    plain = not (library_fn or also or terms or conditioning)
     store = COMPILED.get()
-    if store is not None and (conditioning is not None or library_fn is not None):
-        raise ValueError(f"{label}: a weighed or library site reads its reference's own rounding and arms "
-                         "at its truth's inputs, which no program compiled ahead holds")
+    if store is not None and conditioning is not None:
+        raise ValueError(f"{label}: a weighed site reads its reference's own rounding at its truth's inputs, "
+                         "which no program compiled ahead holds")
     if store is not None and store.prepare:
-        _compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms)
+        with store.preparing(label, armed(label)):
+            _compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn,
+                          terms=terms, also=also, orders=orders, plain=plain, library_fn=library_fn)
         return
     if os.environ.get(QUALIFY) and not (drawing() or judging()):
         _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
-                   examples=examples, plain=not (library_fn or also or terms or conditioning),
-                   followed=followed)
+                   examples=examples, plain=plain, followed=followed)
     with judged(label):
         _judged_site(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                      library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
@@ -1624,23 +1562,37 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
     no pilot stream, so its count cannot be sized again (`seeds_for`'s contract). A site judged under a
     store of programs compiled ahead (`truths_ahead.compiled_truths`: a GPU flow's) sizes in its run, its
     sizing draws' truths computed here from its own `truth_fn`, on the host as a sizing's are; none sizes in
-    a prepare, a map task or its judge."""
+    a prepare, a map task or its judge, its arms the programs its prepare compiled at its sizing draws'
+    shapes (`_stored_arms`), never compiled in the run."""
 
     record = {"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0], "label": label,
               "declared": seeds}
-    recorded = getattr(reference_fn, "recorded", False) and getattr(reference_fn, "pilots", None) is None
+    recorded = _paired_most(reference_fn) is None
     if not plain or recorded:
         record["unsized"] = "its verdict is not the plain pair's" if not plain else "a recording's count"
     else:
         # Its sizing draws' truths its own, never the store's programs', computed on the host under one (a GPU
         # run's): the GPU's memory is the arms'.
-        prepared = COMPILED.get() is not None
-        if prepared and truth_fn is not None and not _given(truth_fn) and not isinstance(truth_fn, Truth):
-            truth_fn = Truth(truth_fn, jax.local_devices(backend="cpu")[0])
+        store = COMPILED.get()
+        arms = None
+        if store is not None:
+            # Its sizing draws' truths the host's: a truth function's, else its reference's widened, the
+            # original reference's, never the stored arm's, which holds no float64 program.
+            truth_fn = _truth_program(truth_fn if truth_fn is not None else reference_fn,
+                                      jax.local_devices(backend="cpu")[0])
+            if store.holds(label):
+                # Its arms the programs its prepare compiled at the sizing draws' shapes too
+                # (`_compile_arms`'s `sizing`), never compiled here.
+                arms = _stored_arms(store, label, dew_fn, reference_fn, {},
+                                    _arms_with(dew_fn, reference_fn, [], label))[:2]
+            else:
+                # A site its prepare did not reach sizes and runs unprepared, recorded before its sizing
+                # compiles (a sizing that fails reaches no verdict to record it, `truths_ahead.running`).
+                store.unprepared(f"{label}: its prepare did not reach this site")
         token = COMPILED.set(None)
         try:
             record["sized"] = seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
-                                        orders=orders, examples=examples, followed=followed)
+                                        orders=orders, examples=examples, followed=followed, arms=arms)
         finally:
             COMPILED.reset(token)
     with open(os.environ[QUALIFY], "a", encoding="utf-8") as log:
@@ -1671,10 +1623,23 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
                            truth_program)
     narrow_leaves: list[str] = []
     compiled = _arms_with(dew_fn, reference_fn, list(also.values()), label)
-    _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
-                       *also.values())
+    # Its truth, where it names none its reference's arm as compiled here, resolved before the store's
+    # programs take the arms' place: a reference arm read from the store is its own program at its own
+    # inputs alone, which a truth its run computes (its truths at run, `truths_ahead.running`) never is.
+    truth_program = truth_program if truth_program is not None else compiled[1]
+    # The arms read from the store wherever its prepare reached the site, its truths' at run or not.
+    if (ahead := reading()) is None:
+        _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
+                           *also.values())
+    else:
+        # Each arm's draws run by the programs its prepare compiled (`_compile_arms`), whose trace refused an
+        # arm computing in NumPy.
+        compiled = _stored_arms(ahead[0], label, dew_fn, reference_fn, also, compiled)
     dew_fn, reference_fn, further = compiled
-    library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
+    library = None if library_fn is None else _arms(library_fn, library_fn)[1]
+    # A library arm's draws run by the program its prepare compiled, as the other arms' are (row 8468).
+    library_fn = library if library is None or ahead is None else _stored_arm(ahead[0], label, library_fn,
+                                                                              library, "library")
     truth_fn = truth_program
     # Each range's draws, every reference's, computed once for the stages of them all.
     ranges: dict[tuple[int, int], list[_Draws]] = {}
@@ -1694,11 +1659,11 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
         def drawn(start, stop):
             assert not judging(), f"{label}: a judge draws nothing of its own, its draws are its pool's"
             if (start, stop) not in ranges:
-                draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
-                               library_fn=library_fn, library_leaves=library_leaves, also=further,
-                               terms_fn=terms_fn, label=label, examples=examples,
-                               conditioning=conditioning_now(), timed=first, followed=followed)
-                ranges[start, stop] = draws if further else [draws]
+                ranges[start, stop] = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn,
+                                             orders=orders, library_fn=library_fn,
+                                             library_leaves=library_leaves, also=further, terms_fn=terms_fn,
+                                             label=label, examples=examples,
+                                             conditioning=conditioning_now(), timed=first, followed=followed)
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
         return drawn
@@ -1764,11 +1729,11 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
     _refuse_numpy_arms(draw, changed_fn, original_fn)
     changed_fn, original_fn = _arms(changed_fn, original_fn)
     truth_fn = _truth_program(truth_fn)
-    draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
+    [draws] = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn, label=label)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
         further = range(seeds, staged_units(seeds))
-        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label))
+        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn, label=label)[0])
         moved, kept, unresolved = _moved(draws, 2)
     if not moved:
         found = (f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
@@ -1793,13 +1758,13 @@ def recorded_pilots(reference_fn, draw, count: int):
     @functools.wraps(reference_fn)
     def view(*inputs):
         return reference_fn(*inputs)
-    view.recorded, view.pilots = True, range(SIZING_FROM, SIZING_FROM + count)
-    return view
+    return as_recorded(view, range(SIZING_FROM, SIZING_FROM + count))
 
 
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None, orders=None, examples: bool = False,
-              conditioning: bool = False, conditioning_scale=None, followed=None) -> int:
+              conditioning: bool = False, conditioning_scale=None, followed=None, arms: tuple | None = None
+              ) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
     interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
     (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
@@ -1829,23 +1794,27 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     reference compared with itself takes its seeds 0 to four times the count (each block's first half
     against its second), and the reference on the same inputs runs once. `orders` sizes a site whose
     verdict sweeps them (`assert_as_exact`'s `orders`): each seed's evidence is its draw's over every
-    order, as the verdict reads it. `examples` sizes a site that stacks them as its verdict judges it."""
+    order, as the verdict reads it. `examples` sizes a site that stacks them as its verdict judges it.
+    `arms`, where given, are the pair as compiled (Dew's and the reference's, a store's, `_stored_arms`),
+    taken in place of compiling them here, an arm computing in NumPy refused where they were made."""
     if COMPILED.get() is not None:
         raise ValueError(f"{label}: a sizing draws seeds past a prepared site's, whose truths' programs no "
                          "prepare compiled")
-    if dew_fn is not None and getattr(reference_fn, "recorded", False):
-        pilots = getattr(reference_fn, "pilots", None)
-        if pilots is None:
+    if dew_fn is not None:
+        held = _paired_most(reference_fn, most)
+        if held is None:
             raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                              f"sizing's from SIZING_FROM; its site keeps its recorded count")
-        most = min(most, len(pilots) // 2)
+        most = held
     paired = dew_fn is not None
-    _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
+    if arms is None:
+        _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
     # A weighed site (`assert_as_exact`'s `conditioning`) is sized as it is judged, weighed, its heavy
     # elements classed over its first stages' draws.
     weighing = (_conditioning(reference_fn, truth_fn, draw, range(staged_units(max(start, FEWEST_SEEDS))),
                               scale=conditioning_scale) if conditioning else None)
-    dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
+    dew_fn, reference_fn = (arms if arms is not None
+                            else _arms(dew_fn if paired else reference_fn, reference_fn))
     dew_fn = dew_fn if paired else None
     truth_fn = _truth_program(truth_fn)
     first = 0 if dew_fn is None else SIZING_FROM
@@ -1853,7 +1822,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     def drawn(start_at: int, stop: int):
         return _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + start_at, first + stop),
                       truth_fn, orders=orders, label=label, examples=examples and dew_fn is not None,
-                      conditioning=weighing, followed=followed)
+                      conditioning=weighing, followed=followed)[0]
 
     return _sized_count(drawn, label, start=start, most=most, paired=dew_fn is not None)
 
@@ -1917,7 +1886,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
                               truth_fn, orders=orders,
                               reference_seeds=None if paired else range(base + span + start,
                                                                         base + span + stop),
-                              library_fn=library_fn, library_leaves=library_leaves, conditioning=weighing)
+                              library_fn=library_fn, library_leaves=library_leaves, conditioning=weighing)[0]
             return _staged(drawn, count, label, two_stage=two_stage)
 
         over, unresolved, stage = judged(None, seeds)
@@ -1944,6 +1913,55 @@ def declared_seeds(path) -> dict[str, int]:
     its `<site>.seeds`, written at record time by `seeds_for` on the recorded reference."""
     return {name.removesuffix(".seeds"): int(value) for name, value in recording(path).items()
             if name.endswith(".seeds")}
+
+
+def ahead_arm(fn: Callable, label: str, *, host: bool = False) -> Callable:
+    """`fn` (a function of arrays: a test's computation with no check-1 site, a bitwise check's kernel run on
+    the GPU) as an arm with no site, through the arms' own path: within a GPU tier part's prepare (`COMPILED`,
+    a store that prepares) its call is traced and compiled at its inputs' shapes as a site's arms are
+    (`_arm_program` in the store's `tracing`, `_arm_compile`, held under `armed(label)` by Dew's statement of
+    it, `arm_role`) and gives zeros of its outputs' shapes, nothing computing there (a test's later failure
+    in its prepare, past its stored program, judges nothing); in its run its call is that executable
+    (`CompiledTruths.ran`), tracing, lowering and compiling none; outside a part, `fn` itself. With `host`,
+    its call is placed on the host's CPU, its program traced and compiled for it and run there (a GPU host's
+    CPU-placed computation, row 8376's). One no statement holds, or one its prepare did not reach, runs
+    unprepared, recorded and named (`unprepared`, as `running` records a site). One call a label: a second in
+    one prepare is refused, as a second site of one label is (`compile_site`). Its inputs are host arrays,
+    NumPy's: a prepare's default device computes nothing, not even their placement (bible §8)."""
+    def unprepared(*inputs):
+        if not host:
+            return fn(*inputs)
+        cpu = jax.devices("cpu")[0]
+        with jax.default_device(cpu):
+            return fn(*jax.device_put(inputs, cpu))
+
+    def called(*inputs):
+        store = COMPILED.get()
+        if store is None:
+            return unprepared(*inputs)
+        role = arm_role("dew", fn, label)
+        if role is None:
+            store.unprepared(f"{label}: its arm has no statement of what it computes")
+            return unprepared(*inputs)
+        if store.prepare:
+            programs: dict = {}
+            held: dict = {}
+            # A host-placed arm traced, and retraced where its compile lowers it, on the host's CPU.
+            with (store.preparing(armed(label)),
+                  jax.default_device(jax.devices("cpu")[0]) if host else contextlib.nullcontext()):
+                with contextlib.nullcontext() if host else store.tracing():
+                    shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
+                store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True),
+                                   arms=True, host=host)
+            # Zeros of the shapes its own trace gave, in the store's tracing: a jit of its own compiler
+            # options traced again inside another, `eval_shape`'s, was refused.
+            return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)
+        if not store.holds(armed(label)):
+            store.unprepared(f"{label}: its prepare did not reach this arm")
+            return unprepared(*inputs)
+        return store.ran(armed(label), role, inputs)
+
+    return called
 
 
 def drawn_on_the_host(inputs_of: Callable, seed: int):
@@ -2120,8 +2138,7 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
             return jax.pure_callback(
                 lambda at: {name: np.asarray(value, kept[name].dtype) for name, value in read(at).items()},
                 kept, index, vmap_method="sequential")
-        recorded.recorded = True
-        return recorded
+        return as_recorded(recorded)
 
     return draw, lookup(reference), lookup(truth)
 
@@ -2318,9 +2335,7 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         leaves = {name: _recorded_leaf(evidence, str(dtypes[name]), name, row) for name in mse}
         return _RecordedRounded(leaves, decisions_at(int(index))) if decided else leaves
 
-    reference.recorded = True
-    if pilots:
-        reference.pilots = range(SIZING_FROM, SIZING_FROM + pilots)
+    as_recorded(reference, range(SIZING_FROM, SIZING_FROM + pilots) if pilots else None)
 
     def recorded_sketch(index: int, name: str):
         evidence, _, row = held(index)
@@ -2337,8 +2352,6 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         return certified(int(index), inputs)
 
     return draw, reference, truth
-
-
 
 
 FALSE_FAILURE = 1e-6

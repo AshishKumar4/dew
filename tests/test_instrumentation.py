@@ -379,9 +379,11 @@ def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
 
 def test_a_loop_bounded_by_a_counter_beside_a_predicate_counts_at_most_its_trips():
     """A loop whose condition is a counted bound and another predicate, `(i < 1) & taken`
-    (`attention_algebra.once`, the guards' rare walk), runs its body at most the counted trips: its
-    matmul counted once; a loop whose condition holds no counted bound beside its predicate counts no
-    FLOPs, unbounded."""
+    (`attention_algebra.once`, the guards' rare walk; a walk over the segments its data holds), runs its
+    body at most the counted trips: its matmul counted once, as an upper bound's (`StepFlops.bounded`),
+    the utilizations it leaves named upper bounds, where a loop its counter alone ends counts the same
+    work exactly; a count with work both uncounted and bounded is named neither bound. A loop whose
+    condition holds no counted bound beside its predicate counts no FLOPs, unbounded."""
     rows, width = 8, 32
 
     def counted(kernel, values, taken):
@@ -394,9 +396,37 @@ def test_a_loop_bounded_by_a_counter_beside_a_predicate_counts_at_most_its_trips
                                   lambda state: (jnp.zeros((), bool), state[1] @ kernel),
                                   (taken, values))[1]
 
+    def exact(kernel, values, taken):
+        return jax.lax.fori_loop(0, 1, lambda _, state: state @ kernel, values)
+
     arguments = (jnp.ones((width, width)), jnp.ones((rows, width)), jnp.ones((), bool))
-    assert compiled_flops(jax.jit(counted).lower(*arguments).compile()) == 2 * rows * width * width
+    bounded = step_flops(jax.jit(counted).lower(*arguments).compile())
+    assert (bounded.hardware, bounded.bounded) == (2 * rows * width * width, 2 * rows * width * width)
+    assert bounded.utilizations(1, 1.0, peak=1.0) == {"train/hlo_flops_util_upper_bound": bounded.model,
+                                                       "train/hfu_upper_bound": bounded.hardware}
+    counted_exactly = step_flops(jax.jit(exact).lower(*arguments).compile())
+    assert (counted_exactly.hardware, counted_exactly.bounded) == (bounded.hardware, 0.0)
+    assert StepFlops(1.0, 2.0, 1.0, 2.0).utilizations(1, 1.0, peak=1.0) == {
+        "train/hlo_flops_util_estimate": 1.0, "train/hfu_estimate": 2.0, "train/unsized_kernels": 1.0}
     assert compiled_flops(jax.jit(uncounted).lower(*arguments).compile()) is None
+
+
+def test_each_bounds_logged_utilization_reads_back_with_its_bound():
+    """A utilization the trainer logs under the name its count's bound gives it (`StepFlops.utilizations`:
+    train/hfu_upper_bound where a loop was counted at its stated bound) is read back, value and bound alike,
+    by the one reader of logged utilizations (`logged_utilization`, the profile report's), for every bound;
+    an interval that logged none reads none (train 1025's F3: the report read train/hfu alone, so a bounded
+    step's HFU was None)."""
+    from dew.telemetry.instrumentation import BOUND_MARKS, logged_utilization
+
+    for unsized, bounded in itertools.product((0.0, 1.0), repeat=2):
+        flops = StepFlops(1.0, 2.0, unsized, bounded)
+        logged = flops.utilizations(1, 1.0, peak=1.0)
+        assert logged_utilization(logged, "hfu") == (2.0, flops.bound)
+        assert logged_utilization(logged, "hlo_flops_util") == (1.0, flops.bound)
+    assert {StepFlops(1.0, 2.0, unsized, bounded).bound
+            for unsized, bounded in itertools.product((0.0, 1.0), repeat=2)} == set(BOUND_MARKS)
+    assert logged_utilization({"train/mfu": 0.5}, "hfu") is None
 
 
 def test_a_conditional_counts_the_branch_of_the_most_flops():

@@ -10,7 +10,6 @@ import dataclasses
 import json
 import math
 import shutil
-import tarfile
 from pathlib import Path
 
 import jax
@@ -20,7 +19,7 @@ import optax
 import pytest
 from diffusion_stubs import PROMPTS, batch_for
 from diffusion_support import images_of
-from interop_support import allocated_bytes
+from interop_support import allocated_bytes, extract_fixture, tiny_pipeline
 from reference_error import as_given, assert_as_exact
 
 from dew.config import ObjectiveConfig, TrainerConfig
@@ -48,13 +47,9 @@ def pipelines(tmp_path_factory):
     pipeline, whose DDIM grid ends short of a clean sample."""
     root = tmp_path_factory.mktemp("pipelines")
     for family in ("sd3", "flux", "qwen_image"):
-        with tarfile.open(FIXTURES / f"{family}_source.tar.xz") as archive:
-            archive.extractall(root / family, filter="data")
-    with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
-        archive.extractall(root / "unet", members=[member for member in archive.getmembers()
-                                                   if member.name.split("/")[0] == "sd"], filter="data")
+        extract_fixture(FIXTURES / f"{family}_source.tar.xz", root / family)
     (root / "sd").mkdir()
-    (root / "unet" / "sd").rename(root / "sd" / "pipeline")
+    tiny_pipeline(root / "unet", "sd").rename(root / "sd" / "pipeline")
     return root
 
 
@@ -370,8 +365,7 @@ def test_a_hub_pipeline_rebound_online_exports_offline_from_its_recorded_headers
 def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_path):
     """A recipe trains the loaded KL posterior and denoiser and publishes the tuned autoencoder,
     and the trained tree rebuilds over the pipeline's metadata alone, scoring as the run did."""
-    with tarfile.open(FIXTURES / "rae.tar.xz") as archive:
-        archive.extractall(tmp_path / "representation", filter="data")
+    extract_fixture(FIXTURES / "rae.tar.xz", tmp_path / "representation")
     alignment = Alignment("proj_out", source=str(tmp_path / "representation" / "dinov2_plain"),
                           resolution=56, width=8)
     config = DiffusionRunConfig(

@@ -10,8 +10,9 @@ import numpy as np
 import pytest
 from diffusion_support import TanhLayer
 from flax import linen as nn
+from interop_support import extract_fixture
+from recorded_runs import assert_as_exact_as_recorded
 from reference_error import assert_as_exact_over_orders, distance
-from reference_runs import assert_as_exact_as_recorded
 
 from dew.diffusion import presets
 from dew.inference import TextToImage
@@ -286,7 +287,6 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     """A REPA run on the tiny Flux holds the encoder its tree lacks and draws
     the projector; a step moves both sides. (REPA-E over a published pipeline tunes
     the pipeline's own autoencoder: test_diffusion_run_sources.)"""
-    import tarfile
 
     import optax
     from diffusion_support import images_of
@@ -297,8 +297,7 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     from dew.training import Trainer
 
     for name in ("flux_source", "rae"):
-        with tarfile.open(Path(__file__).resolve().parent / "fixtures" / f"{name}.tar.xz") as archive:
-            archive.extractall(tmp_path / name, filter="data")
+        extract_fixture(Path(__file__).resolve().parent / "fixtures" / f"{name}.tar.xz", tmp_path / name)
     alignment = Alignment("x_embedder", source=str(tmp_path / "rae" / "dinov2_plain"), width=8, resolution=56)
     config = DiffusionRunConfig(pretrained=str(tmp_path / "flux_source" / "pipeline"), preset=None,
                                 model=precision(), data=images_of("tfds://oxford_flowers102", 16),

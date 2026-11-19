@@ -6,12 +6,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, assert_contract, normal_draw
+from contract_support import EDGES, assert_drawn_contract, normal_draw
 
 from dew.diffusion.schedules.flow import time_shift
 
 
-def positive_draw(seed: int, shape: tuple, scale: float) -> jax.Array:
+def positive_draw(seed: int | tuple[int, ...], shape: tuple, scale: float) -> jax.Array:
     """A float32 variance a row, positive, at `scale`: a draw's magnitude, at least a tenth of the scale."""
     rng = np.random.default_rng(seed)
     return jnp.asarray((np.abs(rng.standard_normal(shape)) + 0.1) * scale, jnp.float32)
@@ -22,16 +22,18 @@ def test_a_time_shift_holds_every_order(edge):
     """`schedules.flow.time_shift` (its derivative in the regular form): every order finite wherever float64
     is a normal float32 and the plain shifted time, shift t / (1 + (shift - 1) t), is, over times in (0, 1],
     its domain, and near its least normal; a time past 1 is no time of a schedule's."""
-    rng = np.random.default_rng(2644)
-    t = jnp.asarray(rng.uniform(1e-3, 1.0, (9,)) * EDGES[edge], jnp.float32)
-    direction = jnp.asarray(rng.standard_normal(t.shape) * EDGES[edge], jnp.float32)
-    cotangent = jnp.asarray(rng.standard_normal(t.shape), jnp.float32)
-
     def plain(t):
         return 3.0 * t / (1 + 2.0 * t)
 
-    assert_contract(lambda t: time_shift(3.0, t), (t,), (direction,), cotangent, f"a time shift {edge}",
-                    truth_fn=plain, plain_fn=plain)
+    def inputs(seed, scale):
+        """A seed's times in (0, 1] and their direction at `scale`, and its cotangent."""
+        drawn = np.random.default_rng((2644, seed))
+        times = jnp.asarray(drawn.uniform(1e-3, 1.0, (9,)) * scale, jnp.float32)
+        along = jnp.asarray(drawn.standard_normal(9) * scale, jnp.float32)
+        return (times,), (along,), jnp.asarray(drawn.standard_normal(9), jnp.float32)
+
+    assert_drawn_contract(lambda t: time_shift(3.0, t), inputs, EDGES[edge], f"a time shift {edge}",
+                          truth_fn=plain, plain_fn=plain)
 
 
 def half_squared_over(value, mean, variance):
@@ -51,14 +53,17 @@ def test_a_transitions_quadratic_term_holds_every_order(edge):
     (each a power of two)."""
     from dew.sampling import flow
 
-    value, mean = normal_draw(2283, (3, 4), (3, 4), scale=EDGES[edge])
-    value = value.at[0].set(mean[0])
-    variance = positive_draw(2284, (3,), EDGES[edge])
-    direction = (*normal_draw(2285, (3, 4), (3, 4), scale=EDGES[edge]),
-                 positive_draw(2286, (3,), EDGES[edge]))
-    (cotangent,) = normal_draw(2287, (3,))
-    assert_contract(flow._half_mahalanobis, (value, mean, variance), direction, cotangent,
-                    f"a transition's quadratic term {edge}", truth_fn=half_squared_over)
+    def inputs(seed, scale):
+        """A seed's value, mean and variance and their direction at `scale`, a value equal to its mean
+        among them, and its cotangent."""
+        value, centre = normal_draw((2283, seed), (3, 4), (3, 4), scale=scale)
+        along = (*normal_draw((2285, seed), (3, 4), (3, 4), scale=scale),
+                 positive_draw((2286, seed), (3,), scale))
+        return ((value.at[0].set(centre[0]), centre, positive_draw((2284, seed), (3,), scale)), along,
+                normal_draw((2287, seed), (3,))[0])
+
+    assert_drawn_contract(flow._half_mahalanobis, inputs, EDGES[edge],
+                          f"a transition's quadratic term {edge}", truth_fn=half_squared_over)
 
     unit = jnp.ones((1,), jnp.float32)
     # A tangent far from its operands' scale among them: a value and mean of 2**-120 under 2**10
@@ -95,17 +100,19 @@ def test_a_transitions_kl_holds_every_order(edge):
     the variance, a forward derivative of its gradient included (ledger 2383)."""
     from dew.sampling import flow
 
-    mean, reference = normal_draw(2288, (3, 4), (3, 4), scale=EDGES[edge])
-    variance = positive_draw(2289, (3,), EDGES[edge])
-    direction = (*normal_draw(2290, (3, 4), (3, 4), scale=EDGES[edge]),
-                 positive_draw(2291, (3,), EDGES[edge]))
-    (cotangent,) = normal_draw(2292, (3,))
-
     def kl(mean, reference, variance):
         return flow.GaussianTransition(mean, variance).kl(reference)
 
-    assert_contract(kl, (mean, reference, variance), direction, cotangent, f"a transition's KL {edge}",
-                    truth_fn=half_squared_over, plain_fn=half_squared_over)
+    def inputs(seed, scale):
+        """A seed's mean, reference and variance and their direction at `scale`, and its cotangent."""
+        centre, held = normal_draw((2288, seed), (3, 4), (3, 4), scale=scale)
+        along = (*normal_draw((2290, seed), (3, 4), (3, 4), scale=scale),
+                 positive_draw((2291, seed), (3,), scale))
+        drawn = (centre, held, positive_draw((2289, seed), (3,), scale))
+        return drawn, along, normal_draw((2292, seed), (3,))[0]
+
+    assert_drawn_contract(kl, inputs, EDGES[edge], f"a transition's KL {edge}", truth_fn=half_squared_over,
+                          plain_fn=half_squared_over)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -115,13 +122,16 @@ def test_a_guided_prediction_holds_every_order(edge):
     combination as written, unconditional + scale (conditional - unconditional), is, a row's scale one."""
     from dew.sampling import guidance
 
-    conditional, unconditional = normal_draw(2298, (4, 5), (4, 5), scale=EDGES[edge])
     scale = jnp.asarray([1.0, 3.5, -0.5, 7.5], jnp.float32)
-    direction = (*normal_draw(2299, (4, 5), (4, 5), scale=EDGES[edge]), *normal_draw(2300, (4,)))
-    (cotangent,) = normal_draw(2301, (4, 5))
 
     def affine(conditional, unconditional, scale):
         return unconditional + scale[:, None] * (conditional - unconditional)
 
-    assert_contract(guidance.guide, (conditional, unconditional, scale), direction, cotangent,
-                    f"a guided prediction {edge}", truth_fn=affine, plain_fn=affine)
+    def inputs(seed, at):
+        """A seed's predictions and their direction at `at`, its rows' scales as fixed, and its cotangent."""
+        drawn, unguided = normal_draw((2298, seed), (4, 5), (4, 5), scale=at)
+        along = (*normal_draw((2299, seed), (4, 5), (4, 5), scale=at), *normal_draw((2300, seed), (4,)))
+        return (drawn, unguided, scale), along, normal_draw((2301, seed), (4, 5))[0]
+
+    assert_drawn_contract(guidance.guide, inputs, EDGES[edge], f"a guided prediction {edge}", truth_fn=affine,
+                          plain_fn=affine)

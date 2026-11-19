@@ -19,6 +19,7 @@ loss reads once through its cast (`narrowed_paths`), none where no weight is rea
 
 import functools
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import optax
@@ -134,8 +135,7 @@ _drawn = token_draw(2184, VOCAB, (ROWS, LENGTH), low=1)
 
 
 @cell("narrow_copies", covers=lambda case: dict(zip(AXES["narrow_copies"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_narrow_copy_training_run_is_on_par(case: tuple[str, ...]) -> None:
     """The case's training run on its GPU through the narrow copies on par with the forward's own casts

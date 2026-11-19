@@ -808,6 +808,75 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
 
 
 @COMPILES_ON_CPU
+def test_a_programs_launches_compile_beside_its_trace():
+    """A training step compiled through Dew's compile point (`OuterProgram.compiled`) certifies its
+    attention launches beside its trace (`report.certifying_aside`): each launch's compile runs on a thread
+    of its own while the trace goes on, as JAX's compile events say of the thread that ran them, the
+    program's own compile on the caller's; its launches certified, none refused."""
+    import threading
+
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.options import owned_program
+
+    compiled_on: list[str] = []
+
+    def heard(event: str, seconds: float, **_) -> None:
+        if event == "/jax/core/compile/backend_compile_duration":
+            compiled_on.append(threading.current_thread().name)
+
+    tokens, heads, kv_heads, width = 1600, 4, 2, 128
+    device = compile_only_gpus("sm90")[0]
+    placed = NamedSharding(Mesh([device], ("x",)), PartitionSpec())
+    query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16, sharding=placed)
+    key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16, sharding=placed)
+
+    def loss(query, key, value):
+        attended = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
+        return jnp.sum(attended.astype(jnp.float32))
+
+    before = len(report.certifications())
+    jax.monitoring.register_event_duration_secs_listener(heard)
+    try:
+        with generation.assumed("sm90"), report.certifying(device):
+            owned_program(jax.grad(loss, argnums=(0, 1, 2))).compiled(query, key, key)
+    finally:
+        jax.monitoring.unregister_event_duration_listener(heard)
+    certified = report.certifications()[before:]
+    assert certified and not any(certification.refused for certification in certified), certified
+    aside = [name for name in compiled_on if name.startswith("dew-certify")]
+    compiled_here = [certification for certification in certified if not certification.stored]
+    assert len(aside) == len(compiled_here) > 0, compiled_on
+    assert compiled_on.count(threading.current_thread().name) == 1, compiled_on
+
+
+@COMPILES_ON_CPU
+def test_a_refused_launch_states_its_model_beside_the_assemblers_registers():
+    """A launch certification refuses records each refused kernel with its launch and config, ptxas's
+    registers and stack frame beside the registers its launch's model stated, and steps it down where the
+    derivation offers another: the accurate backward 64 wide on an H100, configured at a 128-row query
+    block, which its dQ spills at."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    op, ba, derived = _gated_backward("sm90", 64, accurate=True)
+    # Its tile at 128 query rows, which its dQ spills at (FS-DECISION-sm90).
+    config = dataclasses.replace(derived, block_q=128)
+    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]), report.refusals():
+        spilling = report.certified(op, ba, config)
+        assert spilling, config
+        report.missed(op, ba, config, spilling, stepped=True)
+        missed = [miss for miss in report.misses()
+                  if miss.op == type(op).__name__ and miss.config == config]
+        budget = op.register_budget(config)
+    assert len(missed) == len(spilling), (missed, spilling)
+    refused_by_ptxas = [(miss.frame or 0) > 0 or (miss.registers or 0) > budget or bool(miss.serialized)
+                        for miss in missed]
+    assert all(refused_by_ptxas), (missed, budget)
+    assert all(miss.modelled is not None and miss.stepped for miss in missed), missed
+
+
+@COMPILES_ON_CPU
 def test_a_ladder_that_spills_throughout_certifies_its_ends_alone():
     """The accurate backward under an alibi hook 64 wide on an H100, whose dQ spills at every query block the
     derivation offers (row 7938): certification refuses each of them, as it would certifying every rung,
@@ -876,11 +945,15 @@ def test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks():
 
 
 @COMPILES_ON_CPU
-def test_a_start_runs_the_kernels_its_launches_certified():
+@pytest.mark.parametrize("hooks", ["none", "temperature"])
+def test_a_start_runs_the_kernels_its_launches_certified(hooks):
     """A launch's derived config certified as it traces (`report.certified`: its kernels compiled alone as
-    the GPU's compiler assembles them) on a compile-only B200, and then compiled within its program: every
-    Mosaic GPU kernel the program runs is one certification compiled, module for module (its kernel hash),
-    which Mosaic compiles once a process, so certification adds a start no second assembly."""
+    the GPU's compiler assembles them, in certification's own placement) on a compile-only B200, and then
+    compiled within its program: every Mosaic GPU kernel the program runs is one certification compiled,
+    module for module (its kernel hash), which Mosaic compiles once a process, so certification adds a start
+    no second assembly and its verdict is the program's kernel's. Under a score hook too, whose traced digest
+    names the kernels (row 8532: certification's placement named them apart, and ptxas assembled the two
+    otherwise identical modules differently, 8 bytes spilled in the program against none certified)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -888,9 +961,10 @@ def test_a_start_runs_the_kernels_its_launches_certified():
     spans = template.spans(tokens, tokens, 1, causal=True)
     query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
+    hooked = _gated_hooks(hooks, tokens, width)
 
     def forward(query, key, value):
-        return attention_mosaic.forward(query, key, value, spans, None)
+        return attention_mosaic.forward(query, key, value, spans, hooked)
 
     found = compile_mosaic_kernels([KernelCase("a start's forward", lambda: (forward, (query, key, key)))],
                                    "sm100")

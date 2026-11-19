@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -400,8 +401,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
         components.update(safety_configs)
     schedule = SourceSchedule.from_config(_component_config(directory, "scheduler"))
     components["scheduler"] = dict(schedule.config)
-    patch = denoiser.patch * autoencoder.downscale_factor
-    tokens = (height // patch) * (width // patch)
+    tokens = latent_tokens(height, width, denoiser.patch * autoencoder.downscale_factor)
     task = SourceTask(min(policy.steps, schedule.train_steps),
                       CFG(policy.guidance) if policy.guided and policy.guidance > 1 else None,
                       SourceGrid(dict(schedule.config), tokens, denoiser.origin))
@@ -715,6 +715,51 @@ def _square(config: Mapping[str, object], default: int | None = None) -> tuple[i
     side = _records.integer(config["sample_size"] if default is None else config.get("sample_size", default),
                            "sample_size")
     return side, side
+
+
+def latent_tokens(height: int, width: int, patch: int) -> int:
+    """The latent tokens a denoiser reads of a `height` x `width` sample, each token `patch` pixels a side
+    (its patch times its autoencoder's downscale): the count a source grid's resolution shift reads
+    (`SourceGrid.tokens`)."""
+    return (height // patch) * (width // patch)
+
+
+def bound_at_size(inputs: InputSpec, process: Process, grid: SourceGrid | None,
+                  autoencoder: AutoEncoder | None, size: tuple[int, ...], *,
+                  grid_process: bool) -> tuple[InputSpec, Process, SourceGrid | None]:
+    """A pipeline's inputs, process and grid bound at the sample `size` (an image's height and width, a
+    clip's frames before them), as `assemble` binds a published pipeline's at its size: the sample and a
+    mask at it, the autoencoder refusing a size it does not encode (`AutoEncoder.latent_shape`), a published
+    composition's size conditioning at it (`DiffusionConditioner.time_id_values`), the grid's tokens at it
+    (`latent_tokens`, each token's pixels the grid's tokens at the sample's own size state), and, where
+    the process is the grid's own training process (`grid_process`, `DiffusionObjective.grid_process`),
+    the grid's at those tokens (`SourceSchedule.training_process`). Any other process is the run's own,
+    kept as it trained; a preset a run names sets its own at its size (`DiffusionRunConfig.derived_preset`).
+    """
+    sample = inputs.sample
+    if len(size) != len(sample.shape) - 1 or any(type(extent) is not int or extent < 1 for extent in size):
+        raise ValueError(f"a sample of shape {sample.shape[:-1]} resizes to as many positive extents, not "
+                         f"{size}")
+    if tuple(size) == sample.shape[:-1]:
+        return inputs, process, grid
+    (before, after), (height, width) = sample.shape[-3:-1], size[-2:]
+    shaped = replace(sample, shape=(*size, sample.shape[-1]))
+    if autoencoder is not None:
+        autoencoder.latent_shape(shaped.shape)
+    conditions = {keyword: replace(condition, encoder=replace(condition.encoder, height=height, width=width))
+                  if isinstance(condition.encoder, DiffusionConditioner) else condition
+                  for keyword, condition in inputs.conditions.items()}
+    mask = None if inputs.mask is None else replace(inputs.mask, shape=(height, width, inputs.mask.shape[-1]))
+    inputs = replace(inputs, sample=shaped, conditions=conditions, mask=mask)
+    if grid is None or grid.tokens is None:
+        return inputs, process, grid
+    patch = math.isqrt(before * after // grid.tokens)
+    if patch < 1 or latent_tokens(before, after, patch) != grid.tokens:
+        raise ValueError(f"the grid's {grid.tokens} tokens at {before} x {after} state no token's pixels a "
+                         "side, which its tokens at another size read")
+    tokens = latent_tokens(height, width, patch)
+    return (inputs, grid.schedule.training_process(tokens) if grid_process else process,
+            replace(grid, tokens=tokens))
 
 
 def _geometry(index: Mapping[str, object], size: tuple[int, int]) -> tuple[int, int]:

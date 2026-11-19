@@ -43,6 +43,7 @@ from flax.typing import PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 
+from dew import _cache
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_gradients_formed
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block
@@ -52,7 +53,7 @@ from dew.nn.kernels.templates.gemm import mosaic_gpu, scattered
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
-from dew.nn.programs import read_by
+from dew.nn.programs import called, read_by
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -664,10 +665,16 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         matrices = _undeferred(words, scales).decoded()
         return matrices[0] if dense else matrices
 
+    def kernel(rows, words, scales, sizes, gather, first, *, interpret):
+        return launch(rows, _undeferred(words, scales), sizes, (), (), None, first, gather,
+                      out_dtype='float32', trans_rhs=False, interpret=interpret, dense=dense, exact_sums=True)
+
     def forward(rows, words, scales, sizes, gather, first):
-        out = launch(rows, _undeferred(words, scales), sizes, (), (), None, first, gather,
-                     out_dtype='float32', trans_rhs=False, interpret=interpret, dense=dense, exact_sums=True)
-        return out, ()
+        # The launch where the call lowers for CUDA, interpreted on a CPU where asked, the decoded values'
+        # product elsewhere (`_dispatched`; `portable`, the tangent's too), as every launch of gemm's: a CPU
+        # process's call lowered the launch for its CPU uninterpreted (row 8492: "Only interpret mode is
+        # supported on CPU backend").
+        return _dispatched(kernel, portable, interpret, rows, words, scales, sizes, gather, first), ()
 
     def backward(saved, operands, cotangent, live):
         # The cotangent at its own precision times the decoded values' transpose, rounded once to the rows',
@@ -940,7 +947,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
           epilogue_axes, dtypes, *, several: bool, transpose_rhs: bool, interpret_on_cpu: bool,
           precision: PrecisionLike, dense: bool = False, paired: jax.Array | None = None,
           first: jax.Array | None = None, gather: jax.Array | None = None, scatter: jax.Array | None = None,
-          summed_as: tuple = (), joined: jax.Array | None = None, beside: tuple = ()):
+          summed_as: tuple = (), joined: jax.Array | None = None, beside: tuple = (), chained: tuple = ()):
     """`gemm`'s value, on grouped operands; `summed_as`, the outputs of the product whose accumulator it
     recomputes (a reverse pass's, at fp32), whose sums it repeats (`product.promoted`: an fp32 output's
     exact sums, a 16-bit one's not); `first`, a stacked `rhs`'s matrix its first group reads
@@ -948,9 +955,10 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
     (`gemm`'s); `joined`, rows of `lhs`'s shape that `paired` multiplies into the one product, `lhs @ rhs +
     joined @ paired` summed and rounded once, of no hooks, gather or scatter (`grouped_matmul.gmm_call`'s;
     a paired product's input gradient, `_input_cotangents`); `beside`, matrices side by side with `rhs`, an
-    output each (`gemm`'s)."""
+    output each (`gemm`'s); `chained`, further `(rows, matrix)` products summed with `lhs @ rhs`, one
+    output (`grouped_matmul.gmm_call`'s; a multi-matrix input gradient, `_input_cotangents`)."""
     def kernel(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
-               joined, beside, *, interpret):
+               joined, beside, chained, *, interpret):
         # An fp32 product asked above the default precision runs as its operands' bf16 parts where a launch
         # takes them (`_in_parts`); the matrix's values are `rhs`'s where the rows' dtype holds them, else
         # theirs rounded to it, as the product multiplies them.
@@ -958,7 +966,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         counts = _part_counts(lhs.dtype, rhs.dtype if holds else lhs.dtype, precision)
         whole = seen_whole(lhs) and all(map(seen_whole, (rhs, *beside)))
         if (counts is not None and prologue is None and paired is None and scatter is None and not several
-                and _parts_launched(*_gemm_call(
+                and not chained and _parts_launched(*_gemm_call(
                     lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), group_sizes, None, (), (), epilogue,
                     epilogue_arrays, epilogue_axes, dtypes, several=False, transpose_rhs=transpose_rhs,
                     interpret=interpret, precision=precision, dense=dense, paired=None, first=first,
@@ -975,7 +983,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
                                    epilogue_arrays, epilogue_axes, dtypes, several=several,
                                    transpose_rhs=transpose_rhs, interpret=interpret, precision=precision,
                                    dense=dense, paired=paired, first=first, gather=gather, scatter=scatter,
-                                   summed_as=summed_as, joined=joined, beside=beside)
+                                   summed_as=summed_as, joined=joined, beside=beside, chained=chained)
         # A call no launch takes (a TPU's widths its blocks do not divide) runs XLA's program; a paired one,
         # or matrices side by side, no launch takes whole its products apart, each through the launches
         # that take it (`_apart`).
@@ -992,30 +1000,31 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
             # gathers none, row 5213): the rows gathered first and the outputs put at their slots after, the
             # grouped launches taking the rows between, never XLA's ragged dot over every group's matrix.
             return scattered(kernel(lhs if gather is None else lhs[gather], rhs, group_sizes, prologue_arrays,
-                                    epilogue_arrays, paired, first, None, None, None, beside,
+                                    epilogue_arrays, paired, first, None, None, None, beside, chained,
                                     interpret=interpret),
                              scatter)
         if not callable(launch) or _UNBUILT.get():
             return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
-                            scatter, joined, beside)
+                            scatter, joined, beside, chained)
         return launch()
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
-                 joined, beside):
+                 joined, beside, chained):
         config = XlaConfig(transpose_rhs, precision, dense=dense)
         outs = xla_mainloop(config, lhs if gather is None else lhs[gather], rhs, group_sizes, prologue,
                             prologue_arrays, prologue_axes, epilogue, epilogue_arrays, epilogue_axes, dtypes,
-                            several, paired=paired, first=first, joined=joined, beside=beside)
+                            several, paired=paired, first=first, joined=joined, beside=beside,
+                            chained=chained)
         return scattered(outs, scatter)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
-                       epilogue_arrays, paired, first, gather, scatter, joined, beside)
+                       epilogue_arrays, paired, first, gather, scatter, joined, beside, chained)
 
 
 def _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
                epilogue_axes, dtypes, *, several: bool, transpose_rhs: bool, interpret: bool,
                precision: PrecisionLike, dense: bool, paired, first, gather, scatter, summed_as: tuple,
-               joined=None, beside: tuple = ()):
+               joined=None, beside: tuple = (), chained: tuple = ()):
     """`_gemm`'s grouped call of its operands (`grouped_matmul.gmm_call`'s launches, arguments and options)
     and the product it declares: one construction for the launch it runs and for a reverse pass's question
     of which launch a call would run (`_keeps_launch`)."""
@@ -1029,6 +1038,7 @@ def _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, 
     call = grouped_matmul.gmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, before_sides, after_sides,
                                    None if paired is None else paired.astype(lhs.dtype), first, gather,
                                    scatter, joined, tuple(matrix.astype(lhs.dtype) for matrix in beside),
+                                   tuple((rows, matrix.astype(lhs.dtype)) for rows, matrix in chained),
                                    out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
                                    interpret=interpret, promoted=product.promoted, dense=dense)
     return call, product
@@ -1119,15 +1129,17 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
                if d is not None]
     entrywise = _entrywise(lhs, prologue, prologue_arrays, prologue_axes, plain)
     wide, d_operand = at_least_fp32(lhs.dtype), None
-    if len(reached) == 2 and not entrywise and _joins(reached, group_sizes, lhs.dtype, prologue, options):
-        # A paired product's two cotangents through their matrices, one product over their joined depths
-        # (`_gemm`'s `joined`): one launch, one accumulator, rounded once (row 6783: lm-moe's start certified
-        # and built the two at two tiles, 6.2 s).
-        (d, matrix), (d_paired, paired) = reached
+    taken = None if entrywise else _one_launch(reached, group_sizes, lhs.dtype, prologue, options)
+    if taken is not None:
+        # The cotangents through their matrices, one product over their joined depths (`_one_launch`'s
+        # form): one launch, one accumulator, rounded once (row 6783: lm-moe's start certified and built a
+        # paired product's two at two tiles, 6.2 s; row 8282: q, k and v's three launches each read and
+        # wrote the fp32 sum, 1.145 ms on a GH200's 8b input gradient), a chain's overflowing tiles summed
+        # again bounded (`mosaic_gpu.guarded_walk`).
+        d, matrix, form = taken
         out = wide if prologue is not None else jnp.dtype(lhs.dtype)
         d_operand = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), None, (), (), (out,),
-                                      several=False, summed_as=(lhs.dtype,), paired=paired, joined=d_paired,
-                                      **options))
+                                      several=False, summed_as=(lhs.dtype,), **form, **options))
         reached = []
     # Where its rows are gathered, or the last product's epilogue pulls an entrywise prologue back, a paired
     # product's first product, wide, is added in the second's epilogue (`_added`): the same sum, rounded
@@ -1209,26 +1221,52 @@ def _added(acc, prior):
     return acc + prior
 
 
-def _joins(reached: list, group_sizes, dtype, prologue, options: dict) -> bool:
-    """Whether a launch takes a paired product's two input-gradient products (`reached`'s `(cotangent,
-    matrix)` pairs) whole as one over their joined depths (`_gemm`'s `joined`), as `_input_cotangents` calls
-    it: Mosaic GPU's, of 16-bit cotangents and no gathered rows (`grouped_matmul.GROUPED`'s choice, read
-    without reporting it), its two matrices and two cotangents each of one shape (a joined product's
-    contract, `mosaic_gpu.gmm`'s `joined`: projections side by side of their own widths, `beside`, are
-    not one). Elsewhere the two run as before, the second adding the first in its epilogue."""
-    (d, matrix), (d_paired, paired) = reached
-    if (options['gather'] is not None or d.dtype != d_paired.dtype or matrix.shape != paired.shape
-            or d.shape != d_paired.shape):
-        return False
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+def _one_launch(reached: list, group_sizes, dtype, prologue, options: dict) -> tuple | None:
+    """The one launch an input gradient's products (`reached`'s `(cotangent, matrix)` pairs) take whole over
+    their joined depths, as `_input_cotangents` calls it: `(cotangent, matrix, form)`, `_gemm`'s first
+    product and its `form`, where Mosaic GPU's launch takes it (`grouped_matmul.GROUPED`'s choice, read
+    without reporting it, which `_gemm`'s dispatch reports), else None. Its forms, in turn: a paired
+    product's two, each matrix and each cotangent of one shape (`joined`, the matrix `paired`: a joined
+    product's contract, `mosaic_gpu.gmm`'s; row 6783); every product of some depth (a product of none adds
+    nothing, and its operand has no extent a TMA descriptor takes, c3b97e20f F4), in the portable program's
+    transpose order (`chained`: projections side by side of their own widths, `beside`, row 8282), its
+    derivation refusing depths of no whole steps (`mosaic_gpu.chained_refusal`). Cotangents of one dtype and
+    no gathered rows; elsewhere each product runs as before, the next adding it in its epilogue."""
+    if options['gather'] is not None or len({d.dtype for d, _ in reached}) > 1:
+        return None
+    forms = []
+    if len(reached) == 2 and len({d.shape for d, _ in reached}) == len({w.shape for _, w in reached}) == 1:
+        (d, matrix), (d_paired, paired) = reached
+        forms.append((d, matrix, {'paired': paired, 'joined': d_paired}))
+    nonempty = [(d, matrix) for d, matrix in reached if d.shape[1]]
+    if len(nonempty) > 1:
+        (d, matrix), *rest = nonempty[::-1]
+        forms.append((d, matrix, {'chained': tuple(rest)}))
+    return next(((d, matrix, form) for d, matrix, form in forms
+                 if _launch_takes(d, matrix, form, group_sizes, dtype, prologue, options)), None)
+
+
+def _launch_takes(d, matrix, form: dict, group_sizes, dtype, prologue, options: dict) -> bool:
+    """Whether Mosaic GPU's launch takes `d @ matrix` in `form` (`_one_launch`'s) as `_gemm` binds it; a
+    chain not at a pinned tile it does not hold (its replay narrower than a column unit: base review
+    2e4651b2e F1, the chain narrowed a 64-column pin to 16)."""
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     sizes = jnp.full((1,), d.shape[0], jnp.int32) if group_sizes is None else group_sizes
     out = at_least_fp32(dtype) if prologue is not None else jnp.dtype(dtype)
     call, product = _gemm_call(d, matrix, sizes, None, (), (), None, (), (), (out,), several=False,
                                transpose_rhs=options['transpose_rhs'], interpret=interpret,
-                               precision=options['precision'], dense=options['dense'], paired=paired,
-                               first=options['first'], gather=None, scatter=None, summed_as=(dtype,),
-                               joined=d_paired)
-    case = grouped_matmul.grouped_case(*call, product=product, whole=seen_whole(d) and seen_whole(matrix))
+                               precision=options['precision'], dense=options['dense'],
+                               paired=form.get('paired'), first=options['first'], gather=None, scatter=None,
+                               summed_as=(dtype,), joined=form.get('joined'), chained=form.get('chained', ()))
+    operands = (d, matrix, *(() if 'joined' not in form else (form['joined'], form['paired'])),
+                *(each for pair in form.get('chained', ()) for each in pair))
+    pin = dict(_cache.KERNEL_PINS.value).get(grouped_matmul.MosaicGmm)
+    if pin is not None and 'chained' in form:
+        launch = grouped_matmul.MosaicGmm()
+        bound = launch.bind(*call[1], **call[2])
+        if not launch.pinnable(bound, launch.completed(bound, pin)):
+            return False
+    case = grouped_matmul.grouped_case(*call, product=product, whole=all(map(seen_whole, operands)))
     try:
         return selection.selected(grouped_matmul.GROUPED, case).name == grouped_matmul.MosaicGmm.name
     except selection.KernelRefused:
@@ -1245,7 +1283,7 @@ def _keeps_launch(lhs, rhs, group_sizes, hook, sides: tuple, outs: tuple, summed
     asked above the default precision runs as its bf16 parts' launches, the hook the last part's
     (`_gemm`'s `_in_parts`), so the launches asked about are those parts' (a wide cotangent's chained input
     gradient, `_input_cotangents`)."""
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if group_sizes is None else group_sizes
     if _part_counts(lhs.dtype, rhs.dtype, options['precision']) is not None:
         lhs, rhs = lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16)
@@ -1306,7 +1344,7 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
     XLA's program of the whole product. Gathered rows keep the prologue (`_gemm_t` gathers them first)."""
     if options['gather'] is not None:
         return True
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     dense = group_sizes is None
     sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     product = declared(lhs.dtype, options['precision'], outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))
@@ -1452,7 +1490,8 @@ class XlaConfig:
 
 def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
                  epilogue_arrays, epilogue_axes, dtypes, several: bool, *, paired: jax.Array | None = None,
-                 first: jax.Array | None = None, joined: jax.Array | None = None, beside: tuple = ()):
+                 first: jax.Array | None = None, joined: jax.Array | None = None, beside: tuple = (),
+                 chained: tuple = ()):
     """The template's portable mainloop at `config` (docs/design/kernel-templates.md's `xla_mainloop`):
     `gemm`'s arithmetic in XLA, the kernels' products of `lhs`'s dtype summed in at least fp32 (an fp64
     product's in fp64, which no kernel takes), one rounding, a dense call's as XLA's own dot
@@ -1463,7 +1502,8 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     that one (`_grouped`), sliced out, as XLA's ragged dot reads a matrix a group, a pair's second stack's
     alike; with `joined` too, the paired matrix multiplies those rows, the two accumulators added once
     (`mosaic_gpu.joined_sum`, the launch's own finish) where no epilogue is given; with `beside`, each of
-    those matrices' products too, an output each."""
+    those matrices' products too, an output each; with `chained`, each `(rows, matrix)` product too, each
+    summed apart and added in order into the one output (the plain program's sum)."""
     transpose_rhs, precision, compute, dense = (config.transpose_rhs, config.precision, config.compute,
                                                 config.dense)
     if first is not None:
@@ -1472,8 +1512,10 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
         rhs = layer_of(rhs)
         paired = None if paired is None else layer_of(paired)
     matrices = tuple(jnp.swapaxes(each, 1, 2) if transpose_rhs else each
-                     for each in (rhs, *(() if paired is None else (paired,)), *beside))
-    rows = (lhs,) * len(matrices) if joined is None else (lhs, joined)
+                     for each in (rhs, *(() if paired is None else (paired,)), *beside,
+                                  *(matrix for _, matrix in chained)))
+    rows = ((lhs, *(each for each, _ in chained)) if chained else (lhs,) * len(matrices) if joined is None
+            else (lhs, joined))
     epilogue = mosaic_gpu.joined_sum if joined is not None else epilogue
     prologue_arrays = _rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
     epilogue_arrays = _rows(epilogue_arrays, epilogue_axes, group_sizes, lhs.shape[0])
@@ -1491,6 +1533,7 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
                      else xla_products.xla_ragged_dot(product, each.astype(lhs.dtype), group_sizes,
                                                         precision=precision, preferred_element_type=wide)
                      for product, each in zip(products, matrices, strict=True))
+    accs = (functools.reduce(jnp.add, accs),) if chained else accs
     outs = accs if epilogue is None else _as_tuple(epilogue(*accs, *epilogue_arrays))
     outs = tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
     return outs if several else outs[0]
@@ -1562,10 +1605,25 @@ def _rounded_accumulator(kept: dict, count: int, epilogue, acc, sides) -> jax.Ar
     if not kept or count != 1:
         return None
     jaxpr = jax.make_jaxpr(lambda acc, *sides: _tupled(epilogue, acc, *sides))(acc, *sides).jaxpr
-    reading = [eqn for eqn in jaxpr.eqns if jaxpr.invars[0] in eqn.invars]
-    if len(reading) != 1 or reading[0].primitive is not jax.lax.convert_element_type_p:
+    rounded = _rounding(jaxpr, jaxpr.invars[0])
+    return next((value for at, value in kept.items() if jaxpr.outvars[at] is rounded), None)
+
+
+def _rounding(jaxpr, var):
+    """The value of `jaxpr` that is `var` rounded, where `var`'s one reader is that conversion, or a call
+    whose program's is (`dew.nn.programs.called`: an epilogue its fused consumer's derivative declares,
+    `fused_gemm._declared`), its output then the call's; None otherwise."""
+    reading = [eqn for eqn in jaxpr.eqns if var in eqn.invars]
+    if len(reading) != 1:
         return None
-    return next((value for at, value in kept.items() if jaxpr.outvars[at] is reading[0].outvars[0]), None)
+    (eqn,) = reading
+    if eqn.primitive is jax.lax.convert_element_type_p:
+        return eqn.outvars[0]
+    body = called(eqn)
+    if body is None or eqn.invars.count(var) != 1:
+        return None
+    inner = _rounding(body, body.invars[eqn.invars.index(var)])
+    return eqn.outvars[body.outvars.index(inner)] if inner in body.outvars else None
 
 
 def _reads_accumulators(vjp: tuple, count: int) -> bool:

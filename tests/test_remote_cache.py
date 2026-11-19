@@ -336,6 +336,24 @@ def test_a_remote_given_up_sends_none_of_the_uploads_still_queued(tmp_path):
     assert set(programs(tmp_path)) == {f"jit_step-{index}" for index in range(20)}
 
 
+def test_a_remote_given_up_still_counts_the_programs_each_test_compiles(tmp_path):
+    """The remote given up (nothing listens where it was), the local watch still tells what a test compiled
+    (`mark`, `compiled_since`), so a test that ran cold while the Worker was unreachable is timed cold,
+    bundle by bundle (row 7939's review)."""
+    cache = remote_cache.RemoteCache(tmp_path, "http://127.0.0.1:1", "token", "jax/cpu")
+    for index in range(remote_cache.FAILURES):
+        cache.opened(f"tests/test_{index}.py")
+    assert not cache.available
+    cache.opened("tests/test_after.py")
+    mark = cache.mark()
+    compiled(tmp_path, "jit_after-1")
+    assert cache.compiled_since(mark) == 1
+    mark = cache.mark()
+    assert cache.compiled_since(mark) == 0
+    cache.opened("tests/test_next.py")
+    assert cache.compiled_since(mark) is None  # the bundle moved on
+
+
 def test_an_answer_that_arrives_after_the_remote_was_given_up_does_not_take_it_back(tmp_path):
     """A bundle's fetch under way while other requests fail the remote: its
     programs are kept, but the remote stays given up, and no request reaches it

@@ -212,13 +212,13 @@ def test_a_pipelines_conditioner_records_the_tokenizer_files_it_reads(tmp_path, 
     records their hashes, each of its towers' (an SD3's T5 as well as its CLIPs): a pipeline loaded
     again in the same process after a tokenizer's vocabulary moved two ids tokenizes a caption to
     other ids, and the identity an exact resume checks those ids against moves with them."""
-    import tarfile
     from pathlib import Path
+
+    from interop_support import extract_fixture
 
     from dew.interop.pretrained import load_diffusion_source
 
-    with tarfile.open(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz") as opened:
-        opened.extractall(tmp_path, filter="data")
+    extract_fixture(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz", tmp_path)
     directory = tmp_path / inside
 
     def loaded():

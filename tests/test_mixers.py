@@ -283,7 +283,7 @@ the packed row as its Dew arm, on armada, ledger 2828): compared with themselves
 and C biases' and norms' gradients within 512."""
 
 
-SHARDED = {"gated_delta_net", "kimi_delta_attention", "mamba2", "memory"}
+SHARDED = {"gated_delta_net", "kimi_delta_attention", "kpool_sparse_attention", "mamba", "mamba2", "memory"}
 """The kinds whose packed rows' draws run as armada's map tasks (`check1_shards`), each a test of its own."""
 
 
@@ -300,11 +300,26 @@ def test_a_packed_row_of_gated_delta_net_computes_what_its_documents_compute_alo
     assert_packs_as_alone("gated_delta_net")
 
 
+@pytest.mark.check1_shards(seeds=16, per_task=8)
+def test_a_packed_row_of_kpool_attention_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over the k-pool attention, whose 16 seeds took 76 s alone cold, 60 s of it
+    the draws' arms and truth computing, on armada's CI CPU and 139 s in train 1020's CI: CI draws them in map
+    tasks of 8 (row 7851)."""
+    assert_packs_as_alone("kpool_sparse_attention")
+
+
 @pytest.mark.check1_shards(seeds=64, per_task=8)
 def test_a_packed_row_of_kimi_delta_attention_computes_what_its_documents_compute_alone():
     """`assert_packs_as_alone` over Kimi delta attention, whose 64 seeds took 60 s of 120 cold on
     armada's CI CPU: CI draws them in map tasks of 8 (ledger 3901)."""
     assert_packs_as_alone("kimi_delta_attention")
+
+
+@pytest.mark.check1_shards(seeds=32, per_task=8)
+def test_a_packed_row_of_mamba_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over Mamba, whose 32 seeds took 133 s in train 1005's CI (main f4ee27d20):
+    CI draws them in map tasks of 8 (row 7475)."""
+    assert_packs_as_alone("mamba")
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=32)
@@ -378,18 +393,41 @@ def test_deepseek_v4s_projections_are_matrices_muon_steps(compressor):
         assert np.all(np.isfinite(np.asarray(leaf)))
 
 
-@pytest.mark.parametrize("compressor", sorted(COMPRESSED))
+CHECK1_SHARDS = {
+    "test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does[csa]": {"seeds": 256,
+                                                                                         "per_task": 64},
+    "test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does[csa2]": {"seeds": 256,
+                                                                                          "per_task": 64},
+    "test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does[hca]": {"seeds": 256,
+                                                                                         "per_task": 64},
+}
+"""Each compressor's packed row a check-1 site of its own whose seeds run as map tasks (`check1_shards`), by
+node id, a literal the CI plan reads as it reads a mark's (tools/armada/ci.py): one mark over the test's three
+had each task draw every compressor, 98 to 117 s a task (armada, run IG-TIMING2)."""
+
+
+def compressors() -> list:
+    """`COMPRESSED`'s compressors as parameters, each marked from `CHECK1_SHARDS` by its node id."""
+    test = "test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does"
+    return [pytest.param(name, id=name, marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{name}]"]))
+            for name in sorted(COMPRESSED)]
+
+
+@pytest.mark.parametrize("compressor", compressors())
 def test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does(compressor):
     """DeepSeek V4's compressed windows over a packed row (`document_windows`, ledger 2679): each
     document's windows pool its own real tokens from its first, rotate at its own places and are read by
     its own queries alone, an indexer selecting among them alone, so a row packing documents gives each
     document's logits and the parameters' gradients its documents give run one at a time, from float64
-    (check 1), as `test_a_packed_row_computes_what_its_documents_compute_alone` holds every mixer."""
+    (check 1), as `test_a_packed_row_computes_what_its_documents_compute_alone` holds every mixer. Its 256
+    seeds took 91 s alone cold, 60 s of it the draws' arms and truth computing, on armada's CI CPU and 147 s
+    in train 1020's CI: CI draws them in map tasks of 64 (row 7851)."""
     fields, overrides = KIND_FIELDS["deepseek_v4"]
     total = sum(DOCUMENTS)
     model = tiny(mixer=mixers.build("deepseek_v4", **fields, **COMPRESSED[compressor]),
                  max_seq_len=max(128, total + PADDING), **overrides)
-    variables = model.init(jax.random.key(4), jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB))
+    variables = jax.jit(model.init)(jax.random.key(4), jax.random.randint(jax.random.key(3), (1, total), 0,
+                                                                          VOCAB))
     assert_packed_as_alone(model, variables, f"packed deepseek_v4 {compressor}",
                            SEEDS[f"deepseek_v4 {compressor}"])
 

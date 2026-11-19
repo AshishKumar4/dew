@@ -113,7 +113,8 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
     as it is; beside an arm
     run `as_given` (torch, NumPy, a program of its own), which it never traces, the Dew arm with the
     fusions, as users run it. A NumPy arm passes `as_given`, and the verdict holds."""
-    from reference_error import _arms, _Windowed, as_given, assert_as_exact, over_windows, without_ynn
+    from arm_forms import _arms
+    from reference_error import _Windowed, as_given, assert_as_exact, over_windows, without_ynn
 
     def dew(x):
         return jnp.asarray(x) * 2
@@ -167,7 +168,8 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     would compute in JAX); passed `as_given` it runs as given. A window loop of a given arm is
     classified by that arm, so its Dew partner compiles with the fusions as it does without windows.
     A paired sizing of one function against itself stays paired, its draws from SIZING_FROM on."""
-    from reference_error import _arms, as_given, assert_as_exact, over_windows, seeds_for
+    from arm_forms import _arms
+    from reference_error import as_given, assert_as_exact, over_windows, seeds_for
 
     from dew.parity import SIZING_FROM
 

@@ -23,6 +23,7 @@ from reference_error import (
     GateFailure,
     Inconclusive,
     as_given,
+    as_recorded,
     assert_as_exact,
     assert_moves,
     assert_same_artifact,
@@ -162,17 +163,18 @@ def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_
 def test_a_process_whose_xla_refuses_the_ynn_options_moves_no_site_onto_the_fusions(monkeypatch):
     """Where XLA:CPU refuses WITHOUT_YNN's options themselves, a site of two Dew paths raises before
     deciding (`_ynn_option_held`), so it moves onto the fusions and passes nowhere."""
+    import arm_forms
     import reference_error
 
-    reference_error._ynn_option_held.cache_clear()
-    monkeypatch.setattr(reference_error, "WITHOUT_YNN", {"xla_cpu_no_such_option": "none"})
+    arm_forms._ynn_option_held.cache_clear()
+    monkeypatch.setattr(arm_forms, "WITHOUT_YNN", {"xla_cpu_no_such_option": "none"})
     try:
         with pytest.raises(RuntimeError):
             assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention),
                             one_key_draw, "attention over one key, its options refused", seeds=16)
         assert not reference_error.SWITCHED
     finally:
-        reference_error._ynn_option_held.cache_clear()
+        arm_forms._ynn_option_held.cache_clear()
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
@@ -316,7 +318,7 @@ def test_a_row_both_arms_hold_exactly_is_not_carried_and_the_site_judges_as_befo
         x, w = a_product_draw(seed)
         return x.at[:4].set(0.0), w
 
-    draws = _drawn(jnp.matmul, jnp.matmul, zeroed_draw, range(2))
+    [draws] = _drawn(jnp.matmul, jnp.matmul, zeroed_draw, range(2))
     for rows, mine, theirs in (seed[0] for seed in draws.zero_rows):
         assert not np.any((mine == 0) & (theirs == 0)) and not np.isin(np.arange(4), rows).any()
     assert_as_exact(jnp.matmul, jnp.matmul, zeroed_draw, "rows held exactly", seeds=8)
@@ -545,7 +547,7 @@ def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
     """A reference compiled with compiler options of its own (a trainer step's, `as_a_step`) runs as
     given: the gate would nest it in its own jit, which a jit with options of its own refuses (row
     1800)."""
-    from reference_error import _arms
+    from arm_forms import _arms
 
     own = jax.jit(lambda x: {"y": x * 2}, compiler_options={"xla_cpu_enable_fast_math": False})
     def doubled(x):
@@ -569,7 +571,8 @@ def test_an_arm_compiled_outside_the_gates_policy_is_refused():
     as the gate would compile it. A plain jit is nested under the gate's own compile, whose options
     apply; a jit with options of its own refuses that nesting itself (row 1800). Every other arm kind
     runs: plain, as given, a window loop's."""
-    from reference_error import _arms, over_windows, without_ynn
+    from arm_forms import _arms
+    from reference_error import over_windows, without_ynn
 
     def doubled(x):
         return {"y": jnp.asarray(x) + jnp.asarray(x)}
@@ -626,7 +629,8 @@ def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm
     seam holding WITHOUT_YNN open (`compiled_with`), so a program it compiles through the seam
     (`dew.nn.kernels.options.program`) carries the option, and beside an arm `as_given` it runs as it
     is; the seam adds nothing once the arm returns, and a run's own XLA flag for an option wins."""
-    from reference_error import WITHOUT_YNN, _arms, as_given, dew_programs
+    from arm_forms import WITHOUT_YNN, _arms
+    from reference_error import as_given, dew_programs
 
     from dew.nn.kernels import options
 
@@ -663,7 +667,7 @@ def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
     from dew.parity import seeds_resolving
 
     count = seeds_for(_product, _draw, "product")
-    draws = _drawn(_product, _product, _draw, range(4 * count))
+    [draws] = _drawn(_product, _product, _draw, range(4 * count))
     assert seeds_resolving(draws.theirs, draws.names, "product") == count
     with pytest.raises(AssertionError):
         seeds_resolving(draws.theirs[:count], draws.names, "product", start=count)
@@ -1285,7 +1289,7 @@ def test_a_recording_judged_is_held_to_dews_own_run_of_the_same_weights(tmp_path
     `assert_as_exact_as_recorded`'s `judged`) is the arm check 1 judges, Dew's own run its reference, its
     seeds sized with the two in those places: a library that sums nearer float64 than Dew's run is on par,
     where Dew's run judged against it is not, and an export read one part in ten thousand off is over."""
-    from reference_runs import assert_as_exact_as_recorded
+    from recorded_runs import assert_as_exact_as_recorded
     from tool_support import load
 
     def draw(seed):
@@ -1493,7 +1497,7 @@ def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do
     def recorded(index, inputs):
         asked.append(int(index))
         return reference(index, inputs)
-    recorded.recorded, recorded.pilots = True, reference.pilots
+    as_recorded(recorded, reference.pilots)
 
     def dew(index, inputs):
         return reordered(inputs["x"], inputs["w"])
@@ -1607,8 +1611,7 @@ def _recorded_pairs(dew, reference, count: int, missing=()):
     def truth(seed):
         return {"y": np.zeros(64, np.float64)}
 
-    recorded.recorded = True
-    return recorded, recorded_dew, truth, asked
+    return as_recorded(recorded), recorded_dew, truth, asked
 
 
 def test_a_recorded_reference_with_pilots_sizes_paired_on_them_alone():

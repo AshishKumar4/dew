@@ -10,14 +10,16 @@ import dataclasses
 import functools
 import json
 from pathlib import Path
+from typing import Any
 
 import jax
 import numpy as np
 import torch
-from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, PreTrainedModel
 
 from dew._accuracy import distance
-from dew.interop import Pretrained
+from dew.interop import PretrainedDecoder
+from dew.interop.processors import Processor
 from dew.sampling.text import Sampling
 
 CONTINUATION = 3
@@ -65,9 +67,11 @@ class Runs:
     highest fp32 precision: each a run of a batch (`parity_batches`) to its logits."""
     processor: object
     model_type: str
-    reference_model: torch.nn.Module
+    reference_model: PreTrainedModel
     wide_model: torch.nn.Module
-    loaded: Pretrained
+    loaded: PretrainedDecoder
+    host: Processor
+    """Dew's host processor of the checkpoint (`Pretrained.processor`)."""
 
     def reference(self, batch) -> np.ndarray:
         with torch.no_grad():
@@ -87,17 +91,20 @@ class Runs:
 
     def dew(self, batch) -> np.ndarray:
         """Dew's logits of `batch`, its processor's host reading of it outside the compiled forward."""
-        inputs = self.loaded.processor.from_hf(dict(batch))
+        inputs = self.host.from_hf(dict(batch))
         return np.asarray(self.forward(self.loaded.variables, inputs.tokens, **inputs.kwargs()))
 
     def continued(self, batch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dew's greedy continuation of `batch` by CONTINUATION tokens, the reference's, and the reference's
         logits at each of its steps."""
+        # transformers types `generate`'s model as a protocol its own models meet only at runtime (their
+        # quantizer, set as they load), so it is called as the loaded model holds it.
+        model: Any = self.reference_model
         with torch.no_grad():
-            generated = self.reference_model.generate(
+            generated = model.generate(
                 **tensors(batch), max_new_tokens=CONTINUATION, do_sample=False, eos_token_id=None,
                 output_logits=True, return_dict_in_generate=True)
-        inputs = self.loaded.processor.from_hf(dict(batch))
+        inputs = self.host.from_hf(dict(batch))
         mine = self.loaded.text_generation()(inputs, CONTINUATION, key=jax.random.key(0),
                                              sampling=Sampling(temperature=0))
         return (np.asarray(mine.tokens)[:, -CONTINUATION:], generated.sequences.numpy()[:, -CONTINUATION:],
@@ -121,12 +128,14 @@ def checkpoint_runs(checkpoint, revision) -> Runs:
         wide = AutoModelForImageTextToText.from_config(
             config, dtype=torch.float64, attn_implementation='eager', experts_implementation='eager').eval()
         wide.load_state_dict(reference.state_dict())
-    loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=256,
-                             revision=revision)
+    loaded = PretrainedDecoder.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=256,
+                                    revision=revision)
+    if loaded.processor is None:
+        raise ValueError(f"{checkpoint} loads a decoder without its processor")
     language = loaded.model.language_model.clone(precision=jax.lax.Precision.HIGHEST)
     model = loaded.model.clone(language_model=language, precision=jax.lax.Precision.HIGHEST)
     return Runs(AutoProcessor.from_pretrained(checkpoint, revision=revision), config.model_type, reference,
-                wide, dataclasses.replace(loaded, model=model))
+                wide, dataclasses.replace(loaded, model=model), loaded.processor)
 
 
 def measure_checkpoint(checkpoint, output, revision) -> list[Measured]:

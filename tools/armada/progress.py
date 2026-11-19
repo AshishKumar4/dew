@@ -6,10 +6,14 @@ writes nothing outside a task."""
 
 import json
 import os
+import types
+from collections.abc import Callable
 from pathlib import Path
 
 PROGRESS = "progress.jsonl"
-"""The file of the tests a task passed, a JSON line each: its node id and its call's seconds."""
+"""The file of the tests a task passed, a JSON line each: its node id, its seconds (its setup's, call's and
+teardown's, as JUnit times a test) and, where it compiled a program the shared cache lacked over that time
+(tests/conftest.py's property `compiled`), `cold`."""
 SET_ASIDE = "DEW_SET_ASIDE"
 """What names the JSON list of the node ids a resumed attempt sets aside (ci.py's `tested`): exactly those,
 never a test whose id one of them begins, as pytest's --deselect, which matches by prefix, would (train
@@ -31,6 +35,7 @@ def pytest_collection_finish(session) -> None:
         session.config.hook.pytest_deselected(items=dropped)
 
 
+_set_up: dict[str, float] = {}
 _called: dict[str, float] = {}
 _session: dict[str, str | None] = {}
 """The task's own artifacts (ARMADA_ARTIFACTS), named once its session starts (`pytest_configure`)."""
@@ -48,11 +53,65 @@ def pytest_runtest_logreport(report) -> None:
     artifacts = _session.get("artifacts")
     if not artifacts:
         return
-    if report.when == "call" and report.passed:
-        _called[report.nodeid] = report.duration
+    if report.when == "setup" and report.passed:
+        _set_up[report.nodeid] = report.duration
+    elif report.when == "call" and report.passed:
+        _called[report.nodeid] = _set_up.pop(report.nodeid, 0.0) + report.duration
     elif report.when == "teardown" and report.nodeid in _called:
-        seconds = _called.pop(report.nodeid)
+        seconds = _called.pop(report.nodeid) + report.duration
         if report.passed:
+            cold = any(name == "compiled" and int(value) > 0 for name, value in report.user_properties)
             Path(artifacts).mkdir(parents=True, exist_ok=True)
             with (Path(artifacts) / PROGRESS).open("a") as progress:
-                progress.write(json.dumps({"node": report.nodeid, "seconds": seconds}) + "\n")
+                # The attempt's peak by then, which bounds this test (`task_peak`).
+                import host
+
+                peak = task_peak(host)
+                progress.write(json.dumps({"node": report.nodeid, "seconds": seconds,
+                                           **({"cold": True} if cold else {}),
+                                           **({"peak": peak} if peak is not None else {})}) + "\n")
+
+
+def task_peak(host: types.ModuleType) -> int | None:
+    """This task's resident peak in bytes so far: its cgroup's (cgroup v2's memory.peak, which every process
+    the task started counts in, a test's ranks with it), each of its tests' bound above (row 6003: a test's
+    four ranks peaked at 7.17 GiB, packed beside another on a medium), read by Dew's one cgroup reader
+    through `host` (tools/armada/host.py: src/dew/_cgroups.py, its root DEW_CGROUP_ROOT's where set),
+    which a task's pytest imports (tools/armada on its path) and ci.py loads. None where the task's cgroup
+    states no peak."""
+    reader = host.cgroups()
+    return reader.memory_peak(reader.own(host.cgroup_root()))
+
+
+
+def resumed(tests: list[str], owning: Callable[[str], str]) -> tuple[dict[str, float], set[str], int | None]:
+    """The tests of `tests` (each node's file as `owning` reads it) an earlier attempt of this task passed
+    before the fleet recalled it (armada keeps a recalled attempt's artifacts and hands them to the next as
+    ARMADA_RESUME, #4544), each with its seconds, as this plugin kept them, and those of them that ran
+    cold (`cold`), and the most memory those attempts had held by then (`peak`), which bounds them, as
+    this attempt's own cgroup did not run them; copied into this attempt's progress, so a second recall
+    keeps them too. Read by ci.py, which runs a task's pytest. None outside a resumed task."""
+    kept = Path(os.environ.get("ARMADA_RESUME", "/nonexistent")) / PROGRESS
+    if not kept.is_file():
+        return {}, set(), None
+    passed, cold, peaks = {}, set(), []
+    for line in kept.read_text().splitlines():
+        found = json.loads(line)
+        if owning(found["node"]) in tests:
+            passed[found["node"]] = float(found["seconds"])
+            if found.get("cold"):
+                cold.add(found["node"])
+            if found.get("peak") is not None:
+                peaks.append(int(found["peak"]))
+    peak = max(peaks, default=None)
+    artifacts = os.environ.get("ARMADA_ARTIFACTS")
+    if artifacts and passed:
+        Path(artifacts).mkdir(parents=True, exist_ok=True)
+        lines = ({"node": node, "seconds": seconds, **({"cold": True} if node in cold else {}),
+                  **({"peak": peak} if peak is not None else {})}
+                 for node, seconds in passed.items())
+        with (Path(artifacts) / PROGRESS).open("a") as carried:
+            carried.writelines(json.dumps(line) + "\n" for line in lines)
+    if passed:
+        print(f"resumed: {len(passed)} tests an earlier attempt passed set aside", flush=True)
+    return passed, cold, peak

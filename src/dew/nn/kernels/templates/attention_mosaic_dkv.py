@@ -25,6 +25,7 @@ from dew.nn.kernels.templates import (
     outputs,
     placed,
     rings,
+    stacked,
     stores,
     swizzling,
 )
@@ -529,26 +530,26 @@ def _grad_buffers(graded: list[Kind], shapes: list, batch: int, heads: int, quer
 def _graded(score_params: tuple, kinds: tuple, shares: tuple, shape: tuple, keys_padded: int, *,
             adds_vectors: bool) -> tuple[list[Kind], list[tuple], tuple[tuple[int, ...], ...]]:
     """The kinds of the hook gradients a dK/dV program of `shares` writes (`DKV_GRADS`; none for a later
-    share's), their buffers' shapes (`_grad_buffers`) and the groups of one shape (`mosaic.stacked_groups`),
+    share's), their buffers' shapes (`_grad_buffers`) and the groups of one shape (`stacked.groups`),
     for a call whose queries are `shape` `[B, Q, H, D]`."""
     graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
     graded_shapes = [param.shape for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
     buffers = _grad_buffers(graded, graded_shapes, shape[0], shape[2], shape[1], keys_padded,
                             adds_vectors=adds_vectors)
-    return graded, buffers, mosaic.stacked_groups(buffers)
+    return graded, buffers, stacked.groups(buffers)
 
 
 def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], groups: tuple, *, widths: bool, split: bool,
               fused: bool, after: bool) -> tuple:
     """The dK/dV program's refs by role: its nine inputs, its spans' and hook parameters' (`treedef` of
     `leaves`), a fused launch's dQ and the hook's key and tile gradients, each added into in place, a ref a
-    group of equal shapes (`_dkv_launched`, `mosaic.stacked_groups`), its dK and dV outputs, and its scoped
+    group of equal shapes (`_dkv_launched`, `stacked.groups`), its dK and dV outputs, and its scoped
     allocations (`_dkv_scoped`)."""
     inputs, refs = refs[:9], refs[9:]
     unflattened, refs = treedef.unflatten(refs[:leaves]), refs[leaves:]
     dq_ref, refs = (refs[0], refs[1:]) if fused else (None, refs)
     grad_refs, refs = refs[:len(groups)], refs[len(groups):]
-    views = mosaic.stacked_views(grad_refs, groups)
+    views = stacked.views(grad_refs, groups)
     dk_ref, dv_ref, *refs = refs
     keyed = tuple([ref for ref, kind in zip(views, graded, strict=True) if kind == wanted]
                   for wanted in DKV_GRADS)
@@ -790,7 +791,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                after_walks=tuple(after), **products)
         if summed is not None:
             first = 9 + len(leaves) + walk.fused
-            grads = mosaic.stacked_views(refs[first:first + len(groups)], groups)
+            grads = stacked.views(refs[first:first + len(groups)], groups)
             outputs = refs[first + len(groups):first + len(groups) + 2]
             _summed_stored(family, summed, _shared_views(family, outputs, grads, graded, block_k), consumers,
                            walk.interpret)
@@ -906,14 +907,14 @@ def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], 
     fused one's dQ before them, added into zeros too, one copy, or each consumer's own interpreted
     (`Family.added`). A key gradient where the launch's family adds no vector (`Family.adds_vectors`) its
     program's own place too, written, the shared rows summed after (`_grad_buffers`). The gradients of one
-    shape (`groups`) are one ref, a leading axis of them (`mosaic.stacked_zeros`, row 3180)."""
+    shape (`groups`) are one ref, a leading axis of them (`stacked.zeros`, row 3180)."""
     batch, queries, heads, _ = operands[0].shape
-    grads = mosaic.stacked_zeros(buffers, groups, *operands[:4])
+    grads = stacked.zeros(buffers, groups, *operands[:4])
     if not walk.fused:
         dk, dv = launch(*operands, *grads)
-        return dk, dv, *_keys_last(mosaic.stacked_read(grads, groups), graded)
+        return dk, dv, *_keys_last(stacked.read(grads, groups), graded)
     width = operands[0].shape[3]
     copies = walk.consumers if walk.interpret else 1
     dq = jax.new_ref(launches.filled((copies, batch, queries, heads, width), jnp.float32, *operands[:4]))
     dk, dv = launch(*operands, dq, *grads)
-    return mosaic.added_copies(dq), dk, dv
+    return stacked.added(dq), dk, dv

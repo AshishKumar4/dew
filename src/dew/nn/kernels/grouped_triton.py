@@ -204,13 +204,14 @@ class Gmm(_Triton):
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, joined: jax.Array | None = None, beside: tuple = (), *,
-             out_dtype: str,
+             scatter: jax.Array | None = None, joined: jax.Array | None = None, beside: tuple = (),
+             chained: tuple = (), *, out_dtype: str,
              trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: Tile, return_residuals: bool = False):
-        # A second matrix, joined rows, tables, matrices side by side: Mosaic GPU's (`tables`).
-        del paired, gather, scatter, joined, beside
+        # A second matrix, joined rows, tables, matrices side by side, chained products: Mosaic GPU's
+        # (`tables`).
+        del paired, gather, scatter, joined, beside, chained
         # Imported at first use: the kernels need jax's Pallas Triton backend,
         # which jax 0.11.2 deprecates, and importing a model must not load it.
         if dense:

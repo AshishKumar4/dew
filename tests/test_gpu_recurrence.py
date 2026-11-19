@@ -43,6 +43,7 @@ import kernel_matrix
 import numpy as np
 import pytest
 import test_fla_gdn as fla_gdn
+import test_lightning_template as lightning
 import test_mamba_ssd as mamba_ssd
 import test_recurrence_chunk as chunked
 import test_recurrence_mosaic as forward
@@ -359,7 +360,7 @@ def lightning_cells() -> list[Cell]:
     from simple_gla_support import fla_simple_gla
 
     return [Cell("lightning attention's fast forms on the template are as exact as fla",
-                 functools.partial(forward.lightning_fast_forms_are_as_exact_as, as_given(fla_simple_gla)),
+                 functools.partial(lightning.lightning_fast_forms_are_as_exact_as, as_given(fla_simple_gla)),
                  native={"launch": "lightning template"})]
 
 

@@ -131,9 +131,11 @@ __all__ = [
     "spread",
     "sqrt_or_zero",
     "stochastic_bf16",
+    "summed_once",
     "twice_scaled",
     "two_product",
     "two_sum",
+    "uncontracted",
     "weighted_total",
     "wide_cpu_arithmetic",
     "widened_reduction",
@@ -181,31 +183,33 @@ def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = Tr
 
 
 def activation_and_slope(gate, activation: str) -> tuple[jax.Array, jax.Array]:
-    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid'.
+    """An fp32 gate's `act(gate)` and its derivative, for 'silu' or 'sigmoid', its sigmoid and its slope the
+    one logistic's arithmetic (`logistic_and_slope`), as a kernel's body takes them; a gate differentiated by
+    JAX takes Dew's one logistic itself (`activations.gate_activation`), whose tangent is declared.
 
-    silu's derivative `s + g s (1 - s)`, with `s = sigmoid(g)`, cancels to
-    zero near g = -1.28; formed as the product rule forms it, `s + g (s (1 - s))`,
-    its worst element there is half `(g s)(1 - s) + s`'s, as XLA's is."""
-    sigmoid = jax.nn.sigmoid(gate)
-    slope = sigmoid * (1.0 - sigmoid)
+    silu's derivative `s + g s s(-g)`, with `s = sigmoid(g)`, cancels to
+    zero near g = -1.28; formed as the product rule forms it, `s + g (s s(-g))`,
+    its worst element there is half `(g s) s(-g) + s`'s, as XLA's is."""
+    sigmoid, slope = logistic_and_slope(gate)
     if activation == 'sigmoid':
         return sigmoid, slope
     return gate * sigmoid, sigmoid + gate * slope
 
 
 def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None = None,
-                 gate: jax.Array | None = None, activation: str = 'silu',
+                 gate: jax.Array | None = None,
                  rounded: Callable[[jax.Array], jax.Array] | None = None, weight_first: bool = False
                  ) -> jax.Array:
-    """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s,
-    or a kernel's own), times `weight`, times `activation(gate)` (`activation_and_slope`: Qwen3-Next's gated
-    norm), in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after;
-    with `weight_first`, the weight folded into the inverse before the rows (Flax's `nn.RMSNorm`,
-    `x * (inverse * weight)`). `rounded` rounds the normalized rows, before any weight multiplies them
-    (Llama's and Qwen3's cast first, `RMSNorm.scale_after_cast`; a norm computing in its input's dtype),
-    which a weight folded first has none of. The fused norm kernel, the recurrence's gated output norm, the
-    portable norm and the portable gated norm compute it alike, each keeping its own statistics, memory
-    schedule and derivative."""
+    """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s, or
+    a kernel's own), times `weight`, times the activated `gate` (Qwen3-Next's gated norm: a kernel's body
+    activates it by `activation_and_slope`, a gate JAX differentiates by `activations.GATE_ACTIVATIONS`),
+    in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after; with
+    `weight_first`, the weight folded into the inverse before the rows (Flax's `nn.RMSNorm`,
+    `x * (inverse * weight)`). `rounded` rounds the normalized rows, before any weight
+    multiplies them (Llama's and Qwen3's cast first, `RMSNorm.scale_after_cast`; a norm computing in its
+    input's dtype), which a weight folded first has none of. The fused norm kernel, the recurrence's gated
+    output norm, the portable norm and the portable gated norm compute it alike, each keeping its own
+    statistics, memory schedule and derivative."""
     if weight is not None and weight_first:
         if rounded is not None:
             raise ValueError("a weight folded into the inverse leaves no normalized rows to round first")
@@ -214,7 +218,7 @@ def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None =
         y = x * inverse if rounded is None else rounded(x * inverse)
         if weight is not None:
             y = y * weight
-    return y if gate is None else y * activation_and_slope(gate, activation)[0]
+    return y if gate is None else y * gate
 
 
 def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Array, jax.Array]:
@@ -398,7 +402,12 @@ def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
 FP32_PRODUCTS = frozenset({"HIGHEST", "F32_F32_F32"})
 """The precision names that declare fp32 operands' products in IEEE fp32 (`precision_names`): `highest` and
 the F32_F32_F32 preset, which `jax_default_matmul_precision` spells 'highest', 'float32' or the preset's
-name."""
+name. On a GPU a program holding such a dot compiles its GEMMs on cuBLAS
+(`dew.nn.kernels.templates.report.targeted`, reading the program's own dots, an operation's precision as
+a run's), whose sum is the one a float32 reference is computed with: XLA's Triton GEMM sums farther from
+float64 (rows 5026/5028/5029). That is the price of 'highest' meeting its reference, a wrong result
+weighed against a slower one: a decode-sized float32 forward is slower on cuBLAS, a training step and a long
+forward are not (M-IG-13's A100 and GH200 measures)."""
 
 
 def declares_fp32_products(precision: jax.lax.PrecisionLike) -> bool:
@@ -502,34 +511,21 @@ def accurate_exp(x, *, base2: bool = False) -> jax.Array:
     return _exp(base2, x.astype(jnp.float32)).astype(x.dtype)
 
 
-def _logistic(x) -> jax.Array:
+def logistic_value(x) -> jax.Array:
+    """`1 / (1 + e^-x)` in at least float32, its exp accurate (`accurate_exp`) and a true division: the one
+    logistic's arithmetic, which `activations.logistic` declares its tangent over and a kernel's body, which
+    differentiates nothing, calls as it is (`activation_and_slope`, the recurrence step's and conv's). JAX's
+    derivative of it is no number where `e^-x` overflows (below x near -88 in fp32): what JAX differentiates
+    takes `activations.logistic`."""
     work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
     return 1.0 / (1.0 + accurate_exp(-work))
 
 
-def _logistic_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
-    """`logistic`'s value and tangent `s (1 - s)`, each order finite where `e^-x` overflows (`s` zero)."""
-    (x,), (tangent,) = primals, tangents
-    s = logistic(x)
-    return s, s * (1.0 - s) * tangent.astype(s.dtype)
-
-
-logistic = contracted("test_silu_holds_every_order")(declared_tangent(Protected(), _logistic, _logistic_jvp))
-"""`1 / (1 + e^-x)` in at least float32, its exp accurate (`accurate_exp`) and a true division: a backend's
-logistic is no part of it (`silu`'s)."""
-
-
-def silu(x) -> jax.Array:
-    """`x / (1 + e^-x)` as `x` times its `logistic` (its exp accurate and a true division), in at least
-    float32 and rounded once, its derivative through the logistic's declared tangent: a backend's logistic is
-    no part of it, a v5e's approximate even at HIGHEST, which held Mamba-2's layer at 3.5 times its CPU
-    float32 through its conv's and its gate's silus, where this holds it at 0.89 times, its training step
-    unchanged (row 7062, M-JS-136). A gated MLP's silu stays JAX's (`activations.silu`): on a v5e this one
-    took a SwiGLU MLP's bf16 training step 2.1% longer, where JAX's held its fp32 output within its CPU
-    float32's distance from float64 (4.9e-7 against 1.05e-6); on a GH200 the two are the same (M-JS-137)."""
-    given = jnp.asarray(x)
-    x = given.astype(at_least_fp32(given.dtype))
-    return (x * logistic(x)).astype(given.dtype)
+def logistic_and_slope(x) -> tuple[jax.Array, jax.Array]:
+    """The one logistic's value `s(x)` and derivative `s(x) s(-x)` (`logistic_value`), as a kernel's body
+    differentiates it by hand, `activations.logistic`'s declared tangent alike: `s (1 - s)` reads the rounded
+    `s(x)`, one past x near 17 in fp32, its derivative then zero where float64's is 4.1e-8."""
+    return logistic_value(x), logistic_value(x) * logistic_value(-jnp.asarray(x))
 
 
 def softplus_series(x) -> jax.Array:
@@ -541,7 +537,8 @@ def softplus_series(x) -> jax.Array:
     normal wherever `y` is, the series in `s^2` alone: `s` itself, half of `y` near fp32's least normal
     (`x` near -87), is subnormal, which a target flushing them (a TPU's, a GPU's) made zero, and the softplus
     with it, where `y` is the answer; `s^2` underflowing leaves the series its first term, one. Formed in at
-    least float32 and rounded once to `x`'s dtype; its derivative the logistic, as JAX's."""
+    least float32 and rounded once to `x`'s dtype; its derivative Dew's one logistic
+    (`activations.logistic`)."""
     given = jnp.asarray(x)
     x = given.astype(at_least_fp32(given.dtype))
     y = accurate_exp(-jnp.abs(x))
@@ -564,11 +561,13 @@ def _series_terms(dtype) -> int:
 
 
 def _softplus_jvp(primals, tangents) -> tuple[jax.Array, jax.Array]:
-    """`softplus`'s value and tangent: its derivative the logistic, as JAX's softplus's, in at least float32
-    and rounded once to its input's dtype."""
+    """`softplus`'s value and tangent: its derivative Dew's one logistic (`activations.logistic`), in at
+    least float32 and rounded once to its input's dtype."""
+    from dew.nn.activations import logistic
+
     (x,), (tangent,) = primals, tangents
     work = jnp.asarray(x).astype(at_least_fp32(jnp.asarray(x).dtype))
-    return softplus(x), (jax.nn.sigmoid(work) * tangent.astype(work.dtype)).astype(tangent.dtype)
+    return softplus(x), (logistic(work) * tangent.astype(work.dtype)).astype(tangent.dtype)
 
 
 softplus = contracted("test_softplus_holds_every_order")(
@@ -1304,7 +1303,16 @@ def _protected(transform: Callable) -> Callable:
 
 @_protected
 def two_sum(left, right):
-    """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum)."""
+    """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum). Each operand is read as
+    one value (`uncontracted`): a compiler that fused the multiply making an operand into the sum (an FMA,
+    XLA's CPU and GPU contract one) would add its exact product where the steps after read its rounded
+    one, counting that rounding twice."""
+    return _two_sum(*uncontracted(left, right))
+
+
+def _two_sum(left, right):
+    """`two_sum`'s arithmetic over operands no multiply makes in the same fusion: a compensated pair's
+    halves, made by additions alone, and values read as one value each (`uncontracted`)."""
     total = left + right
     part = total - left
     return total, (left - (total - part)) + (right - part)
@@ -1328,6 +1336,28 @@ def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
     normalized = jnp.where(biased > 0, fraction, (fraction << up) & ((1 << width) - 1))
     exponent = jnp.where(biased > 0, biased - bias, limits.minexp - up)
     return sign, biased, fraction, normalized, exponent
+
+
+def uncontracted(*values):
+    """`values` each read as the one value it is, never fused into the arithmetic that reads it: an error-free
+    transform reads each operand more than once and holds only where every read sees the same rounded value,
+    which a compiler's contraction of a multiply into an add (an FMA, XLA's CPU and GPU, Triton's) breaks by
+    reading the exact product at one place and the rounded one at another (a two_product's product added in a
+    compensated sum, its residual then counted twice). An optimization barrier, which no fusion crosses, on
+    the value where it is made, so every reader sees the one rounded value (`two_sum`'s operands,
+    `two_product`'s product); a caller whose plain float32 arithmetic leaned on the contractions a barrier
+    splits around it takes its sum compensated (`summed_once`, row 7979).
+
+    In a Pallas TPU kernel's body (`launches.interpreting` False, a launch compiled for a TPU,
+    `generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier (post108 to
+    post110, whose attention forms reach `two_product` and `two_sum` in a kernel body, `natural_exp` and
+    `natural_carried`), which the fork's post111 lowers (row 7954 retires this branch). XLA's TPU programs,
+    and an interpreted kernel's body, which lowers to them, keep the barrier."""
+    from dew.nn.kernels.generation import backend
+    from dew.nn.kernels.launches import interpreting
+
+    in_tpu_kernel = interpreting() is False and backend() == "tpu"
+    return values if in_tpu_kernel else jax.lax.optimization_barrier(values)
 
 
 def binade_of(x: jax.Array) -> jax.Array:
@@ -1381,14 +1411,34 @@ def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
 
 
+def _split_bits(dtype) -> tuple[type, int, int]:
+    """A float's significand split for `two_product`'s `bit_split`: its unsigned bits' type, the mask keeping
+    its high part and the low bits masked, `p - floor(p / 2)` of its `p`, so its high part holds
+    `floor(p / 2)` bits. An even `p`'s truncated remainder holds the other half (fp32's 12, bfloat16's 4); an
+    odd `p`'s would hold one bit more (float64's 27, float16's 6), its low parts' product past `p` bits, so
+    the cut rounds to nearest there (`_odd`), its remainder signed and at most half the high part's last
+    bit: every product of two parts exact (Dekker's)."""
+    limits = jnp.finfo(dtype)
+    unsigned = np.dtype(f'uint{limits.bits}').type
+    low = (limits.nmant + 2) // 2
+    return unsigned, ~((1 << low) - 1) & np.iinfo(unsigned).max, low
+
+
+def _odd(dtype) -> bool:
+    """Whether a float's significand holds an odd count of bits (`_split_bits`' rounded cut)."""
+    return (jnp.finfo(dtype).nmant + 1) % 2 == 1
+
+
 @_protected
 def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
                 rounding: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """Dekker's rounded product and its residual, with a Veltkamp significand split.
 
-    Guidance keeps the multiply split, which also supports float64. `bit_split`
-    truncates fp32 significands instead, avoiding splitter overflow in norm
-    interpretation and quantizer division; near underflow the splits differ.
+    Guidance keeps the multiply split. `bit_split` truncates the significands
+    instead (`_split_bits`: a float's low half of its bits masked, fp32's 12,
+    float64's 27, a 16-bit float's), with no splitter to overflow: the multiply
+    split's `2^(p/2) + 1` overflowed past 2^115 in fp32 and 2^996 in float64
+    (base reviews 9bc4326dd F1, 1fe546a10 F1); near underflow the splits differ.
     `subtract` keeps division's subtractive residual order and its signed zeros.
     Norm interpretation passes `optimization_barrier` as `rounding` to keep each
     product and residual step separate; the other callers allow fusion.
@@ -1402,20 +1452,47 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         if bit_split and isinstance(value, np.generic | np.ndarray):
             # A constant (a kernel's static factor) splits where it is known, on the host.
             constant = np.asarray(value, np.float32)
-            high = (constant.view(np.uint32) & np.uint32(0xfffff000)).view(np.float32)
+            unsigned, mask, _ = _split_bits(np.float32)
+            high = (constant.view(unsigned) & unsigned(mask)).view(np.float32)
             return jnp.asarray(high), jnp.asarray(constant - high)
+        # The value read as one (`uncontracted`): its split reads it twice (its high part from its bits or a
+        # scaled copy, then `value - high`), which a multiply that made it, contracted into the subtraction,
+        # would read exactly at one and rounded at the other, a spurious low part.
+        (value,) = uncontracted(value)
         if bit_split:
-            bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
-            high = jax.lax.bitcast_convert_type(bits, jnp.float32)
+            unsigned, mask, low = _split_bits(value.dtype)
+            mask = np.array(mask, unsigned)
+            bits = jax.lax.bitcast_convert_type(value, unsigned)
+            if _odd(value.dtype):
+                # Half the cut's last bit added to the magnitude's bits: the cut rounds to nearest.
+                bits = bits + np.array(1 << (low - 1), unsigned)
+            high = jax.lax.bitcast_convert_type(bits & mask, value.dtype)
         else:
             splitter = (1 << 27) + 1 if value.dtype == jnp.float64 else (1 << 12) + 1
             scaled = value * splitter
             high = scaled - (scaled - value)
         return high, rounded(value - high)
 
+    scale = None
+    if bit_split and _odd(jnp.result_type(left, right)):
+        # A rounded cut of the top binade's last values carries past the largest float, and two cuts
+        # rounded up carry a product in the top binade past it ((2 - 2^-52) 2^511 squared, the head inf):
+        # such an operand, and the larger of such a product's, is halved first, its product and residual
+        # doubled back after (each exact, a power of two; train 1018's review F1).
+        top = 2.0 ** (jnp.finfo(jnp.result_type(left, right)).maxexp - 1)
+        large = jnp.abs(left * right) >= top
+        larger = jnp.abs(left) >= jnp.abs(right)
+        halves = [(jnp.abs(left) >= top) | (large & larger), (jnp.abs(right) >= top) | (large & ~larger)]
+        left, right = (jnp.where(half, operand * 0.5, operand)
+                       for operand, half in zip((left, right), halves, strict=True))
+        scale = jnp.where(halves[0], 2.0, 1.0) * jnp.where(halves[1], 2.0, 1.0)
     lh, ll = split(left)
     rh, rl = split(right)
-    product = rounded(left * right)
+    # The product read as one value (`uncontracted`) by the residual's steps and by its caller alike: a
+    # compiler that took its multiply into the step reading it (`product - head`, a caller's `n - product`)
+    # would read the exact product there and the rounded one elsewhere, the residual then the product's
+    # rounding where a caller adds it to the rounded product.
+    (product,) = uncontracted(rounded(left * right))
     head = rounded(lh * rh)
     lost = rounded(product - head if subtract else head - product)
     cross = ((ll, rh), (lh, rl)) if subtract else ((lh, rl), (ll, rh))
@@ -1423,7 +1500,8 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         term = rounded(first * second)
         lost = rounded(lost - term if subtract else lost + term)
     tail = rounded(ll * rl)
-    return product, rounded(tail - lost if subtract else lost + tail)
+    residual = rounded(tail - lost if subtract else lost + tail)
+    return (product, residual) if scale is None else (product * scale, residual * scale)
 
 
 def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
@@ -1639,76 +1717,280 @@ def _binades(x: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
     """The sum of `terms` in float32 or float64 (their widest, at least float32), each the broadcast product
-    of its factors, summed over `axis` of each
-    product too where given (kept): every product formed as its factors' significands' (each below two)
-    times a power of two, aligned to the largest's binade before the sum and scaled back after in steps each
-    within float32's normal exponents, so a sum in range is its value though its terms leave float32's
-    range: entry writes of keys of +-2^60 and values of 2^-20 under a weight of 2^100, each term 2^140 and
-    their sum zero, where summed as formed it was inf - inf, NaN (base review ead11c83a F1). A product a
-    term at a time (`twice_scaled`) holds each term's range, not a sum's. Its error bound: the result is the
-    plain float32 sum's rounding of the exactly scaled terms (each product's significands rounded twice),
-    `(n + 2) 2^-24` of the terms' absolute sum over `n` terms, and a dropped term lies more than 2^126 below
-    the largest, under that bound. Its tangent is its terms' own, each factor's direction times its term's
-    other factors, summed as a plain sum (`_aligned_tangent`): its bits carry none, so differentiated as
-    formed every factor's was zero. Its tangents and gradients carry a plain product's range, not its
-    value's: a forked call's gradient at fp32's edge can still overflow there, which a kernel's own adjoint
-    summing aligned (`ssd`'s TPU forked scan) does not. Elementwise and over a 2-D array's axes, so a Pallas
-    TPU kernel forms it in place."""
-    shape = tuple(len(term) for term in terms)
+    of its factors, summed over `axis` of each product too where given (kept): every product formed as its
+    factors' significands' (each below two) times a power of two, aligned to its band's largest binade
+    before the sum and scaled back after in steps each within float32's normal exponents, so a sum in range
+    is its value though its terms leave float32's range: entry writes of keys of +-2^60 and values of 2^-20
+    under a weight of 2^100, each term 2^140 and their sum zero, where summed as formed it was inf - inf,
+    NaN (base review ead11c83a F1). A product a term at a time (`twice_scaled`) holds each term's range, not
+    a sum's. Summed band by band (`_banded`), each band's products within float32's exponent range of its
+    largest and the next band's those below it, so terms that cancel leave the ones far below them: aligned
+    to the largest alone, a unit below two cancelling terms of 2^127 was dropped before they cancelled, zero
+    (base review 224fcf53a F1). Its error bound is Sum2's (Ogita, Rump and Oishi) over the products as
+    formed (each product's significands rounded twice): their twice-precise sum rounded once, `u |s| + g^2
+    sum |t|` for `u` 2^-24 and `g = n u / (1 - n u)` over `n` terms, a product dropped only below the dtype's
+    least subnormal; so terms cancelling past twice float32's precision (a condition number past 2^48) are
+    not summed exactly (Main's ruling on base review f5e6e678d F1, 2^80 + 2^50 + 1 - 2^50 - 1 - 2^80). Its
+    tangent is its terms' own, each factor's direction times its term's other factors, and each factor's
+    gradient the cotangent times its terms' other factors, each summed aligned as its value is
+    (`_aligned_directions`): its bits carry none, so differentiated as formed every factor's was zero, and
+    summed plainly a cancelling entry write's terms of 2^160 were inf - inf (row 8501). A factor several terms
+    share (one array: an entry write's weight) is one factor, its gradient one aligned sum over them.
+    Elementwise and over a 2-D array's axes, so a Pallas TPU kernel forms it in place."""
+    return _aligned_terms(terms, ((axis, None),) * len(terms))
+
+
+def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Array:
+    """`aligned_sum` of `terms`, `spec` each term's `(axis, laid)`: its product summed over `axis` (kept;
+    none where None), then, where `laid` gives `(held, shape)`, broadcast to `held` and reshaped to `shape`
+    (a gradient's term in its factor's shape, `_aligned_directions`), the value these summed."""
     dtype = jnp.result_type(jnp.float32, *(factor for term in terms for factor in term))
-    return _aligned(shape, axis, *(jnp.asarray(factor, dtype) for term in terms for factor in term))
+    # Each factor once, by identity: a shared factor's gradient sums its terms' together, aligned.
+    factors, places, shape = [], {}, []
+    for term in terms:
+        indices = []
+        for factor in term:
+            if id(factor) not in places:
+                places[id(factor)] = len(factors)
+                factors.append(jnp.asarray(factor, dtype))
+            indices.append(places[id(factor)])
+        shape.append(tuple(indices))
+    return _aligned(tuple(shape), tuple(spec), *factors)
 
 
-def _regrouped(shape: tuple[int, ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
-    """`aligned_sum`'s terms from their factors in a row, `shape` each term's count."""
-    ends = np.cumsum(shape)
-    return [tuple(flat[end - count:end]) for count, end in zip(shape, ends, strict=True)]
+def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
+    """`aligned_sum`'s terms from its factors, `shape` each term's factors' places among them."""
+    return [tuple(flat[at] for at in term) for term in shape]
 
 
-def _aligned_value(shape: tuple[int, ...], axis, *flat: jax.Array) -> jax.Array:
-    """`aligned_sum` of its terms' factors in a row (`_regrouped`)."""
-    products = []
-    for term in _regrouped(shape, flat):
+def _aligned_value(shape: tuple[tuple[int, ...], ...], spec: tuple, *flat: jax.Array) -> jax.Array:
+    """`_aligned_terms` of its terms' factors in a row (`_regrouped`): held scaled (`_scaled_sum`), then
+    scaled back once."""
+    dtype, factors = flat[0].dtype, max(map(len, shape))
+    return _raised(*_scaled_sum(_regrouped(shape, flat), spec, dtype), dtype, factors)
+
+
+def _scaled_sum(terms, spec, dtype) -> tuple[jax.Array, jax.Array]:
+    """The aligned sum of `terms` (each its factors) held scaled, its sum and that sum's binade: each term's
+    product (its factors' significands times a power of two) summed over `axis` in its own shape band by
+    band (`_banded`), every band's pair at its binade, then all of them summed band by band (`_merged`). A
+    term reduced against a shared top broadcast to the value's shape was laid along another term's axis
+    (base review db30f3e80 F2)."""
+    factors, shaped = max(map(len, terms)), {}
+    for term, (axis, laid) in zip(terms, spec, strict=True):
         significand, exponent = _binades(term[0])
         for factor in term[1:]:
             more, power = _binades(factor)
             significand, exponent = significand * more, exponent + power
-        products.append((significand, exponent))
+        shaped.setdefault((significand.shape, axis, laid), []).append((significand, exponent))
+    totals = []
+    # The products of one shape and spec banded together, each reduced in that shape, then laid.
+    for (_, axis, laid), products in shaped.items():
+        parts = products if axis is None else [
+            (part, power + top) for pair, top in _banded(products, axis, dtype, factors)
+            for part, power in map(_binades, pair)]
+        totals.extend(parts if laid is None else [
+            tuple(jnp.broadcast_to(x, laid[0]).reshape(laid[1]) for x in part) for part in parts])
+    return _merged(totals, dtype, factors)
 
-    def reduced(x, op):
-        return x if axis is None else op(x, axis=axis, keepdims=True)
 
-    dtype = flat[0].dtype
+def _merged(totals, dtype, factors: int) -> tuple[jax.Array, jax.Array]:
+    """`aligned_sum`'s bands' pairs (`totals`, each part a significand and binary exponent) summed: the
+    largest band of them (`_band`) summed as a pair, which joins those it left in the next, so a lower
+    band's total stays until the higher ones cancel (aligned at once, 2^-100 was dropped before 2^25 and
+    -2^25 cancelled, base review f5e6e678d F1), as many bands as `_banded` spans (each one at least a band
+    below the one before, or its pair joining the next); the sum rounded once and its binade."""
+    held = [significand != 0 for significand, _ in totals]
+    pair, top, taken = _band(totals, held, None, dtype)
+    for _ in range(min(len(totals), _bands(dtype, factors)) - 1):
+        held = [kept & ~took for kept, took in zip(held, taken[-len(totals):], strict=True)]
+        carried = [(significand, exponent + top) for significand, exponent in map(_binades, pair)]
+        pair, top, taken = _band(carried + totals, [significand != 0 for significand, _ in carried] + held,
+                                 None, dtype)
+    return pair[0] + pair[1], top
+
+
+def _band_width(dtype) -> int:
+    """The binades an `aligned_sum` band spans below its largest product: a significand's every bit then
+    lies at or above the dtype's least normal once scaled, so no sum within the band is subnormal, which a
+    process flushing subnormals (XLA's CPU) would zero (102 for float32)."""
+    limits = jnp.finfo(dtype)
+    return -limits.minexp - limits.nmant - 1
+
+
+def _kept_sum(pairs, axis) -> tuple[jax.Array, jax.Array]:
+    """The sum of `(high, low)` pairs, each over `axis` first where given (kept), as a pair: each addition's
+    rounding kept in the low part (`two_sum`), an axis summed in halves (`_halved_over`), so the pair rounded
+    once is the sum's twice-precise value rounded (Ogita, Rump and Oishi's Sum2): a band's sum rounded alone
+    lost what a lower band's cancelled, -2^25 - 2 tied to -2^25 beside 2^25 (base review 644ef5535 F1)."""
+    (high, low), *rest = (_halved_over(pair, axis) for pair in pairs)
+    for part_high, part_low in rest:
+        high, dropped = two_sum(high, part_high)
+        low = low + part_low + dropped
+    return high, low
+
+
+def _halved_over(pair, axis) -> tuple[jax.Array, jax.Array]:
+    """A `(high, low)` pair summed over `axis` (kept; none where None), each addition's rounding kept in the
+    low part: one XLA reduction of pairs (`_renormalized`), which partitions as any reduction does, so an
+    axis a mesh shards is summed a shard at a time and then across (sliced in halves, its shards split at
+    a size their count does not divide, base review 9e56c760b F1), an empty axis its identity; in a launch's
+    body (`launches.interpreting` not None), compiled or interpreted alike, in halves (`two_sum`),
+    elementwise and slices alone, which a Pallas TPU kernel forms (base review 8d59803fd F3)."""
+    from dew.nn.kernels.launches import interpreting
+
+    high, low = pair
+    axes = () if axis is None else tuple(sorted({int(a) % high.ndim for a in np.atleast_1d(axis)}))
+    if axes and interpreting() is None:
+        zero = jnp.zeros((), high.dtype)
+        high, low = jax.lax.reduce((high, low), (zero, zero), _renormalized, axes)
+        return jnp.expand_dims(high, axes), jnp.expand_dims(low, axes)
+    for along in axes:
+        if high.shape[along] == 0:
+            high, low = (jnp.zeros((*x.shape[:along], 1, *x.shape[along + 1:]), x.dtype) for x in (high, low))
+        while high.shape[along] > 1:
+            size, half = high.shape[along], high.shape[along] // 2
+            first, second = ([jax.lax.slice_in_dim(x, start, start + half, axis=along) for x in (high, low)]
+                             for start in (0, half))
+            summed, dropped = two_sum(first[0], second[0])
+            halves = (summed, first[1] + second[1] + dropped)
+            # An odd size's last element waits for the next halving; an even size leaves no tail, whose empty
+            # slice Mosaic refuses (a vector of no rows, base review 68c63603f F1).
+            high, low = halves if size % 2 == 0 else (
+                jnp.concatenate([part, jax.lax.slice_in_dim(x, 2 * half, size, axis=along)], axis=along)
+                for part, x in zip(halves, (high, low), strict=True))
+    return high, low
+
+
+def _band(products, held, axis, dtype):
+    """One band of `aligned_sum`'s `products` (each a significand and binary exponent): of those `held`, each
+    within `_band_width` binades of their largest's (`top`, per element of the value reduced over `axis`,
+    zero where none is held) scaled to it and summed (`_kept_sum`, over `axis` too); returns the sum's pair,
+    `top` and which products it took."""
+    width = _band_width(dtype)
+    top = functools.reduce(jnp.maximum, [
+        jnp.where(kept, exponent, -jnp.inf) if axis is None
+        else jnp.max(jnp.where(kept, exponent, -jnp.inf), axis=axis, keepdims=True, initial=-jnp.inf)
+        for kept, (_, exponent) in zip(held, products, strict=True)])
+    top = jnp.where(jnp.isfinite(top), top, 0.0)
+    taken = [kept & (exponent - top >= -width) for kept, (_, exponent) in zip(held, products, strict=True)]
+    scaled = [jnp.where(took, significand * _power_of_two(jnp.clip(exponent - top, -width, 0.0), dtype), 0.0)
+              for took, (significand, exponent) in zip(taken, products, strict=True)]
+    return _kept_sum([(x, jnp.zeros_like(x)) for x in scaled], axis), top, taken
+
+
+def _banded(products, axis, dtype, factors: int) -> list[tuple[tuple[jax.Array, jax.Array], jax.Array]]:
+    """`aligned_sum`'s products summed band by band (`_band`), each band over those the bands above it left:
+    as many bands as span the largest binade a product of `factors` factors reaches down to below the dtype's
+    least subnormal, so a band whose products cancel leaves the next band's sum, no term dropped beneath it;
+    each band's sum's pair and its top."""
+    held = [significand != 0 for significand, _ in products]
+    bands = []
+    for _ in range(_bands(dtype, factors)):
+        pair, top, taken = _band(products, held, axis, dtype)
+        bands.append((pair, top))
+        held = [kept & ~took for kept, took in zip(held, taken, strict=True)]
+    return bands
+
+
+def _bands(dtype, factors: int) -> int:
+    """The bands that span the largest binade a product of `factors` factors reaches down to below the
+    dtype's least subnormal, each band's top more than its width below the one before's."""
+    limits = jnp.finfo(dtype)
+    span = factors * limits.maxexp - (limits.minexp - limits.nmant - 1)
+    return -(-span // (_band_width(dtype) + 1))
+
+
+def _raised(total, top, dtype, factors: int) -> jax.Array:
+    """`total 2^top` for `top` the binade of a product of up to `factors` factors, by powers of two each
+    within the dtype's normal exponents, as many as reach its largest binade and its least subnormal's."""
     limits = jnp.finfo(dtype)
     least, most = limits.minexp, limits.maxexp - 1
-    # The largest term's binade, a sum of no nonzero term's zero: no term then aligned past it.
-    top = functools.reduce(jnp.maximum, [reduced(jnp.where(significand != 0, exponent, -jnp.inf), jnp.max)
-                                         for significand, exponent in products])
-    top = jnp.where(jnp.isfinite(top), top, 0.0)
-    # Each term's shift to the largest's binade, at most none; one past the normal exponents dropped.
-    total = sum(reduced(jnp.where(
-        (significand != 0) & (exponent - top >= least),
-        significand * _power_of_two(jnp.clip(exponent - top, least, 0.0), dtype), 0.0), jnp.sum)
-        for significand, exponent in products)
-    first = jnp.clip(top, least, most)
-    second = jnp.clip(top - first, least, most)
-    third = jnp.clip(top - first - second, least, most)
-    return (total * _power_of_two(first, dtype) * _power_of_two(second, dtype)
-            * _power_of_two(third, dtype))
+    reach = max(-(-factors * limits.maxexp // most), -(-factors * (limits.nmant - least) // -least))
+    for _ in range(reach):
+        step = jnp.clip(top, least, most)
+        total, top = total * _power_of_two(step, dtype), top - step
+    return total
 
 
-def _aligned_tangent(shape: tuple[int, ...], axis, primals, tangents):
-    """`aligned_sum`'s value and tangent: each factor's direction times its term's other factors, every
-    term's summed (over `axis` too where given)."""
-    terms, moved = _regrouped(shape, primals), _regrouped(shape, tangents)
-    # Each term's direction reduced over the axis before the terms add, as the value's are: summed after,
-    # a term broadcast across the axis counted once a row (base review 675f2c056 F1).
-    directions = [functools.reduce(jnp.multiply, (*term[:at], direction, *term[at + 1:]))
-                  for term, directions in zip(terms, moved, strict=True)
-                  for at, direction in enumerate(directions)]
-    if axis is not None:
-        directions = [jnp.sum(direction, axis=axis, keepdims=True) for direction in directions]
-    return _aligned_value(shape, axis, *primals), sum(directions[1:], directions[0])
+def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents):
+    """`_aligned_terms`' value and tangent (`_aligned_directions`), the value the declared sum's (`_aligned`)
+    so an outer order takes its tangent: formed from bits, which carry none, a second order lost its loss's
+    curvature, zero for `sum((a c)^2)` along `a` where `2 c^2` (base review d2d45bd6f F2)."""
+    value = _aligned(shape, spec, *primals)
+    return value, _aligned_directions(shape, spec, primals, tangents, value)
+
+
+def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.Array) -> tuple:
+    """`aligned_sum`'s cotangent of one term's factor at `spot` as products and that factor's shape in their
+    space: summed over the axes the shape is one along, then broadcast to it. The term's product reduced
+    over `axis` (its own axes) and broadcast into the value, transposed in reverse: the value's broadcast
+    summed, each of the reduction's elements taking the cotangent, the factor's broadcast summed, as one sum
+    of the cotangent times the term's other factors in a space holding the value's axes and, beside each
+    reduced one, the product's own (row 8501; mixed ranks reduced against another term's axis, base review
+    f5e6e678d F2)."""
+    rank = max(np.ndim(factor) for factor in term)
+    reduced = set() if axis is None else {int(a) % rank for a in np.atleast_1d(axis)}
+    lead = cotangent.ndim - rank
+
+    def laid(x):
+        # A factor in the space: its reduced axes beside the value's, which it is broadcast along.
+        x = jnp.reshape(x, (1,) * (rank - np.ndim(x)) + np.shape(x))
+        return x.reshape((1,) * lead + tuple(d for k, size in enumerate(x.shape)
+                                             for d in ((1, size) if k in reduced else (size,))))
+
+    spread = cotangent.reshape(cotangent.shape[:lead] + tuple(
+        d for k, size in enumerate(cotangent.shape[lead:]) for d in ((size, 1) if k in reduced else (size,))))
+    products = (spread, *(laid(factor) for other, factor in enumerate(term) if other != spot))
+    return products, laid(term[spot]).shape
+
+
+def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents, value):
+    """`aligned_sum`'s tangent, the linear map of its factors' `tangents` it is (`generation.linear_map`):
+    each factor's direction in its place in each of its terms, every one summed aligned (over `axis` too
+    where given), and its transpose each factor's cotangent the aligned sum, over the terms it is in and the
+    axes it is broadcast across, of the cotangent times its terms' other factors, so neither leaves float32's
+    range where its sum is in it (row 8501)."""
+    from dew.nn.kernels import generation
+
+    def applied(factors, directions):
+        # A place's terms side by side (the first factor's direction in every term, then the second's...),
+        # so terms that cancel across a shared factor (an entry write's ranks) meet before smaller ones.
+        placed = [(spot, index) for spot in range(max(map(len, shape)))
+                  for index, term in enumerate(shape) if spot < len(term)]
+        moved = [(*(factors[at] for at in shape[index][:spot]), directions[shape[index][spot]],
+                  *(factors[at] for at in shape[index][spot + 1:])) for spot, index in placed]
+        return _aligned_terms(moved, tuple(spec[index] for _, index in placed))
+
+    def pulled(factors, cotangent):
+        gradients = []
+        for place, factor in enumerate(factors):
+            # Each of the factor's places a term of one aligned sum in its shape (`_transposed_term`), the
+            # cotangent inside its products: summed first, 3 2^127 past float32's largest (base review
+            # d6c1b2c1a F1); held scaled until every place's is summed (base review db30f3e80 F1), and
+            # differentiated as an aligned sum is (base review d2d45bd6f F2: bits carry no tangent).
+            terms, laid = [], []
+            for index, term in enumerate(shape):
+                axis, value = spec[index]
+                given = cotangent if value is None else cotangent.reshape(value[0])
+                for spot, at in enumerate(term):
+                    if at == place:
+                        products, held = _transposed_term([factors[other] for other in term], spot, axis,
+                                                          given)
+                        along = tuple(d for d, size in enumerate(held) if size == 1)
+                        terms.append(products)
+                        laid.append((along if along else None, (held, factor.shape)))
+            gradient = _aligned_terms(terms, tuple(laid)).astype(factor.dtype)
+            # Placed as the factor's type places it, whole too, where its mesh has an Explicit axis: a
+            # transpose's cotangent takes its operand's type (base review 8d59803fd F1).
+            placed = jax.typeof(factor).sharding
+            typed = isinstance(placed, jax.sharding.NamedSharding) and placed.mesh.explicit_axes
+            gradients.append(jax.sharding.reshard(gradient, placed) if typed else gradient)
+        return gradients
+
+    # Typed as the value it perturbs, so a reverse pass traces no forward mode for its type alone.
+    return generation.linear_map(applied, pulled, list(primals), list(tangents),
+                                 out_aval=jax.typeof(value).to_tangent_aval())
 
 
 _aligned = contracted("test_an_aligned_sum_holds_every_order")(
@@ -1738,8 +2020,19 @@ def compensated_add(left, right):
     XLA reassociates no float arithmetic unless fast math is on; with it,
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
-    total, dropped = two_sum(left_hi, right_hi)
-    return two_sum(total, dropped + left_lo + right_lo)
+    return _renormalized((*uncontracted(left_hi), left_lo), (*uncontracted(right_hi), right_lo))
+
+
+@_protected
+def _renormalized(left, right):
+    """`compensated_add`'s arithmetic over pairs whose his no multiply makes in the same fusion (each read as
+    one value, `uncontracted`, or a compensated reduction's accumulator, made by additions alone): the his'
+    TwoSum, then the pair's own, whose operands are additions' (`_two_sum`, no barrier of its own: one in a
+    reduction's computation splits the fusions around the program, row 7953). A lo is read once, so a
+    multiply contracted into its addition reads it once too."""
+    (left_hi, left_lo), (right_hi, right_lo) = left, right
+    total, dropped = _two_sum(left_hi, right_hi)
+    return _two_sum(total, dropped + left_lo + right_lo)
 
 
 @_protected
@@ -1771,9 +2064,10 @@ def _compensated(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     """The sum of `values` over `axes` its compensated pair rounds once, its tangent the plain sum's: a
     protected span (`_compensated_sum`, `dew.nn.derivatives.declared_tangent`), whose compensation the
     algebra pass must not cancel."""
-    wide = values.astype(at_least_fp32(values.dtype))
+    # Each value read as one (`uncontracted`) where it is made: the reduction's pairs are its additions'.
+    (wide,) = uncontracted(values.astype(at_least_fp32(values.dtype)))
     zero = jnp.zeros((), wide.dtype)
-    hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
+    hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), _renormalized, axes)
     return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
 
 
@@ -1857,6 +2151,46 @@ def _compensated_sum_jvp(axes: tuple[int, ...], primals: tuple[jax.Array],
 
 _compensated_sum = contracted("test_the_precision_seams_hold_every_order")(
     declared_tangent(Protected(), _compensated, _compensated_sum_jvp, nondiff_argnums=(1,)))
+
+
+def summed_once(values: Sequence[jax.Array], products: Sequence[tuple[jax.Array, jax.Array]] = ()
+                ) -> jax.Array:
+    """The sum of `values` and of `products` (each a `(left, right)` pair, broadcasting as `*` does), every
+    product's rounding (`two_product`) and every addition's (`two_sum`) carried apart in one plain sum and
+    added back once at the end (Ogita, Rump and Oishi's Dot2), its value read as a compensated sum's is
+    (`compensated_total`): the sum as one rounding of its twice-precise value leaves it, whatever a compiler
+    fuses or keeps apart, so no contraction of a multiply into an add (an FMA) it takes or leaves rounds it
+    more (row 7953: a barrier in a step's arithmetic split its fusion and lost the contractions its plain
+    float32 sum leaned on, row 7979), and a sum reaching an infinity is the plain sum's, as `jnp.sum`'s is
+    (row 8453). Its residuals are carried apart, not renormalized into the running pair as `compensated_add`
+    renormalizes it: added back as they come, `M + 2^102 + 2^102 - M` (`M` float32's largest) rounded the
+    running value past `M` to an infinity, and a residual a later one cancels was rounded away first. Its
+    tangent is the plain sum's."""
+    return _summed_once(tuple(values), tuple(products))
+
+
+def _summed_once_value(values, products):
+    total, carried = values[0], jnp.zeros_like(values[0])
+    for left, right in products:
+        product, lost = two_product(left, right, bit_split=True)
+        total, dropped = two_sum(total, product)
+        carried = carried + (lost + dropped)
+    for value in values[1:]:
+        total, dropped = two_sum(total, value)
+        carried = carried + dropped
+    # Each sum's rounded half the plain running sum, which reads an infinity as `jnp.sum` does.
+    return compensated_total((total, carried), total)
+
+
+def _summed_once_tangent(primals, tangents):
+    (values, products), (value_tangents, product_tangents) = primals, tangents
+    terms = [*value_tangents, *(left_tangent * right + left * right_tangent for (left, right), (
+        left_tangent, right_tangent) in zip(products, product_tangents, strict=True))]
+    return _summed_once_value(values, products), sum(terms[1:], terms[0])
+
+
+_summed_once = contracted("test_the_precision_seams_hold_every_order")(
+    declared_tangent(Protected(), _summed_once_value, _summed_once_tangent))
 
 def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype (`rounded_operand`'s value).

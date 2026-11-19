@@ -19,6 +19,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.activations import silu
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.attention_blocks import projected_heads, projected_output
 from dew.nn.blocks import Modulation
@@ -45,7 +46,7 @@ def layer_norm(dtype, epsilon: float = 1e-6):
 
 
 def embedding(owner: nn.Module, x, features: int, name: str, *, bias: bool = True, dtype: Dtype | None = None,
-              precision: PrecisionLike = None, activation: Callable[[jax.Array], jax.Array] = nn.silu,
+              precision: PrecisionLike = None, activation: Callable[[jax.Array], jax.Array] = silu,
               sharded: bool = True):
     """Apply `TimestepEmbedding` or `PixArtAlphaTextProjection` to `x`.
 
@@ -95,7 +96,7 @@ class TextStream:
 
 def embedding_flops(lengths, input_features: int, features: int) -> float:
     """The two maps that `embedding` builds around its activation."""
-    return GatedMLP(features, features, in_features=input_features, activation=nn.silu,
+    return GatedMLP(features, features, in_features=input_features, activation=silu,
                     parent=None).model_flops(lengths)
 
 

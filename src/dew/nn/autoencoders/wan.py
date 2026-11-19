@@ -396,8 +396,8 @@ class WanAutoencoder(AutoEncoder):
                 f"must both hold one value per latent channel {expected}"
             )
         self.normalization = LatentNormalization({'latents_mean': mean, 'latents_std': std}, mean, 1.0 / std)
-        self._encode = functools.partial(program(_posterior, model, static_argnums=0), model)
-        self._decode = functools.partial(program(_chunk_decoded, model, static_argnums=0), model)
+        self._encode = functools.partial(program(_posterior, static_argnums=0), model)
+        self._decode = functools.partial(program(_chunk_decoded, static_argnums=0), model)
 
     def record_arguments(self) -> dict:
         return dict(self.normalization.record)

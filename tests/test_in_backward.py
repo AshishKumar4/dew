@@ -180,21 +180,46 @@ def test_a_scanned_steps_runs_train_under_each_update(optimizer, wider):
 
 @pytest.mark.parametrize("generation, dtype", [("sm90", "float32"), ("sm80", "bfloat16")])
 def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype):
-    """The scanned step that updates in its backward holds no temporary its layer-at-a-time step does not
-    (row 4098), compiled for a GPU (`compile_ahead`): the run's whole gradient, which a scan's backward made
-    before an update read any, is never made; under bf16 copies of float32 weights, the masters' update is
-    the backward's too."""
-    held = []
-    for scan in (False, True):
+    """The scanned step that updates in its backward (row 4098) holds none of the run's gradient, compiled
+    for a GPU (`compile_ahead`), under bf16 copies of float32 weights too, where the masters' update is the
+    backward's. Its reference is the same scanned step under global-norm clipping, which holds the whole
+    gradient: clipping by the norm of every leaf can update no leaf before every leaf's norm is known, so
+    the stacked gradient is whole at once there, whatever its program. The updating step's temporaries are
+    then at most the clipped step's, less that gradient's bytes (each of the run's stacked weights, the
+    leaves a layer of `LAYERS` holds a row of, at the dtype its layers differentiate them in, the step's),
+    plus one layer's rows of the state the walk moves (the stacked weights as the state holds them, fp32
+    masters of bf16 copies, and the optimizer's moments of them, over the run's layers): the rows a layer's
+    update reads, which XLA keeps beside the stacks or fuses into their writes as it fuses (row 7953: one
+    barrier in the loss flipped which). Every term is read off the clipped run's abstract state. A step
+    that held the gradient again, or more than a layer's state at once, fails it; a fusion that keeps a
+    layer's rows does not."""
+    def built(optimizer: OptimConfig):
         gpu = compile_only_gpus(generation, 1, 80 * 2**30)
-        run = Trainer(LMObjective(decoder(scan=scan, dtype=dtype, num_layers=8), SEQ), ADAMW,
+        run = Trainer(LMObjective(decoder(scan=True, dtype=dtype, num_layers=LAYERS), SEQ), optimizer,
                       key=jax.random.key(0), mesh=MeshSpec().build(gpu),
                       layout=Layout(min_shard=TINY_SHARD), split=1, accumulation=1, checkpoints=None,
                       tracker=None)
         run.validate(steps=8)
-        held.append(compile_ahead(run, token_rows(VOCAB, 1, SEQ + 1)).temp_bytes)
-    plain, scanned = held
-    assert scanned <= plain, (scanned, plain)
+        return run
+
+    def stacked(tree) -> list:
+        return [leaf for leaf in jax.tree.leaves(tree) if leaf.shape[:1] == (LAYERS,)]
+
+    def held(leaves, dtype=None) -> int:
+        return sum(int(np.prod(leaf.shape)) * np.dtype(dtype or leaf.dtype).itemsize for leaf in leaves)
+
+    updating = compile_ahead(built(ADAMW), token_rows(VOCAB, 1, SEQ + 1)).temp_bytes
+    run = built(dataclasses.replace(ADAMW, clip_grads=1.0))
+    clipped = compile_ahead(run, token_rows(VOCAB, 1, SEQ + 1)).temp_bytes
+    state = jax.eval_shape(run.initial_state)
+    weights = stacked(state.variables["params"])
+    gradient = held(weights, dtype)
+    rows = (held(weights) + held(stacked(state.opt_state))) // LAYERS
+    assert updating <= clipped - gradient + rows, (updating, clipped, gradient, rows)
+
+
+LAYERS = 8
+"""The scanned run's layers, a row of each of its stacked leaves each."""
 
 
 PLANNED_SEEDS = 256

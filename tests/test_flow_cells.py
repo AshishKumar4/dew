@@ -2,6 +2,8 @@
 failure is kept and raised together, a cell's own skip is reported and the cells after it still run,
 and a flow of no cell that runs is skipped, never passed."""
 
+import inspect
+
 import gpu_flow
 import pytest
 from gpu_flow import Cell, CellsFailed, cells_of, run_cells
@@ -11,10 +13,12 @@ def test_a_flow_runs_every_cell_and_raises_every_failure_together():
     """A failing cell is kept, the cells after it run, and every failure is raised together after the
     last, each by its label."""
     ran = []
+    raised_at: list[int] = []
 
     def failing(name):
         def run():
             ran.append(name)
+            raised_at.append(inspect.currentframe().f_lineno + 1)
             raise AssertionError(f"{name} is off")
         return run
 
@@ -23,6 +27,9 @@ def test_a_flow_runs_every_cell_and_raises_every_failure_together():
                    Cell("last", failing("last"))])
     assert ran == ["first", "passing", "last"]
     assert raised.value.labels == ["first", "last"]
+    # Each failure kept with the frame it was raised at, the cell's own (its report names where it failed).
+    assert [raised.value.where[label][-1] for label in ("first", "last")] == [(__file__, line)
+                                                                              for line in raised_at]
 
 
 def test_a_cell_that_skips_itself_is_reported_and_the_cells_after_it_run():
@@ -171,3 +178,119 @@ def test_a_classs_covering_holds_every_native_value_and_pair_and_every_named_fau
     mine = [cell for cell in cells if cell.generation is None]
     held = set().union(*(gpu_flow.held(cell.native) for cell in mine if cell.label in kept))
     assert held >= set().union(*(gpu_flow.held(cell.native) for cell in mine))
+
+
+def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_path, monkeypatch):
+    """A matrix case pinned to its generation (`generation_support.pinned`, as every *_matrix.py pins its
+    cases) runs in a GPU part's prepare on the node's CPU when the node is that generation, as its run runs
+    it, and skips there when it is another (rows 7868, 7886: pins read off the CPU at import skipped every
+    pinned case in the prepare, then compiled them on the held GPU)."""
+    import generation_support
+    import model_flows
+    import tier_wire
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = tmp_path / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    ran: list[str] = []
+
+    # An unpinned case beside the pinned ones, so the flow runs and its test fails, never skips, where the
+    # pins skip both.
+    @pytest.mark.parametrize("case", [*(pytest.param(case, marks=generation_support.pinned(case))
+                                        for case in ("sm80", "sm90")), "unpinned"])
+    def a_case(case):
+        ran.append(case)
+
+    run_cells(cells_of(a_case))
+    assert ran == ["sm80", "unpinned"]
+
+
+def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (`tier_wire.preparing`, its store open), a cell that raises, computing
+    where nothing computes, is recorded deferred, where it raised (`truths_ahead.DEFERRED`), and the flow
+    passes its prepare, its other cells run; outside a prepare the same cell fails its flow (rows 8505 and
+    8506: such a cell beside a flow's prepared sites turned its test red in the prepare)."""
+    import tier_wire
+    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths
+
+    def computing():
+        raise AttributeError("'jaxlib._jax.Executable' object has no attribute 'local_devices'")
+
+    ran = []
+    flow = [Cell("computes", computing), Cell("prepared", lambda: ran.append("prepared"))]
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        run_cells(flow)
+    # Recorded deferred, never unprepared, which would take the test's run off its store (tests/conftest.py).
+    assert ran == ["prepared"] and (tmp_path / DEFERRED).is_file() and not (tmp_path / UNPREPARED).exists()
+    monkeypatch.delenv(tier_wire.PREPARE)
+    with pytest.raises(CellsFailed) as raised:
+        run_cells(flow)
+    assert raised.value.labels == ["computes"]
+
+
+def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unrecorded(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare, a cell that compiled a site and then raised, checking what its prepare
+    gives in its programs' place (`ahead_arm`'s zeros), passes its prepare with nothing recorded, its run
+    judging it (row 8555: every such cell was recorded deferred and its test named unprepared, falsely);
+    a cell whose site's prepare did not finish, its compile raised, its arm's trace raised after its
+    truths were written, or a second check's truth trace raised after a first was prepared whole, is
+    deferred, its failure recorded where it raised (the review)."""
+    import jax
+    import numpy as np
+    import reference_error
+    import tier_wire
+    from reference_error import ahead_arm, assert_as_exact
+    from truths_ahead import DEFERRED, UNPREPARED, CompiledTruths, compiled_truths
+
+    def checked():
+        made = ahead_arm(jax.jit(lambda x: x + 1.0), "a checked product")(np.zeros(3, np.float32))
+        assert np.asarray(made).tolist() == [1.0, 1.0, 1.0]
+
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        run_cells([Cell("checks its product", checked)])
+    assert not (tmp_path / DEFERRED).exists() and not (tmp_path / UNPREPARED).exists()
+
+    def unfinished(store, programs, compiled, host=False):
+        raise RuntimeError("its compile failed")
+
+    with monkeypatch.context() as failing:
+        failing.setattr(CompiledTruths, "_compiled", unfinished)
+        failed = ahead_arm(jax.jit(lambda x: x * 2.0), "a failed product")
+        with compiled_truths(tmp_path / "unfinished", prepare=True, stamp="a"):
+            run_cells([Cell("compiles nothing", lambda: failed(np.zeros(3, np.float32)))])
+    assert (tmp_path / "unfinished" / DEFERRED).is_file()
+
+    # A site whose truths are written and whose arm's trace then raises.
+    def traced_badly(*arguments, **options):
+        raise RuntimeError("its arm's trace failed")
+
+    def site():
+        assert_as_exact(jax.jit(lambda x: x * 2.0), jax.jit(lambda x: x * 2.0),
+                        lambda seed: (np.full(3, seed, np.float32),), "a product whose arm failed", seeds=8)
+
+    with monkeypatch.context() as failing:
+        failing.setattr(reference_error, "_arm_program", traced_badly)
+        with compiled_truths(tmp_path / "arms", prepare=True, stamp="a"):
+            run_cells([Cell("traces its arm badly", site)])
+    assert (tmp_path / "arms" / DEFERRED).is_file()
+
+    # A check prepared whole, then a second check whose truth's trace raises before it compiles any site.
+    def two_checks():
+        ahead_arm(jax.jit(lambda x: x + 1.0), "a first product")(np.zeros(3, np.float32))
+
+        def truth(x):
+            raise RuntimeError("its truth's trace failed")
+
+        assert_as_exact(jax.jit(lambda x: x * 3.0), jax.jit(lambda x: x * 3.0),
+                        lambda seed: (np.full(3, seed, np.float32),), "a product whose truth failed", seeds=8,
+                        truth_fn=truth)
+
+    with compiled_truths(tmp_path / "second", prepare=True, stamp="a"):
+        run_cells([Cell("prepares one check and fails the next", two_checks)])
+    assert (tmp_path / "second" / DEFERRED).is_file()

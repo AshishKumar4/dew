@@ -197,7 +197,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     indices, the walk's carry), a measured whole (`scalars_whole`): CUTLASS's cooperative sm90 kernel's 168
     less its accumulator's 128; an A100's attention dQ holds 13 to 43 integers live at its peaks, places and
     addresses together. Its derivations need it: without it the GEMM's gate picks on sm80, sm86, sm89 and
-    sm120 spill 36 to 784 bytes, where its operands' fragments share the registers (FS-HELDREG)."""
+    sm120 spill 36 to 784 bytes, where its operands' fragments share the registers (FS-HELDREG). A
+    pre-lowering prior, which certification overrules (`report.certified`): the count a lowering holds is
+    not derived from the traced kernel, whose shared-memory tile addresses and loop carries predicted the
+    lowered peak's scalars no better than a family's constant over 260 sm80 GEMM and recurrence kernels
+    (FS-DERIVED-HELD2-sm80, row 8377: correlation 0.49 and 0.39; a recurrence's peak 4 to 97 scalars, two to
+    five times its traced count, the lowering's shared-memory addresses and swizzles)."""
 
     scalars_whole = True
 

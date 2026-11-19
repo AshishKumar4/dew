@@ -229,9 +229,9 @@ class Parts:
     """A token's update and readout as the affine map the rules reach (`parts`): the decay `exp(exponent)`
     (`exp2` where `base2`), a scalar's or each key's (`per_key`), on the state; the input `left right^T`;
     the corrections' sum `left (correction^T (D h))^T`, None where none corrects; the readout
-    `reader^T h + free`, or where `values_read` `h reader + free` (the state read along its values, Oja's
-    rule on its transposed state). Each a term free of the state over the traced programs' values `atoms`
-    (each its program and its atom, at `Token.value`'s place)."""
+    `reader_scale reader^T h + free`, or where `values_read` `reader_scale h reader + free` (the state read
+    along its values, Oja's rule on its transposed state). Each a term free of the state over the traced
+    programs' values `atoms` (each its program and its atom, at `Token.value`'s place)."""
 
     update: Program
     readout: Program
@@ -245,6 +245,7 @@ class Parts:
     reader: Token
     free: Token
     values_read: bool = False
+    reader_scale: float | np.floating = 1.0
 
 
 def _chain(traced: Program) -> int:
@@ -286,10 +287,47 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
     if found is None:
         raise Refused("the readout is not the state contracted with a vector over its keys or its values "
                       f"plus a part free of it{stopped}")
+    from dew.nn.precision import at_least_fp32
+
+    reader, free = found
+    reader, reader_scale = _reader_scale(reader, atoms, at_least_fp32(aval(update.jaxpr.invars[0]).dtype))
     base2, per_key, exponent, left, right, *correction = args
     return Parts(update, readout, tuple(atoms), bool(terms.integer(base2)),
                  bool(terms.integer(per_key)), exponent, left, right,
-                 correction[0] if correction else None, *found, values_read=values_read)
+                 correction[0] if correction else None, reader, free, values_read=values_read,
+                 reader_scale=reader_scale)
+
+
+def _reader_scale(reader: Token, atoms: list, dtype: np.dtype) -> tuple[Token, float | np.floating]:
+    """A shrinking literal factored once with its dtype. A magnifying one stays on the reader, so its
+    transpose never magnifies the memory before a small cotangent."""
+    def factored(term):
+        scalar = get_callable_args(term, Token.scalar)
+        if scalar is not None:
+            literal = get_callable_args(scalar[0], Token.literal)
+            if literal is not None:
+                literal_value = np.dtype(dtype).type(terms.real(literal[0]))
+                if abs(literal_value) <= 1.0:
+                    return None, literal_value
+            leaf = get_callable_args(scalar[0], Token.value)
+            if leaf is not None:
+                _, atom = atoms[terms.integer(leaf[0])]
+                if isinstance(atom, jcore.Literal):
+                    literal_value = np.asarray(atom.val).dtype.type(atom.val)
+                    if isinstance(literal_value, np.floating) and abs(literal_value) <= 1.0:
+                        return None, literal_value
+        product = get_callable_args(term, Token.times)
+        if product is not None:
+            left, ls = factored(product[0])
+            right, rs = factored(product[1])
+            vector = right if left is None else left if right is None else left.times(right)
+            scale = rs if ls is None else ls if rs is None else ls * rs
+            return vector, scale
+        return term, None
+
+    vector, scale = factored(reader)
+    return (Token.scalar(Token.literal(1.0)) if vector is None else vector,
+            1.0 if scale is None else scale)
 
 
 _KEEPING = (jax.lax.copy_p,)
@@ -477,10 +515,12 @@ class Chunk(Expr):
     def state(self) -> Chunk: ...
 
     @classmethod
-    def gram(cls, left: Chunk, right: Chunk, strict: i64Like, between: Chunk) -> Chunk: ...
-    """Each pair's decayed contraction `sum_k left_ik right_jk between_ijk`, `j < i` where `strict`, else
-    `j <= i` (`scan._paired`). The decay it reads is its operand (`decay("between")`), as every node's that
-    reads one is: a form's price holds each decay's exponentials once, shared by the nodes that read it."""
+    def gram(cls, left: Chunk, right: Chunk, apart: i64Like, between: Chunk) -> Chunk: ...
+    """Each pair's decayed contraction `sum_k left_ik right_jk between_ijk`, `j // apart < i // apart` where
+    `apart` (a strict pairing's, `j < i`, groups of one; a readout's apart from its group's writes,
+    `scan.Scan.group`), else `j <= i` (`scan._paired`). The decay it reads is its operand
+    (`decay("between")`), as every node's that reads one is: a form's price holds each decay's exponentials
+    once, shared by the nodes that read it."""
 
     @method(cost=1)
     def rows(self, scale: Chunk) -> Chunk: ...
@@ -537,14 +577,15 @@ def decayed_by(part: str) -> Chunk:
     return Chunk.decay(part, Chunk.prefix())
 
 
-def _identities(corrects: bool, scalar: bool, values_read: bool = False):
+def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: int = 0):
     """The identities of the module's account, `wy` where tokens correct the state. A `scalar` decay's
     memory is read and then decayed, `(Q h) exp(G)`, as the template's output (`recurrence_algebra.
     chunk_output`): a memory past fp32's range reads finite, within 2.5 times the fp32 recurrence's distance
     from float64 (1.50e-1 at 2^124 against its 6.1e-2), where its queries decayed first read six times it
     (ledger 2344, 12e501086c8). A decay a key's decays each key before the read. A readout along the state's
     `values_read` takes each output along the keys: the entering state read and decayed along them, and each
-    earlier write's keys decayed to the token, scaled by its values' read (`spread`)."""
+    earlier write's keys decayed to the token, scaled by its values' read (`spread`). A readout `apart` from
+    its group's writes (`scan.Scan.group`) pairs each token with the earlier groups' writes alone."""
     values = Chunk.token("U")
     given, other, lower, left, right = vars_("given other lower left right", Chunk)
     h = Chunk.entering()
@@ -560,8 +601,11 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False):
         corrected = Chunk.solve(system, values.minus(
             Chunk.token("C").times(entering).rows(Chunk.token("s")).matmul(h)))
         found.append(rewrite(Chunk.loop(values)).to(Chunk.plain(corrected)))
+    if values_read and apart:
+        raise Refused("a readout along the state's values apart from its group's writes has no chunk form "
+                      "here")
     local = (Chunk.spread(queries, given, Chunk.token("B"), between) if values_read
-             else Chunk.gram(queries, Chunk.token("B"), 0, between).matmul(given))
+             else Chunk.gram(queries, Chunk.token("B"), apart, between).matmul(given))
     found += [
         rewrite(Chunk.plain(given)).to(Chunk.pair(
             memory.plus(local).plus(Chunk.token("R")),
@@ -587,6 +631,8 @@ class Extents:
     values: int
     decay_keys: int
     values_read: bool = False
+    apart: int = 0
+    """The tokens of the group a readout reads apart from (`scan.Scan.group`), 0 for none."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -596,6 +642,8 @@ class Form:
     outputs: Chunk
     state: Chunk
     price: cost.Seconds
+    apart: int = 0
+    """Its extents' `apart`, by which its token loop reads (`scan._looped`)."""
 
 
 @function(merge=lambda old, new: old)
@@ -625,7 +673,8 @@ def _shapes(extents: Extents):
         for made in (a.rows(b), a.times(b), a.plus(b), a.minus(b), Chunk.solve(b, a),
                      Chunk.substituted(b, a))]
     found += [fixed(made, tokens, tokens)
-              for made in (Chunk.gram(a, b, 0, d), Chunk.gram(a, b, 1, d), Chunk.doubled(a))]
+              for made in (*(Chunk.gram(a, b, apart, d) for apart in {0, 1, extents.apart}),
+                           Chunk.doubled(a))]
     found += [fixed(made, keys, values) for made in (Chunk.decayed(a, d), Chunk.written(a, b, d), a.state())]
     found += [fixed(made, tokens, keys) for made in (Chunk.spread(a, b, e, d), Chunk.applied(a, b))]
     found.append(fixed(a.outputs(), tokens, keys if extents.values_read else values))
@@ -660,7 +709,8 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
     graph.register(root, *_leaves(extents))
     sized = program.node_count(graph)
     saturated = program.run_within(
-        graph, _identities(corrects, extents.decay_keys == 1, extents.values_read) | _shapes(extents),
+        graph, _identities(corrects, extents.decay_keys == 1, extents.values_read, extents.apart)
+        | _shapes(extents),
         saturation.sized(sized, _depth(root)), "a scan's chunk")
 
     def marginal(egraph: EGraph, node) -> cost.Seconds:
@@ -677,7 +727,7 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
     shape_of = functools.partial(_shape_of, graph)
     price = cost.Seconds(_priced((outputs, state), extents, shape_of, precision), schedule)
     kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, price.value))
-    return Form(outputs, state, price)
+    return Form(outputs, state, price, extents.apart)
 
 
 def _shape_of(graph: EGraph, value: Chunk) -> tuple[int, int]:
@@ -738,21 +788,31 @@ CONSTRUCTORS = (
 def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionLike) -> Work:
     """A node's own work and dependent steps at the chunk's extents: products as fp32 products at `precision`
     (`cost._mode`), elementwise work on the CUDA cores, exponentials on the special-function units,
-    a reduction's and a product's kernel (each a root of XLA's fusion, `cost.work`'s), and a loop's and a
-    substitution's rows a step each, whose launches the step's latency holds (`GpuTarget.step_seconds`, a
-    loop iteration's, measured with its kernels)."""
+    a reduction's and a product's kernel (each a root of XLA's fusion, `cost.work`'s) and its result kept on
+    chip, written and read (`Work.kept_bytes`, at a lane's bytes, `cost.LANE_BYTES`; a token step's state so
+    too), and a loop's and a substitution's rows a step each, whose launches the step's latency holds
+    (`GpuTarget.step_seconds`, a loop iteration's, measured with its kernels)."""
     c, k, v, d = extents.tokens, extents.keys, extents.values, extents.decay_keys
     product = functools.partial(cost.product_work, precision=precision)
+
+    def kept(*extent: int) -> float:
+        # A kernel's result of `extent`, written once and read once (`cost.work`'s).
+        return 2.0 * cost.LANE_BYTES * math.prod(extent)
+
     if get_callable_args(node, Chunk.loop) is not None or get_callable_args(node, Chunk.plain) is not None:
         corrected = get_callable_args(node, Chunk.loop) is not None
         # A token's step: the state decayed, read by its correction (a contraction over keys) and corrected,
         # written, and read out, each over the state's keys and values; its dependent steps a reduction and
         # the update that reads it (two launches a token on XLA's path).
         per_token = k * v * (6.0 if corrected else 3.0) + 2.0 * k * v
-        return Work(operations=c * per_token, exponentials=c * d, span=2.0 * c)
+        # Its states a token: the state, and where a token reads apart from its group's writes the state its
+        # group entered too (`scan._looped`'s `held`), a group of one token's the current state's.
+        states = 2 if extents.apart > 1 else 1
+        return Work(operations=c * per_token, exponentials=c * d, span=2.0 * c,
+                    kept_bytes=c * states * kept(k, v))
     if get_callable_args(node, Chunk.prefix) is not None:
         # The compensated prefix (`scan._decays`): one pass over the tokens' exponents, one kernel.
-        return Work(operations=12.0 * c * d, kernels=1.0)
+        return Work(operations=12.0 * c * d, kernels=1.0, kept_bytes=kept(c, d))
     if (args := get_callable_args(node, Chunk.decay)) is not None:
         # Its pairs' exponentials of the prefix's differences, fused with the prefix's pass.
         part = terms.text(args[0])
@@ -761,12 +821,13 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
     if (args := get_callable_args(node, Chunk.gram)) is not None:
         if d == 1:
             return product(c, k, c) + Work(operations=2.0 * c * c)
-        return Work(operations=3.0 * c * c * k, kernels=1.0)
+        return Work(operations=3.0 * c * c * k, kernels=1.0, kept_bytes=kept(c, c))
     if get_callable_args(node, Chunk.spread) is not None:
         # The reads `Q U^T`, then each pair's keys decayed and applied: a scalar decay's a product, a decay a
         # key's elementwise over the pairs' keys.
         reads = product(c, v, c)
-        return reads + (product(c, c, k) if d == 1 else Work(operations=3.0 * c * c * k, kernels=1.0))
+        return reads + (product(c, c, k) if d == 1
+                        else Work(operations=3.0 * c * c * k, kernels=1.0, kept_bytes=kept(c, k)))
     if get_callable_args(node, Chunk.applied) is not None:
         return product(c, v, k)
     if get_callable_args(node, Chunk.doubled) is not None:

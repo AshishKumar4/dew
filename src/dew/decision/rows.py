@@ -103,8 +103,8 @@ class Encoding(ReadsEarlierLayouts):
         fewest = self.none_of_the_above_options
 
         def laid(drop: bool, names: Collection[str] | None = None, held: "FittedRow" = row) -> int:
-            return _with_none(self.layout, self.tokenizer, self.specials, held, fewest, drop, names,
-                              self.context_length, self.context_reader)[0]
+            # Its tokens alone: a context's room is no part of a row's length.
+            return _with_none(self.layout, self.tokenizer, self.specials, held, fewest, drop, names)[0]
 
         if len(row.names) == 1:
             return min(row.length, laid(drop=False), laid(drop=True))
@@ -620,7 +620,8 @@ def _with_none(layout: Layout, tokenizer: Tokenizer, specials: Specials, row: Fi
     option where `drop`: each such question of `names` where given, of the row's every one otherwise. A
     schema read as the row's context lengthens as its row does, the example's context after it in the room
     the schema leaves under `context_length` (`with_context`, read by `reader`, the decision's tokenizer
-    where None); an example's context alone does not change."""
+    where None), the example's context resolved for such a row alone; an example's context alone does not
+    change, and is the row's own count (`FittedRow.context`)."""
     example = row.example
     labels = example.labels()
     asked = {name: (_none_of_the_above(question, labels[name], drop=drop)[0]
@@ -629,7 +630,9 @@ def _with_none(layout: Layout, tokenizer: Tokenizer, specials: Specials, row: Fi
              for name in row.names for question in (example.questions[name],)}
     laid = layout.rows(tokenizer, specials, example.state, asked, tokens=row.tokens.tolist(),
                        request=example.questions)
-    if context_length is not None and all(len(each.context or ()) <= context_length for each in laid):
+    in_context = any(each.spans_in_context for each in laid)
+    if (in_context and context_length is not None
+            and all(len(each.context or ()) <= context_length for each in laid)):
         laid = with_context(laid, tokenizer if reader is None else reader, example.context, context_length)
     schemas = sum(len(each.context or ()) for each in laid if each.spans_in_context)
     return sum(len(each.tokens) for each in laid), schemas or row.context

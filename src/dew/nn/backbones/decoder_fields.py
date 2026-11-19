@@ -309,7 +309,7 @@ def _gate_and_values(model: CausalTransformer):
     """Raise `ValueError` for an output gate activation the attention does not know, one set where no
     output gate is, and value experts (`dew.nn.value_experts`) without the mixture whose routed layers
     they sit on."""
-    from dew.nn.mixers.attention import GATE_ACTIVATIONS
+    from dew.nn.activations import GATE_ACTIVATIONS
 
     if model.output_gate_activation not in GATE_ACTIVATIONS:
         raise ValueError(f"output_gate_activation is one of {sorted(GATE_ACTIVATIONS)}, got "

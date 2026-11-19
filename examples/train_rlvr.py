@@ -498,6 +498,8 @@ def native_server(source, sampling: Sampling, *, slots: int, capacity: int) -> N
             TextGeneration(source.model, served, source.processor, sampling=sampling),
             slots=slots,
             capacity=capacity,
+            # A group's samples repeat their prompt: its pages are prefilled once.
+            kv_cache="shared",
         )
     )
 

@@ -23,8 +23,8 @@ no use of (a delta net has no gated product, bias or gate multiplier) takes its 
 `none` or `plain`, and no other.
 """
 
-import contextlib
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -114,8 +114,7 @@ CASES = (
 
 
 @cell("join", covers=lambda case: dict(zip(AXES["join"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The layer's training step of `case` on its GPU with its two projections joined on par with the
@@ -147,13 +146,9 @@ def per_shard(choice: str, kernel: str) -> dict:
     CPU's devices) per device on its own rows (`joined.py`'s map), its other kernels unfused (`UNFUSED`): the
     output and every gradient on par with one device's from the layer in float64. The fsdp placement of the
     joined product's weights is the GEMM's cells' (`gemm_matrix.per_shard`, joined cases)."""
-    from flax import linen as nn
     from jax.sharding import PartitionSpec
-    from sharded import Shard
+    from sharded import Shard, layer_scope
 
-    from dew.distributed.placement import Layout
-    from dew.mesh import DEFAULT_RULES
-    from dew.nn.sharding import placing
 
     del kernel
     # A 16-bit case: the template multiplies no fp32 product above the default precision (the lane's).
@@ -163,19 +158,13 @@ def per_shard(choice: str, kernel: str) -> dict:
     dtype = jnp.dtype(case["dtype"])
     params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
 
-    def scope():
-        # The trainer's step traces under its layout (`placing`), which a joined product's map reads.
-        stack = contextlib.ExitStack()
-        for context in (generation.chosen(**{**UNFUSED, "grouped_matmul": "mosaic"}),
-                        nn.logical_axis_rules(DEFAULT_RULES), placing(Layout(min_shard=1))):
-            stack.enter_context(context)
-        return stack
 
     def truth(*operands):
         # The layer in float64 through XLA's products, which a float64 product runs on.
         with generation.chosen(grouped_matmul="xla"):
             return with_gradients(layer.clone(dtype=jnp.float64).apply)(*operands)
 
+    named = {**UNFUSED, "grouped_matmul": "mosaic"}
     return {"data": Shard(with_gradients(layer.apply), drawing(params, (*ROWS, FEATURES), dtype),
                           lambda mesh: [PartitionSpec(), PartitionSpec("data"), PartitionSpec("data")], truth,
-                          SEEDS, "data", context=scope)}
+                          SEEDS, "data", context=lambda: layer_scope(**named))}

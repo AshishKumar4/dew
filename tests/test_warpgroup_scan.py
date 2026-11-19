@@ -49,9 +49,10 @@ def _scanned(decays, writes, *, reverse: bool, exclusive: bool = False, interpre
 def _recurrence(positions: int, seed: int = 0):
     """Decays in (0.9, 1) and writes of either sign: a state that grows over the block, as a decay near
     one carries it."""
-    keys = jax.random.split(jax.random.key(seed))
-    decays = jax.random.uniform(keys[0], (positions,), jnp.float32, 0.9, 1.0)
-    writes = jax.random.normal(keys[1], (positions,), jnp.float32)
+    rng = np.random.default_rng(seed)
+    # NumPy's, as a site's draws are: a GPU tier's prepare computes on no device.
+    decays = rng.uniform(0.9, 1.0, (positions,)).astype(np.float32)
+    writes = rng.normal(size=(positions,)).astype(np.float32)
     return decays, writes
 
 
@@ -107,7 +108,10 @@ def test_the_scan_lowers_for_each_family(target, reverse, exclusive):
 
 def the_scan_walks_the_recurrence_on_this_gpu(positions: int, reverse: bool, exclusive: bool) -> None:
     """The scan compiled and run on this GPU: its shuffles and its warps' exchange as the hardware runs
-    them."""
+    them, its program compiled in a tier's prepare (`ahead_arm`)."""
+    from reference_error import ahead_arm
+
     decays, writes = _recurrence(positions, seed=1)
     scanned = functools.partial(_scanned, reverse=reverse, exclusive=exclusive, interpret=None)
-    _assert_walked(jax.jit(scanned)(decays, writes), decays, writes, reverse, exclusive)
+    label = f"the warpgroup scan: {positions}{' reversed' * reverse}{' exclusive' * exclusive}"
+    _assert_walked(ahead_arm(jax.jit(scanned), label)(decays, writes), decays, writes, reverse, exclusive)

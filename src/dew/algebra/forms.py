@@ -17,6 +17,7 @@ from jax.extend import core as jcore
 
 from dew.algebra import program, terms
 from dew.nn import programs
+from dew.nn.derivatives import stated_operation
 from dew.nn.precision import float32_dot_general
 
 
@@ -230,6 +231,10 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
         if (default := _platform_default(equation, producers)) is not None:
             operands = [read(atom) for atom in equation.invars[1:]]
             outs = evaluated_inline(default.jaxpr, default.consts, operands)
+        elif stated_operation(equation) is not None:
+            # A span stating the operation it computes, bound as itself: its values Dew's arithmetic, which
+            # the normal form reads as that operation (`normal_form.canonical`).
+            outs = bound(equation, [read(atom) for atom in equation.invars])
         elif (called := programs.called(equation)) is not None:
             # A call's program (`dew.nn.programs.called`), its constants with it.
             outs = evaluated_inline(called.jaxpr, called.consts, [read(atom) for atom in equation.invars])

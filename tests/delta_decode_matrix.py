@@ -16,6 +16,7 @@ import dataclasses
 import functools
 from collections.abc import Callable
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -178,8 +179,7 @@ CASES = (
 
 
 @cell("delta_decode", covers=lambda case: dict(zip(AXES["delta_decode"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_decode_token_is_on_par(case: tuple[str, ...]) -> None:
     """`on_par` of a GPU's case."""

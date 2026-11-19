@@ -297,6 +297,69 @@ def test_a_named_products_consumers_are_its_epilogue_its_name_the_launchs_residu
                         truth_fn=with_gradients(lambda *x: named_gate(*(a.astype(jnp.float64) for a in x))))
 
 
+def gated_mlp_product(x, w, up):
+    """A gated MLP's gate projection, named for remat (`gate_proj`), and its SwiGLU with `up` as a model takes
+    it (`activations.gated_product`: one marked region, `derivatives.Activation`, whose body is SwiGLU's
+    Pallas kernel where an H100's selector chooses it)."""
+    from jax.ad_checkpoint import checkpoint_name
+
+    from dew.nn import activations
+
+    return activations.gated_product("swiglu")(checkpoint_name(x @ w, "gate_proj"), up)
+
+
+def test_a_models_gated_product_is_its_gate_projections_epilogue():
+    """A model's SwiGLU (`gated_product`, its region marked `Activation`, its body SwiGLU's Pallas kernel on
+    an H100) after its named gate projection, under the pass on an H100 whose template a call names: the
+    region is the product's epilogue (its 'gemm_epilogue' route the fused kernel's), replayed as the
+    activation's arithmetic on the tile (`activations.gated_hook`), no region of it or dot left in the
+    program; the program computes as written, gradients too (check 1 against float64)."""
+    from contract_support import normal_drawn
+    from reference_error import assert_as_exact, with_gradients
+
+    from dew.nn import derivatives
+
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16),
+              jax.ShapeDtypeStruct((256, 256), jnp.bfloat16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        with generation.routes() as found:
+            traced = jax.jit(algebra.rewritten(gated_mlp_product, kernels=True)).trace(*shapes)
+        assert any(route.choice == "gemm_epilogue" and route.kernel == "fused" for route in found), [
+            (route.choice, route.kernel) for route in found]
+        left = [equation for equation in traced.jaxpr.jaxpr.eqns
+                if equation.primitive is jax.lax.dot_general_p
+                or isinstance(equation.params.get("kind"), derivatives.Activation)]
+        assert not left, left
+    operands = normal_drawn(5101, (256, 512), (512, 256), (256, 256), dtype=jnp.bfloat16)
+    cotangent = normal_drawn(5102, (256, 256), dtype=jnp.bfloat16)
+
+    def wide(x, w, up):
+        return jax.nn.silu(x.astype(jnp.float64) @ w.astype(jnp.float64)) * up.astype(jnp.float64)
+
+    # Run as the H100's routes on this CPU: their kernels interpreted where it places them.
+    with generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic"):
+        assert_as_exact(jax.jit(with_gradients(algebra.rewritten(gated_mlp_product, kernels=True))),
+                        jax.jit(with_gradients(gated_mlp_product)),
+                        lambda seed: (*operands(seed), *cotangent(seed)),
+                        "a model's gated product under the pass", seeds=8, truth_fn=with_gradients(wide))
+
+
+def test_a_gated_product_of_no_product_stays_its_region():
+    """A model's SwiGLU (`gated_product`) over projections the program takes as inputs, no product before it:
+    the pass leaves its region whole (`derivatives.Activation`, its body the route its dispatcher chose on an
+    H100), the activation fused into no launch, and the program computes it bit for bit as written."""
+    from dew.nn import activations, derivatives
+
+    product = activations.gated_product("swiglu")
+    gate, up = (jax.random.normal(jax.random.key(seed), (256, 256)).astype(jnp.bfloat16) for seed in (1, 2))
+    with generation.assumed("sm90"):
+        traced = jax.jit(algebra.rewritten(product, kernels=True)).trace(gate, up)
+        assert [equation for equation in traced.jaxpr.jaxpr.eqns
+                if isinstance(equation.params.get("kind"), derivatives.Activation)]
+    np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(product, kernels=True))(gate, up),
+                                             np.float32), np.asarray(jax.jit(product)(gate, up), np.float32))
+
+
 def named_rows(x, w):
     """A sine of rows named for remat before it, then their product: a name on a prologue's value."""
     from jax.ad_checkpoint import checkpoint_name
@@ -820,6 +883,14 @@ def gated_product_of(a, b):
     return jax.nn.silu(a.astype(_wide(a))).astype(a.dtype) * b
 
 
+def dews_gated_product(a, b):
+    """A gated MLP's product written with Dew's own silu (`activations.silu`: its sigmoid Dew's one logistic,
+    a declared derivative over a span stating it), as Dew's layers write theirs (TSSM's, Mamba-3's gate)."""
+    from dew.nn.activations import silu
+
+    return silu(a) * b
+
+
 def _norms_written(fn, *shapes):
     """`fn` with each RMSNorm and SwiGLU the compile point takes on an H100 written as Dew's norm
     (`recognize.recognized`), decided under the H100 and written on this host, whose norms run their portable
@@ -897,6 +968,7 @@ NORM_FORMS = {
     "residual RMSNorm": (residual_rms, _own_residual, (ROWS, ROWS, WEIGHT)),
     "gated RMSNorm": (gated_rms, _own_gated, (ROWS, ROWS, WEIGHT)),
     "SwiGLU": (gated_product_of, _own_swiglu, (ROWS, ROWS)),
+    "SwiGLU of Dew's silu": (dews_gated_product, _own_swiglu, (ROWS, ROWS)),
     "packed SwiGLU": (packed_swiglu, _own_packed, (PACKED,)),
 }
 """Each plain program's fused norm, Dew's own call of it, and its operands' shapes."""
@@ -905,8 +977,9 @@ NORM_FORMS = {
 @pytest.mark.parametrize("form", list(NORM_FORMS))
 def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
     """A plain program's RMSNorm (Flax's, a plain one, Gemma's offset weight after the cast, a residual
-    stream's read on after it, Qwen3-Next's gated one) or SwiGLU (two projections, or one packed one's
-    halves), compiled through `dew.jit` on an H100, runs the kernel Dew's own call routes it to (none where
+    stream's read on after it, Qwen3-Next's gated one) or SwiGLU (two projections, its sigmoid Dew's one
+    logistic too, which train 1026's review found no anchor read, or one packed one's halves), compiled
+    through `dew.jit` on an H100, runs the kernel Dew's own call routes it to (none where
     that is XLA's arithmetic), where the program as written runs XLA's; on this host, its output and
     gradients on par with the program as written (check 1)."""
     from contract_support import normal_drawn
@@ -1215,6 +1288,32 @@ def test_a_norm_whose_epsilon_an_enclosing_trace_closes_over_compiles_through_de
     np.testing.assert_array_equal(np.asarray(through(epsilon)), np.asarray(written(epsilon)))
 
 
+def _held_logistic(x):
+    """Dew's one logistic's value (`precision.logistic_value`), rounded once to `x`'s dtype."""
+    from dew.nn.precision import logistic_value
+
+    given = jnp.asarray(x)
+    return logistic_value(given).astype(given.dtype)
+
+
+def _no_tangent(primals, tangents):
+    """A tangent of the logistic's own: none."""
+    value = _held_logistic(primals[0])
+    return value, jnp.zeros_like(value)
+
+
+def held_logistics_swiglu(a, b):
+    """A SwiGLU whose sigmoid states Dew's one logistic's operation (`Protected.computes`) but is declared
+    with a rule of its own, no tangent: one a fused call written in its place would not keep (train 1026's
+    F6 review: the primal alone read as Dew's logistic would have fused it)."""
+    from dew.nn.derivatives import Protected, declared_tangent
+    from dew.nn.precision import logistic_value
+
+    held = declared_tangent(Protected(computes=logistic_value), _held_logistic, _no_tangent)
+    work = a.astype(jnp.float32)
+    return (work * held(work)).astype(a.dtype) * b
+
+
 def batched_by_its_rule(a, b):
     """A SwiGLU whose SiLU carries a custom batching rule of its own (`jax.custom_batching.custom_vmap`),
     one a fused call written in its place would not keep."""
@@ -1236,13 +1335,15 @@ def swiglu_traced(program):
     return made, any(route.choice == "swiglu" and route.kernel != "xla" for route in found)
 
 
-@pytest.mark.parametrize("barred", [checkpointed_swiglu, batched_by_its_rule],
-                         ids=["a checkpointed sigmoid", "an activation's own batching rule"])
+@pytest.mark.parametrize("barred", [checkpointed_swiglu, batched_by_its_rule, held_logistics_swiglu],
+                         ids=["a checkpointed sigmoid", "an activation's own batching rule",
+                              "a logistic declared with a rule of its own"])
 def test_a_gated_product_across_a_barrier_is_never_fused(barred):
     """A SwiGLU across a barrier runs as written through `dew.jit` on an H100, where the same product
     without it runs Dew's fused kernel: a checkpoint (`checkpointed_swiglu`), whose boundary decides what
-    its derivative saves (§6.2), its program keeping the checkpoint; and an activation's own batching rule
-    (`batched_by_its_rule`), which a fused call written in its place would not keep."""
+    its derivative saves (§6.2), its program keeping the checkpoint; an activation's own batching rule
+    (`batched_by_its_rule`), and a logistic stating Dew's operation declared with a derivative of its own
+    (`held_logistics_swiglu`), which a fused call written in its place would not keep."""
     from jax.extend.core import primitives
 
     from dew.nn.programs import equations

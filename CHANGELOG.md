@@ -7,6 +7,63 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `Trainer(lower_for=...)` lowers a step that keeps its variables on the host: its dry run's `Lowered`
+  holds each program its steady steps call (`Lowered.programs`), the realizations' lowered for the GPU and
+  the companion's for this host, none compiled. `Lowered.lowered` is a device step's one program.
+- A run that keeps its variables on the host samples its rollout from a copy of its weights on its
+  devices, made once a call; the copy and each program the rollout compiles beside it (a generation's KV
+  cache and activations) are refused by name where the devices cannot hold them, and the copy's bytes are
+  logged (`train/rollout_copied_gib`). The streamed layout's choice keeps a run with a rollout on its
+  devices: its stream's first batch is the rollout's input, no step's, so no step is priced before a
+  rollout runs.
+- A fresh fit plans its step once over the batch its loop hands the step, where the layout's choice
+  planned over the batch as read and the first compile planned and compiled it again, and compiles no
+  streamed step where the device plan is priced no dearer than the streamed step's update on the host
+  alone.
+- Under AutoPGLE (`jax_enable_pgle`) a step that keeps its variables on the host is profiled on a trial
+  after its startup and runs its accelerator programs guided by the profile, as a device plan does
+  (`HostStartup.pgle` records it); the streamed layout's choice considers such a run.
+- A TPU v6e states its host link (PCIe Gen5 x8 a chip, 32 GB/s each way), so its runs' streamed
+  layout is priced.
+
+- A run that keeps its variables on the host (`Layout(host=("variables",))`) can inspect
+  (`Trainer(inspection=...)`): its sampled steps summarize what a device run's summarize, its watched
+  outputs' activations and cotangents among them (their probes differentiated beside the parameters, under
+  the loss scale its backward is seeded with), and its unsampled steps are the uninspected run's. Its
+  startup compiles both bodies. A fit whose host steps compile past their startup passes counts it in its
+  own record (`train/step_misses`), no other fit's; a fit of device steps logs no such count.
+
+- A step that keeps its variables on the host (`Layout(host=("variables",))`) compiles every program it calls
+  at its run's startup, over its state's and batch's shapes (`options.collecting`), its CPU companion's and
+  its accelerator's alike, stepping on its own results' shapes until they settle; its steps then trace,
+  lower and compile nothing, a window that replays included; a step that does (an input no pass
+  foresaw) compiles, each program named in a warning and counted in the fit's record
+  (`train/step_misses`). Its
+  glue between the transaction's phases (an attempt's arithmetic, the replay's and the records', a
+  microbatch's reading and its outcome) runs as programs of their own. The startup's programs and seconds
+  are logged and kept (`StepCompiler.host_startup`). A program compiled over shapes within `collecting`
+  serves a later call over arrays alike in shape, dtype, weak type, placement and static arguments
+  (`OuterProgram`).
+
+- A layout that keeps the variables on the host (`Layout(host=("variables",))`) reads each step's batch in
+  the split the run states, each microbatch an attempt of its own, as a device step does; it read every
+  step's batch whole, refusing a stated split.
+
+- A step over several GPUs compiles without XLA's rematerialization pass (`dew.training.memory.COLLECTIVES`),
+  as MaxText runs it: its plan fits it by Dew's ladder, and XLA's pass, against a limit of its own below the
+  plan's, recomputed what it picked at a rung that already fit, a sharded weight's all-gather among them.
+  Qwen3-8B over four H100s (fsdp 2 x tensor 2) at 48 GiB: 14 fewer re-gathered all-gathers, 11.7 GB gathered
+  a step against 16.8, at the same rung and temporaries (row 1307).
+
+- A fresh run that states no layout chooses whether to stream its parameters from the host
+  (`Layout(host=("variables",))`, `dew.training.streaming`; row 1880): the plan its devices hold, priced as its
+  compiled step's hardware FLOPs over the GPU's dense peak, against the streamed step, its own FLOPs or its host
+  link's transfers whichever is longer, then its update over the host's memory. It streams where its devices
+  hold only the streamed step, or where that step is the cheaper; the choice is said and kept
+  (`Trainer.layout_choice`). A GPU's host link is a table fact of each part (`GpuTarget.host_links`,
+  `host_link_rate`: PCIe's or NVLink-C2C's datasheet rate one way); a TPU states none yet. A resume
+  lays out as its checkpoint trained. A process takes the streamed plan only where it was started with a CPU companion of its devices.
+
 - A launch whose derived config spills certifies its ladder's rungs one after another and takes the first
   that holds, where it certified them in threaded rounds as wide as the host's cores: a rung's certification
   is its launch's trace and Mosaic GPU lowering, Python under the GIL, so a round of 13 rungs cost 13 rungs'
@@ -98,8 +155,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post106 and, on Linux x86_64 and aarch64, its own jaxlib build
-  0.12.0.1.post103, with its CUDA and PJRT plugins 0.12.0.1.post103 (post96's until now). A GPU compile takes a
+- Dew requires its JAX build 0.12.0.1.post113 and, on Linux x86_64 and aarch64, its own jaxlib build
+  0.12.0.1.post111, with its CUDA and PJRT plugins 0.12.0.1.post111 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
   executables' buffer assignment, which jaxlib's client of it reads, so `Compiled.peak_live()` lists the buffers
@@ -114,7 +171,26 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   integer's exclusive or with 1; and XLA's HLO evaluator left a float32 dot over an empty contraction
   uninitialized, zeros now (row 6942). Pallas Triton lowers an optimization barrier, a one-element slice, boolean
   reductions and hijax primitives (the attention's merge kernel), and which devices a process sees no longer
-  splits a Mosaic GPU lowering's key (row 6717). Elsewhere jaxlib stays the stock 0.12.0.1.
+  splits a Mosaic GPU lowering's key (row 6717). Four faults are fixed with them: a staged `custom_jvp` call's
+  shared output under `vmap` through a `shard_map` was summed, now refused as without one; a declared lowering-cache
+  package holding an unreadable file failed the lowering, which now runs uncached; a named barrier's arrive-and-wait
+  in a warp context could hang its block, now refused as its arrive is; and an interpreted Mosaic GPU kernel's
+  shared memory admitted another execution's device beside the live one's, now one execution at a time. A Mosaic
+  GPU kernel branches on whether any or every element of a boolean array holds (`jnp.any`, `jnp.all`) under either
+  semantics, the warpgroup's threads agreeing through one `bar.red` predicate reduction. A Mosaic GPU row made a
+  `[1, n]` one in its own layout broadcasts, where a kernel holding it through an optimization barrier failed to
+  lower; Pallas TPU lowers an optimization barrier; a Mosaic GPU gather or scatter of four rows names the thread
+  that issues it; and the GPU interpreter's race detection orders a copy into shared memory after the reads its
+  thread's synchronization orders, as a ring refilled once its readers release a slot. A Pallas Mosaic GPU float
+  add, subtract or multiply under `xla_no_contract` metadata rounds on its own, where each was contractible into a
+  fused multiply-add, and the lowering cache keys that label; a tiled array, an accumulator's tile among them,
+  reduces whole to a scalar under either semantics; `lax.optimization_barrier` states that it rearranges, so a
+  traced work count reads a program holding one; Mosaic GPU names the provider that assembles a kernel's PTX; a
+  deviceless capture with no CUDA plugin raises `NoCudaPlugin`; and Triton's pipeliner sizes a load's buffers by
+  each wgmma reader's stage, where a wgmma a stage after a register use was one buffer short and the next copy
+  overwrote a tile it still read. The Pallas fuser gives every unary elementwise primitive and the optimization
+  barrier its block-spec rules, so a GEMM's SwiGLU or GELU epilogue fuses into it. Elsewhere jaxlib stays the stock
+  0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes

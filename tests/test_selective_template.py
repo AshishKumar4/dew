@@ -27,7 +27,13 @@ from reference_error import (
     run_to_run,
     with_gradients,
 )
-from selective_support import mamba_selective_side, selective_draw, selective_xla
+from selective_support import (
+    mamba_selective_side,
+    rate_past_the_range,
+    selective_draw,
+    selective_xla,
+    stepwise,
+)
 from test_recurrence_chunk import ROUTES, on_route
 from upstream_support import upstream_arm
 
@@ -117,6 +123,20 @@ def held_to(portable_arm, draws, starts, label: str, template_arm):
           f"{np.asarray(distances[0::2]).mean(0)}", flush=True)
     return upstream_arm(lambda drawn: mamba_selective_side(drawn, starts), draws, (1 + REDRAW) * FEWEST_SEEDS,
                         most=8 * MOST_SEEDS, keyed=lambda *args: args[:-1])
+
+
+def test_a_rate_past_float32s_range_scans_as_the_recurrence_interpreted():
+    """The template's output, final state and every input's gradient at a rate whose `A log2(e)` passes
+    float32's range over a ragged chunk (`selective_support.rate_past_the_range`) on par from float64 with
+    the recurrence a token at a time (`selective_support.stepwise`, check 1), where its parameter tile held
+    the rate in base 2, -inf, and a padded token's zero step made its decay NaN (row 8491)."""
+    template = functools.partial(selective.selective_scan, family=taken_family(jnp.float32),
+                                 interpret=INTERPRETED)
+    exact = jax.jit(with_gradients(stepwise))
+    assert_as_exact(jax.jit(with_gradients(template)), exact,
+                    functools.partial(rate_past_the_range, "vanishing decays"),
+                    "the selective template at a rate past float32's range", seeds=FEWEST_SEEDS,
+                    truth_fn=exact)
 
 
 def taken_family(dtype) -> mosaic.Family:

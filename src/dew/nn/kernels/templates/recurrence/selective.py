@@ -198,7 +198,7 @@ class Documents:
 @tuning.lowered_once(("scan",))
 def forward(x, dt, b, c, parameters, state, resets, scan: Scan, table: tuple = ()):
     """The scan's outputs from padded operands: `x`, `dt` `[R, T, D]`, `b`, `c` `[R, T, N]`, `parameters`
-    `[N + PARAMETER_ROWS, D]` fp32 (the rates `A log2(e)` transposed, then the skip `D`), `state` `[R, N, D]`
+    `[N + PARAMETER_ROWS, D]` fp32 (the rates `A` transposed, then the skip `D`), `state` `[R, N, D]`
     fp32 and `resets` `[R, T, RESET_WIDTH]` int8 (a token's flag in every column; ignored unless
     `scan.packed`). Returns `y` `[R, T, D]` in `x`'s dtype, the final state `[R, N, D]` fp32, with
     `scan.entered` the entering state of each chunk opening a backward block `[R, chunks / opening, N, D]`
@@ -554,7 +554,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
     block's entering state by a scan (`block_scan.linear_scan`, each token's state before it, `h_{t-1}`), then
     its cotangents back by a reverse one from the state's carried from the block after (`dfinal` past the
     last): `q_t = a_t (C_t dy_t + q_{t+1})`, the cotangent a token passes the state before it, so
-    `g_t = C_t dy_t + q_{t+1}` the state's own, its decay `a_t = exp2(dt_t rate)` (zero at a document's
+    `g_t = C_t dy_t + q_{t+1}` the state's own, its decay `a_t = exp(dt_t A)` (zero at a document's
     first token). The channel's gradients sum over its states in registers; the states' B and C gradients
     sum over the channels in global memory, each program's added atomically (mamba_ssm's atomicAdd), a
     block's tokens across the threads so a warp's adds are adjacent (cub's BlockedToStriped), into one of
@@ -782,10 +782,10 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
 
 
 def _parameters(A, D, channels: int):
-    """`forward`'s parameter tile: the rates `A log2(e)` transposed, then the skip, padded to the stream's
-    rows."""
+    """`forward`'s parameter tile: the rates `A` transposed (`algebra.selective_decay` takes them to base 2
+    after the step multiplies them), then the skip, padded to the stream's rows."""
     padding = jnp.zeros((PARAMETER_ROWS - 1, channels), jnp.float32)
-    return jnp.concatenate([(A * algebra.LOG2_E).T, D[None], padding])
+    return jnp.concatenate([A.T, D[None], padding])
 
 
 def _scan_primal(x, dt, A, B, C, D, entering, resets, scan: Scan, *table):

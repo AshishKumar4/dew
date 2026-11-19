@@ -13,6 +13,7 @@ import subprocess
 import sys
 from uuid import uuid4
 
+import jax
 import numpy as np
 import pytest
 from reader_support import resumed_changes, saved_after_one
@@ -927,3 +928,209 @@ def test_an_exact_resume_refuses_an_attrs_step_whose_long_array_changed(tmp_path
     assert resumed_changes(reader(), state) == ()
     with pytest.raises(ValueError):
         resumed_changes(reader(changed=True), state)
+
+
+HIDDEN = """import attrs
+import dataclasses
+
+import numpy as np
+
+
+@attrs.define(frozen=True, eq=False)
+class AttrsRemap:
+    table: np.ndarray = attrs.field(repr=False)
+    note: str = attrs.field(default="", eq=False)
+
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + int(self.table[int(row["id"])])}}
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class DataclassRemap:
+    table: np.ndarray = dataclasses.field(repr=False)
+    note: str = dataclasses.field(default="", compare=False)
+
+    def __call__(self, row):
+        return {{**row, "id": row["id"] + int(self.table[int(row["id"])])}}
+
+
+@attrs.define(frozen=True, eq=False)
+class AttrsRoute:
+    handlers: dict
+
+    def __call__(self, row):
+        return row
+
+
+class SubclassRemap(DataclassRemap):
+    # Subclassed without a decorator: its instances hold their base's fields.
+    pass
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class DataclassRoute:
+    handlers: dict
+
+    def __call__(self, row):
+        return row
+
+
+def remap(kind, changed=False, note=""):
+    table = np.arange(8)
+    if changed:
+        table[1] = -1
+    return {{"attrs": AttrsRemap, "dataclass": DataclassRemap, "subclass": SubclassRemap}}[kind](table, note)
+
+
+def route(kind):
+    handlers = {{}}
+    routed = {{"attrs": AttrsRoute, "dataclass": DataclassRoute}}[kind](handlers)
+    handlers["fallback"] = routed
+    return routed
+"""
+
+
+@pytest.fixture
+def hidden(tmp_path, monkeypatch):
+    """`HIDDEN`'s steps, written as a module of their own."""
+    module = tmp_path / f"hidden_{uuid4().hex}.py"
+    module.write_text(HIDDEN.format())
+    monkeypatch.syspath_prepend(str(tmp_path))
+    return importlib.import_module(module.stem)
+
+
+@pytest.mark.parametrize("kind", ["attrs", "dataclass", "subclass"])
+def test_an_exact_resume_refuses_a_steps_hidden_field_that_changed_and_holds_one_that_decides_nothing(
+        hidden, kind):
+    """A step is stated by every field that decides its equality: a table it hides from its repr
+    (`repr=False`, as a large array is) and that changed refuses an exact resume, where it resumed and read
+    other rows; a field that declares it decides no equality (`eq=False`, `compare=False`: a note,
+    credentials) changes nothing it reads, and the run resumes exactly (train 966's review, F3); a subclass
+    no decorator made holds its base's fields, which state it too (train 1013's review, F2)."""
+    def reader(**settings):
+        pipeline = Pipeline(ROWS).map(hidden.remap(kind, **settings)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(note="another"), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(changed=True), state)
+
+
+@pytest.mark.parametrize("kind", ["attrs", "dataclass"])
+def test_a_step_whose_fields_lead_back_to_it_compiles_and_resumes_exactly(hidden, kind):
+    """A step whose field holds a mapping that holds the step itself is stated with a reference back to it,
+    and its pipeline compiles, reads and resumes exactly; describing it recursed past Python's limit and
+    crashed the compile (train 966's review, F2)."""
+    def reader():
+        pipeline = Pipeline(ROWS).map(hidden.route(kind)).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+
+
+def _bumped(ids):
+    return ids + 1
+
+
+BUMPED = jax.jit(_bumped)
+"""A jitted function of this module's own, which a step's code reads."""
+
+
+def read_exactly(step):
+    """`ROWS` read through `step`, shuffled and batched by two, resumed exactly."""
+    pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
+    return compile(pipeline, read="indexed", loading=READ, resume="exact").train(DataPartition())
+
+
+def shifted_by(seed: int):
+    """A step made inside a function (`shifted_by_key`) closing over the typed key of `seed`."""
+    return shifted_by_key(jax.random.key(seed))
+
+
+def shifted_by_key(key):
+    """A step made inside a function: each id bumped (`BUMPED`) and shifted by a draw of its typed `key`,
+    which its closure holds."""
+    def shift(row):
+        return {**row, "id": np.int32(BUMPED(row["id"]) + int(jax.random.randint(key, (), 0, 3)))}
+    return shift
+
+
+def library_scaled_by(factor: int):
+    """A step made inside a function of a library's module (its `__module__` the standard library's
+    `json`), multiplying each id by `factor`, which its closure holds."""
+    def scale(row):
+        return {**row, "id": row["id"] * factor}
+    scale.__module__ = "json"
+    return scale
+
+
+@pytest.mark.parametrize(("made", "same", "other"), [
+    (shifted_by, 0, 1), (library_scaled_by, 3, 4)], ids=["own", "library"])
+def test_a_step_made_inside_a_function_resumes_exactly_only_with_its_closure(made, same, other):
+    """A step made inside a function is stated by its code and what it reads, its closure among it
+    (`dew._stated.stated`), whosever module made it: one of the user's own, which reads a jitted function
+    of the user's and closes over a typed PRNG key, and one a library's module made (`library_scaled_by`).
+    Its run resumes exactly where its closure holds the same value, and is refused where it holds another.
+    Such a step was inexact (its name's `<locals>`); then a jitted function of the user's had no
+    statement, a typed key crashed the statement that fetched its bits (row 7814; train 1019's review, F1
+    and F3), and a library's held by its module's version alone shared one identity over any closure
+    (train 1022's review)."""
+    def reader(value):
+        return read_exactly(made(value))
+
+    state = saved_after_one(lambda: reader(same))
+    assert resumed_changes(reader(same), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(other), state)
+
+
+def shifted_where_weak(value):
+    """A step made inside a function: each id shifted by one where the array it closes over is weakly
+    typed, as a trace that promotes by it computes otherwise."""
+    def shift(row):
+        return {**row, "id": np.int32(row["id"] + (1 if value.weak_type else 0))}
+    return shift
+
+
+def _flipped_bits(key, bit_width, shape):
+    """Threefry's random bits, each flipped: an implementation of its own under the default tag."""
+    from jax.extend import random as extended
+
+    return jax.numpy.bitwise_not(extended.threefry_prng_impl.random_bits(key, bit_width, shape))
+
+
+def _tagged_alike(*, flipped: bool):
+    """A typed key of key data 0 under an implementation printing the default tag (`?`): threefry's, or
+    threefry's with its random bits flipped."""
+    from jax.extend import random as extended
+
+    threefry = extended.threefry_prng_impl
+    impl = extended.define_prng_impl(key_shape=threefry.key_shape, seed=threefry.seed, split=threefry.split,
+                                     random_bits=_flipped_bits if flipped else threefry.random_bits,
+                                     fold_in=threefry.fold_in)
+    return jax.random.wrap_key_data(jax.numpy.zeros(threefry.key_shape, jax.numpy.uint32), impl=impl)
+
+
+@pytest.mark.parametrize("held", ["weak type", "key implementation"])
+def test_a_captured_array_differing_only_in_what_its_bytes_do_not_hold_refuses_exact_resume(held):
+    """A step closing over an array of JAX's whose bytes, dtype name and sharding are the same as the one
+    its run saved with, but whose weak type, or whose typed key's implementation under one printed tag,
+    differs: its exact resume is refused, where the statement held neither and the resumed run read other
+    rows, or drew other bits, as an unchanged one (rows 7903, 7904). The same array resumes exactly."""
+    import jax.numpy as jnp
+
+    if held == "weak type":
+        saved, other = jnp.asarray(1), jnp.asarray(1, dtype=jnp.int32)
+        assert saved.weak_type and not other.weak_type
+        step = shifted_where_weak
+    else:
+        saved, other = _tagged_alike(flipped=False), _tagged_alike(flipped=True)
+        assert str(saved.dtype) == str(other.dtype)
+        step = shifted_by_key
+
+    state = saved_after_one(lambda: read_exactly(step(saved)))
+    assert resumed_changes(read_exactly(step(saved)), state) == ()
+    with pytest.raises(ValueError):
+        resumed_changes(read_exactly(step(other)), state)

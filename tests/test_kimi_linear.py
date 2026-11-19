@@ -26,7 +26,7 @@ from kimi_support import (
     kimi_source,
     recorded_dew,
 )
-from reference_runs import assert_as_exact_as_recorded
+from recorded_runs import assert_as_exact_as_recorded
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "kimi-linear-tiny"

@@ -16,6 +16,8 @@ def collected(lines: Iterable[str]) -> dict[str, set[str]]:
     for line in lines:
         node = line.strip()
         if node.startswith("tests/") and "::" in node:
+            # The node's file as grading.owning reads it, spelled here: ci.py loads this
+            # module by its path, where grading is no sibling it can import.
             found.setdefault(node.split("::")[0], set()).add(node)
     return found
 

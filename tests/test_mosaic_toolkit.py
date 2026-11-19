@@ -10,14 +10,26 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
 from kernel_compile import gate_generations, stated_outputs
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, handoffs, mosaic, outputs, product, rings, stores, swizzling
+from dew.nn.kernels.templates import (
+    across,
+    emission,
+    handoffs,
+    mosaic,
+    outputs,
+    product,
+    rings,
+    stacked,
+    stores,
+    swizzling,
+)
+from dew.nn.kernels.templates.cost import Stated
 
 pytestmark = pytest.mark.kernel
 
@@ -96,9 +108,10 @@ def _expected(x):
 
 
 def _stream():
-    """Small integers, so any tile's sum is exact in fp32 whatever its order."""
+    """Small integers, so any tile's sum is exact in fp32 whatever its order: NumPy's, as a site's draws are
+    (a GPU tier's prepare computes on no device)."""
     steps = _first_step(TILES)
-    return jax.random.randint(jax.random.key(0), (steps * BLOCK[0], BLOCK[1]), -64, 64).astype(jnp.bfloat16)
+    return np.random.default_rng(0).integers(-64, 64, (steps * BLOCK[0], BLOCK[1])).astype(jnp.bfloat16)
 
 
 @INTERPRETS
@@ -123,9 +136,13 @@ def test_the_ring_lowers_for_an_h100(consumers):
 
 
 def a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
-    """The ring's kernel compiled and run on an H100, where the interpreter's no-op waits are real."""
+    """The ring's kernel compiled and run on an H100, where the interpreter's no-op waits are real, its
+    program compiled in a tier's prepare (`ahead_arm`)."""
+    from reference_error import ahead_arm
+
     x = _stream()
-    summed = jax.jit(functools.partial(_ring_sums, interpret=False, consumers=consumers))(x)
+    summed = ahead_arm(jax.jit(functools.partial(_ring_sums, interpret=False, consumers=consumers)),
+                       f"a ring's tile sums: {consumers} consumers")(x)
     np.testing.assert_array_equal(np.asarray(summed), _expected(x))
 
 
@@ -193,10 +210,11 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
 
 
 def _fed_operands():
-    """Small integers, so the product is exact in fp32 whatever its order."""
-    keys = jax.random.split(jax.random.key(1))
-    p = jax.random.randint(keys[0], (FED_ROWS, FED_STEPS * FED_ROWS), -4, 4).astype(jnp.bfloat16)
-    x = jax.random.randint(keys[1], (FED_STEPS * FED_ROWS, FED_WIDTH), -4, 4).astype(jnp.bfloat16)
+    """Small integers, so the product is exact in fp32 whatever its order: NumPy's (a GPU tier's prepare
+    computes on no device)."""
+    rng = np.random.default_rng(1)
+    p = rng.integers(-4, 4, (FED_ROWS, FED_STEPS * FED_ROWS)).astype(jnp.bfloat16)
+    x = rng.integers(-4, 4, (FED_STEPS * FED_ROWS, FED_WIDTH)).astype(jnp.bfloat16)
     return p, x
 
 
@@ -236,9 +254,13 @@ def test_the_fed_walk_lowers_for_an_h100(consumers):
 
 
 def consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
-    """The fed walk compiled and run on an H100, where the interpreter's no-op waits are real."""
+    """The fed walk compiled and run on an H100, where the interpreter's no-op waits are real, its program
+    compiled in a tier's prepare (`ahead_arm`)."""
+    from reference_error import ahead_arm
+
     p, x = _fed_operands()
-    got = jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, lo=lo))(p, x)
+    got = ahead_arm(jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, lo=lo)),
+                    f"a fed walk's products: {consumers} consumers from {lo}")(p, x)
     for value, expected in zip(got, _fed_expected(p, x), strict=True):
         np.testing.assert_array_equal(np.asarray(value), expected)
 
@@ -738,13 +760,13 @@ def test_an_sm80_side_vector_loads_in_the_layout_of_the_axis_it_follows(axis):
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     """Two zeroed refs of one shape and dtype a launch adds into in place are one value to XLA, which a
     dynamic-slice fusion wrapping the launch passes once for both (row 3180): `mosaic.checked` refuses the
-    launch where it traces them, and takes them stacked into one ref (`stacked_zeros`), each member its own
-    place: a launch writing a value of its own into each view (`stacked_views`) reads each back apart
-    (`stacked_read`), in its shapes' order."""
+    launch where it traces them, and takes them stacked into one ref (`stacked.zeros`), each member its own
+    place: a launch writing a value of its own into each view (`stacked.views`) reads each back apart
+    (`stacked.read`), in its shapes' order."""
     shapes = [(2, 3), (4,), (2, 3)]
 
     def written(*refs):
-        for index, view in enumerate(mosaic.stacked_views(refs, groups)):
+        for index, view in enumerate(stacked.views(refs, groups)):
             view[...] = jnp.full(view.shape, index + 1.0)
 
     launched = mosaic.checked(written, "probe")
@@ -752,16 +774,16 @@ def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     def apart():
         launched(*(jax.new_ref(jnp.zeros(shape, jnp.float32)) for shape in shapes))
 
-    groups = mosaic.stacked_groups(shapes)
+    groups = stacked.groups(shapes)
     with pytest.raises(ValueError):
         jax.jit(apart).trace()
 
-    def stacked():
-        refs = mosaic.stacked_zeros(shapes, groups, jnp.zeros(()))
+    def together():
+        refs = stacked.zeros(shapes, groups, jnp.zeros(()))
         launched(*refs)
-        return mosaic.stacked_read(refs, groups)
+        return stacked.read(refs, groups)
 
-    for index, (shape, array) in enumerate(zip(shapes, jax.jit(stacked)(), strict=True)):
+    for index, (shape, array) in enumerate(zip(shapes, jax.jit(together)(), strict=True)):
         np.testing.assert_array_equal(array, np.full(shape, index + 1.0))
 
 
@@ -1298,6 +1320,7 @@ def test_the_gemms_kernel_bodies_run_on_a_tpu_core(case):
         jax.jit(call).trace(*abstract).lower(lowering_platforms=("tpu",))
 
 
+@COMPILES_ON_CPU
 def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_gates_cap_spill_free():
     """A persistent warpgroup-MMA walk, one consumer beside its producer, launched at each residency its
     family admits a multiprocessor on an H100 (`RegisterModel.most`) and compiled as the GPU gate compiles
@@ -1426,12 +1449,15 @@ def _negated(a, b, *, path: str, interpret: bool):
 def every_warpgroup_read_lands_its_products_on_an_h100(path: str):
     """On an H100: each read path of a warpgroup accumulator (`READS`) gives the products' value to a sign op
     on its registers, `-(a @ b)` exactly over small integers, where ptxas dropped the MMA and stored -0.0
-    (row 4346)."""
-    keys = jax.random.split(jax.random.key(7))
-    a, b = (jax.random.randint(key, (LANDED, LANDED), -2, 3).astype(jnp.bfloat16) for key in keys)
+    (row 4346); its program compiled in a tier's prepare (`ahead_arm`), its operands NumPy's."""
+    from reference_error import ahead_arm
+
+    rng = np.random.default_rng(7)
+    a, b = (rng.integers(-2, 3, (LANDED, LANDED)).astype(jnp.bfloat16) for _ in range(2))
     expected = -(np.asarray(a, np.float32) @ np.asarray(b, np.float32))
-    np.testing.assert_array_equal(np.asarray(jax.jit(functools.partial(_negated, path=path,
-                                                                       interpret=False))(a, b)), expected)
+    negated = ahead_arm(jax.jit(functools.partial(_negated, path=path, interpret=False)),
+                        f"a warpgroup read's negated products: {path}")
+    np.testing.assert_array_equal(np.asarray(negated(a, b)), expected)
 
 
 @INTERPRETS
@@ -1937,7 +1963,8 @@ def test_a_uniform_read_gives_each_lane_its_warps_lane_zero_value(read):
         each = plgpu.ShapeDtypeStruct((128,), jnp.dtype(jnp.int32), layout=lanes)
         out_gmem[...] = plgpu.inline_mgpu(arg_types=(scalar,), return_type=each)(spread)(read_value)
 
-    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.int32), grid=(1,))()
+    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.int32), grid=(1,),
+                       grid_names=("programs",))()
     threads = np.arange(128, dtype=np.int32)
     expected = (threads // 32 * 32 if read == "uniform" else threads) + 7
     np.testing.assert_array_equal(np.asarray(out), expected)
@@ -2107,3 +2134,114 @@ def test_a_values_parts_sum_back_to_it_exactly_fp32s_largest_among_them():
     past = 2.0**128 - 2.0**111
     x = jnp.asarray([largest, past, -largest, -past, 1.0 + 2.0**-23], jnp.float32)
     np.testing.assert_array_equal(np.asarray(product.whole(product.formed(x, 3))), np.asarray(x))
+
+STAGED = (8, 32, 3)
+"""A staged output's tile: its rows, a chunk buffer's columns, and its chunks (two buffers, two tiles)."""
+
+
+def _staged_launch(waits: tuple[int, ...], **launch):
+    """A kernel storing two tiles in turn of an output staged through two chunk buffers, `STAGED`'s chunks
+    a tile (`stores.staged_chunks` at `waits`, chunk c in buffer c % 2), each tile its columns' indices plus
+    a thousand times its own; `launch` the kernel's other arguments."""
+    rows, width, chunks = STAGED
+
+    def body(out_gmem):
+        def scoped(smem):
+            for tile in range(2):
+                value = jax.lax.broadcasted_iota(jnp.float32, (rows, chunks * width), 1) + 1000.0 * tile
+                stores.staged_chunks(smem, value, out_gmem, (tile * rows, 0, jnp.int32(rows), 0, rows, rows),
+                                     waits=waits)
+            plgpu.wait_smem_to_gmem(0)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, rows, width), jnp.float32))
+
+    return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((2 * rows, chunks * width), jnp.float32),
+                        **launch)
+
+
+@pytest.mark.parametrize("loosened", [None, 0, 2], ids=["derived", "first-chunk", "third-chunk"])
+def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loosened):
+    """An output staged through two chunk buffers three chunks a tile, two tiles in turn (`_staged_launch`),
+    under the GPU interpreter's race detection: at the derived waits (`stores.buffer_waits`: none left in
+    flight before a tile's first chunk, whose buffer the tile before stored last, two before its second, one
+    before its third) every buffer is rewritten only once its last TMA store has read it, the output the
+    tiles' values; a wait allowing one group more at a tile's first chunk or its third rewrites a buffer a
+    store still reads, which the detector names (its second's buffer the first's drain already freed)."""
+    from jax._src.pallas.mosaic_gpu.interpret.interpret_pallas_call import reset_gpu_interpret_mode_state
+
+    rows, width, chunks = STAGED
+    waits = list(stores.buffer_waits(chunks, 2))
+    assert waits == [0, 2, 1]
+    if loosened is not None:
+        waits[loosened] += 1
+    kernel = _staged_launch(tuple(waits), interpret=plgpu.InterpretGPUParams(detect_races=True))
+    if loosened is None:
+        tiles = 1000.0 * np.repeat([0, 1], rows)[:, None]
+        columns = np.arange(chunks * width, dtype=np.float32)
+        np.testing.assert_array_equal(np.asarray(kernel()), columns + tiles)
+        return
+    try:
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            kernel()
+    finally:
+        reset_gpu_interpret_mode_state()
+
+
+@pytest.mark.parametrize("staged", [False, True], ids=["skipped", "staged"])
+def test_a_share_storing_no_rows_stages_no_chunk_between_stored_tiles(staged):
+    """Three tiles of an output staged two chunks a tile through two chunk buffers at the derived waits
+    (`stores.buffer_waits`: one group left in flight before each), the second tile's share storing no rows,
+    under the GPU interpreter's race detection: `stores.staged_chunks` stages nothing for it (no buffer
+    written, no group issued), so each buffer is rewritten once its last store has read it and the output is
+    the first and third tiles' values. Staged anyway, its chunks writing their buffers but issuing no
+    copy, its second chunk's wait counts a group it never issued and rewrites the buffer the first tile's
+    last store still reads, which the detector names (base review 5b513e9af F1)."""
+    from jax._src.pallas.mosaic_gpu.interpret.interpret_pallas_call import reset_gpu_interpret_mode_state
+
+    rows, width, chunks = 8, 32, 2
+    waits = stores.buffer_waits(chunks, 2)
+    assert waits == (1, 1)
+
+    def body(out_gmem):
+        def scoped(smem):
+            for tile, stored in enumerate((rows, 0, rows)):
+                value = jax.lax.broadcasted_iota(jnp.float32, (rows, chunks * width), 1) + 1000.0 * tile
+                place = (min(tile, 1) * rows, 0, jnp.int32(stored), 0, rows, rows)
+                if staged and stored == 0:
+                    for chunk in range(chunks):
+                        plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
+                        stores.staged_rows(smem.at[chunk], value[:, chunk * width:(chunk + 1) * width],
+                                           out_gmem, place[0], 0, place[2], chunk * width, rows, rows)
+                    continue
+                stores.staged_chunks(smem, value, out_gmem, place, waits=waits)
+            plgpu.wait_smem_to_gmem(0)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, rows, width), jnp.float32))
+
+    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((2 * rows, chunks * width), jnp.float32),
+                          interpret=plgpu.InterpretGPUParams(detect_races=True))
+    if not staged:
+        tiles = 1000.0 * np.repeat([0, 2], rows)[:, None]
+        columns = np.arange(chunks * width, dtype=np.float32)
+        np.testing.assert_array_equal(np.asarray(kernel()), columns + tiles)
+        return
+    try:
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            kernel()
+    finally:
+        reset_gpu_interpret_mode_state()
+
+
+def test_a_staged_outputs_launch_states_its_cost():
+    """The staged output's launch (`_staged_launch`, each of its chunks' copies its own store group) costed as
+    the toolkit's launches are (`emission.costed`, the estimate XLA and Dew's FLOP count read): it states the
+    bytes it is given and no arithmetic, a store group's commit priced as the synchronization it is."""
+    from reference_error import equations
+
+    rows, width, chunks = STAGED
+    stored = 2 * rows * chunks * width * 4
+    launch = _staged_launch(stores.buffer_waits(chunks, 2))
+    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=stored)))()
+    [estimate] = [equation.params["cost_estimate"] for equation in equations(traced.jaxpr)
+                  if "cost_estimate" in equation.params]
+    assert (estimate.bytes_accessed, estimate.flops, estimate.transcendentals) == (stored, 0, 0)

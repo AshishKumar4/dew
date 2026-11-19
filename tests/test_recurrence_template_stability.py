@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from fla_sites import LEAVES, the_template_is_as_exact_as_fla
+from fla_sites import FLOOR_GATES, LEAVES, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU
 from map_judge import sharded
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
@@ -260,7 +260,7 @@ def test_an_fp32_rated_scan_through_the_template_stays_finite_interpreted(forms)
 @pytest.mark.parametrize(('name', 'regime', 'forms'),
                          [(name, regime, forms) for name, regime, product, forms in CASES
                           if product == 'forward' and regime in INTERPRETED])
-@pytest.mark.check1_shards(seeds=256, per_task=16)
+@pytest.mark.check1_shards(seeds=256, per_task=8)
 def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, regime, forms):
     """Each form's 16-bit forward through the template, interpreted off a GPU under the regimes that grow its
     tiles most, held as its GPU flow cell is: finite, and its output and final memory on par from float64
@@ -268,9 +268,10 @@ def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, 
     (`recurrence_chunk.chunk_rounding`) put its final memory 2.1e4 times the portable math's distance from
     float64 unseen off a GPU (row 3962). Whole, the cells took 27 to 151 s (Kimi delta attention's aligned
     keys 128, the rated scan's decays near zero under the accurate forms 151, stab-case at d51a2d2cf): a site
-    each, sharded over the most seeds a cell declares, sixteen draws a task, where every cell's 64 a task
+    each, sharded over the most seeds a cell declares, eight draws a task, where every cell's 64 a task
     took 966.6 s, Kimi delta attention's decays near zero 329 of it (train 625's CI, armada job
-    20261105212801-7b615468)."""
+    20261105212801-7b615468), and a cell's sixteen 638 s, past a train's bound (train de27b8e32's CI, row
+    7458)."""
     the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, 'forward', forms)
 
 
@@ -334,6 +335,18 @@ def compiled_gradient(hooks, name: str) -> list[dict]:
 
 
 @COMPILES_ON_CPU
+@pytest.mark.check1_shards(seeds=512, per_task=8)
+def test_kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla_interpreted():
+    """Kimi delta attention's 16-bit gradient through the template, interpreted, under decays at its floor and
+    write gates down to 2^-60 (fla_sites' `FLOOR_GATES`): its output, final memory and every operand's
+    gradient on par with recorded fla-core's from float64 (check 1), its own pairs folded against its unit
+    keys (`mainloop.Call.unit_keys`). The template held 47 to 75 times the exact fp32 recurrence's error
+    there, as on plain draws, which only fla's judges (rows 7906, 7299)."""
+    mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
+    the_template_is_as_exact_as_fla(mosaic, FLOOR_GATES, LEAVES,
+                                    'the template, Kimi delta attention under tiny gates at the floor')
+
+
 def test_a_gradients_kernels_are_each_certified_as_its_program_lowers():
     """The gated delta net's bf16 gradient compiled for a compile-only H100 as a start compiles it
     (`compiled_gradient`): every Mosaic GPU kernel its program runs, its training forward's and its fast

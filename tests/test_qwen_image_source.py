@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 from interop_support import extract_fixture
 from qwen_image_draws import case_draw, pipeline_draw, prompts_of
+from recorded_runs import assert_arms_as_recorded
 from reference_error import (
     GateFailure,
     as_given,
@@ -36,7 +37,6 @@ from reference_error import (
     recording,
     widened,
 )
-from reference_runs import assert_arms_as_recorded
 
 from dew.batch import coordinates
 from dew.interop.diffusion import component_tensors, qwen_image_fields, qwen_image_path, read_transformer
@@ -173,10 +173,13 @@ def cudnn_case():
                                  attention_impl="cudnn")
     mask = jnp.arange(25)[None] < jnp.asarray([[25], [13]])
     times = jnp.asarray([731.0, 42.0])
-    params = model.init(jax.random.PRNGKey(0), jnp.zeros((2, 4, 6, 4)), times,
-                        DenoisingCondition(jnp.zeros((2, 25, 16)), mask=mask))["params"]
+    # One program (row 6857): run op by op, the initializer compiled hundreds of small programs on the GPU the
+    # cell holds.
+    params = jax.jit(model.init)(jax.random.PRNGKey(0), jnp.zeros((2, 4, 6, 4)), times,
+                                 DenoisingCondition(jnp.zeros((2, 25, 16)), mask=mask))["params"]
 
-    def draw(seed: int):
+    @jax.jit
+    def draw(seed):
         keys = jax.random.split(jax.random.PRNGKey(seed), 3)
         return (jax.random.normal(keys[0], (2, 4, 6, 4)), jax.random.normal(keys[1], (2, 25, 16)),
                 jax.random.normal(keys[2], (2, 4, 6, 4)))

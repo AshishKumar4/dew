@@ -23,8 +23,7 @@ import optax
 import pytest
 from lane_environment import without_flags
 from flax import linen as nn
-from flax.core import FrozenDict
-from interop_support import token_draw
+from interop_support import extract_fixture, token_draw
 from model_support import parameter_loss
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, with_gradients
 from token_support import token_rows
@@ -726,12 +725,10 @@ def flux_source(root: Path):
     is widened to 64 features over freshly drawn weights: the source's 24
     make int8 GEMMs cuBLAS 13 refuses on an A100, as do its 16-wide inputs
     and outputs, which `FLUX_BLOCKS` leaves in float."""
-    import tarfile
 
     from dew.interop.pretrained import Pretrained
 
-    with tarfile.open(Path(__file__).parent / "fixtures/flux_source.tar.xz") as archive:
-        archive.extractall(root, filter="data")
+    extract_fixture(Path(__file__).parent / "fixtures/flux_source.tar.xz", root)
     task = Pretrained.load(root / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
     model = task.model.clone(heads=2, head_dim=32, axes_dims_rope=(8, 12, 12))
     example = task.prepare("", key=0, steps=1)
@@ -923,63 +920,6 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
 
     assert_as_exact(packed_side, canonical_side, lambda seed: (np.int32(seed),), "packed quantized pipeline",
                     seeds=PACKED_SEEDS, truth_fn=truth)
-
-
-def test_a_program_finds_every_quantized_tower_its_models_hold():
-    """The options a program compiles with read the quantization of every model it is handed and every
-    tower those hold (`quantizations`): a quantized text transformer inside a condition's encoder record,
-    inside the tuple of a task's encoders, counts as a quantized denoiser handed alone does, and an
-    unquantized one adds nothing."""
-    from dew.nn.kernels.options import quantizations
-
-    pytest.importorskip("qwix")
-
-    @dataclasses.dataclass(frozen=True)
-    class Encoder:
-        transformer: nn.Module
-        params: dict
-
-    spec = Quantization(dtype="int8")
-    plain = tiny()
-    quantized = spec.apply(plain)
-    weights = {"params": {"kernel": np.zeros((2, 2), np.float32)}}
-    assert quantizations(plain, (("textcontext", Encoder(plain, weights)),)) == []
-    held = quantizations((("textcontext", Encoder(quantized, weights)),))
-    assert [found.dtype for found in held] == ["int8"]
-    assert quantizations(quantized) == held
-    # A FrozenDict makes each nested mapping as it is read: a tower behind fifty such siblings is found.
-    nested = FrozenDict({f"branch_{index}": {"leaf": {"value": np.zeros(())}} for index in range(50)}
-                        | {"tower": {"encoder": Encoder(quantized, weights)}})
-    assert [found.dtype for found in quantizations(nested)] == ["int8"]
-
-
-def test_a_diffusion_step_compiles_for_the_quantized_text_tower_it_encodes_with():
-    """A text-to-image objective's programs run its conditions' encoders and its autoencoder beside its
-    denoiser (`Objective.towers`), so the options its step and its samples compile with read a quantized
-    text tower (`compiler_options`) as they read a quantized denoiser."""
-    from pathlib import Path
-
-    from dew.diffusion import presets
-    from dew.inputs import Condition, Field, InputSpec
-    from dew.interop.encoders import CLIPText
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.nn.kernels.options import quantizations
-    from dew.objectives.diffusion import DiffusionObjective
-
-    pytest.importorskip("qwix")
-    encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures" / "clip" / "tiny"))
-
-    def objective(tower):
-        return DiffusionObjective(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
-                                            mlp_ratio=1),
-                                  presets.Flow(), InputSpec(Field("image", (8, 8, 3)),
-                                                            {"textcontext": Condition(tower)}),
-                                  guidance=None, steps=2)
-
-    assert quantizations(*objective(encoder).towers()) == []
-    tower = Quantization(dtype="int8").apply(encoder.transformer)
-    quantized = dataclasses.replace(encoder, transformer=tower)
-    assert [found.dtype for found in quantizations(*objective(quantized).towers())] == ["int8"]
 
 
 SPLIT_SEEDS = 16

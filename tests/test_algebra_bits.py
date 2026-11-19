@@ -79,6 +79,21 @@ def test_nvfp4_words_stored_in_the_forms_layout_decode_to_their_codes_in_order()
     np.testing.assert_array_equal(got, expected)
 
 
+def test_a_decoded_value_restored_wide_is_its_float32_restoring_widened():
+    """`bits.restored` in float64, a float64 truth's, is its float32 restoring widened exactly (NumPy's
+    widening on the host, a float32 subnormal kept), bit for bit, at every 16-bit pattern, a NaN as a NaN:
+    one definition of the decoded value at every dtype (row 8661)."""
+    patterns = jnp.arange(1 << 16, dtype=jnp.uint32)
+    narrow = np.asarray(jax.jit(bits.restored)(patterns))
+    with jax.enable_x64(new_val=True):
+        wide = np.asarray(jax.jit(lambda pattern: bits.restored(pattern, jnp.float64))(patterns))
+    assert wide.dtype == np.float64
+    numbers = ~np.isnan(narrow)
+    np.testing.assert_array_equal(np.isnan(wide), ~numbers)
+    np.testing.assert_array_equal(wide[numbers].view(np.uint64),
+                                  narrow[numbers].astype(np.float64).view(np.uint64))
+
+
 def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
     """An NVFP4 tile (`nvfp4_decoded`): every code in every place of a word, under E4M3 block scales from the
     least subnormal to the largest, decodes to the code times its block's scale over `NVFP4_OWED`, exactly,
@@ -99,6 +114,29 @@ def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
     block = np.repeat(np.asarray(scales.astype(jnp.float32), np.float64), 16, axis=0)
     np.testing.assert_array_equal(np.asarray(decoded.astype(jnp.float32), np.float64) * bits.NVFP4_OWED,
                                   values * block)
+
+
+def test_a_block_scales_declared_decode_is_the_formats_on_every_code():
+    """The block scale's declared decode (`bits.E4M3_SCALE`, a fixed layout), its checked-in form proven
+    (`bits.proven`) and no dearer than the search's, restored by its one rule (`bits.scales_decoded`), is
+    the format's integer decode (`bits.decoded`) on every E4M3 code, bit for bit under a jit: subnormal
+    scales, both zeros and the NaN code (read as 480) among them."""
+    bits.proven(bits.E4M3_SCALE, bits.E4M3_SCALE_FORM)
+    assert bits.E4M3_SCALE_FORM.price <= bits.synthesized(bits.E4M3_SCALE).price
+    codes = jnp.arange(256, dtype=jnp.uint32)
+    declared = jax.jit(bits.scales_decoded)(codes)
+    integer = jax.jit(lambda codes: bits.decoded(codes, bits.E4M3))(codes)
+    np.testing.assert_array_equal(np.asarray(declared).view(np.uint32), np.asarray(integer).view(np.uint32))
+
+
+def test_a_forms_version_is_its_stored_layouts():
+    """A form's version (`BitForm.version`, what a packed checkpoint records) is its encoder's: forms of one
+    encoder share it whatever their steps, and another encoder's differs, so words stored in another
+    layout are told apart from the checked-in form's."""
+    form = bits.NVFP4_BFLOAT16_FORM
+    restepped = dataclasses.replace(form, steps=form.steps[:-1])
+    reencoded = dataclasses.replace(form, encoder=(*form.encoder[1:], form.encoder[0]))
+    assert restepped.version == form.version != reencoded.version
 
 
 def test_an_fp8_decode_reads_back_every_finite_code_in_every_place():
@@ -233,6 +271,7 @@ FORMS = {
     "encode-e4m3": lambda: bits.encode_form(bits.E4M3),
     "encode-e5m2": lambda: bits.encode_form(bits.E5M2),
     "encode-e2m1": lambda: bits.encode_form(bits.E2M1),
+    "e4m3-scale": lambda: bits.E4M3_SCALE_FORM,
 }
 """Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx`): a rotation, left
 and right shifts on either pipe, and a mask of one value and of two values' XOR; and an encode's (every
@@ -282,23 +321,14 @@ def _inline_decode(form: bits.BitForm):
 def test_a_forms_ptx_compiles_for_the_gpu(generation, name):
     """A form's PTX in a Triton kernel's inline assembly, lowered and compiled by XLA for a compile-only GPU
     of `generation` (`tests/kernel_compile.py`): ptxas takes every instruction PTX writes for a form
-    (`FORMS` take them all)."""
+    (`FORMS` take them all). What a form's PTX computes on a GPU is held where a kernel consumes it, never a
+    unit test on a GPU (the owner's rule): the NVFP4 form in the packed GEMM's mainloop, through
+    tests/test_gpu_gemm.py's NVFP4 product cells (every order, sm80 and sm90, its decode's PTX form a cell's
+    fault) and its NVFP4 matrix (a training step with the matrix decoded in the mainloop, check 1)."""
     from kernel_compile import lowered_for
 
     words = jax.ShapeDtypeStruct((1024,), jnp.uint32)
     lowered_for(_inline_decode(FORMS[name]()), (words,), generation).compile()
-
-
-@pytest.mark.gpu(reason="runs a form's PTX on this host's GPU")
-@pytest.mark.parametrize("name", FORMS)
-def test_a_forms_ptx_decodes_on_the_gpu_as_its_form_does(name):
-    """A form's PTX run on the GPU (`BitForm.ptx` in a Triton kernel's inline assembly) gives every register
-    of every drawn stored word as the form's own decode does, each instruction PTX writes among them."""
-    form = FORMS[name]()
-    words = np.random.default_rng(3734).integers(0, 1 << 32, size=1 << 16, dtype=np.uint64)
-    decoded = jax.jit(_inline_decode(form))(jnp.asarray(words.astype(np.uint32)))
-    for got, expected in zip(decoded, form.decoded(words), strict=True):
-        np.testing.assert_array_equal(np.asarray(got).astype(np.uint64), expected)
 
 
 MINIFLOATS = {"e4m3": (bits.E4M3, ml_dtypes.float8_e4m3fn), "e5m2": (bits.E5M2, ml_dtypes.float8_e5m2),

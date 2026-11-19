@@ -48,7 +48,7 @@ def fused_seam(epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=No
                                                                after_cast, portable, axes=axes)
 
 
-def fused_activated(epsilon: float, activation):
+def fused_activated(epsilon: float, activation, *, axes=None):
     """The fused RMS norm with `activation` after it (`norm_swiglu.rms_norm`'s epilogue), as `fused_seam`
     is."""
     def portable(x, scale):
@@ -57,26 +57,26 @@ def fused_activated(epsilon: float, activation):
                                      activation=activation)[1]
 
     return lambda x, scale: norm_swiglu.rms_norm(x, scale, epsilon, x.dtype, offset=False, after_cast=False,
-                                                 portable=portable, epilogue=activation)
+                                                 portable=portable, epilogue=activation, axes=axes)
 
 
-def fused_gated(epsilon: float, dtype, activation: str):
+def fused_gated(epsilon: float, dtype, activation: str, *, axes=None):
     """The fused gated norm called itself (`norm_swiglu.gated_rms_norm`), as `fused_seam` is."""
     def portable(x, gate, scale):
         return gated_rms_normalized(x, gate, scale, epsilon, dtype, activation, implementation="xla")
 
     return lambda x, gate, scale: norm_swiglu.gated_rms_norm(x, gate, scale, epsilon, dtype, activation,
-                                                            portable)
+                                                            portable, axes=axes)
 
 
-def fused_unweighted(epsilon: float):
+def fused_unweighted(epsilon: float, *, axes=None):
     """`norms.unweighted_rmsnorm` fused (`norm_swiglu.rms_norm`'s `inverse_rounded`), as `fused_seam`
     is."""
     def portable(x, scale):
         return norms.unweighted_rmsnorm(x, epsilon, implementation="xla")
 
     return lambda x: norm_swiglu.rms_norm(x, None, epsilon, x.dtype, offset=False, after_cast=False,
-                                          portable=portable, inverse_rounded=True)
+                                          portable=portable, inverse_rounded=True, axes=axes)
 
 
 def fused_swiglu(*, axes=None):
@@ -276,6 +276,39 @@ def test_a_norms_activation_choosing_a_branch_runs_on_the_tile(taken):
     compare((functools.partial(plain, jnp.float32), fused, functools.partial(plain, jnp.float64)),
             lambda draw: norm_operands((2, 3, 9), jnp.float32, jnp.float32, draw), ("y", "x", "weight"),
             SEEDS[(2, 3, 31)])
+
+
+@pytest.mark.parametrize("taken", [True, False])
+def test_a_norms_activation_choosing_a_branch_by_a_known_predicate_lowers_for_a_gpu(taken):
+    """The fused norm with an activation choosing between two branches by a predicate it closes over
+    (`lax.cond` on a constant), lowered through Pallas's Triton lowering for an H100 on this CPU: the branch
+    the predicate names runs on the tile, where Triton's conditional rule, which reads its index's MLIR type,
+    failed on the constant ("'TypedNdArray' object has no attribute 'type'", on an A100 and a GH200)."""
+    fused, _ = _fused_norm(lambda y: jax.lax.cond(jnp.asarray(taken), lambda v: v * 2, lambda v: v + 1, y))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(fused).trace(jax.ShapeDtypeStruct((2, 3, 32), jnp.float32),
+                             jax.ShapeDtypeStruct((32,), jnp.float32)).lower(lowering_platforms=("cuda",))
+
+
+def a_norm_with_dews_silu_after_it_holds_the_float64_gate():
+    """The fused fp32 norm with Dew's own silu after it (`activations.silu`, `x` times the one logistic, a
+    declared tangent over a marked span the kernel's lowering runs as its body), its output and its input's
+    and weight's gradients on par with XLA's (check 1): interpreted on a CPU, and compiled through Pallas's
+    Triton lowering on a GPU (tests/test_gpu_numerics.py), where a span the lowering cannot take fails the
+    launch (row 7371)."""
+    from dew.nn import activations
+
+    assert norm_swiglu.elementwise(activations.silu, (2, 3, 31))
+    fused, plain = _fused_norm(activations.silu)
+    compare((functools.partial(plain, jnp.float32), fused, functools.partial(plain, jnp.float64)),
+            lambda draw: norm_operands((2, 3, 31), jnp.float32, jnp.float32, draw), ("y", "x", "weight"),
+            SEEDS[(2, 3, 31)])
+
+
+def test_a_norm_with_dews_silu_after_it_holds_the_float64_gate():
+    """`a_norm_with_dews_silu_after_it_holds_the_float64_gate`, interpreted on a CPU."""
+    a_norm_with_dews_silu_after_it_holds_the_float64_gate()
 
 
 def test_a_norms_activation_keeps_its_own_derivative():

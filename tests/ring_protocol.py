@@ -8,14 +8,17 @@ The events are the kernel's own equations: an `mbarrier` wait (`barrier_wait`, a
 without one, Mosaic's tracked phase), an arrival (`barrier_arrive`, or a tcgen05 commit's,
 `tcgen05_commit_arrive`, asynchronous, once the products its thread issued before it complete), a TMA
 load (`copy_gmem_to_smem`: an arrival with its transaction at issue, its bytes landing later, out of order
-with other copies), a TMA store (`copy_smem_to_gmem`, reading shared memory until `wait_smem_to_gmem`
-retires it), a generic proxy's fence (`commit_smem`), a warpgroup product (`wgmma`, reading shared memory
-until `wgmma_wait` retires it) or a tcgen05 one (`tcgen05_mma`, until its thread's next commit completes), a
-shared-memory read or write (`get`, `swap`), and an inlined body's (`inline_mgpu`, lane-level code the
-jaxpr does not show) as its body's own fields state them (`INLINED`: a gathered ring's barriers' arrivals,
-its parity waits, and each load warp's gathers and the first's expecting arrival). Index arithmetic, loops
-and branches are evaluated concretely per warpgroup and warp (`axis_index`), so each program is its own
-fixed sequence of events: no control flow reads shared memory a peer writes.
+with other copies), a TMA store (`copy_smem_to_gmem`, reading shared memory until a `wait_smem_to_gmem`
+retires its group, which it or a `commit_group` commits), a generic proxy's fence (`commit_smem`), a
+warpgroup product (`wgmma`, reading shared memory until `wgmma_wait` retires it) or a tcgen05 one
+(`tcgen05_mma`, until its thread's next commit completes), a shared-memory read or write (`get`, `swap`),
+and an inlined body's (`inline_mgpu`, lane-level code the jaxpr does not show) as its body's own fields
+state them (`INLINED`: a gathered ring's barriers' arrivals, its parity waits, and each load warp's gathers
+and the first's expecting arrival, its step's entries read where the step before filled them, and the next
+step's filled: `fill`, an asynchronous write landing later, `fill_wait` its thread's wait for its fills,
+cp.async's). Index arithmetic, loops and branches are evaluated concretely per
+warpgroup and warp (`axis_index`), so each program is its own fixed sequence of events: no control flow
+reads shared memory a peer writes.
 
 The semantics assumed (PTX ISA, `mbarrier`, `cp.async.bulk`, `fence.proxy.async`):
 - a barrier's phase completes once its arrivals (its `num_arrivals`) and its pending transactions are all in;
@@ -24,7 +27,9 @@ The semantics assumed (PTX ISA, `mbarrier`, `cp.async.bulk`, `fence.proxy.async`
 - an arrival releases, a passing wait acquires: everything before the arrivals of a completed phase happens
   before everything after a wait that observes it; a TMA load's bytes are written after its issue and before
   the transaction completes;
-- a TMA store reads its shared-memory source asynchronously until a `wait_smem_to_gmem` retires it, and
+- a TMA store reads its shared-memory source asynchronously until a `wait_smem_to_gmem` retires its group
+  (the wait's count is the latest committed groups it leaves in flight, an empty one among them; a store no
+  commit has closed it does not retire), and
   reads a generic write only after a `commit_smem` (`fence.proxy.async`) that follows it;
 - a tcgen05 commit completes asynchronously (`tcgen05.commit`): once the products its thread issued before
   it complete, their operands' reads ending then, it arrives at its barrier, ordered to every thread, its
@@ -251,16 +256,42 @@ def _slot(ref, treedef, leaves) -> tuple:
 
 
 def _located(ref, transforms) -> tuple:
-    """A ref's location through `transforms`: the ref and its leading indices each one value (a ring's slot,
-    or a one-entry slice of its leading axis: a gathered ring's slot mbarrier, `gathered.Ring`; a role's
-    ring's, `[role, slot]`), else the ref whole. A location of fewer indices covers every one beneath it
-    (`_overlaps`: `[role]` each of the role's slots)."""
+    """A ref's location through `transforms`: the ref and each leading index that is one value, in order (a
+    ring's slot; a consumer's staging buffer and its chunk's buffer within it, `stores.staged_chunks`; a
+    one-entry slice of an axis, which keeps it, last: a gathered ring's slot mbarrier, `gathered.Ring`), else
+    the ref whole. Two locations share memory where one's indices are a prefix of the other's (`_overlaps`):
+    a consumer's two chunk buffers, keyed by its own index alone, read as one buffer, so its double-buffered
+    stores raced (base review f86cb5b03's witness at 128 x 256)."""
+    found = []
+
+    def whole(index, extent) -> bool:
+        return (hasattr(index, "start") and index.start is not None and int(np.asarray(index.start)) == 0
+                and index.size == extent)
+
     for transform in transforms or ():
-        indices = getattr(transform, "indices", None)
-        if indices:
-            leading = tuple(itertools.takewhile(lambda index: index is not None, map(_one_value, indices)))
-            return (ref.name, *leading) if leading else (ref.name, None)
-    return (ref.name, None)
+        if getattr(transform, "indices", None) is None:
+            # A transform that moves axes (a transpose, a reshape): later indices are not the base's
+            # coordinates, so the location stops at the prefix known (base review 2e4651b2e F3). A tiling's,
+            # a swizzle's or a bitcast's changes the trailing axes alone, the leading ones indexed as before.
+            if hasattr(transform, "permutation") or "reshape" in type(transform).__name__.lower():
+                return (ref.name, *found) if found else (ref.name, None)
+            continue
+        indices, shape = transform.indices, getattr(transform, "shape", None)
+        for axis, index in enumerate(indices):
+            if index is None:
+                return (ref.name, *found) if found else (ref.name, None)
+            if not hasattr(index, "start"):
+                found.append(int(np.asarray(index)))
+                continue
+            # A slice: the axes from it on whole, the next transform indexes them; else its one entry, if it
+            # takes one, the location's last.
+            if shape is not None and all(whole(rest, shape[at])
+                                         for at, rest in enumerate(indices) if at >= axis):
+                break
+            if index.size == 1 and index.start is not None:
+                found.append(int(np.asarray(index.start)))
+            return (ref.name, *found) if found else (ref.name, None)
+    return (ref.name, *found) if found else (ref.name, None)
 
 
 def _one_value(index) -> int | None:
@@ -320,10 +351,18 @@ def _load(self: _Interpreter, equation, values) -> list:
 
 
 def _store(self: _Interpreter, equation, values) -> list:
+    """A TMA store, its argument whether it commits its thread's open store group (`commit_group`: a group of
+    it and every store before it no commit closed)."""
     params = equation.params
     tree = params["src_transforms_treedef"]
     count = tree.num_leaves
-    return self.emit("store", _slot(values[0], tree, values[2:2 + count]))
+    return self.emit("store", _slot(values[0], tree, values[2:2 + count]), bool(params["commit_group"]))
+
+
+def _store_group(self: _Interpreter, equation, values) -> list:
+    """A commit of the thread's open store group (`commit_smem_to_gmem_group`): a group, empty where no store
+    is open, which a wait's count counts as any other."""
+    return self.emit("store_group")
 
 
 def _store_wait(self: _Interpreter, equation, values) -> list:
@@ -384,7 +423,8 @@ too, only through a wait that observes that arrival."""
 SYNC: dict[str, Callable] = {
     "barrier_wait": _wait, "barrier_arrive": _arrival("transforms_treedef"),
     "tcgen05_mma": _tcgen05_product, "tcgen05_commit_arrive": _tcgen05_commit, "copy_gmem_to_smem": _load,
-    "copy_smem_to_gmem": _store, "wait_smem_to_gmem": _store_wait, "commit_smem": _commit,
+    "copy_smem_to_gmem": _store, "commit_group": _store_group, "wait_smem_to_gmem": _store_wait,
+    "commit_smem": _commit,
     "get": _access("read", 1), "swap": _access("write", 2), "wgmma": _product, "wgmma_wait": _product_wait,
 }
 """Each primitive of the toolkit's synchronization and shared memory, as an `Event`."""
@@ -403,13 +443,29 @@ def _waited(self: _Interpreter, body: gathered.Waited, values, located) -> None:
 def _gathers(self: _Interpreter, body: gathered.Gathers, values, located) -> None:
     """A load warp's gathers of a step (`gathered.Gathers`): the first warp's arrival expecting every tile's
     copy, and a copy of each tile the warp issues into its part of the slot, each completing its bytes at
-    the slot's barrier."""
-    _, _, slot, barrier, _ = located
+    the slot's barrier; read a step ahead (`body.ahead`), its tiles' entries read from the entries' parity
+    the step before filled, once its fills are awaited (`gathered.Held.awaited`), a warp's fills an
+    asynchronous write of its own; a tile's first step fills its own entries first (`gathered.Held.awaited`);
+    the next step's fill is the load's next body (`_filled`).
+    The warp's lanes are its one program: the body's warp syncs, which make a lane's fill seen by the
+    others, are its own statement, not an event."""
+    _, _, slot, barrier, _, *ahead = located
     # The slot's tiles: its leading axis as its allocation stages it (`swizzling.swizzle_transforms`'
     # `TILE_ROWS`-row tiles), the memref's the body reads.
     tiles = values[2].shape[1]
     if body.expects:
         self.emit("expect", barrier, tiles)
+    if body.ahead:
+        entries = ahead[0]
+        parity, held = (int(np.asarray(_governing(value, "an entry's parity"))) for value in ahead[1:])
+        # A warp's fills of a step are one cp.async group, awaited together: one write of its parity's
+        # entries, its tiles' all (each warp's its own rows: `gathered.Gathers.tiles`).
+        warp = body.share[0]
+        if not held:
+            self.emit("fill", (entries[0], parity, warp))
+        self.emit("fill_wait")
+        # A read of entries a fill must have written: no fill ordered before it is a read of nothing.
+        self.emit("read", (entries[0], parity, warp), "filled")
     for tile in body.tiles(tiles):
         self.emit("copy", (*slot, tile), barrier)
 
@@ -419,23 +475,32 @@ def _unsynchronized(self: _Interpreter, body, values, located) -> None:
     del self, body, values, located
 
 
+def _filled(self: _Interpreter, body: gathered.Filled, values, located) -> None:
+    """A load warp's fill of its next step's entries (`gathered.Filled`, where the walk has a next step):
+    one asynchronous write of the parity it fills, its tiles' all, a cp.async group the next step awaits."""
+    entries, _, parity = located
+    self.emit("fill", (entries[0], int(np.asarray(_governing(parity, "an entry's parity"))), body.share[0]))
+
+
 INLINED: dict[type, Callable] = {gathered.Initialized: _initialized, gathered.Waited: _waited,
-                                 gathered.Gathers: _gathers, across.LaneZero: _unsynchronized}
+                                 gathered.Gathers: _gathers, gathered.Filled: _filled,
+                                 across.LaneZero: _unsynchronized}
 """Each inlined body a checked kernel takes (`plgpu.inline_mgpu`'s function, by its type), as the `Event`s
 its fields and its operands state: the arrivals a phase of the barriers a gathered ring initializes, its
 parity waits at a turn's rotation, and its load warps' gathers. A body of no synchronization (a fence, a
 register form) takes a reader that emits nothing, its reason beside it; one of no type here is refused."""
 
 
-def programs(kernel: Callable, *operands, threads: int, rare: bool = False
+def programs(kernel: Callable, *operands, threads: int, launch: int = 0, rare: bool = False
              ) -> tuple[list[list[Event]], dict[str, int]]:
-    """Each program of `kernel` (a Mosaic GPU launch the toolkit built, `mosaic.kernel`) over `operands`, of
-    its `threads` warpgroups, its rare spans taken where `rare` (`derivatives.Rare`: a decided walk's
-    second): a warpgroup's events, or where it runs warp roles, each of its warps' in turn
+    """Each program of `kernel`'s `launch`-th Mosaic GPU launch (one the toolkit built, `mosaic.kernel`, in
+    the order its trace makes them: a chained input gradient's flagged walk, then its bounded one) over
+    `operands`, of its `threads` warpgroups, its rare spans taken where `rare` (`derivatives.Rare`: a decided
+    walk's second): a warpgroup's events, or where it runs warp roles, each of its warps' in turn
     (`_Interpreter.programs`), by warpgroup index; and each barrier's arrivals a phase, by name: a barrier
     allocation's, or a shared `uint64`'s its inlined initialization states (`gathered.Initialized`)."""
     closed = jax.make_jaxpr(kernel)(*operands)
-    body = _body(closed.jaxpr)
+    body = list(_bodies(closed.jaxpr))[launch]
     found, arrivals = [], {}
     for thread in range(threads):
         interpreter = _Interpreter(thread, rare)
@@ -447,27 +512,26 @@ def programs(kernel: Callable, *operands, threads: int, rare: bool = False
     return found, arrivals
 
 
-def _body(jaxpr: jcore.Jaxpr) -> jcore.ClosedJaxpr:
-    """The kernel body's jaxpr inside a traced launch: the per-program jaxpr of its `mpmd_map`."""
+def _bodies(jaxpr: jcore.Jaxpr) -> Iterator[jcore.ClosedJaxpr]:
+    """The kernel bodies' jaxprs inside a traced program, in its order: each `mpmd_map`'s per-program
+    jaxpr."""
     for equation in jaxpr.eqns:
         if equation.primitive.name == "mpmd_map":
             (inner,) = equation.params["jaxprs"]
-            return inner if isinstance(inner, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(inner, ())
+            yield inner if isinstance(inner, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(inner, ())
+            continue
         for value in equation.params.values():
             for inner in value if isinstance(value, (tuple, list)) else (value,):
                 nested = inner.jaxpr if isinstance(inner, jcore.ClosedJaxpr) else inner
                 if isinstance(nested, jcore.Jaxpr):
-                    try:
-                        return _body(nested)
-                    except LookupError:
-                        continue
-    raise LookupError("no Mosaic GPU kernel body in the traced launch")
+                    yield from _bodies(nested)
 
 
 @dataclasses.dataclass
 class Violation(AssertionError):
     """A property the exploration found broken: its class (`kind`: "deadlock", "unfinished" phase,
-    "unobserved" phase, "aliased" parity, "early" arrival, "unordered" access, "unfenced" store, "bounds"),
+    "unobserved" phase, "aliased" parity, "early" arrival, "unordered" access, "unfenced" store, "bounds",
+    an "unwritten" entries' read),
     what broke (`what`), and the
     interleaving reaching it (`trace`, each move a thread's index and its event's place, or a landing)."""
 
@@ -683,6 +747,12 @@ class _State:
             made.flight = self.flight | {(thread, self.positions[thread], event.argument)}
         elif event.kind == "committed":
             made.flight = self.flight | {(thread, self.positions[thread], event.at)}
+        elif event.kind == "fill":
+            # A thread's asynchronous write (cp.async's), no barrier's: it lands later, `fill_wait` its wait.
+            made.flight = self.flight | {(thread, self.positions[thread], None)}
+        elif event.kind == "fill_wait" and any(issuer == thread and barrier is None
+                                                for issuer, _, barrier in self.flight):
+            return None
         return made
 
     def check(self, awaited, trace) -> None:
@@ -734,10 +804,12 @@ class _Order:
         self.writes: list = []
         self.reads: list = []
         self.pending: list = [[] for _ in threads]
+        self.groups: list = [0 for _ in threads]
         self.unfenced: list = [set() for _ in threads]
         self.issued: dict = {}
         self.committed: list = [[] for _ in threads]
         self.committing: dict = {}
+        self.fills: dict = {}
 
     def arrived(self, at, clock, *, counted: bool, transaction: int) -> None:
         joined, count, flying = self.accumulating.get(at, ({}, 0, 0))
@@ -778,7 +850,7 @@ class _Order:
             # joins the completions it covers.
             for product in self.committing.pop((thread, position)):
                 if product[1] is None:
-                    _, source, read, issued, key = product[0]
+                    _, source, read, issued, key, _ = product[0]
                     product[1] = _joined(issued, {("completed", *key): 1})
                     self.reads.append((source, product[1], read))
                 landing = _joined(landing, product[1])
@@ -786,7 +858,9 @@ class _Order:
             return
         self.ordered(event.at, landing, event, write=True)
         self.writes.append((event.at, landing, event))
-        if event.argument:
+        if event.kind == "fill":
+            self.fills.setdefault(thread, []).append(landing)
+        elif event.argument:
             self.arrived(event.argument, landing, counted=False, transaction=-1)
 
     def moved(self, thread, position, event) -> None:
@@ -799,11 +873,20 @@ class _Order:
             self.arrived(event.at, clock, counted=True, transaction=0)
         elif kind == "expect":
             self.arrived(event.at, clock, counted=True, transaction=event.argument)
-        elif kind in ("load", "copy"):
+        elif kind == "fill_wait":
+            # Its fills landed (`_State.step` holds it till then): each landing before it.
+            for landing in self.fills.pop(thread, ()):
+                clock = _joined(clock, landing)
+            self.clocks[thread] = clock
+        elif kind in ("load", "copy", "fill"):
             self.issued[(thread, position)] = dict(clock)
             if event.argument and kind == "load":
                 self.arrived(event.argument, clock, counted=True, transaction=1)
         elif kind in ("read", "write"):
+            if kind == "read" and event.argument == "filled" and not any(
+                    where == event.at and _before(prior, clock) for where, prior, _ in self.writes):
+                raise Violation("unwritten", f"read of {event.at}, which no fill ordered before it wrote",
+                                [(thread, event)])
             self.ordered(event.at, clock, event, write=kind == "write")
             (self.writes if kind == "write" else self.reads).append((event.at, dict(clock), event))
             if kind == "write":
@@ -820,8 +903,14 @@ class _Order:
             self.committing[(thread, position)] = list(self.committed[thread])
         elif kind in ("store", "product"):
             self.asynchronous(thread, position, event, clock)
-        elif kind in ("product_wait", "store_wait"):
-            self.retired(thread, "product" if kind == "product_wait" else "store", int(event.argument), clock)
+            if kind == "store" and event.argument:
+                self.groups[thread] += 1
+        elif kind == "store_group":
+            self.groups[thread] += 1
+        elif kind == "product_wait":
+            self.retired(thread, "product", int(event.argument), clock)
+        elif kind == "store_wait":
+            self.retired_groups(thread, int(event.argument), clock)
 
     def asynchronous(self, thread, position, event, clock) -> None:
         """An asynchronous read issued: a store's source, fenced, or a product's operands, each read until
@@ -833,7 +922,17 @@ class _Order:
                             [(thread, event)])
         for source in sources:
             self.ordered(source, clock, event, write=False)
-            self.pending[thread].append((event.kind, source, event, dict(clock), (thread, position)))
+            # A store's read, the group it joins (its thread's open one) after it.
+            self.pending[thread].append((event.kind, source, event, dict(clock), (thread, position),
+                                         self.groups[thread]))
+
+    def retired_groups(self, thread, kept: int, clock) -> None:
+        """A store wait retiring every committed store group but its `kept` latest: each of their reads ends
+        here; a store no commit has closed stays in flight."""
+        retiring = self.groups[thread] - kept
+        for entry in [entry for entry in self.pending[thread] if entry[0] == "store" and entry[5] < retiring]:
+            self.reads.append((entry[1], dict(clock), entry[2]))
+            self.pending[thread].remove(entry)
 
     def retired(self, thread, kind, kept: int, clock) -> None:
         """A wait retiring all but its `kept` latest asynchronous reads of `kind`: each read ends here."""

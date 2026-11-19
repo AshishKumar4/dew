@@ -3,6 +3,7 @@ rows, one launch, its epilogue reading both fp32 accumulators): its check 1 agai
 combined, through every mode of its epilogue, at a named compute dtype and without an epilogue, and its
 lowering; the hooked cases it shares are test_gemm_template's."""
 
+import contextlib
 import functools
 
 import jax
@@ -16,7 +17,7 @@ from test_gemm_template import CASES, SEEDS, _dew, _draw, _drop, _rounded_throug
 
 from dew.nn.kernels import gemm, generation, grouped_launch, xla_products
 from dew.nn.kernels.templates import mosaic_sm90, resources
-from dew.nn.kernels.templates.gemm import derivation, mosaic_gpu
+from dew.nn.kernels.templates.gemm import chained, derivation, mosaic_gpu
 
 
 def swiglu(gate, up):
@@ -515,3 +516,480 @@ def test_matrices_side_by_side_compile_for_an_h100_within_its_resources(dense):
     assert found and all(record.get("kernels") for record in found), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
+CHAINED = (256, 128, 128)
+"""A query's, a key's and a value's widths: an input gradient's three products, chained end to end."""
+
+FEATURES = 256
+"""Their rows' width, the input gradient's: a tile chaining three products holds its replay's tile, a
+quarter of its columns and whole column units (`grouped_matmul.MosaicGmm._replays`), at 256 columns."""
+
+
+def _chained_overflow(dtype=jnp.bfloat16) -> tuple:
+    """Rows of zeros and matrices of `CHAINED` widths by `FEATURES`, cotangents of 2^63 at a product's
+    first columns: the value's products (the transpose order's first) +2^126 at feature 0's two first
+    columns, 2^127 in all; the key's +2^126 there and -2^126 two columns into its second 64-step, 0 in
+    all; the query's none. Each product's own sums and the total (2^127) lie in float32's range; one running
+    sum over the joined contraction meets 2^128 at the key's first step (base review 0711d5f57 F2)."""
+    big = 2.0 ** 63
+    matrices = [np.zeros((FEATURES, width), np.float32) for width in CHAINED]
+    matrices[2][0, [0, 1]] = big
+    matrices[1][0, [0, 1]], matrices[1][0, [64, 65]] = big, -big
+    cotangents = [np.zeros((128, width), np.float32) for width in CHAINED]
+    for cotangent in cotangents[1:]:
+        cotangent[:, [0, 1, 64, 65]] = big
+    return (jnp.zeros((128, FEATURES), dtype), tuple(jnp.asarray(each, dtype) for each in matrices),
+            tuple(jnp.asarray(each, dtype) for each in cotangents))
+
+
+def _input_gradients(rows, matrices, cotangents, generation_name: str | None) -> tuple:
+    """The rows' gradient through projections side by side (`gemm.gemm`'s `beside`, its input gradient's
+    products chained, `gemm._one_launch`), the template named, interpreted as `generation_name`'s (None: this
+    GPU's, natively), and through each projection apart, the plain program, its products added in its
+    reverse pass's order."""
+    def together(rows):
+        return gemm.gemm(rows, matrices[0], beside=matrices[1:], out_dtype=rows.dtype, interpret_on_cpu=True)
+
+    def apart(rows):
+        return tuple(gemm.gemm(rows, matrix, out_dtype=rows.dtype, interpret_on_cpu=True)
+                     for matrix in matrices)
+
+    from dew.nn.kernels import tuning
+
+    assumed = contextlib.nullcontext() if generation_name is None else generation.assumed(generation_name)
+    with (assumed, jax.default_matmul_precision("default"), generation.chosen(grouped_matmul="mosaic")):
+        with tuning.seen() as launches:
+            (got,) = jax.vjp(together, rows)[1](cotangents)
+        (plain,) = jax.vjp(apart, rows)[1](cotangents)
+    # The input gradient one chained call (`gemm._one_launch`, as each trace of it binds it), not the chain of
+    # three.
+    chained = [bound.arguments.get("chained") is not None for _, bound in launches.taken
+               if bound.arguments.get("trans_rhs")]
+    assert chained and all(chained), launches.taken
+    return np.asarray(got, np.float32), np.asarray(plain, np.float32)
+
+
+CHAINED_CASES = ("projections", "unequal scales", "cancelling")
+"""The chained input gradient's check 1 draws (`a_chained_input_gradient_holds_check_1`): q, k and v's
+cotangents at one scale; at scales 2^10 apart, so one product's sum dwarfs another's in the one accumulator;
+and k's product cancelling q's across their boundary (k's matrix q's negated, its cotangent q's plus 2^-6 of
+noise), so the joined sum carries q's partials into k's cancellation (base review c3b97e20f F1, F7)."""
+
+
+def _chained_draw(case: str):
+    """`a_chained_input_gradient_holds_check_1`'s draw of `case` (`CHAINED_CASES`): the rows, three matrices
+    (hidden 256, widths 256, 256 and 128) and their cotangents, bf16, NumPy's (a GPU tier's prepare computes
+    on no device)."""
+    rows, hidden, widths = 256, 256, (256, 256, 128)
+
+    def draw(seed):
+        rng = np.random.default_rng([seed, CHAINED_CASES.index(case)])
+        x = rng.normal(size=(rows, hidden))
+        matrices = [rng.normal(size=(hidden, width)) / np.sqrt(hidden) for width in widths]
+        cotangents = [rng.normal(size=(rows, width)) for width in widths]
+        if case == "unequal scales":
+            cotangents = [each * scale for each, scale in zip(cotangents, (1.0, 2.0 ** 10, 2.0 ** -10),
+                                                               strict=True)]
+        if case == "cancelling":
+            matrices[1] = -matrices[0]
+            cotangents[1] = cotangents[0] + 2.0 ** -6 * cotangents[1]
+        return tuple(each.astype(jnp.bfloat16) for each in (x, *matrices, *cotangents))
+
+    return draw
+
+
+def a_chained_input_gradient_holds_check_1(case: str, interpret: bool = False) -> None:
+    """Three projections side by side (`gemm.gemm`'s `beside`), their input gradient one launch over their
+    joined depths (`gemm._one_launch`, the template named), on par from float64 with the plain program's
+    (each projection apart, its cotangent through its matrix, their products added in its reverse pass's
+    order: XLA's), over `CHAINED_CASES`' draws (check 1; base review c3b97e20f F7): on this GPU (the GEMM
+    flows' Hopper and Blackwell cells), or interpreted (`interpret`). The chained launch's contract is a
+    GEMM's over the joined depth (`chained.guarded_walk`), held here."""
+    def chained(x, wq, wk, wv, dq, dk, dv):
+        def projected(x):
+            return gemm.gemm(x, wq, beside=(wk, wv), out_dtype=x.dtype, interpret_on_cpu=interpret)
+
+        with generation.chosen(grouped_matmul="mosaic"):
+            return jax.vjp(projected, x)[1]((dq, dk, dv))[0]
+
+    def plain(x, wq, wk, wv, dq, dk, dv):
+        def projected(x):
+            return tuple(jnp.dot(x, w, preferred_element_type=jnp.promote_types(x.dtype, jnp.float32))
+                         .astype(x.dtype) for w in (wq, wk, wv))
+
+        return jax.vjp(projected, x)[1]((dq, dk, dv))[0]
+
+    from dew.nn.kernels import tuning
+
+    with tuning.seen() as launches:
+        assert_as_exact(jax.jit(chained), jax.jit(plain), _chained_draw(case),
+                        f"a chained input gradient: {case}", seeds=SEEDS, truth_fn=plain)
+    # Its input gradient one chained call (`gemm._one_launch`), not the products apart, on the GPU as
+    # interpreted (base review d0bc7dee6 F2).
+    assert any(bound.arguments.get("chained") for _, bound in launches.taken), launches.taken
+
+
+@pytest.mark.parametrize("case", CHAINED_CASES)
+@pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
+def test_a_chained_input_gradient_holds_check_1(generation_name, case):
+    """`a_chained_input_gradient_holds_check_1` interpreted as a Hopper's and a Blackwell's walk runs it."""
+    with generation.assumed(generation_name):
+        a_chained_input_gradient_holds_check_1(case, interpret=True)
+
+
+def a_chained_input_gradient_is_as_finite_as_its_products_sum(generation_name: str | None = None) -> None:
+    """Three projections side by side, their input gradient one launch over their joined depths (`gemm`'s
+    `chained`, `_input_gradients` asserting the chain taken): where one running sum over the joined
+    contraction passes float32's largest while each product's own sum and the total lie within it
+    (`_chained_overflow`), the launch flags the tile and walks it again with its sums bounded
+    (`mosaic_gpu.guarded_walk`): the gradient is the plain program's, 2^127 at feature 0 and zero elsewhere,
+    where one running sum gave infinities (row 8282). On this GPU (`generation_name` None: the GEMM flows'
+    Hopper and Blackwell cells, base review d0bc7dee6 F2), or interpreted as `generation_name`'s."""
+    got, plain = _input_gradients(*_chained_overflow(), generation_name)
+    expected = np.zeros((128, FEATURES), np.float32)
+    expected[:, 0] = 2.0 ** 127
+    np.testing.assert_array_equal(plain, expected)
+    np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
+def test_a_chained_input_gradient_is_as_finite_as_its_products_sum(generation_name):
+    """`a_chained_input_gradient_is_as_finite_as_its_products_sum` interpreted as a Hopper's and a
+    Blackwell's walk runs it."""
+    a_chained_input_gradient_is_as_finite_as_its_products_sum(generation_name)
+
+
+def test_a_chained_launchs_walk_holds_every_property_in_every_interleaving():
+    """The chained input gradient's launch on an H100 (`mosaic_gpu.gmm`'s `chained`: three products, each
+    step one product's), a 128 x 256 x 64 tile over a two-stage ring, traced as the GPU builds it: every
+    interleaving of its warpgroups and its loads' landings explored (`ring_protocol.explore`), each slot
+    given back once the products reading it retire. Each product's issue counted as a step's group though one
+    runs a step, the walk waited for three groups where one was in flight, and step 2 refilled step 0's slot
+    while step 0's product read it (base review of f86cb5b03, F2)."""
+    from ring_protocol import explore, programs
+
+    _, matrices, cotangents = _chained_overflow(jnp.bfloat16)
+    (d, w), *rest = [(cotangent, matrix[None]) for cotangent, matrix in zip(cotangents[::-1], matrices[::-1],
+                                                                           strict=True)]
+    tiles = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
+
+    def launch(d, w):
+        with generation.assumed("sm90"):
+            return mosaic_gpu.gmm(d, w, None, tiles=tiles, transpose_rhs=True, out_dtype=jnp.bfloat16,
+                                  multiprocessors=4, interpret=False, dense=True, chained=tuple(rest))
+
+    threads, arrivals = programs(launch, d, w, threads=tiles.warpgroups + 1)
+    assert explore(threads, arrivals) > 0
+
+
+def test_a_ping_pong_chained_launch_flags_its_tiles():
+    """The overflow witness's three products through one chained launch on a Hopper's ping-pong tile
+    (`Tiles.pingpong`: each consumer a whole tile in turn), interpreted: its one finishing consumer writes its
+    tile's one flag (`Tiles.sharing`), the flagged tile walked again, the plain program's 2^127 at feature 0
+    (base review c3b97e20f F5: flags written by consumer left a tile's other slot unwritten)."""
+    _, matrices, cotangents = _chained_overflow(jnp.float32)
+    products = [(np.asarray(d), np.asarray(w)[None]) for d, w in zip(cotangents[::-1], matrices[::-1],
+                                                                       strict=True)]
+    pingpong = mosaic_gpu.Tiles(64, 256, 64, 3, 1, warpgroups=2, family="wgmma", pingpong=True)
+    got = _chained_launch(products, None, jnp.bfloat16, tiles=pingpong)
+    expected = _plain_sum(products, None, jnp.bfloat16)
+    assert expected[0, 0] == 2.0 ** 127 and not expected[:, 1:].any()
+    np.testing.assert_array_equal(got, expected)
+
+
+def _chained_bound(depths: tuple, *, groups: int = 2, features: int = FEATURES, rows: int = 256):
+    """A grouped bf16 input gradient's chained call (`gemm._one_launch`'s chained binding) of products of
+    `depths`, in walk order: each its cotangent `[rows, depth]` by its matrix `[groups, features, depth]`,
+    transposed."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    first, *rest = depths
+    args = (bf16((rows, first)), bf16((groups, features, first)), jax.ShapeDtypeStruct((groups,), jnp.int32))
+    chained = tuple((bf16((rows, depth)), bf16((groups, features, depth))) for depth in rest)
+    return args, {"trans_rhs": True, "out_dtype": "bfloat16", "interpret": False, "chained": chained}
+
+
+@pytest.mark.parametrize("depths", [(128, 128, 128), (80, 128, 256), (128, 0, 128), (64,) * 9, (64,) * 65],
+                         ids=["three", "unaligned", "empty", "nine", "sixty-five"])
+def test_a_chained_call_is_derived_as_it_is_launched(depths):
+    """On an assumed H100, a chained call's tile is one its launch holds legal or none (base review
+    c3b97e20f): the derivation and the launch judge the call as bound (F3: a first depth of 80 was derived
+    on padded to 128 and refused as bound), a tile holds its replay's narrower tile too (F2: nine products
+    narrowed a 64-column tile to four columns, 65 to none, dividing by zero), and a product of no depth takes
+    no chain (F4: its operand has no extent a TMA descriptor takes). Three whole products chain."""
+    from dew.nn.kernels import grouped_matmul
+
+    launch = grouped_matmul.MosaicGmm()
+    args, options = _chained_bound(depths)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        ba, target = launch.bind(*args, **options), generation.gpu_target()
+        tile = launch.derived(ba, target)
+        narrow = mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2, family='wgmma')
+        assert tile is None or launch.legal(ba, tile, target), tile
+        if depths == (128, 128, 128):
+            assert tile is not None and tile.block_n % chained.narrowing(len(depths)) == 0, tile
+        if depths in ((128, 0, 128), (64,) * 9, (64,) * 65):
+            assert not launch.legal(ba, narrow, target)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm90"))
+def test_a_chained_input_gradient_of_non_finite_cotangents_is_the_plain_programs(generation_name):
+    """The chained input gradient where a cotangent holds an infinity and a NaN (each its own row): the launch
+    flags their tiles, and the bounded walk gives the plain program's infinities and NaNs there, every other
+    entry the products' exact sum (small integers) rounded once, as one accumulator rounds it."""
+    rng = np.random.default_rng(8282)
+    rows = jnp.zeros((256, FEATURES), jnp.bfloat16)
+    matrices = [rng.integers(-3, 4, size=(FEATURES, width)).astype(np.float32) for width in CHAINED]
+    cotangents = [rng.integers(-3, 4, size=(256, width)).astype(np.float32) for width in CHAINED]
+    exact = sum(cotangent.astype(np.float64) @ matrix.T.astype(np.float64)
+                for cotangent, matrix in zip(cotangents, matrices, strict=True))
+    cotangents[0][5, 3], cotangents[2][200, 7] = np.inf, np.nan
+    got, plain = _input_gradients(rows, tuple(jnp.asarray(each, jnp.bfloat16) for each in matrices),
+                                  tuple(jnp.asarray(each, jnp.bfloat16) for each in cotangents),
+                                  generation_name)
+    finite = np.isfinite(plain)
+    assert not finite[5].all() and not finite[200].any() and finite[[0, 6, 199, 201]].all()
+    np.testing.assert_array_equal(np.isnan(got), np.isnan(plain))
+    np.testing.assert_array_equal(got[~finite], plain[~finite])
+    rounded = np.asarray(jnp.asarray(exact, jnp.float32).astype(jnp.bfloat16), np.float32)
+    np.testing.assert_array_equal(got[finite], rounded[finite])
+
+
+def _chained_launch(products: list, sizes, dtype, generation_name: str = "sm90", tiles=None) -> np.ndarray:
+    """`products`' `(cotangent, matrix)` pairs (NumPy's, a matrix `[groups, features, width]`) through one
+    interpreted chained launch (`mosaic_gpu.gmm`'s `chained`, the first the call's own), at `tiles` (the
+    template's 128 x 256 tile where None: three products' replay a quarter of it, whole column units,
+    `chained.replay_tile`), its groups' rows `sizes` (None: dense), in `dtype`."""
+    tiles = tiles or mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
+    cast = [(jnp.asarray(d, dtype), jnp.asarray(w, dtype)) for d, w in products]
+    (d, w), *rest = cast
+    group_sizes = None if sizes is None else jnp.asarray(sizes, jnp.int32)
+    with generation.assumed(generation_name):
+        out = mosaic_gpu.gmm(d, w, group_sizes, tiles=tiles, transpose_rhs=True, out_dtype=dtype,
+                             multiprocessors=4, interpret=grouped_launch.INTERPRETED, dense=sizes is None,
+                             chained=tuple(rest))
+    return np.asarray(out, np.float32)
+
+
+def _plain_sum(products: list, sizes, dtype) -> np.ndarray:
+    """The plain program's chained sum: each product's float32 sum over its own depth (its group's matrix
+    at each row), added in order, rounded once to `dtype`."""
+    rows = products[0][0].shape[0]
+    group_of = np.zeros(rows, int) if sizes is None else np.repeat(np.arange(len(sizes)), sizes)
+    with np.errstate(invalid="ignore", over="ignore"):
+        total = None
+        for d, w in products:
+            d32 = np.asarray(jnp.asarray(d, dtype), np.float32)
+            w32 = np.asarray(jnp.asarray(w, dtype), np.float32)
+            product = np.einsum("rw,rfw->rf", d32, w32[group_of], dtype=np.float32)
+            total = product if total is None else total + product
+    return np.asarray(jnp.asarray(total).astype(dtype), np.float32)
+
+
+@pytest.mark.parametrize("sizes", [(64, 64), (128,)], ids=["two-groups-one-tile", "one-group-unused-entry"])
+def test_a_flagged_tile_is_its_own_whatever_shares_its_rows(sizes):
+    """A grouped chained launch whose first group's tile overflows its one running sum (`_chained_overflow`'s
+    products on the first 64 rows, zeros elsewhere) where another tile of the same rows stays finite (a
+    second group's at the same row tile, or the table's unused entry finishing zeros): each tile's flag is its
+    table entry's own (`chained.flag_row`), so the overflowing tile is walked again and gives the plain sum,
+    2^127 at feature 0; one flag a row tile let the finite tile's clear it (237e8e558 F1)."""
+    _, matrices, cotangents = _chained_overflow(jnp.float32)
+    products = []
+    for d, w in zip(cotangents, matrices, strict=True):
+        rows = np.zeros((128, w.shape[1]), np.float32)
+        rows[:64] = np.asarray(d)[:64]
+        products.append((rows, np.stack([np.asarray(w)] * len(sizes))))
+    products = products[::-1]  # the transpose order: the value's first
+    got = _chained_launch(products, sizes, jnp.float32)
+    expected = _plain_sum(products, sizes, jnp.float32)
+    assert expected[0, 0] == 2.0 ** 127 and np.isfinite(expected).all()
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_a_tiles_flag_reads_only_the_rows_it_stores():
+    """A grouped fp16 chained launch of three products, its groups [1, 127] in one row tile: the first
+    product's cotangent 2^15 at a column on group 1's rows, group 0's matrix 2^15 there, so group 0's table
+    entry multiplies rows it never stores into fp16's infinity, while every row it stores, and group 1's, is
+    finite (group 1's matrix one there). The launch's per-tile flags (its int32 output) are all clear, no tile
+    walked again, and its gradient is the plain program's; flagging the discarded rows set group 0's (base
+    review d0bc7dee6 F3)."""
+    from kernel_outputs import launched_outputs
+
+    products = [(np.zeros((128, width), np.float32), np.zeros((2, FEATURES, width), np.float32))
+                for width in CHAINED]
+    products[0][0][1:, 0] = 2.0 ** 15
+    products[0][1][0, 0, 0], products[0][1][1, 0, 0] = 2.0 ** 15, 1.0
+    sizes = (1, 127)
+    cast = [(jnp.asarray(d, jnp.float16), jnp.asarray(w, jnp.float16)) for d, w in products]
+
+    def launch(*operands):
+        (d, w), *rest = zip(operands[0::2], operands[1::2], strict=True)
+        return mosaic_gpu.gmm(d, w, jnp.asarray(sizes, jnp.int32),
+                              tiles=mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma"),
+                              transpose_rhs=True, out_dtype=jnp.float16, multiprocessors=4,
+                              interpret=grouped_launch.INTERPRETED, dense=False, chained=tuple(rest))
+
+    with generation.assumed("sm90"):
+        found = launched_outputs(launch, *(each for pair in cast for each in pair))
+    flags = [output for name, outputs in found if mosaic_gpu.GUARDED_GMM not in name for output in outputs
+             if output.dtype == np.int32]
+    assert flags and not any(np.asarray(each).any() for each in flags), flags
+    expected = _plain_sum(products, sizes, jnp.float16)
+    assert expected[1, 0] == 2.0 ** 15 and np.isfinite(expected).all()
+    np.testing.assert_array_equal(_chained_launch(products, sizes, jnp.float16), expected)
+
+
+def test_a_flagged_tiles_walk_keeps_its_operands_least_values():
+    """A dense fp16 chained launch of three products whose tile is flagged by an infinite cotangent entry
+    (row 0's), another row of it the least fp16 value (2^-24) times 2^15: the bounded walk sums each product
+    over its own depth on its operands as given, so that row's gradient is 2^-9, as the plain program's; rows
+    scaled down in their own dtype lost it to zero (237e8e558 F2)."""
+    widths = (256, 128, 128)
+    products = [(np.zeros((128, width), np.float32), np.zeros((1, FEATURES, width), np.float32))
+                for width in widths]
+    products[0][1][0, 0, 0] = 2.0 ** 15
+    products[0][0][1, 0] = 2.0 ** -24
+    products[0][0][0, 0] = np.inf
+    got = _chained_launch(products, None, jnp.float16)
+    expected = _plain_sum(products, None, jnp.float16)
+    assert expected[1, 0] == 2.0 ** -9 and not np.isfinite(expected[0]).all()
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_a_chained_sum_overflowing_its_output_dtype_is_walked_again():
+    """A dense fp16 chained launch whose products' own sums are 65504, then 2^30 and -2^30 in two steps (0),
+    then 0: the plain program's total, 65504, is fp16's largest, where the joined fp32 sum ends at a finite
+    65536 (2^30 + 65504 rounds to 2^30 + 65536), an fp16 infinity once stored. The launch flags its tile by
+    the value it stores, not its fp32 sum, so the bounded walk gives the plain program's 65504 (base review
+    b1ab251ac F1)."""
+    products = [(np.zeros((128, width), np.float32), np.zeros((1, FEATURES, width), np.float32))
+                for width in (64, 128, 64)]
+    products[0][0][0, 0], products[0][1][0, 0, 0] = 65504.0, 1.0
+    products[1][0][0, [0, 64]] = 2.0 ** 15
+    products[1][1][0, 0, 0], products[1][1][0, 0, 64] = 2.0 ** 15, -2.0 ** 15
+    got = _chained_launch(products, None, jnp.float16)
+    expected = _plain_sum(products, None, jnp.float16)
+    assert expected[0, 0] == 65504.0 and np.isfinite(expected).all()
+    np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("products", [9, 65])
+def test_a_direct_chained_launch_whose_replay_no_tile_holds_is_refused(products):
+    """`mosaic_gpu.gmm` called with chained products directly, at a legal 128 x 64 Hopper tile: nine 64-deep
+    products narrow its replay to four columns, 65 to none, no whole column unit of the family, so the launch
+    refuses the call (`chained.replay_tile`, the one replay plan selection reads too) rather than lower a
+    replay WGMMA cannot run (base review f86cb5b03 F1)."""
+    tiles = mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2, family="wgmma")
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    first, *rest = ((shaped((256, 64)), shaped((1, 128, 64))) for _ in range(products))
+
+    def launch(d, w, *rest):
+        chained = tuple(zip(rest[0::2], rest[1::2], strict=True))
+        return mosaic_gpu.gmm(d, w, None, tiles=tiles, transpose_rhs=True, out_dtype=jnp.bfloat16,
+                              multiprocessors=132, dense=True, chained=chained)
+
+    with generation.assumed("sm90"), pytest.raises(ValueError):
+        jax.eval_shape(launch, *first, *(each for pair in rest for each in pair))
+
+
+def test_a_launch_pinned_at_a_tile_no_chain_holds_keeps_its_products_apart():
+    """A grouped bf16 input gradient of three projections side by side (rows `[256, 256]`, groups
+    `[128, 128]`, matrices `[2, 256, 128]`), the template pinned at a legal 128 x 64 Hopper tile whose
+    chain's replay would narrow it to 16 columns: the products run apart at the pin, no chained launch, the
+    gradient the exact sum (base review 2e4651b2e F1: the chain was chosen at a derived tile, and its call
+    refused the pin, `Unpinnable`)."""
+    from dew.nn.kernels import grouped_matmul, tuning
+
+    rng = np.random.default_rng(21)
+    sizes = jnp.asarray([128, 128], jnp.int32)
+    x = jnp.asarray(rng.integers(-2, 3, size=(256, 256)), jnp.bfloat16)
+    matrices = [jnp.asarray(rng.integers(-2, 3, size=(2, 256, 128)), jnp.bfloat16) for _ in range(3)]
+    cotangents = [jnp.asarray(rng.integers(-2, 3, size=(256, 128)), jnp.bfloat16) for _ in range(3)]
+
+    def projected(x):
+        return gemm.gemm(x, matrices[0], sizes, beside=tuple(matrices[1:]), out_dtype=jnp.bfloat16,
+                         interpret_on_cpu=True)
+
+    pin = mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2, family="wgmma")
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+          tuning.pinned({grouped_matmul.MosaicGmm: pin}), tuning.seen() as launches):
+        got = jax.vjp(projected, x)[1](tuple(cotangents))[0]
+    assert not any(bound.arguments.get("chained") for _, bound in launches.taken), launches.taken
+    group_of = np.repeat([0, 1], 128)
+    expected = sum(np.einsum("rw,rfw->rf", np.asarray(d, np.float32), np.asarray(w, np.float32)[group_of])
+                   for d, w in zip(cotangents, matrices, strict=True))
+    np.testing.assert_array_equal(np.asarray(got, np.float32), expected)
+
+
+def test_a_chained_walks_steps_read_each_from_its_own_product():
+    """The chained products' step views (`mosaic_gpu.ChainedRefs.view`) at each product's boundary steps,
+    `starts[p] - 1` and `starts[p]`, from a balanced tail's first step: the step reads the product it falls
+    in (`which`) at that product's own step, its last before the next product's first."""
+    walk = chained.Chained(starts=(0, 4, 6), depths=(256, 128, 128))
+    first = 1
+    view = chained.ChainedRefs(walk, ("q", "k", "v")).view(lambda gmem: gmem, lambda j: (0, first + j),
+                                                                   first)
+    read = {}
+    for step in (2, 3, 4, 5):  # global steps 3 and 4, then 5 and 6
+        which = int(view.which(step))
+        ref, index_map = view.sources[which]
+        read[first + step] = (ref, index_map(step))
+    assert read == {3: ("q", (0, 3)), 4: ("k", (0, 0)), 5: ("k", (0, 1)), 6: ("v", (0, 0))}
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
+def test_a_chained_input_gradient_lowers_as_one_call(generation_name):
+    """Three projections side by side differentiated for their rows on an H100 and a B200, the template
+    named: their input gradient is one bound call (`gemm`'s `chained`), its flagged walk and its bounded walk
+    over the flagged tiles lowering through Mosaic GPU for CUDA, where it was three, each after the first
+    reading and writing the fp32 sum (row 8282)."""
+    from dew.nn.kernels import tuning
+
+    shapes = (jax.ShapeDtypeStruct((256, FEATURES), jnp.bfloat16),
+              *(jax.ShapeDtypeStruct((FEATURES, width), jnp.bfloat16) for width in CHAINED))
+
+    def loss(x, *matrices):
+        outs = gemm.gemm(x, matrices[0], beside=matrices[1:], out_dtype=jnp.bfloat16)
+        return sum(jnp.sum(out.astype(jnp.float32)) for out in outs)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with (generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh),
+          jax.default_matmul_precision("default"), generation.chosen(grouped_matmul="mosaic"),
+          tuning.seen() as launches):
+        jax.jit(jax.grad(loss)).trace(*shapes).lower(lowering_platforms=("cuda",))
+    input_gradients = [bound for _, bound in launches.taken
+                       if bound.arguments.get("trans_rhs") and bound.arguments.get("kernel") is not None]
+    assert len(input_gradients) == 1 and input_gradients[0].arguments.get("chained"), input_gradients
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("dense", [True, False], ids=["dense", "grouped"])
+def test_a_chained_input_gradient_compiles_for_an_h100_within_its_resources(dense):
+    """An 8B decoder's q, k and v cotangents through their matrices (widths 4096, 1024, 1024 into 4096
+    features) chained in one launch on an H100's rings, its flagged walk and its bounded walk over the flagged
+    tiles (the rows' prologue scaling them, the epilogue scaling the sums back: `chained.guarded_walk`),
+    compiled by Mosaic for a compile-only H100 through ptxas: each within its resources, no register
+    spilled."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    # The tile the derivation takes for three products: its replay's a quarter of its columns, whole column
+    # units (`grouped_matmul.MosaicGmm._replays`).
+    tiles = mosaic_gpu.Tiles(128, 256, 64, 4, 1, warpgroups=2, family="wgmma")
+    groups = 1 if dense else 3
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    widths = (4096, 1024, 1024)
+    operands = (*(shaped((4096, width)) for width in widths),
+                *(shaped((groups, 4096, width)) for width in widths),
+                jax.ShapeDtypeStruct((groups,), jnp.int32))
+
+    def launch(q, k, v, wq, wk, wv, sizes):
+        return mosaic_gpu.gmm(v, wv, None if dense else sizes, tiles=tiles, transpose_rhs=True,
+                              out_dtype=jnp.bfloat16, multiprocessors=132, dense=dense,
+                              chained=((k, wk), (q, wq)))
+
+    case = KernelCase(f"chained input gradient {'dense' if dense else 'grouped'}", lambda: (launch, operands))
+    with generation.assumed("sm90"):
+        found = compile_mosaic_kernels([case], "sm90")
+    assert found and all(len(record.get("kernels") or ()) >= 2 for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

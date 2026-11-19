@@ -5,12 +5,12 @@ the one the checkpoint declares."""
 
 import json
 import shutil
-import tarfile
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import pytest
+from interop_support import extract_fixture
 from torch_layout import node
 
 from dew.interop import Pretrained, codecs
@@ -57,8 +57,7 @@ def test_auto_keeps_each_pipeline_component_in_its_own_dtype(tmp_path):
     """A pipeline whose denoiser is stored in bf16 beside fp32 text encoders
     and VAE loads each component as stored, where the old rule stored all of
     them at the denoiser's dtype."""
-    with tarfile.open(FIXTURES / "flux_source.tar.xz") as archive:
-        archive.extractall(tmp_path, filter="data")
+    extract_fixture(FIXTURES / "flux_source.tar.xz", tmp_path)
     pipeline = tmp_path / "pipeline"
     transformer = read_weights(pipeline / "transformer")
     for stale in (pipeline / "transformer").glob("*.safetensors"):

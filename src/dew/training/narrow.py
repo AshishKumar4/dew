@@ -194,8 +194,8 @@ def holds_copies(compute: Variables | None, copies: dict[tuple[str, ...], jnp.dt
     return held_copies(compute) == {path: jnp.dtype(dtype) for path, dtype in copies.items()}
 
 
-def narrowing(copies: dict[tuple[str, ...], jnp.dtype], towers: tuple, out_shardings) -> OuterProgram:
+def narrowing(copies: dict[tuple[str, ...], jnp.dtype], out_shardings) -> OuterProgram:
     """The program a step's state runs to make its narrowed copies of its weights (`narrowed`), placed by
-    `out_shardings`, compiled under the options of the objective's `towers`: the one program a run's first
-    step runs and a run compiled ahead compiles for it (`dew.training.ahead.started`)."""
-    return owned_program(lambda variables: narrowed(variables, copies), *towers, out_shardings=out_shardings)
+    `out_shardings`, compiled through Dew's compile point: the one program a run's first step runs and a
+    run compiled ahead compiles for it (`dew.training.ahead.started`)."""
+    return owned_program(lambda variables: narrowed(variables, copies), out_shardings=out_shardings)

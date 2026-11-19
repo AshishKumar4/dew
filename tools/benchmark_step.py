@@ -90,7 +90,12 @@ from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.selection import Unlowerable
 from dew.registry import models
 from dew.telemetry.benchmark import carried
-from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
+from dew.telemetry.instrumentation import (
+    BOUND_MARKS,
+    compilation_cache_counts,
+    count_compilation_cache,
+    logged_utilization,
+)
 from dew.telemetry.profile import Profiler
 from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
@@ -381,14 +386,15 @@ def rates(trainer: Trainer, rows: int, steps: int, elapsed: float,
           work: float | None) -> tuple[float | None, float | None]:
     """`steps` steps of `rows` rows over `elapsed` seconds, each `work` training FLOPs, rated as the
     trainer's interval rates them (`dew.training.interval.throughput`): the step's HLO utilization, a
-    lower bound where it runs launches whose work went uncounted (`StepFlops.unsized`), and its MFU, the
+    bound named by what its count is (`StepFlops.bound`: a lower bound where launches' work went
+    uncounted, an upper bound where a loop was counted at its stated bound), and its MFU, the
     work over the mesh's peak; each None where nothing counts it."""
     flops = trainer.step_flops
     scalars = throughput(elapsed, steps, rows * steps, None if flops is None else steps * flops,
                          trainer.device_mesh.devices.size,
                          training_flops=None if work is None else steps * work)
-    bound = "_lower_bound" if flops is not None and flops.unsized else ""
-    return scalars.get(f"train/hfu{bound}"), scalars.get("train/mfu")
+    hfu = logged_utilization(scalars, "hfu")
+    return None if hfu is None else hfu[0], scalars.get("train/mfu")
 
 
 def measured_row(case: Case, config: BenchmarkConfig) -> Row:
@@ -681,8 +687,11 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "tokens_per_sec": round(case.batch_size * case.seq_len / step_time, 1) if case.is_lm else None,
             "flops_per_step": None if flops is None else flops.hardware,
             "utilization": utilization,
-            # The launches a step runs whose work no count holds; where any runs, `utilization` and
-            # `flops_per_step` are lower bounds, as the trainer's train/hfu_lower_bound is.
+            # What `utilization` and `flops_per_step` are (`StepFlops.bound`), as the trainer names its
+            # train/hfu: a lower bound where a launch's work went uncounted (`unsized_kernels`, the launches
+            # a step runs whose work no count holds), an upper bound where a loop was counted at its stated
+            # bound, an estimate where both, else "" (the step's own count).
+            "utilization_bound": None if flops is None else flops.bound,
             "unsized_kernels": None if flops is None else flops.unsized,
             "training_flops": training_flops,
             # Why the model counts no training work, where it counts none, so no MFU is reported.
@@ -734,9 +743,9 @@ def format_table(rows: list[Row]) -> str:
                 text = mesh_label(value)
             elif isinstance(value, (int, float)):
                 text = fmt.format(value * TABLE_SCALE.get(key, 1))
-                # A count some launch's work is missing from is a lower bound.
-                if key in ("flops_per_step", "utilization") and row.get("unsized_kernels"):
-                    text = ">=" + text
+                # A count shown as the bound it is (`BOUND_MARKS`).
+                if key in ("flops_per_step", "utilization"):
+                    text = BOUND_MARKS[row["utilization_bound"]] + text
             else:
                 text = fmt.format(value)
             cells.append(text.ljust(width) if key == "architecture" else text.rjust(width))

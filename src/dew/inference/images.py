@@ -27,7 +27,7 @@ from dew.artifacts import uint8_pixels
 from dew.batch import Variables, thaw
 from dew.diffusion.process import Conditioning, Process
 from dew.inference.scoring import ScoringRequest
-from dew.inference.tasks import InItsForm, SavedRun, SavedRunTask, traced_in_its_form
+from dew.inference.tasks import InItsForm, SavedRun, SavedRunTask, saved_component, traced_in_its_form
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, host_rows, local_rows, mesh_of, request_key
@@ -37,7 +37,7 @@ from dew.objectives.base import OMITTED, Omitted
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.solvers import DDIM, Solver
-from dew.sampling.walks import sampling_modules, walk_and_decode
+from dew.sampling.walks import walk_and_decode
 from dew.telemetry.profile import region
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
@@ -116,6 +116,13 @@ class Images(Generic[ArrayT]):
         """Return this process's real rows as host arrays, without the padding added to fill the devices."""
         return jax.tree.map(lambda leaf: host_rows(leaf, self.rows), self)
 
+    def decoded(self) -> ArrayT:
+        """The decoded images, refused where the samples kept only their latents (a call with
+        `decode=False`)."""
+        if self.images is None:
+            raise ValueError("these samples kept only their latents; call the task with decode=True")
+        return self.images
+
     def pil(self) -> list[PILImage]:
         """Return this process's real rows of an NHWC image batch as PIL images.
 
@@ -125,12 +132,11 @@ class Images(Generic[ArrayT]):
         `[N, H, W, 3]` or `[N, H, W, 1]` images."""
         from PIL import Image
 
-        if self.images is None:
-            raise ValueError("these samples kept only their latents; call the task with decode=True")
-        if self.images.ndim != 4 or self.images.shape[-1] not in (1, 3):
+        images = self.decoded()
+        if images.ndim != 4 or images.shape[-1] not in (1, 3):
             raise ValueError(f"pil() takes [N, H, W, 3] or [N, H, W, 1] images, not samples of shape "
-                             f"{self.images.shape}")
-        pixels = uint8_pixels(host_rows(self.images, self.rows))
+                             f"{images.shape}")
+        pixels = uint8_pixels(host_rows(images, self.rows))
         return [Image.fromarray(row[..., 0] if row.shape[-1] == 1 else row) for row in pixels]
 
 
@@ -154,6 +160,10 @@ class ImageSettings:
     # dewml/hybrid-dit-176m's published record predates the fields below.
     end_to_end: JSON = None
     grid: JSON = None
+    grid_process: bool = field(default=False, metadata={"derived": "preset"})
+    """Whether `process` is the grid's own training process at the grid's tokens
+    (`DiffusionObjective.grid_process`: a run over a published pipeline naming no preset), which a run over
+    another size takes at its tokens; a record before it states none, its process kept as it trained."""
 
     def __post_init__(self) -> None:
         from dew._records import integer
@@ -196,6 +206,9 @@ class TextToImage(SavedRunTask, InItsForm):
     grid: Callable[[int], tuple[Process, jax.Array]] | None = None
     final_denoise: bool = True
     finish: Callable[[Variables, jax.Array], jax.Array] | None = None
+    grid_process: bool = False
+    """Whether `process` is `grid`'s own training process at its tokens (`DiffusionObjective.grid_process`,
+    `PipelineSource.grid_process`)."""
 
     def __post_init__(self) -> None:
         # A tree split for training, an adapter's, is read whole.
@@ -234,12 +247,14 @@ class TextToImage(SavedRunTask, InItsForm):
         return cls(objective.model, objective.process, objective.inputs,
                    without_loss_heads(variables), autoencoder,
                    steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
-                   grid=objective.grid, final_denoise=objective.final_denoise)
+                   grid=objective.grid, final_denoise=objective.final_denoise,
+                   grid_process=objective.grid_process)
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
                    layout: Layout | None = None, dtype: DTypeLike | None = None,
-                   param_dtype: DTypeLike | None = None, variables: Variables | None = None) -> TextToImage:
+                   param_dtype: DTypeLike | None = None, variables: Variables | None = None,
+                   published: bool = False) -> TextToImage:
         """Load the run `run` (its checkpoint pinned, `SavedRun.pinned`), built from the inference record
         its checkpoint holds (`Checkpoints.artifact`) the way the recipe built it; the run's `run.json`
         is not read. `from_run` loads one from its directory.
@@ -255,8 +270,10 @@ class TextToImage(SavedRunTask, InItsForm):
         `dtype` sets the compute dtype of the model, the encoders and the VAE.
         `param_dtype` sets the dtype the parameters are stored in; None keeps
         the checkpoint's dtypes exactly. Supplied `variables`, a tree of the
-        run's own form (a run that started from it saved them), are bound in
-        place of the checkpoint's, which is not read.
+        run's own form, are bound in place of the checkpoint's, which is not
+        read; with `published`, of the form this task holds it in (a run that
+        started from it saved them), a tuned autoencoder's weights and running
+        statistics under `autoencoder` (`EndToEnd.tuned`).
         """
         from dew._records import record as fields
         from dew.diffusion.schedules.source import SourceGrid
@@ -276,26 +293,37 @@ class TextToImage(SavedRunTask, InItsForm):
                           in fields(inputs_record['conditions'], 'conditions').items()}
             inputs_record = {**inputs_record, 'conditions': {
                 keyword: {**condition,
-                          'encoder': _computing(fields(condition['encoder'], 'encoder'), compute)}
+                          'encoder': saved_component(fields(condition['encoder'], 'encoder'), compute)}
                 for keyword, condition in conditions.items()}}
             if autoencoder_record is not None:
-                autoencoder_record = _computing(autoencoder_record, compute)
+                autoencoder_record = saved_component(autoencoder_record, compute)
         params = (restored_tree(run, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
                   if variables is None else variables)
         inputs = InputSpec.bound(inputs_record, params=params.get('encoders', {}))
         end_to_end = settings.end_to_end
         autoencoder = None
         if autoencoder_record is not None and end_to_end is not None:
-            from dew.objectives.diffusion.end_to_end import AUTOENCODER, EndToEnd
-            tuning = from_record(EndToEnd, fields(end_to_end, 'end_to_end'), dtypes=False)
-            frozen = AutoEncoder.bound(autoencoder_record, params=params['params'][AUTOENCODER])
-            autoencoder, params = tuning.tuned(frozen, params)
+            from dew.objectives.diffusion.end_to_end import (
+                AUTOENCODER,
+                TUNED_WEIGHTS,
+                EndToEnd,
+                TunedAutoEncoder,
+            )
+            if published:
+                # The tuned autoencoder as a run started from this one holds it: its weights and running
+                # statistics under `autoencoder` (`EndToEnd.tuned`).
+                frozen = AutoEncoder.bound(autoencoder_record, params=params['autoencoder'][TUNED_WEIGHTS])
+                autoencoder = TunedAutoEncoder(frozen, params['autoencoder'])
+            else:
+                tuning = from_record(EndToEnd, fields(end_to_end, 'end_to_end'), dtypes=False)
+                frozen = AutoEncoder.bound(autoencoder_record, params=params['params'][AUTOENCODER])
+                autoencoder, params = tuning.tuned(frozen, params)
         elif autoencoder_record is not None:
             autoencoder = AutoEncoder.bound(autoencoder_record, params=params['autoencoder'])
         grid = None if settings.grid is None else from_record(SourceGrid, fields(settings.grid, 'grid'))
         return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
                    steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver,
-                   grid=grid, final_denoise=grid is None)
+                   grid=grid, final_denoise=grid is None, grid_process=settings.grid_process)
 
     @classmethod
     def from_flaxdiff(cls, directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
@@ -340,11 +368,10 @@ class TextToImage(SavedRunTask, InItsForm):
         by the task's towers as the training step encodes its blank (`DiffusionObjective.encode`)."""
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
-            encode = _encoder(plan.sharding, self.inputs.encoders)
+            encode = _encoder(plan.sharding)
             return encode(self.inputs.encoders, self.variables, plan.place(plan.pad(tokens)))
         # Host tokens, which reach the encoders' devices as the call places them.
-        return _encoder(None, self.inputs.encoders)(self.inputs.encoders, self.variables,
-                                                    jax.tree.map(np.asarray, tokens))
+        return _encoder(None)(self.inputs.encoders, self.variables, jax.tree.map(np.asarray, tokens))
 
 
     def prepare(
@@ -487,7 +514,6 @@ class TextToImage(SavedRunTask, InItsForm):
         mapped over the requests (`_initials`, `_walks`), the weights and the grid shared."""
         walks = [jax.random.fold_in(request, 1) for request in requests]
         grid = _default_grid(walking.process, walking.count) if walking.times is None else walking.times
-        models = sampling_modules(self.model, walking.guidance, self.autoencoder)
         statics = (self.model, walking.process, self.autoencoder, self.finish, self.final_denoise,
                    walking.decode)
         times = np.asarray(grid, np.float32)
@@ -498,7 +524,7 @@ class TextToImage(SavedRunTask, InItsForm):
                 plan = RowPlan.over(mesh_of(self.variables), inputs.rows)
                 initial = program(_initial, static_argnums=(0, 1, 2), in_shardings=(plan.sharding, None))(
                     walking.solver, walking.process, grid, inputs.noise, walk)
-                walked = program(_walk, *models, static_argnums=(0, 1, 2, 3, 4, 5),
+                walked = program(_walk, static_argnums=(0, 1, 2, 3, 4, 5),
                                  in_shardings=(None, None, None, None, None, plan.sharding, None,
                                                plan.sharding, None, None),
                                  out_shardings=plan.sharding)
@@ -513,7 +539,7 @@ class TextToImage(SavedRunTask, InItsForm):
             keys = jnp.stack(walks)
             initial = program(_initials, static_argnums=(0, 1, 2))(walking.solver, walking.process, grid,
                                                                    noise, keys)
-            generated = program(_walks, *models, static_argnums=(0, 1, 2, 3, 4, 5))(
+            generated = program(_walks, static_argnums=(0, 1, 2, 3, 4, 5))(
                 *statics, walking.solver, walking.guidance, times, initial, self.variables, conditions,
                 unconditional, noise, keys, streams)
         return [replace(jax.tree.map(lambda leaf, index=index: leaf[index], generated), rows=inputs.rows)
@@ -720,7 +746,7 @@ class TextToImage(SavedRunTask, InItsForm):
         plan, process = settled.plan, settled.process
         given = plan.place(plan.pad(settled.tokens))
         if "given" not in settled.encoded:
-            given = _encoder(plan.sharding, self.inputs.encoders)(self.inputs.encoders, self.variables, given)
+            given = _encoder(plan.sharding)(self.inputs.encoders, self.variables, given)
         if settled.null_tokens is None:
             null = {}
         elif "null" in settled.encoded:
@@ -734,7 +760,7 @@ class TextToImage(SavedRunTask, InItsForm):
                             out_shardings=plan.sharding)
             return given, null, noise(process, plan.keys(settled.request), settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
-        starting = program(_image_start, *(() if self.autoencoder is None else self.autoencoder.towers()),
+        starting = program(_image_start,
                            static_argnums=(0, 1, 2),
                            in_shardings=(None, plan.sharding, plan.sharding, None, None),
                            out_shardings=plan.sharding)
@@ -906,6 +932,7 @@ class _ImagePass:
     images: int
     first: _Drawn | None = None
     held: int = 0
+    requests: int = 0
 
     def add(self, request: _Drawn) -> bool:
         if self.first is not None and (not self.first.alike(request)
@@ -913,7 +940,12 @@ class _ImagePass:
             return False
         self.first = self.first or request
         self.held += len(request.prompts)
+        self.requests += 1
         return True
+
+    def taken(self) -> int:
+        """Every request it holds: alike, they run as one batch."""
+        return self.requests
 
 
 @dataclass(frozen=True, eq=False)
@@ -991,10 +1023,12 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
                      ) -> tuple[tuple[str, ...], ...]:
     """The parameter roots of a recorded run's tree, which a storage override
     casts: the denoiser's, each condition encoder's own collections and the
-    autoencoder's. The rest keep the dtypes they were saved in."""
+    autoencoder's parameters (`AutoEncoder.parameter_collections`). The rest keep the dtypes they were
+    saved in."""
     from dew._records import record
     from dew.batch import PARAMETER_ROOTS
     from dew.inputs.condition import ConditionEncoder
+    from dew.nn.autoencoders import AutoEncoder
     from dew.registry import component
 
     roots: list[tuple[str, ...]] = list(PARAMETER_ROOTS)
@@ -1004,22 +1038,11 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
         roots.extend([("encoders", keyword)] if collections is None else
                      [("encoders", keyword, collection) for collection in collections])
     if autoencoder is not None:
-        roots.append(("autoencoder",))
+        held = component(AutoEncoder, autoencoder)[0].parameter_collections
+        # A tuned autoencoder's weights, not its running statistics (`AutoEncoder.parameter_collections`).
+        roots.extend([("autoencoder",)] if held is None
+                     else [("autoencoder", collection) for collection in held])
     return tuple(roots)
-
-
-def _computing(owner: Mapping[str, object], compute: str) -> Mapping[str, object]:
-    """A recorded encoder or autoencoder (a class record, `dew.registry.component`) computing in
-    `compute`: its own `dtype`, and the dtype of the model it wraps where it records one."""
-    from dew._records import record
-
-    recorded = dict(record(owner['fields'], 'fields'))
-    if 'dtype' in recorded:
-        recorded['dtype'] = compute
-    model = recorded.get('model')
-    if isinstance(model, Mapping) and 'dtype' in record(model.get('fields', {}), 'model.fields'):
-        recorded['model'] = {**model, 'fields': {**record(model['fields'], 'model.fields'), 'dtype': compute}}
-    return {**owner, 'fields': recorded}
 
 
 def _time_grid(times) -> tuple[float, ...]:
@@ -1083,10 +1106,10 @@ def _encoded(encoders, params, tokens):
     return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens, path="TextToImage")
 
 
-def _encoder(rows: jax.sharding.NamedSharding | None, encoders):
-    """The program that encodes rows placed by `rows` (`_encoded`) with `encoders`, placed as they are,
-    under the options its towers compile with (`compiler_options`)."""
-    return program(_encoded, encoders, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
+def _encoder(rows: jax.sharding.NamedSharding | None):
+    """The program that encodes rows placed by `rows` (`_encoded`), its encoders placed as they are,
+    compiled through Dew's compile point (`program`)."""
+    return program(_encoded, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
 
 
 def _encoded_rows(conditions: Mapping[str, Conditioning]) -> int:

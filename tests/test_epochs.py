@@ -286,6 +286,39 @@ def test_epochs_of_a_read_whose_objective_makes_rows_of_its_examples_are_passes_
     assert recorded(evaluated) == {"examples": 12}
 
 
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_the_default_cadence_is_each_pass_where_the_run_counts_them_and_its_end_where_it_counts_none(read):
+    """A config's default validation and checkpoint cadence (`passes`) is a pass's end where the run counts
+    its data's passes: a pass's 12 source examples for a run of epochs over a read whose objective makes
+    rows of them, a pass's 3 steps for a read with a record count; and the run's end ("100%") for the same
+    read bounded in steps, which counts none, where a written "epoch" is refused. The default was "epoch",
+    so a steps-bounded decision run was refused at its defaults (the decision recipe's documented
+    command)."""
+    from data_support import Questioned
+
+    from dew.config import TrainerConfig
+    from dew.data.compile import fitted
+    from dew.training.budget import recorded
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids}, shard_rows=4)).shuffle(seed=3, window=12).read(read).batch(8)
+    objective = _pulled(Questioned()).data()
+    passes, _ = fitted(chain, None, objective=objective, epochs=2)
+    by_epochs = TrainerConfig(epochs=2)
+    assert recorded(by_epochs.eval_interval(passes)) == recorded(by_epochs.checkpoint_interval(passes)) == {
+        "examples": 12}
+    stepped, _ = fitted(chain, None, objective=objective, steps=4)
+    assert (stepped.records, stepped.pass_examples) == (None, None)
+    by_steps = TrainerConfig(steps=4)
+    assert by_steps.eval_interval(stepped) == by_steps.checkpoint_interval(stepped) == "100%"
+    with pytest.raises(ValueError):
+        TrainerConfig(steps=4, eval_every="epoch").eval_interval(stepped)
+    with pytest.raises(ValueError):
+        TrainerConfig(steps=4, checkpoint_every="epoch").checkpoint_interval(stepped)
+    records = compile(Pipeline(Memory({"id": ids})).batch(4), read="memory")
+    assert by_steps.eval_interval(records) == by_steps.checkpoint_interval(records) == 3
+
+
 def test_epochs_of_a_read_it_packs_as_its_rows_arrive_are_passes_over_its_documents():
     """A run of three epochs over 10 documents a pack lays out as they arrive, read per share, so its
     read has no record count: an epoch is a pass over its 10 documents, so the run trains on the examples
@@ -520,3 +553,77 @@ def test_epochs_of_a_memory_read_that_packs_after_a_draw_or_a_cache_are_passes_o
     assert (loader.epochs, loader.pass_examples, loader.examples) == (2, 10, 20)
     state = Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
     assert int(state.consumed) == 20
+
+
+class FirstKept:
+    """Rejects a document whose first id is a multiple of `every`, as a decode rejects bytes it cannot
+    make."""
+
+    identity = "first-kept@1"
+    rejects = True
+
+    def __init__(self, every: int):
+        self.every = every
+
+    def __call__(self, row):
+        from dew.data.pipeline import Rejected
+
+        return Rejected("unkept") if int(row["id"][0]) % self.every == 0 else row
+
+
+def test_epochs_of_a_memory_read_that_rejects_documents_before_it_packs_them_count_those_it_holds():
+    """Twelve documents, three of them rejected before a memory read packs the rest as it holds them: the
+    epochs' bound is held with the pack, where the read counts the nine it holds, a pass of them (train
+    1014's review: a bound placed before the rejecting step held none, and the epochs were refused)."""
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(12)]
+    chain = (Pipeline(Memory(documents)).filter_map(FirstKept(5)).pack(8, fields=("id",)).shuffle(seed=1)
+             .read("memory").batch(8))
+    loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
+    assert (loader.pass_examples, loader.examples) == (9, 18)
+
+
+def test_epochs_of_a_streamed_mix_whose_member_rejects_records_count_no_pass_ahead():
+    """A streamed mix of two corpora, one rejecting every third record, bounded after the mix where only the
+    rows it keeps reach the bound: no pass of it is counted ahead (a run of its epochs is refused), where
+    counting its source's records, 23 a pass, read each pass of it past its end (train 1014's review)."""
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+
+    first = Pipeline(Memory({"id": np.arange(1, 13, dtype=np.int32)})).filter_map(Keeps(3)).named("first")
+    second = Pipeline(Memory({"id": np.arange(21, 25, dtype=np.int32)})).named("second")
+    chain = mix([first, second], weights=(1, 1)).read("streamed").batch(4)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.pass_examples, loader.examples) == (None, None)
+
+
+def test_a_splits_epoch_cadence_is_the_runs_own_under_a_batch_ramp(tmp_path):
+    """A split validated each epoch (`--val-every '{"val": "epoch"}'`) and the run's own validation at
+    `epoch` (`eval_every`) resolve to the same steps under a batch ramp, which reads fewer records a step
+    early, so a pass takes more steps than the unramped run's: both read the loader the ramp reads. The
+    split's was resolved before the ramp, at the unramped pass's steps, so it validated mid-epoch (train
+    1012's review)."""
+    import dataclasses
+
+    from run_kinds import lm
+
+    from dew.data.dataset import Ramp
+
+    run = lm(tmp_path, drawn=False)
+
+    def readied(ramp: Ramp | None):
+        """The run's trainer, loader and suites as it trains, under `ramp`."""
+        trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"), epochs=2,
+                                      eval_every="epoch", multi_host=False, batch_ramp=ramp)
+        prepared = dataclasses.replace(run, trainer=trainer, val_every={"val": "epoch"}).prepare()
+        sized, loader, _, suites, _ = prepared.run.readied(prepared.objective, prepared.dataset,
+                                                           prepared.validation, (), "ramped")
+        return sized.trainer, loader, suites
+
+    trainer, loader, suites = readied(Ramp(start=4, increment=4, samples=16))
+    flat, flat_loader, flat_suites = readied(None)
+    assert suites["val"].every == trainer.eval_interval(loader)
+    assert flat_suites["val"].every == flat.eval_interval(flat_loader) != trainer.eval_interval(loader)

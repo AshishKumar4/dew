@@ -11,8 +11,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from recorded_runs import assert_as_exact_as_recorded
 from reference_error import GateFailure, Inconclusive
-from reference_runs import assert_as_exact_as_recorded
 from rounding_bound import rounding_scale
 from test_weighed_check import WEIGHED_SEEDS, biased, draw, reference, reformulated
 from tool_support import load

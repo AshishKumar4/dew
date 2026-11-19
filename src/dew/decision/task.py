@@ -76,6 +76,7 @@ from dew.inference.tasks import (
     SavedRun,
     SavedRunTask,
     length_ladder,
+    saved_component,
     shape_bucket,
     traced_in_its_form,
 )
@@ -283,28 +284,25 @@ def _head_changes(first: Mapping[str, object], other: Mapping[str, object]) -> l
 
 def _tokenizer_held(settings: "DecideSettings", run: str) -> "Tokenizer | str | None":
     """The text tokenizer of the run in `run`, which runs compare by (`_same_tokenizer`): whether its record
-    states its files or was saved before records did (`dew.inference.tasks.saved_tokenizer`); the byte
-    vocabulary, which has no files, by its name."""
-    from dew.data.text import HFTokenizer
-    from dew.inference.tasks import saved_tokenizer
+    states its files or was saved before records did (`dew.data.text.tokenizer_for`, the copy the run
+    holds); the byte vocabulary, which has no files, by its name."""
+    from dew.data.text import HFTokenizer, tokenizer_for
 
     if settings.tokenizer is None:
         return None
-    found = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, run)
+    found = tokenizer_for(settings.tokenizer, files=settings.tokenizer_files, held=run)
     return found if isinstance(found, HFTokenizer) else settings.tokenizer
 
 
 def _same_tokenizer(one: "Tokenizer | str | None", other: "Tokenizer | str | None") -> bool:
-    """Whether two runs read one tokenizer: their files' hashes alike (`PinnedTokenizer.files`), else their
-    files each written again by this host's transformers alike (`dew.data.text.canonical_files`), which a
-    release exported before releases copied their run's files (`HFTokenizer.save_pretrained`) is read by:
-    transformers rewrote its tokenizer.json, so its hashes differ from its run's though it is one
-    tokenizer, which a run continued from it averages with its start by. A byte vocabulary by its name."""
-    from dew.data.text import HFTokenizer, canonical_files
+    """Whether two runs read one tokenizer, by Dew's one rule of it (`dew.data.text.same_tokenizer`): a run
+    continued from a release reads the release's tokenizer, which an export wrote through transformers,
+    and averages with its start by it. A byte vocabulary by its name."""
+    from dew.data.text import HFTokenizer, same_tokenizer, tokenizer_revision
 
     match one, other:
         case HFTokenizer(), HFTokenizer():
-            return one.pinned.files == other.pinned.files or canonical_files(one) == canonical_files(other)
+            return same_tokenizer(tokenizer_revision(one), tokenizer_revision(other))
         case _:
             return one == other
 
@@ -527,16 +525,20 @@ class Decide(SavedRunTask, InItsForm):
                   weights: Weights, dtype: DTypeLike | None) -> Self:
         """The task a run's `record` describes over `backbone` and `variables`, the `weights` they are:
         its head, layout, tokenizer, special tokens and processor as the run recorded them."""
-        from dew.inference.tasks import saved_settings, saved_tokenizer
+        from dew.data.text import tokenizer_for
+        from dew.inference.tasks import saved_settings
         from dew.interop.pretrained import load_processor
 
         settings = saved_settings(record, DecideSettings)
         width, head_dtype = DecisionModel.head_size(backbone)
         head = Head.from_record(settings.head, width)
         # The head computes in the dtype it recorded, or as a fresh head over
-        # the backbone would where the caller overrides the compute dtype.
+        # the backbone would where the caller overrides the compute dtype, and a configured context
+        # encoder in that dtype too (`saved_component`), as a diffusion task's encoders do.
         context = None if settings.context is None else Condition.bound(
-            settings.context, params=thaw(part(variables, "context"))["params"])
+            {**settings.context, "encoder": saved_component(
+                _records.record(settings.context["encoder"], "encoder"), dtype)},
+            params=thaw(part(variables, "context"))["params"])
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
                               settings.context_encoder, context)
         if settings.tokenizer is None:
@@ -551,7 +553,7 @@ class Decide(SavedRunTask, InItsForm):
         # here as documents continuing the shared part: the same tokens at the same positions, each
         # question reading the shared part and itself (with siblings, the questions before it), so the
         # same function, each held to its questions' own rows (tests/test_decision_state_once.py).
-        tokenizer = saved_tokenizer(settings.tokenizer, settings.tokenizer_files, directory)
+        tokenizer = tokenizer_for(settings.tokenizer, files=settings.tokenizer_files, held=directory)
         return cls(model, variables, settings.layout, tokenizer, settings.specials,
                    name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget,
                    derives_sharing=False)
@@ -665,7 +667,7 @@ class Decide(SavedRunTask, InItsForm):
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
         # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs, and
         # their heads by how they run or train alone (`_head_changes`).
-        # Their tokenizers by what they are, their files' hashes, wherever each found it (`_tokenizer_held`).
+        # Their tokenizers by what they are (`_same_tokenizer`), wherever each found it (`_tokenizer_held`).
         tokenizers = [_tokenizer_held(own, run.directory) for own, run in zip(settings, pinned, strict=True)]
         for directory, own, held in zip(runs, settings, tokenizers, strict=True):
             differing = [entry.name for entry in fields(DecideSettings)
@@ -985,20 +987,19 @@ class Decide(SavedRunTask, InItsForm):
 
     def planned_shapes(self, rows: Sequence[Encoded]) -> tuple[PassShape, ...]:
         """The shapes the passes over `rows` take, in a server's order (`dew.inference.scoring.
-        ScoringServer`): each pass growing over them while its plan holds them (`planned`), a row it
-        refuses opening the next, and a row no plan holds a pass of its own; each shape once, in
-        `pass_shapes`' order."""
+        ScoringServer`): each pass growing over them while its plan holds them (`planned`), running as
+        many as it takes (`PassPlan.taken`), the rest opening the next, and a row no plan holds a pass of
+        its own; each shape once, in `pass_shapes`' order."""
         taken: set[PassShape] = set()
-        passing: list[Encoded] = []
-        plan = self.planned()
-        for row in rows:
-            if not plan.add(row) and passing:
-                taken.add(self._shape(passing))
-                passing, plan = [], self.planned()
-                plan.add(row)
-            passing.append(row)
-        if passing:
-            taken.add(self._shape(passing))
+        start = 0
+        while start < len(rows):
+            plan, end = self.planned(), start
+            while end < len(rows) and (plan.add(rows[end]) or end == start):
+                end += 1
+            # Those the plan runs now (`PassPlan.taken`), the first always, the rest first in the next.
+            run = max(plan.taken(), 1)
+            taken.add(self._shape(rows[start:start + run]))
+            start += run
         return tuple(shape for shape in self.pass_shapes if shape in taken)
 
     @functools.cached_property
@@ -1162,10 +1163,11 @@ class Decide(SavedRunTask, InItsForm):
     @traced_in_its_form
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,
                  media: ModelInputs | None = None) -> jax.Array:
-        """`model.logits`, compiled with the XLA options its backbone and head take where they run
-        (`program`)."""
+        """`model.logits`, compiled through Dew's compile point (`program`), each GEMM's backend chosen from
+        the program's own dots (`dew.nn.kernels.templates.report.targeted`): a configured context
+        encoder's int8 products among them, whatever tower makes them."""
         model = self.model
-        logits = program(type(model).logits, model.backbone, model.head, static_argnums=(0,))
+        logits = program(type(model).logits, static_argnums=(0,))
         return logits(model, variables, inputs, media=media)
 
     def tournament(self, state: JSON, questions: Mapping[str, Question], *,
@@ -1388,8 +1390,12 @@ class Decide(SavedRunTask, InItsForm):
 
         With `whole`, a request that the layout could answer only by cutting its
         state, instructions or options is refused instead, naming the maximum
-        context length, as a benchmark that forbids truncation requires
-        (Decision Index counts such a refusal as unsupported).
+        context length, and one whose context its cross-attention reads only cut
+        (past `context_length`) naming that, as a benchmark that forbids
+        truncation requires (Decision Index counts such a refusal as unsupported).
+        Without it, a longer context keeps its first tokens, and the response
+        states its whole and kept tokens (`usage.context_tokens`,
+        `usage.context_kept`).
         """
         if isinstance(request, Mapping):
             [answered] = self._systemone([request], details=details, strict=strict, whole=whole)
@@ -1542,6 +1548,33 @@ class PassPlan:
             self.rows.append(row)
         return bool(held)
 
+    def taken(self) -> int:
+        """How many of its rows, the first by the order they were added, the pass runs now
+        (`ScoringServer`): all of them, or, where they overrun the declared count below their shape's, those
+        added before the first row placed past that count's windows, the rest left to a pass of its own
+        shape, of fewer windows than theirs, where the two passes compute fewer tokens (each costed by its
+        shape, `Decide._shape`). The counts are powers of 8, so a pass that overruns one by a little took
+        the next count whole: a server's last pass of 512 requests held 29% of its 32 windows' tokens, a
+        fifth of every pass's tokens padding (row 3330). The rows run are the first added, so each request
+        keeps its rows in order, and the passes are costed as they run. One count below and one pass after,
+        its windows fewer, so a pass splits once and a server's passes stay few: a rest that takes the whole
+        pass's count again would only shorten its length, a pass more for each row it left, so it runs
+        whole."""
+        rows, decide = self.rows, self.decide
+        if not rows or not self.alive:
+            return len(rows)
+        whole = self.shape()
+        windows = self.placing[self.alive[0]].windows
+        below = max((shape.rows for shape in decide.pass_shapes
+                     if shape.length == whole.length and shape.rows < whole.rows), default=None)
+        cut = next((index for index, window in enumerate(windows) if below is not None and window >= below),
+                   len(rows))
+        if cut in (0, len(rows)):
+            return len(rows)
+        first, rest = decide._shape(rows[:cut]), decide._shape(rows[cut:])
+        split = first.rows * first.length + rest.rows * rest.length
+        return cut if rest.rows < whole.rows and split < whole.rows * whole.length else len(rows)
+
     def shape(self) -> PassShape:
         """The pass's shape: of the shortest length that holds its rows, the fewest windows declared that
         hold them."""
@@ -1622,15 +1655,15 @@ class _WirePlan:
         self.decide = decide
         self.text = decide.planned()
         self.seen: list[_Row] = []
-        self.taken = 0
+        self.texts = 0
 
     def add(self, row: _Row) -> bool:
         if row.media is None:
             if self.seen:
                 return False
-            self.taken += 1
+            self.texts += 1
             return self.text.add(row.encoded)
-        if self.taken:
+        if self.texts:
             return False
         first = self.seen[0] if self.seen else row
         assert first.media is not None
@@ -1641,6 +1674,10 @@ class _WirePlan:
             return False
         self.seen.append(row)
         return True
+
+    def taken(self) -> int:
+        """Its text rows as their plan runs them now (`PassPlan.taken`), or its rows of images, all."""
+        return self.text.taken() if self.texts else len(self.seen)
 
 
 @dataclass(frozen=True)
@@ -1742,8 +1779,11 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
             with self.counting:
                 self.counts.dropped(Rejected("cut", cut=removed))
-            cut = ("state" if usage.truncated else "context" if usage.context_cut
-                   else "instructions or options")
+            if usage.context_cut:
+                # A context's room is its cross-attention's, apart from the row's.
+                raise Refused("cut", f"the request's context does not fit the context length, context_length="
+                                     f"{decide.context_length} tokens, without cutting it")
+            cut = "state" if usage.truncated else "instructions or options"
             raise Refused("cut", f"the request does not fit the maximum context length, max_len="
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
         with self.counting:

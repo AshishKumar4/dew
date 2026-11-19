@@ -562,14 +562,15 @@ def expert_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]) -
 
 def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
     """The logical axes of each leaf of an expert bank's `matrix` (`expert_matrix`), its own `[experts, in,
-    out]` being `axes`: one leaf, the matrix; a packed bank's three (`NvFp4`), its words and block scales
-    `[experts, out, in / 8 or in / 16]` and its tensor scales `[experts]`, in its leaves' order."""
+    out]` being `axes`: one leaf, the matrix; a packed bank's four (`NvFp4`), its words and block scales
+    `[experts, out, in / 8 or in / 16]`, its tensor scales `[experts]` and its form's version bytes, whole on
+    every device, in its leaves' order."""
     from dew.nn.kernels.formats import NvFp4
 
     if not isinstance(matrix, NvFp4):
         return [tuple(axes)]
     experts, inputs, outputs = axes
-    return [(experts, outputs, inputs), (experts, outputs, inputs), (experts,)]
+    return [(experts, outputs, inputs), (experts, outputs, inputs), (experts,), (None,)]
 
 
 def decoded_expert_banks(variables: Variables) -> Variables:

@@ -52,17 +52,9 @@ from flax import traverse_util as flax_traverse
 
 from dew import _records
 from dew._cache import package_digest
-from dew.interop import (
-    codecs,
-    decoder_config,
-    decoder_parts,
-    hf_decoders as decoders,
-    isolated,
-    parts,
-    sources,
-)
+from dew._isolated import Isolated, prepared_script
+from dew.interop import codecs, decoder_config, decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
-from dew.interop.isolated import Isolated
 from dew.interop.probe import BATCH, LENGTH, probe_ids
 from dew.nn.blocks import padded_row
 from dew.nn.kernels.options import owned_program
@@ -828,7 +820,7 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
 @dataclass(frozen=True)
 class _Source:
     """The probe's reference at float32, in the load's process, and its float64 twin, built and run in a
-    process of its own (`twin`, `dew.interop.isolated`: the twin sets torch's defaults process-wide),
+    process of its own (`twin`, `dew._isolated`: the twin sets torch's defaults process-wide),
     whose runs over each draw tier 2's verdict reads (`_mapped`)."""
 
     reference: PreTrainedModel
@@ -937,7 +929,7 @@ def logits_mapped(source: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]],
     with jax.enable_x64(new_val=True):
         model, held = _wide_dew(record, variables)
         # Held by this verdict alone, which a closure over its probe's arrays is (`owned_program`).
-        forward = owned_program(lambda ids: model.apply(held, ids), model)
+        forward = owned_program(lambda ids: model.apply(held, ids))
 
         def draw(seed: int):
             ids = probe_ids(_VOCAB, seed, _DRAWN)
@@ -1007,7 +999,7 @@ def gradients_mapped(source: _Source, family: decoder_parts.DecoderFamily,
             return jax.grad(lambda params: jnp.sum(model.apply({**held, 'params': params}, ids) * cotangent))(
                 params)
 
-        compiled = owned_program(gradient, model)
+        compiled = owned_program(gradient)
 
         def draw(seed: int):
             ids, cotangent = _gradient_inputs(seed)
@@ -1202,7 +1194,7 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
                 weights = {key: value.detach().cpu().numpy() for key, value in reference.state_dict().items()}
                 if registered is not None and any(kind.__module__ == '__main__' for kind in registered):
                     # The script that defines the type's classes, imported there as spawn imports it.
-                    twin.call(multiprocessing.spawn.prepare, isolated.main())
+                    twin.call(multiprocessing.spawn.prepare, prepared_script())
                 # The config as it serializes, without the implementations a build resolved onto it (its
                 # experts', its attention's), which the twin's process resolves for itself.
                 twin.call(_twin_built, source, type(config), config.to_dict(), weights, registered)
@@ -1217,7 +1209,7 @@ def _registered(source: ModelSource, config: PretrainedConfig) -> tuple[type, ob
     """The config class of `config` and the causal LM transformers' auto classes register for it, the
     constructor `ModelSource.causal_lm` builds by (which may return another class, a factory's), which the
     twin's process registers alike (`_twin_built`), so a type a script or a module registered at runtime
-    builds there (`dew.interop.isolated`); None for a source's remote code, which its auto classes do not
+    builds there (`dew._isolated`); None for a source's remote code, which its auto classes do not
     build."""
     from transformers import MODEL_FOR_CAUSAL_LM_MAPPING
 

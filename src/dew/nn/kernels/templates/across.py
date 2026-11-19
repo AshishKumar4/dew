@@ -79,15 +79,24 @@ class LaneZero:
 
     def __call__(self, ctx, value):
         del ctx
-        i32 = ir.IntegerType.get_signless(32)
-        broadcast = mgpu_utils.inline_ptx("shfl.sync.idx.b32 $0, $1, 0, 0x1f, 0xffffffff;",
-                                          value.registers.item(), result_types=i32, convergent=True)
-        return mgpu_fragments.FragmentedArray.splat(broadcast, (), is_signed=True)
+        return mgpu_fragments.FragmentedArray.splat(lane_value(value.registers.item(), 0), (), is_signed=True)
 
 
 # One shuffle a thread: an operation of the CUDA cores, no memory read or written.
 LANE_ZERO = emission.stating(lambda value: Work(operations=1))(LaneZero())
 """The one `LaneZero` body every `uniform` inlines, its work stated once (`emission.stating`)."""
+
+
+def lane_value(value: ir.Value, lane: int) -> ir.Value:
+    """The int32 `value` (an MLIR value of a lane-level body, `plgpu.inline_mgpu`'s) that the warp's lane
+    `lane` holds, as every lane of the warp holds it: one `shfl.sync.idx` from that constant lane, whose
+    result ptxas holds in a uniform register (`uniform`, row 7898). Its warp's lanes all run it; a lane
+    past the warp's is refused, whose shuffle would read no lane."""
+    if not 0 <= lane < mgpu_utils.WARP_SIZE:
+        raise ValueError(f"lane {lane} is no lane of a warp's {mgpu_utils.WARP_SIZE}")
+    i32 = ir.IntegerType.get_signless(32)
+    return mgpu_utils.inline_ptx(f"shfl.sync.idx.b32 $0, $1, {lane}, 0x1f, 0xffffffff;", value,
+                                 result_types=i32, convergent=True)
 
 
 def summing(shape: tuple[int, ...], consumers: int) -> dict:

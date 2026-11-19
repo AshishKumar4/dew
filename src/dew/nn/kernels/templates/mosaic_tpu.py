@@ -255,7 +255,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
         def launched(*operands):
             # A table its programs read an element at a time in scalar memory, every other operand in HBM. A
-            # ref the launch adds into in place (`jax.new_ref`, `mosaic.stacked_zeros`) goes in as its value
+            # ref the launch adds into in place (`jax.new_ref`, `stacked.zeros`) goes in as its value
             # aliased to an output of its own (`input_output_aliases`), which the program reads and writes as
             # the ref, and which is written back into the ref after the call. Its programs run in turn
             # ("arbitrary"), so one's read-modify-write of a shared view (`added`) races no other's.

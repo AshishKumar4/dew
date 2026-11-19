@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, assert_contract, assert_drawn_contract, normal_draw
 from reference_error import Followed, Rounded, as_given, assert_as_exact, widened
 
 from dew.nn import precision
@@ -107,9 +107,11 @@ def test_a_grouped_gemm_holds_every_order(edge):
     products near float32's ends."""
     sizes = jnp.asarray([3, 0, 5], jnp.int32)
     groups = jnp.repeat(jnp.arange(3), sizes, total_repeat_length=8)
-    primals = normal_draw(146, (8, 16), (3, 16, 4), scale=EDGES[edge])
-    direction = normal_draw(147, (8, 16), (3, 16, 4), scale=EDGES[edge])
-    (cotangent,) = normal_draw(148, (8, 4))
+    def inputs(seed: int, scale: float) -> tuple:
+        # Each stream salted apart (`normal_draw`'s salt): one seed's cotangent is no other's input.
+        (cotangent,) = normal_draw([148, seed], (8, 4))
+        return (normal_draw([146, seed], (8, 16), (3, 16, 4), scale=scale),
+                normal_draw([147, seed], (8, 16), (3, 16, 4), scale=scale), cotangent)
 
     def grouped(rows, matrices):
         return gemm.gemm(rows, matrices, sizes, out_dtype=rows.dtype)
@@ -117,8 +119,8 @@ def test_a_grouped_gemm_holds_every_order(edge):
     def plain(rows, matrices):
         return jnp.einsum("rg,rk,gkn->rn", jax.nn.one_hot(groups, 3, dtype=rows.dtype), rows, matrices)
 
-    assert_contract(grouped, primals, direction, cotangent, f"a grouped GEMM {edge}", truth_fn=plain,
-                    plain_fn=plain)
+    assert_drawn_contract(grouped, inputs, EDGES[edge], f"a grouped GEMM {edge}", truth_fn=plain,
+                          plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -405,11 +407,47 @@ def test_a_gemm_prologue_holds_every_order(edge):
 
     prologued = _prologued(rms_producer, lambda *primals: lambda *tangents: jax.jvp(
         rms_producer, primals, tangents)[1])
-    primals = normal_draw(394, (6, 16), (16,), scale=EDGES[edge])
-    direction = normal_draw(395, (6, 16), (16,), scale=EDGES[edge])
-    (cotangent,) = normal_draw(396, (6, 16))
-    assert_contract(prologued, primals, direction, cotangent, f"a GEMM prologue {edge}",
-                    truth_fn=rms_producer, plain_fn=rms_producer)
+    def inputs(seed: int, scale: float) -> tuple:
+        # Each stream salted apart (`normal_draw`'s salt): one seed's cotangent is no other's input.
+        (cotangent,) = normal_draw([396, seed], (6, 16))
+        return (normal_draw([394, seed], (6, 16), (16,), scale=scale),
+                normal_draw([395, seed], (6, 16), (16,), scale=scale), cotangent)
+
+    assert_drawn_contract(prologued, inputs, EDGES[edge], f"a GEMM prologue {edge}", truth_fn=rms_producer,
+                          plain_fn=rms_producer)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_fused_gemm_epilogue_holds_every_order(edge):
+    """The fused GEMM's epilogue (`fused_gemm._declared`): its consumer's arithmetic with each call read
+    through to its body, as the fuser tiles it, its derivative the consumer's as written, a gated product's
+    SwiGLU (`activations.gated_hook`): every order finite wherever float64 is a normal float32 and the plain
+    formula is, where the inlined logistic's own derivative is no number past exp's overflow."""
+    from dew.nn import activations
+    from dew.nn.kernels import fused_gemm
+
+    hook = activations.gated_hook("swiglu")
+
+    def consumer(values, acc):
+        return hook(acc, values[0])
+
+    shape = jax.ShapeDtypeStruct((6, 16), jnp.float32)
+    treedef = jax.tree.structure((shape,))
+    written, inlined = fused_gemm._rewritten_consumer(consumer, (shape,), shape)
+    epilogue = fused_gemm._declared(
+        lambda acc, *tiles: inlined(jax.tree.unflatten(treedef, list(tiles)), acc), written, treedef,
+        jax.tree.structure(shape), shape)
+
+    def plain(gate, up):
+        return jax.nn.silu(gate) * up
+
+    def inputs(seed: int, scale: float) -> tuple:
+        (cotangent,) = normal_draw([399, seed], (6, 16))
+        return (normal_draw([397, seed], (6, 16), (6, 16), scale=scale),
+                normal_draw([398, seed], (6, 16), (6, 16), scale=scale), cotangent)
+
+    assert_drawn_contract(epilogue, inputs, EDGES[edge], f"a fused GEMM epilogue {edge}", truth_fn=plain,
+                          plain_fn=plain)
 
 
 def softly_rectified(scores):

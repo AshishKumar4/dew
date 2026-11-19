@@ -362,6 +362,38 @@ def test_a_meeting_and_a_new_stage_drop_each_groups_part_filled_window():
         assert after.inner.accumulation.fill.tolist() == [0, 0]
 
 
+def test_a_meeting_averages_every_inexact_leaf_of_its_groups_in_its_own_precision():
+    """At a meeting, the EMA's and the other collections' leaves are the groups' mean, held to an
+    independent average: a complex leaf's ([1+0j, 3+2j] meets at 2+1j, where it took the first group's),
+    a float64 leaf's in float64 (where it was averaged in float32), a bfloat16 leaf's in float32 stored
+    back in bfloat16; a count is the first group's (row 7612)."""
+    from dew.state import Replicas, TrainState
+
+    with jax.enable_x64(new_val=True):
+        groups = {"complex": np.asarray([[1 + 0j], [3 + 2j]], np.complex64),
+                  "wide": np.asarray([[1.0], [1.0 + 2.0 ** -40]], np.float64),
+                  "narrow": np.asarray([[1.0], [1.5]], jnp.bfloat16),
+                  "count": np.asarray([[4], [7]], np.int32)}
+        stacked = {name: jnp.asarray(value) for name, value in groups.items()}
+        inner = Replicas(microstep=jnp.asarray([2, 2]), updates=jnp.asarray([1, 1]),
+                         variables={"params": {"w": jnp.ones((2, 3))}, "stats": stacked}, opt_state=(),
+                         ema=stacked, scale=None, accumulation=None, deferred=None)
+        state = TrainState(step=jnp.asarray(2), microstep=jnp.asarray(2), updates=jnp.asarray(1),
+                           variables={"params": {"w": jnp.ones(3)}, "stats": {name: value[0] for name, value
+                                                                              in stacked.items()}},
+                           opt_state=(), ema=None, key=jax.random.key(0), scale=None,
+                           window_size=jnp.asarray(1), inner=inner)
+        diloco = DiLoCo(every=1, rate=1.0, momentum=0.0)
+        outer = diloco.outer.init(state.variables["params"])
+        met = diloco.synced(dataclasses.replace(state, opt_state=outer))
+        expected = {"complex": np.asarray([2 + 1j], np.complex64),
+                    "wide": np.asarray([1.0 + 2.0 ** -41], np.float64),
+                    "narrow": np.asarray([1.25], jnp.bfloat16), "count": np.asarray([4], np.int32)}
+        for tree in (met.ema, met.variables["stats"]):
+            for name, want in expected.items():
+                np.testing.assert_array_equal(np.asarray(tree[name]), want, err_msg=name, strict=True)
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_diloco_runs_profiles_are_kept_snapshots_its_groups_averages_restore_from(tmp_path):
     """Under DiLoCo the configured optimizer, and the power profiles it keeps, are the groups' inner ones

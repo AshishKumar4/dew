@@ -12,6 +12,7 @@ the selector's (`recurrence_chunk.SELECTIVE`: the template qualified on an H100 
 
 import functools
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import pytest
@@ -73,8 +74,7 @@ CASES = (
 
 
 @cell("selective_scan", covers=lambda case: dict(zip(AXES["selective_scan"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_selective_scan_is_as_exact_as_mamba_ssm(case: tuple[str, ...]) -> None:
     """`case`'s recorded call on its GPU on the template, on par with recorded mamba_ssm (check 1,

@@ -20,7 +20,7 @@ from token_support import write_token_corpus
 from dew import registry
 from dew._cli.main import main
 from dew.config import ObjectiveConfig, RunConfig, SourceOptions, TrainerConfig
-from dew.config.diffusion import DiffusionRunConfig
+from dew.config.diffusion import DEFAULT_MODEL_CONFIG, DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
 from dew.data import TFDS, Files, Loading, images as image_steps, presets
@@ -122,20 +122,38 @@ def pictures():
     return TFDS("dew_images", path=str(IMAGES), split="all").holdout(records=4)
 
 
+def captioned(rows, size: int, *, drawn: bool):
+    """`rows`' pictures at `size` square in batches of 8, each with its caption, dimmed where `drawn`."""
+    return read(rows.pipe(presets.images, size, batch=8, caption=image_steps.caption(),
+                          augment=Dimmed() if drawn else False))
+
+
 def diffusion(root: Path, drawn: bool) -> RunConfig:
     del root
     train, held = pictures()
-
-    def captioned(rows, *, drawn: bool):
-        return read(rows.pipe(presets.images, 4, batch=8, caption=image_steps.caption(),
-                              augment=Dimmed() if drawn else False))
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
                                          "num_heads": 2}),
-        data=captioned(train, drawn=drawn), validation=captioned(held, drawn=False), preset=Flow(),
+        data=captioned(train, 4, drawn=drawn), validation=captioned(held, 4, drawn=False), preset=Flow(),
         val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}))
+
+
+def published(root: Path, drawn: bool) -> RunConfig:
+    """A diffusion run over the tiny SD pipeline (tiny_diffusers.tar.xz's `sd`, unpacked under `root`) naming
+    no preset, so it trains the pipeline's own process over its grid (`ImageSettings.grid_process`)."""
+    from interop_support import tiny_pipeline
+
+    pipeline = root / "tiny_diffusers" / "sd"
+    if not pipeline.exists():
+        tiny_pipeline(root / "tiny_diffusers", "sd")
+    train, held = pictures()
+    return DiffusionRunConfig(
+        pretrained=str(pipeline), preset=None,
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        data=captioned(train, 32, drawn=drawn), validation=captioned(held, 32, drawn=False), val_metrics=(),
+        objective=ObjectiveConfig("diffusion", {"steps": 2}))
 
 
 def jepa(root: Path, drawn: bool) -> RunConfig:

@@ -156,7 +156,6 @@ def flights(objective: Agent, env: Environment, steps: int, *, reached: tuple[st
     policy = objective.act if drawn else objective.greedy
     if isinstance(objective, DreamerV3Objective):
         driven = DrivenSimulator(env) if isinstance(env, Simulator) else Driven(env)
-        return episodes(policy, driven, steps, memory=objective.memory, reached=reached,
-                        models=objective.towers())
-    return episodes(policy, env, steps, reached=reached, models=objective.towers())
+        return episodes(policy, driven, steps, memory=objective.memory, reached=reached)
+    return episodes(policy, env, steps, reached=reached)
 

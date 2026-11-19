@@ -43,6 +43,6 @@ def start(command, **options):
     return _cleanup().start(command, **options)
 
 
-def stop(process, **options):
+def stop(processes, **options):
     """`dew._cleanup.stop`."""
-    return _cleanup().stop(process, **options)
+    return _cleanup().stop(processes, **options)

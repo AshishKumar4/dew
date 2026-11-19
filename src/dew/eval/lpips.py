@@ -145,7 +145,7 @@ def _distance():
     """The published network's distance, its program the process's one (`program`) and its weights
     loaded once (`_published_variables`)."""
     network, variables = LPIPSNetwork.published()
-    return functools.partial(program(_distances, network, static_argnums=0), network, variables)
+    return functools.partial(program(_distances, static_argnums=0), network, variables)
 
 
 class LPIPS(ImageMetric):

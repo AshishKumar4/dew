@@ -79,14 +79,14 @@ def test_a_group_whose_leader_was_reaped_is_signalled_only_where_its_owner_start
     with started(leader_with_child("")) as unowned:
         stranded = child_of(unowned)
         unowned.wait()
-        assert stop(unowned) == []
+        assert stop([unowned]) == []
         assert running(stranded)
         os.kill(stranded, signal.SIGKILL)
     owned = start([sys.executable, "-c", leader_with_child("")], stdout=subprocess.PIPE, text=True)
     try:
         held = child_of(owned)
         owned.wait()
-        assert stop(owned) == []
+        assert stop([owned]) == []
         assert not running(held)
     finally:
         owned.stdout.close()
@@ -108,7 +108,7 @@ def test_a_groups_lifeline_ends_when_the_last_process_its_leader_left_ends():
         while lifelines() > before and time.monotonic() < deadline:
             time.sleep(0.05)
         assert lifelines() == before
-        assert stop(owned) == []
+        assert stop([owned]) == []
     finally:
         owned.stdout.close()
 
@@ -167,7 +167,7 @@ def test_a_started_command_meets_sigpipe_as_popen_leaves_it(disposition, restore
                f"plain = subprocess.run(command, restore_signals={restore}).returncode\n"
                f"started = start(command, restore_signals={restore})\n"
                "print(plain, started.wait(timeout=60))\n"
-               "stop(started)\n")
+               "stop([started])\n")
     done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=120)
     ended = -signal.SIGPIPE if restore or disposition == "SIG_DFL" else 3
     assert done.stdout == f"{ended} {ended}\n", done.stdout + done.stderr
@@ -186,6 +186,49 @@ def lifelines() -> int:
             parent = int((entry / "stat").read_text().rpartition(")")[2].split()[1])
             found += parent == os.getpid() and b"_cleanup.py" in (entry / "cmdline").read_bytes()
     return found
+
+
+def test_an_interruption_at_any_line_its_caller_runs_in_start_reaches_it_as_raised():
+    """An interruption (an exception a signal handler raises) landing at each line the caller's thread runs
+    in `start`, its own and those of what it calls and waits on, reaches the caller as the handler raised
+    it, leaving no lifeline and no descriptor of the start. `threading`'s waits reacquire a condition's
+    lock as they unwind, and an interruption landing there raised "RuntimeError: release unlocked lock" in
+    the handler's place (row 7619, once in CI, where alarms land at random)."""
+    def interrupt(number: int, frame: object) -> None:
+        raise Interrupted
+
+    def started(at: int) -> int:
+        """The lines the caller's thread ran in a `start` interrupted at its `at`th (none where 0)."""
+        ran = [0]
+
+        def trace(frame: object, event: str, arg: object) -> object:
+            if event == "line":
+                ran[0] += 1
+                if ran[0] == at:
+                    signal.raise_signal(signal.SIGALRM)
+            return trace
+
+        sys.settrace(trace)
+        try:
+            process = start(["sleep", "600"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        finally:
+            sys.settrace(None)
+        stop([process])
+        return ran[0]
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    descriptors, held = len(os.listdir("/proc/self/fd")), lifelines()
+    try:
+        lines = started(0)
+        for at in range(1, lines + 1):
+            with pytest.raises(Interrupted):
+                started(at)
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+    deadline = time.monotonic() + 30
+    while lifelines() > held and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert lifelines() == held and len(os.listdir("/proc/self/fd")) == descriptors
 
 
 def test_a_start_interrupted_before_its_command_runs_leaves_nothing_behind(tmp_path):
@@ -216,7 +259,7 @@ def test_a_start_interrupted_before_its_command_runs_leaves_nothing_behind(tmp_p
             except Interrupted:
                 interrupted += 1
             else:
-                stop(started)
+                stop([started])
                 continue
             finally:
                 armed["on"] = False
@@ -264,7 +307,7 @@ def test_a_start_interrupted_as_a_descriptor_opens_leaves_it_closed(opened, nth)
         threading.setprofile(profile)
         with pytest.raises(Interrupted):
             try:
-                stop(start(["sleep", "600"]))
+                stop([start(["sleep", "600"])])
             finally:
                 sys.setprofile(None)
                 threading.setprofile(None)
@@ -295,7 +338,7 @@ def test_threads_starting_their_first_groups_at_once_in_a_process_without_dew_al
                "    thread.start()\n"
                "for thread in threads:\n"
                "    thread.join()\n"
-               "left = [pid for process in started for pid in groups.stop(process)]\n"
+               "left = groups.stop(started)\n"
                "print(len(started), failed, left)\n")
     for _ in range(5):
         done = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True,

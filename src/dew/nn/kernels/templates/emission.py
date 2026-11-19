@@ -149,7 +149,7 @@ _FREE = frozenset({
     gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p, state.get_p,
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
     lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
-    lax.stack_p, lax.tile_p, lax.unstack_p})
+    lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
 indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's;
 every layout move the Pallas fuser tiles: a dynamic slice and its update, whose index arithmetic is scalar,
@@ -175,9 +175,11 @@ def _folded(equation, values: list) -> list:
 
 def scalar_evaluated(primitive, operands: Sequence, params: Mapping, dtype) -> np.generic | None:
     """An elementwise `primitive`'s output, of `dtype`, over concrete integer and boolean scalar `operands`,
-    as this host computes a constant (`programs.host_evaluated`), which for integers and booleans is `lax`'s
-    and the GPU's exactly: a width's wrap, a quotient truncated and a remainder of its dividend's sign,
-    shifts past the width. None for a primitive outside the arithmetic a warpgroup's index flows through
+    as `lax` and the GPU compute it exactly, in this host's own integers (`_SCALAR`): a width's wrap, a
+    quotient truncated and a remainder of its dividend's sign, a shift past the width, a product at the
+    output dtype it names. No program is compiled to fold one: evaluated by binding the primitive, each
+    kernel's index arithmetic compiled a one-primitive program a process (18 beside a 4B step's first trace,
+    row 8612). None for a primitive outside the arithmetic a warpgroup's index flows through
     (`SCALAR_EVALUATED`), a parameter it does not read (`_READ`), a floating or complex operand or output,
     whose IEEE semantics no warpgroup's index arithmetic reads and this host's CPU computes otherwise than a
     GPU (its subnormals flushed), and a quotient or remainder the GPU leaves undefined (`_undefined`)."""
@@ -186,10 +188,70 @@ def scalar_evaluated(primitive, operands: Sequence, params: Mapping, dtype) -> n
             or not all(_integral(np.result_type(value)) for value in operands) or not _integral(dtype)
             or (primitive in (lax.div_p, lax.rem_p) and _undefined(*operands))):
         return None
-    # At the widths its program declared: a kernel's body may have traced under x64 that this fold is not.
-    with jax.enable_x64(new_val=True):
-        made = programs.host_evaluated(primitive, operands, params)
-    return None if made is None else np.dtype(dtype).type(np.asarray(made[0]).item())
+    held = np.result_type(operands[0])
+    return np.dtype(dtype).type(_wrapped(_SCALAR[primitive](held, *map(int, operands)), dtype))
+
+
+def _wrapped(value: int, dtype) -> int | bool:
+    """`value` as `dtype` holds it: a boolean's truth, an integer's two's complement at its width."""
+    dtype = np.dtype(dtype)
+    if dtype == np.bool_:
+        return value != 0
+    limits = jnp.iinfo(dtype)
+    value &= (1 << limits.bits) - 1
+    return value - (1 << limits.bits) if value > limits.max else value
+
+
+def _quotient(dividend: int, divisor: int) -> int:
+    """An integer quotient truncated toward zero."""
+    quotient = abs(dividend) // abs(divisor)
+    return quotient if (dividend < 0) == (divisor < 0) else -quotient
+
+
+def _shifted(primitive, held, value: int, amount: int) -> int:
+    """`value`, of `held`'s width, shifted by `amount`, read unsigned: past the width a left or logical
+    shift leaves nothing and an arithmetic one its sign, which it reads of the value as signed (an
+    unsigned value's too)."""
+    bits = jnp.iinfo(held).bits
+    amount &= (1 << bits) - 1
+    signed = value & ((1 << bits) - 1)
+    signed -= (1 << bits) if signed >> (bits - 1) else 0
+    if primitive is lax.shift_right_arithmetic_p:
+        return signed >> min(amount, bits - 1)
+    if amount >= bits:
+        return 0
+    if primitive is lax.shift_left_p:
+        return value << amount
+    return (value & ((1 << bits) - 1)) >> amount
+
+
+_SCALAR: dict = {
+    lax.add_p: lambda held, a, b: a + b,
+    lax.sub_p: lambda held, a, b: a - b,
+    lax.mul_p: lambda held, a, b: a * b,
+    lax.neg_p: lambda held, a: -a,
+    lax.div_p: lambda held, a, b: _quotient(a, b),
+    lax.rem_p: lambda held, a, b: a - b * _quotient(a, b),
+    lax.max_p: lambda held, a, b: max(a, b),
+    lax.min_p: lambda held, a, b: min(a, b),
+    lax.clamp_p: lambda held, low, a, high: min(max(a, low), high),
+    lax.lt_p: lambda held, a, b: a < b,
+    lax.le_p: lambda held, a, b: a <= b,
+    lax.gt_p: lambda held, a, b: a > b,
+    lax.ge_p: lambda held, a, b: a >= b,
+    lax.eq_p: lambda held, a, b: a == b,
+    lax.ne_p: lambda held, a, b: a != b,
+    lax.and_p: lambda held, a, b: a & b,
+    lax.or_p: lambda held, a, b: a | b,
+    lax.xor_p: lambda held, a, b: a ^ b,
+    lax.not_p: lambda held, a: not a if held == np.bool_ else ~a,
+    lax.shift_left_p: functools.partial(_shifted, lax.shift_left_p),
+    lax.shift_right_arithmetic_p: functools.partial(_shifted, lax.shift_right_arithmetic_p),
+    lax.shift_right_logical_p: functools.partial(_shifted, lax.shift_right_logical_p),
+    lax.convert_element_type_p: lambda held, a: a,
+}
+"""Each of `SCALAR_EVALUATED`'s primitives over its operands as Python's integers (a boolean's 0 or 1), the
+dtype they are held at first: its result before `scalar_evaluated` wraps it to the output's dtype."""
 
 
 def _integral(dtype) -> bool:
@@ -205,10 +267,7 @@ def _undefined(dividend, divisor) -> bool:
     return divisor == 0 or (dtype != np.bool_ and dividend == jnp.iinfo(dtype).min and divisor == -1)
 
 
-SCALAR_EVALUATED = frozenset({
-    lax.add_p, lax.sub_p, lax.mul_p, lax.neg_p, lax.div_p, lax.rem_p, lax.max_p, lax.min_p, lax.clamp_p,
-    lax.lt_p, lax.le_p, lax.gt_p, lax.ge_p, lax.eq_p, lax.ne_p, lax.and_p, lax.or_p, lax.xor_p, lax.not_p,
-    lax.shift_left_p, lax.shift_right_arithmetic_p, lax.shift_right_logical_p, lax.convert_element_type_p})
+SCALAR_EVALUATED = frozenset(_SCALAR)
 """The elementwise primitives a warpgroup's index arithmetic flows through, which `scalar_evaluated`
 computes over concrete integer and boolean scalars."""
 

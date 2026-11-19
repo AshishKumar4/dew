@@ -36,7 +36,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.typing import DTypeLike
 
 from dew.nn import derivatives
-from dew.nn.kernels import chunked_launch, launches
+from dew.nn.kernels import launches
 from dew.nn.precision import aligned_sum
 
 from ..precision import exact_float32
@@ -259,10 +259,14 @@ def _opened(given_ref, table, entry, load, add, document, zero):
     taken = _slot(given_ref, table, load, zero) + _slot(given_ref, table, add, zero)
     if entry is None:
         return taken
+    # Imported here: the kernels' package imports this module, and the launch's module reaches the run's
+    # stated values (`dew._stated`) through its tuning, which a test imports before the package.
+    from dew.nn.kernels.chunked_launch import entry_write
+
     key, value, weight = (ref[document] for ref in entry)
     # Its terms' outer products summed aligned to the largest, which may leave fp32's range where the
     # sum is in it (`precision.aligned_sum`).
-    return taken + chunked_launch.entry_write(key, value, weight, values_first=True)
+    return taken + entry_write(key, value, weight, values_first=True)
 
 
 def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_ref, c_ref, a_ref, state_ref,

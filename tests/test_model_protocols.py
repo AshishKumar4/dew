@@ -59,7 +59,19 @@ import numpy as np
 import pytest
 import quantized_arms
 from architecture_cases import CASES as ARCHITECTURES
-from checkpoint_cases import CHECKPOINTS, DECODERS, FIXTURES, LENGTH, OWN, PATHS, ROWS, loaded, reads, tokens
+from checkpoint_cases import (
+    CHECKPOINTS,
+    DECODERS,
+    FIXTURES,
+    LENGTH,
+    OWN,
+    PATHS,
+    ROWS,
+    code_path,
+    loaded,
+    reads,
+    tokens,
+)
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jepa_cases import MASK
 from model_support import float64_twin, floating_gradient, moved
@@ -97,7 +109,7 @@ def contracted(hidden: jax.Array, table: OutputTable, variables) -> jax.Array:
     return table.logits(hidden)
 
 
-def _cotangent(logits: jax.Array) -> jax.Array:
+def _cotangent(logits: jax.Array | jax.ShapeDtypeStruct) -> jax.Array:
     return jax.random.normal(jax.random.key(1), logits.shape, logits.dtype)
 
 
@@ -111,20 +123,16 @@ dtypes = pytest.mark.parametrize("dtype", DTYPES)
 
 
 @pytest.mark.parametrize("name", PATHS)
-def test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward(name):
+def test_a_token_models_reads_and_cache_invariance_match_its_forward(name):
     """A token model's `logits`, `logits_from_hidden` and `output_table` contraction agree bit for bit
-    with its forward (at both checkpoint dtypes for decoders), neither `logits` nor `hidden_states`
-    writes a `cache` or alters an allocated decode cache, and a decoder's gradients through `logits`
-    match its forward's."""
+    with its forward (at both checkpoint dtypes for decoders), and neither `logits` nor `hidden_states`
+    writes a `cache` or alters an allocated decode cache."""
     source, read = loaded(name, "float32"), reads(name, "float32")
     model, variables = source.model, source.variables
     if name in DECODERS:
         same(read.logits, model.apply(variables, read.tokens))
         bf16, bf16_read = loaded(name, "bfloat16"), reads(name, "bfloat16")
         same(bf16_read.logits, bf16.model.apply(bf16.variables, bf16_read.tokens))
-        cotangent = _cotangent(read.logits)
-        same(gradient(model, variables, read.tokens, cotangent, method="logits"),
-             gradient(model, variables, read.tokens, cotangent))
     same(model.apply(variables, read.hidden, method="logits_from_hidden"), read.logits)
     same(model.apply(variables, read.hidden, method="logits_from_hidden")
          if read.table is None else contracted(read.hidden, read.table, variables), read.logits)
@@ -139,6 +147,18 @@ def test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward(n
                                             method=method, mutable=True)
             same(written_c["cache"], cache)
             same(beside, without)
+
+@pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
+def test_a_decoders_gradients_through_its_logits_match_its_forwards(name):
+    """A decoder's gradients through `logits` match its forward's, bit for bit, each run eagerly as the
+    reads are: a test apart from its reads', so each runs its own eager programs (row 7665: together they
+    compiled 1,700 to 2,300 programs, 40 to 53 s of a cold run)."""
+    source, rows = loaded(name, "float32"), tokens(name, "float32")
+    model, variables = source.model, source.variables
+    cotangent = _cotangent(jax.eval_shape(lambda: model.apply(variables, rows, method="logits")))
+    same(gradient(model, variables, rows, cotangent, method="logits"),
+         gradient(model, variables, rows, cotangent))
+
 
 # DiffusionGemma: the clean read is the causal encoder over the shared tree.
 
@@ -554,21 +574,34 @@ def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
 
 
 @pytest.mark.parametrize("name", PATHS)
-def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
-    """The resized model reads the same variables to the model's logits, both in one program, bit for bit,
-    and a causal one decodes into a cache of `CAPACITY` slots and draws the same tokens over prompts whose
-    float64 greedy walk clears the selection margin at every step (`_margined_prompts`). Its attention
-    reduces over the shorter cache, so the cached logits are the model's bits or as exact as them
-    (`as_exact`). Each call is compiled, where op by op the logits took a minute of the test, and the
-    greedy decodes run as the check runs its arms (`summed_as_run`), whose programs they share (ledger
-    2957)."""
+def test_a_model_at_a_cache_capacity_computes_the_models_logits(name):
+    """The resized model reads the same variables to the model's logits, both in one program, bit for
+    bit."""
     source, rows = loaded(name), tokens(name)
-    model, variables = source.model, source.variables
-    sized = model.with_cache_capacity(CAPACITY)
+    sized = source.model.with_cache_capacity(CAPACITY)
     same(*jax.jit(lambda variables, rows: [network.apply(variables, rows, method="logits")
-                                           for network in (sized, model)])(variables, rows))
-    if not model.causal:
-        return
+                                           for network in (sized, source.model)])(source.variables, rows))
+
+
+def _decodes(name: str) -> bool:
+    """Whether `name`'s model decodes causally through a cache: DiffusionGemma's clean encoder (`OWN`), and
+    a decoder whose record is causal or whose family only its own translator reads (`code_path`'s
+    direction), as its load builds it (the decode test holds it to `model.causal`)."""
+    path = code_path(name)
+    return name in OWN or len(path) == 2 or path[2][4]
+
+
+@pytest.mark.parametrize("name", [name for name in PATHS if _decodes(name)])
+def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
+    """A causal model decodes into a cache of `CAPACITY` slots and draws the same tokens as at its own over
+    prompts whose float64 greedy walk clears the selection margin at every step (`_margined_prompts`). Its
+    attention reduces over the shorter cache, so the cached logits are the model's bits or as exact as
+    them (`as_exact`). Each call is compiled, where op by op the logits took a minute of the test, and the
+    greedy decodes run as the check runs its arms (`summed_as_run`), whose programs they share (ledger
+    2957). Its logits at the capacity are the model's (the logits test beside it)."""
+    source = loaded(name)
+    model, variables = source.model, source.variables
+    assert model.causal
     call = tuple(_decoding(name).items())
     own, at_capacity = _programs(name, "model", call), _programs(name, "sized", call)
     # Prompts whose float64 greedy walk selects each token by a margin float32's rounding cannot cross, so

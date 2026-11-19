@@ -72,7 +72,7 @@ def stepped_logits(model, variables, row) -> jax.Array:
 
 
 def recorded_dew(directory: Path, leaves: tuple[str, ...]):
-    """The site's `dew(dtype, inputs)` (tests/reference_runs.py): the fixture at `directory` loaded once at
+    """The site's `dew(dtype, inputs)` (tests/recorded_runs.py): the fixture at `directory` loaded once at
     each dtype, its `leaves` over a drawn batch: each valid position's logits of its forward (`logits`)
     and the first row's from its cached decode (`stepped`, `stepped_logits`)."""
     loaded: dict[str, tuple] = {}
