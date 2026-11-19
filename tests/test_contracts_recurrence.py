@@ -137,12 +137,12 @@ def precedent_chunked(query, key, value, g, beta, *, chunk_size: int, starts=Non
 
 ORDER_SETS = {"first orders": ("primal", "jvp", "vjp"), "jvp of grad": ("jvp of grad",),
               "second jvp": ("second jvp",), "grad of grad": ("grad of grad",),
-              "second orders, staged": ("jvp of grad, remat", "second jvp, remat", "jvp of grad, nested jit",
-                                        "jvp of grad, scanned")}
+              "second orders, staged": ("jvp of grad, remat", "second jvp, remat", "jvp of grad, nested jit"),
+              "jvp of grad, scanned": ("jvp of grad, scanned",)}
 """The contract's orders (`contract_support.orders`) a case of the chunked delta rule takes at once: all ten
 in one case took 127 to 156 s near float32's largest, each order's program compiled for itself (row
 4433); the three second orders in one case 172 s over packed documents there (row 5348), so each is a case
-of its own."""
+of its own, the scanned one apart from the staged ones (an interpreted selective scan's 170 s alone)."""
 
 
 def outside(taken: tuple[str, ...]) -> tuple[str, ...]:
@@ -432,27 +432,38 @@ def test_the_selective_scan_holds_its_orders(edge, taken):
     assert_selective_contract(edge, ORDER_SETS[taken])
 
 
-@pytest.mark.parametrize("taken", [
-    pytest.param(("primal", "jvp", "vjp"), id="first-orders",
-                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
-    pytest.param(("jvp of grad",), id="jvp-of-grad",
-                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
-    pytest.param(("second jvp",), id="second-jvp",
-                 marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
-    pytest.param(("grad of grad",), id="grad-of-grad",
-                 marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
-    pytest.param(("jvp of grad, remat", "second jvp, remat", "jvp of grad, nested jit"),
-                 id="staged-and-nested", marks=pytest.mark.check1_shards(seeds=8, per_task=4)),
-    pytest.param(("jvp of grad, scanned",), id="scanned",
-                 marks=pytest.mark.check1_shards(seeds=8, per_task=4))])
+CHECK1_SHARDS = {
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[first-orders]": {"seeds": 8, "per_task": 4},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[jvp-of-grad]": {"seeds": 8, "per_task": 4},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[second-jvp]": {"seeds": 8, "per_task": 8},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[grad-of-grad]": {"seeds": 8, "per_task": 4},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[second-orders-staged]":
+        {"seeds": 8, "per_task": 4},
+    "test_the_selective_scan_holds_its_orders_over_normal_draws[jvp-of-grad-scanned]":
+        {"seeds": 8, "per_task": 4},
+}
+"""The selective scan's normal-draw sites, an order set each (`ORDER_SETS`), by node id, a literal the CI plan
+reads as it reads a mark's (tools/armada/ci.py): a map task compiles a set's programs once for its draws (an
+interpreted second order's 60 to 170 s, then 30 to 40 s a draw: the five sets in two tasks of four draws each
+ran past 20 minutes a task, a set's eight draws in one 141 to 421 s), four draws a task but the second jvp's
+eight."""
+
+
+def normal_order_cases() -> list:
+    """`ORDER_SETS` as the selective scan's normal-draw parameters, each marked from `CHECK1_SHARDS`."""
+    test = "test_the_selective_scan_holds_its_orders_over_normal_draws"
+    cases = [(taken, taken.replace(",", "").replace(" ", "-")) for taken in ORDER_SETS]
+    return [pytest.param(taken, id=ident,
+                         marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{ident}]"]))
+            for taken, ident in cases]
+
+
+@pytest.mark.parametrize("taken", normal_order_cases())
 def test_the_selective_scan_holds_its_orders_over_normal_draws(taken, request):
-    """`assert_selective_contract` in the normal domain, check 1 over its declared draws: a site an order,
-    the first orders together, whose programs a map task compiles once for its draws (an interpreted
-    second order's 60 to 170 s, then 30 to 40 s a draw: the five order sets in two tasks of four draws each
-    ran past 20 minutes a task, a site's eight draws in one 141 to 421 s), four draws a task but the second
-    jvp's eight; the remat orders, which an interpreted kernel takes none of (`INTERPRETED_REMAT`), beside
-    the nested one."""
-    assert_selective_contract("normal", taken, seeds=marked_seeds(request))
+    """`assert_selective_contract` in the normal domain over an order set (`ORDER_SETS`), check 1 over its
+    declared draws (`CHECK1_SHARDS`); the remat orders, which an interpreted kernel takes none of
+    (`INTERPRETED_REMAT`), beside the nested one."""
+    assert_selective_contract("normal", ORDER_SETS[taken], seeds=marked_seeds(request))
 
 
 def assert_selective_contract(edge: str, taken: tuple[str, ...], seeds: int | None = None) -> None:

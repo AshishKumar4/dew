@@ -31,6 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from map_judge import marked_seeds
 from port_support import row_names_port
 from reference_error import assert_as_exact, with_gradients
 from ssd_support import mamba_side
@@ -466,26 +467,42 @@ def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
     _gradient_holds_check_1(name, regime)
 
 
-@pytest.mark.parametrize('name, regime', [
-    pytest.param('rated', 'a fading memory', id='rated-a-fading-memory',
-                 marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
-    pytest.param('turned', 'decays near zero', id='turned-decays-near-zero',
-                 marks=pytest.mark.check1_shards(seeds=128, per_task=32))])
-def test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences(name, regime):
+CHECK1_SHARDS = {
+    "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[rated-a-fading-memory]":
+        {"seeds": 256, "per_task": 64},
+    "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[turned-decays-near-zero]":
+        {"seeds": 128, "per_task": 32},
+}
+"""`LONG_GRADIENT`'s sites by node id, a literal the CI plan reads as it reads a mark's (tools/armada/ci.py):
+each its case's `GRADIENT_SEEDS`, its draws in map tasks of a quarter of them."""
+
+
+def long_gradient_cases() -> list:
+    """`LONG_GRADIENT` as parameters, each marked from `CHECK1_SHARDS` by its node id."""
+    test = "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences"
+    cases = [(name, regime, f"{name}-{regime}".replace(" ", "-")) for name, regime in LONG_GRADIENT]
+    return [pytest.param(name, regime, id=ident,
+                         marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{ident}]"]))
+            for name, regime, ident in cases]
+
+
+@pytest.mark.parametrize('name, regime', long_gradient_cases())
+def test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences(name, regime, request):
     """`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences` at its long cases (`LONG_GRADIENT`),
-    each mark's seeds its case's `GRADIENT_SEEDS`, its draws in map tasks of a quarter of them."""
-    _gradient_holds_check_1(name, regime)
+    over the seeds their marks declare (`CHECK1_SHARDS`)."""
+    _gradient_holds_check_1(name, regime, marked_seeds(request))
 
 
-def _gradient_holds_check_1(name, regime):
-    """A case's gradient check (`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences`)."""
+def _gradient_holds_check_1(name, regime, seeds: int | None = None):
+    """A case's gradient check (`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences`), over
+    `seeds`, its `GRADIENT_SEEDS` where None."""
     hooks = PORTABLE_SITES[name]
     assert_finite_and_on_par(
         with_gradients(restarting(
             functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK, **bounded(regime)), regime)),
         with_gradients(restarting(functools.partial(token_by_token, hooks), regime)),
         functools.partial(cotangents, hooks, regime), f"the portable math's gradient, {name} under {regime}",
-        seeds=GRADIENT_SEEDS[name, regime])
+        seeds=GRADIENT_SEEDS[name, regime] if seeds is None else seeds)
 
 
 def ssd_port(hooks, *args, **kwargs):
