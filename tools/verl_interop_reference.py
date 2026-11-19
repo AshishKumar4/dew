@@ -21,6 +21,8 @@ from importlib.metadata import distribution
 from pathlib import Path
 
 import pyarrow.parquet as pq
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reference_releases import commit
 
 COHORT = "verl-agentic"

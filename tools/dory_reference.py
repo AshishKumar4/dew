@@ -29,11 +29,15 @@ from __future__ import annotations
 import itertools
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_releases import commit
 
 FIXTURE = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf' / 'dory-tiny'
 EPS = 1e-6
@@ -423,7 +427,7 @@ def write_tiny() -> None:
     np.savez(FIXTURE / 'reference.npz', allow_pickle=False, **arrays)
     (FIXTURE / 'source.json').write_text(json.dumps({
         'reference': 'vllm-project/vllm#60149 vllm/model_executor/models/dory.py at '
-                     '55076950b6c155f384d6766d63563c3bc20a0e3f, transcribed in tools/dory_reference.py',
+                     f"{commit('vllm-dory', 'vllm')}, transcribed in tools/dory_reference.py",
         'released_config': 'nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16 at '
                            'b366b87f762ea334ba3eb55912031baba1515810'},
         indent=2) + '\n')

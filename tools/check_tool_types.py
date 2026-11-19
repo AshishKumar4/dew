@@ -40,9 +40,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PYRIGHT = "pyright@1.1.406"
 """The release tools/check_gates' pyright gate runs, so both read types alike."""
-ROOTS = ("src", "tools", "tests")
-"""Where an import of a tool's is looked up in the checkout, as pyproject.toml's extraPaths and Dew's install
-put them on its path."""
 ENVIRONMENTS = Path(".venv-tools")
 """Each cohort set's environment, `<digest>` under it, made once and read by every run after."""
 DEW = "dew"
@@ -138,27 +135,33 @@ def imported(path: Path) -> set[str]:
 
 
 def roots_of(path: Path) -> tuple[str, ...]:
-    """Where an import of the file `path` is looked up: its pyproject.toml execution environment's extraPaths
-    when it sits under one's root (tools/armada's scripts import their neighbours by name), then `ROOTS`."""
+    """Where an import of the file `path` is looked up, in pyright's order as `checked` configures it: its
+    pyproject.toml execution environment's extraPaths where it sits under one's root (tools/armada's scripts
+    import their neighbours by name), else the checkout itself (`import tools.x`, "") and then
+    pyproject.toml's extraPaths."""
     for root, extra in environment_roots():
         if path.is_relative_to(root):
-            return (*extra, *ROOTS)
-    return ROOTS
+            return extra
+    return ("", *settings().get("extraPaths", []))
 
 
 @functools.cache
-def environment_roots() -> tuple[tuple[Path, tuple[str, ...]], ...]:
-    """pyproject.toml's pyright execution environments, each its root and extraPaths, read once: every file of
-    every closure asks (`roots_of`), and a read each took the gate past its deadline."""
+def settings() -> Mapping:
+    """pyproject.toml's pyright settings, read once: every file of every closure asks (`roots_of`), and a read
+    each took the gate past its deadline."""
     configuration = ROOT / "pyproject.toml"
     if not configuration.is_file():
-        return ()
-    pyright = tomllib.loads(configuration.read_text()).get("tool", {}).get("pyright", {})
+        return {}
+    return tomllib.loads(configuration.read_text()).get("tool", {}).get("pyright", {})
+
+
+def environment_roots() -> tuple[tuple[Path, tuple[str, ...]], ...]:
+    """pyproject.toml's pyright execution environments, each its root and extraPaths."""
     return tuple((ROOT / each["root"], tuple(each.get("extraPaths", [])))
-                 for each in pyright.get("executionEnvironments", []))
+                 for each in settings().get("executionEnvironments", []))
 
 
-def located(name: str, roots: tuple[str, ...] = ROOTS) -> list[Path]:
+def located(name: str, roots: tuple[str, ...]) -> list[Path]:
     """The checkout's files an import of `name` executes: each package's __init__.py on the way and the
     module, looked up under `roots` in order, the first root holding its first part as a module or a
     package (a directory of no Python, such as tools/ci beside tools/armada's ci.py, is neither)."""

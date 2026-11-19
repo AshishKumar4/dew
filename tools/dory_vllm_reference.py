@@ -52,6 +52,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reference_releases import commit
 
 if TYPE_CHECKING:

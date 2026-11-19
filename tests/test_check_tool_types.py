@@ -16,7 +16,8 @@ PINS = {"torch": {"torch": "2.14.0"}, "transformers": {"transformers": "5.22.2"}
 @pytest.fixture
 def gate(tmp_path, monkeypatch):
     """The gate's module, its checkout `tmp_path`: src/lib/{shared,deep}.py (shared imports deep),
-    tools/{helper,tool}.py and a package tools/runs/ with a relative import, and Dew's lock."""
+    tools/{helper,tool}.py, tools/packaged.py importing tools.helper, a package tools/runs/ with a relative
+    import, Dew's lock and pyright's extraPaths."""
     spec = importlib.util.spec_from_file_location("check_tool_types_under_test", TOOL)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -27,7 +28,9 @@ def gate(tmp_path, monkeypatch):
              "tools/tool.py": "import helper\nfrom lib.shared import deep\n",
              "tools/runs/__init__.py": "", "tools/runs/a.py": "from . import b\n",
              "tools/runs/b.py": "Y = 2\n",
-             "tools/other.py": "Z = 3\n", "locks/cpu.txt": "jax==1\n"}
+             "tools/other.py": "Z = 3\n", "tools/packaged.py": "from tools.helper import json\n",
+             "locks/cpu.txt": "jax==1\n",
+             "pyproject.toml": '[tool.pyright]\nextraPaths = ["src", "tests", "tools"]\n'}
     for name, text in files.items():
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_text(text)
@@ -74,13 +77,21 @@ def test_a_tools_environments_are_its_cohorts_pins_its_headers_or_dews(gate, tmp
 
 def test_a_tools_key_covers_what_it_imports_through_their_imports_and_nothing_else(gate, tmp_path) -> None:
     """A tool's key moves with any module it imports, however deep (tools/tool.py imports lib.shared, which
-    imports lib.deep), with its environment and with the shared part; not with a file it does not import."""
+    imports lib.deep), through the checkout's root too (tools.helper), with its environment and with the
+    shared part; not with a file it does not import."""
     tool = tmp_path / "tools" / "tool.py"
     names = {path.relative_to(tmp_path).as_posix() for path in gate.closure(tool)}
     assert names == {"tools/tool.py", "tools/helper.py", "src/lib/__init__.py", "src/lib/shared.py",
                      "src/lib/deep.py"}
     relative = {path.relative_to(tmp_path).as_posix() for path in gate.closure(tmp_path / "tools/runs/a.py")}
     assert relative == {"tools/runs/a.py", "tools/runs/__init__.py", "tools/runs/b.py"}
+    # An import through the checkout's root, as pyright reads it first (`import tools.x`).
+    packaged = tmp_path / "tools" / "packaged.py"
+    assert {path.relative_to(tmp_path).as_posix() for path in gate.closure(packaged)} == {
+        "tools/packaged.py", "tools/helper.py"}
+    held = gate.key(packaged, [], b"shared")
+    (tmp_path / "tools" / "helper.py").write_text("import json\nW = 1\n")
+    assert gate.key(packaged, [], b"shared") != held
     before = gate.key(tool, [], b"shared")
     (tmp_path / "tools" / "other.py").write_text("Z = 4\n")
     assert gate.key(tool, [], b"shared") == before

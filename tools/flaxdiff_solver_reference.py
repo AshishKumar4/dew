@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import sys
 import types
 from pathlib import Path
 
@@ -47,6 +48,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reference_releases import commit
 from reference_source import fetched, ran, selected
 

@@ -42,6 +42,8 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reference_releases import commit
 from reference_source import loaded, package, published_files, saved_fixture
 

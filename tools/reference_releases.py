@@ -27,6 +27,8 @@ def tested(distribution: str) -> str:
     raise LookupError(f"pyproject.toml's test extra pins no {distribution} release")
 
 
+MODELOPT = {"nvidia-modelopt": "0.47.0"}
+"""ModelOpt's release, which its codec reader's cohort and the NVFP4 tools' share."""
 RELEASES: Mapping[str, Mapping[str, str]] = {
     "transformers": {"transformers": tested("transformers")},
     # MiniMax-M2's rotary fix (transformers PR 48486) landed in 5.18.0.
@@ -67,7 +69,7 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "vllm": {"vllm": "0.30.0"},
     "sglang": {"sglang": "0.5.20"},
     # ModelOpt's NVFP4 codec checkpoints' reader (tools/modelopt_worker.py, tools/venv_reference.py's sites).
-    "modelopt": {"nvidia-modelopt": "0.47.0"},
+    "modelopt": MODELOPT,
     # MiMo Audio's mel reference (tools/torchaudio_mel_worker.py, tools/venv_reference.py's mimo-mel site).
     "torchaudio": {"torchaudio": "2.11.0"},
     # The reference environments each tool's own notes install (row 7933: each type-checked in its own,
@@ -106,8 +108,7 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
         "mamba-ssm": "git+https://github.com/state-spaces/mamba@e9594ce1c732d97440f0332fdc43170a2294dbfa",
         "torch": "2.14.0"},
     "maxtext": {"maxtext": "0.2.5"},
-    "modelopt-nvfp4": {"nvidia-modelopt": "0.47.0", "torch": "2.13.0", "triton": "3.7.1",
-                       "diffusers": "0.34.0"},
+    "modelopt-nvfp4": {**MODELOPT, "torch": "2.13.0", "triton": "3.7.1", "diffusers": "0.34.0"},
     "pytorch-fid": {"pytorch-fid": "0.3.0", "torch": "2.14.0"},
     "megatron": {"megatron-core": "0.19.2", "torch": "2.14.0"},
     "torch-qwen35": {"torch": "2.10.0", "transformers": "5.3.0", "triton": "3.6.0", "fla-core": "0.5.2",

@@ -38,7 +38,10 @@ scheduler's grid."""
 
 DIFFUSERS = importlib.import_module("reference_releases").tested("diffusers")
 RELEASES = importlib.import_module("reference_releases")
-PIPELINES = RELEASES.RELEASES["diffusers-pipelines"]
+PINS = RELEASES.RELEASES
+PIPELINES = PINS["diffusers-pipelines"]
+MODELOPT = PINS["modelopt"]["nvidia-modelopt"]
+MAXTEXT = PINS["maxtext"]["maxtext"]
 NATIVE_PIPELINES = (f"huggingface/diffusers {PIPELINES['diffusers']} with huggingface/transformers "
                     f"{PIPELINES['transformers']}")
 """The diffusers-pipelines cohort (tools/reference_releases.py) the saved tiny pipelines' own calls run in,
@@ -47,8 +50,8 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                   "reference": f"danijar/dreamerv3 {RELEASES.commit('dreamerv3', 'dreamerv3')}",
                   "license": "MIT"},
          **{site: {"test": f"test_maxtext_{site}", "worker": "maxtext_worker.py",
-                   "reference": "AI-Hypercomputer/maxtext 0.2.5", "license": "Apache-2.0",
-                   "distribution": ("maxtext", "0.2.5")} for site in ("gpt3", "engram")},
+                   "reference": f"AI-Hypercomputer/maxtext {MAXTEXT}", "license": "Apache-2.0",
+                   "distribution": ("maxtext", MAXTEXT)} for site in ("gpt3", "engram")},
          "llama-cpp": {"test": "test_llama_cpp_export", "worker": "llama_cpp_worker.py",
                        "reference": "ggml-org/llama.cpp 7fe450e19305b828c199d602c23a8337aaa1f03b (v0.5.0)",
                        "license": "MIT", "host": True, "outputs": True, "judged": True},
@@ -59,17 +62,18 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                          "outputs": True},
          "laya": {"test": "test_decision_laya", "worker": "laya_worker.py",
                   "reference": f"NandhaKishorM/laya {RELEASES.commit('laya', 'laya')}",
-                  "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
+                  "license": "Apache-2.0", "distribution": ("transformers", PINS["laya"]["transformers"])},
          "kimi-k3": {"test": "test_kimi_k3", "worker": "kimi_worker.py", "device": "cuda",
                      "reference": "moonshotai/Kimi-K3 f831ab66814297da540d832a5235f8e904f29d06",
-                     "license": "other (kimi-k3)", "distribution": ("fla-core", "0.5.2")},
+                     "license": "other (kimi-k3)", "distribution": ("fla-core", PINS["kimi-k3"]["fla-core"])},
          "kimi-k3-vision": {"test": "test_kimi_k3_vision", "worker": "kimi_k3_vision_worker.py",
                             "reference": "moonshotai/Kimi-K3 f831ab66814297da540d832a5235f8e904f29d06",
-                            "license": "other (kimi-k3)", "distribution": ("transformers", "4.56.2")},
+                            "license": "other (kimi-k3)",
+                            "distribution": ("transformers", PINS["kimi-k3"]["transformers"])},
          "kimi-linear": {"test": "test_kimi_linear", "worker": "kimi_worker.py", "device": "cuda",
                          "reference": "moonshotai/Kimi-Linear-48B-A3B-Instruct "
                                       "e1df551a447157d4658b573f9a695d57658590e9",
-                         "license": "MIT", "distribution": ("fla-core", "0.4.0")},
+                         "license": "MIT", "distribution": ("fla-core", PINS["kimi-linear"]["fla-core"])},
          **{f"uvit-{case}": {"test": "test_uvit_source", "arms": case, "worker": "uvit_worker.py",
                              "reference": "baofff/U-ViT ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
                              "license": "MIT"} for case in ("published", "variant")},
@@ -106,9 +110,9 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
             for family in importlib.import_module("multimodal_families").TEXT_DRAWN},
          **{f"codec-modelopt-{name}": {"test": "test_codec_checkpoints", "arms": f"modelopt/{name}",
                                      "worker": "modelopt_worker.py",
-                                     "reference": "NVIDIA/TensorRT-Model-Optimizer 0.47.0 with "
+                                     "reference": f"NVIDIA/TensorRT-Model-Optimizer {MODELOPT} with "
                                                   "huggingface/transformers 5.16.1",
-                                     "license": "Apache-2.0", "distribution": ("nvidia-modelopt", "0.47.0"),
+                                     "license": "Apache-2.0", "distribution": ("nvidia-modelopt", MODELOPT),
                                      "outputs": True} for name in ("tiny", "mixed")},
          **{f"codec-{family}-{kind}": {"test": "test_codec_checkpoints", "arms": f"{family}/{kind}",
                                        "worker": "codec_worker.py",
@@ -131,7 +135,9 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                "worker": "qwen_image_export_reference.py",
                                "reference": "huggingface/diffusers "
                                             + RELEASES.commit("diffusers-qwen-image", "diffusers"),
-                               "license": "Apache-2.0", "distribution": ("transformers", "5.17.0")},
+                               "license": "Apache-2.0",
+                               "distribution": ("transformers",
+                                                PINS["diffusers-qwen-image"]["transformers"])},
          **{f"wan-{case}": {"test": "test_wan_source", "arms": case, "worker": "wan_worker.py",
                             "reference": f"huggingface/diffusers {DIFFUSERS}", "license": "Apache-2.0",
                             "distribution": ("diffusers", DIFFUSERS)} for case in ("published", "variant")},

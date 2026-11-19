@@ -44,6 +44,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reference_releases import commit
 
 COHORT = "flaxdiff"
