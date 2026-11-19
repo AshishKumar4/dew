@@ -26,14 +26,17 @@ from jax.experimental.pallas import pallas_call_p
 from jax.extend.backend import backends
 
 
-def holes[Tree, Leaf](tree: Tree, selected: Callable[[Leaf], bool],
+def holes[Tree, Leaf](tree: Tree, selected: Callable[[Leaf], bool] | Sequence[bool],
                       is_leaf: Callable[[Leaf], bool] | None = None
                       ) -> tuple[list[Leaf], Callable[[Sequence[Leaf]], Tree]]:
-    """The leaves of `tree` (a call's arguments, `(args, kwargs)`) that `selected` keeps, in order, and
-    `fill(values)`, `tree` with those leaves replaced by `values` in their order and every other as it is:
-    what a trace of a function of some of its arguments (its arrays) binds and what it rebuilds."""
+    """The leaves of `tree` (a call's arguments, `(args, kwargs)`) that `selected` keeps (a predicate of a
+    leaf, or a mask: one bool per leaf in flatten order, a choice no leaf alone states, such as whose
+    tangent is live), in order, and `fill(values)`, `tree` with those leaves replaced by `values` in their
+    order and every other as it is: what a trace of a function of some of its arguments (its arrays) binds
+    and what it rebuilds."""
     leaves, structure = jax.tree.flatten(tree, is_leaf=is_leaf)
-    places = [index for index, leaf in enumerate(leaves) if selected(leaf)]
+    kept = list(map(selected, leaves)) if callable(selected) else list(selected)
+    places = [index for index, (_, keep) in enumerate(zip(leaves, kept, strict=True)) if keep]
 
     def fill(values: Sequence[Leaf]) -> Tree:
         filled = list(leaves)
