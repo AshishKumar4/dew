@@ -250,26 +250,21 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     sums are at each row's `2^-shift` (`Scale`), and `total` is taken there; a row at the shift
     `NORMALIZED` holds normalized sums (an output residual's, `normalized_rows`), its total 1. Each sum is
     taken over the total before its product with dO, as the reference's output is, so none overflows where
-    the sums are near fp32's largest (a state's). A dropping call's `B` holds its kept keys' weights alone
-    and its anchor's value row arrives where its draw keeps it (`algebra.kept`), the draw's multiplier
-    `dropped` taken once with each weight over the total and on the centre's product with dO
-    (`algebra.Forward.dropped`), never on a value: a value near fp32's largest times 4/3 overflowed (row
-    8652). Each row's product with dO is `rows`' (`off_anchor_delta`'s), of the sums as dO reads them
-    (`read`)."""
+    the sums are near fp32's largest (a state's). A dropping call's `B` holds its kept keys' weights alone,
+    its multiplier `dropped` taken with the total (`algebra.Forward.dropped`; the anchor's own term arrives
+    at its draw's multiplier, `values`). Each row's product with dO is `rows`' (`off_anchor_delta`'s), of the
+    sums as dO reads them (`read`)."""
     over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
-    # A normalized row's sums are its output, which took the multiplier already (`algebra.dropped_output`).
-    multiplier = np.float32(dropped)
-    others_over = over if dropped == 1.0 else jnp.where(normalized_rows(shift), 1.0, over * multiplier)
+    others_over = (over if dropped == 1.0
+                   else jnp.where(normalized_rows(shift), 1.0, over * np.float32(dropped)))
     # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
     # and the state's share of D about the anchor with it (row 2466).
     state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = rows(anchor_value, cotangent)
-    anchor = anchor if dropped == 1.0 else anchor * multiplier
     others = others * expand(others_over, others)
-    weight = over if dropped == 1.0 else over * multiplier
-    own, others_total = own * weight, others_total * weight
+    own, others_total = own * over, others_total * over
     about_zero = rows(read(split_output(others, own, anchor_value), cotangent), cotangent)
     off_anchor = others - expand(others_total, anchor_value) * anchor_value
     about_anchor = rows(read(off_anchor, cotangent), cotangent) - state_weight * anchor

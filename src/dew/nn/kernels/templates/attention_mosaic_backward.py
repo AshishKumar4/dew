@@ -71,10 +71,10 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     cotangent = jnp.swapaxes(dout, 1, 2).astype(jnp.float32)
     values = jnp.swapaxes(anchor_value, 1, 2)
     if drop is not None:
-        # A dropping call's D from the forward's dropped split sums too, about its anchor's value where its
-        # draw keeps it (`algebra.kept`; its multiplier `split_delta`'s, as the forward's output takes it): no
-        # first pass of its own (row 2252, the centre launch's dropped products recomputed every key tile).
-        values = algebra.kept(values, algebra.anchor_multipliers(drop, key_index)[..., None])
+        # A dropping call's D from the forward's dropped split sums too, about its anchor's value as its
+        # draw keeps it (`algebra.anchor_multipliers`, the factor the forward's output took it by): no first
+        # pass of its own (row 2252, the centre launch's dropped products recomputed every key tile).
+        values = values * algebra.anchor_multipliers(drop, key_index)[..., None]
     # D's and the anchor's products with dO, summed as the launch's issuer sums dP
     # (`gradient.off_anchor_delta`).
     anchor, delta, chosen = gradient.split_delta(others, own, others_total, forward_total, state_total,
