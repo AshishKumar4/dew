@@ -112,6 +112,7 @@ from dew._accuracy import distance, reduction_bound, within
 from dew.algebra import passes
 from dew.nn import programs
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates import report
 from dew.parity import (
     CONFIDENCE,
     FACTOR,
@@ -536,8 +537,8 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
         shaped.setdefault(named("truth", widened(inputs)), inputs)
 
     def compiled(device, *, host: bool) -> bool:
-        """The site traced for `device` and compiled for it (`host`: the host's CPU), or, where `host` is
-        not, whether its target's GPU would leave a choice to run time, then left uncompiled."""
+        """The site traced for `device` and compiled for it (`host`: the host's CPU): whether it compiled,
+        none where its target's GPU would leave a choice to run time (`report.CompiledOnDevice`)."""
         programs, held = {}, {}
         with (jax.enable_x64(new_val=True), passes(on=False), jax.default_device(device), evaluated_on([])):
             for index, inputs in enumerate(shaped.values()):
@@ -549,9 +550,10 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
                 if index == 0 and not _given(truth):
                     _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
                 _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
-            if not host and _left_to_run_time(store, programs):
+            try:
+                store.compile_site(label, programs, held, host=host)
+            except report.CompiledOnDevice:
                 return False
-            store.compile_site(label, programs, held, host=host)
         return True
 
     # A truth its target's GPU would leave a choice of to run time (a convolution's algorithm,
@@ -566,19 +568,6 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
                           **({} if library_fn is None else {"library": (library_fn, True)}),
                           **{f"further {name}": (fn, True) for name, fn in also.items()}},
                   draw, label, seeds=seeds, orders=orders, sizing=sizing)
-
-
-def _left_to_run_time(store: CompiledTruths, programs: Mapping[str, tuple[Callable, Sequence]]) -> bool:
-    """Whether a program of `programs`, lowered for `store`'s GPU target as its compile lowers it, leaves a
-    choice to run time its device's own compile makes (`report.at_run_time`); none where the store compiles
-    for this process's devices."""
-    from dew.nn.kernels.templates import report
-
-    if store.target is None:
-        return False
-    with store.tracing():
-        return any(report.at_run_time(jax.jit(function).lower(*shapes))
-                   for function, shapes in programs.values())
 
 
 def armed(label: str) -> str:
@@ -636,7 +625,12 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     if programs:
         plain = any(_given(fn) for fn in (arms["dew"][0], arms["reference"][0]) if fn is not None)
         with arithmetic():
-            store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain), arms=True)
+            try:
+                store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain), arms=True)
+            except report.CompiledOnDevice as refused:
+                # Check 1 measures the arms as their GPU compiles them, a choice no compile without it
+                # holds: every arm of the site compiles in its run, as the prepare states (`_stored_arm`).
+                store.compile_site(armed(label), {}, {}, arms=True, at_run=str(refused))
 
 
 def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference: bool):
@@ -741,6 +735,11 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str):
     named_role = arm_role(role, given_fn, label)
     if named_role is None:
         store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
+        return arm
+    at_run = store.at_run(armed(label))
+    if at_run is not None:
+        # Compiled on its GPU in the run, as its prepare stated (`_compile_arms`).
+        store.compiled_at_run(f"{label}: its {role} arm: {at_run}")
         return arm
     if not store.holds(armed(label)):
         store.unprepared(f"{label}: its {role} arm ran unprepared: its prepare wrote the site's truths and "
