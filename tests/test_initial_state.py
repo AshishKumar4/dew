@@ -92,8 +92,8 @@ def test_an_objectives_init_outside_a_trace_is_one_program_its_held_arrays_kept(
 
 def test_two_instances_of_an_overriding_trainer_each_build_their_own_state():
     """Two instances of one Trainer subclass whose `initial_state` reads the instance's own field each build
-    their own state, eagerly and traced, not the first instance's kept trace (row 8956: the kept trace was
-    keyed by the class, so the second instance replayed the first's offset)."""
+    their own state, placed as a fit places it and eagerly, not the first instance's kept trace (row 8956:
+    the kept trace was keyed by the class, so the second instance replayed the first's offset)."""
 
     class Offset(Trainer):
         def __init__(self, *args, offset, **kwargs):
@@ -106,7 +106,9 @@ def test_two_instances_of_an_overriding_trainer_each_build_their_own_state():
 
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=8)
-    objective = LMObjective(model, seq_len=8)
-    trainers = [Offset(objective, optax.adam(1e-3), key=jax.random.key(0), offset=offset) for offset in (1, 2)]
+    # One objective and one optimizer, so the two trainers' steps trace alike (`Trainer._step_key`) and
+    # their starts are kept as one would be (`traced_start`).
+    objective, optimizer = LMObjective(model, seq_len=8), optax.adam(1e-3)
+    trainers = [Offset(objective, optimizer, key=jax.random.key(0), offset=offset) for offset in (1, 2)]
+    assert [int(trainer.place()[0].step) for trainer in trainers] == [1, 2]
     assert [int(trainer.initial_state().step) for trainer in trainers] == [1, 2]
-    assert [int(jax.jit(trainer.initial_state)().step) for trainer in trainers] == [1, 2]
