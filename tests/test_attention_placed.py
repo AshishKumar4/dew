@@ -150,20 +150,33 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
 
 
 def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy_and_rounds_tmem_residency():
-    """An empty walk (`lengths=[0]`) on B200 `tcgen05.rows` skips `async_copy_smem_to_tmem` so the epilogue's
-    store through the Q stage is race-free (row 9103), and a 1-consumer d128 call (320 -> 512 TMEM columns)
-    reports residency 1 (row 9105)."""
-    from ring_protocol import explore, programs
+    """An empty walk (`lengths=[0]`) on B200 `tcgen05.rows` predicates `async_copy_smem_to_tmem` on
+    nonempty reach (`start < end`) so the epilogue's store through the Q stage is race-free (row 9103), and
+    a 1-consumer d128 call (320 -> 512 TMEM columns) reports residency 1 (row 9105)."""
+    from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
 
     target = generation.gpu_target("sm100")
     query = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
     key = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
     spans = template.spans(128, 128, 1, lengths=jnp.zeros((1,), jnp.int32))
-    threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key,
-                                 threads=ROWS_TILES.consumers + 1, rare=False)
-    assert not any(event.kind == "write" for thread in threads for event in thread
-                   if any(ev.kind == "product" for ev in thread))
-    assert explore(threads, arrivals) > 0
+    with generation.assumed("sm100"), _pinned(ROWS_TILES):
+        out = attention_mosaic.forward(query, key, key, spans, interpret=True)
+    np.testing.assert_array_equal(np.asarray(out), np.zeros((1, 128, 1, 64), dtype=np.float32))
+
+    # Confirm async_copy_smem_to_tmem only appears inside a cond branch (never unconditionally issued).
+    def find_copies(jaxpr, in_cond: bool = False) -> list[bool]:
+        found = []
+        for eq in jaxpr.eqns:
+            if eq.primitive is gpu_primitives.async_copy_smem_to_tmem_p:
+                found.append(in_cond)
+            next_cond = in_cond or eq.primitive is jax.lax.cond_p
+            for sub in jax.extend.core.jaxprs_in_params(eq.params):
+                found.extend(find_copies(sub, next_cond))
+        return found
+
+    jaxpr = jax.make_jaxpr(_placed_forward(ROWS_TILES, spans))(query, key).jaxpr
+    copies = find_copies(jaxpr)
+    assert copies and all(copies), f"expected all async_copy_smem_to_tmem predicated by cond, got {copies}"
     # 1-consumer d128 allocates 320 TMEM columns -> rounds to 512 -> residency 1 on B200 (row 9105).
     q128 = jax.ShapeDtypeStruct((1, 256, 1, 128), jnp.bfloat16)
     op = attention_mosaic.MosaicForward(scale=128 ** -0.5, keys=256, form="full")
