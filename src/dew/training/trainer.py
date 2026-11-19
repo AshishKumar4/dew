@@ -448,7 +448,8 @@ class Trainer(Generic[Loss, Effects]):
             # Outside any trace, one program, not each operation's (`built_start`): the moving state its
             # buffers, the frozen tree the held arrays. This body's, not the bound override's, which then
             # changes it once (row 8730). A state held on the host takes the arrays over as it is placed.
-            return built_start(self._fresh_state, initializer, key)
+            stated = self._step_key(self.objective, self._compiler)
+            return built_start(self._fresh_state, initializer, key, stated and (stated, type(self), "fresh"))
         return self._fresh_state(initializer, key)
 
     def _fresh_state(self, initializer: Initializer, key: jax.Array) -> TrainState:

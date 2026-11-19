@@ -17,7 +17,8 @@ def test_a_state_built_outside_a_trace_is_one_program_its_frozen_tree_the_held_a
     """A fresh state built outside any trace (`Trainer.initial_state`, a caller's or a test's) compiles one
     program, its traced start's (`distributed.built_start`), where run eagerly each operation of the
     model's draw compiled alone (row 8682); a held base's frozen tree is the held arrays themselves and its
-    moving tree buffers of its own, which the step's donation may free."""
+    moving tree buffers of its own, which the step's donation may free; a second build compiles nothing, its
+    program the one kept (row 8731: it traced and compiled again)."""
     from dew._cache import uncached
     from dew.batch import FROZEN
     from dew.lora import LoRA
@@ -36,9 +37,12 @@ def test_a_state_built_outside_a_trace_is_one_program_its_frozen_tree_the_held_a
     with uncached():
         try:
             trainer.initial_state()
+            first = len(compiles)
+            # Built the one way a fresh state is, its build kept as a refit's (row 8731): again, nothing.
+            trainer.initial_state()
         finally:
             jax.monitoring.unregister_event_duration_listener(heard)
-    assert len(compiles) <= 2, len(compiles)
+    assert first <= 2 and len(compiles) == first, (first, len(compiles))
     variables = nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
     adapted = LoRA(rank=2, modules=("q_proj",)).apply(model, variables, key=2)
     objective = LMObjective(adapted.model, seq_len=8, variables=adapted.variables)

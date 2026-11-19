@@ -628,21 +628,18 @@ def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
 
 
 def built_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                key: jax.Array) -> TrainState:
-    """`initial_state(initializer, key)` for a caller outside any trace, built by one program: its trace
-    (`traced_start`) replayed and compiled whole, where run eagerly each operation of the model's draw
-    compiled alone (tens to hundreds a model, row 8682). The frozen leaves its init passes through as they
-    are (`through`) are the initializer's arrays themselves, as an eager build returns them, not the
-    program's copies of them."""
-    _, through, build = traced_start(initial_state, initializer, key)
-    state = owned_program(build)(initializer, key)
-    if not through:
-        return state
-    moving, frozen = apart(state)
-    leaves, structure = jax.tree.flatten(frozen)
-    given = jax.tree.leaves(initializer)
-    return together(moving, jax.tree.unflatten(structure, [
-        given[through[index]] if index in through else leaf for index, leaf in enumerate(leaves)]))
+                key: jax.Array, kept: Hashable | None = None) -> TrainState:
+    """`initial_state(initializer, key)` for a caller outside any trace, on this process's default device,
+    built the one way a fresh state is (`start_build`, `placed_start`): one program, its draws rolled
+    (`drawing`), where run eagerly each operation of the model's draw compiled alone (tens to hundreds a
+    model, row 8682); the frozen leaves its init passes through the held arrays themselves, no output of it;
+    its trace and build kept as a refit's are, where `kept` states what it traces from (`traced_start`,
+    `KEPT_STARTS`), so a second call compiles nothing (row 8731)."""
+    abstract, through, build = traced_start(initial_state, initializer, key, kept)
+    mesh = Mesh(np.asarray(jax.devices()[:1]), ("devices",))
+    shardings = jax.tree.map(lambda _: NamedSharding(mesh, P()), abstract)
+    return placed_start(start_build(build, initializer, shardings, through), initializer, key, abstract,
+                        shardings, mesh)
 
 
 def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, abstract: TrainState,
