@@ -363,13 +363,19 @@ def settled_heap(run: FitRun, *, compiled: bool = False) -> None:
     (row 6739; row 8760: a compile mid-fit too). Read against the last full collection, noted by a
     collector hook this first call installs (`_full`, none at import: row 8761), not the compile: what a
     plan's compile or an earlier fit made is pending too (rows 8511, 8545). A process that has run none
-    collects."""
+    collects. A heap read below that collection's has freed what it held since, and its later growth is
+    counted from the lowest heap read: CPython's own count of what it promoted since grows by what is made
+    after a free too, so counting from the collection's heap would leave it to the collector among the
+    steps."""
     if run.settled and not compiled:
         return
     run.settled = True
     if _full not in gc.callbacks:
         gc.callbacks.append(_full)
-    if not _FULL or sys.getallocatedblocks() - _FULL[0] > _FULL[0] // 4:
+    blocks = sys.getallocatedblocks()
+    if _FULL and blocks < _FULL[0]:
+        _FULL[:] = [blocks]
+    if not _FULL or blocks - _FULL[0] > _FULL[0] // 4:
         gc.collect()
 
 @dataclasses.dataclass
