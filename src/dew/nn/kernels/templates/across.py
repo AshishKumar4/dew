@@ -3,6 +3,7 @@ programs to arrive at a semaphore (`arrived`), and the consumer warpgroups' part
 order and stored once (`summing`, `summed_across`)."""
 
 import dataclasses
+import functools
 from collections.abc import Callable
 
 import jax
@@ -140,9 +141,17 @@ def scale_smem(ref, power: float, *, swizzle: int, interpret: bool = False) -> N
     pair = bits | (bits << 16)
     transforms = () if swizzle == swizzling.UNSWIZZLED else swizzling.swizzle_transforms(dtype, swizzle)
     ref_type = plgpu.RefType(transforms) if transforms else plgpu.RefType()
-    body = emission.stating(lambda r: Work(operations=elements, shared_bytes=2 * elements * 2))(
+    plgpu.inline_mgpu(arg_types=(ref_type,))(_scaling(words, pair, bf16))(ref)
+
+
+@functools.cache
+def _scaling(words: int, pair: int, bf16: bool) -> ScaleSmem:
+    """The `ScaleSmem` body of a tile of `words` 32-bit words, its work stated once and held while any kernel
+    may inline it (`emission.stating`'s record is weak: a body built per call was gone by the time a launch's
+    cost read it, and its count refused it as unpriced)."""
+    elements = 2 * words
+    return emission.stating(lambda ref: Work(operations=elements, shared_bytes=2 * elements * 2))(
         ScaleSmem(words, pair, bf16))
-    plgpu.inline_mgpu(arg_types=(ref_type,))(body)(ref)
 
 
 def lane_value(value: ir.Value, lane: int) -> ir.Value:
