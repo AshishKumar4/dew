@@ -65,12 +65,13 @@ def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array
 
 
 def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
-    """A float `x` (fp32 or float64) from its bits, each a signed integer of its width: its sign bit, its
-    biased exponent, its fraction, its fraction normalized as a normal one's (a subnormal's leading bit moved
-    up to the implicit bit's place and dropped) and its binary exponent `floor(log2 |x|)`, a subnormal's
-    below the least normal: `(sign, biased, fraction, normalized, exponent)`. Read from its bits, a
-    subnormal is kept where a process's float multiply flushes a subnormal operand (XLA's CPU, row 4023):
-    the one reading `binade_of`, `raised_exactly` and `aligned_sum` take."""
+    """A float `x` of IEEE's binary formats (fp16, bfloat16, fp32, float64) from its bits, each a signed
+    integer of its width: its sign bit, its biased exponent, its fraction, its fraction normalized as a
+    normal one's (a subnormal's leading bit moved up to the implicit bit's place and dropped) and its binary
+    exponent `floor(log2 |x|)`, a subnormal's below the least normal: `(sign, biased, fraction, normalized,
+    exponent)`. Read from its bits, a subnormal is kept where a process's float multiply flushes a subnormal
+    operand (XLA's CPU, row 4023): the one reading `binade_of`, `raised_exactly`, `widened_exactly` and
+    `aligned_sum` take."""
     limits = jnp.finfo(x.dtype)
     signed = jnp.dtype(f"int{limits.bits}")
     bias, width = limits.maxexp - 1, limits.nmant
@@ -150,17 +151,13 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
         return jnp.asarray(x, dtype)
     source, target = jnp.finfo(x.dtype), jnp.finfo(dtype)
     word = jnp.dtype(f"uint{target.bits}")
-    _, sign, biased, fraction = raw_fields(x)
-    # The leading bit's place, and the value's binary exponent: `fraction 2^(minexp - nmant)`.
-    lead = (source.bits - 1) - jax.lax.clz(fraction).astype(jnp.int32)
-    least = int(source.minexp) - int(source.nmant)
-    exponent = least + lead
-    fraction = fraction.astype(word)
-    rest = fraction & ((word.type(1) << jnp.maximum(lead, 0).astype(word)) - word.type(1))
+    # Its exponent and normalized fraction as `float_bits` reads a subnormal's; placed in `dtype` alone here.
+    sign, biased, fraction, normalized, exponent = float_bits(x)
     normal = (((exponent + (1 << (target.nexp - 1)) - 1).astype(word) << word.type(target.nmant))
-              | (rest << (int(target.nmant) - lead).astype(word)))
-    tiny = fraction << word.type(least - (int(target.minexp) - int(target.nmant)))
+              | (normalized.astype(word) << word.type(target.nmant - source.nmant)))
+    least = int(source.minexp) - int(source.nmant)
+    tiny = fraction.astype(word) << word.type(least - (int(target.minexp) - int(target.nmant)))
     held = jnp.where(fraction == 0, word.type(0), jnp.where(exponent >= target.minexp, normal, tiny))
-    signed = sign.astype(word) << word.type(target.bits - source.bits)
+    signed = (sign != 0).astype(word) << word.type(target.bits - 1)
     subnormal = jax.lax.bitcast_convert_type(signed | held, dtype)
     return jnp.where(biased == 0, subnormal, x.astype(dtype))

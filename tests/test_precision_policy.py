@@ -1257,6 +1257,19 @@ def test_an_aligned_sum_of_mixed_factors_differentiates_each_factor():
     np.testing.assert_array_equal(np.asarray(gradient), [2.0, 2.0])
 
 
+def test_an_aligned_sums_tangent_keeps_its_float64_sum_where_no_direction_moves_its_float64_term():
+    """The tangent of `aligned_sum([(a, 2^70), (1,)])` of fp32 `a` and `2^70` and a float64 `1`, with x64
+    on, at `a = 0` in the direction `2^70`: float64's `2^140`, the sum's type, where the float64 term no
+    direction moves was dropped from the tangent's terms and they were summed in fp32, infinite (base review
+    a8a1fdea7 F1)."""
+    with jax.enable_x64(new_val=True):
+        big = jnp.float32(2.0 ** 70)
+        value, tangent = jax.jvp(lambda a: aligned_sum([(a, big), (jnp.float64(1.0),)]),
+                                 (jnp.float32(0.0),), (big,))
+    assert value.dtype == tangent.dtype == jnp.float64
+    assert float(tangent) == 2.0 ** 140 and float(value) == 1.0
+
+
 def test_an_aligned_sum_of_a_weak_float64_factor_keeps_float32():
     """`aligned_sum` of one weakly typed float64 factor (`jnp.asarray(1.0)` with x64 on) is float32's 1, the
     factor narrowed as promotion narrows it, where its exact widening read float64's bits as float32's and
