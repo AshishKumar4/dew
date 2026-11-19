@@ -59,6 +59,8 @@ def kda(q, k, v, g, beta, scale=None, initial_state=None, output_final_state=Fal
     if use_gate_in_kernel:
         from fla.ops.kda import gate
 
+        if A_log is None:
+            raise ValueError("a gate computed in the kernel (use_gate_in_kernel) takes its A_log")
         g = (gate.naive_kda_gate(g, A_log, dt_bias, output_dtype=g.dtype) if lower_bound is None else
              gate.naive_kda_lowerbound_gate(g, A_log, dt_bias, lower_bound, output_dtype=g.dtype))
     if use_beta_sigmoid_in_kernel:
