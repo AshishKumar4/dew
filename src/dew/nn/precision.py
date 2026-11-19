@@ -39,6 +39,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
+from jax.core import ShapedArray
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
@@ -1957,12 +1958,13 @@ def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, t
     live = tuple(index for index, direction in enumerate(tangents) if not isinstance(direction, SymbolicZero))
     if not live:
         return value, jnp.zeros_like(value)
-    return value, _aligned_directions(shape, spec, primals, [tangents[index] for index in live], value, live)
+    return value, _aligned_directions(shape, spec, primals, [tangents[index] for index in live],
+                                      jax.typeof(value), live)
 
 
-def _placed_as(x: jax.Array, like: jax.Array) -> jax.Array:
-    """`x` placed as `like`'s type, whole too, where its mesh has an Explicit axis (row 8757)."""
-    placed = jax.typeof(like).sharding
+def _placed_as(x: jax.Array, like) -> jax.Array:
+    """`x` placed as `like`'s type (an array's or its aval), whole too, where its mesh has an Explicit one."""
+    placed = (like if isinstance(like, ShapedArray) else jax.typeof(like)).sharding
     typed = isinstance(placed, jax.sharding.NamedSharding) and placed.mesh.explicit_axes
     return jax.sharding.reshard(x, placed) if typed else x
 
@@ -1993,8 +1995,7 @@ def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.
 
 def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents, value,
                         live: tuple[int, ...]):
-    """`aligned_sum`'s tangent in its `live` factors' `tangents`, a linear map (`generation.linear_map`) of
-    each direction in its places, its own tangent one aligned sum of all a tangent reaches (row 8757)."""
+    """`aligned_sum`'s tangent in its `live` factors' `tangents` (`value` the sum's type alone, row 8757)."""
     from dew.nn.kernels import generation
 
     def applied(factors, directions):
@@ -2029,9 +2030,8 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
             gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype), factor))
         return gradients
 
-    # Typed as the value it perturbs, so a reverse pass traces no forward mode for its type alone.
     return generation.linear_map(applied, pulled, list(primals), list(tangents),
-                                 out_aval=jax.typeof(value).to_tangent_aval(), traced_tangent=True)
+                                 out_aval=value.to_tangent_aval(), traced_tangent=True)
 
 
 _aligned = contracted("test_an_aligned_sum_holds_every_order")(
