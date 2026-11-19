@@ -1830,7 +1830,8 @@ class Trainer(Generic[Loss, Effects]):
         objective, inputs = self.objective, self.objective.inputs
         # What the stream states it hands each step, a rollout's batches aside, which make their own rows.
         produced = None if self.rollout is not None else Produced.of(plan.dataset, run.partition)
-        whole = not plan.dataset.device
+        # A rollout's batches are its prompts, which the objective reads once the rollout makes their rows.
+        whole = not plan.dataset.device and self.rollout is None
 
         def prepare(batch: Batch) -> Batch:
             # Every batch as its loader states it, before it is placed (`Produced`), and as its objective
