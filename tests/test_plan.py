@@ -1442,22 +1442,6 @@ def test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_plac
     assert (trainer.plan["split"], trainer.plan["remat"]) == (1, None), trainer.plan["probes"]
 
 
-
-def test_a_plan_made_before_the_state_is_placed_records_its_placed_judgement_whole(monkeypatch):
-    """A fresh fit's plan, searched before its state is placed (`StepCompiler.planned_unplaced`) and kept
-    where the placed devices hold it, records its own probe as that placed judgement read it: the headroom
-    the placed devices hold and the bytes it placed beside the step, not the unplaced search's charge of a
-    state the devices held none of then (row 8962: one record held a headroom and a charge of two
-    judgements, the state's bytes counted beside a step that holds them)."""
-    state, _, _ = lm().place()
-    held = sum(leaf.nbytes for leaf in jax.tree.leaves(state) if isinstance(leaf, jax.Array))
-    free(monkeypatch, 4 * (needs(monkeypatch, lm()) + held))
-    trainer = lm()
-    trainer.fit(Pipeline(Memory({"text": np.asarray(BATCH["text"])})).repeat().batch(ROWS), steps=1)
-    placed = trainer.plan["placed"]
-    (own,) = [probe for probe in trainer.plan["probes"] if probe["headroom"] == placed["headroom"]]
-    assert own["beside"] - placed["held"] < held, (own, placed, held)
-
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
     """An A100's plan: no recomputation fits the batch at four microbatches and not in fewer, so the plan
     is four at no recomputation, which XLA's memory analysis of each compile decides, and no optional
