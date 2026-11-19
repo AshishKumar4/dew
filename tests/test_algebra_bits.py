@@ -282,23 +282,14 @@ def _inline_decode(form: bits.BitForm):
 def test_a_forms_ptx_compiles_for_the_gpu(generation, name):
     """A form's PTX in a Triton kernel's inline assembly, lowered and compiled by XLA for a compile-only GPU
     of `generation` (`tests/kernel_compile.py`): ptxas takes every instruction PTX writes for a form
-    (`FORMS` take them all)."""
+    (`FORMS` take them all). What a form's PTX computes on a GPU is held where a kernel consumes it, never a
+    unit test on a GPU (the owner's rule): the NVFP4 form in the packed GEMM's mainloop, through
+    tests/test_gpu_gemm.py's NVFP4 product cells (every order, sm80 and sm90, its decode's PTX form a cell's
+    fault) and its NVFP4 matrix (a training step with the matrix decoded in the mainloop, check 1)."""
     from kernel_compile import lowered_for
 
     words = jax.ShapeDtypeStruct((1024,), jnp.uint32)
     lowered_for(_inline_decode(FORMS[name]()), (words,), generation).compile()
-
-
-@pytest.mark.gpu(reason="runs a form's PTX on this host's GPU")
-@pytest.mark.parametrize("name", FORMS)
-def test_a_forms_ptx_decodes_on_the_gpu_as_its_form_does(name):
-    """A form's PTX run on the GPU (`BitForm.ptx` in a Triton kernel's inline assembly) gives every register
-    of every drawn stored word as the form's own decode does, each instruction PTX writes among them."""
-    form = FORMS[name]()
-    words = np.random.default_rng(3734).integers(0, 1 << 32, size=1 << 16, dtype=np.uint64)
-    decoded = jax.jit(_inline_decode(form))(jnp.asarray(words.astype(np.uint32)))
-    for got, expected in zip(decoded, form.decoded(words), strict=True):
-        np.testing.assert_array_equal(np.asarray(got).astype(np.uint64), expected)
 
 
 MINIFLOATS = {"e4m3": (bits.E4M3, ml_dtypes.float8_e4m3fn), "e5m2": (bits.E5M2, ml_dtypes.float8_e5m2),

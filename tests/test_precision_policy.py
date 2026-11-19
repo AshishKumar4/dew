@@ -581,9 +581,12 @@ def the_gpu_divides_fp32_to_the_nearest_float():
     from 1e-4 to 10 apart, each is the float64 quotient rounded to fp32, as a
     CPU's and the references' are. XLA's own `div.full` left 28% of them off
     by up to 2 ulps on an H100."""
+    from reference_error import ahead_arm
+
     rng = np.random.default_rng(0)
     numerator, denominator = (rng.uniform(1e-4, 10, 1 << 20).astype(np.float32) for _ in range(2))
-    quotient = np.asarray(jax.jit(jnp.divide)(numerator, denominator))
+    # A program with no check-1 site, prepared as an arm is in a GPU tier part (`ahead_arm`).
+    quotient = np.asarray(ahead_arm(jax.jit(jnp.divide), "the GPU's fp32 division")(numerator, denominator))
     nearest = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
     np.testing.assert_array_equal(quotient, nearest)
 

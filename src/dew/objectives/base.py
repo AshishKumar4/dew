@@ -2155,6 +2155,37 @@ class _Unkeyed:
 
 UNKEYED = _Unkeyed()
 
+
+class Held:
+    """An object a trace is kept by whose value states nothing and whose identity states everything it
+    traces (an Optax transformation given built: pure functions over the settings it closed over,
+    `Trainer._step_key`): equal only to the same object while it lives, hashed by its identity. It holds the
+    object weakly where the object allows it, so a key kept for a refit keeps no released trainer's objects
+    alive, and a released object's key equals none, the object that takes its identity after it among them;
+    strongly where it does not (a tuple). Two equal-looking objects (two transformations built alike) key
+    apart; one object keys alike each time it is read."""
+
+    __slots__ = ("_hash", "_strong", "_weak")
+
+    def __init__(self, value: TracedSetting):
+        self._hash = id(value)
+        try:
+            self._weak, self._strong = weakref.ref(value), None
+        except TypeError:
+            self._weak, self._strong = None, value
+
+    @property
+    def value(self) -> TracedSetting:
+        """The object, None once a weakly held one is released."""
+        return self._strong if self._weak is None else self._weak()
+
+    def __eq__(self, other) -> bool:
+        held = self.value
+        return isinstance(other, Held) and held is not None and other.value is held
+
+    def __hash__(self) -> int:
+        return self._hash
+
 type TracedSetting = (Hashable | Mapping[str, TracedSetting] | Sequence[TracedSetting] | DataclassInstance
                       | None)
 """A setting an objective holds, as its trace key states it (`Objective.trace_key`): a hashable value (a

@@ -60,7 +60,7 @@ def windows(draw, count: int):
 class _Windowed:
     """An arm of one draw (`fn`) over `windows`' stacked arguments, window by window (`over_windows`):
     the gate compiles `fn` as it compiles any arm (`_arms`) and runs the windows through that program. A
-    frozen record, stated by its arm (`reference_error._arm_role`)."""
+    frozen record, stated by its arm (`truths_ahead.arm_role`)."""
 
     fn: Callable
 
@@ -73,7 +73,7 @@ class _Windowed:
 class _RunToRun:
     """An arm whose outputs vary in their last bits from run to run on the same inputs (`run_to_run`):
     the gate compiles `fn` as it compiles any arm (`_arms`) and judges each draw by the one run it makes. A
-    frozen record, stated by its arm and its reason (`reference_error._arm_role`)."""
+    frozen record, stated by its arm and its reason (`truths_ahead.arm_role`)."""
 
     fn: Callable
     why: str

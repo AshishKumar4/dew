@@ -80,6 +80,29 @@ def test_the_contract_runs_every_order_on_trainings_mesh():
                               "a split sum counted twice")
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_contracts_mesh_sites_draw_their_declared_seeds_and_size_none(monkeypatch):
+    """Given `seeds` (a cell sharded across CI's map tasks, its mark's count), every order's check-1 site on
+    training's mesh draws that count's seeds, its second stage's past them where its first does not decide,
+    and in an ordinary run sizes none (`seeds_for`'s draws, from SIZING_FROM on; a qualification run sizes a
+    declared count, `_qualified`): a cell's sizing on every run took most of a 300 s contract cell (row
+    8429's), which a shard mark's count in its place cuts."""
+    from check1_wire import QUALIFY
+    from reference_error import staged_units
+
+    monkeypatch.delenv(QUALIFY, raising=False)
+    drawn: set[int] = set()
+
+    def inputs(seed, scale):
+        drawn.add(int(seed))
+        summed = normal_draw(seed, (1024,), (1,), scale=scale)
+        return summed, normal_draw(seed + 1, (1024,), (1,), scale=scale), normal_draw(seed + 2, (1,))[0]
+
+    assert_drawn_contract(_summed_over_the_mesh(1), inputs, EDGES["normal"], "a split sum of declared seeds",
+                          seeds=16)
+    assert set(range(16)) <= drawn <= set(range(staged_units(16)))
+
+
 def test_the_contract_refuses_a_bfloat16_formula_less_finite_than_the_plain_one():
     """The same refusal where the formula's values are bfloat16 (row 4499): the squared root overflows
     bfloat16's range where |x| does not, and its leaves are held as a float32 formula's are."""

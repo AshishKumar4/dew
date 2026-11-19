@@ -264,7 +264,7 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     def attempted() -> None:
         attempt.set_running_or_notify_cancel()
         try:
-            attempt.set_result(context.run(report.attempted, lowered, None))
+            attempt.set_result(context.run(report.attempted, lowered, None, background=True))
         except BaseException as error:
             # Its reader raises it (`attempting`).
             attempt.set_exception(error)
@@ -791,6 +791,20 @@ class OuterProgram:
                 self._released(key, pending, error)
         return pending.result()
 
+    def _lowered_aside(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
+        """The call's program lowered, its launches certified aside while it traces
+        (`report.certifying_aside`), and lowered afresh (`_relowered`) for as long as a certification
+        refuses, each refused launch's derivation stepping past its config and certifying the next in
+        turn."""
+        from dew.nn.kernels.templates import report
+
+        with report.certifying_aside() as aside:
+            lowered = self.lower(*args, **kwargs)
+        while report.settled_aside(aside):
+            with report.certifying_aside() as aside:
+                lowered = self._relowered(args, kwargs, relowered)
+        return lowered
+
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
         """A call's program traced afresh past a spill's refused config (`report.compiled`'s `relower`), on
         the thread that keeps it, each relowering with its jit kept in `relowered`."""
@@ -833,6 +847,14 @@ class OuterProgram:
         with self._compiling:
             if key in self._executables:
                 self._ready[key] = executable
+
+    def keeps(self) -> bool:
+        """Whether it keeps an executable a call over arrays runs (one compiled at a call, or taken from a
+        compile over shapes at one): none before its first call and once released (`released`). It says that
+        one is kept, not that it is the one a call over given arguments runs: a caller reads it of a program
+        called over one shape alone (a kept start's, `dew.training.distributed.start_compiling`)."""
+        with self._compiling:
+            return bool(self._ready)
 
     def guided(self, executable: jax.stages.Compiled, replacement: jax.stages.Compiled) -> None:
         """`executable`, one this program holds, replaced by `replacement`, its compile again guided by a
@@ -893,7 +915,7 @@ class OuterProgram:
             lowered = begun.lowered
             begun.taken.set()
         else:
-            lowered = self.lower(*args, **kwargs)
+            lowered = self._lowered_aside(args, kwargs, relowered)
         lowered_at = time.perf_counter()
         # A program compiled ahead or kept for this target runs as it was compiled (`taking`).
         if (ahead := taken(lowered, self.options)) is not None:
