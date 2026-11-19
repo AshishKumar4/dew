@@ -547,10 +547,18 @@ class MosaicForward(_Mainloop[Tiles]):
         # common op's is the step's (`_launch_flops`).
         decides, registered, _ = self._decided_model(query, value, score_params, residuals, config, table,
                                                      sources, scales, initial, priced=False)
+        family = bundle_of(config, query.dtype)
+        target = self.launch_target()
+        query_in_tmem = False
+        if family.places_on_role and self.parts == 1:
+            ba = self.bind(query, key, value, start, end, query_ids, key_ids, score_params, output_params,
+                           initial, drop, table, sources, scales, query_params, residuals=residuals,
+                           interpret=interpret)
+            query_in_tmem = placed.QUERY in family.product_scratch(*self._products(ba, config, target))
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret,
-                "counts": not self.scaled, "registered": registered}
+                "counts": not self.scaled, "registered": registered, "tmem_columns": target.tmem_columns,
+                "query_in_tmem": query_in_tmem}
         scaled = (self.scaled or (self.cached(table, sources, scales) and not self.bounded)) and not decides
-
         def launched():
             match residuals:
                 case Kept.SPLIT:
@@ -624,7 +632,8 @@ class MosaicForward(_Mainloop[Tiles]):
         # A family that places its products on a role issues its logits ahead (`_ahead`: tcgen05's rows,
         # whose issuer warp is a step ahead of its consumer), which past its tensor memory it does not: its
         # products' scratch then none it takes (`Issuer.product_scratch`).
-        if bundle_of(config, ba.arguments["query"].dtype).places_on_role and not self._ahead(ba, config):
+        if bundle_of(config, ba.arguments["query"].dtype).places_on_role and not self._ahead(ba, config,
+                                                                                              target):
             return False
         if not super().legal(ba, config, target):
             return False
@@ -843,7 +852,9 @@ class MosaicForward(_Mainloop[Tiles]):
                       if config.block_k % block == 0)
         relaunch = next((tiles for tiles in relaunches
                          if self._launch_legal(ba, tiles, target, decides=decides)
-                         and self.proposed(ba, tiles, target, self.registers(ba, tiles, decides=decides))),
+                         and self.proposes(ba, tiles, target,
+                                           held=lambda tiles=tiles: self.within(
+                                               self.registers(ba, tiles, decides=decides), tiles))),
                         None)
         if relaunch is None:
             return None
@@ -909,6 +920,11 @@ class MosaicForward(_Mainloop[Tiles]):
                      decides: bool | None = None) -> int:
         """The program's shared memory (`_forward_allocations`, `resources.shared_bytes`), at the call's
         widths as the launch stages them (`_width`)."""
+        return self._staged_bytes(ba, config, target, products=self._products(ba, config, target),
+                                  decides=decides)
+
+    def _staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
+                      products: tuple, decides: bool | None = None) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
@@ -934,30 +950,47 @@ class MosaicForward(_Mainloop[Tiles]):
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
         return resources.shared_bytes(family, launch_scope(family, allocations, reduced,
                                                            reduces=forward_reduces(family, reduced),
-                                                           products=self._products(ba, config, target),
-                                                           over_rings=True))
+                                                           products=products, over_rings=True))
 
     def _products(self, ba: tokamax.BoundArguments, config: Tiles,
-                  target: generation.GpuTarget | None = None) -> tuple:
+                  target: generation.GpuTarget) -> tuple:
         """The launch's products at `config` as its program scopes them (`forward_products`): its logits a
         step ahead where it issues them so (`_ahead`), a scaled walk's small weights' accumulator beside its
         sums where its kernel walks scaled (`scales_in_kernel`), and its query in tensor memory where
-        tensor memory holds it beside them (`placed.QUERY`)."""
+        tensor memory holds it beside them without dropping rounded residency (`placed.QUERY`,
+        `resources.register_model`, rows 9475, 9479)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         query_width = _width(query.shape[-1], family, query.dtype)
         value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
-        return forward_products(family, config, value_width, query.dtype, parts=self.parts,
-                                scaled=self.scales_in_kernel(ba), ahead=self._ahead(ba, config),
-                                training=ba.arguments.get("residuals") is Kept.SPLIT,
-                                query_width=query_width,
-                                tmem_columns=None if target is None else target.tmem_columns)
+        ahead = self._ahead(ba, config, target)
+        scaled = self.scales_in_kernel(ba)
+        training = ba.arguments.get("residuals") is Kept.SPLIT
+        base = forward_products(family, config, value_width, query.dtype, parts=self.parts,
+                                scaled=scaled, ahead=ahead, training=training,
+                                tmem_columns=target.tmem_columns)
+        if family.places_on_role and self.parts == 1:
+            with_query = forward_products(family, config, value_width, query.dtype, parts=self.parts,
+                                          scaled=scaled, ahead=ahead, training=training,
+                                          query_width=query_width, tmem_columns=target.tmem_columns)
+            if with_query != base:
+                staged = (self._staged_bytes(ba, config, target, products=base)
+                          if target.shared_limit else None)
+                regs = self.registers(ba, config)
+                base_most = resources.register_model(family, config.consumers, regs, shared=staged,
+                                                     target=target, tmem=family.product_columns(base)).most
+                with_most = resources.register_model(family, config.consumers, regs, shared=staged,
+                                                     target=target,
+                                                     tmem=family.product_columns(with_query)).most
+                if with_most >= base_most:
+                    return with_query
+        return base
 
     def tmem_columns(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
         return family.product_columns(self._products(ba, config, target))
 
-    def _ahead(self, ba: tokamax.BoundArguments, config: Tiles) -> bool:
+    def _ahead(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
         """Whether the launch at `config` issues its logits a step ahead of their read (`logits_ahead`)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
@@ -967,7 +1000,8 @@ class MosaicForward(_Mainloop[Tiles]):
         return logits_ahead(family, config, value_width,
                             query.dtype, stages=min(config.stages, steps), parts=self.parts, coded=coded,
                             scaled=self.scales_in_kernel(ba),
-                            training=ba.arguments.get("residuals") is Kept.SPLIT)
+                            training=ba.arguments.get("residuals") is Kept.SPLIT,
+                            tmem_columns=target.tmem_columns)
 
     def cached(self, table, sources, scales) -> bool:
         """Whether a call walks a cache's keys (masked, split, paged, by rows or over codes: a decode step's
@@ -1246,7 +1280,8 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         query = prologued(query, hooks.query_mod, hooks.query_params)
         hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
     return config, certified_walk(query, key, value, spans, hooks, scale=op.scale, natural=op.natural,
-                                  tiles=config, interpret=interpret, registered=registered)
+                                  tiles=config, interpret=interpret, registered=registered,
+                                  tmem_columns=target.tmem_columns)
 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
