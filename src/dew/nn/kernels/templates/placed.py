@@ -173,7 +173,7 @@ class Tcgen05Placed(Tcgen05Rings):
         return tuple(barrier for name in ("scored", "weighed", "summed", "q_ready")
                      if name in scratch for barrier in scratch[name])
 
-    def held(self, ref: Any) -> Any:
+    def held(self, ref):
         # The query block moved into tensor memory once before the walk where tensor memory holds it beside
         # the logits and sums (`product_scratch`'s `QUERY`), so every key tile's logits product reads Q from
         # tensor memory (tcgen05's TS form) instead of re-reading shared memory (`issuing`, row 5368).
