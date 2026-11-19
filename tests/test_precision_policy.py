@@ -1178,27 +1178,47 @@ def _edge_values(dtype) -> np.ndarray:
     return np.concatenate([values, -values])
 
 
-@pytest.mark.parametrize(("dtype", "reach"), [
-    (jnp.float32, None), (jnp.float32, 2 * 126), (jnp.float64, None), (jnp.bfloat16, None)])
-def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach):
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.bfloat16])
+def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
+    """`dew.nn.precision.exact_power2` is `2^n` in its format, bit for bit, at every normal exponent from the
+    least to the largest, and +0 one below them (a zero a caller encodes so), compiled."""
+    from dew.nn.precision import exact_power2
+
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        limits = jnp.finfo(dtype)
+        exponents = np.arange(limits.minexp - 1, limits.maxexp)
+        found = np.asarray(jax.jit(lambda n: exact_power2(n, dtype))(jnp.asarray(exponents, jnp.int32)))
+    assert found.dtype == dtype
+    expected = np.asarray([0.0, *(2.0 ** int(n) for n in exponents[1:])], np.float64).astype(dtype)
+    np.testing.assert_array_equal(found.view(f"uint{limits.bits}"), expected.view(f"uint{limits.bits}"))
+
+
+@pytest.mark.parametrize(("dtype", "reach", "exponent"), [
+    (jnp.float32, None, jnp.int32), (jnp.float32, 2 * 126, jnp.int32), (jnp.float32, None, jnp.int8),
+    (jnp.float32, 2 * 126, jnp.int8), (jnp.float32, None, jnp.uint8), (jnp.float32, None, jnp.float32),
+    (jnp.float64, None, jnp.int32), (jnp.bfloat16, None, jnp.int32)])
+def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach, exponent):
     """`dew.nn.precision.power2` (the one owner of scaling by a power of two: a kernel template's, a scaled
-    value's, an aligned sum's) scales by powers of two exactly wherever the result is a normal value of its
-    format (`x`'s, at least float32), compiled (where XLA computes `exp2` as an inexact `exp` and fuses a
-    product of them into one `exp`, past the format), at every integral exponent past the format's range
-    both ways against exact rational scaling, greedy factors by default and a stated reach's two halves
-    within it; zero stays zero, and a result past the format is infinite."""
+    value's, an aligned sum's) scales by powers of two exactly wherever the operand and the result are
+    normal values of its format (`x`'s, at least float32), compiled (where XLA computes `exp2` as an inexact
+    `exp` and fuses a product of them into one `exp`, past the format), at every integral exponent its type
+    holds past the format's range both ways against exact rational scaling, greedy factors by default and a
+    stated reach's two halves within it, operands at both ends of the normal range among them; zero stays
+    zero, and a result past the format is infinite."""
     from dew.nn.precision import power2
 
     with jax.enable_x64(new_val=dtype == jnp.float64):
         wide = jnp.result_type(dtype, jnp.float32)
         limits = np.finfo(wide)
         span = int(limits.maxexp - limits.minexp + limits.nmant) + 8 if reach is None else reach
-        exponents = np.arange(-span, span + 1)
-        mantissas = np.asarray([0.0, 0.5, 0.75, 1.0, -0.6, 1.0 + 2.0 ** -7], np.float64)
+        held = np.iinfo(exponent) if jnp.issubdtype(exponent, jnp.integer) else np.finfo(exponent)
+        exponents = np.arange(max(-span, int(held.min)), min(span, int(held.max)) + 1)
+        operands = [0.0, 0.5, 0.75, 1.0, -0.6, 1.0 + 2.0 ** -7, float(jnp.finfo(dtype).tiny),
+                    -1.5 * 2.0 ** (jnp.finfo(dtype).maxexp - 2)]
         found = np.asarray(jax.jit(lambda x, k: power2(x[:, None], k[None, :], reach))(
-            jnp.asarray(mantissas, dtype), jnp.asarray(exponents, jnp.int32)))
+            jnp.asarray(operands, dtype), jnp.asarray(exponents, exponent)))
     assert found.dtype == wide
-    taken = np.asarray(mantissas.astype(dtype), np.float64)
+    taken = np.asarray(np.asarray(operands, np.float64).astype(dtype), np.float64)
     exact = [[Fraction(float(x)) * Fraction(2) ** int(k) for k in exponents] for x in taken]
     normal = np.asarray([[value == 0 or limits.tiny <= abs(value) <= limits.max for value in row]
                          for row in exact])

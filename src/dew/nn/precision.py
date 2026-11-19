@@ -465,12 +465,13 @@ def _exp_value(base2: bool, x) -> jax.Array:
     return power2(summed, n, reach=150)
 
 
-def exact_power2(n, dtype=jnp.float32) -> jax.Array:
+def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax.Array:
     """`2^n` in `dtype`, exactly, for an integral `n` (an integer, or a float holding one) within its normal
-    exponents ([-126, 127] in float32), set in its exponent bits: the one owner of an exact power of two
-    (`power2`'s factors, a kernel template's). No `exp2`, which XLA computes as `exp(n ln 2)`, inexactly, and
-    whose products its algebraic simplifier fuses into one `exp` of their sum (`exp(a) exp(b) -> exp(a +
-    b)`), past the format where each factor is in it."""
+    exponents ([-126, 127] in float32), set in its exponent bits, and +0 at one below them (`minexp - 1`,
+    a zero a caller encodes so): the one owner of an exact power of two (`power2`'s factors, a kernel
+    template's). No `exp2`, which XLA computes as `exp(n ln 2)`, inexactly, and whose products its algebraic
+    simplifier fuses into one `exp` of their sum (`exp(a) exp(b) -> exp(a + b)`), past the format where each
+    factor is in it."""
     limits = jnp.finfo(dtype)
     word = jnp.dtype(f"int{limits.bits}")
     biased = jnp.asarray(n).astype(word) + word.type(limits.maxexp - 1)
@@ -478,29 +479,33 @@ def exact_power2(n, dtype=jnp.float32) -> jax.Array:
     return jax.lax.bitcast_convert_type(bits, dtype)
 
 
-def power2(x, k, reach: float | None = None) -> jax.Array:
-    """`x * 2^k` for an integral `k` (an integer, or a float holding one) of any size, exactly wherever the
-    result is a normal value of its format (`x`'s, at least float32's, as a float32 factor widens a narrower
-    one): products by exact powers of two of `k`'s sign (`exact_power2`), so each partial product lies
-    between `x` and the result, `k` held within `reach` (by default its format's saturating bound, past
-    which every finite `x` lands zero or infinite: 279 in float32). The one owner of scaling by a power of
-    two (a scaled value's, an aligned sum's, a kernel template's).
+def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None) -> jax.Array:
+    """`x * 2^k` for an integral `k` (an integer, or a float holding one) of any size, exactly wherever `x`
+    and the result are normal values of its format (`x`'s, at least float32's, as a float32 factor widens a
+    narrower one): products by exact powers of two of `k`'s sign (`exact_power2`), so each partial product
+    lies between `x` and the result, `k` held within `reach` (by default its format's saturating bound, past
+    which every finite `x` lands zero or infinite: 279 in float32). The one owner of scaling by a power of two
+    (a scaled value's, an aligned sum's, a kernel template's; `scalar_power2` a Mosaic kernel's scalar `k`).
+    A backend that flushes subnormals (XLA:CPU) flushes a subnormal `x` before any factor raises it:
+    `raised_exactly` raises one from its bits.
 
     Each factor takes as much of what is left of `k` as the normal exponents hold, as many factors as `reach`
     needs, so a result below the least normal rounds once wherever `|k|` fits one factor, where a split into
     equal parts rounded it again at each part past the normal range. A caller whose `k` stays within twice
-    the largest exponent states its `reach` and takes two factors, `k`'s halves, each built as its product
-    takes it: one integer tile live, not two (et-livehook1: the factor tiles 66 of an attention template's
-    natural forward's 281 registers at its peak). Two halves hold `k` down to twice the least normal exponent
-    (-252 in float32), below which a half is no normal power and the product zero, a value of at most
-    `2^-125` in float32 lost."""
+    the least of the normal exponents' bounds (252 in float32: both halves normal powers) states its `reach`
+    and takes two factors, `k`'s halves, each built as its product takes it: one integer tile live, not two
+    (et-livehook1: the factor tiles 66 of an attention template's natural forward's 281 registers at its
+    peak)."""
     x = jnp.asarray(x)
     dtype = jnp.result_type(x, jnp.float32)
     limits = jnp.finfo(dtype)
     least, largest = limits.minexp, limits.maxexp - 1
     saturating = (largest + 1) - (least - limits.nmant) + 2
     held = saturating if reach is None else min(reach, saturating)
-    if held <= 2 * largest:
+    # Held as float32, which every exponent within a format's saturating bound is exactly, so no narrow
+    # integer `k` wraps at the bound.
+    k = jnp.clip(jnp.asarray(k, jnp.float32), -held, held)
+    if held <= 2 * min(-least, largest):
         # The half truncated from an exact multiply by its conversion, `k` an integer only at each factor's
         # bias: an int32 `k` halved (a shift or a floored division alike) spilled an A100's recurrence
         # query_key launch 32 bytes at the 27B gated delta net's training tiles, the float half none
@@ -508,15 +513,24 @@ def power2(x, k, reach: float | None = None) -> jax.Array:
         # 32-entry fragment pass a thread's seven and ptxas parks them in general registers, holding the
         # exponent's parts live to their selects (an A100's hooked training forwards at width 128 spilled
         # 496 to 588 bytes; the conversion's own truncation none).
-        k = jnp.clip(jnp.asarray(k, jnp.float32), -held, held)
         half = (k * np.float32(0.5)).astype(jnp.int32)
         return (x * exact_power2(half, dtype)
                 * exact_power2((k - half.astype(jnp.float32)).astype(jnp.int32), dtype))
-    k = jnp.clip(jnp.asarray(k), -held, held).astype(jnp.int32)
+    k = k.astype(jnp.int32)
     for _ in range(math.ceil(held / -least)):
         part = jnp.clip(k, least, largest)
         x, k = x * exact_power2(part, dtype), k - part
     return x
+
+
+def scalar_power2(x: jax.Array, k: jax.Array) -> jax.Array:
+    """`x` times `2^k` for a scalar integral `k` within twice fp32's exponent range, as two scalar powers of
+    two, each within it (`exp2` of an integer, a GPU's exactly): `power2`'s form for a Mosaic GPU kernel's
+    scalar `k`, no tile of exponent bits, which held a 128-wide fp16 fused backward's dK and dV beside two
+    int tiles a step, 286 registers live at its peak and 2240 bytes spilled (et-c7512), and no bitcast of a
+    scalar, which Mosaic GPU takes none of."""
+    half = jnp.floor(k * 0.5)
+    return x * jnp.exp2(half) * jnp.exp2(k - half)
 
 
 def _exp_jvp(base2: bool, primals, tangents) -> tuple[jax.Array, jax.Array]:

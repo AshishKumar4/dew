@@ -53,6 +53,7 @@ from dew.nn.precision import (
     lowered_divide,
     power2,
     raised_exactly,
+    scalar_power2,
     two_product,
     two_sum,
 )
@@ -191,7 +192,7 @@ class Forward:
             return jnp.exp2((x * np.float32(self.scale * LOG2E) if self.raw else x) + k)
         if not self.natural and not self.approximate:
             half = jnp.exp(x * np.float32(0.5))
-            return power2(half, k, reach=2 * 127) * half
+            return power2(half, k, reach=2 * 126) * half
         return natural_exp(x, self.scale if self.raw else 1.0, offset=k)
 
     def naturalized(self, m: jax.Array) -> jax.Array:
@@ -864,7 +865,7 @@ def denominator_after(total: jax.Array, factor: jax.Array, weighed: jax.Array, h
     (`held`)."""
     if held is None:
         return carry_factor(total, factor) + weighed
-    return carry_factor(total, factor, held.drop) + power2(weighed, -held.exponent, reach=2 * 127)
+    return carry_factor(total, factor, held.drop) + power2(weighed, -held.exponent, reach=2 * 126)
 
 
 def stepped(state: Partial, m: jax.Array, factor: jax.Array, weighed: jax.Array,
@@ -878,7 +879,7 @@ def stepped(state: Partial, m: jax.Array, factor: jax.Array, weighed: jax.Array,
     low = state.low
     drop = None if held is None else held.drop
     total, acc = carry_factor(state.total, factor, drop), carry_factor(state.acc, factor, drop)
-    weights = (weighed if held is None else power2(weighed, -held.exponent, reach=2 * 127),)
+    weights = (weighed if held is None else power2(weighed, -held.exponent, reach=2 * 126),)
     kept = None
     if low is None:
         total, acc = in_turn(total, weights), in_turn(acc, products)
@@ -963,8 +964,8 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Pa
         return Partial(acc, m, total)
     bound = scale_of(Partial(acc, m, total)).bound
     exponent = exponent_of(bound)
-    return Partial(power2(acc, expand(-exponent, acc), reach=2 * 127), m,
-                   power2(total, -exponent, reach=2 * 127), Scale(exponent, bound))
+    return Partial(power2(acc, expand(-exponent, acc), reach=2 * 126), m,
+                   power2(total, -exponent, reach=2 * 126), Scale(exponent, bound))
 
 
 def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
@@ -1374,7 +1375,7 @@ def at_scale(p: jax.Array, held: Scaled, *, axis: int = -1) -> tuple[jax.Array, 
         # or, held keys first, its first.
         return x if axis % p.ndim == 0 else expand(x, p)
 
-    shifted = power2(p, row(-held.exponent), reach=2 * 127)
+    shifted = power2(p, row(-held.exponent), reach=2 * 126)
     tiny = (shifted < LEAST_NORMAL) & row(held.exponent > 0)
     return jnp.where(tiny, 0.0, shifted), jnp.where(tiny, held.raised(SMALL_SHIFT - held.exponent), 0.0)
 
@@ -1589,7 +1590,7 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
         else:
             rescale = functools.partial(_queries_taken, keys.coords, None, held)
             acc = keys.accumulate(state.acc, rescale, parts, value)
-        total = power2(state.total, drop) + power2(p.sum(axis=-1), -held.exponent, reach=2 * 127)
+        total = power2(state.total, drop) + power2(p.sum(axis=-1), -held.exponent, reach=2 * 126)
         return (Partial(acc, state.m, total, scale), anchor, power2(own, drop) + own_tile,
                 power2(others_total, drop) + rest())
 
@@ -1829,7 +1830,7 @@ def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.
     m = jnp.where(no_keys(state.total), 0.0 if spec.guarded or initial else -jnp.inf, m)
     if state.scale is None:
         return m, state.total
-    return m, power2(state.total, state.scale.exponent, reach=2 * 127)
+    return m, power2(state.total, state.scale.exponent, reach=2 * 126)
 
 
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
@@ -1876,20 +1877,11 @@ def _scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:
     largest = jnp.max(jnp.abs(x), axis=-1)
     top = largest if rows else jnp.max(largest)
     exponent = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
-    # A GPU's approximate log2 flushes a subnormal largest to zero, its exponent -inf: scaled by 2^381
-    # (`power2`'s reach) the part passed fp32's largest and its remainder was inf - inf, NaN (row 4464, an
-    # fp16 row whose keys weigh subnormal beside a state near fp32's largest). Such a part takes no scale.
+    # A GPU's approximate log2 flushes a subnormal largest to zero, its exponent -inf: scaled by `power2`'s
+    # reach the part passed fp32's largest and its remainder was inf - inf, NaN (row 4464, an fp16 row whose
+    # keys weigh subnormal beside a state near fp32's largest). Such a part takes no scale.
     exponent = jnp.where(finite(exponent), exponent, 0.0)
     return power2(x, expand(14.0 - exponent, x) if rows else 14.0 - exponent), exponent - 14.0
-
-
-def scaled_by(x: jax.Array, k: jax.Array) -> jax.Array:
-    """`x` times `2^k` for a scalar integral `k` within twice fp32's exponent range, as two scalar
-    powers of two, each within it (`exp2` of an integer, a GPU's exactly): no tile of exponent bits, which
-    held a 128-wide fp16 fused backward's dK and dV beside two int tiles a step, 286 registers live at its
-    peak and 2240 bytes spilled (et-c7512), and no bitcast of a scalar, which Mosaic GPU takes none of."""
-    half = jnp.floor(k * 0.5)
-    return x * jnp.exp2(half) * jnp.exp2(k - half)
 
 
 def running_parts(x: jax.Array, exponent: jax.Array, dtype=jnp.float16
@@ -1897,8 +1889,9 @@ def running_parts(x: jax.Array, exponent: jax.Array, dtype=jnp.float16
     """An fp32 tile `x` as two `dtype` parts at a walk's running scale (a queries-first backward's dK's and
     dV's left operands, accumulated over its query tiles): the tile's largest exponent (two one-axis
     reductions, `_scaled`) joins the walk's running `exponent`, the largest so far (-inf before any), and
-    both parts are `x` times `2^(14 - exponent')` (`scaled_by`), the high part rounded and the low part its
-    remainder rounded at the same scale, so both products issue into one accumulator held at that scale.
+    both parts are `x` times `2^(14 - exponent')` (`scalar_power2`), the high part rounded and the low part
+    its remainder rounded at the same scale, so both products issue into one accumulator held at that
+    scale.
     Returns the new exponent, the power of two that takes the accumulator from the old scale to the new
     (0 before any tile, else at most 0) and the parts; a product of them is taken back by
     `running_restored`. A part's entries far below the running largest lose their low bits to `dtype`'s
@@ -1926,17 +1919,17 @@ def running_shift(old: jax.Array, new: jax.Array) -> jax.Array:
 def parts_at(x: jax.Array, exponent: jax.Array, dtype=jnp.float16) -> tuple[jax.Array, jax.Array]:
     """An fp32 tile `x` as two `dtype` parts at the running scale of `exponent`, its tile's own or larger
     (`running_parts`): `x` times `2^(14 - exponent)` rounded, then its remainder rounded."""
-    scaled = scaled_by(x, jnp.where(exponent == -jnp.inf, 0.0, 14.0 - exponent))
+    scaled = scalar_power2(x, jnp.where(exponent == -jnp.inf, 0.0, 14.0 - exponent))
     high = scaled.astype(dtype)
     return high, (scaled - high.astype(jnp.float32)).astype(dtype)
 
 
 def running_restored(value: jax.Array, exponent: jax.Array) -> jax.Array:
     """A product of `running_parts`' parts, or an accumulator of them, at the walk's scale taken back:
-    `value` times `2^(exponent - 14)` (`scaled_by`); itself where no tile moved the exponent, every part then
-    zero. No select of a scalar's condition over the tile: Mosaic GPU broadcasts none implicitly
+    `value` times `2^(exponent - 14)` (`scalar_power2`); itself where no tile moved the exponent, every part
+    then zero. No select of a scalar's condition over the tile: Mosaic GPU broadcasts none implicitly
     (et-fp16lower)."""
-    return scaled_by(value, jnp.where(exponent == -jnp.inf, 0.0, exponent - 14.0))
+    return scalar_power2(value, jnp.where(exponent == -jnp.inf, 0.0, exponent - 14.0))
 
 
 def restored(value: jax.Array, exponent: jax.Array | float) -> jax.Array:
