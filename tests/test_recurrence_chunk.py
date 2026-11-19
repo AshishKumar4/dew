@@ -476,9 +476,8 @@ def test_a_turned_forked_calls_turn_curvature_is_as_exact_as_each_document_alone
     """A turned forked call's turns' block of its Hessian along a drawn direction (`turn_curvature`), its
     documents entering their table slots with entry writes (`turned_entered_draw`): on par from float64 with
     each document alone through the same op (check 1, the recurrence a token at a time in float64 the
-    truth), where the walk's adjoint gave each document's load rotation no cotangent and the block lost its
-    part (row 8573's head review). Each document alone takes the same portable second order, its memory
-    turned in as a call's (row 8656 its precision against the recurrence's)."""
+    truth): a forked call's second order, which its custom VJP refused (row 8573), and which through the
+    portable pullback lost each document's load rotation's part (its head review)."""
     def ours(operands):
         return chunk_on('xla', TURNED, entering_documents(operands), chunk_size=CHUNK)
 

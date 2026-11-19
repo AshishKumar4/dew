@@ -128,3 +128,13 @@ def test_a_held_still_kernels_second_order_keeps_its_loss_curvature(order):
         found = jax.grad(lambda x: jnp.vdot(jax.grad(loss)(x), direction))(x)
     np.testing.assert_array_equal(np.asarray(found), np.asarray(12 * x ** 2))
 
+
+def test_a_held_still_kernels_third_order_keeps_its_loss_curvature():
+    """The third derivative of `squared(x)^2`, `x^4` through a kernel whose derivative runs its forward held
+    still, at `x` two: 48, `24 x`, where the second order's attached output was the stopped one again and a
+    third order lost its part, 32 (row 8573's head review)."""
+    def loss(x):
+        return squared(x) ** 2
+
+    assert float(jax.grad(jax.grad(jax.grad(loss)))(jnp.float32(2.0))) == 48.0
+
