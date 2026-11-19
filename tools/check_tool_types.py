@@ -113,8 +113,9 @@ def environment_of(path: Path, pins: Mapping[str, Mapping[str, str]]) -> tuple[s
                 raise ValueError(f"{path}: its cohorts {', '.join(cohorts)} pin {distribution} at "
                                  f"{held[distribution]} and {release}; no one environment holds both: "
                                  "split it into a file a cohort")
-    return "+".join(cohorts), sorted(f"{distribution} @ {release}" if release.startswith("git+")
-                                     else f"{distribution}=={release}" for distribution, release in held.items())
+    pinned = (f"{distribution} @ {release}" if release.startswith("git+") else f"{distribution}=={release}"
+              for distribution, release in held.items())
+    return "+".join(cohorts), sorted(pinned)
 
 
 def imported(path: Path) -> set[str]:
