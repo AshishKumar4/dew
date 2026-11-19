@@ -230,10 +230,13 @@ def test_a_projections_weight_gradient_leaves_its_map_as_its_placement_states(ax
     H100s: its forward gathers the weight where the layout splits it and moves nothing on a data axis; its
     step reduce-scatters the weight's gradient back on fsdp and sums it whole on a data axis, moving no
     activation between devices (the template's kernel an opaque call the partitioner would read whole);
-    and its temporaries are no more than the partitioner's step of the same product (`jnp.dot`, no map)."""
+    and its temporaries are no more than the partitioner's step of the same product (`jnp.dot`, no map),
+    each compiled for H100s stating 128 MiB, below the step's need, so XLA's scheduler holds the least it can
+    and the temporaries are the route's alone (an H100's 80 GB lets it hold the step's twice over, 99.6 MB
+    against the partitioner's 49.8 MB; a compile-only GPU stated 0 bytes before row 8768)."""
     from kernel_compile import _device
 
-    mesh = _device("sm90", ((axis, 2),))
+    mesh = _device("sm90", ((axis, 2),), memory=2**27)
     shapes = ((8, 4096, 2560), (2560, 9728), (9728,), (8, 4096, 9728))
     with (jax.sharding.use_abstract_mesh(mesh.abstract_mesh), nn.logical_axis_rules(DEFAULT_RULES),
           _declared()):
@@ -249,7 +252,7 @@ def test_a_projections_weight_gradient_leaves_its_map_as_its_placement_states(ax
             return jax.jit(fn).lower(*arguments).compile()
 
     def ops(executable):
-        return {op for op, _ in collectives(executable.as_text())}
+        return {op for op, _ in collectives(executable)}
 
     def partitioned(x, kernel, bias):
         return (jnp.dot(x, kernel) + bias).astype(jnp.bfloat16)
@@ -259,7 +262,7 @@ def test_a_projections_weight_gradient_leaves_its_map_as_its_placement_states(ax
     summed = {"all-gather", "reduce-scatter"} if split else {"all-reduce"}
     step = compiled(with_gradients(dense), placed)
     assert summed <= ops(step) <= summed | {"all-reduce"}, ops(step)
-    moved = [(op, shapes) for op, shapes in collectives(step.as_text()) if op in MOVES]
+    moved = [(op, shapes) for op, shapes in collectives(step) if op in MOVES]
     # The weight's gather alone, whatever dimension XLA gathers it on: its whole elements.
     assert all(op == "all-gather" and [math.prod(each) for each in found] == [math.prod(shapes[1])]
                for op, found in moved), moved

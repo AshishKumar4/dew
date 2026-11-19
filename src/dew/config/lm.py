@@ -28,7 +28,7 @@ import tyro
 from dew._records import integer, text
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.text import HFTokenizer, tokenizer_for
-from dew.objectives.drawn import drawn_once
+from dew.objectives.drawn import WHOLE, drawn_once
 from dew.objectives.lm.objective import Samples
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig, objectives
@@ -280,7 +280,7 @@ class LMRunConfig(DecoderRunConfig):
                 key = jax.random.key(self.trainer.key)
                 # One program, not each operation's (row 8732).
                 base = drawn_once(lambda _, draw: model.init(draw, jnp.zeros((1, tokens.seq_len), jnp.int32)),
-                                  None, key, lambda drawn: drawn)
+                                  None, key, WHOLE)
                 adapter = self.lora.apply(model, base, key=jax.random.fold_in(key, 1))
                 model, variables = adapter.model, adapter.variables
             else:

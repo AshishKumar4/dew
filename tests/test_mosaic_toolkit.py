@@ -839,11 +839,12 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
 
 
 def _persisted_operands(rows: int):
-    """Small integers, so every tile's product is exact in fp32 whatever its order."""
-    keys = jax.random.split(jax.random.key(2))
+    """Small integers, so every tile's product is exact in fp32 whatever its order: NumPy's (a GPU tier's
+    prepare computes on no device, row 8932)."""
+    rng = np.random.default_rng(2)
     depth = PERSISTED_STEPS * PERSISTED_DEPTH
-    x = jax.random.randint(keys[0], (PERSISTED_TILES * rows, depth), -4, 4).astype(jnp.bfloat16)
-    w = jax.random.randint(keys[1], (depth, 128), -4, 4).astype(jnp.bfloat16)
+    x = rng.integers(-4, 4, (PERSISTED_TILES * rows, depth)).astype(jnp.bfloat16)
+    w = rng.integers(-4, 4, (depth, 128)).astype(jnp.bfloat16)
     return x, w
 
 
@@ -1964,8 +1965,11 @@ def test_a_uniform_read_gives_each_lane_its_warps_lane_zero_value(read):
         each = plgpu.ShapeDtypeStruct((128,), jnp.dtype(jnp.int32), layout=lanes)
         out_gmem[...] = plgpu.inline_mgpu(arg_types=(scalar,), return_type=each)(spread)(read_value)
 
-    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.int32), grid=(1,),
-                       grid_names=("programs",))()
+    from reference_error import ahead_arm
+
+    kernel = jax.jit(plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.int32), grid=(1,),
+                                  grid_names=("programs",)))
+    out = ahead_arm(kernel, f"uniform read {read}")()
     threads = np.arange(128, dtype=np.int32)
     expected = (threads // 32 * 32 if read == "uniform" else threads) + 7
     np.testing.assert_array_equal(np.asarray(out), expected)
@@ -2131,10 +2135,14 @@ def test_a_values_parts_sum_back_to_it_exactly_fp32s_largest_among_them():
     """An fp32 value's three bf16 parts (`product.formed`) sum back to it exactly (`product.whole`), the
     largest finite values among them: fp32's largest, and bf16's largest past by `2^120 - 2^111`, whose
     leading two parts summed first reach `2^128`, past fp32's largest, to infinity (rows 6842, 6866)."""
+    from reference_error import ahead_arm
+
     largest = float(np.finfo(np.float32).max)
     past = 2.0**128 - 2.0**111
-    x = jnp.asarray([largest, past, -largest, -past, 1.0 + 2.0**-23], jnp.float32)
-    np.testing.assert_array_equal(np.asarray(product.whole(product.formed(x, 3))), np.asarray(x))
+    x = np.asarray([largest, past, -largest, -past, 1.0 + 2.0**-23], np.float32)
+    got = ahead_arm(jax.jit(lambda v: product.whole(product.formed(v, 3))), "values parts exact")(x)
+    np.testing.assert_array_equal(np.asarray(got), x)
+
 
 STAGED = (8, 32, 3)
 """A staged output's tile: its rows, a chunk buffer's columns, and its chunks (two buffers)."""

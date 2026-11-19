@@ -189,7 +189,7 @@ def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
         options = step_compiler_options(objective, BATCH * SEQ_LEN, frozen=False, devices=mesh.size)
         compiled = jax.jit(step, out_shardings=shardings["params"]).trace(placed, batch).lower().compile(
             compiler_options=options)
-    ran = collective_axes(compiled.as_text(), mesh)
+    ran = collective_axes(compiled, mesh)
     for axis, ops in report.collectives.items():
         for op in ops:
             assert any(kind == op and axis in axes for kind, axes in ran), (axis, op)

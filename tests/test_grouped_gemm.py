@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from certified import lane
-from generation_support import INTERPRETS, interpreted_projection, lowers, runs
+from generation_support import INTERPRETS, here, interpreted_projection, lowers, runs
 from jax.sharding import Mesh
 from native_certificates import (
     forward_products,
@@ -867,8 +867,8 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
         routed(got, group, forward, BFLOAT16, f"forward {tiles}")
 
 
-AMPERE_CLASS = jax.default_backend() == "cpu" or (
-    jax.default_backend() == "gpu" and not generation.gpu_target().wgmma)
+HERE = here()
+AMPERE_CLASS = HERE == "cpu" or (HERE.startswith("sm") and not generation.gpu_target(HERE).wgmma)
 """Whether this process runs mma.sync's kernels: a CPU interprets them as an A100's; a GPU without warpgroup
 MMA (an A100, an A10, an L4) runs them on its own facts, where one with warpgroup MMA lowers them for its
 own device, whose pipelines its Mosaic sizes past its block (SM80-h100)."""
@@ -877,7 +877,7 @@ own device, whose pipelines its Mosaic sizes past its block (SM80-h100)."""
 def ampere(generation_name: str = "sm80"):
     """The assumed device an mma.sync test runs on: the process's own Ampere-class GPU, else
     `generation_name`'s, which a CPU interprets."""
-    return generation.assumed(None if jax.default_backend() == "gpu" else generation_name)
+    return generation.assumed(generation_name if HERE == "cpu" else None)
 
 
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")

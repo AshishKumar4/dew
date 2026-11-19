@@ -893,6 +893,40 @@ def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
     assert work.kept_bytes == 2 * (2 * 3 + 3 * 4) + 2 * made * (2 * 4)
 
 
+def test_a_product_of_two_16_bit_formats_replays_as_traced():
+    """A product of a bfloat16 and a float16 matrix, no preferred type stated, its region's term replayed as
+    the engine binds a term's equation (`terms.value_of`): its product bound with its parameters as traced,
+    its preferred type unset, and its value the traced program's bit for bit, one program. The region wrote
+    the dtype it makes into that preferred type, which the replay then bound (base review 3232beb7c); it
+    keeps it apart (`Region.made`)."""
+    def product(a, b):
+        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
+
+    a, b = jnp.full((2, 3), 0.75, jnp.bfloat16), jnp.full((3, 4), 2.5, jnp.float16)
+    traced = jax.make_jaxpr(product)(a, b)
+    region = terms.region(traced)
+
+    def replayed(a, b):
+        def value(term):
+            return terms.value_of(term, value, region, (a, b))
+        return value(region.outputs[0])
+
+    def dots(jaxpr) -> list[dict]:
+        # Each product's parameters, within the programs an equation calls too (a jit's).
+        found = []
+        for equation in jaxpr.eqns:
+            if equation.primitive is jax.lax.dot_general_p:
+                found.append(dict(equation.params))
+            for value in equation.params.values():
+                inner = getattr(value, "jaxpr", None)
+                if inner is not None:
+                    found += dots(getattr(inner, "jaxpr", inner))
+        return found
+
+    assert dots(jax.make_jaxpr(replayed)(a, b).jaxpr) == dots(traced.jaxpr)
+    assert np.asarray(jax.jit(replayed)(a, b)).tolist() == np.asarray(jax.jit(product)(a, b)).tolist()
+
+
 @pytest.mark.parametrize("apart", [0, 1, 4], ids=["as written", "a group of one", "apart from its group"])
 def test_a_token_loops_states_are_kept_each_token(apart):
     """A scan's token loop keeps its state on chip each token, written and read (`Work.kept_bytes`, row
