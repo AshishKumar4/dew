@@ -12,7 +12,7 @@ import contextlib
 import enum
 import functools
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import NamedTuple, TypeGuard
+from typing import NamedTuple, TypeGuard, overload
 
 import jax
 import jax.extend.core as jcore
@@ -26,17 +26,30 @@ from jax.experimental.pallas import pallas_call_p
 from jax.extend.backend import backends
 
 
+@overload
+def holes[Tree, Leaf](tree: Tree, selected: Callable[[Leaf], bool],
+                      is_leaf: Callable[[Leaf], bool] | None = None
+                      ) -> tuple[list[Leaf], Callable[[Sequence[Leaf]], Tree]]: ...
+
+
+@overload
+def holes[Tree](tree: Tree, selected: Sequence[bool], is_leaf: Callable[[object], bool] | None = None
+                ) -> tuple[list[object], Callable[[Sequence[object]], Tree]]: ...
+
+
 def holes[Tree, Leaf](tree: Tree, selected: Callable[[Leaf], bool] | Sequence[bool],
                       is_leaf: Callable[[Leaf], bool] | None = None
                       ) -> tuple[list[Leaf], Callable[[Sequence[Leaf]], Tree]]:
-    """The leaves of `tree` (a call's arguments, `(args, kwargs)`) that `selected` keeps (a predicate of a
-    leaf, or a mask: one bool per leaf in flatten order, a choice no leaf alone states, such as whose
-    tangent is live), in order, and `fill(values)`, `tree` with those leaves replaced by `values` in their
-    order and every other as it is: what a trace of a function of some of its arguments (its arrays) binds
-    and what it rebuilds."""
+    """The leaves of `tree` (a call's arguments, `(args, kwargs)`) that `selected` keeps, in order, and
+    `fill(values)`, `tree` with those leaves replaced by `values` in their order and every other as it is:
+    what a trace of a function of some of its arguments (its arrays) binds and what it rebuilds.
+
+    A callable `selected` is a predicate of each leaf. Any other is a mask: one bool per leaf, in JAX's
+    flatten order under `is_leaf`, for a choice no leaf alone states (whose paired tangent is live). A
+    mask of another length raises `ValueError`."""
     leaves, structure = jax.tree.flatten(tree, is_leaf=is_leaf)
-    kept = list(map(selected, leaves)) if callable(selected) else list(selected)
-    places = [index for index, (_, keep) in enumerate(zip(leaves, kept, strict=True)) if keep]
+    kept = map(selected, leaves) if callable(selected) else selected
+    places = [index for index, keep in zip(range(len(leaves)), kept, strict=True) if keep]
 
     def fill(values: Sequence[Leaf]) -> Tree:
         filled = list(leaves)
