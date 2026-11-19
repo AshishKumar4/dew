@@ -566,6 +566,27 @@ def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
     assert_finite_where_float64_is(operands, seeded)
 
 
+@pytest.mark.parametrize("values_first", [False, True], ids=["keys first", "values first"])
+def test_an_entry_write_of_no_terms_is_zero(values_first):
+    """A document's entry write (`chunked_launch.entry_write`) of rank zero, keys `[2, 0, 3]` and values `[2,
+    0, 4]` (or `[2, 4, 0]` laid values first) under a weight `[2, 1, 1]`: zeros `[2, 3, 4]` (`[2, 4, 3]`),
+    the memory it enters unchanged, and its weight's gradient zero, where its aligned sum of no terms raised
+    (row 8967)."""
+    from dew.nn.kernels.chunked_launch import entry_write
+
+    key = jnp.zeros((2, 0, 3), jnp.float32)
+    value = jnp.zeros((2, 4, 0) if values_first else (2, 0, 4), jnp.float32)
+    weight = jnp.ones((2, 1, 1), jnp.float32)
+
+    def written(weight):
+        return entry_write(key, value, weight, values_first=values_first)
+
+    shape = (2, 4, 3) if values_first else (2, 3, 4)
+    np.testing.assert_array_equal(np.asarray(written(weight)), np.zeros(shape))
+    gradient = jax.grad(lambda weight: jnp.sum(written(weight)))(weight)
+    np.testing.assert_array_equal(np.asarray(gradient), np.zeros((2, 1, 1)))
+
+
 @pytest.mark.parametrize('hooks', [*HOOKS, TURNED], ids=str)
 def test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it(hooks):
     """A one-token call whose token begins a document, its memory entering 2^127 in every entry (discarded),
