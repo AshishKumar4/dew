@@ -21,7 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import emission, handoffs, mosaic, outputs as stated_outputs, persistent
+from dew.nn.kernels.templates import emission, handoffs, mosaic, outputs as stated_outputs, persistent, rings
 from dew.nn.kernels.templates.cost import Stated
 
 STAGES = 2
@@ -187,6 +187,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     consumers = 1
 
     bounded_loads = False  # a DMA past its operand's rows is refused, not filled with zeros
+    walks_once = True  # a once stream folded into its walked streams (`folded`), each step's block the one
 
     stores_through_registers = False
 
@@ -252,7 +253,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
         def launched(*operands):
             # A table its programs read an element at a time in scalar memory, every other operand in HBM. A
-            # ref the launch adds into in place (`jax.new_ref`, `mosaic.stacked_zeros`) goes in as its value
+            # ref the launch adds into in place (`jax.new_ref`, `stacked.zeros`) goes in as its value
             # aliased to an output of its own (`input_output_aliases`), which the program reads and writes as
             # the ref, and which is written back into the ref after the call. Its programs run in turn
             # ("arbitrary"), so one's read-modify-write of a shared view (`added`) races no other's.
@@ -298,7 +299,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
-                gathered: tuple[str, ...] = ()) -> dict:
+                gathered: tuple[str, ...] = (), joined: tuple[str, ...] = ()) -> dict:
+        del joined  # a pair a stream (`Family.streams`)
         # Each stream's ring of `STAGES` slots, whatever the stages asked: a DMA a step ahead hides a step's.
         del stages, swizzles
         if gathered:
@@ -309,6 +311,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         return {name: {'slots': pltpu.VMEM((STAGES, *shape), dtype),
                        'sems': pltpu.SemaphoreType.DMA((STAGES,))}
                 for name, (shape, dtype) in blocks.items()}
+
+    def folded(self, allocated: dict, once: dict) -> dict:
+        return {**allocated, **once}
 
     def lifetimes(self, streams: dict, steps: int | None = None) -> tuple[tuple, tuple]:
         del steps
@@ -411,7 +416,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
                 for name in names:
                     streams.copy(name, index, slot).wait()
-                slots = mosaic.WholeSlots({name: streams.rings[name]['slots'].at[slot] for name in names})
+                slots = rings.WholeSlots({name: streams.rings[name]['slots'].at[slot] for name in names})
                 return step(index, slots, *carry)
 
             carry = lax.fori_loop(lo, hi, body, carry)

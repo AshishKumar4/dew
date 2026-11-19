@@ -25,7 +25,7 @@ from dew.batch import CLOSES_WINDOW, Batch
 from dew.data.dataset import Stage
 from dew.data.pipeline import DeviceStep
 from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_bytes
-from dew.distributed.placement import Placement, Validation, placed_bytes, placed_shapes
+from dew.distributed.placement import Placement, Validation, allocated_bytes, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
 from dew.nn.kernels.options import held_context, owned_program
@@ -272,8 +272,11 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     # A step lowered for other devices is checked against none of this process's.
     # The copies the runner makes where the state holds another program's, or none (`holds_copies`).
     made = [] if prepared.compute is None or holds_copies(state.compute, copies) else [prepared.compute]
+    # Their bytes among the step's arguments as XLA counts them (`placed_bytes`), and beside it as the
+    # pools charge them, one allocation a shard (`allocated_bytes`).
     built = 0 if mesh is not None else placed_bytes([*made, *fresh])
-    held = 0 if mesh is not None else prefetched_bytes(batch, placement, stepping.shape.prefetch) + built
+    held = 0 if mesh is not None else (prefetched_bytes(batch, placement, stepping.shape.prefetch)
+                                       + allocated_bytes([*made, *fresh]))
     jitted = step_program(stepping, shapes, copies, shardings, placement, replicated, split)
     part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
     # The batch as shapes with the placement it is read under, whoever lowers it: a lowering over the host

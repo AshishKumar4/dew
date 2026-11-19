@@ -392,16 +392,23 @@ def test_a_phase_whose_program_plans_other_copies_counts_them_built_in_its_fit(m
     as it is handed the state, the first's let go, so its plan's fit counts them built, as a fresh state's
     step's does (train 769's review: the fit counted them only where the state held none, and a tight
     phase could run out of memory the plan said it fit)."""
-    from test_plan import LIMIT, free
+    import gc
+
+    from model_support import allocating
+    from test_plan import LIMIT
 
     from dew.nn.kernels.generation import chosen
 
     tokens, _ = phased_draw(0)
     narrow = looped(steps=1).clone(dtype=jnp.bfloat16)
-    free(monkeypatch, LIMIT)
+    # Each run on an allocator counting what it places (its copies as its plan's search builds them, or
+    # beside its step where its compile builds none), nothing of the run before it live.
+    allocating(monkeypatch, LIMIT, LIMIT)
     with chosen(narrow_copies="on"):
         phased = phased_trainer(narrow, 0, (3, 1))
         phased_params(phased, tokens)
+        gc.collect()
+        allocating(monkeypatch, LIMIT, LIMIT)
         fresh = phased_trainer(narrow, 0, None)
         state, _, _ = fresh.place()
         fresh.compile(state, {"text": jnp.asarray(tokens)})

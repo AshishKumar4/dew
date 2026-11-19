@@ -44,6 +44,7 @@ fails leaves the space. The tuner only times what is proven.
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import contextlib
 import contextvars
@@ -60,7 +61,7 @@ import threading
 import time
 import types
 import weakref
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Collection, Hashable, Iterator, Mapping
 from typing import ClassVar
 
 import filelock
@@ -78,6 +79,7 @@ from dew._files import write_atomically
 from dew._records import JSON
 from dew.algebra.terms import opaque, parameter_key
 from dew.nn import programs
+from dew.nn.kernels import options
 from dew.nn.kernels.options import UNGRAPHED_OPTIONS, owned_program
 
 from . import generation
@@ -617,10 +619,13 @@ class KernelOp(tokamax.Op):
         seen = set()
         while config not in seen and (spilling := report.certified(self, ba, config)):
             seen.add(config)
-            report.refuse_launch(self, ba, config, {binary.kernel for binary in spilling})
+            report.refuse_launch(self, ba, config, {binary.kernel for binary in spilling},
+                                 {binary.kernel: binary.spilled_in for binary in spilling})
             # Each refused config stepped to the next refused one; the last, to its held rung or the offer.
             climbed, held = self._climbed(ba, config, spilling, seen)
             refused = [(config, spilling), *climbed]
+            if held is None:
+                refused += self._spanned(ba, config, spilling, seen)
             stepped = held if held is not None else offered()
             for (refusal, its), later in zip(refused, [*refused[1:], None], strict=True):
                 report.missed(self, ba, refusal, its, stepped=later is not None or (
@@ -629,6 +634,40 @@ class KernelOp(tokamax.Op):
                 return None
             config = stepped
         return config
+
+    def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
+        """The configs below a refused `config` whose kernels spill too where both `config`'s and the last's
+        do: `config`'s fields at each smaller block its derivation's own walk takes, within `config`'s
+        register cap and residency (ptxas is not monotone across caps, kernel-templates.md), largest first;
+        none unless the launch states them (`_spanned`), as no launch whose ladders were not measured
+        monotone does."""
+        del ba, config
+        return ()
+
+    def _spanned(self, ba: tokamax.BoundArguments, config: Hashable, spilling: tuple, seen: set
+                 ) -> list[tuple[Hashable, tuple]]:
+        """After `config` spilled (`spilling`), its ladder's last rung (`ladder`) certified, and where it
+        spills too every rung between refused unasked: inferred from a launch's spilling being monotone in its
+        block within one cap and residency, which every whole ladder certified held (FS-MONOTONE2 at
+        base/kernels d612ccb2d: the attention backward's and training forward's gate cases at blocks 64 to
+        256, sm90's 111 ladders and sm80's 110, 39 of them holding at some blocks and spilling at others, none
+        spilling below a block that held). An all-spilling ladder of n rungs certifies two, not n (row 7938:
+        the accurate backward's dQ 25 to 100 s cold). A wrong inference costs a tile, never a result. Where
+        the last holds or cannot be certified, nothing is inferred and the derivation walks the rungs in turn;
+        the last's refusal returned for its miss (`_certified`'s), the rungs inferred refused for `config`'s
+        kernels."""
+        rungs = [rung for rung in self.ladder(ba, config) if rung not in seen]
+        if len(rungs) < 2:
+            return []
+        last = rungs[-1]
+        found = report.certified(self, ba, last)
+        if not found:
+            return []
+        for rung, kernels in ((last, found), *((rung, spilling) for rung in rungs[:-1])):
+            seen.add(rung)
+            report.refuse_launch(self, ba, rung, {binary.kernel for binary in kernels},
+                                 {binary.kernel: binary.spilled_in for binary in kernels})
+        return [(last, found)]
 
     def remaining(self, ba: tokamax.BoundArguments) -> Hashable | None:
         """The config the launch's derivation offers `ba` now, its refusals read (`_get_heuristics_config`'s);
@@ -673,7 +712,8 @@ class KernelOp(tokamax.Op):
             if found == ():
                 return refused, rung
             seen.add(rung)
-            report.refuse_launch(self, ba, rung, {binary.kernel for binary in found} if found else named)
+            report.refuse_launch(self, ba, rung, {binary.kernel for binary in found} if found else named,
+                                 {binary.kernel: binary.spilled_in for binary in found or ()})
             refused.append((rung, found or ()))
         return refused, None
 
@@ -815,7 +855,24 @@ class KernelOp(tokamax.Op):
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
 
 
+_Structure = tuple[jax.tree_util.PyTreeDef]
+"""A tree's structure in a one-element tuple: JAX declares `PyTreeDef` as a value, which a type admits only
+inside another (`dew.nn.kernels.options._Structure`)."""
+
+
+@dataclasses.dataclass(eq=False)
+class _Held:
+    """A launch's held trace (`lowered_once`): its program, its outputs' structure, the kernels it named
+    (`report.naming`) and the facts it read (`generation.recording`)."""
+
+    jaxpr: jax_core.Jaxpr
+    outputs: _Structure
+    named: tuple
+    reads: dict
+
+
 def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), at: str | None = None,
+                 kernels: Callable[[Callable, Mapping], Collection[str]] | None = None,
                  unless: Callable[[], bool] = lambda: False) -> Callable[[Callable], Callable]:
     """A kernel launch jitted with the arguments its signature names among `static` static: JAX keys its
     program on them and on its operands' shapes and dtypes, so each configuration is traced and lowered
@@ -832,28 +889,80 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
     not, a training call's attention forward and a forward alone) traces each kernel of a name apart, and a
     template that says nothing names every static. The static `at` names carries the config its kernels are
     emitted at, a level of the launch's (a training call's tiles or its forward's), whose part each kernel's
-    name reads (`report.forming`'s `at`)."""
+    name reads (`report.forming`'s `at`).
+
+    A launch's trace is held under all it is given and the launch tracing it: its static arguments, its
+    operands' types, the trace state (`options.trace_context`, the launch apart, `report.replayed`) and
+    the launch (`report.launch_metadata`), whose identity and config its kernels' names read
+    (`report.named`), taken where each fact it read answers as it did (`generation.recording`,
+    `generation.still`): a launch given the same traces once however many layers and passes call it, each
+    call binding the trace its launch made, its kernels' calls carrying that launch as they were traced
+    (`mosaic.compiler_params`) and named for it again (`report.renamed`). The `configured` statics are
+    given narrowed to what the kernels the launch builds read of them (`kernels`, the names a launch's
+    builder takes, each config's `at`): a producer's raise leaves every other launch of a config given
+    what it was, its trace held (a ladder's rungs traced each of a launch's kernels again, 114 traces of
+    20 kernels for a 4B decoder's step, FS-EST-REPEATS). A launch naming a kernel it does not say it
+    builds is refused, as it was given none of that kernel's config."""
     def decorate(launch: Callable) -> Callable:
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
+        held: dict[Hashable, list[_Held]] = {}
 
-        # One jitted launch a launch digest. JAX keys its trace cache on the function a jit wraps, not the
-        # jit, so each digest wraps a function object of its own.
         @functools.cache
-        def jitted(digest: str | None) -> Callable:
-            del digest
-            return owned_program(functools.partial(launch), static_argnames=names)
+        def bound(found: _Held) -> Callable:
+            # One jit a held trace, which a model's layers' calls share: its key holds its launch, so its
+            # kernels' calls carry the launch they are bound for as they were traced.
+            (outputs,) = found.outputs
+            run = jax_core.jaxpr_as_fun(found.jaxpr)
+            return owned_program(lambda *operands: jax.tree.unflatten(outputs, run(*operands)))
+
+        def calling(arguments: Mapping[str, object]):
+            # `launch` called with `arguments` by name, as `signature.bind` gave them.
+            bound_ = inspect.BoundArguments(signature, collections.OrderedDict(arguments))
+            return launch(*bound_.args, **bound_.kwargs)
 
         @functools.wraps(launch)
         def called(*args, **kwargs):
-            bound = signature.bind(*args, **kwargs).arguments
+            given = dict(signature.bind(*args, **kwargs).arguments)
+            builds = None if kernels is None else frozenset(kernels(launch, given))
+            if builds is not None:
+                given.update({name: given[name].at(builds) for name in configured
+                              if given.get(name) is not None})
             # Each static argument but those its config carries, keyed as a key kept beyond this process is.
             form = opaque(parameter_key(tuple(
-                (name, bound[name]) for name in names if name in bound and name not in configured)))
-            with report.forming(form, at=None if at is None else bound.get(at)):
-                if unless() or not all(holdable(bound[name]) for name in names if name in bound):
-                    return launch(*args, **kwargs)
-                return jitted(report.launch_digest())(*args, **kwargs)
+                (name, given[name]) for name in names if name in given and name not in configured)))
+            with report.forming(form, at=None if at is None else given.get(at)):
+                if unless() or not all(holdable(given[name]) for name in names if name in given):
+                    return calling(given)
+                statics = {name: given[name] for name in names if name in given}
+                leaves, operands = jax.tree.flatten({name: value for name, value in given.items()
+                                                     if name not in statics})
+                with report.replayed():
+                    state = options.trace_context()
+                # Its kernels' names read the launch tracing it (`report.named`: its identity and the part
+                # of its config each emission reads), so a trace is held for that launch.
+                metadata = report.launch_metadata()
+                key = (tuple(statics.items()), operands, tuple(map(jax.typeof, leaves)), state, metadata)
+                entries = held.setdefault(key, [])
+                found = next((entry for entry in entries if generation.still(entry.reads)), None)
+                if found is None:
+                    def traced(*values):
+                        return calling({**statics, **jax.tree.unflatten(operands, values)})
+
+                    with report.naming() as named, generation.recording() as reads:
+                        program = owned_program(traced).trace(*leaves)
+                    strays = {report.kernel_of(took)[0] for _, _, took in named if took is not None
+                              and builds is not None and report.kernel_of(took)[0] not in builds}
+                    if strays:
+                        raise ValueError(f"{launch.__qualname__} builds {sorted(strays)}, which it does not "
+                                         f"say it builds ({sorted(builds or ())}): it was given none of "
+                                         "their config")
+                    found = _Held(program.jaxpr, (jax.tree.structure(program.out_info),), tuple(named), reads)
+                    entries.append(found)
+                else:
+                    generation.replay(found.reads)
+                    report.renamed(found.named)
+                return bound(found)(*leaves)
 
         return called
 
@@ -1032,13 +1141,22 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
     return op.operands(shapes, 0), fill
 
 
+def _candidates(op: KernelOp, ba: tokamax.BoundArguments) -> list[Hashable]:
+    """The configs of `ba`'s launch (at its key's shapes) the tuner times (`_measured`): each of the op's
+    space the call takes (`KernelOp.pinnable`: one it refuses, measured, raised `Unpinnable` and ended the
+    run, row 5326, a Triton forward's 128 x 128 tile holding 320 registers a thread) and the GPU's assembler
+    does not refuse alone, as a run's derivation certifies a config (`report.certified`: it spills, or
+    serializes its warpgroup MMAs), each certified in turn, as a ladder's rungs are (`KernelOp._climbed`); a
+    config certification cannot compile alone stays, its own compile the judge. Uncertified, a spilling config
+    was timed, as slow as its spills, and could be chosen."""
+    pinnable = [config for config in ba.autotuning_configs if op.pinnable(ba, op.completed(ba, config))]
+    return [config for config in pinnable if not report.certified(op, ba, op.completed(ba, config))]
+
+
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
-    """Every config of `ba`'s launch (at its key's shapes) the launch can take (`KernelOp.pinnable`), each
-    compiled on a thread and timed alone: the device time CUPTI reads for the launch's own
-    kernels (`dew.telemetry.benchmark.device_time`), each run behind an
-    eviction, so every config starts with its operands out of cache. A config of the op's space the call
-    refuses is no candidate: measured, its launch raised `Unpinnable` and ended the run (row 5326, a
-    Triton forward's 128 x 128 tile holding 320 registers a thread)."""
+    """Every candidate config of `ba`'s launch (`_candidates`), each compiled on a thread and timed alone: the
+    device time CUPTI reads for the launch's own kernels (`dew.telemetry.benchmark.device_time`), each run
+    behind an eviction, so every config starts with its operands out of cache."""
     from dew.telemetry.benchmark import CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
@@ -1052,9 +1170,9 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
             return configured(*args, **kwargs)
 
         start = time.perf_counter()
-        # A candidate's lowering and its compile timed apart, the compile of its config as it is: a config
-        # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`). The
-        # launch runs behind the flush, which reads the whole buffer through the cache.
+        # A candidate's lowering and its compile timed apart, the compile of its config as it is, never
+        # refused and lowered afresh (`OuterProgram.compiled`). The launch runs behind the flush, which reads
+        # the whole buffer through the cache.
         # Without command buffers, which CUPTI does not read whole (`benchmark.Ungraphed`).
         lowered = owned_program(behind(launched), step=UNGRAPHED_OPTIONS).lower(flush, (arrays,))
         middle = time.perf_counter()
@@ -1063,7 +1181,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
 
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     read = {}
-    configs = [config for config in ba.autotuning_configs if op.pinnable(ba, op.completed(ba, config))]
+    configs = _candidates(op, ba)
     # As many as the CPUs this process may use, its affinity and container quota (`_cgroups.usable_cpus`).
     with concurrent.futures.ThreadPoolExecutor(_cgroups.usable_cpus()) as pool:
         futures = {config: pool.submit(compiled, config) for config in configs}
@@ -1190,46 +1308,54 @@ def _store(device_kind: str, picks) -> None:
 
 
 _VERDICTS: dict[str, dict[str, _records.JSON]] = {}
-"""Each GPU model's certification verdicts this process read from its picks' store or stored there
+"""Each compile target's certification verdicts this process read from its store or stored there
 (`stored_verdict`), by launch key, as the store holds them (`encoded`)."""
 
 
-def stored_verdict(device_kind: str, key: str) -> Rebuilt | None:
-    """Certification's verdict of the launch `key` names on GPUs of `device_kind` (`report.certified`), an
-    accepted config's or a refused one's, as stored in the picks' store (`_store`'s file,
-    `kernel_picks_path`) and rebuilt (`decoded`), read once a process; none where none is stored, or this
-    checkout cannot rebuild it (`Unreadable`: it certifies again). Read under deterministic ops too, which
-    keep no picks (`dew._cache.keeps_picks`, measured timings): a verdict is what the assembler said of a
-    compile, the same in every process alike in what its key states, the run's XLA flags among them (row
-    7308: under --xla_gpu_deterministic_ops every warm start certified every launch again)."""
+def _verdicts_path(target: str) -> str:
+    """The store of the certification verdicts of kernels assembled for `target` (a generation,
+    `report.verdict_target`), beside the GPU models' picks (`kernel_picks_path`): verdicts alone, each by
+    what decides its compile (`report._verdict_key`), where the picks are measured timings. An H100's, a
+    GH200's and a compile-only H100's alike (row 6717). Read and written under deterministic ops too,
+    which keep no picks (`dew._cache.keeps_picks`): a verdict is what the assembler said of a compile, the
+    same in every process alike in what its key states, the run's XLA flags among them (row 7308: the cuda
+    lane's warm start certified every launch again)."""
+    return _cache.kernel_picks_path(f"certified {target}")
+
+
+def stored_verdict(target: str, key: str) -> Rebuilt | None:
+    """Certification's verdict of the launch `key` names, its kernels assembled for `target`
+    (`report.certified`), an
+    accepted config's or a refused one's, as stored (`_verdicts_path`) and rebuilt (`decoded`), read once a
+    process; none where none is stored, or this checkout cannot rebuild it (`Unreadable`: it certifies
+    again)."""
     with _LOADING:
-        if device_kind not in _VERDICTS:
-            _VERDICTS[device_kind] = {entry["certified"]: entry["verdict"]
-                                      for entry in _stored(_cache.kernel_picks_path(device_kind))
-                                      if isinstance(entry, dict) and "certified" in entry}
-        found = _VERDICTS[device_kind].get(key)
+        if target not in _VERDICTS:
+            _VERDICTS[target] = {entry["certified"]: entry["verdict"]
+                                 for entry in _stored(_verdicts_path(target))
+                                 if isinstance(entry, dict) and "certified" in entry}
+        found = _VERDICTS[target].get(key)
     try:
         return None if found is None else decoded(found)
     except Unreadable as unread:
         _log.warning("a certification verdict stored for %s is not this checkout's, so its launch certifies "
-                     "again: %s", device_kind, unread)
+                     "again: %s", target, unread)
         return None
 
 
-def store_verdict(device_kind: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
-    """`verdict` stored for the launch `key` names on GPUs of `device_kind` in the picks' store, as the picks
-    are (`encoded`), one writer at a time, the file replaced whole (`_store`, whose picks keep a verdict as an
-    entry they do not read), under deterministic ops too (`stored_verdict`)."""
+def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
+    """`verdict` stored for the launch `key` names, its kernels assembled for `target` (`_verdicts_path`), as
+    the picks are (`encoded`), one writer at a time, the file replaced whole."""
     written = encoded(verdict)
-    path = _cache.kernel_picks_path(device_kind)
+    path = _verdicts_path(target)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
         kept = [entry for entry in _stored(path)
                 if not (isinstance(entry, dict) and entry.get("certified") == key)]
-        write_atomically(path, json.dumps({"device_kind": device_kind,
+        write_atomically(path, json.dumps({"target": target,
                                            "data": [*kept, {"certified": key, "verdict": written}]}))
     with _LOADING:
-        _VERDICTS.setdefault(device_kind, {})[key] = written
+        _VERDICTS.setdefault(target, {})[key] = written
 
 
 def _shapes(value):

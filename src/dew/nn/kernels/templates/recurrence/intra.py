@@ -28,6 +28,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _merges,
     _merging,
     _resident,
+    building,
     chunk_liveness,
     f32,
     held_tile,
@@ -106,7 +107,7 @@ def _intra_solve(system, taken, call: Call):
         system, taken)
 
 
-@lowered_once
+@building(lambda launch: ("recurrence_intra", "recurrence_intra_scores", "recurrence_intra_system"))
 def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     """`(Aqk [R, HV * C], A [R, HV * C] where the call `solves`, hi, lo [R, HV * Dk])` of each chunk and value
     head under a decay a key dimension, one launch (`_intra_walk`): the scores as `call.held`, the keys'

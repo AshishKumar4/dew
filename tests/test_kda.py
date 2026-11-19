@@ -34,10 +34,12 @@ from reference_error import (
     widened,
     with_gradients,
 )
+from test_recurrence_chunk import chunk_on, token_by_token
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, recurrent_delta_rule
+from dew.nn.kernels import recurrence
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk_gated_delta_rule, recurrent_delta_rule
 from dew.nn.precision import l2norm as jax_l2norm
 from tools.kda_reference import (
     RECORDED,
@@ -352,3 +354,28 @@ def test_a_decode_token_on_the_fused_step_is_the_layers_own():
     delta_decode_matrix.on_par(('sm90', 'kimi delta attention', 'fused', 'float32'))
 
 
+def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
+    """Kimi delta attention's own pairs' log decay gradient, interpreted, over two bf16 tokens of unit-basis
+    keys `e0` (scale one, a zero memory and decays): the first writing `e0` under a gate of 2^-30, the second
+    reading with `e0` and writing `e0` under a gate of one, a unit cotangent on its output's first entry
+    alone. The second token's write erases what the first left, so its decay's gradient is exactly zero, and
+    every log decay's gradient is float64's exactly (powers of two throughout). A token's own scores pair
+    taken out of the decay's terms after they were summed in fp32 lost the cross term's 2^-30 with it,
+    -2^-30 there (base review 29b07fb60 F1); left out before they are summed, the decay's terms never take
+    it (row 7906)."""
+    hooks = recurrence.Hooks(decay='vector', scale=1.0)
+    width = 16
+    basis = jnp.zeros((1, 2, 1, width), jnp.float32).at[:, :, :, 0].set(1.0)
+    query = basis.at[0, 0].set(0.0)
+    operands = Chunk(query.astype(jnp.bfloat16), basis.astype(jnp.bfloat16), basis.astype(jnp.bfloat16),
+                     state=jnp.zeros((1, 1, width, width), jnp.float32),
+                     log_decay=jnp.zeros((1, 2, 1, width), jnp.float32),
+                     beta=jnp.asarray([[[2.0 ** -30], [1.0]]], jnp.float32))
+    # The output's cotangent in its dtype (the operands' bf16), the final memory's in fp32.
+    seeded = (jnp.zeros((1, 2, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(1.0),
+              jnp.zeros((1, 1, width, width), jnp.float32))
+    ours = jax.jit(with_gradients(lambda o: chunk_on('mosaic_gpu', hooks, o)))(operands, seeded)
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
+        exact = jax.jit(with_gradients(lambda o: token_by_token(hooks, o)))(*wide)
+    np.testing.assert_array_equal(np.asarray(ours[1].log_decay, np.float64), np.asarray(exact[1].log_decay))

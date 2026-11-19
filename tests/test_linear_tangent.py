@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh, PartitionSpec
+from reference_error import assert_as_exact
 
 from dew.nn.derivatives import KernelGlue
 from dew.nn.kernels import generation
@@ -110,31 +111,50 @@ def squared(x):
         lambda x: x * x, kind=KernelGlue(), nested=False)(x)
 
 
-@pytest.mark.parametrize("order", ["forward over reverse", "reverse over reverse"])
-def test_a_held_still_kernels_second_order_keeps_its_loss_curvature(order):
-    """The Hessian of `sum(squared(x)^2)` along a direction, its loss nonlinear in the kernel's output,
-    through a kernel whose derivative runs its forward held still (`nested` off): `12 x^2` times the
-    direction, the loss's curvature `J^T H J` with it, by `jax.jvp` of the gradient and by the gradient of
-    the gradient's product with the direction, where the output held still carried no tangent of its own and
-    both gave `4 x^2` (row 8648)."""
-    x, direction = jnp.arange(1.0, 9.0), jnp.ones(8)
-
+def _orders(square):
+    """Each higher-order derivative of the loss `sum(square(x)^2)`, nonlinear in `square`'s output, along a
+    direction: the Hessian's product with it by `jax.jvp` of the gradient and by the gradient of the
+    gradient's product with it, `12 x^2` times it, and the third derivative twice along it, `24 x` times its
+    square."""
     def loss(x):
-        return jnp.sum(squared(x) ** 2)
+        return jnp.sum(square(x) ** 2)
 
-    if order == "forward over reverse":
-        found = jax.jvp(jax.grad(loss), (x,), (direction,))[1]
-    else:
-        found = jax.grad(lambda x: jnp.vdot(jax.grad(loss)(x), direction))(x)
-    np.testing.assert_array_equal(np.asarray(found), np.asarray(12 * x ** 2))
+    def forward_over_reverse(x, direction):
+        return jax.jvp(jax.grad(loss), (x,), (direction,))[1]
+
+    return {
+        "forward over reverse": forward_over_reverse,
+        "reverse over reverse": lambda x, direction: jax.grad(
+            lambda x: jnp.vdot(jax.grad(loss)(x), direction))(x),
+        "third order": lambda x, direction: jax.jvp(
+            lambda x: forward_over_reverse(x, direction), (x,), (direction,))[1],
+    }
 
 
-def test_a_held_still_kernels_third_order_keeps_its_loss_curvature():
-    """The third derivative of `squared(x)^2`, `x^4` through a kernel whose derivative runs its forward held
-    still, at `x` two: 48, `24 x`, where the second order's attached output was the stopped one again and a
-    third order lost its part, 32 (row 8573's head review)."""
-    def loss(x):
-        return squared(x) ** 2
+ORDERS = {label: (dew, _orders(lambda x: x * x)[label]) for label, dew in _orders(squared).items()}
+"""Each order's Dew arm, through `squared`'s kernel, beside its reference, through the portable `x * x`."""
 
-    assert float(jax.grad(jax.grad(jax.grad(loss)))(jnp.float32(2.0))) == 48.0
+SEEDS = {"forward over reverse": 8, "reverse over reverse": 16, "third order": 8}
+"""Each order's declared seeds, sized paired (`seeds_for` with its Dew arm) at 1d187ee02f6 on armada."""
+
+
+def held_still_draw(draw: int) -> tuple[jax.Array, jax.Array]:
+    """A draw's point and direction, 257 values each: the point's magnitudes spread over two decades, so the
+    curvature `12 x^2` and the third derivative `24 x` round at every scale."""
+    point = jax.random.normal(jax.random.fold_in(jax.random.key(81), draw), (257,), jnp.float32)
+    direction = jax.random.normal(jax.random.fold_in(jax.random.key(82), draw), (257,), jnp.float32)
+    return point * 10.0 ** jax.random.uniform(jax.random.fold_in(jax.random.key(83), draw), (257,),
+                                              minval=-1.0, maxval=1.0), direction
+
+
+@pytest.mark.parametrize("order", list(ORDERS))
+def test_a_held_still_kernels_higher_orders_keep_its_loss_curvature(order):
+    """Through a kernel whose derivative runs its forward held still (`nested` off), the loss `sum(x^4)`'s
+    Hessian along a direction, by forward over reverse and by reverse over reverse, and its third derivative
+    twice along it, are on par with the portable composition's (check 1, truth float64): its curvature `J^T H
+    J` among them, where the output held still carried no tangent of its own and both second orders gave `4
+    x^2` (row 8648), and the third order lost its part, 32 at two where `24 x` is 48 (row 8573's head
+    review)."""
+    dew, reference = ORDERS[order]
+    assert_as_exact(jax.jit(dew), jax.jit(reference), held_still_draw, order, seeds=SEEDS[order])
 

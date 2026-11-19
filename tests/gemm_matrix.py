@@ -201,10 +201,10 @@ def _reported(case: dict[str, str], kernel: str | None, *,
 
 
 def _cutlass_takes(case: dict[str, str]) -> bool:
-    """Whether CUTLASS's launches take each product of `case`'s training step (`_Cutlass.takes`: its kernels'
-    contract, wherever dew-cutlass holds them) on a generation whose instruction family declares a CUTLASS
-    cell (`grouped_matmul.DECLARED`): read from that table and contract, since only the GPU tier's Hopper node
-    installs the library a selection would ask for."""
+    """Whether CUTLASS's launches take each product of `case`'s training step (`_Cutlass.in_contract`: its
+    kernels' contract, wherever dew-cutlass holds them) on a generation whose instruction family declares a
+    CUTLASS cell (`grouped_matmul.DECLARED`): read from that table and contract, since only the GPU tier's
+    Hopper node installs the library a selection would ask for."""
     family = generation.family(case["generation"])
     declared = grouped_matmul.DECLARED.items()
     if not any(cell[0] == family and kernel is grouped_matmul.CUTLASS for cell, (kernel, _) in declared):
@@ -218,7 +218,7 @@ def _cutlass_takes(case: dict[str, str]) -> bool:
     binds = (grouped_matmul.CutlassGmm().bind(x, matrix, sizes, trans_rhs=transposed, **options),
              grouped_matmul.CutlassGmm().bind(dout, matrix, sizes, trans_rhs=not transposed, **options),
              grouped_matmul.CutlassTgmm().bind(x, dout, sizes, **options))
-    return case["hook"] == "plain" and all(grouped_matmul.CutlassGmm.takes(ba) for ba in binds)
+    return case["hook"] == "plain" and all(grouped_matmul.CutlassGmm.in_contract(ba) for ba in binds)
 
 
 def route_of(case: dict[str, str]) -> str | None:
