@@ -171,8 +171,11 @@ def _termed(fn, args, *, power: int):
                             "walked as it runs, which no trace holds")
         token = POWER.set(power)
         try:
+            # Inlined, not a jit of its own: the store's compile of the whole program states its compiler
+            # options (as written, `reference_error._truth_compile`), which JAX takes on a program's outermost
+            # jit alone.
             with jax.default_device(store.device()), evaluated_on([]):
-                values, energies = _compiled(closed.jaxpr)(closed.consts, jax.tree.leaves(args))
+                values, energies = evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
                 return jax.tree.structure(shapes), values, [_or_size(energy, value) for energy, value
                                                             in zip(energies, values, strict=True)]
         finally:

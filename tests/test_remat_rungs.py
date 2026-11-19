@@ -311,7 +311,7 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
             return output, pull(cotangent)[0]
         return run
 
-    assert_as_exact(jax.jit(stepped(scanned)), jax.jit(stepped(plain)), draw,
+    assert_as_exact(jax.jit(stepped(scanned)), dew_path(jax.jit(stepped(plain))), draw,
                     "a scanned, rematerialized continuum decoder", seeds=CONTINUUM_SEEDS,
                     truth_fn=stepped(float64_twin(plain)))
 

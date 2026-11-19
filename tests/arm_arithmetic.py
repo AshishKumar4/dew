@@ -244,27 +244,52 @@ class Unrewritten:
 
 class Truth:
     """A check's float64 truth as the gate runs it (`reference_error._truth_program`): its own function jitted
-    as written (`as_written`), which every site of it shares, run unrewritten (`unrewritten`), compiled from
-    its first call and never run eagerly, so a seed's truth is the same whichever seed a process draws first
-    (a map task's, DRAWS) and a large truth pays no eager run. A truth that does host work on its values
-    (NumPy, torch, a fetch to the host) states it, `as_given`, and the gate runs it so; unstated, its trace
-    fails at its first seed, naming it (ledger 3198). On `device` where one is named (a GPU run's sizing,
-    whose truths its host computes as a prepare's do, the GPU's memory left to the arms)."""
+    as written (`as_written`) for the platform its call runs on (`_platform_of`: where its inputs lie, a
+    GPU-committed draw's under a CPU default included; the platform the context places a call on where none
+    is committed), once a platform, which every site of it shares, run unrewritten (`unrewritten`), compiled
+    from its first call and never run eagerly, so a seed's truth is the same whichever seed a process draws
+    first (a map task's, DRAWS) and a large truth pays no eager run. A truth that does host work on its
+    values (NumPy, torch, a fetch to the host) states it, `as_given`, and the gate runs it so; unstated, its
+    trace fails at its first seed, naming it (ledger 3198). On `device` where one is named (a GPU run's
+    sizing, whose truths its host computes as a prepare's do, the GPU's memory left to the arms)."""
 
     def __init__(self, fn, device=None):
-        # As written (`as_written`) on the device it computes on: a truth rewritten into another value makes
-        # every ratio meaningless.
-        placed = device or float64_host()
-        written = as_written(None if placed is None else placed.platform)
-        self.fn, self.run, self.device = fn, unrewritten(jax.jit(fn, compiler_options=written)), device
+        self.fn, self.device, self._runs = fn, device, {}
+
+    def _run(self, platform: str):
+        # As written (`as_written`) on the platform it computes on: a truth rewritten into another value
+        # makes every ratio meaningless.
+        if platform not in self._runs:
+            self._runs[platform] = unrewritten(jax.jit(self.fn, compiler_options=as_written(platform)))
+        return self._runs[platform]
 
     def __call__(self, *inputs):
         # On `device` where one is named: a GPU run's sizing computes its truths on the host, as a prepare
         # does; a process whose float64 is its host's (`float64_host`) computes them there.
         device = self.device or float64_host()
-        return self.run(*(inputs if device is None else jax.device_put(inputs, device)))
+        placed = inputs if device is None else jax.device_put(inputs, device)
+        return self._run(_platform_of(placed))(*placed)
+
+    @property
+    def run(self):
+        """Its program for the platform the context places a call on, the one an uncommitted call runs."""
+        from dew.nn.kernels.generation import placed_platform
+
+        device = self.device or float64_host()
+        return self._run(placed_platform() if device is None else device.platform)
 
     @property
     def trace(self):
-        """Its program's trace (JAX's `jit(...).trace`), the one its calls run."""
+        """Its program's trace (JAX's `jit(...).trace`), the one an uncommitted call runs."""
         return self.run.trace
+
+
+def _platform_of(inputs) -> str:
+    """The platform a call on `inputs` runs on: their committed arrays' devices' (a GPU's for a draw an
+    accelerator holds), else the one the context places a call on (`generation.placed_platform`)."""
+    from dew.nn.kernels.generation import placed_platform
+
+    platforms = {device.platform for leaf in jax.tree.leaves(inputs)
+                 if isinstance(leaf, jax.Array) and getattr(leaf, "committed", False)
+                 for device in leaf.devices()}
+    return platforms.pop() if len(platforms) == 1 else placed_platform()

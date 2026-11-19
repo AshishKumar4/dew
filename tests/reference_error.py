@@ -79,6 +79,7 @@ from arm_arithmetic import FORMATTED, Truth, as_written, rounds_nothing, summed_
 from arm_forms import (
     _arms,
     _arms_with,
+    _bounded,
     _compile_for,
     _declared,
     _given,
@@ -586,7 +587,8 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
                   draw, label, seeds=seeds, orders=orders, sizing=sizing, compile=compile)
     # Each reference its accuracy claim holds Dew's arm against as written, compiled so (`_written_twin`).
     twins = {_written_role(name): (fn, True) for name, fn in _written_references(reference_fn, also)}
-    _compile_arms(store, twins, draw, label, seeds=seeds, orders=orders, compile=compile, written=True)
+    _compile_arms(store, twins, draw, label, seeds=seeds, orders=orders, compile=compile, sizing=sizing,
+                  written=True)
 
 
 def _paired_most(reference_fn, most: int = MOST_SEEDS) -> int | None:
@@ -1402,12 +1404,20 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
                 # A site its prepare did not reach sizes and runs unprepared, recorded before its sizing
                 # compiles (a sizing that fails reaches no verdict to record it, `truths_ahead.running`).
                 store.unprepared(f"{label}: its prepare did not reach this site")
+        # An accuracy claim's bound sized too (`arm_forms._bounded`), Dew paired with the reference as written
+        # (`_written_twin`; a store's, its prepare's twin at the sizing draws' shapes), the larger declared.
+        twin = None if arms is None or not _bounded(reference_fn) else (arms[0], _stored_arm(
+            store, label, reference_fn, _written_twin(dew_fn, reference_fn), _written_role(None),
+            written=True))
         token = COMPILED.set(None)
         try:
-            record["sized"] = seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
-                                        orders=orders, examples=examples, followed=followed, arms=arms)
+            sized = {written: seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
+                                        orders=orders, examples=examples, followed=followed,
+                                        arms=twin if written else arms, written=written)
+                     for written in (False, True)[:1 + _bounded(reference_fn)]}
         finally:
             COMPILED.reset(token)
+        record["sized"], record["sized as written"] = max(sized.values()), sized.get(True)
     with open(os.environ[QUALIFY], "a", encoding="utf-8") as log:
         log.write(json.dumps(record) + "\n")
     if (sized := record.get("sized", 0)) > seeds:
@@ -1437,17 +1447,17 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     if judging():
         _judged_pooled(label, verdict)
         return
-    truth_program = _truth_program(truth_fn)
+    # Its truth, where it names none its reference as compiled here as written, resolved once, before its
+    # terms are sized by it and before the store's programs take the arms' place: a reference arm read from
+    # the store is its own program at its own inputs alone, which a truth its run computes (its truths at
+    # run, `truths_ahead.running`) never is.
+    own = _written_twin(dew_fn, reference_fn)
+    truth_program = _truth_program(truth_fn) or own
     terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
                            truth_program)
     narrow_leaves: list[str] = []
     compiled = _arms_with(dew_fn, reference_fn, list(also.values()), label)
-    own = _written_twin(dew_fn, reference_fn)
     twins = [own if name is None else _written_twin(dew_fn, fn) for name, fn in written]
-    # Its truth, where it names none its reference as compiled here as written, resolved before the store's
-    # programs take the arms' place: a reference arm read from the store is its own program at its own
-    # inputs alone, which a truth its run computes (its truths at run, `truths_ahead.running`) never is.
-    truth_program = truth_program if truth_program is not None else own
     # The arms read from the store wherever its prepare reached the site, its truths' at run or not.
     if (ahead := reading()) is None:
         _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
@@ -1623,8 +1633,9 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     against its second), and the reference on the same inputs runs once. `orders` sizes a site whose
     verdict sweeps them (`assert_as_exact`'s `orders`): each seed's evidence is its draw's over every
     order, as the verdict reads it. `examples` sizes a site that stacks them as its verdict judges it.
-    `arms`, where given, are the pair as compiled (Dew's and the reference's, a store's, `_stored_arms`),
-    taken in place of compiling them here, an arm computing in NumPy refused where they were made."""
+    `arms`, where given, are the pair as compiled (Dew's and the reference's, a store's, `_stored_arms`; with
+    `written` the reference's twin as written), taken in place of compiling them here, an arm computing in
+    NumPy refused where they were made."""
     if COMPILED.get() is not None:
         raise ValueError(f"{label}: a sizing draws seeds past a prepared site's, whose truths' programs no "
                          "prepare compiled")
@@ -1637,16 +1648,24 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     paired = dew_fn is not None
     if arms is None:
         _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
+    # The truth, the reference compiled as written where none is named, as every truth is (`_written_twin`),
+    # resolved once before a weighing reads it.
+    own = _written_twin(dew_fn if paired else reference_fn, reference_fn)
+    truth_program = _truth_program(truth_fn) or own
     # A weighed site (`assert_as_exact`'s `conditioning`) is sized as it is judged, weighed, its heavy
     # elements classed over its first stages' draws.
-    weighing = (_conditioning(reference_fn, truth_fn, draw, range(staged_units(max(start, FEWEST_SEEDS))),
-                              scale=conditioning_scale) if conditioning else None)
-    # The truth, the reference compiled as written where none is named, as every truth is (`_written_twin`).
-    own = _written_twin(dew_fn if paired else reference_fn, reference_fn)
-    truth_fn = _truth_program(truth_fn) or own
-    dew_fn, reference_fn = (arms if arms is not None
-                            else _arms(dew_fn if paired else reference_fn, reference_fn))
-    dew_fn, reference_fn = (dew_fn if paired else None), (own if written and paired else reference_fn)
+    weighing = (_conditioning(reference_fn, truth_program, draw,
+                              range(staged_units(max(start, FEWEST_SEEDS))), scale=conditioning_scale)
+                if conditioning else None)
+    truth_fn = truth_program
+    # The pair as given (`arms`, the one `written` names where it is given, a store's twin), else compiled
+    # here: Dew paired with the reference compiled as written where `written`.
+    if arms is not None:
+        dew_fn, reference_fn = arms
+    else:
+        dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
+        reference_fn = own if written and paired else reference_fn
+    dew_fn = dew_fn if paired else None
     first = 0 if dew_fn is None else SIZING_FROM
 
     def drawn(start_at: int, stop: int):

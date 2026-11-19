@@ -315,9 +315,12 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False, written: bo
 
 
 def _own_function(fn):
-    """`fn`'s own function where it is a `without_ynn` program (a jit of compiler options of its own, a
-    library arm's cuBLAS), which the gate compiles as written (`_compiled`'s `written`); else `fn`."""
-    return fn.__wrapped__ if getattr(fn, "without_ynn", False) else fn
+    """`fn`'s own function where it is a jit (a plain one, one of compiler options of its own: a
+    `without_ynn` program, a library arm's cuBLAS), which the gate compiles as written (`_compiled`'s
+    `written`, `reference_error._truth_program`), so no jit of options nests in another, which JAX refuses
+    (options on a program's outermost jit alone); else `fn`. An arm or a truth takes arrays alone, so a jit's
+    static arguments are none of its call."""
+    return fn.__wrapped__ if hasattr(fn, "lower") and hasattr(fn, "__wrapped__") else fn
 
 
 def _as_is(fn):

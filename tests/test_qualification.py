@@ -83,6 +83,31 @@ def test_a_site_judged_from_its_prepared_truths_sizes_itself_in_its_run(monkeypa
     assert found == [(sized, sized), (sized // 2, sized)]
 
 
+def test_an_accuracy_claims_site_sizes_its_bound_as_written_too(monkeypatch, tmp_path):
+    """A site whose reference is written apart from Dew (an accuracy claim, its reference compiled as written
+    too, `reference_error._written_twin`) sizes under `QUALIFY` both pairs it is judged by, Dew against its
+    reference compiled alike and against it as written (`seeds_for`'s `written`), and declares the larger,
+    run live and from programs its prepare compiled, the twin's at the sizing draws' shapes too (the
+    as-written head's review: its sizing took the pair compiled alike alone)."""
+    dew, _, truth, draw = site()
+
+    def reference(x, w):
+        return jnp.dot(x[::-1], w[::-1])
+
+    alike = seeds_for(reference, draw, LABEL, dew_fn=dew, truth_fn=truth)
+    written = seeds_for(reference, draw, LABEL, dew_fn=dew, truth_fn=truth, written=True)
+    declared = max(alike, written)
+    store = tmp_path / "store"
+    with compiled_truths(store, prepare=True, stamp="here"):
+        assert_as_exact(dew, reference, draw, LABEL, seeds=declared, truth_fn=truth)
+    monkeypatch.setenv(QUALIFY, str(tmp_path / "qualified.jsonl"))
+    assert_as_exact(dew, reference, draw, LABEL, seeds=declared, truth_fn=truth)
+    with compiled_truths(store, prepare=False, stamp="here"):
+        assert_as_exact(dew, reference, draw, LABEL, seeds=declared, truth_fn=truth)
+    records = [json.loads(line) for line in (tmp_path / "qualified.jsonl").read_text().splitlines()]
+    assert [(record["sized"], record["sized as written"]) for record in records] == [(declared, written)] * 2
+
+
 def test_a_compiled_sites_run_draws_its_second_stage_from_its_programs(tmp_path, monkeypatch):
     """A site under programs compiled ahead (a GPU flow's, `truths_ahead.compiled_truths`) whose first stage
     leaves it undecided (this one sizes far above the 64 it declares) draws its second stage in its run, its

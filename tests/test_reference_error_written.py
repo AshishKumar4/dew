@@ -80,3 +80,24 @@ def test_a_truth_its_terms_size_runs_as_written():
         outputs, totals = np.asarray([large, -large, tiny]), np.ones(3)
         value = float(float64_terms(combined, outputs, totals)[0])
     assert value == np.sum(totals / np.sum(totals) * outputs)
+
+
+def _product(x, w):
+    """A float32 product of drawn matrices."""
+    return x @ w
+
+
+def _drawn_matrices(seed):
+    rng = np.random.default_rng([0x6909, seed])
+    return (rng.standard_normal((16, 32)).astype(np.float32), rng.standard_normal((32, 8)).astype(np.float32))
+
+
+def test_a_truth_jitted_with_compiler_options_of_its_own_runs_as_written():
+    """A float64 truth its site passes as a jit of compiler options of its own runs as every truth does, its
+    own function compiled as written (`arm_forms._own_function`): nested inside the gate's jit of options,
+    JAX refused it, a configured truth's site raising before it drew (the as-written head's review)."""
+    from arm_forms import WITHOUT_YNN
+
+    configured = jax.jit(_product, compiler_options=WITHOUT_YNN)
+    assert_as_exact(_product, _product, _drawn_matrices, "a product beside its configured truth", seeds=8,
+                    truth_fn=configured)
