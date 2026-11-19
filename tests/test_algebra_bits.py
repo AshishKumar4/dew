@@ -101,6 +101,29 @@ def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
                                   values * block)
 
 
+def test_a_block_scales_declared_decode_is_the_formats_on_every_code():
+    """The block scale's declared decode (`bits.E4M3_SCALE`, a fixed layout), its checked-in form proven
+    (`bits.proven`) and no dearer than the search's, restored by its one rule (`bits.scales_decoded`), is
+    the format's integer decode (`bits.decoded`) on every E4M3 code, bit for bit under a jit: subnormal
+    scales, both zeros and the NaN code (read as 480) among them."""
+    bits.proven(bits.E4M3_SCALE, bits.E4M3_SCALE_FORM)
+    assert bits.E4M3_SCALE_FORM.price <= bits.synthesized(bits.E4M3_SCALE).price
+    codes = jnp.arange(256, dtype=jnp.uint32)
+    declared = jax.jit(bits.scales_decoded)(codes)
+    integer = jax.jit(lambda codes: bits.decoded(codes, bits.E4M3))(codes)
+    np.testing.assert_array_equal(np.asarray(declared).view(np.uint32), np.asarray(integer).view(np.uint32))
+
+
+def test_a_forms_version_is_its_stored_layouts():
+    """A form's version (`BitForm.version`, what a packed checkpoint records) is its encoder's: forms of one
+    encoder share it whatever their steps, and another encoder's differs, so words stored in another
+    layout are told apart from the checked-in form's."""
+    form = bits.NVFP4_BFLOAT16_FORM
+    restepped = dataclasses.replace(form, steps=form.steps[:-1])
+    reencoded = dataclasses.replace(form, encoder=(*form.encoder[1:], form.encoder[0]))
+    assert restepped.version == form.version != reencoded.version
+
+
 def test_an_fp8_decode_reads_back_every_finite_code_in_every_place():
     """Four E4M3 codes of a 32-bit word decoded into two registers of two float16s (sm80's FP8, which its
     tensor cores do not multiply), code `2i` the low half of register `i` and `2i + 1` the high, its layout
@@ -233,6 +256,7 @@ FORMS = {
     "encode-e4m3": lambda: bits.encode_form(bits.E4M3),
     "encode-e5m2": lambda: bits.encode_form(bits.E5M2),
     "encode-e2m1": lambda: bits.encode_form(bits.E2M1),
+    "e4m3-scale": lambda: bits.E4M3_SCALE_FORM,
 }
 """Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx`): a rotation, left
 and right shifts on either pipe, and a mask of one value and of two values' XOR; and an encode's (every
