@@ -991,6 +991,13 @@ class Hooks:
     key_params: tuple[Param, ...] = ()
 
     def __post_init__(self):
+        from dew.nn.kernels import tuning
+
+        # Each mod the one form every route takes (`tuning.prepared`): the Mosaic and Triton launches and the
+        # portable program run, and differentiate, the same functions, an explicit caller's and an inferred
+        # fusion's alike (docs/design/algebra.md §2's template hooks).
+        for name in ("score_mod", "output_mod", "query_mod", "key_mod"):
+            object.__setattr__(self, name, tuning.prepared(getattr(self, name)))
         for side, mod, params in (("query", self.query_mod, self.query_params),
                                   ("key", self.key_mod, self.key_params)):
             if params and mod is None:
