@@ -1912,11 +1912,12 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False) -> Callable:
         if store.prepare:
             programs: dict = {}
             held: dict = {}
-            placed = jax.default_device(jax.devices("cpu")[0]) if host else store.tracing()
-            with placed:
-                shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
-            store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True), arms=True,
-                               host=host)
+            # A host-placed arm traced, and retraced where its compile lowers it, on the host's CPU.
+            with jax.default_device(jax.devices("cpu")[0]) if host else contextlib.nullcontext():
+                with contextlib.nullcontext() if host else store.tracing():
+                    shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
+                store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True),
+                                   arms=True, host=host)
             # Zeros of the shapes its own trace gave, in the store's tracing: a jit of its own compiler
             # options traced again inside another, `eval_shape`'s, was refused.
             return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)
