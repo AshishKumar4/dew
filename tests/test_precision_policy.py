@@ -1291,6 +1291,35 @@ def test_an_aligned_sums_tangent_moves_only_the_factors_it_reaches():
     assert float(jax.grad(summed)(one)) == 1.0
 
 
+def test_an_aligned_sums_tangent_takes_the_values_layout():
+    """The tangent along a scalar `x` of `aligned_sum([(x,), (v,)])` beside a constant `v` of `[10, 20]`:
+    `[1, 1]`, the value's layout, where the moving term alone made a scalar (base review 0c6ef9c11 F1)."""
+    v = jnp.asarray([10.0, 20.0], jnp.float32)
+    tangent = jax.jvp(lambda x: aligned_sum([(x,), (v,)]), (jnp.float32(1.0),), (jnp.float32(1.0),))[1]
+    np.testing.assert_array_equal(np.asarray(tangent), [1.0, 1.0])
+
+
+def test_an_aligned_sums_mixed_derivative_holds_a_constant_infinity_still():
+    """The tangent along `y` of the tangent along `x` of `aligned_sum([(x, y), (x, inf, 1)])` at `x = y =
+    1`: one, the constant infinity held still, where its residual's zero tangent met it, NaN (base review
+    0c6ef9c11 F2)."""
+    infinite, one = jnp.float32(jnp.inf), jnp.float32(1.0)
+
+    def along_x(y):
+        return jax.jvp(lambda x: aligned_sum([(x, y), (x, infinite, one)]), (one,), (one,))[1]
+
+    assert float(jax.jvp(along_x, (one,), (one,))[1]) == 1.0
+
+
+def test_an_aligned_sum_over_2_31_less_2_terms_lowers():
+    """`aligned_sum([(x,)], axis=0)` over `2^31 - 2` fp32 terms, lowered: its carry, in `[-(n + 1), n]`, and
+    its one-bit digits' partial sums held by int32, where a looser bound refused it (base review 0c6ef9c11
+    F3)."""
+    lowered = jax.jit(lambda x: aligned_sum([(x,)], axis=0)).trace(
+        jax.ShapeDtypeStruct((2 ** 31 - 2,), jnp.float32)).lower()
+    assert lowered.out_info.shape == (1,)
+
+
 def test_an_aligned_sum_over_2_30_terms_lowers():
     """`aligned_sum([(x,)], axis=0)` over 2^30 fp32 terms, lowered: one-bit digits whose partial sum the
     integers hold, the carry apart, where it was refused (base review ee7d1e761 F2, row 8757)."""
