@@ -1132,21 +1132,16 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
               past_walks: Callable | None = None):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
-    on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
-    under the output hook, `value_width` wide, stored through its stage (`out_stage(store)`: the query's
-    where the widths agree, one scoped after the walks where the family scopes them apart), and its rows'
-    maxima through `row_smem` to its status (`algebra.walked_launches`' fold guard), each row output into
-    views `stored()` forms where it is stored (`_written_views`' at the block formed there). The walk's
-    running sums are the family's accumulator, issued into in place, at its rows' scale where they could
-    pass fp32's largest (`algebra.SCALED_WALK`). `training`, the walk is the training step's at the
-    `anchors` a peak walk found (`algebra.anchored_step`): the accumulator holds the split sums, every
-    key's weighted values but the anchor's, which it stores with the rows' sums and status, no output (the
-    output's anchor term joins in XLA, `_trained_forward`). With `certified` (its views and an fp32 stage,
-    `_Block.certified`), the plain walk stores its state after each key tile (`certified_walk`). With `kept`
-    (a launch into the plain launch's outputs, `_Read.kept`), it writes its rows `kept` alone, every other
-    row of its views as it was (`_kept_rows`). With `relay` (its own tile, `relays`), its weights reach the
-    values' product through it. With `codes` (a quantized call's, `_Codes`), each step converts its slots'
-    codes and scales its keys' and values'."""
+    on each tile, passing the `streamed` range its partner alone reads; its output under the output hook,
+    `value_width` wide, stored through its stage (`out_stage(store)`), and its rows' maxima through
+    `row_smem` to its status (`algebra.walked_launches`' fold guard), each into views `stored()` forms
+    (`_written_views`). Its running sums are the family's accumulator, at its rows' scale where they could
+    pass fp32's largest (`algebra.SCALED_WALK`). `training`: the training step's walk at the `anchors` a peak
+    walk found (`algebra.anchored_step`), the accumulator the split sums, stored with the rows, no output
+    (`_trained_forward`). `certified`: the plain walk stores its state after each key tile
+    (`certified_walk`). `kept`: it writes its rows `kept` alone (`_kept_rows`). `relay`: its weights reach the
+    values' product through its own tile (`relays`). `codes`: each step converts its slots' codes (`_Codes`).
+    `decided`: its verdict reads its walk's bound too (`_bound_unit`)."""
     row, head, _ = place
     family, tiles = program.family, program.tiles
     if relay is not None:
@@ -1174,12 +1169,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     def walk(spec: algebra.Forward, turns) -> tuple:
         start, merged = _started(program, spec, hooked, state_rows, value_width, training=training)
-        # A deciding launch's unscaled walk bounds its rows' sums as the host's bound would
-        # (`algebra.bounded_past`): its visible keys' largest value magnitudes summed at the bound's unit,
-        # times the most a weight reaches (`algebra.walk_reach`, a dropping call's multiplier's), and its
-        # initial state's sums', which its verdict reads (`_walks_stored`).
-        bounding = decided is not None and not spec.headroom
-        unit = 2.0 ** -algebra.BOUND_UNIT * algebra.walk_reach(weights, hooks.drop, natural=spec.natural)
+        unit = _bound_unit(spec, weights, hooks.drop, decided)
 
         def scored(index, slots, product=None):
             return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
@@ -1195,32 +1185,26 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             tile = values(slots, converted)
             # The sums are the accumulator's, which the step takes the tile into (`Keys.accumulate`); the
             # rows' maxima, denominators and a scaled walk's scale the carry (`algebra.exported`).
-            state = algebra.imported((accumulators[0], *(carry[:-1] if bounding else carry)))
+            state = algebra.imported((accumulators[0], *(carry if unit is None else carry[:-1])))
             largest = (_largest(program, hooked, (row, place[2]), k_first, slots, converted,
-                                value_width=value_width) if spec.headroom else None)
+                                value_width=value_width) if spec.headroom or unit is not None else None)
             accumulate = family.accumulating(mosaic.declared_into(program.products, "sums"), slots,
                                              _accumulated(family, interpret))
             keys = algebra.Keys(coords, logits, tile, dot, accumulate, products, largest)
             state = algebra.plain_step(spec, state, keys)
             if certified is not None:
                 _certified_step(family, certified, index, state, row_smem)
-            if not bounding:
-                return algebra.exported(state)[1:], (state.acc,)
-            magnitudes = _largest(program, hooked, (row, place[2]), k_first, slots, converted,
-                                  value_width=value_width)()
-            seen = jnp.where(logits > -jnp.inf, algebra.across(magnitudes, logits), 0.0)
-            reached = carry[-1] + jnp.sum(seen * unit, axis=-1)
-            return (*algebra.exported(state)[1:], reached), (state.acc,)
+            rows = algebra.exported(state)[1:]
+            rows = rows if unit is None else (*rows, _bounded(carry[-1], logits, largest(), unit))
+            return rows, (state.acc,)
 
         def inference(walk):
             # An inference walk through `walk(step, start, shapes, initial=)` (`_walk_of`): its sums the
-            # accumulator's, and a bounding walk's bound (`bounding`) beside its rows.
-            rows = algebra.exported(start)[1:]
-            rows = (*rows, jnp.zeros_like(start.total)) if bounding else rows
+            # accumulator's, and a bounding walk's bound (`_bound_unit`) beside its rows, its second result.
+            rows = (*algebra.exported(start)[1:], *(() if unit is None else (jnp.zeros_like(start.total),)))
             rows, (acc,) = walk(step, rows, ((tiles.block_q, value_width),), initial=(start.acc,))
-            if not bounding:
-                return algebra.imported((acc, *rows)), None
-            return algebra.imported((acc, *rows[:-1])), rows[-1]
+            held = rows if unit is None else rows[:-1]
+            return algebra.imported((acc, *held)), None if unit is None else rows[-1]
 
         def walked(streams, lo, hi, counted):
             if not training:
@@ -1239,13 +1223,10 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
                                          between=lambda: (turn(), turn()), counted=turns)
         # A bounding walk's second result its bound (`inference`), a training walk's its anchor's terms.
-        bound, trained = (trained, None) if bounding else (None, trained)
+        bound, trained = (None, trained) if unit is None else (trained, None)
         if merged:
             # The initial state merged in at the walk's end, before a decided walk's verdict reads the sums.
-            initial = _initial(family, spec, hooked, state_rows)
-            state = algebra.merge(spec, initial, state)
-            if bounding:
-                bound = bound + jnp.max(jnp.abs(initial.acc), axis=-1) * 2.0 ** -algebra.BOUND_UNIT
+            state, bound = _merged_initial(spec, _initial(family, spec, hooked, state_rows), state, bound)
         return state, trained, bound
 
     def store(spec: algebra.Forward, state: algebra.Partial, trained) -> None:
@@ -1262,6 +1243,34 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                      training=training, out=(out_view, out_stage), rows=(stored, row_smem), keep=keep)
 
     _walks_stored(walk, store, spec, consumer, turn, decided=decided, past=past_walks, streamed=streamed)
+
+
+def _bound_unit(spec: algebra.Forward, weights, drop, decided: after_walk.Decided | None) -> float | None:
+    """The unit a deciding launch's unscaled walk bounds its rows' sums at as the host's bound would
+    (`algebra.bounded_past`, its verdict's, `_walks_stored`): `2^-BOUND_UNIT` times the most a weight of
+    `weights` reaches (`algebra.walk_reach`, a dropping call's multiplier's); None where it decides nothing
+    or walks scaled."""
+    if decided is None or spec.headroom:
+        return None
+    return 2.0 ** -algebra.BOUND_UNIT * algebra.walk_reach(weights, drop, natural=spec.natural)
+
+
+def _bounded(reached: jax.Array, logits: jax.Array, magnitudes: jax.Array, unit: float) -> jax.Array:
+    """A walk's bound `reached` `[bq]` after a step: its visible keys' (`logits` past -inf) largest value
+    magnitudes (`magnitudes`, `algebra.magnitudes`'s finite ones) at `unit` (`_bound_unit`) added."""
+    seen = jnp.where(logits > -jnp.inf, algebra.across(magnitudes, logits), 0.0)
+    return reached + jnp.sum(seen * unit, axis=-1)
+
+
+def _merged_initial(spec: algebra.Forward, initial: algebra.Partial, state: algebra.Partial,
+                    bound: jax.Array | None) -> tuple[algebra.Partial, jax.Array | None]:
+    """A walk's `state` with the call's `initial` state merged in past it (`algebra.merge`), and its `bound`
+    (`_bounded`'s, where it bounds) with the state's sums' largest at the bound's unit, as the host's takes
+    them (`algebra.bounded_past`)."""
+    state = algebra.merge(spec, initial, state)
+    if bound is None:
+        return state, None
+    return state, bound + jnp.max(jnp.abs(initial.acc), axis=-1) * 2.0 ** -algebra.BOUND_UNIT
 
 
 def _walks_stored(walk: Callable, store: Callable, spec: algebra.Forward, consumer, turn: Callable, *,

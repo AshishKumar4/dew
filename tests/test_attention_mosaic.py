@@ -1005,12 +1005,11 @@ def test_a_scaled_or_resumed_forward_past_a_lazy_walks_reach_is_on_par_interpret
 @INTERPRETS
 def test_a_deciding_forward_whose_finite_sums_cancelled_walks_scaled_interpreted():
     """A bf16 inference forward on wgmma deciding its scaled walk itself (`after_walk.Decided`), interpreted:
-    each query over keys of logits 0, 0 and -100 (the rest masked), the first two's values 2^127 and -2^127 in
-    the first coordinate, the third's 2^126 in the second. Its unscaled sums cancel to finite ones, but the
-    third key's weight, e^-100 against a row
-    bound past 2^127, is the scaled walk's to keep (its small tier): the walk's own bound, the host's
-    (`algebra.bounded_past`), takes it there, where the verdict read the sums' finiteness alone and dropped
-    an output near 1.58e-6 (the base review of b872d1849, F4). On par with the reference (check 1)."""
+    each query over keys of logits 0, 0 and -100 (the rest masked) whose values are 2^127 and -2^127 in the
+    first coordinate and 2^126 in the second. Its unscaled sums cancel to finite ones, but the third key's
+    weight, e^-100 beside a bound past 2^127, is the scaled walk's to keep: its verdict reads its own bound,
+    the host's (`algebra.bounded_past`), where its sums' finiteness alone dropped an output near 1.58e-6 (the
+    base review of b872d1849, F4). On par with the reference (check 1)."""
     spans = template.spans(64, 64, 1, lengths=jnp.full((1,), 3, jnp.int32))
     tiles = attention_mosaic.Tiles(64, 64, 2, 1, family=WGMMA)
 
@@ -1018,18 +1017,15 @@ def test_a_deciding_forward_whose_finite_sums_cancelled_walks_scaled_interpreted
         with _device(interpret=True, target=generation.gpu_target("sm90")), _pinned(tiles):
             return attention_mosaic.forward(query, key, value, spans, natural=True, interpret=True, scale=1.0)
 
-    def reference(query, key, value):
-        return template.reference(query, key, value, spans, scale=1.0)
-
     def draw(seed: int):
-        del seed
         query = jnp.zeros((1, 64, 1, 64), jnp.bfloat16).at[..., 0].set(1)
         key = jnp.zeros((1, 64, 1, 64), jnp.bfloat16).at[0, 2, 0, 0].set(-100)
         value = (jnp.zeros((1, 64, 1, 64), jnp.float32).at[0, 0, 0, 0].set(2.0 ** 127)
                  .at[0, 1, 0, 0].set(-2.0 ** 127).at[0, 2, 0, 1].set(2.0 ** 126)).astype(jnp.bfloat16)
         return query, key, value
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "a deciding walk's cancelled sums", seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(lambda q, k, v: template.reference(q, k, v, spans, scale=1.0)),
+                    draw, "a deciding walk's cancelled sums", seeds=SEEDS)
 
 
 @INTERPRETS
