@@ -33,6 +33,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - A decode step's query and output pass through grouped_rows' transpose ([B,T,KV,G,D] to [B,T,G,KV,D] and back, attention.py:1113-1128) and a pad to the launch's…. [7926]
 - Attention tests to the bible's §6 and §7 test rules. [8437]
 - Time to first step: the compile path's re-derivations. [8612]
+- Certification's stored verdict is keyed by Dew's whole package digest (report._verdict_key: package_digest beside the launch identity, config, direction, the…. [8650]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -126,6 +127,5 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
-- options.keeping holds one listener. [8450]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
