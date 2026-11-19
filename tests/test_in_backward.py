@@ -186,9 +186,9 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype, 
     backward's. Its reference is the same scanned step under global-norm clipping, which holds the whole
     gradient: clipping by the norm of every leaf can update no leaf before every leaf's norm is known, so
     the stacked gradient is whole at once there, whatever its program. The updating step's temporaries are
-    then at most the clipped step's, less that gradient's bytes (each of the run's stacked weights, the
-    leaves a layer of `LAYERS` holds a row of, at the dtype its layers differentiate them in, the step's),
-    plus one layer's rows of the state the walk moves (the stacked weights as the state holds them, fp32
+    then at most the clipped step's, less that gradient's bytes (each of the run's layers' weights, which
+    its walk stacks, at the dtype its layers differentiate them in, the step's),
+    plus one layer's rows of the state the walk moves (the layers' weights as the state holds them, fp32
     masters of bf16 copies, and the optimizer's moments of them, over the run's layers): the rows a layer's
     update reads, which XLA keeps beside the stacks or fuses into their writes as it fuses (row 7953: one
     barrier in the loss flipped which), at the test's width and at 512, where a walk that kept slices of the
@@ -209,7 +209,9 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype, 
         return run
 
     def stacked(tree) -> list:
-        return [leaf for leaf in jax.tree.leaves(tree) if leaf.shape[:1] == (LAYERS,)]
+        # The run's layers' leaves, each layer's tree its own (`layers_<i>`), which its walk stacks.
+        return [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
+                if any(str(getattr(key, "key", "")).startswith("layers_") for key in path)]
 
     def held(leaves, dtype=None) -> int:
         return sum(int(np.prod(leaf.shape)) * np.dtype(dtype or leaf.dtype).itemsize for leaf in leaves)
