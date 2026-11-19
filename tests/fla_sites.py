@@ -178,10 +178,36 @@ def _rwkv6_sites() -> dict[str, Site]:
     return sites
 
 
+FLOOR_GATES = "kda/tiny gates at the floor/gradient"
+"""Kimi delta attention's site of decays at its floor and write gates down to 2^-60 (`_floor_gate_sites`)."""
+
+
+def _floor_gate_sites() -> dict[str, Site]:
+    """Kimi delta attention under unit keys (test_recurrence_stability's 'vector delta', `write_bound`
+    declared) with every token's log decay near Kimi Linear's floor ((-5, -4.5) a key dimension) and write
+    gates `2^U(-60, 0)`, in 16 bits with their cotangents: a chunk's own pairs and its system's rows into
+    fp32's subnormals at once, which no stability regime draws (row 7906)."""
+    import test_recurrence_chunk as chunked
+    import test_recurrence_stability as stability
+    import test_recurrence_template_stability as template_stability
+
+    hooks = stability.SITES['vector delta']
+
+    def gradient(seed):
+        operands, (out, final) = stability.cotangents(hooks, 'the decay bound', seed)
+        rng = np.random.default_rng([seed, 7906])
+        operands = dataclasses.replace(
+            operands, log_decay=chunked.hosted(rng.uniform(-5.0, -4.5, operands.log_decay.shape)),
+            beta=chunked.hosted(2.0 ** rng.uniform(-60.0, 0.0, operands.beta.shape)))
+        return template_stability.bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
+
+    return {FLOOR_GATES: Site(hooks, gradient)}
+
+
 @functools.cache
 def sites() -> dict[str, Site]:
     """Every recorded site by name."""
-    return {**_mosaic_sites(), **_stability_sites(), **_rwkv6_sites()}
+    return {**_mosaic_sites(), **_stability_sites(), **_rwkv6_sites(), **_floor_gate_sites()}
 
 
 def the_template_is_as_exact_as_fla(rule: Callable[[Chunk], tuple], site: str,
