@@ -121,6 +121,11 @@ UNTUNED = ("this step was compiled ahead into a file for %s GPUs without their t
 """What a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is said as, where it
 is saved and where a run is handed it (`dew.training.trainer.Trainer`)."""
 
+AT_RUN = ("this step was compiled ahead into a file for %s GPUs without them, leaving a convolution's "
+          "algorithm to run time (dew.nn.kernels.templates.report.DEVICELESS_CONVOLUTION_PICKS): a run "
+          "handed it compiles its step on its GPUs as a run without a file does")
+"""What a step file leaving a choice to run time (`AheadOfTime.at_run`) is said as, where a run takes it."""
+
 @functools.cache
 def compile_only_tpus(topology: str) -> tuple:
     """The devices of the TPU `topology` ('v5e:4x4', as `jax.experimental.topologies` names one), none
@@ -426,6 +431,13 @@ class AheadOfTime:
         step on its devices in its place (`runnable`); a TPU's is the device's own."""
         return boolean(record(self.plan, "plan")["autotuned"], "autotuned")
 
+    @property
+    def at_run(self) -> bool:
+        """Whether it leaves a choice to run time its device's own compile makes, as its plan records it
+        (`at_run_time`, `report.at_run_time`: a convolution compiled for compile-only GPUs): a run handed it
+        compiles its step on its devices in its place (`runnable`), whatever it tunes."""
+        return boolean(record(self.plan, "plan")["at_run_time"], "at_run_time")
+
     def runnable(self, devices: Sequence) -> AheadOfTime | None:
         """The step a run on `devices` handed it runs: this one where it is tuned, or where the run's own
         compile would take no tuned choice either (`report.autotuned`: XLA_FLAGS setting the autotuner's
@@ -434,15 +446,15 @@ class AheadOfTime:
         without a file, said once (`UNTUNED`). A step of another target is refused first, tuned or not
         (`held`): no run takes it."""
         self.held(devices)
-        if self.tuned or not report.autotuned(devices):
+        if report.compiled_as_here(devices, tuned=self.tuned, at_run=self.at_run):
             return self
-        _log.warning(UNTUNED, self.generation)
+        _log.warning(UNTUNED if not self.at_run else AT_RUN, self.generation)
         return None
 
     def save(self, path: str | Path) -> None:
         """Write the step to `path`, for `load` on a host of its topology."""
-        if not self.tuned:
-            _log.warning(UNTUNED, self.generation)
+        if not self.tuned or self.at_run:
+            _log.warning(AT_RUN if self.at_run else UNTUNED, self.generation)
         Path(path).write_bytes(filed(self))
 
     @staticmethod
@@ -450,10 +462,11 @@ class AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
         if ("starts" not in vars(step) or "counts" not in vars(step)
-                or "autotuned" not in record(step.plan, "plan")):
+                or not {"autotuned", "at_run_time"} <= record(step.plan, "plan").keys()):
             raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
                              "programs (`starts`), a sampled pass count's other counts' steps (`counts`) and "
-                             "said whether XLA tuned them (`autotuned`); compile it ahead again")
+                             "said whether XLA tuned them and left a choice to run time (`autotuned`, "
+                             "`at_run_time`); compile it ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         counted = [program.executable for held in step.counts.values() for program in held
                    if program is not None]
@@ -675,6 +688,10 @@ class AheadPrograms:
     for a generation's canonical GPUs is XLA's untuned program (`compile_programs`), which `loaded`
     refuses where the process's own compile would tune (row 8422: untuned convolutions left cuDNN's runtime
     heuristic to pick a non-deterministic algorithm)."""
+    at_run: tuple[str, ...] = ()
+    """The programs that leave a choice to run time their device's own compile makes (`report.at_run_time`:
+    a convolution compiled for compile-only GPUs), which `loaded` refuses on any GPU: each is compiled there
+    in its place."""
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
@@ -692,15 +709,21 @@ class AheadPrograms:
         """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices, the ones
         it was compiled for: each called with the arguments it was compiled for runs it. Refused, naming what
         differs, where those devices, this JAX, its XLA flags or its host are not the target they were built
-        for, and where they are untuned and this process's own compile would tune (`tuned`,
-        `report.autotuned`); each is admitted as a compiled program is (`dew.communicators.admit`)."""
+        for, and where they would not run as this process's own compile of them (`report.compiled_as_here`:
+        untuned where it tunes, or a choice left to run time, `at_run`); each is admitted as a compiled
+        program is (`dew.communicators.admit`)."""
         devices = jax.devices()[:self.target.devices]
         self.target.held(devices)
-        if not self.tuned and report.autotuned(devices):
-            raise ValueError(f"these programs were compiled for {self.target.generation}'s canonical GPUs, "
-                             "untuned (XLA's defaults where a device's compile tunes its convolutions and "
-                             "GEMMs): compile them for this node's topology (compile_programs' topology, "
-                             "$DEW_NODE_TOPOLOGY), or run with the autotuner off (xla_gpu_autotune_level 0)")
+        if not report.compiled_as_here(devices, tuned=self.tuned, at_run=bool(self.at_run)):
+            raise ValueError(
+                f"programs {', '.join(self.at_run)} were compiled without their GPU and leave a "
+                "convolution's algorithm to run time (report.DEVICELESS_CONVOLUTION_PICKS): compile them on "
+                "this GPU"
+                if self.at_run else
+                f"these programs were compiled for {self.target.generation}'s canonical GPUs, untuned (XLA's "
+                "defaults where a device's compile tunes its convolutions and GEMMs): compile them for this "
+                "node's topology (compile_programs' topology, $DEW_NODE_TOPOLOGY), or run with the autotuner "
+                "off (xla_gpu_autotune_level 0)")
         return {name: program.loaded(devices) for name, program in self.programs.items()}
 
 
@@ -916,7 +939,9 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     compile takes every tuned choice the GPU kind's runs left beside the compilation cache
     (`report.for_devices`), a choice none has tuned refused, named; over the generation's canonical GPUs
     it is XLA's untuned program, which its file says (`AheadPrograms.tuned`) and a tuning process refuses
-    to load (row 8422)."""
+    to load (row 8422). A program holding a choice only its GPU makes (`report.at_run_time`: a convolution)
+    is refused over a node's topology before any compiles (`report.CompiledOnDevice`, naming each), and
+    over the canonical GPUs compiled for its file to say (`AheadPrograms.at_run`), refused at its load."""
     target = built_target(generation, multiprocessors)
     gpus = (compile_only_gpus(generation, multiprocessors=multiprocessors) if topology is None
             else host_gpus(generation, topology, 1))
@@ -938,6 +963,11 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
         lowerings.append((lowered(), None, lowered))
     # Through Dew's compile point, as a run compiles them, at once (`report.compiled_at_once`): a launch
     # whose kernel spills there is derived again at its next config; for a node, tuned or refused.
+    at_run = tuple(name for name, (lowered, _, _) in zip(programs, lowerings, strict=True)
+                   if report.at_run_time(lowered))
+    if at_run and topology is not None:
+        # A node's run compiles them on its GPU, whose choices they would leave to run time here.
+        raise report.CompiledOnDevice(lowerings[0][0], at_run)
     with report.for_devices() if topology is not None else contextlib.nullcontext():
         tuned = report.autotuned(gpus[:1])
         try:
@@ -953,7 +983,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
             raise ValueError(f"program {name!r} cannot be compiled ahead (an array it closed over is a "
                              "constant of its program, which no executable serializes: pass it as an "
                              f"argument): {refused}") from refused
-    return AheadPrograms(BuildTarget.built(target, 1), built, tuned=tuned)
+    return AheadPrograms(BuildTarget.built(target, 1), built, tuned=tuned, at_run=at_run)
 
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
@@ -1111,6 +1141,8 @@ class AheadTarget:
                 try:
                     ahead = _compiled_ahead(trainer, batch, frontier=self.frontier, plan=plan,
                                             topology=topology)
+                except report.CompiledOnDevice as refused:
+                    raise ValueError(f"this step is compiled on its GPU, not ahead: {refused}") from refused
                 except report.Untuned as untuned:
                     raise ValueError(
                         "this step is not preparable on this host until a run on such a GPU has tuned it, "
@@ -1135,8 +1167,9 @@ class AheadTarget:
                     ahead = _compiled_ahead(trainer, stepped, frontier=False, plan=plan if first else None,
                                             topology=topology)
             except report.Untuned as refused:
-                # Its run compiles it on the device, which tunes it, and the next prepare finds it.
-                _log.warning("a step is not preparable until a device run has tuned it: %s", refused)
+                # Its run compiles it on the device, which tunes it (and the next prepare finds it), or makes
+                # the choice a compile without it cannot (`report.CompiledOnDevice`).
+                _log.warning("a step is not preparable here: %s", refused)
                 untuned.append(program_digest(refused.lowered))
                 continue
             _log.info("a step compiled ahead into the cache in %.1f s", ahead.planned_seconds)
