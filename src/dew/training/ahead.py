@@ -1141,6 +1141,8 @@ class AheadTarget:
                 try:
                     ahead = _compiled_ahead(trainer, batch, frontier=self.frontier, plan=plan,
                                             topology=topology)
+                except report.CompiledOnDevice as refused:
+                    raise ValueError(f"this step is compiled on its GPU, not ahead: {refused}") from refused
                 except report.Untuned as untuned:
                     raise ValueError(
                         "this step is not preparable on this host until a run on such a GPU has tuned it, "
