@@ -746,7 +746,8 @@ def _compiled(flow: ModelFlow, named: Mapping[str, tuple[Callable, list]], arm: 
         return None, found, on_device
     return AheadPrograms(next(iter(compiled.values())).target, {
         name: program for each in compiled.values() for name, program in each.programs.items()},
-        tuned=all(each.tuned for each in compiled.values())), found, on_device
+        tuned=all(each.tuned for each in compiled.values()),
+        at_run=tuple(name for each in compiled.values() for name in each.at_run)), found, on_device
 
 
 ON_DEVICE = "on_device.json"

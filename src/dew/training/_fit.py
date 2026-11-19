@@ -9,10 +9,12 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import gc
 import json
 import logging
 import math
 import os
+import sys
 import time
 import types
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
@@ -341,6 +343,33 @@ class FitPlan:
         return tuple(name for name, suite in self.suites.items() if self.falls(suite.every, step, counts))
 
 
+
+_FULL: list[int] = []
+"""The process's allocated blocks after its last full collection (`_full`), none before its first."""
+
+
+def _full(phase: str, info: Mapping[str, int]) -> None:
+    """Note the heap a full collection leaves (`_FULL`), the collector's own or one asked for."""
+    if phase == "stop" and info["generation"] == 2:
+        _FULL[:] = [sys.getallocatedblocks()]
+
+
+gc.callbacks.append(_full)
+
+
+def settled_heap(run: FitRun) -> None:
+    """Collect the whole heap before a fit's steps where it has grown by a quarter since the last full
+    collection, once a fit (`FitRun.settled`): CPython runs one itself once the objects made since outnumber a
+    quarter of those kept (Modules/gcmodule.c: long_lived_pending < long_lived_total / 4), and a start's
+    compiles make millions, so the first after them walked them in the loop, 0.75-0.9 s at a 4B step (row
+    6739). Read against the last full collection, not this fit's compile: what a plan's compile or an
+    earlier fit made is pending too (rows 8511, 8545). A fit whose process has run none collects."""
+    if run.settled:
+        return
+    run.settled = True
+    if not _FULL or sys.getallocatedblocks() - _FULL[0] > _FULL[0] // 4:
+        gc.collect()
+
 @dataclasses.dataclass
 class FitRun:
     """One `Trainer.fit` call's progress: what its loop carries from step
@@ -352,6 +381,8 @@ class FitRun:
     restarted: tuple[str, ...] | None = None
     """What differed between a relaxed resume's saved data plan and the run's, which started its data
     again (`dew.data.plan.PlanChanged.differs`); None where the data read on or the run did not resume."""
+    settled: bool = False
+    """Whether this fit has held its heap to a collection before its steps (`settled_heap`), once a fit."""
     unworked: bool = False
     """Whether a per-share stream reads its data in the training process, no loading workers sized for it
     (row 5852), asked through the wrappers it reads under (`dew.data.dataset.Forwarding.in_process`), which

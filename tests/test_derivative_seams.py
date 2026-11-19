@@ -70,9 +70,11 @@ def test_the_contract_runs_every_order_on_trainings_mesh():
         assert_contract(_split_over_the_mesh(1), x, x, cotangent, "a product a spec short")
 
     # A sum of 1024 products, its rounding errors check 1's to resolve (four of them resolve no ratio).
+    # Each stream its own salt (row 8464): seed, seed + 1 and seed + 2 made one seed's direction the next's
+    # primals.
     def inputs(seed, scale):
-        summed = normal_draw(seed, (1024,), (1,), scale=scale)
-        return summed, normal_draw(seed + 1, (1024,), (1,), scale=scale), normal_draw(seed + 2, (1,))[0]
+        summed = normal_draw((0, seed), (1024,), (1,), scale=scale)
+        return summed, normal_draw((1, seed), (1024,), (1,), scale=scale), normal_draw((2, seed), (1,))[0]
 
     assert_drawn_contract(_summed_over_the_mesh(1), inputs, EDGES["normal"], "a split sum")
     with pytest.raises(AssertionError):

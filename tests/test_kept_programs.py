@@ -371,7 +371,7 @@ def test_a_kept_program_is_handed_by_its_own_fingerprint_alone(tmp_path):
     other = {f"{number:064d}": each for number, each in enumerate(programs.kept.values())}
     dataclasses.replace(programs, kept=other).save(path)
     assert kept_worker(tmp_path, "take") == {"answers": answers, "compiled": EVERY_PROGRAM}
-    AheadPrograms(programs.target, {}).save(path)
+    AheadPrograms(programs.target, {}, tuned=True, at_run=()).save(path)
     with pytest.raises(ValueError), kept(path):
         pass
 
