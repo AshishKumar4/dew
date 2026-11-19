@@ -18,7 +18,7 @@ import flax_precision
 import jax
 import jax.numpy as jnp
 import numpy as np
-from diffusers.models.unets.unet_2d_condition_flax import FlaxUNet2DConditionModel
+from diffusers.models.unets.unet_2d_condition_flax import FlaxUNet2DConditionModel, FlaxUNet2DConditionOutput
 from diffusers.models.vae_flax import FlaxAutoencoderKL, FlaxDecoderOutput
 from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion import FlaxStableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_img2img import (
@@ -82,7 +82,10 @@ def build(directory, task):
         config2 = CLIPTextConfig(**{**config.to_dict(), "hidden_act": "gelu"})
         text2 = FlaxCLIPTextModelWithProjection(config2, seed=3)
         params["text_encoder_2"] = text2.params
-        pipeline = FlaxStableDiffusionXLPipeline(**components, text_encoder_2=text2, tokenizer_2=tokenizer)
+        # SDXL's second tower projects (WithProjection), which the pipeline takes though its signature
+        # names the plain text model.
+        pipeline = FlaxStableDiffusionXLPipeline(**components, **dict[str, Any](text_encoder_2=text2),
+                                                 tokenizer_2=tokenizer)
     else:
         cls = {"sd": FlaxStableDiffusionPipeline, "img2img": FlaxStableDiffusionImg2ImgPipeline,
                "inpaint": FlaxStableDiffusionInpaintPipeline}[task]
@@ -137,8 +140,10 @@ def build(directory, task):
     if task in ("sd", "xl"):
         added = None if not xl else {"text_embeds": arrays["pooled"],
                                      "time_ids": jnp.asarray([[32, 32, 0, 0, 32, 32]])}
-        arrays["prediction"] = unet.apply({"params": params["unet"]}, noise, jnp.asarray([10]),
-            encoder_hidden_states=arrays["hidden"], added_cond_kwargs=added).sample.transpose(0, 2, 3, 1)
+        predicted = unet.apply({"params": params["unet"]}, noise, jnp.asarray([10]),
+                               encoder_hidden_states=arrays["hidden"], added_cond_kwargs=added)
+        assert isinstance(predicted, FlaxUNet2DConditionOutput)  # return_dict's default; no mutable state.
+        arrays["prediction"] = predicted.sample.transpose(0, 2, 3, 1)
     np.savez_compressed(directory / "reference.npz", allow_pickle=False, **arrays)
     print(json.dumps({"task": task, "directory": str(directory), "reference": pins["diffusers"],
                       "transformers": pins["transformers"], "backend": jax.default_backend(),
