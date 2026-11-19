@@ -24,6 +24,7 @@ runs no pyright here.
 
 import argparse
 import ast
+import functools
 import hashlib
 import json
 import os
@@ -139,14 +140,22 @@ def imported(path: Path) -> set[str]:
 def roots_of(path: Path) -> tuple[str, ...]:
     """Where an import of the file `path` is looked up: its pyproject.toml execution environment's extraPaths
     when it sits under one's root (tools/armada's scripts import their neighbours by name), then `ROOTS`."""
+    for root, extra in environment_roots():
+        if path.is_relative_to(root):
+            return (*extra, *ROOTS)
+    return ROOTS
+
+
+@functools.cache
+def environment_roots() -> tuple[tuple[Path, tuple[str, ...]], ...]:
+    """pyproject.toml's pyright execution environments, each its root and extraPaths, read once: every file of
+    every closure asks (`roots_of`), and a read each took the gate past its deadline."""
     configuration = ROOT / "pyproject.toml"
     if not configuration.is_file():
-        return ROOTS
+        return ()
     pyright = tomllib.loads(configuration.read_text()).get("tool", {}).get("pyright", {})
-    for environment in pyright.get("executionEnvironments", []):
-        if path.is_relative_to(ROOT / environment["root"]):
-            return (*environment.get("extraPaths", []), *ROOTS)
-    return ROOTS
+    return tuple((ROOT / each["root"], tuple(each.get("extraPaths", [])))
+                 for each in pyright.get("executionEnvironments", []))
 
 
 def located(name: str, roots: tuple[str, ...] = ROOTS) -> list[Path]:
