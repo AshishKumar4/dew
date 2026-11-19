@@ -752,3 +752,23 @@ def test_a_child_process_prepares_and_runs_from_its_tests_store(tmp_path):
         ran = fresh(CHILD_ARM, variables=for_a_child())
     assert prepared["traced"] and prepared["made"] == [0.0] * 6
     assert ran == {"traced": 0, "made": (a * a + 1.0).tolist()} and not (tmp_path / UNPREPARED).exists()
+
+
+def test_a_site_whose_prepare_ended_before_its_arms_runs_them_unprepared(tmp_path, monkeypatch):
+    """A site whose prepare wrote its truths and then failed before its arms' (a flow's cell its prepare
+    deferred, `gpu_flow.run_cells`, its store still serving the run) runs its arms unprepared in its run,
+    recorded, judging the site as one computing its own does, where its run found no program
+    (`MissingTruth`, the review)."""
+    import reference_error
+
+    dew, reference, draw = _site()
+    with compiled_truths(tmp_path, prepare=True, stamp="a"), monkeypatch.context() as failing:
+        def ended(*arguments, **options):
+            raise RuntimeError("the prepare ended before the site's arms")
+
+        failing.setattr(reference_error, "_compile_arms", ended)
+        with pytest.raises(RuntimeError):
+            assert_as_exact(dew, reference, draw, "a product whose arms went unprepared", seeds=8)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product whose arms went unprepared", seeds=8)
+    assert (tmp_path / UNPREPARED).is_file()

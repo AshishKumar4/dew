@@ -704,12 +704,17 @@ def _stored_arms(store: CompiledTruths, label: str, dew_fn, reference_fn, also: 
 def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str):
     """A site's arm `role` (`given_fn` as the site passed it, `arm` as compiled) whose every call is its
     draw's program its prepare compiled into `store` (`_ahead_arm`), named as its prepare named it; one no
-    statement holds runs unprepared, named, and one that holds no program as it is (`_stored_arms`)."""
+    statement holds, or whose site's arms its prepare did not finish (its truths written, a failure before
+    its arms': a flow's cell its prepare deferred, `gpu_flow.run_cells`), runs unprepared, named, and one
+    that holds no program as it is (`_stored_arms`)."""
     if not _holds_program(given_fn):
         return arm
     named_role = arm_role(role, given_fn, label)
     if named_role is None:
         store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
+        return arm
+    if not store.holds(armed(label)):
+        store.unprepared(f"{label}: its prepare compiled none of its arms")
         return arm
     return _ahead_arm(given_fn, arm, functools.partial(store.ran, armed(label)), named_role)
 
