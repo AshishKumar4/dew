@@ -454,11 +454,10 @@ def vanishing_entered_draw(seed: int):
 
 def test_a_turned_forked_calls_cancelling_entry_write_keeps_every_gradient_finite():
     """A turned forked call whose documents' entry writes cancel (two terms of one key `(2^80, 0, ...)`,
-    values of 2^80 and -2^80, a weight of one: each write zero): its output and every gradient but the
-    entry weight's finite wherever float64's is a normal float32, where the turns' gradient formed the
-    write's terms one at a time and summed them, inf - inf (base review 2354cbaf7 F1);
-    `chunked_launch.entry_write` sums them aligned. The weight's gradient takes `precision.aligned_sum`'s
-    tangent, a plain sum of its terms' (row 8501)."""
+    values of 2^80 and -2^80, a weight of one: each write zero): its output and every gradient finite
+    wherever float64's is a normal float32, where the turns' gradient formed the write's terms one at a time
+    and summed them, inf - inf (base review 2354cbaf7 F1), and the weight's gradient summed `aligned_sum`'s
+    terms' plainly (row 8501); `chunked_launch.entry_write` sums them aligned, its derivatives too."""
     operands, seeded = entered_draw(TURNED, 0, entries=True)
     key = jnp.zeros_like(operands.entry_key).at[..., 0].set(2.0 ** 80)
     value = jnp.zeros_like(operands.entry_value).at[:, :, 0].set(2.0 ** 80).at[:, :, 1].set(-(2.0 ** 80))
@@ -471,8 +470,6 @@ def test_a_turned_forked_calls_cancelling_entry_write_keeps_every_gradient_finit
         exact = jax.jit(with_gradients(lambda given: document_by_document(TURNED, given)))(*wide)
     leaves = jax.tree_util.tree_leaves_with_path(ours)
     for (path, made), truth in zip(leaves, jax.tree.leaves(exact), strict=True):
-        if jax.tree_util.keystr(path).endswith('entry_weight'):
-            continue
         held = normal_float32(np.asarray(truth))
         wrong = held & ~np.isfinite(np.asarray(made))
         assert not wrong.any(), (jax.tree_util.keystr(path), int(wrong.sum()))
