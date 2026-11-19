@@ -554,8 +554,8 @@ def centre_start(centre: jax.Array) -> Centre:
     return Centre(centre, *(running_sum(centre.shape, jnp.float32) for _ in range(3)))
 
 
-def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: jax.Array, exponent: float
-                ) -> Centre:
+def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: jax.Array,
+                at_anchor: jax.Array, exponent: float) -> Centre:
     """A key tile's part of dropout's centre (`Centre`): `weights` `[bq, bk]` (unnormalized, `exp(s - m)`),
     the tile's dropped `products` (`dropped_products`) and `seen` where a key counts, each product taken at
     `2^exponent`, about the row's anchor's and about zero, before any sum, so no difference or sum overflows
@@ -563,7 +563,9 @@ def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: ja
     term rounded at the scale of the products (a product near 2^123 against a key near 2^30 made dQ infinite
     where it is 1e-127, row 8652), and about the first tile's heaviest a later tile's dominant one was lost
     (the base review of 4e2eb287e, F4). The sums run as the loop's running sums (`added_to`), each tile's
-    rows summed compensated where loops are (`compensates_loops`)."""
+    rows summed compensated where loops are (`compensates_loops`). The anchor's own centred product is
+    zero, as in the score cotangents, even when the separate row and tile contractions round it
+    differently."""
     # The scale a Python float, exact (`centre_scale`'s exponent is within fp32's normal range), so no
     # scalar arithmetic runs in a kernel (Mosaic GPU holds no rank-0 vector).
     factor = 2.0 ** exponent
@@ -573,7 +575,7 @@ def centre_step(state: Centre, weights: jax.Array, products: jax.Array, seen: ja
         values = jnp.where(seen, values, 0.0)
         return compensated_sum(values, (values.ndim - 1,)) if compensates_loops() else values.sum(axis=-1)
 
-    centred = weights * (scaled - expand(state.centre * factor, scaled))
+    centred = jnp.where(at_anchor, 0.0, weights * (scaled - expand(state.centre * factor, scaled)))
     return Centre(state.centre, added_to(state.residual, row_sum(centred)),
                   added_to(state.zero, row_sum(weights * scaled)), added_to(state.mass, row_sum(weights)))
 
@@ -607,19 +609,21 @@ def centre_finish(state: Centre, state_total: jax.Array, initial: jax.Array, exp
                          jnp.where(total > 0, key_index, -1))
 
 
-def dropout_centre(lo, hi, terms: Callable[[jax.Array], tuple[jax.Array, jax.Array, jax.Array]], keys: int,
-                   centre: jax.Array, key_index: jax.Array, state_total: jax.Array, initial: jax.Array, *,
+def dropout_centre(lo, hi, terms: Callable[[jax.Array], tuple[jax.Array, jax.Array, jax.Array, jax.Array]],
+                   keys: int, centre: jax.Array, key_index: jax.Array, state_total: jax.Array,
+                   initial: jax.Array, *,
                    most: int | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Dropout's first pass over a query block (`Centre`): `terms(j)` gives key tile `j`'s unnormalized
-    weights `exp(s - m)`, its dropped products (`dropped_products`) and where its entries are seen. Each
-    product is taken about its query's `centre` (the dropped product at the forward's anchor key
+    weights `exp(s - m)`, its dropped products (`dropped_products`), its visibility and its key indices.
+    Each product is taken about its query's `centre` (the dropped product at the forward's anchor key
     `key_index`) and about zero, scaled, before any sum (`centre_step`), and D is rebuilt about the nearer
     (`centre_finish`): the second sweep's `(anchor, delta, chosen)`, identical products cancelling exactly in
     its cotangents. Its tiles at most `most` (`tiles_walked`)."""
     exponent = centre_scale(keys)
 
     def step(j, state):
-        return centre_step(state, *terms(j), exponent)
+        weights, products, seen, columns = terms(j)
+        return centre_step(state, weights, products, seen, columns == key_index[:, None], exponent)
 
     centred = tiles_walked(lo, hi, step, centre_start(centre), most)
     return centre_finish(centred, state_total, initial, exponent, key_index)
