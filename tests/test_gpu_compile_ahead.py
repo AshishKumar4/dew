@@ -47,13 +47,23 @@ with open(sys.argv[4], "wb") as file:
 """
 """A fresh process compiling the programs for argv[1] on this GPU at argv[2] multiprocessors, as the build
 compiles them, and running them on the arguments at argv[3], their outputs written to argv[4]."""
-BUILD = """
+UNTUNED = 3
+"""The status the build exits with where its compile is refused for a choice no run of the GPU tuned
+(`report.Untuned`), apart from any other failure's."""
+BUILD = f"""
 import sys
 
+from dew.nn.kernels.templates import report
 from dew.training.ahead import compile_programs
 from ahead_programs import programs
 
-compile_programs(programs(sys.argv[1]), sys.argv[1], int(sys.argv[3]), topology=sys.argv[4]).save(sys.argv[2])
+try:
+    built = compile_programs(programs(sys.argv[1]), sys.argv[1], int(sys.argv[3]), topology=sys.argv[4])
+except ValueError as refused:
+    if isinstance(refused.__cause__, report.Untuned):
+        sys.exit({UNTUNED})
+    raise
+built.save(sys.argv[2])
 """
 RUN = """
 import pickle
@@ -286,28 +296,33 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
         (tmp_path / name).write_text(text)
     # Every process the autotuner on and measuring, the lane's level 0 and deterministic ops left out (under
     # which XLA measures nothing and keeps no picks), every other flag kept, so the build and the run agree
-    # on their compile options; and one store of picks, which here's compile writes and the build reads
-    # (row 8457: at level 0 nothing tuned, so a node's compile never met an untuned choice and its file
-    # never said one).
+    # on their compile options; one store of picks of its own, written as well as read (a packed job's
+    # read-only mode left out: row 8783), which here's compile writes and the build reads; and a compilation
+    # cache of its own, which no other job's executable serves (row 8457: at level 0 nothing tuned, so a
+    # node's compile never met an untuned choice and its file never said one).
     environment = environment_of(tmp_path)
-    picks = "--xla_gpu_per_fusion_autotune_cache_dir"
+    picks, mode = "--xla_gpu_per_fusion_autotune_cache_dir", "--xla_gpu_experimental_autotune_cache_mode"
     environment["XLA_FLAGS"] = " ".join((without_flags(
-        environment.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level", "--xla_gpu_deterministic_ops", picks),
-        f"{picks}={tmp_path / 'picks'}"))
+        environment.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level", "--xla_gpu_deterministic_ops", picks,
+        mode), f"{picks}={tmp_path / 'picks'}"))
+    environment["JAX_COMPILATION_CACHE_DIR"] = str(tmp_path / "cache")
     arrays = {name: [np.asarray(array) for array in drawn] for name, drawn in arguments(generation).items()}
     (tmp_path / "arguments.pkl").write_bytes(pickle.dumps(arrays))
-    # Compiled first on this GPU, which tunes them and leaves its choices beside the compilation cache the
-    # build reads (row 8422: a node's programs compile tuned or are refused).
-    subprocess.run([sys.executable, str(tmp_path / "here.py"), generation, str(own.multiprocessors),
-                    str(tmp_path / "arguments.pkl"), str(tmp_path / "here.pkl")], env=environment, check=True)
-    here = pickle.loads((tmp_path / "here.pkl").read_bytes())
     topology = tmp_path / "topology.bin"
     topology.write_bytes(topologies.get_attached_topology("cuda").serialize())
     # Built where no GPU is visible, as a CPU host builds them, over this GPU's serialized topology.
-    # For this GPU: its generation and its own multiprocessors.
+    # For this GPU: its generation and its own multiprocessors. Refused before this GPU tuned them: their
+    # picks are none yet.
     build = [sys.executable, str(tmp_path / "build.py"), generation, str(tmp_path / "programs.dew-aot"),
              str(own.multiprocessors), str(topology)]
-    subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
+    deviceless = {**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}
+    assert subprocess.run(build, env=deviceless).returncode == UNTUNED
+    # Compiled on this GPU, which tunes them and leaves its choices in the store the build reads (row 8422:
+    # a node's programs compile tuned or are refused); then built.
+    subprocess.run([sys.executable, str(tmp_path / "here.py"), generation, str(own.multiprocessors),
+                    str(tmp_path / "arguments.pkl"), str(tmp_path / "here.pkl")], env=environment, check=True)
+    here = pickle.loads((tmp_path / "here.pkl").read_bytes())
+    subprocess.run(build, env=deviceless, check=True)
     # Loaded and run in a fresh process whose compilers' dumps must stay empty; refused in one whose XLA
     # computes otherwise.
     run = [sys.executable, str(tmp_path / "run.py"), str(tmp_path / "programs.dew-aot"),
