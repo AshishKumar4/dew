@@ -442,7 +442,7 @@ template takes it (row 8991)."""
 def untimed(case: "PortCase | ScanCase") -> str:
     """A cell's words for `case`'s rows and tokens where no receipt timed them (`TIMED`), none where one
     did."""
-    return "" if (case.rows, case.tokens) == TIMED else f", {case.rows} rows of {case.tokens} tokens"
+    return "" if (case.rows, case.tokens) == TIMED else f", {case.rows}x{case.tokens} tokens"
 
 
 B200 = "on a B200, by device time"
