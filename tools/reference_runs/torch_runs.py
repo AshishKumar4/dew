@@ -182,7 +182,7 @@ def record(args: argparse.Namespace, place: Ranks, run: Split, curves: Curves, w
         "lr": curves.rates,
         "throughput": throughput(curves.window_seconds, curves.timed_steps, tokens_per_step,
                                  curves.step_seconds),
-        "flops_per_token": work.training_flops_per_step / work.tokens_per_step,
+        "flops_per_token": work.training_flops_per_step / tokens_per_step,
         "work": dataclasses.asdict(work),
         "mfu": mfu(work.training_flops_per_step, curves.timed_steps, curves.window_seconds, peak_rate,
                    place.world),

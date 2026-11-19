@@ -235,18 +235,20 @@ def made(requirements: list[str]) -> Path:
     purelib = "import sysconfig; print(sysconfig.get_paths()['purelib'])"
     site = subprocess.run([str(python), "-c", purelib], capture_output=True, text=True,
                           check=True).stdout.strip()
-    # Dew's environment beneath its own (a .pth is read after the environment's own packages): a reference
-    # tool runs Dew's side and the reference's in one file, each in its own interpreter, and imports both.
-    Path(site, "_tool_types_dew.pth").write_text(f"{sysconfig.get_paths()['purelib']}\n")
+    # One .pth, read after the environment's own packages, its lines in order: each repository pin's checkout
+    # (a src layout's packages under its src/, as an editable install puts them on the path), then Dew's
+    # environment beneath them all: a reference tool runs Dew's side and the reference's in one file, each in
+    # its own interpreter, and imports both.
+    paths = []
     for source in filter(None, map(SOURCE.match, requirements)):
         checkout = where / "sources" / source["name"]
         subprocess.run(["git", "init", "--quiet", str(checkout)], check=True)
         subprocess.run(["git", "-C", str(checkout), "fetch", "--quiet", "--depth=1", source["url"],
                         source["sha"]], check=True)
         subprocess.run(["git", "-C", str(checkout), "checkout", "--quiet", "FETCH_HEAD"], check=True)
-        # A src layout's packages are under its src/, as an editable install of it puts them on the path.
-        root = checkout / "src" if (checkout / "src").is_dir() else checkout
-        Path(site, f"_tool_types_{source['name']}.pth").write_text(f"{root}\n")
+        paths.append(checkout / "src" if (checkout / "src").is_dir() else checkout)
+    paths.append(Path(sysconfig.get_paths()["purelib"]))
+    Path(site, "_tool_types.pth").write_text("".join(f"{path}\n" for path in paths))
     (where / "made").write_text(json.dumps(requirements))
     return python
 

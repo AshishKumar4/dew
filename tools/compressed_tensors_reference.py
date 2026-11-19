@@ -69,8 +69,10 @@ def extremes(weight: torch.Tensor, args: QuantizationArgs) -> tuple[torch.Tensor
     if args.strategy == "channel":
         return weight.amin(-1, keepdim=True), weight.amax(-1, keepdim=True)
     if args.strategy in ("group", "tensor_group"):
+        assert args.group_size is not None  # A group strategy's args name its size.
         groups = weight.unflatten(-1, (-1, args.group_size))
         return groups.amin(-1), groups.amax(-1)
+    assert args.block_structure is not None  # The block strategy, the one left, names its blocks.
     rows, columns = args.block_structure
     blocks = weight.unflatten(0, (-1, rows)).unflatten(-1, (-1, columns))
     return blocks.amin((1, 3)), blocks.amax((1, 3))
@@ -104,6 +106,7 @@ def main() -> None:
         if not args.symmetric:
             state["weight_zero_point"] = zero
         if args.actorder == "group":
+            assert args.group_size is not None  # Group activation order is a group strategy's.
             state["weight_g_idx"] = torch.randperm(96, generator=generator) // args.group_size
             state["weight_g_idx"] = state["weight_g_idx"].to(torch.int32)
         stored = compressor.compress(dict(state), scheme)

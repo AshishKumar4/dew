@@ -10,6 +10,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Hashable, Iterable
 from pathlib import Path
+from typing import TypeGuard
 
 GPU_HEADROOM = (1.25, 2 ** 30)
 """A file's share of the GPU over its recorded peak, a factor and bytes beside it: the allocator's
