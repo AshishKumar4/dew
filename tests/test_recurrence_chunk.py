@@ -1110,6 +1110,27 @@ def test_the_templates_documents_adding_a_slot_are_as_exact_as_each_alone_interp
     the_templates_forked_documents_are_as_exact_as_each_alone(hooks, added=True)
 
 
+@pytest.mark.parametrize('hooks', FORKED_TEMPLATE, ids=str)
+def test_a_forked_call_of_entry_writes_of_no_terms_lowers_on_the_template(hooks):
+    """A forked call whose documents' entry writes take no terms (`Chunk.entry_key` `[B, D, 0, H, K]`),
+    through the public chunked op on the template, its gradient lowered for an H100: each chunk's write
+    zero (`chunked_launch.entry_write`, row 8967), where its documents' terms flattened by an inferred
+    extent of no elements refused the call (`ForkedChunks.entries`, head review of 512810acf F3)."""
+    operands = entering_documents(narrowed_draw(hooks, 0)[0])
+    rows, documents, value_heads = operands.value.shape[0], len(DOCUMENTS[0]), operands.value.shape[2]
+    operands = dataclasses.replace(
+        operands, entry_key=jnp.zeros((rows, documents, 0, *operands.key.shape[2:])),
+        entry_value=jnp.zeros((rows, documents, 0, *operands.value.shape[2:])),
+        entry_weight=jnp.ones((rows, documents, value_heads)))
+
+    def loss(given):
+        out, final = chunk_on('mosaic_gpu', hooks, given)
+        return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
+
+    with generation.assumed('sm90'):
+        jax.jit(jax.grad(loss, allow_int=True)).trace(operands).lower(lowering_platforms=('cuda',))
+
+
 def test_a_turned_forked_call_adding_a_slot_is_refused():
     """A turned call's documents adding a second table slot (`Chunk.adds` under `Hooks.turns`) are refused:
     its turns' gradient composes each document's frames from the one slot it loads (`turned._forked_frames`),
