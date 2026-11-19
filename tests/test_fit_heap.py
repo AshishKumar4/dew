@@ -109,11 +109,7 @@ def test_a_compile_mid_fit_collects_before_the_steps_after_it():
     def stepped(state):
         events.append(("step", 0))
         if not made:
-            gc.disable()  # Made pending, none collected while made.
-            try:
-                made.extend([index] for index in range(sys.getallocatedblocks() // 2))
-            finally:
-                gc.enable()
+            made.extend(pending())
 
     def collecting(phase, info):
         if phase == "start":
