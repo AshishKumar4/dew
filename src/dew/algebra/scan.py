@@ -1034,12 +1034,15 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
     from dew.nn.kernels import recurrence_algebra
 
     issue = issue or _issued
-    active = jnp.any(~_crossed(between), axis=-1)
+    active, scalar = jnp.any(~_crossed(between), axis=-1), between.shape[-1] == 1
     reads = jnp.where(active, issue("scores", readers, values.T), 0.0)
+    if scalar:
+        # Out before a weight multiplies it: an overflowing product times a level's zero weight is NaN.
+        reads = _underflowed_out(reads, between)
     if weights is not None:
         reads = reads * weights
-    if between.shape[-1] == 1:
-        return issue("apply", _underflowed_out(reads, between) * between[..., 0], keys)
+    if scalar:
+        return issue("apply", reads * between[..., 0], keys)
     count = keys.shape[0]
     sub = recurrence_algebra.SUB
     rows = []
