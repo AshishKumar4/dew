@@ -45,6 +45,13 @@ def tier_arguments(choosing: argparse.ArgumentParser) -> None:
     choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
 
 
+def fetching_arguments(operation: argparse.ArgumentParser, deadline: float) -> None:
+    """The deadline an operation that collects tests, `pytest` and `gpu-tier`, fetches the pins its store
+    lacks within first (ci.py's `main`), as a task does within its own (`task_arguments`)."""
+    operation.add_argument("--deadline", type=float, default=deadline,
+                           help="seconds the pins' fetch may take")
+
+
 def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
     """ci.py's command line, every operation's arguments: the tested Pythons are `pythons`, a task's own
     deadline `deadline`."""
@@ -63,6 +70,7 @@ def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
                            help="--tests' group as CI names it: 1/3, a check-1 site's test or its draws")
     selecting.add_argument("arguments", nargs=argparse.REMAINDER,
                            help="after --, pytest's own: files, node ids and options")
+    fetching_arguments(selecting, deadline)
     measuring = operations.add_parser("coverage")
     stages = measuring.add_subparsers(dest="stage", required=True)
     itemizing = stages.add_parser("items")
@@ -72,7 +80,10 @@ def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
                            help="the scenario suite's tasks alone (coverage_report.py SCENARIO_SUITE)")
     reporting = stages.add_parser("report")
     reporting.add_argument("directory", type=Path)
-    tier_arguments(operations.add_parser("gpu-tier"))
+    tier_arguments(tiering := operations.add_parser("gpu-tier"))
+    tiering.add_argument("--python", choices=pythons, default=pythons[0],
+                         help="the interpreter it collects with")
+    fetching_arguments(tiering, deadline)
     lane = operations.add_parser("gpu-lane")
     lane.add_argument("--tests", help="the test files; with --network, every file holding a "
                                        "network-marked test by default (`network_files`)")

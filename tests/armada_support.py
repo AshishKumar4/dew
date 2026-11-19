@@ -107,6 +107,9 @@ def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 
     starts it: .armada.json's command filled from its plan entry, in .armada.json's environment, which the
     plan's DEW_TEST_CACHE is not part of. Their rows, in the plan's order."""
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
+    # Run in an environment holding every pin its checkout names, as one built at that checkout does: a
+    # scratch checkout's pins name payloads no store holds, and fetching them is no part of what these show.
+    monkeypatch.setattr(ci.digests.fetched, "absent", lambda root: {})
     monkeypatch.setenv("DEW_TEST_CACHE", policy)
     entries = [entry for entry in ci.plan(target, timings or {}, census=census) if entry["python"] == "3.12"]
     monkeypatch.delenv("DEW_TEST_CACHE")

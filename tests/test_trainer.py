@@ -2427,3 +2427,35 @@ def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path
     restored, *_ = resumed.checkpoints.restore(resumed.initial_state())
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(restored.variables))
     refuse_non_finite(restored, 3, lambda: 2)
+
+
+def test_a_trainers_refit_traces_its_step_and_start_once_and_another_trainers_its_own():
+    """A trainer fit again in its process (a suite's draws, a pool's fits) reads the step and the start its
+    first fit traced: its objective states its trace, and its optimizer, an Optax transformation given
+    built, keys them by the object itself (`objectives.base.Held`), so its refit traces neither (PF03, rows
+    7381, 8407). A trainer handed an equal-looking transformation built apart keys apart and traces its
+    own, and a user's objective that states no trace traces its step at each fit, as nothing states what its
+    loss reads."""
+    from test_run_budgets import FEATURES, Pulled
+
+    from dew.telemetry.compiles import Compiles
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, dtype="float32")
+    objective = LMObjective(model, seq_len=LM_CONTEXT)
+
+    def traced(trainer, data) -> set[str]:
+        with Compiles(None) as compiles:
+            trainer.fit(data, steps=3, log_every=1)
+        return {program.name for program in compiles.programs if program.kind == "traced"}
+
+    trainer = Trainer(objective, optax.adam(1e-2), key=0)
+    assert {"step", "traced"} <= traced(trainer, lm_data())
+    again = traced(trainer, lm_data())
+    assert not {"step", "traced"} & again, again
+    assert {"step", "traced"} <= traced(Trainer(objective, optax.adam(1e-2), key=0), lm_data())
+    drawn = np.random.default_rng(0).standard_normal((64, FEATURES)).astype(np.float32)
+    rows = Pipeline(Memory({"x": drawn})).repeat()
+    unstated = Trainer(Pulled(), optax.adam(1e-2), key=0)
+    traced(unstated, rows.batch(8))
+    assert "step" in traced(unstated, rows.batch(8))

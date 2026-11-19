@@ -37,10 +37,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew import _position
+from dew import _cgroups as cgroups, _position
 from dew._records import JSON, boolean, integer, integers, json_value, listed, record, strings, text
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Draws, Phase, padded_rows
-from dew.data import cgroups
 from dew.mesh import LayoutRefused, batch_axes
 from dew.registry import from_record, to_record
 

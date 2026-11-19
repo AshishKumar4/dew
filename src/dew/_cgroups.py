@@ -1,7 +1,8 @@
 """A process's cgroup (v2) limits, read raw: its own cgroup, which /proc/self/cgroup names, each ancestor
 up to the hierarchy's root, and the CPU quota and memory each states. The standard library alone, so a
 tool loads it by its path before Dew is importable (CI's `tools/armada/host.py`); `dew.data.dataset.Host`
-sizes automatic loading by it (row 4161)."""
+sizes automatic loading by it (row 4161) and the kernels' compile slots their count (`usable_cpus`), so it
+sits below both the data and the model layers."""
 
 from __future__ import annotations
 

@@ -396,7 +396,7 @@ class AheadOfTime:
         is (`loaded`), where it would have compiled it (`dew.nn.kernels.options.taking`)."""
         def load(executable: Executable) -> Callable[[], jax.stages.Compiled]:
             def loaded() -> jax.stages.Compiled:
-                found = jax.devices()
+                found = jax.devices() if self.built is None else self.built.own_devices()
                 self.held(found)
                 return executable.loaded(found)
             return loaded
@@ -477,7 +477,7 @@ class AheadOfTime:
         """The executable, loaded onto this process's devices, which must be `devices` GPUs or TPUs of
         `generation`: called with the state and batch the step was compiled for, it runs the step. It is
         admitted as a compiled one is (`dew.communicators.admit`)."""
-        found = jax.devices()
+        found = jax.devices() if self.built is None else self.built.own_devices()
         self.held(found)
         return self.executable.loaded(found)
 
@@ -660,6 +660,12 @@ class BuildTarget:
             found.append(f"memory {self.memory} bytes, not {other.memory}")
         return found
 
+    def own_devices(self) -> list:
+        """This process's devices of the build's platform, which its loaders load onto and check (`held`):
+        the host's CPUs for a CPU's build (`cpu`), which a GPU's process holds beside its GPUs, else the
+        process's own."""
+        return jax.devices("cpu") if self.cpu is not None else jax.devices()
+
     def held(self, devices: Sequence) -> None:
         """Refused, naming what differs, where `devices` under this process's JAX, XLA flags and host are not
         this target."""
@@ -688,10 +694,6 @@ class AheadPrograms:
     for a generation's canonical GPUs is XLA's untuned program (`compile_programs`), which `loaded`
     refuses where the process's own compile would tune (row 8422: untuned convolutions left cuDNN's runtime
     heuristic to pick a non-deterministic algorithm)."""
-    at_run: tuple[str, ...] = ()
-    """The programs that leave a choice to run time their device's own compile makes (`report.at_run_time`:
-    a convolution compiled for compile-only GPUs), which `loaded` refuses on any GPU: each is compiled there
-    in its place."""
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
@@ -706,24 +708,20 @@ class AheadPrograms:
         return programs
 
     def loaded(self) -> dict[str, jax.stages.Compiled]:
-        """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices, the ones
-        it was compiled for: each called with the arguments it was compiled for runs it. Refused, naming what
-        differs, where those devices, this JAX, its XLA flags or its host are not the target they were built
-        for, and where they would not run as this process's own compile of them (`report.compiled_as_here`:
-        untuned where it tunes, or a choice left to run time, `at_run`); each is admitted as a compiled
-        program is (`dew.communicators.admit`)."""
-        devices = jax.devices()[:self.target.devices]
+        """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices of its
+        platform (`BuildTarget.own_devices`), the ones it was compiled for: each called with the arguments it
+        was compiled for runs it. Refused, naming what differs, where those devices, this JAX, its XLA flags
+        or its host are not the target they were built for, and where they would not run as this process's
+        own compile of them (`report.compiled_as_here`: untuned where it tunes; none leaves a choice to run
+        time, which `compile_programs` refuses); each is admitted as a compiled program is
+        (`dew.communicators.admit`)."""
+        devices = self.target.own_devices()[:self.target.devices]
         self.target.held(devices)
-        if not report.compiled_as_here(devices, tuned=self.tuned, at_run=bool(self.at_run)):
-            raise ValueError(
-                f"programs {', '.join(self.at_run)} were compiled without their GPU and leave a "
-                "convolution's algorithm to run time (report.DEVICELESS_CONVOLUTION_PICKS): compile them on "
-                "this GPU"
-                if self.at_run else
-                f"these programs were compiled for {self.target.generation}'s canonical GPUs, untuned (XLA's "
-                "defaults where a device's compile tunes its convolutions and GEMMs): compile them for this "
-                "node's topology (compile_programs' topology, $DEW_NODE_TOPOLOGY), or run with the autotuner "
-                "off (xla_gpu_autotune_level 0)")
+        if not report.compiled_as_here(devices, tuned=self.tuned, at_run=False):
+            raise ValueError(f"these programs were compiled for {self.target.generation}'s canonical GPUs, "
+                             "untuned (XLA's defaults where a device's compile tunes its convolutions and "
+                             "GEMMs): compile them for this node's topology (compile_programs' topology, "
+                             "$DEW_NODE_TOPOLOGY), or run with the autotuner off (xla_gpu_autotune_level 0)")
         return {name: program.loaded(devices) for name, program in self.programs.items()}
 
 
@@ -940,8 +938,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     (`report.for_devices`), a choice none has tuned refused, named; over the generation's canonical GPUs
     it is XLA's untuned program, which its file says (`AheadPrograms.tuned`) and a tuning process refuses
     to load (row 8422). A program holding a choice only its GPU makes (`report.at_run_time`: a convolution)
-    is refused over a node's topology before any compiles (`report.CompiledOnDevice`, naming each), and
-    over the canonical GPUs compiled for its file to say (`AheadPrograms.at_run`), refused at its load."""
+    is refused before any compiles (`report.CompiledOnDevice`, naming each): no GPU's load would take it."""
     target = built_target(generation, multiprocessors)
     gpus = (compile_only_gpus(generation, multiprocessors=multiprocessors) if topology is None
             else host_gpus(generation, topology, 1))
@@ -965,8 +962,8 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     # whose kernel spills there is derived again at its next config; for a node, tuned or refused.
     at_run = tuple(name for name, (lowered, _, _) in zip(programs, lowerings, strict=True)
                    if report.at_run_time(lowered))
-    if at_run and topology is not None:
-        # A node's run compiles them on its GPU, whose choices they would leave to run time here.
+    if at_run:
+        # Their run compiles them on its GPU, whose choices they would leave to run time here.
         raise report.CompiledOnDevice(lowerings[0][0], at_run)
     with report.for_devices() if topology is not None else contextlib.nullcontext():
         tuned = report.autotuned(gpus[:1])
@@ -983,7 +980,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
             raise ValueError(f"program {name!r} cannot be compiled ahead (an array it closed over is a "
                              "constant of its program, which no executable serializes: pass it as an "
                              f"argument): {refused}") from refused
-    return AheadPrograms(BuildTarget.built(target, 1), built, tuned=tuned, at_run=at_run)
+    return AheadPrograms(BuildTarget.built(target, 1), built, tuned=tuned)
 
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:

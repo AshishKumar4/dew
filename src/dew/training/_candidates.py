@@ -222,6 +222,16 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     return candidate
 
 
+def forget(lowered: jax.stages.Lowered) -> None:
+    """Drop every step this process keeps for a trainer built anew (`candidate_for`) lowered as `lowered`:
+    one whose program a compile guided by a profile supersedes (`Planned.guided`), whose executable a kept
+    lowering would hold alive beside the guided one (JAX keeps each executable of a lowering while it
+    lives)."""
+    with _KEEPING:
+        for key in [key for key, kept in _CANDIDATES.items() if kept.lowered is lowered]:
+            del _CANDIDATES[key]
+
+
 def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Candidate, batch: Batch,
                               placement, replicated, split: int, platforms: tuple[str, ...] | None
                               ) -> Callable[[], jax.stages.Lowered] | None:

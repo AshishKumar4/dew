@@ -701,7 +701,7 @@ def host_facts() -> dict:
     counts and the cgroup files it reads, so an arm's record says why its workers were what they were."""
     import psutil
 
-    from dew.data import cgroups
+    from dew import _cgroups as cgroups
     from dew.data.dataset import Host
 
     group = cgroups.own()
