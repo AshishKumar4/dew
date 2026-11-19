@@ -14,7 +14,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import after_walk, handoffs, mosaic, resources, rings, swizzling
+from dew.nn.kernels.templates import after_walk, handoffs, mosaic, resources, swizzling
 from dew.nn.kernels.templates.mosaic_sm100 import (
     STORED,
     TMEM,
