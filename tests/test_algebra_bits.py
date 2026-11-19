@@ -80,15 +80,14 @@ def test_nvfp4_words_stored_in_the_forms_layout_decode_to_their_codes_in_order()
 
 
 def test_a_decoded_value_restored_wide_is_its_float32_restoring_widened():
-    """`bits.restored` in float64, a float64 truth's, is its float32 restoring widened, bit for bit, at every
-    16-bit pattern (a NaN as a NaN, its payload the cast's): one definition of the decoded value at every
-    dtype (row 8661)."""
+    """`bits.restored` in float64, a float64 truth's, is its float32 restoring widened as the device widens
+    it, bit for bit, at every 16-bit pattern (a NaN as a NaN, its payload the cast's): one definition of the
+    decoded value at every dtype (row 8661)."""
     patterns = jnp.arange(1 << 16, dtype=jnp.uint32)
-    narrow = np.asarray(jax.jit(bits.restored)(patterns))
     with jax.enable_x64(new_val=True):
         wide = np.asarray(jax.jit(lambda pattern: bits.restored(pattern, jnp.float64))(patterns))
-    assert wide.dtype == np.float64
-    widened = narrow.astype(np.float64)
+        widened = np.asarray(jax.jit(lambda pattern: bits.restored(pattern).astype(jnp.float64))(patterns))
+    assert wide.dtype == widened.dtype == np.float64
     numbers = ~np.isnan(widened)
     np.testing.assert_array_equal(np.isnan(wide), ~numbers)
     np.testing.assert_array_equal(wide[numbers].view(np.uint64), widened[numbers].view(np.uint64))

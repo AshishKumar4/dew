@@ -380,15 +380,12 @@ def exact_banks(taken) -> dict:
 
 def exact_codes(words: jax.Array, dtype) -> jax.Array:
     """The E2M1 values of an NVFP4 matrix's stored words (`[..., depth / 8, width]`, `NvFp4`'s staged order)
-    in `dtype`, in the depths' own order: the stored form's decode (`bits.NVFP4_BFLOAT16_FORM`, each code
-    times 2^-126 as a bfloat16's bits) restored to the code by `bits.restored`, in `dtype`."""
+    in `dtype`, in the depths' own order (`bits.nvfp4_codes`, the portable decode's codes)."""
     from dew.algebra import bits
     from dew.nn.kernels.formats import staged_rows
 
     def one(words: jax.Array) -> jax.Array:
-        decoded = bits.NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T
-        pattern = jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32)
-        codes = bits.restored(pattern, dtype)
+        codes = bits.nvfp4_codes(words, dtype)
         return codes[np.argsort(staged_rows(codes.shape[0]))]
 
     for _ in range(words.ndim - 2):
@@ -832,7 +829,7 @@ def loaded(flow: ModelFlow) -> dict[str, Callable]:
     the draw's inputs whose results are fetched to the host, as check 1 holds an arm's (`reference_error`):
     no arm's outputs stay on the GPU while the next program runs, which the flow's needs count none of
     (`need`)."""
-    from truths_ahead import AT_RUN, COMPILED
+    from truths_ahead import AT_RUN
 
     from dew.training.ahead import AheadPrograms
 
@@ -843,14 +840,14 @@ def loaded(flow: ModelFlow) -> dict[str, Callable]:
         for name, program in AheadPrograms.load(directory / f"{arm}.programs").loaded().items()}
     # Each program its prepare could not prepare compiled on this GPU as it first runs, under this process's
     # flags, traced as its prepare traced it (the reference arm under its reference kernels), named in the
-    # run's summary as its prepare declared (`truths_ahead.AT_RUN`), as an at-run site's truths are.
+    # run's summary as its prepare declared (`truths_ahead.AT_RUN`), in the flow's truths' store, as an at-run
+    # site's truths are (the store a flow's run opens names its records, tests/conftest.py's).
     named = programs_of(flow) if on_device else {}
-    store = COMPILED.get()
-    for name, why in on_device.items():
-        kernels = reference_kernels() if name.endswith(" reference") else {}
-        held[name] = jax.jit(functools.partial(_traced_under, named[name][0], kernels))
-        if store is not None:
-            store.unprepared(f"{flow.name} {name}: {why}", AT_RUN)
+    with compiled_truths(directory / "truths", prepare=False, stamp=stamp()) as truths:
+        for name, why in on_device.items():
+            kernels = reference_kernels() if name.endswith(" reference") else {}
+            held[name] = jax.jit(functools.partial(_traced_under, named[name][0], kernels))
+            truths.unprepared(f"{flow.name} {name}: {why}", AT_RUN)
     return {name: as_given(lambda params, *inputs, program=program: jax.device_get(
                 program(*jax.tree.leaves(params), *inputs))) for name, program in held.items()}
 

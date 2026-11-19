@@ -249,11 +249,8 @@ def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monk
     assert all("convolution compiled without its GPU" in why for why in on_device.values())
     assert not (held / "dew.programs").exists() and not (held / "reference.programs").exists()
     assert len(list((held / "truths").iterdir())) == len(flow.kinds)
-    test = store / "test"
-    monkeypatch.setenv("PYTEST_CURRENT_TEST", f"tests/test_gpu_flows.py::cell[{flow.name}] (call)")
-    with compiled_truths(test, prepare=False, stamp=model_flows.stamp()):
-        assert sorted(model_flows.loaded(flow)) == sorted(on_device)
-    named = json.loads((test / AT_RUN).read_text())["reasons"]
+    assert sorted(model_flows.loaded(flow)) == sorted(on_device)
+    named = json.loads((held / "truths" / AT_RUN).read_text())["reasons"]
     assert sorted(reason["error"] for reason in named) == sorted(
         f"{flow.name} {name}: {why}" for name, why in on_device.items())
 
