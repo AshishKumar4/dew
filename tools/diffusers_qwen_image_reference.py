@@ -55,6 +55,7 @@ from typing import Any
 import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline
+from reference_releases import commit
 
 from _dew_torch.precision import float64, float64_twin
 
@@ -63,7 +64,7 @@ SOURCE = ROOT / "tests" / "fixtures" / "hf" / "qwen-image-2.1-source"
 COHORT = "diffusers-qwen-image"
 """The reference releases this tool runs against (tools/reference_releases.py), and the environment
 tools/check_tool_types.py checks it in."""
-DIFFUSERS_COMMIT = "6256aa7666cedd47443adc8f82da9a10e110b09c"
+DIFFUSERS_COMMIT = commit("diffusers-qwen-image", "diffusers")
 BASE: dict[str, Any] = dict(patch_size=1, in_channels=8, out_channels=8, num_layers=2, attention_head_dim=12,
             num_attention_heads=2, context_in_dim=16, mlp_ratio=3, axes_dims_rope=(4, 4, 4),
             eps=1e-6, causal_condition=True)

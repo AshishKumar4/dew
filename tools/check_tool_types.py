@@ -136,13 +136,28 @@ def imported(path: Path) -> set[str]:
     return names
 
 
-def located(name: str) -> list[Path]:
+def roots_of(path: Path) -> tuple[str, ...]:
+    """Where an import of the file `path` is looked up: its pyproject.toml execution environment's extraPaths
+    when it sits under one's root (tools/armada's scripts import their neighbours by name), then `ROOTS`."""
+    configuration = ROOT / "pyproject.toml"
+    if not configuration.is_file():
+        return ROOTS
+    pyright = tomllib.loads(configuration.read_text()).get("tool", {}).get("pyright", {})
+    for environment in pyright.get("executionEnvironments", []):
+        if path.is_relative_to(ROOT / environment["root"]):
+            return (*environment.get("extraPaths", []), *ROOTS)
+    return ROOTS
+
+
+def located(name: str, roots: tuple[str, ...] = ROOTS) -> list[Path]:
     """The checkout's files an import of `name` executes: each package's __init__.py on the way and the
-    module, looked up under `ROOTS` in order, the first root holding its first part."""
+    module, looked up under `roots` in order, the first root holding its first part as a module or a
+    package (a directory of no Python, such as tools/ci beside tools/armada's ci.py, is neither)."""
     parts = name.split(".")
-    for root in ROOTS:
+    for root in roots:
         base = ROOT / root
-        if not ((base / parts[0]).is_dir() or (base / f"{parts[0]}.py").is_file()):
+        if not ((base / parts[0] / "__init__.py").is_file() or (base / f"{parts[0]}.py").is_file()
+                or (base / parts[0]).is_dir() and any((base / parts[0]).glob("*.py"))):
             continue
         found = []
         for depth in range(1, len(parts) + 1):
@@ -162,8 +177,9 @@ def closure(path: Path) -> list[Path]:
     """Tool `path` and every module of the checkout it imports, followed through their own imports."""
     seen, frontier = {path}, [path]
     while frontier:
-        for name in imported(frontier.pop()):
-            for found in located(name):
+        here = frontier.pop()
+        for name in imported(here):
+            for found in located(name, roots_of(here)):
                 if found not in seen:
                     seen.add(found)
                     frontier.append(found)

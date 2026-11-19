@@ -37,12 +37,13 @@ from typing import Any
 
 import numpy as np
 import torch
+from reference_releases import commit
 
 COHORT = "laya"
 """The reference releases this tool runs against (tools/reference_releases.py), and the environment
 tools/check_tool_types.py checks it in."""
 
-LAYA_COMMIT = "a4a8921afebfd852bba0000475cfb6ab737a124c"
+LAYA_COMMIT = commit("laya", "laya")
 GLOBAL_EVERY_THIRD: dict[str, Any] = {"global_attn_every_n_layers": 3}
 """ModernBERT's layer pattern by its legacy keyword, which ModernBertConfig's __post_init__ reads into its
 layer types though its signature names no such field (transformers 5.16.1)."""

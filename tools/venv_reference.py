@@ -37,13 +37,14 @@ of leaves (tools/native_diffusion_worker.py's `groups`), and the SD pipeline's w
 scheduler's grid."""
 
 DIFFUSERS = importlib.import_module("reference_releases").tested("diffusers")
-PIPELINES = importlib.import_module("reference_releases").RELEASES["diffusers-pipelines"]
+RELEASES = importlib.import_module("reference_releases")
+PIPELINES = RELEASES.RELEASES["diffusers-pipelines"]
 NATIVE_PIPELINES = (f"huggingface/diffusers {PIPELINES['diffusers']} with huggingface/transformers "
                     f"{PIPELINES['transformers']}")
 """The diffusers-pipelines cohort (tools/reference_releases.py) the saved tiny pipelines' own calls run in,
 as a recording names it."""
 SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py",
-                  "reference": "danijar/dreamerv3 e01491fad6434b2245a3b8ca201dd7faedcc458c",
+                  "reference": f"danijar/dreamerv3 {RELEASES.commit('dreamerv3', 'dreamerv3')}",
                   "license": "MIT"},
          **{site: {"test": f"test_maxtext_{site}", "worker": "maxtext_worker.py",
                    "reference": "AI-Hypercomputer/maxtext 0.2.5", "license": "Apache-2.0",
@@ -57,7 +58,7 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                          "license": "Apache-2.0", "distribution": ("vllm", "0.30.0+cu129"), "host": True,
                          "outputs": True},
          "laya": {"test": "test_decision_laya", "worker": "laya_worker.py",
-                  "reference": "NandhaKishorM/laya a4a8921afebfd852bba0000475cfb6ab737a124c",
+                  "reference": f"NandhaKishorM/laya {RELEASES.commit('laya', 'laya')}",
                   "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
          "kimi-k3": {"test": "test_kimi_k3", "worker": "kimi_worker.py", "device": "cuda",
                      "reference": "moonshotai/Kimi-K3 f831ab66814297da540d832a5235f8e904f29d06",
@@ -89,7 +90,8 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                       "distribution": ("torchaudio", "2.11.0+cpu"), "host": True, "outputs": True},
          **{"flaxdiff-" + case.replace("/", "-"): {
              "test": "test_flaxdiff_family_source", "arms": case, "worker": "flaxdiff_family_worker.py",
-             "reference": "AshishKumar4/FlaxDiff 15c55b001304604147a2a8002a76cf5d4c32092f", "license": "MIT"}
+             "reference": f"AshishKumar4/FlaxDiff {RELEASES.commit('flaxdiff-trainer', 'flaxdiff')}",
+             "license": "MIT"}
             for case in importlib.import_module("flaxdiff_family_cases").CASES},
          **{f"multimodal-{family}": {
              "test": "test_multimodal_model", "arms": family, "worker": "multimodal_worker.py",
@@ -127,7 +129,8 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                       "outputs": True},
          "qwen-image-export": {"test": "test_qwen_image_source", "arms": "export",
                                "worker": "qwen_image_export_reference.py",
-                               "reference": "huggingface/diffusers 6256aa7666cedd47443adc8f82da9a10e110b09c",
+                               "reference": "huggingface/diffusers "
+                                            + RELEASES.commit("diffusers-qwen-image", "diffusers"),
                                "license": "Apache-2.0", "distribution": ("transformers", "5.17.0")},
          **{f"wan-{case}": {"test": "test_wan_source", "arms": case, "worker": "wan_worker.py",
                             "reference": f"huggingface/diffusers {DIFFUSERS}", "license": "Apache-2.0",

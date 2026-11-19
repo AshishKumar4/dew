@@ -91,7 +91,8 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "flaxdiff-source": {
         "flaxdiff": "git+https://github.com/AshishKumar4/FlaxDiff@3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a"},
     # FlaxDiff's trainer beside Dew's own JAX (reference_runs/diffusion.py, which records its checkout):
-    # a commit holding the trainer API the run calls (get_diffusion_preset, DiffusionObjective).
+    # a commit holding the trainer API the run calls (get_diffusion_preset, DiffusionObjective), and the
+    # one the schedule, solver and family references fetch their modules at.
     "flaxdiff-trainer": {
         "flaxdiff": "git+https://github.com/AshishKumar4/FlaxDiff@15c55b001304604147a2a8002a76cf5d4c32092f"},
     "laya": {
@@ -124,6 +125,17 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
 build label (`+cpu`) aside. The default cohorts' releases are the test extra's
 (`tested`), so the suite and its fixtures' writers pin one release; a cohort
 recorded against another names its own."""
+
+
+def commit(cohort: str, distribution: str) -> str:
+    """The commit cohort `cohort` pins `distribution` at, a repository pin's (`git+...@<sha>`): the one copy
+    of it, which the tools that fetch or check that repository read."""
+    pin = RELEASES[cohort][distribution]
+    found = re.fullmatch(r"git\+https://\S+@([0-9a-f]{40})", pin)
+    if found is None:
+        raise ValueError(f"{cohort} pins {distribution} at {pin}, a release, not a repository's commit")
+    return found[1]
+
 
 
 def require(*cohorts: str) -> dict[str, str]:

@@ -42,9 +42,10 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from reference_releases import commit
 from reference_source import loaded, package, published_files, saved_fixture
 
-REPO, COMMIT = "AshishKumar4/FlaxDiff", "15c55b001304604147a2a8002a76cf5d4c32092f"
+REPO, COMMIT = "AshishKumar4/FlaxDiff", commit("flaxdiff-trainer", "flaxdiff")
 # In import order: each module's own imports come before it.
 FILES = {
     "common": "2b7e643c25a09dedd5489b7c62c7c18fb48a5dafb277b1d7aebdd34b7a9748b0",

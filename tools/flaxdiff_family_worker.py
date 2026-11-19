@@ -39,10 +39,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict, unflatten_dict
 from flaxdiff_family_cases import CASES
+from reference_releases import commit
 from reference_source import github
 from reference_worker import Applied, answered, serve
 
-REPO, COMMIT = "AshishKumar4/FlaxDiff", "15c55b001304604147a2a8002a76cf5d4c32092f"
+REPO, COMMIT = "AshishKumar4/FlaxDiff", commit("flaxdiff-trainer", "flaxdiff")
 # In import order: each module's own imports come before it.
 FILES = {
     "hilbert": "24b7c9bf77539c0b15ca54ac372d93eba4cdd4fd8ce85e5e95a3ab3d9f7faff7",

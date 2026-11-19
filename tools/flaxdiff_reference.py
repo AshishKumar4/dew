@@ -44,13 +44,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict
+from reference_releases import commit
 
 COHORT = "flaxdiff"
 """The reference releases this tool runs against (tools/reference_releases.py), and the environment
 tools/check_tool_types.py checks it in."""
 
-COMMIT = "3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a"
-HYBRID_COMMIT = "94d2d21caeb79aba48a505fa79d9a1a974751234"
+COMMIT = commit("flaxdiff", "flaxdiff")
+HYBRID_COMMIT = commit("flaxdiff-hybrid", "flaxdiff")
 
 # The model entry of a FlaxDiff run config, at a size a fixture can hold.
 MODEL = {"output_channels": 4, "patch_size": 2, "emb_features": 32, "num_layers": 4,

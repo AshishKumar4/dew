@@ -47,9 +47,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+from reference_releases import commit
 from reference_source import fetched, ran, selected
 
-COMMIT = "15c55b001304604147a2a8002a76cf5d4c32092f"
+COMMIT = commit("flaxdiff-trainer", "flaxdiff")
 FLAXDIFF = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{COMMIT}/flaxdiff/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flaxdiff_solvers" / "solvers.npz"
 STEPS, SIGMA_MAX, RHO, SIGMA_DATA = 12, 80.0, 7.0, 0.5

@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+from reference_releases import commit
 
 if TYPE_CHECKING:
     from vllm.config.device import Device
@@ -61,7 +62,7 @@ COHORT = "vllm-dory"
 tools/check_tool_types.py checks it in."""
 
 FIXTURE = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf' / 'dory-1.0-4b'
-PULL = 'vllm-project/vllm#60149 at shan18/vllm 55076950b6c155f384d6766d63563c3bc20a0e3f'
+PULL = f'vllm-project/vllm#60149 at shan18/vllm {commit("vllm-dory", "vllm")}'
 BASE = '153a17166e5d07bc38184dedeea542d2e8885e55'
 WHEEL = (f'https://wheels.vllm.ai/{BASE}/vllm-0.32.0rc1.dev307%2Bg153a17166-cp38-abi3-'
          'manylinux_2_28_x86_64.whl')

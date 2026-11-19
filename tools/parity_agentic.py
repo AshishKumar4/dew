@@ -34,12 +34,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from parity_rl import ActorConfig, load_verl, stub
+from reference_releases import commit
 from reference_source import git_head, loaded
 
 SOURCES = Path.home() / ".cache/dew/research/src"
 VERL = SOURCES / "verl"
 LIGHTNING = SOURCES / "agent-lightning"
-VERL_REVISION = "12ebe0cb4d300c58449fb6c675379e8700015c51"
+VERL_REVISION = commit("verl-agentic", "verl")
 LIGHTNING_REVISION = "ff9457587fb6ec900e16e93be9ad2d77409afa08"
 OUTPUT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "rl" / "agentic.npz"
 
