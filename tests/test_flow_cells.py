@@ -2,6 +2,8 @@
 failure is kept and raised together, a cell's own skip is reported and the cells after it still run,
 and a flow of no cell that runs is skipped, never passed."""
 
+import inspect
+
 import gpu_flow
 import pytest
 from gpu_flow import Cell, CellsFailed, cells_of, run_cells
@@ -11,10 +13,12 @@ def test_a_flow_runs_every_cell_and_raises_every_failure_together():
     """A failing cell is kept, the cells after it run, and every failure is raised together after the
     last, each by its label."""
     ran = []
+    raised_at: list[int] = []
 
     def failing(name):
         def run():
             ran.append(name)
+            raised_at.append(inspect.currentframe().f_lineno + 1)
             raise AssertionError(f"{name} is off")
         return run
 
@@ -23,6 +27,9 @@ def test_a_flow_runs_every_cell_and_raises_every_failure_together():
                    Cell("last", failing("last"))])
     assert ran == ["first", "passing", "last"]
     assert raised.value.labels == ["first", "last"]
+    # Each failure kept with the frame it was raised at, the cell's own (its report names where it failed).
+    assert [raised.value.where[label][-1] for label in ("first", "last")] == [(__file__, line)
+                                                                              for line in raised_at]
 
 
 def test_a_cell_that_skips_itself_is_reported_and_the_cells_after_it_run():
@@ -200,3 +207,27 @@ def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_pa
 
     run_cells(cells_of(a_case))
     assert ran == ["sm80", "unpinned"]
+
+
+def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (`tier_wire.preparing`, its store open), a cell that raises, computing
+    where nothing computes, is recorded deferred, where it raised (`truths_ahead.DEFERRED`), and the flow
+    passes its prepare, its other cells run; outside a prepare the same cell fails its flow (rows 8505 and
+    8506: such a cell beside a flow's prepared sites turned its test red in the prepare)."""
+    import tier_wire
+    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths
+
+    def computing():
+        raise AttributeError("'jaxlib._jax.Executable' object has no attribute 'local_devices'")
+
+    ran = []
+    flow = [Cell("computes", computing), Cell("prepared", lambda: ran.append("prepared"))]
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        run_cells(flow)
+    # Recorded deferred, never unprepared, which would take the test's run off its store (tests/conftest.py).
+    assert ran == ["prepared"] and (tmp_path / DEFERRED).is_file() and not (tmp_path / UNPREPARED).exists()
+    monkeypatch.delenv(tier_wire.PREPARE)
+    with pytest.raises(CellsFailed) as raised:
+        run_cells(flow)
+    assert raised.value.labels == ["computes"]

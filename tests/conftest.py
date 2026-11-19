@@ -276,12 +276,24 @@ UNPREPARED_RUN = pytest.StashKey[list]()
 order they ran."""
 
 
+AT_RUN_SITES = pytest.StashKey[list]()
+"""This run's tests whose sites' programs their prepare left to the run to compile on its GPU
+(`truths_ahead.AT_RUN`): their records, in the order they ran."""
+
+
 def pytest_terminal_summary(terminalreporter):
     if _remote is not None:
         terminalreporter.write_line(_remote.summary())
+    # Each test run unprepared, with every reason it gave, where and why (`truths_ahead.reasoned`).
     for record in terminalreporter.config.stash.get(UNPREPARED_RUN, []):
-        terminalreporter.write_line(f"unprepared, its sites compiled on its GPU: {record['test']} computes "
-                                    f"before its first check-1 site at {record['where']}")
+        terminalreporter.write_line(f"unprepared, its sites compiled on its GPU: {record['test']}")
+        for reason in record["reasons"]:
+            terminalreporter.write_line(f"  at {reason['where']}: {reason['error']}")
+    # Each test whose arms compiled on its GPU as its prepare stated (`truths_ahead.compiled_at_run`).
+    for record in terminalreporter.config.stash.get(AT_RUN_SITES, []):
+        for reason in record["reasons"]:
+            terminalreporter.write_line(
+                f"arms compiled at run on its GPU: {record['test']}: {reason['error']}")
 
 
 def pytest_runtest_setup(item):
@@ -335,7 +347,7 @@ def compiled_ahead(request):
         yield
         return
     import model_flows
-    from truths_ahead import UNPREPARED, compiled_truths
+    from truths_ahead import AT_RUN, DEFERRED, UNPREPARED, compiled_truths, reasoned
 
     if not tier_wire.preparing():
         record = store / UNPREPARED
@@ -346,6 +358,14 @@ def compiled_ahead(request):
             return
         with compiled_truths(store, prepare=False, stamp=model_flows.stamp()):
             yield
+        if (store / AT_RUN).exists():
+            request.config.stash.setdefault(AT_RUN_SITES, []).append(json.loads((store / AT_RUN).read_text()))
+        # A flow's cells its prepare deferred (`gpu_flow.run_cells`) ran unprepared beside its served ones,
+        # each named.
+        if (store / DEFERRED).exists():
+            deferred = json.loads((store / DEFERRED).read_text())
+            for reason in deferred["reasons"]:
+                reasoned(record, deferred["test"], reason["where"], reason["error"])
         if record.exists():
             # A site its prepare did not reach, or an arm no statement names, ran unprepared
             # (`truths_ahead.running`).

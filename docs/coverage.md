@@ -621,7 +621,7 @@ Branch coverage of src/dew over the scenario suite (the files ci.py SCENARIO_SUI
 | src/dew/algebra/forms.py | 156 | 21 | 44 | 5 | 84.0% |
 | src/dew/interop/autoencoders/kl.py | 17 | 2 | 2 | 1 | 84.2% |
 | src/dew/data/sources/tokens.py | 191 | 21 | 40 | 13 | 84.4% |
-| src/dew/data/cgroups.py | 35 | 3 | 10 | 4 | 84.4% |
+| src/dew/_cgroups.py | 35 | 3 | 10 | 4 | 84.4% |
 | src/dew/diffusion/schedules/common.py | 58 | 9 | 0 | 0 | 84.5% |
 | src/dew/nn/kernels/templates/product.py | 109 | 15 | 20 | 5 | 84.5% |
 | src/dew/interop/config_records.py | 22 | 2 | 4 | 2 | 84.6% |

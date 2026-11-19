@@ -1320,8 +1320,7 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     """Import `tests` under `python` without running them and write one verdict row a file: red
     where collecting it errs or skips on a missing import, which running it would have."""
     began = time.monotonic()
-    command = [f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-rs",
-               *tests]
+    command = [f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-rs", *tests]
     done = subprocess.run(command, capture_output=True, text=True, timeout=deadline)
     output = done.stdout + done.stderr
     errors = dict.fromkeys(re.findall(r"ERROR collecting (tests/\S+\.py)", output), "")
@@ -2409,6 +2408,8 @@ def lane_asked(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int
 def main() -> int:
     parser = command_line.parser(PYTHONS, session.DEADLINE)
     args = parser.parse_args()
+    if args.operation in ("task", "pytest", "gpu-tier"):  # each collects tests: the pins they read, fetched
+        args.deadline -= session.fetched_absent(args.python, args.deadline, digests.fetched.absent(Path()))
     if args.operation == "pythons":
         return pythons(check=args.check)
     if args.operation == "gangs":
@@ -2445,9 +2446,9 @@ def main() -> int:
     if args.operation == "gpu-tier":
         # A GPU runs its marked files alone, a batch's and a day's alike (ledger 2452); --evidence prints that
         # tier, each file with its records' backend reads beside its marked tests.
-        tier, pinned = marked(PYTHONS[0])
+        tier, pinned = marked(args.python)
         if args.evidence:
-            reads = gpu_tier(PYTHONS[0])
+            reads = gpu_tier(args.python)
             for name, count in tier.items():
                 evidence = [item for item in reads.get(name, []) if not item.startswith("mark:")]
                 print(name, f"{count} marked", *evidence, sep="\t")
@@ -2459,8 +2460,7 @@ def main() -> int:
         # And each file's pinned generations, one line of JSON: what a tier's composer cuts each kind's by.
         print(json.dumps(pinned))
         return 0
-    if args.operation == "pytest":
-        # argparse keeps the `--` that sets pytest's arguments apart from these.
+    if args.operation == "pytest":  # argparse keeps the `--` that sets pytest's arguments apart from these
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
         return targeted(args.python, arguments, args.report, args.tests.split(), args.split)
     if args.operation == "gpu-lane":

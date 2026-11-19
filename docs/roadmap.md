@@ -81,6 +81,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
+- A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 
 ## Data
 

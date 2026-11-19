@@ -141,6 +141,35 @@ def capacity_gib(room: int) -> str:
     return str(memory_limited_to(room) / 2**30)
 
 
+def test_a_background_compile_takes_no_slot_a_step_waits_for():
+    """One compile slot (`report.CompileSlots`), held: a background compile (a start's program, `options
+    .compiling`) and a step's then wait for it, and when it frees the step's takes it first, the background
+    one only once no step's waits."""
+    import threading
+    import time
+
+    from dew.nn.kernels.templates.report import CompileSlots
+
+    slots, order = CompileSlots(1), []
+
+    def compile_(name, background):
+        with slots.held(background=background):
+            order.append(name)
+
+    with slots.held(background=False):
+        waiting = [threading.Thread(target=compile_, args=(name, name == "start"))
+                   for name in ("start", "step")]
+        for thread in waiting:
+            thread.start()
+        # The step's compile waiting before the slot frees: its order is the slots', not the threads'.
+        deadline = time.monotonic() + 10
+        while not slots._waiting and time.monotonic() < deadline:
+            time.sleep(0.01)
+    for thread in waiting:
+        thread.join(timeout=10)
+    assert order == ["step", "start"], order
+
+
 def test_a_program_compiled_ahead_runs_in_place_of_compiling():
     """A program compiled ahead over its arguments' shapes runs where a call of it lowers that program
     (`dew.nn.kernels.options.taking`, by its digest): the call compiles nothing and answers as the program
@@ -188,10 +217,10 @@ begun, ended = threading.Event(), threading.Event()
 compiled = report.attempted
 
 
-def attempted(lowered, held):
+def attempted(lowered, held, **given):
     begun.set()
     try:
-        return compiled(lowered, held)
+        return compiled(lowered, held, **given)
     finally:
         ended.set()
 
@@ -2204,9 +2233,9 @@ def test_programs_compiled_ahead_for_a_generation_are_untuned_and_refused_where_
 def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path, monkeypatch):
     """A compile without a device cannot pick a cuDNN convolution's algorithm, which is then picked at run
     time, on an A100 not the same each run (`report.DEVICELESS_CONVOLUTION_PICKS`, row 7941): over a node's
-    topology, autotuner off as a repeatable lane runs, a program holding a convolution is refused before
-    any compiles (`report.CompiledOnDevice`), named, where a product alone compiles; over the generation's
-    canonical GPUs its file says so (`AheadPrograms.at_run`), which every GPU's load refuses."""
+    topology, autotuner off as a repeatable lane runs, and over the generation's canonical GPUs alike, a
+    program holding a convolution is refused before any compiles (`report.CompiledOnDevice`), named, where a
+    product alone compiles."""
     from jax.experimental import topologies
 
     from dew.nn.kernels.generation import compile_only_gpus
@@ -2226,11 +2255,12 @@ def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path
     with pytest.raises(report.CompiledOnDevice) as refused:
         compile_programs({"conv": (convolved, [image, kernel])}, "sm80", topology=serialized)
     assert refused.value.programs == ("conv",)
-    assert compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm80",
-                            topology=serialized).at_run == ()
-    canonical = compile_programs({"conv": (convolved, [image, kernel]),
-                                  "dot": (lambda x, y: x @ y, [square, square])}, "sm80")
-    assert canonical.at_run == ("conv",)
+    assert list(compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm80",
+                                 topology=serialized).programs) == ["dot"]
+    with pytest.raises(report.CompiledOnDevice) as refused:
+        compile_programs({"conv": (convolved, [image, kernel]),
+                          "dot": (lambda x, y: x @ y, [square, square])}, "sm80")
+    assert refused.value.programs == ("conv",)
 
 def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
     """A device's own target, what a program compiled ahead is checked against, is the one `gpu_target`
@@ -2376,3 +2406,24 @@ def test_a_program_compiled_for_a_compile_only_gpu_is_refused_by_the_keeper_not_
     with keeping() as programs:
         owned_program(lambda values: values * 2).executable(placed)
     assert programs.kept == {} and len(programs.refused) == 1
+
+
+@pytest.mark.mesh(devices=2)
+def test_programs_built_for_the_host_cpu_load_onto_it_whatever_the_process_lists_first(monkeypatch):
+    """Programs compiled ahead for the host's CPU (`BuildTarget.cpu`) load onto the host's first CPU
+    (`BuildTarget.own_devices`) in a process whose devices list another first, as a GPU's process lists its
+    GPUs before the CPUs it holds beside them: loaded onto the process's first devices, a CPU's program went
+    to them (row 8376's CPU-placed arms, `reference_error.ahead_arm(host=True)`)."""
+    from dew.training.ahead import AheadPrograms, BuildTarget, Executable
+
+    host = jax.devices("cpu")
+    x = np.arange(4.0, dtype=np.float32)
+    placed = jax.sharding.SingleDeviceSharding(host[0])
+    doubled = jax.jit(lambda x: x * 2.0, out_shardings=placed).lower(
+        jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=placed)).compile()
+    programs = AheadPrograms(BuildTarget.of(host[:1]), {"doubled": Executable.of(doubled)})
+    listed = jax.devices
+    # A process listing another device first, the host's first CPU among its CPUs.
+    monkeypatch.setattr(jax, "devices", lambda backend=None: listed(backend) if backend else listed()[1:])
+    ran = programs.loaded()["doubled"](x)
+    assert ran.devices() == {host[0]} and np.asarray(ran).tolist() == [0.0, 2.0, 4.0, 6.0]

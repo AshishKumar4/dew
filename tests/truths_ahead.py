@@ -17,7 +17,7 @@ A program the store does not hold for a draw's shapes or an arm's statement, or 
 `stamp` (the commit and JAX), is a red (`MissingTruth`), never one compiled in its place; a site its
 prepare did not reach, and an arm no statement holds, runs unprepared, every draw judged, recorded in the
 test's store (`unprepared`); a terms walk its values steer (a branch or loop it reads as it runs,
-`float64_terms.static`) is held as one, which its run walks on its device.
+`float64_terms.static`) is held as one, which its run walks on the host's CPU.
 
 A program takes its traced constants as arguments, held beside it (`held.pkl`): no executable serializes an
 array it closed over. The roles are a site's truth (`truth`: its float64 program, `arm_arithmetic.Truth`),
@@ -31,14 +31,18 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import functools
 import hashlib
 import inspect
 import json
+import logging
 import os
 import pickle
 import shutil
+import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import jax
 import numpy as np
@@ -58,9 +62,19 @@ constants and output tree (`held`), and its record, written last, so a prepare c
 reads."""
 
 UNPREPARED = "unprepared.json"
-"""A test's record, in its store, that it ran unprepared (`unprepared`): `{"test", "where", "error"}`, its
-first reason, the GPU tier's list of unprepared tests read from these alone (a ledger row each, the
-tier's)."""
+"""A test's record, in its store, that it ran unprepared (`unprepared`): `{"test", "where", "error",
+"reasons"}`, its first reason's where and why and every reason it gave, each once (a site, an arm, a cell:
+their count shows a tier drifting from its prepares), the GPU tier's list of unprepared tests read from these
+alone (a ledger row each, the tier's)."""
+
+AT_RUN = "at_run.json"
+"""A test's record, in its store, of a site its prepare left to its run to compile on its GPU
+(`compile_site`'s `at_run`: a choice the GPU makes that no compile without it holds), as `UNPREPARED`'s: a
+decision named in the run's summary, not drift."""
+
+DEFERRED = "deferred.json"
+"""A test's record, in its store, of a GPU flow's cell its prepare deferred to its run (`unprepared`'s, as
+`UNPREPARED`'s), which its run serves from the store beside it and then records unprepared."""
 
 
 def named(role: str, inputs) -> str:
@@ -93,6 +107,22 @@ class CompiledTruths:
         """Whether the store's prepare reached site `label` (its programs written, at any stamp)."""
         return (self.path(label) / SITE).is_file()
 
+    def at_run(self, label: str) -> str | None:
+        """Why the store's prepare compiled none of site `label`'s programs, its run compiling each on its
+        GPU (`compile_site`'s `at_run`), at this stamp; None for a site it compiled or did not reach."""
+        site = self.path(label) / SITE
+        if not site.is_file():
+            return None
+        stored = json.loads(site.read_text())
+        return stored.get("at_run") if stored["stamp"] == self.stamp else None
+
+    def compiled_at_run(self, why: str) -> None:
+        """Records in the store that its test compiled a site's programs on its GPU as its prepare stated
+        (`at_run`, `AT_RUN`), where in its file this process stands: a decision its run names, not drift."""
+        test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+        unprepared(self.directory, test, [(frame.filename, frame.lineno) for frame in inspect.stack()], why,
+                   record=AT_RUN)
+
     def unprepared(self, why: str) -> None:
         """Records in the store that its test ran a site, or an arm, unprepared (`unprepared`), where in its
         file this process stands."""
@@ -123,15 +153,20 @@ class CompiledTruths:
             yield
 
     def compile_site(self, label: str, programs: Mapping[str, tuple[Callable, Sequence]],
-                     held: Mapping[str, dict], *, compiled: Callable | None = None, arms: bool = False
-                     ) -> None:
+                     held: Mapping[str, dict], *, compiled: Callable | None = None, arms: bool = False,
+                     host: bool = False, at_run: str | None = None) -> None:
         """The site's `programs` (each a function of its constants and inputs, flat, and their shapes, by
         its name, `named`) compiled for the store's target and written with what each `held`; refused for a
         label this store compiled already, whose programs a second site of it would replace. `compiled` makes
         each program as its run's compile does (`dew.training.ahead.compile_programs`' `compiled`; Dew's
         compile point where None, a truth's, whose program is its run's); `arms` whether they are a site's
-        arms (`compiled_memory`), whose state its run holds while its truths compute."""
+        arms (`compiled_memory`), whose state its run holds while its truths compute; `host` whether they
+        are compiled for the host's CPU, whatever the store's target (an arm placed there, `ahead_arm`'s);
+        `at_run` why none is compiled, their run compiling each on its GPU (`at_run`), the site written with
+        no programs. A site its target's compile refuses (`report.CompiledOnDevice`: a choice its GPU makes at
+        run time) is left unbegun, its refusal raised for its caller to place it otherwise."""
         from dew._cache import uncached
+        from dew.nn.kernels.templates import report
 
         if label in self.begun:
             raise ValueError(f"{label}: two sites of one label in one store of compiled truths, where the "
@@ -141,27 +176,37 @@ class CompiledTruths:
         if site.exists():
             shutil.rmtree(site)
         site.mkdir(parents=True)
+        if at_run is not None:
+            (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": {},
+                                                 "arms": arms, "host": host, "at_run": at_run}))
+            return
         # Compiled here, never loaded from JAX's persistent cache, whose executables serialize without their
         # kernels (`dew.training.ahead.keeping`).
-        with uncached():
-            built = self._compiled(programs, compiled)
+        try:
+            with uncached():
+                built = self._compiled(programs, compiled, host)
+        except report.CompiledOnDevice:
+            self.begun.discard(label)
+            shutil.rmtree(site)
+            raise
         built.save(site / PROGRAMS)
         (site / HELD).write_bytes(pickle.dumps(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
                   if executable.memory is not None}
         (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
-                                             "arms": arms}))
+                                             "arms": arms, "host": host}))
 
-    def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None):
+    def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None,
+                  host: bool = False):
         """`programs` compiled for the store's target (`compile_programs`), or for this process's first device
-        where it names none, each made by `compiled` where it is given (`compile_site`), else by Dew's compile
-        point on a target and `jax.jit` here."""
+        where it names none, or for the host's first CPU (`host`), each made by `compiled` where it is given
+        (`compile_site`), else by Dew's compile point on a target and `jax.jit` here."""
         from dew.training.ahead import AheadPrograms, BuildTarget, Executable, compile_programs
 
-        if self.target is not None:
+        if self.target is not None and not host:
             return compile_programs(programs, self.target.generation, self.target.multiprocessors,
                                     **({} if compiled is None else {"compiled": compiled}))
-        devices = jax.devices()[:1]
+        devices = jax.devices("cpu" if host else None)[:1]
         placed = jax.sharding.SingleDeviceSharding(devices[0])
         compile_one = compiled or jax.jit
 
@@ -227,9 +272,11 @@ def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, in
     """Every program of a store's sites (`compiled_truths`, prepared), its truths' or, with `arms`, its
     arms' (`CompiledTruths.compile_site`), as its compile analysed its memory
     (`dew.telemetry.instrumentation.CompiledMemory`, as its fields name it), its sites' record's; none for
-    a program whose backend stated none."""
+    a program whose backend stated none, nor for one compiled for the host's CPU (`compile_site`'s `host`),
+    which holds none of the devices' memory."""
     records = (json.loads(site.read_text()) for site in Path(directory).glob(f"*/{SITE}"))
-    return [memory for record in records if record.get("arms", False) == arms
+    return [memory for record in records
+            if record.get("arms", False) == arms and not record.get("host", False)
             for memory in record.get("memory", {}).values()]
 
 
@@ -305,6 +352,47 @@ def judged(label: str) -> Iterator[None]:
         SITE_IN_PROGRESS.reset(token)
 
 
+PARENT = "DEW_PARENT_STORE"
+"""The environment variable a child process of a test opens its test's store by (`for_a_child`)."""
+
+PARENT_STORE = "parent.pkl"
+"""A store's own record of how its test's process opened it, which a child process reads (`of_the_parent`)."""
+
+
+def for_a_child() -> dict[str, str]:
+    """The environment a child process of this test opens its test's store with (`of_the_parent`): the
+    store's directory, beside its sites its own record (whether it prepares, its stamp and its target), so a
+    computation that needs a process of its own (its XLA flags, a backend option set once a process: the
+    approximate divider's) prepares and runs from its test's store, its sites the test's; none outside a
+    part's prepare or run."""
+    store = COMPILED.get()
+    if store is None:
+        return {}
+    store.directory.mkdir(parents=True, exist_ok=True)
+    (store.directory / PARENT_STORE).write_bytes(pickle.dumps((store.prepare, store.stamp, store.target)))
+    return {PARENT: str(store.directory)}
+
+
+@contextlib.contextmanager
+def of_the_parent() -> Iterator[CompiledTruths | None]:
+    """In a child process of a test (`for_a_child`), its test's store as the test's process opened it:
+    preparing it, its target's compile-only GPU the default device as a part's prepare's (`prepared`), or
+    reading it; outside one, none."""
+    directory = os.environ.get(PARENT)
+    if directory is None:
+        yield None
+        return
+    prepare, stamp, target = pickle.loads((Path(directory) / PARENT_STORE).read_bytes())
+    with compiled_truths(directory, prepare=prepare, stamp=stamp, target=target) as store:
+        if not prepare or target is None:
+            yield store
+            return
+        from dew.nn.kernels.generation import compile_only_gpus
+
+        with jax.default_device(compile_only_gpus(target.generation, 1)[0]):
+            yield store
+
+
 def running() -> tuple[CompiledTruths, str] | None:
     """The store whose programs compute the truths of the site in progress, and its label: where a run reads
     a store (`compiled_truths(prepare=False)`) within a site (`judged`) its prepare reached, else None. A
@@ -320,17 +408,101 @@ def running() -> tuple[CompiledTruths, str] | None:
     return store, label
 
 
-def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str) -> None:
-    """The one writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
-    compiling a site or an arm on its devices with every site judged: its node id, where (`frames`, innermost
-    first, `(file, line)`: the first of the test's own file, else the test's file), and the first reason it
-    gives, a record already written kept (a prepare's, before its run's)."""
-    record = directory / UNPREPARED
-    if record.exists():
-        return
+def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str,
+               record: str = UNPREPARED) -> None:
+    """The writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
+    compiling a site or an arm on its devices with every site judged: its node id and each reason it gives,
+    where (`frames`, innermost first, `(file, line)`: the first of the test's own file, else the test's file)
+    and why (`reasoned`). Under `DEFERRED`, a GPU flow's cell its prepare deferred to its run
+    (`gpu_flow.run_cells`), which its run's store still serves, and which the run names unprepared
+    (tests/conftest.py's `compiled_ahead`)."""
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
     path = Path(load("grading", "tools/armada").owning(test))
     lines = [line for file, line in frames if Path(file).name == path.name]
-    directory.mkdir(parents=True, exist_ok=True)
-    record.write_text(json.dumps({"test": test, "where": f"{path}:{lines[0]}" if lines else str(path),
-                                  "error": why}))
+    reasoned(directory / record, test, f"{path}:{lines[0]}" if lines else str(path), why)
+
+
+def reasoned(record: Path, test: str, where: str, why: str) -> None:
+    """Into a test's `record` (`UNPREPARED`, `DEFERRED`), a reason it ran unprepared, `where` and `why`, each
+    reason once in the order given, its first's its record's own `where` and `error` (a prepare's, before
+    its run's): a test with three unprepared arms names three (Main)."""
+    reason = {"where": where, "error": why}
+    if record.exists():
+        held = json.loads(record.read_text())
+        if reason not in held["reasons"]:
+            held["reasons"].append(reason)
+            record.write_text(json.dumps(held))
+        return
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"test": test, **reason, "reasons": [reason]}))
+
+
+_log = logging.getLogger(__name__)
+
+
+def arm_role(role: str, fn, label: str) -> str | None:
+    """An arm's role in its site's store (`reference_error._compile_arms`) with what it computes as Dew states
+    an identity (`dew._stated.stated`, one form in every process that holds an equal value): a run that passes
+    the site another computation under that role finds none (`MissingTruth`), never the prepare's run in its
+    place. None for an arm no statement holds (`Unestablished`), which runs unprepared, named
+    (`CompiledTruths.unprepared`)."""
+    from dew._stated import Unestablished, stated
+
+    at = f"{label}: its {role} arm"
+    try:
+        known: dict[int, Any] = {}
+        _mutable_known(fn, known, set(), at)
+        statement = stated(fn, at, known)
+    except Unestablished as unstated:
+        _log.info("an arm no statement holds runs unprepared: %s", unstated)
+        return None
+    return f"{role} {hashlib.sha256(json.dumps(statement, sort_keys=True).encode()).hexdigest()[:16]}"
+
+
+def _mutable_known(value, known: dict[int, Any], walking: set[int], at: str) -> None:
+    """Into `known` (`dew._stated.stated`'s values its caller states), each list, dict or set `value`
+    reaches through partials, records, tuples, jits, containers and what each function reads, stated by its
+    contents as this process first named an arm reading it (`_FIRST_NAMED`): such a container may be state an
+    arm keeps as it runs (a test's record of its calls, a cache a trace fills), which a prepare's trace of the
+    arm fills after its first naming and its run, calling the arm's executable, never does; and it may hold
+    what the arm computes by (a test's options read off its backend, another in a GPU's run than in its CPU's
+    prepare), which names another arm (row 7674: stated by its type alone, the run computed the prepare's
+    program). Each container's parts are walked before it is stated, through the one `known` every reached
+    container's statement is in, so one a trace filled since its first naming is stated as it was then
+    wherever it lies, inside another or beside an alias of itself (the review's: a dict read its record
+    trace-filled in a prepare, empty in its run)."""
+    from dew._sources import function_reads
+    from dew._stated import stated
+
+    if id(value) in walking:
+        return
+    walking.add(id(value))
+    container = isinstance(value, (list, dict, set))
+    if container:
+        parts = tuple(value.values()) if isinstance(value, dict) else tuple(value)
+    elif isinstance(value, functools.partial):
+        parts = (value.func, *value.args, *value.keywords.values())
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        parts = tuple(getattr(value, field.name) for field in dataclasses.fields(value))
+    elif isinstance(value, tuple):
+        parts = value
+    elif isinstance(value, types.FunctionType):
+        cells, read = function_reads(value)
+        parts = (*cells.values(), *read.values(), *(value.__defaults__ or ()),
+                 *(value.__kwdefaults__ or {}).values())
+    elif (wrapped := getattr(value, "__wrapped__", None)) is not None:
+        parts = (wrapped,)
+    else:
+        return
+    for part in parts:
+        _mutable_known(part, known, walking, at)
+    if container:
+        named = _FIRST_NAMED.get(id(value))
+        if named is None:
+            named = _FIRST_NAMED[id(value)] = (value, ["mutable", stated(value, at, known)])
+        known[id(value)] = named[1]
+
+_FIRST_NAMED: dict[int, tuple[Any, Any]] = {}
+"""Each list, dict or set an arm reads (`_mutable_known`), by its `id`, with its statement as this process
+first named an arm reading it, before any trace of that arm wrote to it, as a prepare names it and a run, a
+process whose executables write to none, alike; held, so no other container takes its `id`."""
