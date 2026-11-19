@@ -173,8 +173,9 @@ def _termed(fn, args, *, power: int):
                 values, energies = _compiled(closed.jaxpr)(consts, leaves)
             else:
                 values, energies = evaluated(closed.jaxpr, consts, leaves, compiling=True)
-        return tree, values, [np.asarray(_or_size(energy, value))
-                              for energy, value in zip(energies, values, strict=True)]
+            # A leaf of no energy (a literal output) sized where the walk ran.
+            return tree, values, [np.asarray(_or_size(energy, value))
+                                  for energy, value in zip(energies, values, strict=True)]
     finally:
         POWER.reset(token)
 
