@@ -30,13 +30,41 @@ def fetched(tree):
     return jax.tree.map(lambda leaf: jax.device_put(leaf, jax.memory.Space.Device), tree)
 
 
-def fetched_at(tree, index: jax.Array | int, axis: int = 0):
-    """Each leaf's entry `index` along `axis` (a bank's layer, a pool's page) in device memory: copied with
-    the axis intact and squeezed there."""
-    index = jax.lax.optimization_barrier(jnp.asarray(index, jnp.int32))
-    return jax.tree.map(
-        lambda leaf: jax.lax.squeeze(fetched(jax.lax.dynamic_slice_in_dim(leaf, index, 1, axis)), (axis,)),
-        tree)
+type Index = jax.Array | int
+"""An entry's place along one axis, traced or not."""
+
+
+def _entry(index: Index | tuple[Index, ...], axis: int | tuple[int, ...]
+           ) -> tuple[tuple[int, ...], tuple[jax.Array, ...]]:
+    """The axes an entry is taken along and its index on each, int32 behind one optimization barrier (a
+    slice's starts share one dtype), so the slice stays the dynamic one a scanned layer takes."""
+    axes = (axis,) if isinstance(axis, int) else axis
+    indices = (index,) if isinstance(axis, int) else index
+    if not isinstance(indices, tuple) or len(indices) != len(axes):
+        raise ValueError(f"an entry along the axes {axes} takes an index on each, not {index!r}")
+    return axes, jax.lax.optimization_barrier(tuple(jnp.asarray(each, jnp.int32) for each in indices))
+
+
+def _starts(ndim: int, axes: tuple[int, ...], indices: tuple[jax.Array, ...]) -> list[jax.Array]:
+    """A slice's starts over `ndim` axes: each of `axes` at its index, every other axis at zero."""
+    starts = [jnp.zeros((), jnp.int32)] * ndim
+    for axis, index in zip(axes, indices, strict=True):
+        starts[axis] = index
+    return starts
+
+
+def fetched_at(tree, index: Index | tuple[Index, ...], axis: int | tuple[int, ...] = 0):
+    """Each leaf's entry `index` along `axis` (a bank's layer, a pool's page), or along each of several axes
+    at an index of each (a bank's layer and page), in device memory: copied with the axes intact and
+    squeezed there."""
+    axes, indices = _entry(index, axis)
+
+    def entry(leaf: jax.Array) -> jax.Array:
+        sizes = [1 if dimension in axes else size for dimension, size in enumerate(leaf.shape)]
+        return jax.lax.squeeze(fetched(jax.lax.dynamic_slice(leaf, _starts(leaf.ndim, axes, indices), sizes)),
+                               axes)
+
+    return jax.tree.map(entry, tree)
 
 
 def placed_like(leaf: jax.Array, value: jax.Array) -> jax.Array:
@@ -44,9 +72,11 @@ def placed_like(leaf: jax.Array, value: jax.Array) -> jax.Array:
     return jax.device_put(value, jax.memory.Space.Host) if on_host(leaf) else value
 
 
-def stored_at(bank: jax.Array, value: jax.Array, index: jax.Array | int, axis: int = 0) -> jax.Array:
-    """`bank` with `value` its entry `index` along `axis`, where `bank` lies (`fetched_at`'s inverse): the
-    axis restored in device memory, the entry copied to the bank's memory and written there."""
-    index = jax.lax.optimization_barrier(jnp.asarray(index, jnp.int32))
-    entry = placed_like(bank, jnp.expand_dims(value.astype(bank.dtype), axis))
-    return jax.lax.dynamic_update_slice_in_dim(bank, entry, index, axis)
+def stored_at(bank: jax.Array, value: jax.Array, index: Index | tuple[Index, ...],
+              axis: int | tuple[int, ...] = 0) -> jax.Array:
+    """`bank` with `value` its entry `index` along `axis` (or along each of several axes), where `bank` lies
+    (`fetched_at`'s inverse): the axes restored in device memory, the entry copied to the bank's memory and
+    written there."""
+    axes, indices = _entry(index, axis)
+    entry = placed_like(bank, jnp.expand_dims(value.astype(bank.dtype), axes))
+    return jax.lax.dynamic_update_slice(bank, entry, _starts(bank.ndim, axes, indices))

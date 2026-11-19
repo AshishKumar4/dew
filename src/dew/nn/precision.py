@@ -1848,25 +1848,23 @@ _compensated_sum = contracted("test_the_precision_seams_hold_every_order")(
 def summed_once(values: Sequence[jax.Array], products: Sequence[tuple[jax.Array, jax.Array]] = ()
                 ) -> jax.Array:
     """The sum of `values` and of `products` (each a `(left, right)` pair, broadcasting as `*` does), every
-    product's rounding (`two_product`) and every addition's (`two_sum`) kept and added back once at the end:
-    the sum as one rounding of its twice-precise value leaves it (Ogita, Rump and Oishi's Dot2), whatever a
-    compiler fuses or keeps apart, so no contraction of a multiply into an add (an FMA) it takes or leaves
-    rounds it more (row 7953: a barrier in a step's arithmetic split its fusion and lost the contractions its
-    plain float32 sum leaned on, row 7979). Its tangent is the plain sum's."""
+    product's rounding (`two_product`) and every addition's kept and added back once at the end: each product
+    a double-float pair, its rounded product and what the rounding dropped, and each value one, summed by
+    `compensated_add` and rounded once (`compensated_total`), so no contraction of a multiply into an add (an
+    FMA) a compiler takes or leaves rounds it more (row 7953: a barrier in a step's arithmetic split its
+    fusion and lost the contractions its plain float32 sum leaned on, row 7979), and a sum reaching an
+    infinity is the plain sum's, as `jnp.sum`'s is (row 8453). Its tangent is the plain sum's."""
     return _summed_once(tuple(values), tuple(products))
 
 
 def _summed_once_value(values, products):
-    total = values[0]
-    carried = jnp.zeros_like(total)
+    pair, plain = (values[0], jnp.zeros_like(values[0])), values[0]
     for left, right in products:
-        product, lost = two_product(left, right, bit_split=True)
-        total, dropped = two_sum(total, product)
-        carried = carried + (lost + dropped)
+        product = two_product(left, right, bit_split=True)
+        pair, plain = compensated_add(pair, product), plain + product[0]
     for value in values[1:]:
-        total, dropped = two_sum(total, value)
-        carried = carried + dropped
-    return total + carried
+        pair, plain = compensated_add(pair, (value, jnp.zeros_like(value))), plain + value
+    return compensated_total(pair, plain)
 
 
 def _summed_once_tangent(primals, tangents):
