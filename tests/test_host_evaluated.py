@@ -145,9 +145,9 @@ def test_a_trees_holes_take_a_mask_as_they_take_a_predicate():
     leaves refused (row 8839)."""
     tree = ({"b": 7, "a": 7}, [7, 4.0])
     # Flatten order: a's 7, b's 7, the list's 7, 4.0.
-    kept, fill = programs.holes(tree, [False, True, True, False])
-    assert kept == [7, 7]
-    assert fill([20, 30]) == ({"b": 20, "a": 7}, [30, 4.0])
+    kept, fill = programs.holes(tree, [False, True, False, True])
+    assert kept == [7, 4.0]
+    assert fill([20, 30]) == ({"b": 20, "a": 7}, [7, 30])
     by_predicate, _ = programs.holes(tree, lambda leaf: leaf == 4.0)
     assert by_predicate == [4.0]
     for mask in ([True, False], [True, False, False, False, True]):
