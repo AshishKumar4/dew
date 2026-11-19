@@ -92,7 +92,7 @@ class Schedule:
     def role(self, name: str) -> Role:
         return next(role for role in self.roles if role.name == name)
 
-    def joined(self, role: Role) -> "Schedule":
+    def joined(self, role: Role) -> Schedule:
         """The schedule with `role` among its last warpgroup's warp roles (a launch's `REDUCER`)."""
         if not role.warp or not any(other.warp for other in self.roles):
             raise ValueError(f"{role.name} joins a schedule's warp roles, which {self.roles} holds none of")
