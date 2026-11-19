@@ -674,3 +674,31 @@ def test_a_truth_run_as_given_computes_on_the_host_in_a_prepare(tmp_path, monkey
         assert_as_exact(dew, reference, draw, "a product of a given truth", seeds=8, truth_fn=as_given(truth))
     host = jax.devices("cpu")[0]
     assert placed and all(device == host and on == {host} for device, on in placed)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_host_placed_arm_is_prepared_and_run_on_the_host(tmp_path, monkeypatch):
+    """A site-free arm placed on the host's CPU (`ahead_arm(host=True)`: a GPU host's CPU-placed computation,
+    row 8376's) is traced in its prepare placed on the host's CPU, whatever the store's device (a GPU part's
+    compile-only GPU), and compiled for it; its run, in a process listing another device first as a GPU's
+    does, computes it from that program, tracing none, the same values as computing it."""
+    from truths_ahead import CompiledTruths
+
+    traced = []
+
+    def scaled(a, b):
+        traced.append(jax.config.jax_default_device)
+        return a * b + 1.0
+
+    a, b = (np.arange(6, dtype=np.float32).reshape(2, 3) + offset for offset in (1.0, 0.5))
+    host = jax.devices("cpu")[0]
+    monkeypatch.setattr(CompiledTruths, "device", lambda store: jax.devices()[1])
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        ahead_arm(jax.jit(scaled), "a host-placed product", host=True)(a, b)
+    assert traced == [host]
+    traced.clear()
+    listed = jax.devices
+    monkeypatch.setattr(jax, "devices", lambda backend=None: listed(backend) if backend else listed()[1:])
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        ran = ahead_arm(jax.jit(scaled), "a host-placed product", host=True)(a, b)
+    assert not traced and np.asarray(ran).tolist() == (a * b + 1.0).tolist()

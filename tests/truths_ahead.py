@@ -127,14 +127,15 @@ class CompiledTruths:
             yield
 
     def compile_site(self, label: str, programs: Mapping[str, tuple[Callable, Sequence]],
-                     held: Mapping[str, dict], *, compiled: Callable | None = None, arms: bool = False
-                     ) -> None:
+                     held: Mapping[str, dict], *, compiled: Callable | None = None, arms: bool = False,
+                     host: bool = False) -> None:
         """The site's `programs` (each a function of its constants and inputs, flat, and their shapes, by
         its name, `named`) compiled for the store's target and written with what each `held`; refused for a
         label this store compiled already, whose programs a second site of it would replace. `compiled` makes
         each program as its run's compile does (`dew.training.ahead.compile_programs`' `compiled`; Dew's
         compile point where None, a truth's, whose program is its run's); `arms` whether they are a site's
-        arms (`compiled_memory`), whose state its run holds while its truths compute."""
+        arms (`compiled_memory`), whose state its run holds while its truths compute; `host` whether they
+        are compiled for the host's CPU, whatever the store's target (an arm placed there, `ahead_arm`'s)."""
         from dew._cache import uncached
 
         if label in self.begun:
@@ -148,7 +149,7 @@ class CompiledTruths:
         # Compiled here, never loaded from JAX's persistent cache, whose executables serialize without their
         # kernels (`dew.training.ahead.keeping`).
         with uncached():
-            built = self._compiled(programs, compiled)
+            built = self._compiled(programs, compiled, host)
         built.save(site / PROGRAMS)
         (site / HELD).write_bytes(pickle.dumps(dict(held)))
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
@@ -156,16 +157,17 @@ class CompiledTruths:
         (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
                                              "arms": arms}))
 
-    def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None):
+    def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None,
+                  host: bool = False):
         """`programs` compiled for the store's target (`compile_programs`), or for this process's first device
-        where it names none, each made by `compiled` where it is given (`compile_site`), else by Dew's compile
-        point on a target and `jax.jit` here."""
+        where it names none, or for the host's first CPU (`host`), each made by `compiled` where it is given
+        (`compile_site`), else by Dew's compile point on a target and `jax.jit` here."""
         from dew.training.ahead import AheadPrograms, BuildTarget, Executable, compile_programs
 
-        if self.target is not None:
+        if self.target is not None and not host:
             return compile_programs(programs, self.target.generation, self.target.multiprocessors,
                                     **({} if compiled is None else {"compiled": compiled}))
-        devices = jax.devices()[:1]
+        devices = jax.devices("cpu" if host else None)[:1]
         placed = jax.sharding.SingleDeviceSharding(devices[0])
         compile_one = compiled or jax.jit
 

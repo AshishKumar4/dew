@@ -1881,38 +1881,48 @@ def declared_seeds(path) -> dict[str, int]:
             if name.endswith(".seeds")}
 
 
-def ahead_arm(fn: Callable, label: str) -> Callable:
+def ahead_arm(fn: Callable, label: str, *, host: bool = False) -> Callable:
     """`fn` (a function of arrays: a test's computation with no check-1 site, a bitwise check's kernel run on
     the GPU) as an arm with no site, through the arms' own path: within a GPU tier part's prepare (`COMPILED`,
     a store that prepares) its call is traced and compiled at its inputs' shapes as a site's arms are
     (`_arm_program` in the store's `tracing`, `_arm_compile`, held under `armed(label)` by Dew's statement of
     it, `arm_role`) and gives zeros of its outputs' shapes, nothing computing there (a test's later failure
     in its prepare, past its stored program, judges nothing); in its run its call is that executable
-    (`CompiledTruths.ran`), tracing, lowering and compiling none; outside a part, `fn` itself. One no
-    statement holds, or one its prepare did not reach, runs unprepared, recorded and named (`unprepared`,
-    as `running` records a site). One call a label: a second in one prepare is refused, as a second site
-    of one label is (`compile_site`). Its inputs are host arrays, NumPy's: a prepare's default device
-    computes nothing, not even their placement (bible §8)."""
+    (`CompiledTruths.ran`), tracing, lowering and compiling none; outside a part, `fn` itself. With `host`,
+    its call is placed on the host's CPU, its program traced and compiled for it and run there (a GPU host's
+    CPU-placed computation, row 8376's). One no statement holds, or one its prepare did not reach, runs
+    unprepared, recorded and named (`unprepared`, as `running` records a site). One call a label: a second in
+    one prepare is refused, as a second site of one label is (`compile_site`). Its inputs are host arrays,
+    NumPy's: a prepare's default device computes nothing, not even their placement (bible §8)."""
+    def unprepared(*inputs):
+        if not host:
+            return fn(*inputs)
+        cpu = jax.devices("cpu")[0]
+        with jax.default_device(cpu):
+            return fn(*jax.device_put(inputs, cpu))
+
     def called(*inputs):
         store = COMPILED.get()
         if store is None:
-            return fn(*inputs)
+            return unprepared(*inputs)
         role = arm_role("dew", fn, label)
         if role is None:
             store.unprepared(f"{label}: its arm has no statement of what it computes")
-            return fn(*inputs)
+            return unprepared(*inputs)
         if store.prepare:
             programs: dict = {}
             held: dict = {}
-            with store.tracing():
+            placed = jax.default_device(jax.devices("cpu")[0]) if host else store.tracing()
+            with placed:
                 shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
-            store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True), arms=True)
+            store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True), arms=True,
+                               host=host)
             # Zeros of the shapes its own trace gave, in the store's tracing: a jit of its own compiler
             # options traced again inside another, `eval_shape`'s, was refused.
             return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)
         if not store.holds(armed(label)):
             store.unprepared(f"{label}: its prepare did not reach this arm")
-            return fn(*inputs)
+            return unprepared(*inputs)
         return store.ran(armed(label), role, inputs)
 
     return called
