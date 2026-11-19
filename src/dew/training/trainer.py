@@ -409,18 +409,18 @@ class Trainer(Generic[Loss, Effects]):
 
         Both inputs default to the run's own, and `place` passes them explicitly so that what it compiles
         takes them as arguments. A held checkpoint then reaches the device as an argument instead of a
-        constant embedded in the executable. Passing None means "use the configured input", which is what a
-        call without arguments does. This is the only implementation of the state, so a subclass overrides it
-        here and every path sees the override.
+        constant embedded in the executable. This is the only implementation of the state, so a subclass
+        overrides it here and every path sees the override.
         """
         initializer = self.objective.initializer if initializer is None else initializer
         from dew.nn.inputs import request_key
         ready_process()  # A key given here opens the backend as the run's does (`key`).
         key = self.key if key is None else request_key(key)
         if not self.host_master and jax_core.trace_state_clean():
-            # Outside any trace one program of this body, which reads no override's field, so kept by the
-            # class (row 8985), its frozen tree the held arrays (`drawn_once`; rows 8682, 8730).
-            stated = self._step_key(self.objective, self._compiler)
+            # One program of this body (`drawn_once`), kept by the class only over the objective's own
+            # initializer, the one its key states (rows 8985, 9092).
+            own = jax.tree.structure(initializer) == jax.tree.structure(self.objective.initializer)
+            stated = self._step_key(self.objective, self._compiler) if own else None
             return drawn_once(self._fresh_state, initializer, key, HELD_APART,
                               kept=stated and (stated, type(self), "fresh"))
         return self._fresh_state(initializer, key)
