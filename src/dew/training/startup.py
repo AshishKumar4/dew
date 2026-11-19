@@ -163,8 +163,10 @@ def computation_differs(saved: JSON, now: JSON, trained: JSON, training: JSON) -
             found = [differs for name in ("objective", "model") if name in saved and name in now
                      for differs in _differing(without_fields(saved[name], RunConfig.EXECUTED),
                                                without_fields(now[name], RunConfig.EXECUTED), name)]
-    return found + (_differing(trained, training, "training")
-                    if isinstance(trained, dict) and isinstance(training, dict) else [])
+    match trained, training:
+        case dict(), dict():
+            found += _differing(trained, training, "training")
+    return found
 
 
 def _differing(before: JSON, after: JSON, path: str) -> list[str]:

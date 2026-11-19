@@ -1511,9 +1511,11 @@ class Trainer(Generic[Loss, Effects]):
         first and, for a fresh state, its start. A supplied `initial` state is placed as it
         is given, once its shapes are checked as a fresh one's are: no continuation, which
         `resume="require"` refuses, and under "never" into a directory that holds no run either. An
-        objective that names its input field alone declares it first (`_declare_input`)."""
+        objective that names its input field alone declares it first (`_declare_input`), a resume's from the
+        first batch its saved position admits (`_resumed_position`)."""
         checkpoints = self.checkpoints
-        self._declare_input(lambda: self._primed_first(run, dataset))
+        self._declare_input(lambda: self._primed_first(
+            run, dataset, None if initial is not None else self._resumed_position(resume)))
         if resume == "require" and (checkpoints is None or initial is not None):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")
@@ -1561,14 +1563,18 @@ class Trainer(Generic[Loss, Effects]):
         beginning where updates do (`window`, `Ramp.stages`)."""
         return DataPartition.of(self.device_mesh, window=self.accumulation)
 
-    def _primed_first(self, run: FitRun, dataset: Loader) -> Batch:
+    def _primed_first(self, run: FitRun, dataset: Loader, position: bytes | None = None) -> Batch:
         """The first batch of this process's share of `dataset`'s training stream, its stream kept open with
         its position after it (`FitRun.primed`), which a fresh start's prefetcher hands on as its first
         batch (`_opened`), so the run reads it once (training.md, the batch contract; row 6663); a share
-        that reads none of its own reads its pool's (`first_batch`)."""
+        that reads none of its own reads its pool's (`first_batch`). A resume's from its saved `position`,
+        its plan checked before any batch is read (`restored_or_restarted`; row 9013: the stream was read
+        from its start, the replacement plan unchecked)."""
         partition = self._stream_partition()
         stream = dataset.train(partition)
         try:
+            if position is not None and isinstance(stream, Checkpointable):
+                restored_or_restarted(stream, position, resume=self.data_resume, step=run.current)
             batch = next(iter(stream), None)
             position = stream.get_state() if isinstance(stream, Checkpointable) else None
         except BaseException:
@@ -1579,6 +1585,21 @@ class Trainer(Generic[Loss, Effects]):
             return first_batch(dataset, partition)
         run.primed = (partition, stream, batch, position)
         return batch
+
+    def _resumed_position(self, resume: Resume) -> bytes | None:
+        """The data position a resume of this run reads from (`Checkpoints.position`), none for a fresh run,
+        one that saved none, or one resumed relaxed whose saved position no reader here reads."""
+        checkpoints = self.checkpoints
+        step = None if checkpoints is None else agreed_same("newest checkpoint",
+                                                            lambda: checkpoints.resumed(resume))
+        if checkpoints is None or step is None:
+            return None
+        try:
+            return checkpoints.position(step, DataPartition.of(self.device_mesh))
+        except PlanChanged:
+            if self.data_resume == "exact":
+                raise
+            return None
 
     def _declare_input(self, first: Callable[[], Batch]) -> None:
         """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the

@@ -1269,6 +1269,14 @@ class Plan:
             earlier = record(saved["environment"], "saved data environment")
             changes = environment_changes(
                 {name: value for name, value in earlier.items() if name != "modules"})
+        # A volatile step's fetched outcomes may differ on a second read, and with them the row read next
+        # at the saved offset: no exact resume can promise it, so one is refused (row 9012), a relaxed one
+        # warned.
+        if self.volatile and resume != "relaxed":
+            raise PlanChanged(("volatile",), "the data reads a volatile step (volatile=True), whose fetched "
+                              "outcomes may differ from the saved run's, so an exact resume cannot promise "
+                              "the rows that come next: snapshot(url) the data and train from the sealed "
+                              "generation, or resume relaxed (`data_resume='relaxed'`)")
         if self.volatile:
             _log.warning("resuming volatile data; fetched outcomes may differ")
         if edited:

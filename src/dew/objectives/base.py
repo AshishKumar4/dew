@@ -2188,12 +2188,19 @@ _UNRECORDED = _Unrecorded()
 def _setting_record(value: TracedSetting) -> JSON | _Unrecorded:
     """`value` as a training record states it (`Objective.training_record`): a number, a string, a truth value
     or None as itself, a sequence of them as a list; anything else `_UNRECORDED`."""
-    if value is None or type(value) in (bool, int, float, str):
-        return value
-    if type(value) in (list, tuple):
-        parts = [_setting_record(part) for part in value]
-        return _UNRECORDED if any(part is _UNRECORDED for part in parts) else parts
-    return _UNRECORDED
+    match value:
+        case None | bool() | int() | float() | str() if type(value) in (type(None), bool, int, float, str):
+            return value
+        case list() | tuple() if type(value) in (list, tuple):
+            parts: list[JSON] = []
+            for part in value:
+                recorded = _setting_record(part)
+                if isinstance(recorded, _Unrecorded):
+                    return _UNRECORDED
+                parts.append(recorded)
+            return parts
+        case _:
+            return _UNRECORDED
 
 HELD = frozenset({"variables", "ema"})
 """The attributes every objective's key states its own way (`Objective.traced_by`): the tree it starts
