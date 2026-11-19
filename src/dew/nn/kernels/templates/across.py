@@ -3,7 +3,6 @@ programs to arrive at a semaphore (`arrived`), and the consumer warpgroups' part
 order and stored once (`summing`, `summed_across`)."""
 
 import dataclasses
-import functools
 from collections.abc import Callable
 
 import jax
@@ -90,11 +89,14 @@ LANE_ZERO = emission.stating(lambda value: Work(operations=1))(LaneZero())
 """The one `LaneZero` body every `uniform` inlines, its work stated once (`emission.stating`)."""
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, eq=False)
 class ScaleSmem:
     """`scale_smem`'s body (`plgpu.inline_mgpu`'s): scales every 16-bit element of a shared-memory tile in
     place by a scalar power of two (swizzle-agnostic since scalar multiplication commutes with every
-    permutation), avoiding layout inference on small or swizzled query stages (row 5274)."""
+    permutation), avoiding layout inference on small or swizzled query stages (row 5274). Equal only to
+    itself, so the weak record of its stated work (`emission.stating`) is keyed by the very body a trace
+    holds: by value, an equal body's registration kept a dropped one's key and lost the live one's (the base
+    review of 09b477e3d, F1)."""
 
     words: int
     pair: int
@@ -141,17 +143,9 @@ def scale_smem(ref, power: float, *, swizzle: int, interpret: bool = False) -> N
     pair = bits | (bits << 16)
     transforms = () if swizzle == swizzling.UNSWIZZLED else swizzling.swizzle_transforms(dtype, swizzle)
     ref_type = plgpu.RefType(transforms) if transforms else plgpu.RefType()
-    plgpu.inline_mgpu(arg_types=(ref_type,))(_scaling(words, pair, bf16))(ref)
-
-
-@functools.cache
-def _scaling(words: int, pair: int, bf16: bool) -> ScaleSmem:
-    """The `ScaleSmem` body of a tile of `words` 32-bit words, its work stated once and held while any kernel
-    may inline it (`emission.stating`'s record is weak: a body built per call was gone by the time a launch's
-    cost read it, and its count refused it as unpriced)."""
-    elements = 2 * words
-    return emission.stating(lambda ref: Work(operations=elements, shared_bytes=2 * elements * 2))(
+    body = emission.stating(lambda r: Work(operations=elements, shared_bytes=2 * elements * 2))(
         ScaleSmem(words, pair, bf16))
+    plgpu.inline_mgpu(arg_types=(ref_type,))(body)(ref)
 
 
 def lane_value(value: ir.Value, lane: int) -> ir.Value:
