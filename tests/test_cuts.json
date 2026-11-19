@@ -21,9 +21,6 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
-"tests/test_algebra_fuzz.py": [
-"tests/test_algebra_fuzz.py::test_a_rewritten_program_is_on_par_with_the_program"
-],
 "tests/test_algebra_scan.py": [
 "tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[gated_delta-before]",
 "tests/test_algebra_scan.py::test_a_turned_scans_adjoint_is_the_token_scans_gradient[apart-ranks]",
@@ -1051,9 +1048,6 @@
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_backward_that_read_other_gradients",
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16"
 ],
-"tests/test_checkpoint_averaging.py": [
-"tests/test_checkpoint_averaging.py::test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read_where_it_keeps_one[stages]"
-],
 "tests/test_chunk_adaptation.py": [
 "tests/test_chunk_adaptation.py::test_a_chain_steps_each_level_as_equation_71_at_its_own_window[1-3-documents]",
 "tests/test_chunk_adaptation.py::test_a_damped_chain_steps_each_level_as_the_literal_loop[documents]",
@@ -1121,9 +1115,6 @@
 "tests/test_compile_ahead.py::test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step",
 "tests/test_compile_ahead.py::test_an_ahead_plan_that_fits_no_device_reports_every_refused_program",
 "tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it"
-],
-"tests/test_config_cli.py": [
-"tests/test_config_cli.py::test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_time"
 ],
 "tests/test_config_paths.py": [
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[diffusion]",
@@ -1320,9 +1311,6 @@
 "tests/test_decision_objective.py::test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from_the_run",
 "tests/test_decision_objective.py::test_the_joint_heads_bfloat16_cosine_is_an_fp32_cosine_in_every_process_on_a_cpu"
 ],
-"tests/test_decision_option_slots.py": [
-"tests/test_decision_option_slots.py::test_a_rows_real_options_compact_in_order_and_a_row_over_the_cap_is_refused"
-],
 "tests/test_decision_packing.py": [
 "tests/test_decision_packing.py::test_a_decision_run_steps_one_program_over_rows_of_every_length",
 "tests/test_decision_packing.py::test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_row[False]",
@@ -1333,9 +1321,6 @@
 "tests/test_decision_packing.py::test_a_reader_tokenizes_each_text_of_its_rows_once[joint]",
 "tests/test_decision_packing.py::test_single_option_questions_fit_the_packing_bounds[1]",
 "tests/test_decision_packing.py::test_single_option_questions_fit_the_packing_bounds[2]"
-],
-"tests/test_decision_readout.py": [
-"tests/test_decision_readout.py::test_a_slot_heads_scores_are_the_releases_law_with_its_query_and_key_trained"
 ],
 "tests/test_decision_recipe.py": [
 "tests/test_decision_recipe.py::test_a_checkpoint_declaring_block_attention_trains_and_serves_a_fresh_heads_rows_in_blocks",
@@ -1532,9 +1517,6 @@
 "tests/test_decoder_remat.py::test_recomputed_pipeline_preserves_updates_and_sown_values[True-dense]",
 "tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[False-altup]",
 "tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[True-altup]"
-],
-"tests/test_decoding_strategies.py": [
-"tests/test_decoding_strategies.py::test_any_sequence_of_components_decodes_as_its_tuple_does"
 ],
 "tests/test_deepest_rings.py": [
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention backward 64-sm86]",
@@ -1793,9 +1775,6 @@
 "tests/test_flaxdiff_family_source.py::test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs[simple_mmdit/published]",
 "tests/test_flaxdiff_family_source.py::test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs[unet_3d/published]",
 "tests/test_flaxdiff_family_source.py::test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs[video_dit/published]"
-],
-"tests/test_flight.py": [
-"tests/test_flight.py::test_an_image_is_developed_as_its_camera_does"
 ],
 "tests/test_flow_grpo.py": [
 "tests/test_flow_grpo.py::test_a_transitions_density_keeps_a_residual_whose_square_overflows",
@@ -2061,9 +2040,6 @@
 "tests/test_inference.py::test_every_route_generates_through_the_same_packed_projections",
 "tests/test_inference.py::test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images"
 ],
-"tests/test_inference_sampling.py": [
-"tests/test_inference_sampling.py::test_cached_generation_records_the_transformers_filtered_distribution[sampling1]"
-],
 "tests/test_inference_tasks.py": [
 "tests/test_inference_tasks.py::test_decoding_fp32_masters_draws_what_a_bf16_storage_load_draws[diffusion-gemma-workflow]"
 ],
@@ -2319,9 +2295,6 @@
 ],
 "tests/test_live_bridge.py": [
 "tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
-],
-"tests/test_llama4.py": [
-"tests/test_llama4.py::test_a_paged_cache_draws_what_the_dense_cache_draws[paged]"
 ],
 "tests/test_lm_objective.py": [
 "tests/test_lm_objective.py::test_evaluation_correctness_is_the_same_full_forward_argmax",
@@ -3752,9 +3725,6 @@
 "tests/test_ssd_kernel.py": [
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk-resets]"
 ],
-"tests/test_stage_blocks.py": [
-"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[hybrid_dit-fsdp2_stage2]"
-],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
 "tests/test_stage_local.py::test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one",
@@ -3952,9 +3922,6 @@
 "tests/test_trainer.py::test_a_share_of_a_run_with_no_planned_length_is_refused",
 "tests/test_trainer.py::test_an_explicit_state_starts_a_token_count_with_its_own_reader"
 ],
-"tests/test_training_dtypes.py": [
-"tests/test_training_dtypes.py::test_x64_router_bias_storage_survives_updates_and_restart[bfloat16]"
-],
 "tests/test_training_transactions.py": [
 "tests/test_training_transactions.py::test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima[whole]",
 "tests/test_training_transactions.py::test_real_lm_mtp_router_and_qk_update_matches_combined_batch[None]",
@@ -3989,6 +3956,9 @@
 "tests/test_wan_source.py": [
 "tests/test_wan_source.py::test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone",
 "tests/test_wan_source.py::test_pipeline_walk_matches_the_source[streamed]"
+],
+"tests/test_wan_vae.py": [
+"tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
 ],
 "tests/test_weighed_check.py": [
 "tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
