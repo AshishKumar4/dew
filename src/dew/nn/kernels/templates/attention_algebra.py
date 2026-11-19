@@ -24,6 +24,7 @@ nothing (spans, a score hook) guards its maxima and denominators against an empt
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any, NamedTuple
 
@@ -415,10 +416,11 @@ LEAST_NORMAL = float(jnp.finfo(jnp.float32).tiny)
 """fp32's (and bf16's) least normal number: a scaled weight below it takes the two-tier product."""
 
 
-def exponent_of(bound: jax.Array) -> jax.Array:
-    """The exponent a row of `bound` (`Scale.bound`, at `2^-BOUND_UNIT`) is held at: the binades its
-    weighted values' bound passes `2^HEADROOM` by (rounded up), 0 below and where it is no positive number."""
-    log = jnp.ceil(jnp.log2(jnp.where(bound > 0, bound, 1.0))) + (BOUND_UNIT - HEADROOM)
+def exponent_of(bound: jax.Array, binades: float = 0.0) -> jax.Array:
+    """The exponent a row of `bound` (`Scale.bound`, at `2^-BOUND_UNIT`) times `2^binades` is held at: the
+    binades its weighted values' bound passes `2^HEADROOM` by (rounded up), 0 below and where it is no
+    positive number."""
+    log = jnp.ceil(jnp.log2(jnp.where(bound > 0, bound, 1.0)) + binades) + (BOUND_UNIT - HEADROOM)
     return jnp.where((bound > 0) & finite(log) & (log > 0), log, 0.0)
 
 
@@ -1334,8 +1336,16 @@ def rescaled(state: Partial, factor: jax.Array, weighed: Callable[[], jax.Array]
     if before is None:
         return None
     term = weighed()
-    bound = factor * before.bound + (term if drop is None else term * np.float32(drop.reach))
-    return Scale(jnp.maximum(before.exponent, exponent_of(bound)), bound)
+    if drop is None:
+        bound = factor * before.bound + term
+        return Scale(jnp.maximum(before.exponent, exponent_of(bound)), bound)
+    # The bound in the reach's units, its binades added to the exponent, so a bound the reach takes past
+    # fp32's largest takes its exponent still (values of 2^126 at a reach of 2^66 overflowed it and took none,
+    # the range audit of row 8652, #3); held at fp32's largest past it, as finite as a bound need be.
+    binades = math.log2(drop.reach)
+    held = power2(factor * before.bound, -binades, reach=TWO_FACTOR_REACH) + term
+    bound = jnp.minimum(power2(held, binades, reach=TWO_FACTOR_REACH), np.float32(np.finfo(np.float32).max))
+    return Scale(jnp.maximum(before.exponent, exponent_of(held, binades)), bound)
 
 
 def scales(scale: Scale | None) -> jax.Array | bool:

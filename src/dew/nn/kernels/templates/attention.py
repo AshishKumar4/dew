@@ -964,9 +964,10 @@ class Dropout:
 def dropped_reach(bound: float) -> float:
     """The least power of two at or above a dropout multiplier `bound`, the units a walk's sums hold a kept
     weight in (`attention_algebra.Forward.units`), the most its bounds take one by (`frexp`'s exponent,
-    less one where `bound` is a power of two)."""
+    less one where `bound` is a power of two); 2^127 past it, fp32's largest (a multiplier of 4/3 2^127 took
+    2^128, an infinite fp32, the range audit of row 8652, #2)."""
     mantissa, exponent = math.frexp(bound)
-    return float(2.0 ** (exponent - 1 if mantissa == 0.5 else exponent))
+    return float(2.0 ** min(exponent - 1 if mantissa == 0.5 else exponent, 127))
 
 
 def kept(weights: jax.Array, multiplier: jax.Array | None, power: float = 1.0) -> jax.Array:

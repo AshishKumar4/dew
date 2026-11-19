@@ -280,19 +280,19 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
 
     if dropped == 1.0:
         return nearer_centre(*centred(mean, 1.0), key_index)
-    # A dropping call's: in the power its sums hold (`algebra.Forward.units`), contracted with dO before it
-    # comes out, so a mean the power takes below fp32's least subnormal keeps its bits (2^-126 at a weight of
-    # e^-22 and a power of 2^53, dQ 0 where it is -2.79e-10, the base review of eb3ab2670, F1); where those
-    # pass fp32's largest, and on a normalized row (an output's sums, which took the multiplier), the power
-    # taken out first, after the total where the mean is finite, else in one division with it (sums of
-    # 18 2^126 over a total of 4, the base review of e2b671ce9, F2).
-    held = jnp.where(normalized_rows(shift), np.float32(1), np.float32(power))
+    # A dropping call's: in the units its sums hold (its power, `algebra.Forward.units`; a normalized row's,
+    # an output's, the multiplier), contracted with dO before they come out, so a mean they take below fp32's
+    # least subnormal keeps its bits (2^-126 at a weight of e^-22 and a power of 2^53, dQ 0 where it is
+    # -2.79e-10, the base review of eb3ab2670, F1; a normalized row's divided by 2^53 first, the range audit
+    # of row 8652, #1); where those pass fp32's largest, the units taken out first, after the total where the
+    # mean is finite, else in one division with it (18 2^126 over 4, the base review of e2b671ce9, F2).
+    held = jnp.where(normalized_rows(shift), multiplier, np.float32(power))
     divisor = jnp.where(normalized_rows(shift), multiplier, power2(total, -shift) * np.float32(power))
     divided = others / expand(jnp.where(finite(divisor) & (divisor > 0), divisor, 1.0), others)
     in_units = centred(mean, held)
     taken = jnp.where(normalized_rows(shift), np.float32(1 / dropped), np.float32(1 / power))
     plain = centred(jnp.where(finite(mean), mean * expand(taken, mean), divided), 1.0)
-    kept = ~normalized_rows(shift) & finite(in_units[0]) & finite(in_units[1]) & finite(in_units[2])
+    kept = finite(in_units[0]) & finite(in_units[1]) & finite(in_units[2])
     centre, about_anchor, about_zero = (jnp.where(kept, held_term, plain_term)
                                         for held_term, plain_term in zip(in_units, plain, strict=True))
     anchor, delta, chosen = nearer_centre(centre, about_anchor, about_zero, key_index)
