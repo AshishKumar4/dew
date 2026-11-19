@@ -378,6 +378,9 @@ stubPath = "stubs"
 # A tool imports the test helpers and the tools beside it by their names, as it runs with both on its
 # path, and dew from src/, which a reference tool's own environment (tools/check_tool_types.py) lacks.
 extraPaths = ["src", "tests", "tools"]
+# armada's scripts import their neighbours by name, their own directory first on their path, where
+# tools/ci (the gates' shell scripts) would otherwise be read as `import ci`.
+executionEnvironments = [{ root = "tools/armada", extraPaths = ["tools/armada", "src", "tests", "tools"] }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

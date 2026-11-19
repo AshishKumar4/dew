@@ -16,6 +16,7 @@ runs no pyright here.
 
     python tools/check_tool_types.py            # every tool, its verdict printed; exit 1 where any is red
     python tools/check_tool_types.py --list     # each cohort set's tools, checking nothing
+    python tools/check_tool_types.py --environment dew    # one environment's tools alone
 
 """
 
@@ -256,7 +257,11 @@ def checked(environment: Path, paths: list[Path]) -> dict[Path, list[str]]:
     configuration = {**{name: value for name, value in configuration.items() if name != "include"},
                      "venvPath": str(environment.parent), "venv": environment.name,
                      "stubPath": str(ROOT / configuration["stubPath"]),
-                     "extraPaths": [str(ROOT / path) for path in configuration.get("extraPaths", [])]}
+                     "extraPaths": [str(ROOT / path) for path in configuration.get("extraPaths", [])],
+                     "executionEnvironments": [
+                         {**each, "root": str(ROOT / each["root"]),
+                          "extraPaths": [str(ROOT / path) for path in each.get("extraPaths", [])]}
+                         for each in configuration.get("executionEnvironments", [])]}
     (ROOT / ENVIRONMENTS).mkdir(exist_ok=True)
     written = ROOT / ENVIRONMENTS / f"pyright-{environment.name}.json"
     written.write_text(json.dumps(configuration))
@@ -280,8 +285,10 @@ def records() -> types.ModuleType | None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="each cohort set's tools, checking nothing")
+    parser.add_argument("--environment", action="append", default=[],
+                        help="check only this environment's tools (a name --list prints); repeatable")
     args = parser.parse_args()
     pins, shared, store = releases(), common(), records()
     groups: dict[tuple[str, tuple[str, ...]], list[Path]] = {}
@@ -301,6 +308,8 @@ def main() -> int:
         return 0
     token = os.environ.get("DEW_XLA_CACHE_TOKEN", "")
     for (name, requirements), paths in sorted(groups.items()):
+        if args.environment and name not in args.environment:
+            continue
         keys = {path: key(path, requirements, shared) for path in paths}
         wanted = [path for path in paths
                   if store is None or store.recorded(f"{STORE}/{keys[path]}", token) is None]
