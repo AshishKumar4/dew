@@ -500,14 +500,18 @@ class StartBuild:
 
 
 def start_build(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                shardings: Placement[TrainState], through: Mapping[int, int]) -> StartBuild:
+                shardings: Placement[TrainState], through: Mapping[int, int], *, kept: bool) -> StartBuild:
     """The one way a fresh state is built and placed, which a run's start runs (`placed_start`) and a run
     compiled ahead compiles (`start_compiled`): where its init passes no frozen leaf through, one program
     builds the state; where it does, the passed leaves are the held arrays placed where the state keeps them,
-    and the program builds the rest (`_rest`). One build a process keeps for each init (`initial_state`, by
-    the object itself: a refit's start traced once, `traced_start`), placement and held arrays it passes
-    through, held weakly (`Held`, `_cache.holding`), so a trainer's refits compile and lower its program
-    once (PF03): their start's program keeps the executable their call runs (`start_compiling`)."""
+    and the program builds the rest (`_rest`). One build a process keeps for each init it `kept` (a refit's
+    start traced once, `traced_start`; by the object itself), placement and held arrays it passes through,
+    held weakly (`Held`, `_cache.holding`), so a trainer's refits compile and lower its program once (PF03):
+    their start's program keeps the executable their call runs (`start_compiling`). An init no process
+    keeps is traced afresh each fit, so its build is read once and kept by none, where it took a kept one's
+    place among the `KEPT_STARTS`."""
+    if not kept:
+        return _built(initial_state, initializer, shardings, through)
     inputs = jax.tree.leaves(initializer)
     where = jax.tree.flatten(shardings)
     passed = tuple((index, Held(inputs[given])) for index, given in sorted(through.items()))
