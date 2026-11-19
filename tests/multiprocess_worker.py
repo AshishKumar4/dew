@@ -2222,23 +2222,44 @@ def mode_host_training(args) -> dict:
 
 
 def mode_streamed_refused(args) -> dict:
-    """A fresh fit choosing its layout across two processes on stand-in H100s that hold both steps, process
-    1's streamed compile refused for memory as XLA refuses one (`compiled_if_it_fits` answering None there):
-    each process's choice and whether it streams."""
+    """A fresh fit choosing its layout across two processes on stand-in H100s that hold both steps, its
+    hosts' memory stated fast, process 1's streamed compile refused for memory as XLA refuses one
+    (`compiled_if_it_fits` answering None there): each process's choice and whether it streams."""
     import jax
     from test_host_training import assumed_on_cpu, streaming_data, streaming_decoder
 
     from dew.training import execution
     from dew.training.ahead import stand_in_gpus
+    from dew.training.memory import host_memory_stated
 
     whole = execution.HostExecution.compiled_whole
     if args.process_id == 1:
         execution.HostExecution.compiled_whole = lambda self, *given: (None, whole(self, *given)[1])
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.local_devices(), 80 * 2 ** 30):
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.local_devices(), 80 * 2 ** 30), host_memory_stated(1e20):
         trainer = streaming_decoder()
         trainer.fit(streaming_data(), steps=1, log_every=100)
     return {"streams": trainer.host_master, "choice": trainer.layout_choice.record()}
 
+
+def mode_update_priced_apart(args) -> dict:
+    """A fresh fit choosing its layout across two processes on stand-in H100s that hold both steps, process
+    0's host memory stated slow (its device plan priced under the streamed update) and process 1's fast:
+    whether each streams, its choice, and how many streamed host programs it compiled."""
+    import jax
+    import jax.numpy as jnp
+    from test_host_training import assumed_on_cpu, streaming_data, streaming_decoder
+
+    from dew.telemetry.compiles import Compiles
+    from dew.training.ahead import stand_in_gpus
+    from dew.training.memory import host_memory_stated
+
+    rate = 1e6 if args.process_id == 0 else 1e20
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.local_devices(), 80 * 2 ** 30), host_memory_stated(rate):
+        # bf16, which the H100's table prices (its f32 it states no peak of).
+        trainer = streaming_decoder(dtype=jnp.bfloat16)
+        with Compiles("whole") as whole:
+            trainer.fit(streaming_data(), steps=1, log_every=100)
+    return {"streams": trainer.host_master, "choice": trainer.layout_choice.record(), "whole": whole.count}
 
 def mode_step_fits(args) -> dict:
     """Each process's own headroom for a step, and the pool's answer: process
@@ -2399,6 +2420,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "decision_publish": mode_decision_publish,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
          "streamed_refused": mode_streamed_refused,
+         "update_priced_apart": mode_update_priced_apart,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,
          "topology": mode_topology, "data": mode_data, "online_data": mode_online_data,
          "packed": mode_packed,
