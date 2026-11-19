@@ -611,6 +611,30 @@ def test_a_lazy_walks_kept_anchor_is_on_par_with_the_exact_maximum(family, base)
                         f"a lazy walk {family} ({base}), {run}", seeds=LAZY_SEEDS)
 
 
+@pytest.mark.parametrize("base", sorted(LAZY_SCALES))
+def test_a_lazy_walks_far_move_keeps_the_sums_before_it(base):
+    """Three tiles whose maxima rise by the margin and then by 105 nats past their first (`FAR_BINADES` past
+    the kept anchor), the first and last tiles' values 0 and the middle's 2^50 times a draw: the anchor kept
+    through the middle tile moves to the last tile's maximum less the margin, its factor a normal number,
+    so the middle tile's sums, about 1e-21 of the last's weight, survive: on par with the softmax at each
+    row's exact maximum (check 1), where a move to the last tile's maximum took e^-105 at once and flushed
+    them (the base review of 13eba49bd, F1)."""
+    spec = _lazy_spec(LAZY_SCALES[base])
+    margin = algebra.lazy_margin(spec, jnp.bfloat16)
+    nats = spec.unit
+    rises = (0.0, margin * 0.99, 105.0 / nats)
+    draw = _lazy_draw(rises.__getitem__)
+
+    def drawn(seed):
+        logits, values = draw(seed)
+        scale = jnp.asarray([0.0, 2.0 ** 50, 0.0], jnp.float32)[:, None, None]
+        return logits, (values.astype(jnp.float32) * scale).astype(jnp.bfloat16)
+
+    walk = _lazy_walk(spec)
+    assert_as_exact(jax.jit(walk), as_given(_exact_softmax(spec)), drawn, f"a lazy walk's far move ({base})",
+                    seeds=LAZY_SEEDS)
+
+
 def _raw_softmax(spec):
     """A raw fold's softmax at each row's exact maximum over every tile's raw logits, their differences
     taken by the scale (`Forward.raw`): its weights narrowed to the values' dtype for their product (fp32
