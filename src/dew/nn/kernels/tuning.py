@@ -1034,7 +1034,9 @@ class Prepared:
 def prepared(hook):
     """`hook` as every template launch takes it, explicit or inferred (`KernelOp.prepared`): rewritten once
     by the algebra pass where it is traced (`dew.algebra.rewritten`), so a launch given a hook directly runs
-    the form an inferred one does; a prepared hook as it is; None as None."""
+    the form an inferred one does; a prepared hook as it is; None as None. A derivative a caller declares
+    for a hook (a GEMM prologue's `prologue_jvp`) stays the caller's, never prepared: the rewritten form
+    computes the hook's own function (`rewritten`'s contract), which that derivative differentiates."""
     if hook is None or isinstance(hook, Prepared):
         return hook
     from dew import algebra
