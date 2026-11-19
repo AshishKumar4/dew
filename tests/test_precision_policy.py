@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from contract_support import CANCELLING_LEVELS, MOST
 from reference_error import assert_as_exact, assert_fp32_reduction_bound, dot_precisions
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -1160,10 +1161,8 @@ ALIGNED_CASES = {
     "a band below two that cancel": ([(2.0 ** 100, 2.0 ** 27, 1.0), (2.0 ** 100, -(2.0 ** 27), 1.0),
                                       (2.0 ** 25, 1.0, 1.0), (-(2.0 ** 24), 1.0, 1.0),
                                       (-(2.0 ** 24), 1.0, 1.0), (2.0 ** -50, 2.0 ** -50, 1.0)], 2.0 ** -100),
-    "three levels cancelling beside the largest": (
-        [(2.0 ** 100, 2.0 ** 53, 1.0), (2.0 ** 100, 2.0 ** 28, 1.0), (-(2.0 ** 100), 2.0 ** 3, 1.0),
-         (-(2.0 ** 100), 2.0 ** 28, 1.0), (2.0 ** 100, 2.0 ** 3, 1.0), (-(2.0 ** 100), 2.0 ** 53, 1.0),
-         (float(np.finfo(np.float32).max), 1.0, 1.0)], float(np.finfo(np.float32).max)),
+    "three levels cancelling beside the largest": ([(key, value, 1.0) for key, value in CANCELLING_LEVELS],
+                                                   MOST),
     "cancelling past twice the precision": ([(2.0 ** 80, 1.0, 1.0), (2.0 ** 50, 1.0, 1.0), (1.0, 1.0, 1.0),
                                              (-(2.0 ** 50), 1.0, 1.0), (-1.0, 1.0, 1.0),
                                              (-(2.0 ** 80), 1.0, 1.0)], 0.0),
@@ -1173,7 +1172,7 @@ order of summing (their sum a float32): a term more than float32's exponent rang
 where the largest cancel (base review 224fcf53a F1), and a lower band's rounding, -2^25 - 2 a tie, kept
 where its rounded sum cancels a higher band's (base review 644ef5535 F1), a third band's 2^-100 kept
 where the two above it cancel (base review f5e6e678d F1), and three levels of cancelling terms beside the
-largest, `[2^153, 2^128, -2^103, -2^128, 2^103, -2^153, fp32's largest]` the largest, not inf, and
+largest (`contract_support.CANCELLING_LEVELS`) the largest, not inf, and
 `2^80 + 2^50 + 1 - 2^50 - 1 - 2^80` zero, which floats summed in some order lose (row 8757)."""
 
 
@@ -1376,21 +1375,36 @@ def test_an_aligned_sums_second_order_keeps_a_lone_parts_sign():
 
 
 def test_an_aligned_sums_tangents_value_and_gradient_keeps_its_joint_tangent():
-    """The tangent along `(0, -2^70, 2^70, 0)` at `(2^70, 2^70, 2^70, 0)` of the value of `aligned_sum([(a,
-    b)])`'s tangent's value-and-gradient: zero, `da vb + a vdb`, the reverse pass's value the joint-tangent
-    map's, whose own tangent is one aligned sum, where an untraced map's parts, rounded apart, added to inf -
-    inf, NaN (row 8757)."""
-    big = jnp.float32(2.0 ** 70)
+    """The tangent along `(0, -2^70, 2^70 (1 + k 2^-23), 0)` at `(2^70, 2^70, 2^70, 0)`, `k` each of 0 to 8
+    in check 1's first stage (the seed's modulo `offsets`, its seeds; rows 9087, 9091), of the value of
+    `aligned_sum([(a, b)])`'s tangent's value-and-gradient, `da vb + vda b`: `k 2^117`, its two products each
+    2^140 past float32's largest, cancelling exactly at `k` zero, held by check 1 against the formula in
+    float64 rounded once (exact, so Dew must be) where an untraced map's parts, rounded apart, added to inf -
+    inf, NaN (rows 8757, 8975)."""
+    from arm_forms import as_given
+
+    big, offsets = 2.0 ** 70, 9
+
+    def draw(seed):
+        k = seed % offsets
+        point, direction = (big, big, big, 0.0), (0.0, -big, big * (1 + k * 2.0 ** -23), 0.0)
+        return tuple(np.float32(x) for x in (*point, *direction))
 
     def tangent(a, b, da, db):
         return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (a, b), (da, db))[1]
 
-    def value(a, b, da, db):
-        return jax.value_and_grad(tangent)(a, b, da, db)[0]
+    def ours(*inputs):
+        def value(*point):
+            return jax.value_and_grad(tangent)(*point)[0]
 
-    point = (big, big, big, jnp.float32(0.0))
-    direction = (jnp.float32(0.0), -big, big, jnp.float32(0.0))
-    assert float(jax.jvp(value, point, direction)[1]) == 0.0
+        return jax.jvp(value, inputs[:4], inputs[4:])[1]
+
+    def formula(a, b, da, db, va, vb, vda, vdb):
+        return vda * b + da * vb + va * db + a * vdb
+
+    rounded = as_given(lambda *inputs: np.float32(formula(*(np.float64(x) for x in inputs))))
+    assert_as_exact(jax.jit(ours), rounded, draw, "an aligned sum's tangent's value and gradient",
+                    seeds=offsets, truth_fn=jax.jit(formula))
 
 
 def test_an_aligned_sums_tangent_pulls_back_inside_its_sum():
@@ -1447,11 +1461,13 @@ def test_an_aligned_sums_tangent_leaks_no_tracer():
         jax.grad(lambda a: aligned_sum([(a, one)]))(one)
 
 
-@pytest.mark.parametrize("axis", [2, -3, (0, 0), (1, -1)], ids=["past the rank", "before it", "repeated",
-                                                               "repeated by its sign"])
+@pytest.mark.parametrize("axis", [2, -3, (0, 0), (1, -1), 2 ** 31, (0, 2 ** 31)],
+                         ids=["past the rank", "before it", "repeated", "repeated by its sign",
+                              "past a C int", "one of them past a C int"])
 def test_an_aligned_sum_refuses_an_axis_its_term_has_not(axis):
     """`aligned_sum([(x,)], axis)` of a `[2, 3]` term over an axis past its rank or repeated: a ValueError, as
-    `jnp.sum`'s, where the axis wrapped by the rank reduced another (row 8837)."""
+    `jnp.sum`'s, where the axis wrapped by the rank reduced another (row 8837), and one past a C int's range,
+    where numpy's conversion of it raised an OverflowError (row 9086)."""
     with pytest.raises(ValueError):
         aligned_sum([(jnp.ones((2, 3), jnp.float32),)], axis=axis)
 

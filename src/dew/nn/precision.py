@@ -43,6 +43,7 @@ from jax.core import ShapedArray
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
+from numpy.lib.array_utils import normalize_axis_tuple
 
 from dew.nn.derivatives import (
     Protected,
@@ -1707,24 +1708,24 @@ def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Arr
         shape.append(tuple(indices))
     from dew.nn.kernels.launches import interpreting
 
-    # Each term's axes checked and made one sorted tuple of nonnegative axes once, for the value and its
-    # transpose alike (row 8837).
-    spec = tuple((_axes(axis, max(map(np.ndim, term))), laid)
-                 for term, (axis, laid) in zip(terms, spec, strict=True))
+    # Each term's axes checked and made one sorted tuple of nonnegative axes once, as numpy normalizes them
+    # (an AxisError, a ValueError, for one out of range or repeated), for its value and transpose alike
+    # (rows 8837, 8974).
+    ranks = [max(map(np.ndim, term)) for term in terms]
+    spec = tuple((axis if axis is None else _normalized_axes(axis, rank), laid)
+                 for rank, (axis, laid) in zip(ranks, spec, strict=True))
     # A compiled kernel's body bare, as Mosaic lowers no symbolic zeros' rule; an interpreted one declared.
     return (_aligned_value if interpreting() is False else _aligned)(tuple(shape), spec, *factors)
 
 
-def _axes(axis, rank: int) -> tuple[int, ...] | None:
-    """`axis` of a term of `rank` as sorted nonnegative axes, None for none; a ValueError for one out of
-    range or repeated, as `jnp.sum`'s: wrapped by the rank, a third axis of a matrix reduced its first (row
-    8837)."""
-    if axis is None:
-        return None
-    given = [int(a) for a in np.atleast_1d(axis)]
-    if any(not -rank <= a < rank for a in given) or len({a % rank for a in given}) < len(given):
-        raise ValueError(f"an aligned sum's axis {axis} is out of range or repeated in a term of rank {rank}")
-    return tuple(sorted(a % rank for a in given))
+def _normalized_axes(axis: int | Sequence[int], rank: int) -> tuple[int, ...]:
+    """`axis` of a term of `rank` as numpy normalizes it (`normalize_axis_tuple`), sorted: a ValueError for
+    one out of range or repeated, an axis past a C int's range one too, where numpy's conversion of it
+    raised an OverflowError (row 9086)."""
+    try:
+        return tuple(sorted(normalize_axis_tuple(axis, rank)))
+    except OverflowError as error:
+        raise ValueError(f"axis {axis} is out of bounds for a term of rank {rank}") from error
 
 
 def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
@@ -1787,11 +1788,12 @@ def _product(term: Sequence[jax.Array], ints) -> _Product:
 
 
 def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
-    """A term's reduction to the sum's value, `op` over its axes (kept) and laid, and its count."""
+    """A term's reduction over its axes one at a time (Mosaic TPU x64, 8807) and laid, and its count."""
     axes = axis or ()
 
     def reduced(x: jax.Array, op: Callable = jnp.sum, **options) -> jax.Array:
-        x = op(x, axis=axes, keepdims=True, **options) if axes else x
+        for a in axes:
+            x = op(x, axis=a, keepdims=True, **options)
         return x if laid is None else jnp.broadcast_to(x, laid[0]).reshape(laid[1])
 
     return reduced, math.prod(shape[a] for a in axes)
@@ -1808,14 +1810,13 @@ def _exact_sum(terms, spec, dtype) -> jax.Array:
         product = _product(term, ints)
         reduced, extent = _reduction(product.place.shape, axis, laid)
         parts.append((product, reduced, extent))
-        nan = nan | reduced(product.nan, jnp.any)
-        positive = positive | reduced(product.infinite & ~product.negative, jnp.any)
-        negative = negative | reduced(product.infinite & product.negative, jnp.any)
-        # A sum of negative zeros alone is one, of none positive zero (base review 6c68b90ad F4).
-        live = live | reduced(~(product.zero & product.negative), jnp.any)
+        # Sum in `ints` (not `jnp.any`, float64 under Mosaic TPU x64, 8807); negative zeros alone stay -0.
+        flags = (product.nan, product.infinite & ~product.negative, product.infinite & product.negative,
+                 ~(product.zero & product.negative))
+        nan, positive, negative, live = (p | (reduced(f.astype(ints), jnp.sum, dtype=ints) != 0)
+                                         for p, f in zip((nan, positive, negative, live), flags, strict=True))
     count = sum(extent for _, _, extent in parts)
-    if not count:
-        live = True
+    live = True if not count else live
     # The widest digit whose one term's sum `widest (2^w - 1)` the integers hold, its quotient carried apart
     # as it adds (`_nearest`, row 8757).
     widest, most = max(extent for _, _, extent in parts), (1 << (limits.bits - 1)) - 1

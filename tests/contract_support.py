@@ -31,6 +31,13 @@ contracts)."""
 MOST = float(np.finfo(np.float32).max)
 """Float32's largest value: a held position's truth, and each signed sum of its terms, at most it."""
 
+CANCELLING_LEVELS = ((2.0 ** 26, 2.0 ** 127), (2.0, 2.0 ** 127), (1.0, -(2.0 ** 103)), (2.0, -(2.0 ** 127)),
+                     (1.0, 2.0 ** 103), (2.0 ** 26, -(2.0 ** 127)), (1.0, MOST))
+"""Seven products of a float32 key and value, 2^153, 2^128, -2^103, -2^128, 2^103, -2^153 and the largest,
+summing to the largest: three levels cancelling beside it, which floats summed in some order lose (one
+dropping -2^103 at a tie as 2^103 survives summed to inf, row 8757). Each a multiple of 2^103 below 2^154, so
+float64 sums them, and any power of two times them, exactly in any order."""
+
 
 class LessFinite(AssertionError):
     """A seam's order not finite where the contract holds it (`assert_contract`): what the contract refuses,

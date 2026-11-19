@@ -1132,6 +1132,12 @@ class Issuer[Accumulator](abc.ABC):
         which its products read, not beside every loop carry."""
         return ref
 
+    def stored_row(self, vector: jax.Array, smem) -> jax.Array:
+        """`vector` `[rows]` in the layout the epilogue's `stored` callback reads: unchanged where the family
+        scales in place, or relayed through `smem` where its sums live in tensor memory (`placed.py`)."""
+        del smem
+        return vector
+
     @abc.abstractmethod
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the

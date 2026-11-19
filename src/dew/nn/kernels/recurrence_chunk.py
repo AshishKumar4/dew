@@ -1950,12 +1950,13 @@ def _tpu_documents(state, forked: Forked, length: int, chunk_size: int, work, wi
 
 def _tpu_specs(documents, rows, heads):
     """`_tpu_documents`' placements on a shard map (`manual_map`): the memories `[B, S', H, P, N]` and the
-    entry write's operands by rows and heads, the tokens `[B, T]` by rows, None for absent ones."""
+    entry write's operands (`Forked.entry_specs`) by rows and heads, the tokens `[B, T]` by rows, None for
+    absent ones."""
     if documents is None:
         return None
     _, tokens, entry = documents
-    each = (P(rows, None, None, heads, None), P(rows, None, None, heads, None), P(rows, None, heads))
-    return P(rows, None, heads, None, None), (P(rows, None),) * len(tokens), None if entry is None else each
+    return (P(rows, None, heads, None, None), (P(rows, None),) * len(tokens),
+            None if entry is None else Forked.entry_specs(rows, heads))
 
 
 @dataclasses.dataclass(frozen=True)

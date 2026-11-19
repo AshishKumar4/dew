@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from fla_sites import FLOOR_GATES, LEAVES, the_template_is_as_exact_as_fla
+from fla_sites import FAINT_CROSS, FLOOR_GATES, LEAVES, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU
 from map_judge import sharded
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
@@ -335,7 +335,7 @@ def compiled_gradient(hooks, name: str) -> list[dict]:
 
 
 @COMPILES_ON_CPU
-@pytest.mark.check1_shards(seeds=512, per_task=8)
+@pytest.mark.check1_shards(seeds=512, per_task=3)
 def test_kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla_interpreted():
     """Kimi delta attention's 16-bit gradient through the template, interpreted, under decays at its floor and
     write gates down to 2^-60 (fla_sites' `FLOOR_GATES`): its output, final memory and every operand's
@@ -347,6 +347,20 @@ def test_kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla_inter
                                     'the template, Kimi delta attention under tiny gates at the floor')
 
 
+@COMPILES_ON_CPU
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_kimis_faint_cross_terms_are_as_exact_as_fla_interpreted():
+    """Kimi delta attention's 16-bit gradient through the template, interpreted, over one key under faint
+    write gates beside large ones and no decay (fla_sites' `FAINT_CROSS`): its output, final memory and
+    every operand's gradient on par with recorded fla-core's from float64 (check 1). A token's own scores
+    pair taken out of the log decay's terms after they were summed in fp32 lost the faint cross term
+    beside it (base review 29b07fb60 F1, row 7906), which a cell held bitwise outside the gate (row 8569)."""
+    mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
+    the_template_is_as_exact_as_fla(mosaic, FAINT_CROSS, LEAVES,
+                                    'the template, Kimi delta attention under faint cross terms')
+
+
+@COMPILES_ON_CPU
 def test_a_gradients_kernels_are_each_certified_as_its_program_lowers():
     """The gated delta net's bf16 gradient compiled for a compile-only H100 as a start compiles it
     (`compiled_gradient`): every Mosaic GPU kernel its program runs, its training forward's and its fast
