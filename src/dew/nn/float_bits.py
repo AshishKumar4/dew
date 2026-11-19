@@ -48,16 +48,18 @@ TWO_FACTOR_REACH = two_factor_reach(jnp.float32)
 
 
 def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """A float `x`'s bits as the unsigned integer of its width, and its raw fields in that type: its sign bit
-    in place, its biased exponent shifted down and its fraction, `(bits, sign, biased, fraction)`. The one
-    reader of a float's fields: a subnormal's normalization (`float_bits`) and a result's rounding
-    (`lowered_rounded`, `precision`'s division) are their callers'."""
+    """A float `x`'s bits as the unsigned integer of its width (a format a byte or wider), and its raw fields
+    in that type: its sign bit in place (0 in a format with none, E8M0), its biased exponent shifted down
+    and its fraction, `(bits, sign, biased, fraction)`. The one reader of a float's fields: a subnormal's
+    normalization (`float_bits`) and a result's rounding (`lowered_rounded`, `precision`'s division) are
+    their callers'."""
     limits = jnp.finfo(x.dtype)
     word = jnp.dtype(f"uint{limits.bits}")
     bits = jax.lax.bitcast_convert_type(x, word)
+    signed = limits.bits - limits.nexp - limits.nmant
     # The exponent's field by its width (`nexp`): a format with no infinity (E4M3) holds finite values in
     # its top binade, past IEEE's `maxexp`.
-    return (bits, bits & word.type(1 << (limits.bits - 1)),
+    return (bits, bits & word.type(signed << (limits.bits - 1)),
             (bits >> word.type(limits.nmant)) & word.type((1 << limits.nexp) - 1),
             bits & word.type((1 << limits.nmant) - 1))
 
@@ -128,17 +130,23 @@ def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
 
 
+WIDENED = frozenset(map(jnp.dtype, (jnp.float16, jnp.bfloat16, jnp.float32)))
+"""The formats `widened_exactly` widens from their bits: IEEE's binary ones a hardware conversion reads as a
+float, flushing a subnormal where its process does (XLA:CPU's float32 to float64). An 8-bit or narrower
+float converts by integer arithmetic, a fraction's bits moved, exactly as it is."""
+
+
 def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
-    """`x` in `dtype`, a float format holding every value of `x`'s, exactly: a subnormal `x` set in
-    `dtype`'s bits from its own (its leading bit its normal exponent where `dtype` holds one, else its
-    fraction on `dtype`'s subnormal grid), a normal one converted, so a process whose float conversion
-    flushes a subnormal operand (XLA's CPU, row 4023: float32's `2^-149` widened to zero, row 8966) widens
-    it; any other `x` (an integer, a Python scalar, `x` of `dtype`) converted as `jnp.asarray` converts it.
-    Its select reads `x`'s bits, so a function JAX transposes (a product's linear map) takes no `x` it
-    widens."""
+    """`x` in `dtype`, exactly, where `dtype` is the wider of IEEE's binary formats (float32, float64): a
+    subnormal `x` of a `WIDENED` format set in `dtype`'s bits from its own (its leading bit its normal
+    exponent where `dtype` holds one, else its fraction on `dtype`'s subnormal grid), a normal one converted,
+    so a process whose float conversion flushes a subnormal operand (XLA's CPU, row 4023: float32's `2^-149`
+    widened to zero, row 8966) widens it. Any other `x` (an integer, a Python scalar, a narrower format's, a
+    conversion that narrows) converted as `jnp.asarray` converts it. It reads `x`'s bits, so a derivative
+    of it is its caller's to declare (`aligned_sum`'s)."""
     x, dtype = jnp.asarray(x), jax.dtypes.canonicalize_dtype(dtype)
-    # A format of no fraction (E8M0) has no subnormal: its biased exponent 0 a power.
-    if not jnp.issubdtype(x.dtype, jnp.floating) or x.dtype == dtype or jnp.finfo(x.dtype).nmant == 0:
+    if (x.dtype not in WIDENED or dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.float64))
+            or jnp.finfo(dtype).bits <= jnp.finfo(x.dtype).bits):
         return jnp.asarray(x, dtype)
     source, target = jnp.finfo(x.dtype), jnp.finfo(dtype)
     word = jnp.dtype(f"uint{target.bits}")

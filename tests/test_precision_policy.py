@@ -1236,6 +1236,30 @@ def test_an_aligned_sum_of_mixed_factors_reads_a_subnormal_from_its_bits():
     np.testing.assert_array_equal(np.asarray(found), [1.0, -(2.0 ** 23 - 1)])
 
 
+def test_an_aligned_sum_of_mixed_factors_differentiates_each_factor():
+    """`aligned_sum([(a, b)])` of an fp32 `a` and an fp64 `b`, with x64 on: its tangent and gradient in `a`
+    at `a = 0` and at the subnormal `2^-149` are `b`, 2, each factor's own type's, where its exact widening
+    read `a`'s bits outside the declared rule and its tangent was 0 (base review ed11c8e4e F1)."""
+    with jax.enable_x64(new_val=True):
+        a = jnp.asarray([0.0, 2.0 ** -149], jnp.float32)
+        b = jnp.full((2,), 2.0, jnp.float64)
+        _, tangent = jax.jvp(lambda a: aligned_sum([(a, b)]), (a,), (jnp.ones_like(a),))
+        gradient = jax.grad(lambda a: jnp.sum(aligned_sum([(a, b)])))(a)
+    assert tangent.dtype == jnp.float64 and gradient.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(tangent), [2.0, 2.0])
+    np.testing.assert_array_equal(np.asarray(gradient), [2.0, 2.0])
+
+
+def test_an_aligned_sum_of_a_weak_float64_factor_keeps_float32():
+    """`aligned_sum` of one weakly typed float64 factor (`jnp.asarray(1.0)` with x64 on) is float32's 1, the
+    factor narrowed as promotion narrows it, where its exact widening read float64's bits as float32's and
+    shifted by a negative count (base review ed11c8e4e F2)."""
+    with jax.enable_x64(new_val=True):
+        found = aligned_sum([(jnp.asarray(1.0),)])
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), 1.0)
+
+
 def test_an_aligned_sum_of_three_factors_over_a_long_axis_is_its_exact_sum():
     """`aligned_sum([(x, x, x)], axis=0)` of 2^20 fp32 ones: 2^20, its digits as narrow as its count of limbs
     needs, where four million pieces were refused (base review 6c68b90ad F2)."""
@@ -1951,19 +1975,44 @@ def test_a_floats_raw_fields_are_its_bits(dtype):
 
 
 @pytest.mark.parametrize(("source", "target"), [
-    (np.float32, np.float64), (jnp.bfloat16, np.float32), (np.float16, np.float32),
-    (jnp.float8_e4m3fn, np.float32), (np.float32, np.float32)],
-    ids=["fp32-float64", "bf16-fp32", "fp16-fp32", "e4m3-fp32", "fp32-fp32"])
+    (np.float32, np.float64), (jnp.bfloat16, np.float32), (np.float16, np.float32), (np.float16, np.float64),
+    (jnp.float8_e4m3fn, np.float32), (jnp.float8_e4m3fnuz, np.float32), (np.float32, np.float32)],
+    ids=["fp32-float64", "bf16-fp32", "fp16-fp32", "fp16-float64", "e4m3-fp32", "e4m3fnuz-fp32", "fp32-fp32"])
 def test_a_float_widens_exactly_from_its_bits(source, target):
     """`widened_exactly` of a format's edge values of both signs (its subnormals of every leading bit's place
     among them) into a format at least as wide, compiled: NumPy's exact conversion bit for bit, a negative
-    zero's sign kept, where XLA:CPU's cast flushes a subnormal (row 8966)."""
+    zero's sign kept, where XLA:CPU's cast flushes a subnormal (row 8966); an 8-bit float's as its
+    conversion gives it, E4M3FNUZ's 0x80 a NaN, not -0 (base review ed11c8e4e F4)."""
     with jax.enable_x64(new_val=target == np.float64):
         values = edge_values(source)
         found = np.asarray(jax.jit(lambda x: widened_exactly(x, target))(jnp.asarray(values)))
     assert found.dtype == target
+    expected = values.astype(target)
     word = f"uint{np.finfo(target).bits}"
-    np.testing.assert_array_equal(found.view(word), values.astype(target).view(word))
+    np.testing.assert_array_equal(np.isnan(found), np.isnan(expected))
+    held = ~np.isnan(expected)
+    np.testing.assert_array_equal(found[held].view(word), expected[held].view(word))
+
+
+@pytest.mark.parametrize("source", [jnp.float6_e2m3fn, jnp.float6_e3m2fn, jnp.float4_e2m1fn])
+def test_a_sub_byte_float_widens_as_it_converts(source):
+    """`widened_exactly` of every code of a sub-byte float (FP6, FP4) into float32: its conversion, exact,
+    where reading its bits asked for an unsigned integer of its width (base review ed11c8e4e F3)."""
+    values = np.arange(1 << jnp.finfo(source).bits, dtype=np.uint8).view(source)
+    found = np.asarray(jax.jit(lambda x: widened_exactly(x, np.float32))(jnp.asarray(values)))
+    np.testing.assert_array_equal(found, values.astype(np.float32))
+
+
+def test_e8m0s_raw_fields_hold_no_sign():
+    """`raw_fields` of E8M0 (an MX block's scale, unsigned, no fraction): no sign bit, every bit its biased
+    exponent, where the sign's mask read its top exponent bit (base review ed11c8e4e F3)."""
+    codes = np.arange(255, dtype=np.uint8)
+    bits, sign, biased, fraction = (np.asarray(field) for field in jax.jit(raw_fields)(
+        jnp.asarray(codes.view(jnp.float8_e8m0fnu))))
+    np.testing.assert_array_equal(bits, codes)
+    np.testing.assert_array_equal(sign, 0)
+    np.testing.assert_array_equal(biased, codes)
+    np.testing.assert_array_equal(fraction, 0)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["fp32", "float64"])

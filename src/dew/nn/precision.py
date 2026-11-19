@@ -1701,16 +1701,15 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
 def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Array:
     """`aligned_sum` of `terms`, each product summed over its `spec` entry's axis (kept) and, where it gives
     `(held, shape)`, broadcast to `held` and reshaped to `shape` (a gradient's term in its factor's)."""
-    dtype = jnp.result_type(jnp.float32, *(factor for term in terms for factor in term))
-    # Each factor once, by identity: a shared factor's gradient sums its terms' together, aligned.
+    # Each factor once, by identity: a shared factor's gradient sums its terms' together, aligned. Each its
+    # own type here, widened within the value (`_aligned_value`), so its tangent is the declared rule's.
     factors, places, shape = [], {}, []
     for term in terms:
         indices = []
         for factor in term:
             if id(factor) not in places:
                 places[id(factor)] = len(factors)
-                # Widened from its bits: a cast flushes a subnormal factor on XLA:CPU (row 8966).
-                factors.append(widened_exactly(factor, dtype))
+                factors.append(jnp.asarray(factor))
             indices.append(places[id(factor)])
         shape.append(tuple(indices))
     from dew.nn.kernels.launches import interpreting
@@ -1741,8 +1740,11 @@ def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) ->
 
 
 def _aligned_value(shape: tuple[tuple[int, ...], ...], spec: tuple, *flat: jax.Array) -> jax.Array:
-    """`_aligned_terms` of its terms' factors in a row (`_regrouped`), summed exactly (`_exact_sum`)."""
-    return _exact_sum(_regrouped(shape, flat), spec, flat[0].dtype)
+    """`_aligned_terms` of its terms' factors in a row (`_regrouped`), each widened to their common type
+    from its bits (a cast flushes a subnormal factor on XLA:CPU, row 8966; `widened_exactly`), summed
+    exactly (`_exact_sum`)."""
+    dtype = jnp.result_type(jnp.float32, *flat)
+    return _exact_sum(_regrouped(shape, [widened_exactly(factor, dtype) for factor in flat]), spec, dtype)
 
 
 class _Product(NamedTuple):
