@@ -893,13 +893,15 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     float32's largest (a future corrected write's), whose product by a zero decay is NaN in every query's
     gradient the pair reads (the chunked op's reverse mode, near the largest) and in the decays'. A pairing
     `apart` by groups of that many tokens pairs no two of one group (`j // apart < i // apart`: a gram's own
-    token, a group of one; a readout's group, `Scan.group`)."""
+    token, a group of one; a readout's group, `Scan.group`). A pair is out where its decay is crossed
+    (`_crossed`), not where it rounds to zero: a live pair's that underflows reads a NaN as the recurrence
+    does (train 1079's review F1)."""
     joined = between
     if apart:
         rows, columns = (jnp.arange(between.shape[axis])[index] // apart
                          for axis, index in ((0, (slice(None), None)), (1, (None, slice(None)))))
-        joined = jnp.where((rows > columns)[:, :, None], between, 0.0)
-    active = jnp.any(joined != 0, axis=-1)
+        joined = jnp.where((rows > columns)[:, :, None], between, -0.0)
+    active = jnp.any(~_crossed(joined), axis=-1)
     issue = issue or _issued
     if between.shape[-1] == 1:
         # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
@@ -955,7 +957,7 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
     from dew.nn.kernels import recurrence_algebra
 
     issue = issue or _issued
-    active = jnp.any(between != 0, axis=-1)
+    active = jnp.any(~_crossed(between), axis=-1)
     reads = jnp.where(active, issue("scores", readers, values.T), 0.0)
     if weights is not None:
         reads = reads * weights
@@ -1185,8 +1187,9 @@ def _decays_value(exponents, base2: bool) -> _Decays:
 
 
 def _crossed(decay: jax.Array) -> jax.Array:
-    """Where a chunk's decay (`_decays_value`'s) spans a vanished token, a document's start: negative zero,
-    which a live span's decay that underflows (positive zero) is not."""
+    """Where a chunk's decay (`_decays_value`'s) is cut: a span through a vanished token (a document's start,
+    or a decay that alone underflows), or a pair's future, negative zero, which a live span's decay that
+    underflows (positive zero) is not: the one reading the readout's select and the pairs' take."""
     # The sign bit read as the integer of its width's: `jnp.signbit` shifts by a constant, which a checked
     # `shard_map` refuses beside a varying decay.
     bits = jax.lax.bitcast_convert_type(decay, jnp.dtype(f"int{jnp.finfo(decay.dtype).bits}"))
