@@ -1267,6 +1267,20 @@ def each_process_reads_the_facts_of_the_gpu_it_sees(tmp_path):
     assert reports[0]["clock_hz"] == reports[1]["clock_hz"]
 
 
+def test_a_call_reads_its_facts_from_the_devices_its_context_places_it_on():
+    """The devices a call's target and generation are read from (`generation.placed_devices`, the first of
+    them its target's) are the ones its context places it on: a set mesh's own, in its order, or the
+    default device, never the process's first where the call runs on another (row 8990: a call placed on a
+    second local GPU read the first's instruction family and resources)."""
+    from dew.nn.kernels import generation
+
+    devices = jax.local_devices()
+    with jax.set_mesh(Mesh(np.asarray(devices[2:4]), ("x",))):
+        assert generation.placed_devices() == devices[2:4]
+    with jax.default_device(devices[1]):
+        assert generation.placed_devices() == [devices[1]]
+
+
 def test_a_run_over_gpus_of_two_kinds_is_refused():
     """Each process's kernel choices read its first GPU's facts and must agree with every other's, so a
     run whose processes' first GPUs are of two kinds is refused; first GPUs of one kind pass, whatever
