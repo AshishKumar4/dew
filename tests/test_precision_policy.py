@@ -1321,6 +1321,32 @@ def test_an_aligned_sums_second_order_keeps_its_losss_curvature(order):
     np.testing.assert_array_equal(np.asarray(jax.grad(mixed)(a)), [8.0, 24.0])
 
 
+def test_an_aligned_sum_over_an_axis_a_mesh_splits_sums_it_shard_by_shard():
+    """`aligned_sum([(x,)], axis=0)` of ones `[6, 2]` split over an Explicit two-device data axis: `[[6, 6]]`,
+    and its gradient ones placed as `x` is, where its axis summed in halves sliced the split axis at three,
+    which two shards do not divide (base review 9e56c760b F1)."""
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+        x = jax.device_put(jnp.ones((6, 2), jnp.float32), rows)
+        value = jax.jit(lambda x: aligned_sum([(x,)], axis=0))(x)
+        gradient = jax.jit(jax.grad(lambda x: jnp.sum(aligned_sum([(x,)], axis=0))))(x)
+    np.testing.assert_array_equal(np.asarray(value), [[6.0, 6.0]])
+    np.testing.assert_array_equal(np.asarray(gradient), np.ones((6, 2)))
+    assert gradient.sharding.is_equivalent_to(rows, gradient.ndim)
+
+
+def test_an_aligned_sum_over_an_empty_axis_is_zero():
+    """`aligned_sum([(x, y)])` of a scalar `x` beside an empty `y`: an empty value whose pullback gives `x` a
+    zero cotangent, and a sum over an empty axis zero, where the largest binade over no element raised
+    (base review 9e56c760b F2)."""
+    x, y = jnp.float32(2.0), jnp.zeros((0,), jnp.float32)
+    value, pulled = jax.vjp(lambda x, y: aligned_sum([(x, y)]), x, y)
+    assert value.shape == (0,) and float(pulled(jnp.zeros_like(value))[0]) == 0.0
+    np.testing.assert_array_equal(np.asarray(aligned_sum([(jnp.zeros((0, 3), jnp.float32),)], axis=0)),
+                                  np.zeros((1, 3)))
+
+
 def test_an_aligned_sums_gradient_scales_a_cotangent_before_its_broadcast_sum():
     """`aligned_sum([(x, y), (z,)])` of one-element `x` 2^-20 and `y` 2^-100 beside `z` of two, under a
     cotangent of 1.5 2^127 on each: `x`'s gradient 3 2^27 and `y`'s 3 2^107, float64's, where the cotangent's
