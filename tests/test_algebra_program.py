@@ -878,6 +878,26 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     assert priced.price.value > unmeasured.price.value
 
 
+def test_a_derivatives_sum_outside_the_language_is_priced_as_the_sum_it_computes():
+    """A sum JAX's derivatives accumulate with (`add_any`, a leaf of the region, outside the language) is
+    priced as the add it computes, one CUDA-core operation an element, as the template's emission prices it:
+    a product and an `add_any` of it cost what a product and an add do. Its work was dropped, its leaf's
+    bytes alone charged, so a prologue holding one compared cheaper than it computes (the audit of
+    2026-11-19pm, 8964)."""
+    from jax._src.ad_util import add_jaxvals_p
+
+    def priced(fn):
+        x, y = jnp.ones((64, 128), jnp.float32), jnp.ones((64, 128), jnp.float32)
+        region = terms.region(jax.make_jaxpr(fn)(x, y))
+        graph, bundle, _ = program.graphed(region)
+        return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                             cost_model=cost.model(region, cost.fused(generation.TARGETS["sm90"])))[1].work
+
+    accumulated = priced(lambda x, y: add_jaxvals_p.bind(x * y, x))
+    added = priced(lambda x, y: x * y + x)
+    assert accumulated.operations == added.operations
+
+
 def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
     """A `lax.dot_general` of a bfloat16 and a float16 matrix, no preferred type stated, priced at the dtype
     JAX makes it (`terms.product_dtype`, its traced result's, which the region records as its stated type),

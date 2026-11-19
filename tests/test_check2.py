@@ -145,6 +145,17 @@ def test_a_correctly_rounded_division_is_held_at_its_exact_quotient():
                         lambda seed: (dividend,), "a correctly rounded division's gradient", seeds=1)
 
 
+def test_a_compensated_sum_and_a_maximum_of_no_rows_are_certified():
+    """A compensated sum (`precision.compensated_sum`) and a maximum over axis 1 of a `(0, 3)` operand, rows
+    of nothing: check 2 certifies each, holding its empty result; its reshape of the reduced axes inferred
+    their extent from an array of no elements and raised (the audit of 2026-11-19pm, 8965)."""
+    from dew.nn.precision import compensated_sum
+
+    empty = jnp.zeros((0, 3), jnp.float32)
+    for fn in (lambda x: compensated_sum(x, (1,)), lambda x: jnp.max(x, axis=1)):
+        assert ct.certified(fn, empty)[1] == []
+
+
 def test_a_sum_holds_in_any_order_and_a_lost_term_breaks_it():
     """A float32 sum taken left to right, pairwise or the lane's own way holds the sum's bound; a sum
     missing one term of a cancelling row breaks it."""

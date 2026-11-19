@@ -75,7 +75,10 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
     CUDA-core operations, one an element of its operand; a reduction and a product each a kernel of XLA's
     fusion, its root (elementwise work fuses into it); a conversion's conversions and a special
     function's exponentials, one an element of their result; any other elementwise node's CUDA-core
-    operations; a layout change none. What XLA's fusion keeps on chip (`Work.kept_bytes`, a TPU's VMEM
+    operations, an entrywise equation's outside the language (a derivative's `add_any`, a leaf of the region,
+    `terms.OPERATIONS`) among them, one an element as the template's emission prices it, where it was work no
+    comparison read (the audit of 2026-11-19pm, 8964); a layout change none. What XLA's fusion keeps on chip
+    (`Work.kept_bytes`, a TPU's VMEM
     traffic, row 7283): a leaf's bytes read once into the vector registers, a reduction's and a product's
     result written once and read once by its reader (a product's at its result's dtype, a reduction's at a
     vector lane's four bytes an element, as the e-graph holds no dtype), and elementwise work fused into a
@@ -84,8 +87,13 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         # The leaf's own shape from its region (a callback may read no table at a node it was not given).
         leaf = key(Term.leaf(args[0]))
         extent = region.extents.get(leaf)
-        stored = None if extent is None else math.prod(extent) * region.dtypes[leaf].itemsize
-        return Work() if stored is None else Work(device_bytes=stored, kept_bytes=stored)
+        if extent is None:
+            return Work()
+        stored = math.prod(extent) * region.dtypes[leaf].itemsize
+        outside = region.made_by.get(integer(args[0]))
+        entrywise = outside is not None and programs.entrywise(outside.equation.primitive)
+        computed = math.prod(extent) if entrywise else 0
+        return Work(device_bytes=stored, kept_bytes=stored, operations=computed)
     if (args := get_callable_args(node, Term.reduce)) is not None:
         operand = shape_of(graph, args[0], held)
         _, params = region.params[integer(args[3])]
