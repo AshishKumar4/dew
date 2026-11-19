@@ -12,13 +12,14 @@ The saved pipelines' own calls on drawn inputs, in float32 and float64, are tool
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import flax_precision
 import jax
 import jax.numpy as jnp
 import numpy as np
 from diffusers.models.unets.unet_2d_condition_flax import FlaxUNet2DConditionModel
-from diffusers.models.vae_flax import FlaxAutoencoderKL
+from diffusers.models.vae_flax import FlaxAutoencoderKL, FlaxDecoderOutput
 from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion import FlaxStableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_img2img import (
     FlaxStableDiffusionImg2ImgPipeline,
@@ -26,9 +27,11 @@ from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_img2img
 from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_inpaint import (
     FlaxStableDiffusionInpaintPipeline,
 )
+from diffusers.pipelines.stable_diffusion.pipeline_output import FlaxStableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion_xl.pipeline_flax_stable_diffusion_xl import (
     FlaxStableDiffusionXLPipeline,
 )
+from diffusers.pipelines.stable_diffusion_xl.pipeline_output import FlaxStableDiffusionXLPipelineOutput
 from diffusers.schedulers.scheduling_ddim_flax import FlaxDDIMScheduler
 from PIL import Image
 from reference_releases import require
@@ -73,7 +76,8 @@ def build(directory, task):
     params = {"vae": vae.init_weights(jax.random.PRNGKey(1)),
               "unet": unet.init_weights(jax.random.PRNGKey(2)),
               "text_encoder": text.params, "scheduler": scheduler.create_state()}
-    components = dict(vae=vae, text_encoder=text, tokenizer=tokenizer, unet=unet, scheduler=scheduler)
+    components: dict[str, Any] = dict(vae=vae, text_encoder=text, tokenizer=tokenizer, unet=unet,
+                                      scheduler=scheduler)
     if xl:
         config2 = CLIPTextConfig(**{**config.to_dict(), "hidden_act": "gelu"})
         text2 = FlaxCLIPTextModelWithProjection(config2, seed=3)
@@ -97,32 +101,38 @@ def build(directory, task):
     prompts, negative = ["cat"], ["dog"]
     tokens = tokenizer(prompts, padding="max_length", max_length=8, truncation=True, return_tensors="np").input_ids
     neg = tokenizer(negative, padding="max_length", max_length=8, truncation=True, return_tensors="np").input_ids
-    arrays = dict(pixels=pixels, mask=mask, tokens=tokens)
+    arrays: dict[str, Any] = dict(pixels=pixels, mask=mask, tokens=tokens)
     if xl:
+        assert isinstance(pipeline, FlaxStableDiffusionXLPipeline)  # The task's pipeline class.
         tokens, neg = pipeline.prepare_inputs(prompts), pipeline.prepare_inputs(negative)
         hidden, pooled = pipeline.get_embeddings(tokens, params)
         arrays.update(tokens=tokens, hidden=hidden, pooled=pooled)
     else:
         arrays["hidden"] = pipeline.text_encoder(tokens, params=params["text_encoder"])[0]
-    common = dict(params=params, prng_seed=key, num_inference_steps=2, height=32, width=32,
+    common: dict[str, Any] = dict(params=params, prng_seed=key, num_inference_steps=2, height=32, width=32,
                   guidance_scale=3.0, neg_prompt_ids=neg)
     noise = jax.random.normal(key, (1, 4, 8, 8))
     if task == "img2img":
+        assert isinstance(pipeline, FlaxStableDiffusionImg2ImgPipeline)  # The task's pipeline class.
         ids, processed = pipeline.prepare_inputs(prompts, image)
         arrays["processed"] = processed
         output = pipeline(ids, image=processed, strength=1.0, noise=noise, **common)
     elif task == "inpaint":
+        assert isinstance(pipeline, FlaxStableDiffusionInpaintPipeline)  # The task's pipeline class.
         ids, processed, masks = pipeline.prepare_inputs(prompts, image, mask_image)
         arrays.update(processed=processed, processed_mask=masks)
         output = pipeline(ids, mask=masks, masked_image=processed, latents=noise, **common)
     else:
         output = pipeline(tokens, latents=noise, **common)
+    assert isinstance(output, FlaxStableDiffusionPipelineOutput | FlaxStableDiffusionXLPipelineOutput)
     arrays["images"] = output.images
     raw = jnp.asarray(pixels[None]).transpose(0, 3, 1, 2) / 127.5 - 1
     posterior = pipeline.vae.apply({"params": params["vae"]}, raw, method=pipeline.vae.encode).latent_dist
     arrays["encoded"] = posterior.sample(key) * pipeline.vae.config.scaling_factor
-    arrays["decoded"] = pipeline.vae.apply({"params": params["vae"]}, noise / pipeline.vae.config.scaling_factor,
-                                            method=pipeline.vae.decode).sample.transpose(0, 2, 3, 1)
+    decoded = pipeline.vae.apply({"params": params["vae"]}, noise / pipeline.vae.config.scaling_factor,
+                                 method=pipeline.vae.decode)
+    assert isinstance(decoded, FlaxDecoderOutput)  # return_dict's default.
+    arrays["decoded"] = decoded.sample.transpose(0, 2, 3, 1)
     arrays["noise"] = noise.transpose(0, 2, 3, 1)
     if task in ("sd", "xl"):
         added = None if not xl else {"text_embeds": arrays["pooled"],

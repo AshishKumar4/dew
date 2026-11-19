@@ -12,7 +12,7 @@ import argparse
 import json
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import jax
 import numpy as np
@@ -146,7 +146,8 @@ def build(base, directory, task):
         image_latents = pipe.vae.encode(processed).latent_dist.mode() * pipe.vae.config.scaling_factor
         prompt, negative, pooled, neg_pooled = pipe.encode_prompt(
             "cat", prompt_2="fox", device=torch.device("cpu"), negative_prompt="dog", negative_prompt_2="owl")
-        assert negative is not None and neg_pooled is not None  # Guided: its negative embeddings made.
+        # Every embedding made: the prompts are given and guided.
+        assert pooled is not None and negative is not None and neg_pooled is not None
         kwargs: dict[str, Any] = dict(
             prompt="cat", prompt_2="fox", negative_prompt="dog", negative_prompt_2="owl", num_inference_steps=4,
             guidance_scale=3.0, height=32, width=32, generator=torch.Generator().manual_seed(17),
@@ -170,8 +171,8 @@ def build(base, directory, task):
                 meta["denoising_start"] = 0.5
         output = pipe(**kwargs, return_dict=True)
         assert isinstance(output, StableDiffusionXLPipelineOutput)  # return_dict=True.
-        final = output.images
-        assert isinstance(final, torch.Tensor)  # output_type="latent".
+        # output_type="latent" returns the latents, a tensor the output's annotation (images) does not name.
+        final = cast(torch.Tensor, output.images)
         decoded = pipe.vae.decode(final / pipe.vae.config.scaling_factor, return_dict=False)[0]
         arrays.update(final_latents=final.permute(0, 2, 3, 1).numpy(),
                       images=(decoded / 2 + 0.5).clamp(0, 1).permute(0, 2, 3, 1).numpy())

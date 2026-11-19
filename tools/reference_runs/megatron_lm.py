@@ -44,7 +44,7 @@ from collections.abc import Callable
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -296,9 +296,9 @@ def train_step(args: argparse.Namespace, place: Ranks, run: Run, step: int) -> t
         num_microbatches=layout.accumulation, seq_length=layout.seq, micro_batch_size=layout.micro,
         forward_only=False)
     assert reported is not None  # The last pipeline stage's losses, which this one stage is.
-    stepped = run.optimizer.step()
-    assert stepped is not None  # Its success, gradient norm and zero count, which a stepping optimizer gives.
-    _, norm, _ = stepped
+    # Its success, gradient norm and zero count: what every optimizer get_megatron_optimizer makes returns,
+    # though the base class's step, a stub, reads as returning None.
+    _, norm, _ = cast(tuple[bool, float, int], run.optimizer.step())
     return torch.stack([entry["lm loss"] for entry in reported]).sum(dim=0), norm, None
 
 
