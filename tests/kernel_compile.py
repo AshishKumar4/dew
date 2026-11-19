@@ -426,7 +426,7 @@ def _route(lowered, executable, mesh: Mesh) -> dict:
         shards.setdefault(call.name, []).append([list(shape) for shape in call.operands])
     return {"launches": sorted(shards), "shards": shards,
             "collectives": sorted([op, sorted(axes)]
-                                  for op, axes in collective_axes(executable.as_text(), mesh))}
+                                  for op, axes in collective_axes(executable, mesh))}
 
 
 def route_failures(cases, found: list[dict]) -> list[str]:
