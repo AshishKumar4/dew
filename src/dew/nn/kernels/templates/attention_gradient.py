@@ -271,8 +271,18 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = rows(anchor_value, cotangent)
-    others = others * expand(over, others)
-    others = others if taken is None else others * expand(taken, others)
+    if taken is None:
+        others = others * expand(over, others)
+    else:
+        # The sums' power and the row's total taken out in one division where their product is a normal
+        # number (sums of 18 2^126 over a total of 4 passed fp32's largest before the power came out, the
+        # base review of e2b671ce9, F2), else one after the other (a total past 2^126 beside a power of
+        # 2^24, their product's inverse flushed).
+        divisor = jnp.where(normalized_rows(shift), np.float32(dropped),
+                            power2(total, -shift) * np.float32(power))
+        at_once = finite(divisor) & (divisor >= np.float32(2.0 ** -126))
+        others = jnp.where(expand(at_once, others), others / expand(jnp.where(at_once, divisor, 1.0), others),
+                           others * expand(over, others) * expand(taken, others))
     own, others_total = own * over, others_total * over
     about_zero = rows(read(split_output(others, own, anchor_value), cotangent), cotangent)
     off_anchor = others - expand(others_total, anchor_value) * anchor_value
