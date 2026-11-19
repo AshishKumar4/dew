@@ -1788,12 +1788,8 @@ def _kept_sum(pairs, axis) -> tuple[jax.Array, jax.Array]:
     rounding kept in the low part (`two_sum`), an axis summed in halves (`_halved_over`), so the pair rounded
     once is the sum's twice-precise value rounded (Ogita, Rump and Oishi's Sum2): a band's sum rounded alone
     lost what a lower band's cancelled, -2^25 - 2 tied to -2^25 beside 2^25 (base review 644ef5535 F1)."""
-    high, low = None, None
-    for pair in pairs:
-        part_high, part_low = _halved_over(pair, axis)
-        if high is None:
-            high, low = part_high, part_low
-            continue
+    (high, low), *rest = (_halved_over(pair, axis) for pair in pairs)
+    for part_high, part_low in rest:
         high, dropped = two_sum(high, part_high)
         low = low + part_low + dropped
     return high, low
