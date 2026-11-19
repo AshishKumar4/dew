@@ -12,7 +12,7 @@ import contextlib
 import enum
 import functools
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import NamedTuple, TypeGuard, overload
+from typing import NamedTuple, TypeGuard
 
 import jax
 import jax.extend.core as jcore
@@ -24,17 +24,6 @@ from jax._src.pallas.mpmd import mpmd_map_p
 from jax.core import ShapedArray
 from jax.experimental.pallas import pallas_call_p
 from jax.extend.backend import backends
-
-
-@overload
-def holes[Tree, Leaf](tree: Tree, selected: Callable[[Leaf], bool],
-                      is_leaf: Callable[[Leaf], bool] | None = None
-                      ) -> tuple[list[Leaf], Callable[[Sequence[Leaf]], Tree]]: ...
-
-
-@overload
-def holes[Tree](tree: Tree, selected: Sequence[bool], is_leaf: Callable[[object], bool] | None = None
-                ) -> tuple[list[object], Callable[[Sequence[object]], Tree]]: ...
 
 
 def holes[Tree, Leaf](tree: Tree, selected: Callable[[Leaf], bool] | Sequence[bool],
