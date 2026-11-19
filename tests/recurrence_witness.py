@@ -748,10 +748,11 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         chunk = tiles.chunk
 
         # One program for the call and each of its chunks' leaving memories (`through`), traced once, run as a
-        # GPU tier runs it (`launched`).
+        # GPU tier runs it (`launched`); its family read in it from its operands, a family no identity states.
         program = jax.jit(lambda *x: chunk_forward.kept_forward(
             *x[:6], tiles=tiles, starts=x[6], max_segments=max_segments, scale=scale, delta=delta,
-            rounded=rounded, family=family, keeps=not walked, interpret=generation.backend() != "gpu"))
+            rounded=rounded, family=mainloop.issued(jnp.result_type(*x[:3]))[0], keeps=not walked,
+            interpret=generation.backend() != "gpu"))
 
         def kept(*x, starts):
             return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens")[0]
@@ -1353,7 +1354,6 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
     do = np.asarray(rng.standard_normal(v.shape), dtype)
     dfinal = np.asarray(rng.standard_normal(h0.shape), np.float32)
     scale, rounded = run.scale, route_rounding(delta, dtype)
-    family = mainloop.issued(dtype)[0]
     interpret = generation.backend() != "gpu"
 
     def route(*x):
@@ -1369,6 +1369,8 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
                    if isinstance(op, template.Mosaic)]
 
         def kept(*x):
+            # Its family read from its operands, a family no identity states (`launched`'s statement).
+            family = mainloop.issued(jnp.result_type(*x[:3]))[0]
             _, _, (inverse, held) = chunk_forward.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
                                                          delta=delta, family=family, interpret=interpret)
             grads, saved = mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale,
