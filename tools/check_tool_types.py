@@ -1,12 +1,13 @@
 """Every script under tools/ type-checked by pyright in the environment it runs in (row 7933).
 
 A tool runs in Dew's own environment unless it names the reference releases it records against: a module-level
-`COHORTS` (tools/reference_releases.py's RELEASES names: one, a list, or a mapping whose values name them), or
-a PEP 723 header, which `uv run` reads (tools/superoptimize_bits.py). Each cohort set's tools are checked in a
-virtual environment holding exactly its pins, built here by uv and kept under `ENVIRONMENTS` by its pins'
-digest, so a reference library's types are its own release's: with its import unresolved, pyright reads its
-every use as Unknown and finds none of the tool's errors. A tool whose cohorts pin one distribution at two
-releases runs in no one environment, and is refused: it is split into a file a cohort.
+`COHORTS` (tools/reference_releases.py's RELEASES names: one or a list, run in together, or a mapping of the
+tool's variants to them, each variant run in its own), or a PEP 723 header, which `uv run` reads
+(tools/superoptimize_bits.py). Each cohort set's tools are checked in a virtual environment holding exactly
+its pins, built here by uv and kept under `ENVIRONMENTS` by its pins' digest, so a reference library's types
+are its own release's: with its import unresolved, pyright reads its every use as Unknown and finds none of
+the tool's errors. Cohorts run in together that pin one distribution at two releases make no one
+environment, and are refused: the tool is split into a file a cohort.
 
 A tool's verdict is kept by its key (`key`): pyright's release and configuration, the stubs, its environment's
 pins and the code of every module it imports from the checkout, followed through their own imports
@@ -63,9 +64,11 @@ def releases() -> Mapping[str, Mapping[str, str]]:
     return loaded(ROOT / "tools" / "reference_releases.py").RELEASES
 
 
-def cohorts_of(path: Path) -> tuple[str, ...] | None:
-    """The cohorts tool `path`'s module-level `COHORTS` names (a name, a list or tuple of them, or a mapping
-    whose values are either), sorted; None where it names none."""
+def cohorts_of(path: Path) -> tuple[tuple[str, ...], ...] | None:
+    """The environments tool `path`'s module-level `COHORTS` names, each as its cohorts, sorted: one for a
+    name or a list or tuple of them, which it runs in together; one a distinct value for a mapping, whose
+    keys are the tool's variants, each run in its value's cohorts alone (tools/diffusers_dc_ae_reference.py
+    records each variant under its own diffusers release). None where it names none."""
     for node in ast.parse(path.read_text(), str(path)).body:
         if isinstance(node, ast.Assign):
             targets, expression = node.targets, node.value
@@ -76,8 +79,8 @@ def cohorts_of(path: Path) -> tuple[str, ...] | None:
         if any(isinstance(target, ast.Name) and target.id in ("COHORT", "COHORTS") for target in targets):
             value = ast.literal_eval(expression)
             values = value.values() if isinstance(value, dict) else [value]
-            return tuple(sorted({name for each in values
-                                 for name in ([each] if isinstance(each, str) else each)}))
+            return tuple(sorted({tuple(sorted({each} if isinstance(each, str) else set(each)))
+                                 for each in values}))
     return None
 
 
@@ -94,28 +97,31 @@ def header_of(path: Path) -> dict | None:
                                    for line in found["body"].splitlines()))
 
 
-def environment_of(path: Path, pins: Mapping[str, Mapping[str, str]]) -> tuple[str, list[str]]:
-    """Tool `path`'s environment: its name (`DEW`, `script:<file>`, or its cohorts joined by `+`) and the
-    requirements it is made of (none for Dew's). A tool whose cohorts pin a distribution at two releases
-    raises ValueError, naming them."""
+def environments_of(path: Path, pins: Mapping[str, Mapping[str, str]]) -> list[tuple[str, list[str]]]:
+    """Tool `path`'s environments (`cohorts_of`), each its name (`DEW`, `script:<file>`, or its cohorts joined
+    by `+`) and the requirements it is made of (none for Dew's). Cohorts a tool runs in together that pin a
+    distribution at two releases raise ValueError, naming them."""
     header = header_of(path)
     if header is not None:
-        return f"script:{path.relative_to(ROOT).as_posix()}", sorted(header.get("dependencies", []))
-    cohorts = cohorts_of(path)
-    if not cohorts:
-        return DEW, []
-    if unknown := [cohort for cohort in cohorts if cohort not in pins]:
+        return [(f"script:{path.relative_to(ROOT).as_posix()}", sorted(header.get("dependencies", [])))]
+    environments = cohorts_of(path)
+    if not environments:
+        return [(DEW, [])]
+    if unknown := sorted({cohort for cohorts in environments for cohort in cohorts if cohort not in pins}):
         raise ValueError(f"{path}: COHORTS names {', '.join(unknown)}, which RELEASES does not")
-    held: dict[str, str] = {}
-    for cohort in cohorts:
-        for distribution, release in pins[cohort].items():
-            if held.setdefault(distribution, release) != release:
-                raise ValueError(f"{path}: its cohorts {', '.join(cohorts)} pin {distribution} at "
-                                 f"{held[distribution]} and {release}; no one environment holds both: "
-                                 "split it into a file a cohort")
-    pinned = (f"{distribution} @ {release}" if release.startswith("git+") else f"{distribution}=={release}"
-              for distribution, release in held.items())
-    return "+".join(cohorts), sorted(pinned)
+    made = []
+    for cohorts in environments:
+        held: dict[str, str] = {}
+        for cohort in cohorts:
+            for distribution, release in pins[cohort].items():
+                if held.setdefault(distribution, release) != release:
+                    raise ValueError(f"{path}: its cohorts {', '.join(cohorts)} pin {distribution} at "
+                                     f"{held[distribution]} and {release}; no one environment holds both: "
+                                     "split it into a file a cohort")
+        pinned = (f"{distribution} @ {release}" if release.startswith("git+")
+                  else f"{distribution}=={release}" for distribution, release in held.items())
+        made.append(("+".join(cohorts), sorted(pinned)))
+    return made
 
 
 def imported(path: Path) -> set[str]:
@@ -169,8 +175,9 @@ def closure(path: Path) -> list[Path]:
 
 
 def common() -> bytes:
-    """What every tool's key holds: pyright's release, its configuration in pyproject.toml, and the stubs."""
-    digest = hashlib.sha256(PYRIGHT.encode())
+    """What every tool's key holds: pyright's release, its configuration in pyproject.toml, the stubs, and
+    this gate's own code, which says how pyright reads them."""
+    digest = hashlib.sha256(PYRIGHT.encode() + Path(__file__).read_bytes())
     configuration = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["pyright"]
     digest.update(json.dumps(configuration, sort_keys=True).encode())
     for stub in sorted((ROOT / "stubs").rglob("*")):
@@ -216,9 +223,12 @@ def made(requirements: list[str]) -> Path:
     subprocess.run(["uv", "venv", "--quiet", "--clear", "--python", PYTHON, str(where)], check=True)
     released = [each for each in requirements if not SOURCE.match(each)]
     if released:
+        # The pins are the versions the reference's environment held, over what a release of them declares
+        # (Kimi K3's: compressed-tensors 0.17.1, which declares torch>=2.10, beside torch 2.8.0).
+        (where / "pins.txt").write_text("".join(f"{each}\n" for each in released))
         subprocess.run(["uv", "pip", "install", "--quiet", "--python", str(python), "--extra-index-url",
-                        TORCH_CPU, "--index-strategy", "unsafe-best-match", *released], check=True,
-                       env={**os.environ, **SKIPPED_BUILDS})
+                        TORCH_CPU, "--index-strategy", "unsafe-best-match", "--override",
+                        str(where / "pins.txt"), *released], check=True, env={**os.environ, **SKIPPED_BUILDS})
     purelib = "import sysconfig; print(sysconfig.get_paths()['purelib'])"
     site = subprocess.run([str(python), "-c", purelib], capture_output=True, text=True,
                           check=True).stdout.strip()
@@ -237,9 +247,20 @@ SKIPPED_BUILDS = {"MAMBA_SKIP_CUDA_BUILD": "TRUE", "CAUSAL_CONV1D_SKIP_CUDA_BUIL
 """A release that compiles CUDA kernels at install, installed without them: pyright reads its Python alone."""
 
 
-def checked(python: str, paths: list[Path]) -> dict[Path, list[str]]:
-    """Each of `paths` with pyright's errors in it, read with `python`'s environment."""
-    ran = subprocess.run(["uvx", PYRIGHT, "--pythonpath", python, "--outputjson",
+def checked(environment: Path, paths: list[Path]) -> dict[Path, list[str]]:
+    """Each of `paths` with pyright's errors in it, its imports resolved in the virtual environment
+    `environment`: pyproject.toml's configuration with its environment named there (a configuration's `venv`
+    outranks `--pythonpath`, so a reference tool read Dew's environment, its libraries unresolved), every path
+    in it made absolute, since pyright reads them from the configuration's own directory."""
+    configuration = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["pyright"]
+    configuration = {**{name: value for name, value in configuration.items() if name != "include"},
+                     "venvPath": str(environment.parent), "venv": environment.name,
+                     "stubPath": str(ROOT / configuration["stubPath"]),
+                     "extraPaths": [str(ROOT / path) for path in configuration.get("extraPaths", [])]}
+    (ROOT / ENVIRONMENTS).mkdir(exist_ok=True)
+    written = ROOT / ENVIRONMENTS / f"pyright-{environment.name}.json"
+    written.write_text(json.dumps(configuration))
+    ran = subprocess.run(["uvx", PYRIGHT, "--project", str(written), "--outputjson",
                           *(str(path) for path in paths)], cwd=ROOT, capture_output=True, text=True,
                          env={**os.environ, "NODE_OPTIONS": "--max-old-space-size=8192"}, check=False)
     found: dict[Path, list[str]] = {path: [] for path in paths}
@@ -267,12 +288,13 @@ def main() -> int:
     red = 0
     for path in tools():
         try:
-            name, requirements = environment_of(path, pins)
+            environments = environments_of(path, pins)
         except ValueError as refused:
             print(f"refused: {refused}")
             red += 1
             continue
-        groups.setdefault((name, tuple(requirements)), []).append(path)
+        for name, requirements in environments:
+            groups.setdefault((name, tuple(requirements)), []).append(path)
     if args.list:
         for (name, _), paths in sorted(groups.items()):
             print(f"{name}: {len(paths)} tools: {' '.join(str(path.relative_to(ROOT)) for path in paths)}")
@@ -286,12 +308,12 @@ def main() -> int:
         if not wanted:
             continue
         try:
-            python = str(made(list(requirements))) if requirements else sys.executable
+            environment = made(list(requirements)).parents[1] if requirements else Path(sys.prefix)
         except subprocess.CalledProcessError as failed:
             print(f"red: {name}'s environment ({' '.join(requirements)}) was not made: {failed}")
             red += len(wanted)
             continue
-        for path, errors in checked(python, wanted).items():
+        for path, errors in checked(environment, wanted).items():
             if errors:
                 red += 1
                 print("\n".join(errors))

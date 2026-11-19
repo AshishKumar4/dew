@@ -87,7 +87,9 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
         "lm-engine":
             "git+https://github.com/open-lm-engine/lm-engine@45b6b57b0deea5b9ef6c9c6f637dc151f1383343",
         "torch": "2.10.0", "pydantic": "2.13.4", "transformers": "4.57.3"},
-    "mamba-ssm": {"mamba-ssm": "2.3.2.post1", "torch": "2.14.0"},
+    "mamba-ssm": {
+        "mamba-ssm": "git+https://github.com/state-spaces/mamba@e9594ce1c732d97440f0332fdc43170a2294dbfa",
+        "torch": "2.14.0"},
     "maxtext": {"maxtext": "0.2.5"},
     "modelopt-nvfp4": {"nvidia-modelopt": "0.47.0", "torch": "2.13.0", "triton": "3.7.1",
                        "diffusers": "0.34.0"},

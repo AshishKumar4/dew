@@ -35,36 +35,41 @@ def gate(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(("declared", "cohorts"), [
-    ('COHORTS = "torch"', ("torch",)), ('COHORTS = ["transformers", "torch"]', ("torch", "transformers")),
-    ('COHORTS: dict = {"a": "torch", "b": ["transformers"]}', ("torch", "transformers")),
-    ('COHORT = "torch"', ("torch",)), ("X = 1", None)])
+    ('COHORTS = "torch"', (("torch",),)),
+    ('COHORTS = ["transformers", "torch"]', (("torch", "transformers"),)),
+    ('COHORTS: dict = {"a": "torch", "b": ["transformers", "torch"], "c": "torch"}',
+     (("torch",), ("torch", "transformers"))),
+    ('COHORT = "torch"', (("torch",),)), ("X = 1", None)])
 def test_a_tools_cohorts_are_read_from_its_module_level_cohorts(gate, tmp_path, declared, cohorts) -> None:
     (tmp_path / "tools" / "t.py").write_text(f"import os\n{declared}\n")
     assert gate.cohorts_of(tmp_path / "tools" / "t.py") == cohorts
 
 
-def test_a_tools_environment_is_its_cohorts_pins_its_headers_or_dews(gate, tmp_path) -> None:
-    """A tool's environment holds its cohorts' pins; a PEP 723 header's dependencies where it has one
-    (`uv run` reads only that); Dew's own where it names neither; and none where its cohorts pin a
-    distribution twice."""
+def test_a_tools_environments_are_its_cohorts_pins_its_headers_or_dews(gate, tmp_path) -> None:
+    """A tool's environment holds the pins of the cohorts it runs in together; one a variant's cohorts where
+    COHORTS maps variants; a PEP 723 header's dependencies where it has one (`uv run` reads only that); Dew's
+    own where it names neither; and none where cohorts it runs in together pin a distribution twice."""
     tools = tmp_path / "tools"
     (tools / "paired.py").write_text('COHORTS = ["torch", "transformers"]\n')
     (tools / "script.py").write_text('# /// script\n# requires-python = ">=3.12"\n'
                                      '# dependencies = ["z3-solver==4.15.4"]\n# ///\nimport z3\n')
-    (tools / "mixed.py").write_text('COHORTS = {"new": "transformers", "old": "ouro"}\n')
-    (tools / "unknown.py").write_text('COHORTS = "nothing"\n')
-    assert gate.environment_of(tools / "paired.py", PINS) == (
-        "torch+transformers", ["torch==2.14.0", "transformers==5.22.2"])
-    assert gate.environment_of(tools / "script.py", PINS)[1] == ["z3-solver==4.15.4"]
-    assert gate.environment_of(tools / "other.py", PINS) == (gate.DEW, [])
+    (tools / "variants.py").write_text('COHORTS = {"new": "transformers", "old": "ouro"}\n')
+    (tools / "mixed.py").write_text('COHORTS = ["transformers", "ouro"]\n')
+    (tools / "unknown.py").write_text('COHORTS = {"a": "torch", "b": "nothing"}\n')
+    assert gate.environments_of(tools / "paired.py", PINS) == [
+        ("torch+transformers", ["torch==2.14.0", "transformers==5.22.2"])]
+    assert gate.environments_of(tools / "script.py", PINS)[0][1] == ["z3-solver==4.15.4"]
+    assert gate.environments_of(tools / "other.py", PINS) == [(gate.DEW, [])]
+    assert gate.environments_of(tools / "variants.py", PINS) == [
+        ("ouro", ["transformers==4.56.2"]), ("transformers", ["transformers==5.22.2"])]
     (tools / "source.py").write_text('COHORT = "laya"\n')
-    name, requirements = gate.environment_of(tools / "source.py", PINS)
+    [(name, requirements)] = gate.environments_of(tools / "source.py", PINS)
     assert requirements == [f"laya @ git+https://github.com/o/laya@{'a' * 40}", "transformers==5.22.2"]
     assert gate.SOURCE.match(requirements[0])
     with pytest.raises(ValueError, match="pin transformers at 4.56.2 and 5.22.2.*split it"):
-        gate.environment_of(tools / "mixed.py", PINS)
-    with pytest.raises(ValueError, match="RELEASES does not"):
-        gate.environment_of(tools / "unknown.py", PINS)
+        gate.environments_of(tools / "mixed.py", PINS)
+    with pytest.raises(ValueError, match="nothing, which RELEASES does not"):
+        gate.environments_of(tools / "unknown.py", PINS)
 
 
 def test_a_tools_key_covers_what_it_imports_through_their_imports_and_nothing_else(gate, tmp_path) -> None:
