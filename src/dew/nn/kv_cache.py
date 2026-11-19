@@ -680,11 +680,16 @@ def pages_written(leaf: jax.Array, places: jax.Array, values: jax.Array, axis: i
         return leaf.at[(*(slice(None),) * axis, places)].set(flat.astype(leaf.dtype), mode="drop")
     last = leaf.shape[axis] - 1
 
-    def page(index: jax.Array, pool: jax.Array) -> jax.Array:
-        place = places[index]
-        return stored_at(pool, values[index], place, axis, kept=place <= last)
+    # The places in the pool alone, in their order, each written unconditionally where the pool lies (a write
+    # in a conditional's branch XLA:GPU's host offloading refuses, `host_memory.stored_at`).
+    written = places <= last
+    order = jnp.argsort(~written, stable=True)
 
-    return jax.lax.fori_loop(0, places.shape[0], page, leaf)
+    def page(index: jax.Array, pool: jax.Array) -> jax.Array:
+        at = order[index]
+        return stored_at(pool, values[at], places[at], axis)
+
+    return jax.lax.fori_loop(0, jnp.sum(written), page, leaf)
 
 
 def offloaded(cache: Mapping[str, object], layout: KVCache) -> Mapping[str, object]:
@@ -1657,18 +1662,22 @@ def _banked_page_copies(bank: jax.Array, own: jax.Array, parents: jax.Array) -> 
     before any of them is written (a row's own page may be another's parent's; one layer's pages never
     another's), a page past the pool read as its last and written as none, as `pages_read` and
     `pages_written` take a pool's."""
-    layers, count = own.shape
+    layers = own.shape[0]
     last = bank.shape[2] - 1
 
     def layer_copies(layer, pool: jax.Array) -> jax.Array:
         held = jax.lax.map(lambda page: fetched_at(pool, (layer, page), (0, 2)),
                            jnp.minimum(parents[layer], last))
 
-        def write(row, pool: jax.Array) -> jax.Array:
-            target = own[layer, row]
-            return stored_at(pool, held[row], (layer, target), (0, 2), kept=target <= last)
+        # The layer's pages in the pool alone, in their order (`pages_written`'s).
+        written = own[layer] <= last
+        order = jnp.argsort(~written, stable=True)
 
-        return jax.lax.fori_loop(0, count, write, pool)
+        def write(index, pool: jax.Array) -> jax.Array:
+            row = order[index]
+            return stored_at(pool, held[row], (layer, own[layer, row]), (0, 2))
+
+        return jax.lax.fori_loop(0, jnp.sum(written), write, pool)
 
     return jax.lax.fori_loop(0, layers, layer_copies, bank)
 

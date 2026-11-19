@@ -45,12 +45,15 @@ def _entry(index: Index | tuple[Index, ...], axis: int | tuple[int, ...]
     return axes, jax.lax.optimization_barrier(tuple(jnp.asarray(each, jnp.int32) for each in indices))
 
 
-def _starts(ndim: int, axes: tuple[int, ...], indices: tuple[jax.Array, ...]) -> list[jax.Array]:
-    """A slice's starts over `ndim` axes: each of `axes` at its index, every other axis at zero."""
+def _placed(ndim: int, axes: tuple[int, ...], indices: tuple[jax.Array, ...]
+            ) -> tuple[tuple[int, ...], list[jax.Array]]:
+    """`axes` of an array of rank `ndim`, each counted from its first (a negative axis from its last), and a
+    slice's starts over its axes: each of `axes` at its index, every other axis at zero."""
+    held = tuple(axis % ndim for axis in axes)
     starts = [jnp.zeros((), jnp.int32)] * ndim
-    for axis, index in zip(axes, indices, strict=True):
+    for axis, index in zip(held, indices, strict=True):
         starts[axis] = index
-    return starts
+    return held, starts
 
 
 def fetched_at(tree, index: Index | tuple[Index, ...], axis: int | tuple[int, ...] = 0):
@@ -60,9 +63,9 @@ def fetched_at(tree, index: Index | tuple[Index, ...], axis: int | tuple[int, ..
     axes, indices = _entry(index, axis)
 
     def entry(leaf: jax.Array) -> jax.Array:
-        sizes = [1 if dimension in axes else size for dimension, size in enumerate(leaf.shape)]
-        return jax.lax.squeeze(fetched(jax.lax.dynamic_slice(leaf, _starts(leaf.ndim, axes, indices), sizes)),
-                               axes)
+        held, starts = _placed(leaf.ndim, axes, indices)
+        sizes = [1 if dimension in held else size for dimension, size in enumerate(leaf.shape)]
+        return jax.lax.squeeze(fetched(jax.lax.dynamic_slice(leaf, starts, sizes)), held)
 
     return jax.tree.map(entry, tree)
 
@@ -73,16 +76,13 @@ def placed_like(leaf: jax.Array, value: jax.Array) -> jax.Array:
 
 
 def stored_at(bank: jax.Array, value: jax.Array, index: Index | tuple[Index, ...],
-              axis: int | tuple[int, ...] = 0, *, kept: jax.Array | None = None) -> jax.Array:
+              axis: int | tuple[int, ...] = 0) -> jax.Array:
     """`bank` with `value` its entry `index` along `axis` (or along each of several axes), where `bank` lies
     (`fetched_at`'s inverse): the axes restored in device memory, the entry copied to the bank's memory and
-    written there; where `kept` is given, written only where it holds (a place past a pool writes nothing).
-    The entry is copied to the bank's memory before that choice: XLA:GPU's host offloading reads no copy to
-    the host made inside a conditional's branch, and refuses the bank as a host parameter."""
+    written there. A write it makes is taken unconditionally: XLA:GPU's host offloading reads no copy to the
+    host made inside a conditional's branch, and refuses the bank as a host parameter, so a caller that
+    writes some entries alone loops over those (`kv_cache.pages_written`)."""
     axes, indices = _entry(index, axis)
-    entry = placed_like(bank, jnp.expand_dims(value.astype(bank.dtype), axes))
-    starts = _starts(bank.ndim, axes, indices)
-    if kept is None:
-        return jax.lax.dynamic_update_slice(bank, entry, starts)
-    return jax.lax.cond(kept, lambda bank: jax.lax.dynamic_update_slice(bank, entry, starts),
-                        lambda bank: bank, bank)
+    held, starts = _placed(bank.ndim, axes, indices)
+    entry = placed_like(bank, jnp.expand_dims(value.astype(bank.dtype), held))
+    return jax.lax.dynamic_update_slice(bank, entry, starts)
