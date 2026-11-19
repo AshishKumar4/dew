@@ -16,8 +16,9 @@ from jax.typing import DTypeLike
 def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax.Array:
     """`2^n` in `dtype`, exactly, for an integral `n` within its normal exponents, set in its exponent bits at
     the format's own bias (its encoding of 1.0's), and +0 at `minexp - 1` in a format whose biased exponent 0
-    holds its zero (IEEE's binary formats, bfloat16, the float8s): the one owner of an exact power of two. No
-    `exp2`, which XLA computes as `exp(n ln 2)` and whose products it fuses into one `exp` of their sum. A
+    holds its zero (IEEE's binary formats, bfloat16, the float8s); E8M0, whose every biased exponent below its
+    NaN's is a power and none a zero, from `minexp` to `maxexp - 1`: the one owner of an exact power of two.
+    No `exp2`, which XLA computes as `exp(n ln 2)` and whose products it fuses into one `exp` of their sum. A
     format whose width no integer holds (FP6) takes float32's power, its sentinel its own zero, cast to it,
     exactly. `dtype` is the one JAX makes of it (a Python `float` float32 where x64 is off)."""
     dtype = jax.dtypes.canonicalize_dtype(dtype)

@@ -1799,6 +1799,20 @@ def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
                                       err_msg=str(exponent))
 
 
+def test_an_exact_power_of_two_in_e8m0_is_every_biased_exponent():
+    """`exact_power2` in E8M0 (an MX block's scale) is `2^n` at every exponent from its least, `2^-127`, its
+    biased exponent 0 a power and no zero, to its largest, `2^127`, compiled, bit for bit the byte MXFP8's
+    encode wrote as `n + 127` (row 8832)."""
+    from dew.nn.float_bits import exact_power2
+
+    exponents = np.arange(-127, 128)
+    found = np.asarray(jax.jit(lambda n: exact_power2(n, jnp.float8_e8m0fnu))(
+        jnp.asarray(exponents, jnp.int32)))
+    assert found.dtype == jnp.float8_e8m0fnu
+    np.testing.assert_array_equal(found.view(np.uint8), (exponents + 127).astype(np.uint8))
+    np.testing.assert_array_equal(found.astype(np.float64), np.exp2(exponents.astype(np.float64)))
+
+
 def power2_rounds_a_subnormal_result_once():
     """`dew.nn.precision.power2` by `2^o 2^(k-2o) 2^o` rounds a result below the least normal once, at its
     last factor, on a device that keeps subnormals (a GPU's XLA, whose fp32 arithmetic keeps them where
