@@ -17,6 +17,7 @@ runs no pyright here.
     python tools/check_tool_types.py            # every tool, its verdict printed; exit 1 where any is red
     python tools/check_tool_types.py --list     # each cohort set's tools, checking nothing
     python tools/check_tool_types.py --environment dew    # one environment's tools alone
+    python tools/check_tool_types.py tools/x.py tools/y.py  # these tools alone
 
 """
 
@@ -295,11 +296,15 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="each cohort set's tools, checking nothing")
     parser.add_argument("--environment", action="append", default=[],
                         help="check only this environment's tools (a name --list prints); repeatable")
+    parser.add_argument("paths", nargs="*", type=Path, help="check only these tools")
     args = parser.parse_args()
     pins, shared, store = releases(), common(), records()
     groups: dict[tuple[str, tuple[str, ...]], list[Path]] = {}
     red = 0
+    named = {(ROOT / path).resolve() for path in args.paths}
     for path in tools():
+        if named and path.resolve() not in named:
+            continue
         try:
             environments = environments_of(path, pins)
         except ValueError as refused:

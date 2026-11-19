@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import ast
 import math
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -308,7 +308,7 @@ def _shadowing(tree: ast.Module) -> tuple[dict[int, frozenset[str]], dict[int, f
     return shadowed, comprehended
 
 
-def divisions(path: Path, tree: ast.Module, parent: str) -> Iterator[tuple[int, int, str]]:
+def divisions(path: Path, tree: ast.Module, parent: Sequence[str]) -> Iterator[tuple[int, int, str]]:
     """SLOP024: a JAX array (`_array`, or a name its function binds only to one) divided by a compile-time
     constant no power of two divides exactly by (`_constant`, `_rounded`): a literal, a named constant of
     this module or the library's, a number of math or numpy, or a pure function of constants; by `/`, `/=`,
