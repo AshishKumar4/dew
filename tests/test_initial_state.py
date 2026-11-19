@@ -154,4 +154,4 @@ def test_an_initial_state_from_another_initializer_draws_that_initializer():
 
     own = jax.tree.leaves(trainer.initial_state().variables["params"])
     other = jax.tree.leaves(trainer.initial_state(Partial(shifted)).variables["params"])
-    assert all(jnp.allclose(b, a + 1) for a, b in zip(own, other, strict=True))
+    assert all(jnp.array_equal(b, a + 1) for a, b in zip(own, other, strict=True))
