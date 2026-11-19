@@ -96,7 +96,9 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
             out, pull = jax.vjp(forward, *args)
         return out, pull(jax.tree.map(jnp.ones_like, out))
 
-    timed = trained if training else forward
+    def timed(q, k, v, g, beta):
+        return (trained if training else forward)(q, k, v, g, beta)
+
     timed.__name__ = f"{'trained' if training else 'forward'}_{arm}"
     with generation.chosen(gated_delta_rule=NAMED[arm]):
         return program(timed).executable(*args), args
@@ -160,7 +162,7 @@ def profiled(name: str, arms: list[str], dtype, warmup: int, repeats: int, train
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arm', required=True, help=f"one of {tuple(NAMED)}, or several comma-separated "
                                                      "with --profile")
     parser.add_argument('--profile', help="capture the arms' kernels under this directory (kernel_stats)")

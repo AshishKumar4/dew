@@ -312,11 +312,12 @@ def test_two_hooks_share_an_identity_only_where_they_lower_to_one_program():
             assert_computes_the_oracle(one(tile), other(tile), f"{one} and {other}", roundings=0)
 
 
-def test_a_hooks_program_is_one_key_under_meshes_of_one_shape_whatever_their_devices():
-    """A hook traced under meshes of the same axes, made of different kinds of device (a compile-only H100's
-    for a step compiled ahead, a GH200's for the run it is handed to), keys one program (`tuning.program`),
-    so the launch's kernels carry one name in both processes and the run lowers the program compiled ahead;
-    under meshes of other axes, apart."""
+def test_a_hooks_program_is_one_key_under_any_mesh():
+    """A hook traced under meshes made of different kinds of device (a compile-only H100's for a step
+    compiled ahead, a GH200's for the run it is handed to), or of other axes (a program's, and the one device
+    certification compiles its launch on), keys one program (`tuning.program`): it computes one tile under any
+    mesh, so the launch's kernels carry one name wherever it traces, and the run lowers the program compiled
+    ahead and the module certification compiled (row 8532)."""
     def hook(gate, up):
         return jax.nn.silu(gate) * up
 
@@ -329,7 +330,7 @@ def test_a_hooks_program_is_one_key_under_meshes_of_one_shape_whatever_their_dev
             return tuning.program(hook, tile, tile)
 
     assert keyed((1, 1), "NVIDIA H100 80GB HBM3") == keyed((1, 1), "NVIDIA GH200 480GB")
-    assert keyed((1, 1), "NVIDIA H100 80GB HBM3") != keyed((2, 1), "NVIDIA H100 80GB HBM3")
+    assert keyed((1, 1), "NVIDIA H100 80GB HBM3") == keyed((2, 1), "NVIDIA H100 80GB HBM3")
 
 
 def _traced(block: compiles.Compiles) -> int:

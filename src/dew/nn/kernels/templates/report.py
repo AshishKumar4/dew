@@ -26,7 +26,7 @@ import subprocess
 import tempfile
 import threading
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
 
@@ -39,6 +39,7 @@ from google.protobuf.message import DecodeError
 from google.protobuf.unknown_fields import UnknownFieldSet
 from jax._src.thunky import thunky
 from jax.extend.mlir import ir
+from jax.extend.mlir.dialects import stablehlo
 
 from dew import _cache, communicators
 from dew._devices import deterministic_ops_requested, deviceless, xla_flag
@@ -47,6 +48,7 @@ from dew.nn.kernels import generation
 if TYPE_CHECKING:
     from dew.nn.kernels.lowered import KernelCall
     from dew.nn.kernels.templates.resources import RegisterModel
+    from dew.nn.kernels.tuning import KernelOp
 
 SHARED_REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
 """XLA's refusal of a program one of whose Triton kernels asks more shared memory than a block holds,
@@ -294,6 +296,9 @@ class Miss:
     serialized: tuple[str, ...] = ()
     """The codes of ptxas's notes of its warpgroup MMAs serialized (`SERIALIZED`), a reason it was refused
     beside a spill (`frame`)."""
+    modelled: int | None = None
+    """The registers a consumer thread holds as its launch's model stated them (`RegisterModel.registers`,
+    `named`), beside the assembler's (`registers`); None where its launch stated none."""
 
     @property
     def reason(self) -> str:
@@ -635,6 +640,78 @@ def certifying(device) -> Iterator[None]:
         _CERTIFYING.reset(token)
 
 
+@dataclasses.dataclass(frozen=True)
+class _AsideLaunch:
+    """A launch certified aside (`certifying_aside`): what `certified` read of it, and its compile's
+    kernels (`_launch_binaries`) to come."""
+    op: "KernelOp"
+    arguments: tokamax.BoundArguments
+    config: Hashable
+    reverse: bool
+    device: Hashable
+    stored: str | None
+    kernels: Future
+
+
+@dataclasses.dataclass
+class Aside:
+    """The launches a block certified aside (`certifying_aside`), by `certified`'s key, compiling on
+    `pool`."""
+    pool: ThreadPoolExecutor
+    pending: dict[tuple, _AsideLaunch] = dataclasses.field(default_factory=dict)
+
+
+_ASIDE: contextvars.ContextVar[Aside | None] = contextvars.ContextVar("certifying_aside", default=None)
+
+
+@contextlib.contextmanager
+def certifying_aside() -> Iterator[Aside]:
+    """Within the block, a launch whose derivation has refused none of its configs is certified aside
+    (`certified`): lowered as the trace reaches it, Python that holds the GIL, and compiled on
+    `compile_threads` threads while the trace runs on, XLA and the GPU's assembler releasing it, its config
+    taken as holding until `settled_aside` reads its compile; the block's end waits for every compile. A
+    launch with a refusal certifies in turn, its ladder read as it climbs (`tuning.KernelOp._certified`). A
+    cold start's 47 launches certified in turn took 48 s, 18 of them compiling (M-MC-21b), and every config
+    the gates derive holds (FS-DECISION: an attention forward's 68 and a backward's 45 on sm90), so a
+    refusal's relowering is rare."""
+    with ThreadPoolExecutor(compile_threads(), thread_name_prefix="dew-certify") as pool:
+        aside = Aside(pool)
+        token = _ASIDE.set(aside)
+        try:
+            yield aside
+        finally:
+            _ASIDE.reset(token)
+
+
+def settled_aside(aside: Aside) -> bool:
+    """Each launch `aside` certified, kept as `certified` keeps one: a launch whose kernels the assembler
+    refuses refused (`refuse_launch`) and its misses recorded, stepped where its derivation offers another
+    config now, so the program lowered within the block holds a refused config and is lowered afresh.
+    Whether any was refused."""
+    refused = False
+    for key, each in aside.pending.items():
+        try:
+            kernels = each.kernels.result()
+        except jax.errors.JaxRuntimeError as error:
+            _uncertified_launch(key, each.op, each.config, error)
+            continue
+        spilling = _kept_certification(key, each.op, each.config, each.reverse, kernels, each.stored,
+                                       each.device).refused
+        if spilling:
+            refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling},
+                          {binary.kernel: binary.spilled_in for binary in spilling})
+            missed(each.op, each.arguments, each.config, spilling,
+                   stepped=each.op.remaining(each.arguments) is not None)
+            refused = True
+    return refused
+
+
+def _refused_before(op, arguments: tokamax.BoundArguments) -> bool:
+    """Whether `op`'s launch of `arguments` had a config refused in this context (`refused_launches`)."""
+    identity = _identity(op, arguments)
+    return any(refused == identity for refused, _, _ in refused_launches())
+
+
 @contextlib.contextmanager
 def targeting(mesh: jax.sharding.Mesh) -> Iterator[None]:
     """Within the block, a trace outside any mesh certifies as one under `mesh` does (`_certifying_device`):
@@ -680,24 +757,45 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     stored = _verdict_key(_identity(op, arguments), config, reverse)
     verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
     if isinstance(verdict, dict):
-        kernels = verdict
-    else:
-        try:
-            kernels = _compiled_launch(op, arguments, config, device, reverse)
-        except jax.errors.JaxRuntimeError as error:
-            # XLA refuses the launch alone (a collective's devices): its program's compile reads it as it did
-            # before certification (`settled`), and the gate names it (`uncertified`).
-            _log.warning("launch %s at %s is not certified: XLA does not compile it alone (%s)",
-                         type(op).__name__, config, str(error)[:200])
-            with _GUARD:
-                _UNCERTIFIED[key] = str(error)[:400]
-            return None
-        if stored is not None:
-            tuning.store_verdict(verdict_target(device), stored, kernels)
-    found = Certification(type(op).__name__, config, reverse, kernels, verdict is not None, device)
+        return _kept_certification(key, op, config, reverse, verdict, stored, device, read=True).refused
+    aside = _ASIDE.get()
+    if aside is not None and not _refused_before(op, arguments):
+        # Taken as holding while it compiles aside (`certifying_aside`), once a block.
+        if key not in aside.pending:
+            lowered, modules = _lowered_launch(op, arguments, config, device, reverse)
+            compiling = aside.pool.submit(contextvars.copy_context().run, _launch_binaries, lowered, modules)
+            aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, compiling)
+        return ()
+    try:
+        kernels = _compiled_launch(op, arguments, config, device, reverse)
+    except jax.errors.JaxRuntimeError as error:
+        _uncertified_launch(key, op, config, error)
+        return None
+    return _kept_certification(key, op, config, reverse, kernels, stored, device).refused
+
+
+def _uncertified_launch(key: tuple, op, config: Hashable, error: Exception) -> None:
+    """XLA refuses the launch alone (a collective's devices): its program's compile reads it as it did
+    before certification (`settled`), and the gate names it (`uncertified`)."""
+    _log.warning("launch %s at %s is not certified: XLA does not compile it alone (%s)",
+                 type(op).__name__, config, str(error)[:200])
+    with _GUARD:
+        _UNCERTIFIED[key] = str(error)[:400]
+
+
+def _kept_certification(key: tuple, op, config: Hashable, reverse: bool, kernels: dict, stored: str | None,
+                        device, *, read: bool = False) -> "Certification":
+    """A launch's certification recorded once a process (`certifications`): its kernels `read` back from the
+    picks' store, else compiled here, their verdict stored for the GPU model by `stored` (None where no key
+    states the installation's code)."""
+    from dew.nn.kernels import tuning
+
+    if not read and stored is not None:
+        tuning.store_verdict(verdict_target(device), stored, kernels)
+    found = Certification(type(op).__name__, config, reverse, kernels, read, device)
     with _GUARD:
         _CERTIFIED[key] = found
-    return found.refused
+    return found
 
 
 def verdict_target(device) -> str:
@@ -802,6 +900,12 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
     forward and its pullback of a unit cotangent): its Mosaic GPU and Pallas-Triton kernels' modules (a Triton
     call's config) and binaries, by name and launch, none for a launch of none. A launch that does not trace
     alone raises: certification is no optional pass."""
+    return _launch_binaries(*_lowered_launch(op, arguments, config, device, reverse))
+
+
+def _lowered_launch(op, arguments: tokamax.BoundArguments, config: Hashable, device, reverse: bool
+                    ) -> tuple[jax.stages.Lowered, dict]:
+    """`_compiled_launch`'s launch lowered, beside its kernels' modules (a Triton call's config) by name."""
     from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.kernels.options import owned_program
     from dew.nn.programs import meshless
@@ -842,6 +946,12 @@ def _compiled_launch(op, arguments: tokamax.BoundArguments, config: Hashable, de
     calls = kernel_calls(lowered, unrun=True)
     modules = kernel_modules(calls) | {name: call.config for name, call in
                                        kernel_bodies(call for call in calls if call.kind == "triton").items()}
+    return lowered, modules
+
+
+def _launch_binaries(lowered: jax.stages.Lowered, modules: dict) -> dict[str, tuple[str, "Binary"]]:
+    """A launch `_lowered_launch` lowered, compiled: its kernels' modules (`modules`) and binaries, by name
+    and launch, none for a launch of none."""
     if not modules:
         return {}
     # Compiled to be read, never run (`read_offline`): its kernels' binaries are what it states, so a prepare
@@ -1059,7 +1169,8 @@ def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.Com
     thread, in the order given, as `compiled` keeps them one after another: a spill's refusal commits,
     and its program relowers, under this thread's contexts, so the programs kept are the ones compiled in
     turn keep: a program lowered before an earlier one's refusals committed is lowered again past them and
-    compiled in turn, as it would have been lowered after them. At most `COMPILE_THREADS` compile at once."""
+    compiled in turn, as it would have been lowered after them. At most `compile_threads()` compile at
+    once."""
     firsts = attempts([(lowered, options) for lowered, options, _ in programs])
     held = refusal_entries()
     kept_programs = []
@@ -1070,10 +1181,14 @@ def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.Com
     return kept_programs
 
 
-COMPILE_THREADS = 4
-"""The most programs `compiled_at_once` compiles at once: four took 2.2 times the programs a second of one
-on an 8-core host, each 1.8 times slower than alone, where two took 1.94 times (FS-2440-CONCURRENT2), so
-more would share the host's cores among more compiles without finishing more."""
+def compile_threads() -> int:
+    """The most programs `compiled_at_once` compiles at once, and launches `certifying_aside` compiles: half
+    the CPUs this process may use (`cgroups.usable_cpus`, its affinity and container quota), a compile
+    threading its LLVM passes over about two (four on an 8-core host took 2.2 times the programs a second of
+    one, each 1.8 times slower than alone, where two took 1.94 times, FS-2440-CONCURRENT2): a 4-vCPU
+    container's two, a 72-core Grace's 36."""
+    from dew import _cgroups as cgroups
+    return max(1, cgroups.usable_cpus() // 2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1087,15 +1202,16 @@ class Attempt:
     """A `jax.errors.JaxRuntimeError`, which JAX names as a value, no type."""
 
 
-def attempted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None) -> Attempt:
+def attempted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None, *,
+              background: bool = False) -> Attempt:
     """`lowered` compiled once under `options`: XLA's compile alone, which reads and writes nothing of this
     process's but the executable it makes and the persistent compilation cache, so a thread of its own
-    runs it (`compiled_at_once`); its kernels' binaries are read where it is kept (`settled`), in its
-    caller's thread, as reading them walks the executable's MLIR (`binaries`), which two threads at once
-    failed in (a Qwen3.5-4B step and its sampled step for a compile-only H100: `MLIRError: Failure while
-    executing pass pipeline`)."""
+    runs it (`compiled_at_once`), `background` where no step waits on it (`compile_slots`); its kernels'
+    binaries are read where it is kept (`settled`), in its caller's thread, as reading them walks the
+    executable's MLIR (`binaries`), which two threads at once failed in (a Qwen3.5-4B step and its sampled
+    step for a compile-only H100: `MLIRError: Failure while executing pass pipeline`)."""
     try:
-        return Attempt(xla_compiled(lowered, options))
+        return Attempt(xla_compiled(lowered, options, background=background))
     except jax.errors.JaxRuntimeError as error:
         return Attempt(None, error)
 
@@ -1117,17 +1233,116 @@ class Untuned(RuntimeError):
         self.lowered = lowered
 
 
+class CompiledOnDevice(Untuned):
+    """A compile without a device for a device to run met a choice only the device makes (`at_run_time`):
+    the programs it names (`programs`; the compile's own where it names none) are not preparable at all, and
+    their run compiles each on its GPU, which picks every choice itself. Refused before XLA compiles, so no
+    executable leaving the choice to run time reaches the persistent cache under the key the run's own
+    compile reads. An `Untuned` by intent: each says a choice the device's own compile makes, where a
+    handler of either compiles the program on its device; one naming how to tune it catches this first."""
+
+    def __init__(self, lowered: jax.stages.Lowered, programs: Sequence[str] = ()):
+        super().__init__("a cuDNN convolution compiled without its GPU leaves its algorithm to run time "
+                         "(DEVICELESS_CONVOLUTION_PICKS): compiled on its GPU"
+                         + (f" ({', '.join(programs)})" if programs else ""), lowered)
+        self.programs = tuple(programs)
+
+
+DEVICELESS_CONVOLUTION_PICKS = False
+"""Whether this jaxlib's compile without a device (`deviceless`) can carry a cuDNN convolution's algorithm.
+It cannot: a compile-only GPU has no cuDNN to ask, so the convolution keeps algorithm -1, which cuDNN picks
+at run time, and on an A100 not the same each run (row 7941's UNet fp32 cell, two runs of one executable
+apart). XLA records no convolution's pick to read instead: on the A100 a device compile measuring among
+deterministic algorithms (deterministic ops off, autotuner at level 4) wrote nothing to its per-fusion
+autotune cache in UPDATE mode, and an empty autotune results dump, while every device compile, level 0 to 4,
+picked the same algorithms and ran bit for bit (jaxlib 0.12, UB-PICKS2-a100, 11-19). A jaxlib that stores
+them (row 8527) retires `at_run_time`'s refusal."""
+
+
+def at_run_time(lowered: jax.stages.Lowered) -> bool:
+    """Whether `lowered`, compiled for its target, leaves a choice to run time that its device's own compile
+    makes: a convolution, which XLA's GPU compiles to a cuDNN call, compiled for compile-only GPUs
+    (`DEVICELESS_CONVOLUTION_PICKS`). Read from its StableHLO before XLA compiles it."""
+    devices = target_devices(lowered)
+    if DEVICELESS_CONVOLUTION_PICKS or not devices or not deviceless(next(iter(devices))):
+        return False
+    found = False
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        nonlocal found
+        found = op.name == "stablehlo.convolution"
+        return ir.WalkResult.INTERRUPT if found else ir.WalkResult.ADVANCE
+
+    module = lowered.compiler_ir("stablehlo")
+    assert module is not None, "a lowered program states its StableHLO module"
+    module.operation.walk(visit)
+    return found
+
+
+def target_devices(lowered: jax.stages.Lowered) -> Sequence | None:
+    """The GPUs `lowered` compiles for, None where it compiles for none."""
+    from jax._src.interpreters import pxla
+
+    lowering = lowered._lowering
+    devices = lowering._device_list if isinstance(lowering, pxla.MeshComputation) else None
+    return None if devices is None or next(iter(devices)).platform != "gpu" else devices
+
+
 def untuned(code: str, message: str) -> bool:
     """Whether XLA refused a deviceless compile for want of a tuned result (`UNTUNED`)."""
     return code == "NOT_FOUND" and any(said in message for said in UNTUNED)
 
 
-def xla_compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
-                 ) -> jax.stages.Compiled:
-    """`lowered` compiled by XLA under `options` for its target (`targeted`): Dew's one call of XLA's
-    compile, where an instruction no device run has tuned yet is said so (`Untuned`)."""
+class CompileSlots:
+    """The compiles this process runs at once (`compile_threads`), shared by every thread that compiles
+    (`xla_compiled`): one a step waits on takes any free slot; one no step waits on (`background`: a
+    start's program compiled beside its work, `options.compiling`) takes one only while one is free and no
+    other waits, so on a host of one slot a step's compile never queues behind it."""
+
+    def __init__(self, count: int):
+        self._free, self._waiting = count, 0
+        self._changed = threading.Condition()
+
+    @contextlib.contextmanager
+    def held(self, *, background: bool) -> Iterator[None]:
+        """A slot held for the block, taken as its priority allows."""
+        with self._changed:
+            if background:
+                self._changed.wait_for(lambda: self._free > 0 and self._waiting == 0)
+            else:
+                self._waiting += 1
+                try:
+                    self._changed.wait_for(lambda: self._free > 0)
+                finally:
+                    self._waiting -= 1
+            self._free -= 1
+            self._changed.notify_all()
+        try:
+            yield
+        finally:
+            with self._changed:
+                self._free += 1
+                self._changed.notify_all()
+
+
+@functools.cache
+def compile_slots() -> CompileSlots:
+    """This process's compile slots (`CompileSlots`), counted once at first use (`compile_threads`)."""
+    return CompileSlots(compile_threads())
+
+
+def xla_compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None, *,
+                 background: bool = False) -> jax.stages.Compiled:
+    """`lowered` compiled by XLA under `options` for its target (`targeted`), in one of this process's
+    compile slots (`compile_slots`, `background` where no step waits on it): Dew's one call of XLA's
+    compile, where an instruction no device run has tuned yet is said so (`Untuned`), and a choice only the
+    device makes, for a device to run, is refused before XLA compiles (`CompiledOnDevice`)."""
+    devices = target_devices(lowered)
+    if devices is not None and not offline(devices) and at_run_time(lowered):
+        raise CompiledOnDevice(lowered)
     try:
-        return lowered.compile(targeted(lowered, options))
+        with compile_slots().held(background=background):
+            return lowered.compile(targeted(lowered, options))
     except jax.errors.JaxRuntimeError as error:
         if untuned(error.error_code_string, str(error)):
             raise Untuned(str(error), lowered) from error
@@ -1181,6 +1396,13 @@ def offline(devices: Sequence) -> bool:
     return device is not None and device.platform == "gpu" and deviceless(device) and not _FOR_DEVICES.get()
 
 
+def compiled_as_here(devices: Sequence, *, tuned: bool, at_run: bool) -> bool:
+    """Whether a program compiled ahead runs as `devices`' own compile of it would: none of its choices left
+    to run time (`at_run`, `at_run_time`) and, where `devices`' compile tunes (`autotuned`), tuned. A
+    program that does not is compiled on `devices` in its place."""
+    return not at_run and (tuned or not autotuned(devices))
+
+
 def autotuned(devices: Sequence) -> bool:
     """Whether a program compiled for `devices` takes XLA's tuned choices, as `targeted` compiles it: for a
     device to run (not `offline`), where the run's XLA_FLAGS leaves the autotuner on. One read offline skips
@@ -1198,16 +1420,18 @@ def targeted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     compile makes under the same key; one only read for its memory or text (a plan offline, a validation,
     a step compiled into a file, a probe) skips the autotuner (`xla_gpu_autotune_level` 0, its own key,
     which no device's run reads) and keeps XLA's sorts as they fall back, its memory the same (a frontier
-    search's every probe and rung, 142 s to 99 s on armada, 11-02). A run's own XLA_FLAGS setting keeps
-    `options` as given. Every program compiled here takes it, a run's step and every program it compiles
-    ahead alike."""
-    from jax._src.interpreters import pxla
-
-    lowering = lowered._lowering
-    devices = lowering._device_list if isinstance(lowering, pxla.MeshComputation) else None
-    if devices is None or next(iter(devices)).platform != "gpu":
+    search's every probe and rung, 142 s to 99 s on armada, 11-02). A program holding a dot XLA's Triton
+    GEMM computes wrong on the compile's own target (`triton_wrong`) compiles its GEMMs on cuBLAS, on a
+    device or for one alike, read from the program and its device alone, opening no backend. A run's own
+    XLA_FLAGS setting keeps `options` as given. Every program compiled here takes it, a run's step and
+    every program it compiles ahead alike."""
+    devices = target_devices(lowered)
+    if devices is None:
         return options
     device = next(iter(devices))
+    if (xla_flag("xla_gpu_enable_triton_gemm") is None
+            and triton_wrong(lowered, generation.device_target(device))):
+        options = {**(options or {}), "xla_gpu_enable_triton_gemm": False}
     if offline(devices):
         return options if xla_flag("xla_gpu_autotune_level") is not None else {
             **(options or {}), "xla_gpu_autotune_level": 0}
@@ -1219,14 +1443,57 @@ def targeted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     return options
 
 
+def triton_wrong(lowered: jax.stages.Lowered, target: generation.GpuTarget) -> bool:
+    """Whether XLA's Triton GEMM computes one of `lowered`'s own dots (a kernel's products are its custom
+    call's) wrong on `target`, as the program states each dot, whatever stated it:
+    a product of an int8 operand, which it computes as two or four times the product (openxla/xla#51016)
+    on every GPU measured (`GpuTarget.int8_triton_gemm`); with CUDA 13 cuBLAS refuses some int8 shapes
+    (on an A100 a contraction of 16 or 48), and then the program does not compile rather than compute
+    wrong;
+    or fp32 operands at IEEE fp32 products (a precision of `HIGHEST` on either operand, XLA's GPU taking the
+    higher of a pair, or an algorithm of fp32 operands one product a term, the F32_F32_F32 preset), which it
+    sums farther from float64 than cuBLAS, whose sum a float32 reference is
+    (`dew.nn.precision.FP32_PRODUCTS`), as JAX lowers each dot at the precision it resolved: the run's
+    default, a model's, an operation's own."""
+    from dew.nn.precision import FP32_PRODUCTS, declares_fp32_products
+    from dew.nn.programs import algorithm_arithmetic, dot_arithmetic
+
+    wrong = False
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        nonlocal wrong
+        if op.name != "stablehlo.dot_general":
+            return ir.WalkResult.ADVANCE
+        types = [ir.RankedTensorType(operand.type).element_type for operand in list(op.operands)[:2]]
+        if any(isinstance(each, ir.IntegerType) and ir.IntegerType(each).width == 8 for each in types):
+            wrong = not target.int8_triton_gemm
+        elif all(isinstance(each, ir.F32Type) for each in types):
+            attributes = op.attributes
+            if "precision_config" in attributes:
+                # Each operand's precision as JAX's enum names it, the pair read as a run's precision is.
+                lhs, rhs = (jax.lax.Precision[stablehlo.PrecisionAttr(each).value]
+                            for each in ir.ArrayAttr(attributes["precision_config"]))
+                wrong = declares_fp32_products((lhs, rhs))
+            if not wrong and "algorithm" in attributes:
+                stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
+                wrong = any(stated == dot_arithmetic(name, jnp.float32, jnp.float32)
+                            for name in FP32_PRODUCTS)
+        return ir.WalkResult.INTERRUPT if wrong else ir.WalkResult.ADVANCE
+
+    module = lowered.compiler_ir("stablehlo")
+    assert module is not None, "a lowered program states its StableHLO module"
+    module.operation.walk(visit)
+    return wrong
+
+
 def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]]
              ) -> list[Attempt]:
-    """Each of `programs` compiled once (`attempted`), in order, all at once, at most `COMPILE_THREADS`
+    """Each of `programs` compiled once (`attempted`), in order, all at once, at most `compile_threads()`
     at a time; one alone in this thread. JAX's cache key reads a module's context without writing it from
     0.12.0.1.post54 (pyproject's pin), so programs one thread lowered in one context compile together."""
     if len(programs) < 2:
         return [attempted(*program) for program in programs]
-    with ThreadPoolExecutor(min(len(programs), COMPILE_THREADS), thread_name_prefix="dew-compile") as pool:
+    with ThreadPoolExecutor(min(len(programs), compile_threads()), thread_name_prefix="dew-compile") as pool:
         # Each in the submitting thread's context: the compile's target reads it (`for_devices`).
         return [each.result() for each in [pool.submit(contextvars.copy_context().run, attempted, *program)
                                            for program in programs]]
@@ -1562,13 +1829,16 @@ def _recorded(found: list, *, stepped: bool) -> None:
     """Each of `found`'s misses recorded and logged, stepped down where `stepped` and its kernel a
     launch's."""
     for _, report, launch in found:
+        stated = None if report.launch is None else traced(report.launch)
+        model = None if stated is None else stated.kernels.get(report.kernel)
         miss = Miss(report.kernel, None if launch is None else launch.op,
                     None if launch is None else launch.config, report.registers, report.frame,
                     stepped and launch is not None,
-                    serialized=tuple(note.code for note in report.notes if note.code in SERIALIZED))
+                    serialized=tuple(note.code for note in report.notes if note.code in SERIALIZED),
+                    modelled=None if model is None else model.registers)
         if _record(None, miss):
-            _log.warning("kernel %s %s at %s registers (%s at %s); %s", miss.kernel, miss.reason,
-                         miss.registers, miss.op, miss.config,
+            _log.warning("kernel %s %s at %s registers against its model's %s (%s at %s); %s", miss.kernel,
+                         miss.reason, miss.registers, miss.modelled, miss.op, miss.config,
                          "its launch steps down" if miss.stepped else "no step-down")
 
 

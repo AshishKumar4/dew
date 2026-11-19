@@ -377,9 +377,11 @@ def documents_draw(seed: int):
 def documents_on_the_kernel(x, b, c, a, given, key, value, weight, added: bool = False):
     """The kernel over a forked call, its documents walked in place, each taking its table slot's memory up
     at its first token, where `added` its `ADDS` slot's too (`Chunk.adds`), with its entry write added
-    (`recurrence_chunk._tpu_documents`): the output and the row's last memory."""
+    (`recurrence_chunk._tpu_documents`), launched per shard of rows and heads as the rated scan launches it
+    (`recurrence_chunk.ssd_specs`), so it runs under any mesh: the output and the row's last memory."""
     from dew.nn.kernels.chunked_launch import Forked
-    from dew.nn.kernels.recurrence_chunk import _tpu_documents
+    from dew.nn.kernels.recurrence_chunk import _tpu_documents, ssd_specs
+    from dew.nn.sharding import manual_map
 
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
     forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, (key, value, weight), 2,
@@ -391,7 +393,11 @@ def documents_on_the_kernel(x, b, c, a, given, key, value, weight, added: bool =
     padding = -length % 64
     x, b, c, a = (jnp.pad(t, ((0, 0), (0, padding)) + ((0, 0),) * (t.ndim - 2)) for t in (x, b, c, a))
     start = jnp.zeros((x.shape[0], *given.shape[2:]), jnp.float32)
-    y, final = _chunk_scan(x, b, c, a, start, documents, 64, "tpu", 2)
+
+    def local(x, b, c, a, start, documents):
+        return _chunk_scan(x, b, c, a, start, documents, 64, "tpu", 2)
+
+    y, final = manual_map(local, *ssd_specs(x.shape, documents))(x, b, c, a, start, documents)
     return y[:, :length], final
 
 
@@ -501,9 +507,33 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
         np.testing.assert_array_equal(np.asarray(ours, np.float64)[normal], theirs[normal])
     # Every order the kernel's rule takes finite wherever float64's is a normal float32 (the contract's
     # seams): its primal and its reverse mode (`contract_support.REVERSE_ONLY`: rows 7874, 7875).
-    assert_contract(without_ynn(documents_on_the_kernel), operands, operands, seeded,
+    # The kernel as a program differentiates and places it (no compiler options, which refuse to nest in the
+    # mesh run's program, `without_ynn`).
+    assert_contract(documents_on_the_kernel, operands, operands, seeded,
                     "the TPU kernel's forked call at fp32's edge", truth_fn=documents_one_by_one,
                     without=REVERSE_ONLY)
+
+
+def test_an_entry_writes_gradient_lowers_for_a_tpu():
+    """A forked call's gradient with its documents' entry writes (`documents_on_the_kernel`), traced for an
+    assumed v5p on its mesh: it lowers on any host to Mosaic kernels, where the entry write's aligned sums
+    over its 16 keys summed each halving with an empty tail, a slice Mosaic refuses, a vector of no rows
+    (base review 68c63603f F1)."""
+    from jax.sharding import AbstractDevice, AbstractMesh, AxisType
+
+    from dew.nn.kernels.generation import TARGETS, assumed
+    from dew.nn.kernels.lowered import custom_calls
+
+    operands, seeded = documents_draw(0)
+
+    def gradient(operands, seeded):
+        return with_gradients(lambda *o: documents_on_the_kernel(*o))(*operands, seeded)
+
+    device = AbstractDevice(device_kind=TARGETS["v5p"].device_kind, num_cores=None, platform="tpu")
+    mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(gradient).trace(operands, seeded).lower(lowering_platforms=("tpu",))
+    assert any(call.target == "tpu_custom_call" for call in custom_calls(lowered))
 
 
 @pytest.mark.tpu(reason="the recurrence matrix's TPU cells run on the TPU tier's own TPU")

@@ -16,6 +16,7 @@ import contextlib
 import functools
 import multiprocessing
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -295,8 +296,7 @@ one-launch backward, which the register rule's calibration found within its regi
 
 
 @cell("attention", covers=lambda case: dict(zip(AXES["attention"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_routes_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The route's training step of `case` on its GPU on par with the reference path's (check 1), its launch

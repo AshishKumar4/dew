@@ -18,8 +18,8 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+from recorded_runs import assert_as_exact_as_recorded
 from reference_error import declared_seeds
-from reference_runs import assert_as_exact_as_recorded
 from sampling_gate import assert_draws_as_declared
 from tool_support import run_from
 

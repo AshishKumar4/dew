@@ -39,6 +39,7 @@ import optax
 from benchmark_cases import LM_DENSE, LM_MOE, Case, grouped_operands, routed
 from benchmark_models import build_trainer, compiled_step, timed_steps
 
+from dew._records import integer, record
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import program
 from dew.nn.moe import expert_projection
@@ -205,11 +206,12 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
     else:
         config = dict(LM_MOE)
         if args is not None:
-            config["mixture"] = {**LM_MOE["mixture"], "implementation": args.implementation}
+            mixture = record(LM_MOE["mixture"], "mixture")
+            config["mixture"] = {**mixture, "implementation": args.implementation}
     config["remat"] = None if remat in (None, "none") else remat
     # The decoder's whole context, a window a row.
-    return Case("causal_transformer", config, dtype="bfloat16",
-                               batch_size=batch, seq_len=config["max_seq_len"])
+    return Case("causal_transformer", config, dtype="bfloat16", batch_size=batch,
+                seq_len=integer(config["max_seq_len"], "max_seq_len"))
 
 
 def step(args: argparse.Namespace) -> dict[str, object]:
@@ -234,7 +236,7 @@ def step(args: argparse.Namespace) -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     modes = parser.add_subparsers(dest="mode", required=True)
     project = modes.add_parser("projection")
     project.add_argument("--kernel", type=kernel_name, default="auto",

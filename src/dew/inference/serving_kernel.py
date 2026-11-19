@@ -723,7 +723,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
     group by group, the way the slots are placed (a prefilled admission's state
     rows first, `_rows_first`); None leaves them where they are. `options` are
     the program's own XLA options beside the run's
-    (`decode_programs`: the model's `dew.nn.kernels.options.compiler_options`,
+    (`decode_programs`: the opened `dew.nn.kernels.options.compiler_options`,
     and the admitting step's); pass XLA_FLAGS to change the backend's
     defaults. See docs/performance.md for the measurements.
     """
@@ -761,7 +761,7 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
         return jax.tree.map(lambda leaf, sharding: None if leaf is None else jax.ShapeDtypeStruct(
             leaf.shape, leaf.dtype, sharding=sharding), half, shardings, is_leaf=lambda leaf: leaf is None)
 
-    program = _compiled(automatic(resident), automatic(carried), rows, compiler_options(model) or None)
+    program = _compiled(automatic(resident), automatic(carried), rows, compiler_options() or None)
     arguments = (model, params, pad_id, placement, steps, abstract(resident), abstract(carried), None,
                  transforms, stopping, grammar, progress)
     # Tuned first: a program a block hands (`dew.training.ahead.kept`) is the one its tuned lowering is, which
@@ -984,7 +984,7 @@ def dispatched(program: OuterProgram) -> Step:
 
 def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, Option]
                     ) -> tuple[OuterProgram, OuterProgram]:
-    """`_compiled` over `formats` and model `options`
+    """`_compiled` over `formats` and the run's `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
     the admitting one, compiled without CUDA command buffers on a GPU
     (`dew.nn.kernels.options.UNGRAPHED_OPTIONS`): its inputs are fresh

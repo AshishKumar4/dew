@@ -47,16 +47,18 @@ from dew.nn.kernels import recurrence, short_conv
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
 from dew.nn.residuals import Residual
 
+from .activations import silu
 from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
 from .derivatives import Protected, contracted, declared_derivative
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .joined import joined_dense, joins
-from .kernels import generation
+from .kernels import generation, recurrence_algebra
 from .kernels.generation import INHERENT, Choice
 from .kernels.recurrence_chunk import (
     CHUNK_SIZE,
+    RESET_DECAY,
     chunk_gated_delta_rule,
     entering_memory,
     kernel_routed,
@@ -71,7 +73,6 @@ from .precision import (
     compensated_sum,
     float32_dot_general,
     l2norm,
-    silu,
 )
 from .sharding import (
     HEADS,
@@ -632,6 +633,26 @@ def over_sequence(local, shards: int, tokens: tuple, whole: tuple):
                             f"axis, and it does not divide")
     spec = logical_spec(("activation_batch", "activation_length"), tokens[0].shape[:2])
     return on_shards(local, spec, (*tokens, *whole), whole=range(len(tokens), len(tokens) + len(whole)))
+
+
+def sequence_entered(run, decay, starts):
+    """This shard's slice of a recurrence whose memory decays by a scale a head (lightning's) or each
+    channel and state its own (Mamba-1's), inside a `shard_map` that holds the sequence axis manual
+    (`over_sequence`): `run(state) -> (out, final)` scans this shard's slice alone, no collective in it,
+    from the memory `state` (zero where None) through the memory it leaves, a document start in it dropping
+    the memory before it. Run from zero, the memory it leaves and `decay` `[B, *lead]`, its span's summed
+    log decay (a document start in `starts` `[B, S]` zeroing it, `RESET_DECAY`), give the memory the
+    earlier shards leave it (`recurrence_algebra.entering`, `lead`'s each a head of the span, a scale's
+    `[1, 1]` memory), and the slice runs again from that memory: the Mamba-1 and lightning layers' split
+    (tests/test_mamba.py, tests/test_recurrent_sequence_split.py)."""
+    _, leaving = run(None)
+    batch, lead = decay.shape[0], decay.shape[1:]
+    if starts is not None:
+        decay = jnp.where(jnp.any(starts, axis=1).reshape(batch, *(1,) * len(lead)), RESET_DECAY, decay)
+    memory = leaving.shape[1 + len(lead):] or (1, 1)
+    span = recurrence_algebra.Span(decay.reshape(batch, -1), leaving.reshape(batch, -1, *memory))
+    out, _ = run(recurrence_algebra.entering(span, SEQUENCE_AXIS).reshape(leaving.shape))
+    return out
 
 
 def sequence_conv(mixed, taps, bias, segments, valid, *, parts=None, dtype=None):

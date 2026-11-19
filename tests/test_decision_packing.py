@@ -4,6 +4,7 @@ import collections
 import copy
 import functools
 import itertools
+import operator
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from attention_oracle import attention_terms
+from attention_oracle import traced_attention_terms
 from decision_support import decision_rows
 from float64_terms import float64_terms
 from optim_support import in_float64
@@ -217,18 +218,22 @@ def gradient(objective, variables, batch):
     return jax.grad(total)(variables)
 
 
-def located(tree, path: tuple[str, ...], held) -> tuple[str, ...]:
+def located(tree, path: tuple[str, ...], held, same=lambda mine, its: np.array_equal(np.asarray(mine),
+                                                                                     np.asarray(its))
+            ) -> tuple[str, ...]:
     """Where in a parameters tree a module whose scope is `path` holds `held`, its own parameters as its
     apply read them: its model applies it at the tree's root or under one of its top-level modules, a
     backbone's and a head's scopes alike (`layers_0/self_attn` in both), so the one place whose
-    parameters are `held`'s is its."""
+    parameters are `held`'s is its, each leaf the `same` as `held`'s (equal values, or under a trace the
+    very arrays, `operator.is_`: `AttentionTerms`). A place none or several of whose places hold them is
+    refused, naming its path."""
     found = []
     for root in ((), *((name,) for name, child in tree.items() if isinstance(child, dict))):
         reached = tree
         for name in (*root, *path):
             reached = reached.get(name) if isinstance(reached, dict) else None
         if reached is not None and jax.tree.structure(reached) == jax.tree.structure(held) and all(
-                np.array_equal(np.asarray(mine), np.asarray(its))
+                same(mine, its)
                 for mine, its in zip(jax.tree.leaves(reached), jax.tree.leaves(held), strict=True)):
             found.append((*root, *path))
     assert len(found) == 1, f"{path} is at {len(found)} places of the parameters"
@@ -241,17 +246,20 @@ READ = ("_heads", "__call__")
 
 class AttentionTerms:
     """Each attention's projections' gradients' float64 terms in `objective`'s float64 model at `batch`
-    (`NormalAttention`): its queries', keys' and values' terms (`attention_terms`, a logit's gradient
+    (`NormalAttention`): its queries', keys' and values' terms (`traced_attention_terms`, a logit's gradient
     P (dP - delta) sized by its terms' rounding), carried through the projection that made them to its
     bias, their root sum of squares over the batch's tokens, and to its kernel, the tokens' input times
     them. A key's bias moves every logit of its query alike, so its gradient cancels to zero in float64
     (softmax's shift invariance); its rounding is of those terms, behind the sums that cancel, where
     `float64_terms` sizes a leaf by its final sum's terms alone. The attentions' inputs and outputs are
     read through Flax's method interception, the outputs' cotangents as the gradient of a zero added to
-    each, in one program traced once."""
+    each, in one program traced once. Each attention's place in the parameters is read as it is traced,
+    the one place whose leaves are the very arrays its module reads (`located` by `operator.is_`), so the
+    terms are a program of the variables a prepare traces and compiles ahead (row 7359)."""
 
     def __init__(self, objective, batch):
         self.names: dict = {}
+        self.places: dict = {}
         step = Step(jnp.asarray(0), jax.random.key(0), None, training=False)
 
         def total(variables, added):
@@ -263,13 +271,15 @@ class AttentionTerms:
                     return call(*args, **kwargs)
                 path = module.scope.path
                 self.names[path] = module.names
+                if path not in self.places:
+                    self.places[path] = located(variables["params"], path, module.variables["params"],
+                                                operator.is_)
                 record = held.setdefault(path, {})
                 out = call(*args, **kwargs)
                 if context.method_name == "_heads":
                     record[args[0]] = (args[1], out)
                     return out
                 record["documents"] = (kwargs["segment_ids"], kwargs.get("key_segment_ids"))
-                record["params"] = module.variables["params"]
                 record["out"] = out
                 return out + added[path] if path in added else out
 
@@ -299,16 +309,56 @@ class AttentionTerms:
             key_ids = query_ids if key_ids is None else key_ids
             queried = query_ids[:, None, :, None]
             keep = (queried == key_ids[:, None, None, :]) & (queried != 0)
-            place = located(variables["params"], path, record["params"])
+            place = self.places[path]
             kernel = node(variables["params"], place)[out_name]["kernel"]
             heads, width = queries.shape[2:]
             dout = jnp.einsum("bsf,hdf->bshd", cotangents[path], kernel.reshape(heads, width, -1))
-            _, query_terms, key_terms, value_terms = attention_terms(queries, keys, values, dout, keep)
+            _, query_terms, key_terms, value_terms = traced_attention_terms(queries, keys, values, dout, keep)
             # `into` stays on the device: `with_attention_terms` widens it there, at float64 under x64.
             carried[place] = {name: (into, terms) for name, into, terms in (
                 (query_name, into_queries, query_terms), (key_name, into_keys, key_terms),
                 (value_name, into_keys, value_terms))}
         return carried
+
+
+def test_an_attentions_terms_find_its_parameters_by_their_trace_where_their_values_place_them():
+    """`AttentionTerms` reads each attention's place in the parameters as it is traced, the one place whose
+    leaves are the very arrays its module reads (`located` by `operator.is_`), so its terms are a program a
+    prepare traces and compiles ahead (row 7359: value comparisons of traced arrays failed there). On the
+    joint arm's packed window (its head's attentions), traced whole (`jax.jit`), it places each attention
+    where its parameters' values do, read from an eager apply's (`located` by value), so its terms are the
+    value-located ones; a tree holding no such arrays, as a copy does, or holding them at two places, is
+    refused."""
+    objective = objective_for("joint")
+    rows = apart(windows(objective, 1))
+    wide = copy.copy(objective)
+    wide.substitute((objective.model.backbone.clone(dtype=jnp.float64, attention_impl="reference"),
+                     objective.model.head.clone(dtype=jnp.float64)))
+    with jax.enable_x64(new_val=True):
+        variables = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
+                                 nn.unbox(objective.init(jax.random.key(0))))
+        traced = AttentionTerms(wide, rows)
+        jax.jit(traced)(variables)
+        # Each attention's parameters as an eager apply reads them, placed by their values.
+        held = {}
+
+        def read(call, args, kwargs, context):
+            if isinstance(context.module, NormalAttention) and context.method_name == "__call__":
+                held[context.module.scope.path] = context.module.variables["params"]
+            return call(*args, **kwargs)
+
+        with nn.intercept_methods(read):
+            wide.loss(variables, rows, Step(jnp.asarray(0), jax.random.key(0), None, training=False))
+    assert held and traced.places == {path: located(variables["params"], path, params)
+                                      for path, params in held.items()}
+    path, params = next(iter(held.items()))
+    # Its place's top-level module, or the tree where it sits at the root, held under two names.
+    root = traced.places[path][:len(traced.places[path]) - len(path)]
+    under = node(variables["params"], root) if root else variables["params"]
+    copied, twice = jax.tree.map(np.copy, variables["params"]), {"one": under, "other": under}
+    for tree in (copied, twice):
+        with pytest.raises(AssertionError):
+            located(tree, path, params, operator.is_)
 
 
 def with_attention_terms(sized, carried: dict):
@@ -368,7 +418,7 @@ def packed_rows_decided_alone(arm: str) -> None:
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64,
                                                                          attention_impl="reference"),
                                           objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm],
-                              PACKING_WINDOWS.get(arm, 2))
+                              arm, PACKING_WINDOWS.get(arm, 2))
 
 
 def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
@@ -383,7 +433,7 @@ def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
         last = np.flatnonzero(batch["segments"][window] == row)[-1]
         assert np.all(batch["readout"][window][owners(batch)[window] == row] == last)
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
-                                          objective.model.head), PACKING_SEEDS["readout"])
+                                          objective.model.head), PACKING_SEEDS["readout"], "readout")
 
 
 def a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
@@ -400,7 +450,7 @@ def a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic
         loss=LogLoss(), shuffle_options=False)
     head = objective.model.head.clone(dtype=jnp.float64, attention_impl="xla")
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64), head),
-                              PACKING_SEEDS["flash"])
+                              PACKING_SEEDS["flash"], "flash")
 
 
 def asked(batch, logits) -> np.ndarray:
@@ -452,11 +502,12 @@ packs several rows, and its draw at two windows took 0.50 s on armada against 0.
 256 draws two windows took on an A100 brought it past the suite's 240 s a test (ledger 1851)."""
 
 
-def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 2) -> None:
+def assert_rows_decided_alone(objective, wide_modules, seeds: int, arm: str, count: int = 2) -> None:
     """`count` packed windows of the examples decide each row's questions as the row does alone where
     its window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
     over drawn parameters, the truth `wide_modules`, the backbone and head in float64, over the rows
-    in windows of their own, a leaf zero by algebra sized by the terms its sum adds."""
+    in windows of their own, a leaf zero by algebra sized by the terms its sum adds; its site `arm`'s own
+    (`packed window: <arm>`), as two arms' cells share a GPU flow's one store of programs."""
     batch = windows(objective, count)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
@@ -512,8 +563,8 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
     initialized = jax.jit(lambda key: nn.unbox(objective.init(key)))
     # A leaf whose float64 truth cancels, an algebraic zero's, is sized by the terms its sums add
     # (`terms`), so each arm's rounding of them is on par, on every backend.
-    assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),), "packed window",
-                    seeds=seeds, truth_fn=truth, terms=terms)
+    assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),),
+                    f"packed window: {arm}", seeds=seeds, truth_fn=truth, terms=terms)
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():
@@ -682,9 +733,12 @@ PACKED_SEEDS = 256
 variables, sized paired by `seeds_for` on armada."""
 
 
+@pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_packed_loss_counts_only_real_scored_questions():
     """Different joint-row lengths and label counts contribute question charges, not token,
-    window, unanswered or padding counts; a repeated held window contributes neither part."""
+    window, unanswered or padding counts; a repeated held window contributes neither part. Its 256
+    seeds, each two arms' runs of the objective, are drawn by CI's map tasks, 64 a task
+    (`check1_shards`, row 6449)."""
     examples = [
         Example("short", {"q0": Choice("x", ["a", "b"])}, {"q0": "a"}),
         Example("state " + "x" * 80,

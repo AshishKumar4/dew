@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
@@ -25,6 +25,7 @@ from dew.nn.kernels.templates import (
     outputs,
     product,
     rings,
+    stacked,
     stores,
     swizzling,
 )
@@ -107,9 +108,10 @@ def _expected(x):
 
 
 def _stream():
-    """Small integers, so any tile's sum is exact in fp32 whatever its order."""
+    """Small integers, so any tile's sum is exact in fp32 whatever its order: NumPy's, as a site's draws are
+    (a GPU tier's prepare computes on no device)."""
     steps = _first_step(TILES)
-    return jax.random.randint(jax.random.key(0), (steps * BLOCK[0], BLOCK[1]), -64, 64).astype(jnp.bfloat16)
+    return np.random.default_rng(0).integers(-64, 64, (steps * BLOCK[0], BLOCK[1])).astype(jnp.bfloat16)
 
 
 @INTERPRETS
@@ -134,9 +136,13 @@ def test_the_ring_lowers_for_an_h100(consumers):
 
 
 def a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
-    """The ring's kernel compiled and run on an H100, where the interpreter's no-op waits are real."""
+    """The ring's kernel compiled and run on an H100, where the interpreter's no-op waits are real, its
+    program compiled in a tier's prepare (`ahead_arm`)."""
+    from reference_error import ahead_arm
+
     x = _stream()
-    summed = jax.jit(functools.partial(_ring_sums, interpret=False, consumers=consumers))(x)
+    summed = ahead_arm(jax.jit(functools.partial(_ring_sums, interpret=False, consumers=consumers)),
+                       f"a ring's tile sums: {consumers} consumers")(x)
     np.testing.assert_array_equal(np.asarray(summed), _expected(x))
 
 
@@ -204,10 +210,11 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
 
 
 def _fed_operands():
-    """Small integers, so the product is exact in fp32 whatever its order."""
-    keys = jax.random.split(jax.random.key(1))
-    p = jax.random.randint(keys[0], (FED_ROWS, FED_STEPS * FED_ROWS), -4, 4).astype(jnp.bfloat16)
-    x = jax.random.randint(keys[1], (FED_STEPS * FED_ROWS, FED_WIDTH), -4, 4).astype(jnp.bfloat16)
+    """Small integers, so the product is exact in fp32 whatever its order: NumPy's (a GPU tier's prepare
+    computes on no device)."""
+    rng = np.random.default_rng(1)
+    p = rng.integers(-4, 4, (FED_ROWS, FED_STEPS * FED_ROWS)).astype(jnp.bfloat16)
+    x = rng.integers(-4, 4, (FED_STEPS * FED_ROWS, FED_WIDTH)).astype(jnp.bfloat16)
     return p, x
 
 
@@ -247,9 +254,13 @@ def test_the_fed_walk_lowers_for_an_h100(consumers):
 
 
 def consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
-    """The fed walk compiled and run on an H100, where the interpreter's no-op waits are real."""
+    """The fed walk compiled and run on an H100, where the interpreter's no-op waits are real, its program
+    compiled in a tier's prepare (`ahead_arm`)."""
+    from reference_error import ahead_arm
+
     p, x = _fed_operands()
-    got = jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, lo=lo))(p, x)
+    got = ahead_arm(jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, lo=lo)),
+                    f"a fed walk's products: {consumers} consumers from {lo}")(p, x)
     for value, expected in zip(got, _fed_expected(p, x), strict=True):
         np.testing.assert_array_equal(np.asarray(value), expected)
 
@@ -749,13 +760,13 @@ def test_an_sm80_side_vector_loads_in_the_layout_of_the_axis_it_follows(axis):
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     """Two zeroed refs of one shape and dtype a launch adds into in place are one value to XLA, which a
     dynamic-slice fusion wrapping the launch passes once for both (row 3180): `mosaic.checked` refuses the
-    launch where it traces them, and takes them stacked into one ref (`stacked_zeros`), each member its own
-    place: a launch writing a value of its own into each view (`stacked_views`) reads each back apart
-    (`stacked_read`), in its shapes' order."""
+    launch where it traces them, and takes them stacked into one ref (`stacked.zeros`), each member its own
+    place: a launch writing a value of its own into each view (`stacked.views`) reads each back apart
+    (`stacked.read`), in its shapes' order."""
     shapes = [(2, 3), (4,), (2, 3)]
 
     def written(*refs):
-        for index, view in enumerate(mosaic.stacked_views(refs, groups)):
+        for index, view in enumerate(stacked.views(refs, groups)):
             view[...] = jnp.full(view.shape, index + 1.0)
 
     launched = mosaic.checked(written, "probe")
@@ -763,16 +774,16 @@ def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     def apart():
         launched(*(jax.new_ref(jnp.zeros(shape, jnp.float32)) for shape in shapes))
 
-    groups = mosaic.stacked_groups(shapes)
+    groups = stacked.groups(shapes)
     with pytest.raises(ValueError):
         jax.jit(apart).trace()
 
-    def stacked():
-        refs = mosaic.stacked_zeros(shapes, groups, jnp.zeros(()))
+    def together():
+        refs = stacked.zeros(shapes, groups, jnp.zeros(()))
         launched(*refs)
-        return mosaic.stacked_read(refs, groups)
+        return stacked.read(refs, groups)
 
-    for index, (shape, array) in enumerate(zip(shapes, jax.jit(stacked)(), strict=True)):
+    for index, (shape, array) in enumerate(zip(shapes, jax.jit(together)(), strict=True)):
         np.testing.assert_array_equal(array, np.full(shape, index + 1.0))
 
 
@@ -1309,6 +1320,7 @@ def test_the_gemms_kernel_bodies_run_on_a_tpu_core(case):
         jax.jit(call).trace(*abstract).lower(lowering_platforms=("tpu",))
 
 
+@COMPILES_ON_CPU
 def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_gates_cap_spill_free():
     """A persistent warpgroup-MMA walk, one consumer beside its producer, launched at each residency its
     family admits a multiprocessor on an H100 (`RegisterModel.most`) and compiled as the GPU gate compiles
@@ -1437,12 +1449,15 @@ def _negated(a, b, *, path: str, interpret: bool):
 def every_warpgroup_read_lands_its_products_on_an_h100(path: str):
     """On an H100: each read path of a warpgroup accumulator (`READS`) gives the products' value to a sign op
     on its registers, `-(a @ b)` exactly over small integers, where ptxas dropped the MMA and stored -0.0
-    (row 4346)."""
-    keys = jax.random.split(jax.random.key(7))
-    a, b = (jax.random.randint(key, (LANDED, LANDED), -2, 3).astype(jnp.bfloat16) for key in keys)
+    (row 4346); its program compiled in a tier's prepare (`ahead_arm`), its operands NumPy's."""
+    from reference_error import ahead_arm
+
+    rng = np.random.default_rng(7)
+    a, b = (rng.integers(-2, 3, (LANDED, LANDED)).astype(jnp.bfloat16) for _ in range(2))
     expected = -(np.asarray(a, np.float32) @ np.asarray(b, np.float32))
-    np.testing.assert_array_equal(np.asarray(jax.jit(functools.partial(_negated, path=path,
-                                                                       interpret=False))(a, b)), expected)
+    negated = ahead_arm(jax.jit(functools.partial(_negated, path=path, interpret=False)),
+                        f"a warpgroup read's negated products: {path}")
+    np.testing.assert_array_equal(np.asarray(negated(a, b)), expected)
 
 
 @INTERPRETS
@@ -2173,7 +2188,7 @@ def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loo
 
 
 def test_a_staged_outputs_launch_states_its_cost():
-    """The staged output's launch (`_staged_launch`, its chunks' stores committed a group a chunk) costed as
+    """The staged output's launch (`_staged_launch`, each of its chunks' copies its own store group) costed as
     the toolkit's launches are (`emission.costed`, the estimate XLA and Dew's FLOP count read): it states the
     bytes it is given and no arithmetic, a store group's commit priced as the synchronization it is."""
     from reference_error import equations

@@ -42,6 +42,7 @@ __all__ = [
     "KernelGlue",
     "Kind",
     "Protected",
+    "Rare",
     "Surrogate",
     "TangentKind",
     "WalkStep",
@@ -255,11 +256,17 @@ def declared_tangent[Value](kind: TangentKind, primal: Callable[..., Value], tan
     an operand no tangent reaches is a `SymbolicZero` there, as `defjvp` gives it), the primal and the rule
     each one marked call of `kind` (`bound_span`) within the custom rule, as `declared_derivative` declares
     its; a surrogate's tangent is `surrogate`'s, whose rule reads the surrogate's own value, so a second
-    order meets the rule again (`TangentKind`)."""
+    order meets the rule again (`TangentKind`). A protected kind that states the operation its primal
+    computes (`Protected.computes`) states it of the primal alone: the rule's span is protected stating
+    nothing, as partial evaluation splits it into pieces that compute no such one operation."""
     fixed = tuple(nondiff_argnums)
+    # A span stating its operation is bound with the rule it is declared with (`Protected.declared`).
+    stated = (dataclasses.replace(kind, declared=tangent) if isinstance(kind, Protected) and kind.computes
+              else kind)
     rule = contracted("test_a_declared_derivative_holds_every_order")(
-        jax.custom_jvp(bound_span(kind, primal, static=fixed), nondiff_argnums=fixed))
-    rule.defjvp(bound_span(kind, tangent, static=range(len(fixed))), symbolic_zeros=symbolic_zeros)
+        jax.custom_jvp(bound_span(stated, primal, static=fixed), nondiff_argnums=fixed))
+    ruled = Protected() if isinstance(kind, Protected) else kind
+    rule.defjvp(bound_span(ruled, tangent, static=range(len(fixed))), symbolic_zeros=symbolic_zeros)
     return rule
 
 
@@ -303,7 +310,25 @@ def _array(leaf):
 @dataclasses.dataclass(frozen=True)
 class Protected:
     """A span the algebra pass keeps as it is: an error-free transform's (`dew.nn.precision`), whose
-    residual a reassociation would cancel."""
+    residual a reassociation would cancel; or, where it names what it `computes`, one operation of Dew's
+    in at least float32 and rounded once to its operand's dtype (`dew.nn.precision.logistic_value`, Dew's
+    one logistic, `dew.nn.activations.logistic`), which the algebra's normal form reads as that operation
+    (`dew.algebra.normal_form`), its arithmetic Dew's wherever it is fused. Such a span declared with a
+    derivative of its own (`declared_tangent`) is `declared` with that rule, set there alone, so a reader
+    that takes the span for its operation takes its derivative for the operation's only where the rule is
+    the one Dew's own declaration of it is declared with (`dew.algebra.recognize`)."""
+    computes: Callable | None = None
+    declared: Callable | None = None
+
+
+def stated_operation(equation) -> Callable | None:
+    """The operation a protected span states it computes (`Protected.computes`: Dew's one logistic its
+    `precision.logistic_value`), None for any other equation: what the algebra's normal form reads such a
+    span as, while a declaration traced inline keeps the span itself, Dew's arithmetic."""
+    if equation.primitive is not marked_call_p:
+        return None
+    kind = equation.params["kind"]
+    return kind.computes if isinstance(kind, Protected) else None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -330,7 +355,24 @@ class WalkStep:
     or unrolled rotation holds it; inlined, it lowers to its index."""
 
 
-type Kind = Protected | Surrogate | KernelGlue | Algebra | WalkStep
+@dataclasses.dataclass(frozen=True)
+class Activation:
+    """An activation's region (`dew.nn.activations`): `name`'s activation of its operand, or where `gated` a
+    gated product's, the activation of its gate times its up projection, its operands gate then up. Its one
+    reader is a fusion pass's choice of a matmul's epilogue that computes it; inlined, it lowers to its body,
+    Dew's arithmetic as it stands."""
+    name: str
+    gated: bool
+
+
+class Rare:
+    """A kernel's verdict a rare span of it runs by (a decided walk's second, where its rows' sums passed
+    fp32's largest: `templates.after_walk.Decided`), through a marked call, which a count of the kernel's work
+    by emission reads as its common value, False (`templates.emission`): its launch states its common walk's
+    work, as a rare call's scaled launch states none; inlined, it lowers to its value."""
+
+
+type Kind = Protected | Surrogate | KernelGlue | Algebra | WalkStep | Activation | Rare
 """What a marked span is, read as an object, never a name: to the algebra pass, or to a kernel's count."""
 
 type TangentKind = Protected | KernelGlue | Algebra

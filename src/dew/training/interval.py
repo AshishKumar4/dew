@@ -16,7 +16,7 @@ import math
 import queue
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
@@ -56,6 +56,10 @@ CONSUMED_COMMITTED = "consumed_committed"
 CONSUMED_EXAMPLES = "consumed_examples"
 """The checkpoint control field that holds the examples a run's dispatched batches consumed, as its host
 counted them (`Interval.consumed`), where it counts them."""
+
+DISPATCHED_MICROBATCHES = "dispatched_microbatches"
+"""The checkpoint control field that holds the microbatches a run dispatched, as its host counted them
+(`Interval.microbatches`), where it draws a pass count per microbatch."""
 
 
 def committed_tokens(control: dict) -> int:
@@ -111,6 +115,11 @@ class Book(NamedTuple):
     bad_loss: jax.Array
     bad_norm: jax.Array
     """That step's loss and gradient norm, which the check names (`checked_finite`)."""
+    broken: jax.Array
+    """The first step since the last check whose committed state holds a value not finite (a scaled step's
+    update overflowed it, `Committed.unfinite_state`), by its place among them, 0 for none."""
+    broken_state: jax.Array
+    """That step's first such leaf and their count (`unfinite_state`), -1 and 0 for none."""
 
 
 def _zeros(loss: jax.Array | jax.ShapeDtypeStruct) -> tuple[np.ndarray, ...]:
@@ -119,7 +128,7 @@ def _zeros(loss: jax.Array | jax.ShapeDtypeStruct) -> tuple[np.ndarray, ...]:
     return (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32), np.zeros((), dtype),
             np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32), np.zeros((2,), np.uint32),
             np.full((), -1, np.int32), np.zeros((), np.int32), np.zeros((), np.int32), np.zeros((), dtype),
-            np.zeros((), dtype))
+            np.zeros((), dtype), np.zeros((), np.int32), np.array([-1, 0], np.int32))
 
 
 def fresh_book(loss: jax.Array) -> Book:
@@ -149,6 +158,14 @@ def booked(book: Book, fresh: Book, loss: jax.Array, finite: jax.Array, committe
 
 
 @program
+def streak_of(book: Book) -> Streak:
+    """What `book`'s steps that were not finite left (`Streak`), on the devices, one program: a run's start
+    compiled ahead holds it (`dew.training.ahead`), so its first check compiles nothing."""
+    return Streak(jnp.stack([book.worst_bad_run, book.unfinite_layer, book.first_bad, book.stepped,
+                             book.broken, *book.broken_state]), jnp.stack([book.bad_loss, book.bad_norm]))
+
+
+@program
 def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, training=0.0,
              tokens=(0, 0), scored=(0, 0)) -> Book:
     """Advance the loop's counters for one step in a single dispatch.
@@ -168,11 +185,16 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committe
     # The first step not finite since the last check, by its place, and what it read (`checked_finite`).
     stepped = book.stepped + 1
     first = ~finite & (book.first_bad == 0)
+    # The first step that left its state not finite, and which of it (`Committed.unfinite_state`).
+    held = None if committed is None else committed.unfinite_state
+    broke = jnp.asarray(a=False) if held is None else (held[1] > 0) & (book.broken == 0)
     return Book(book.loss + loss.astype(dtype), bad_run, jnp.maximum(book.worst_bad_run, bad_run),
                 book.training + training, TokenCount.add(book.tokens, tokens), norms, commits,
                 TokenCount.add(book.scored, scored), layer.astype(jnp.int32), stepped,
                 jnp.where(first, stepped, book.first_bad),
-                jnp.where(first, loss.astype(dtype), book.bad_loss), jnp.where(first, norm, book.bad_norm))
+                jnp.where(first, loss.astype(dtype), book.bad_loss), jnp.where(first, norm, book.bad_norm),
+                jnp.where(broke, stepped, book.broken),
+                book.broken_state if held is None else jnp.where(broke, held, book.broken_state))
 
 
 @dataclasses.dataclass
@@ -217,6 +239,9 @@ class Interval:
     model_counted: bool = False
     tokens_counted: bool = False
     rollout_seconds: float = 0.0
+    kept_paths: tuple[str, ...] = ()
+    """The leaves of the run's kept state (`dew.training.transaction.checked`) by their paths, in their
+    order, by which a stop names one not finite (`checked_finite`)."""
     skips_nonfinite: bool = False
     """Whether the run drops a step that is not finite, stopping only after `BAD_LOSS_STEPS` in a row: one
     that skips such steps (`Trainer(skip_nonfinite=True)`) or holds a dynamic loss scale, whose overflowing
@@ -224,12 +249,21 @@ class Interval:
     waited: float = 0.0
     compiling: float = 0.0
     compiles: int = 0
+    step_misses: int | None = None
+    """The programs this fit's host steps compiled past their startup passes (`HostRun`), every HostRun the
+    fit steps on counted (a phase planned afresh among them); None for a fit whose steps are no host's,
+    which logs none."""
     inspected: tuple[jax.Array, Summaries] | None = None
     """The latest sampled commit's count and summaries since the last log (`Committed.inspected`)."""
     consumed: int = 0
     """The examples the run's dispatched batches consumed, the runs before this fit's included, as the host
     counted each batch (`dew.batch.ConsumedCount`): what its cadences and pause of examples read, the
     same as its state's clock (`TrainState.consumed`) without a read off the devices."""
+    microbatches: int | None = None
+    """The microbatches the run dispatched, the runs before this fit's included, rejected attempts among
+    them, as the host counted them: the global position of the next, which a run drawing its looped model's
+    pass count per microbatch draws at (`dew.training.phase_passes.SampledPasses`); None where it draws
+    none, or a checkpoint counted none."""
     consumed_before: int = 0
     """`consumed` before the latest step."""
     consumed_committed: int = 0
@@ -295,27 +329,36 @@ class Interval:
         if self.book is None or self.fresh is None:
             return None
         book, fresh = self.book, self.fresh
-        counts = jnp.stack([book.worst_bad_run, book.unfinite_layer, book.first_bad, book.stepped])
         self.book = book._replace(worst_bad_run=fresh.worst_bad_run, unfinite_layer=fresh.unfinite_layer,
-                                  first_bad=fresh.first_bad, stepped=fresh.stepped)
-        return Streak(counts, jnp.stack([book.bad_loss, book.bad_norm]))
+                                  first_bad=fresh.first_bad, stepped=fresh.stepped, broken=fresh.broken,
+                                  broken_state=fresh.broken_state)
+        return streak_of(book)
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
         """Check the steps since the last check now (`checked_finite`): the loop checks at its logging
         cadence as it reads a log (`Taken`), and this is the check at the end of a run."""
         streak = self.streak()
         if streak is not None:
-            checked_finite(on_host(streak, step), step, display, skips=self.skips_nonfinite)
+            checked_finite(on_host(streak, step), step, display, skips=self.skips_nonfinite,
+                           kept=self.kept_paths)
+
+    def branched(self) -> Interval:
+        """A fresh interval for a branch off the run (a cooldown's), its tokens before its log this one's and
+        its dispatched microbatches this one's, which a sampled pass count draws on from."""
+        return Interval(time.time(), None, tokens_before_log=self.real_tokens, microbatches=self.microbatches)
 
     @classmethod
-    def resumed(cls, control: dict, *, last_saved: int | None, skips_nonfinite: bool = False) -> Interval:
+    def resumed(cls, control: dict, *, last_saved: int | None, skips_nonfinite: bool = False,
+                kept_paths: tuple[str, ...] = ()) -> Interval:
         """An interval from now on, its token clock and its consumed examples read off a checkpoint's
         `control` (`committed_tokens`), which it takes the clocks' fields out of."""
         consumed = int(control.pop(CONSUMED_EXAMPLES, 0))
         committed = int(control.pop(CONSUMED_COMMITTED, consumed))
+        dispatched = control.pop(DISPATCHED_MICROBATCHES, None)
         return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control),
                    resumable=last_saved, consumed=consumed, consumed_before=consumed,
-                   consumed_committed=committed, skips_nonfinite=skips_nonfinite)
+                   consumed_committed=committed, skips_nonfinite=skips_nonfinite, kept_paths=kept_paths,
+                   microbatches=None if dispatched is None else int(dispatched))
 
     def consumption(self, examples: int | None) -> dict[str, float]:
         """The examples a run on the examples clock (bounded to `examples`) has consumed, as its log
@@ -324,11 +367,13 @@ class Interval:
 
     @property
     def token_control(self) -> dict[str, int]:
-        """The clocks a checkpoint keeps (`Checkpoints.control`): the committed updates' real tokens, and
-        the examples consumed where the run counts them."""
+        """The clocks a checkpoint keeps (`Checkpoints.control`): the committed updates' real tokens, the
+        examples consumed where the run counts them, and the microbatches dispatched where it draws a pass
+        count per microbatch."""
         consumed = ({CONSUMED_EXAMPLES: self.consumed, CONSUMED_COMMITTED: self.consumed_committed}
                     if self.consumed else {})
-        return {COMMITTED_TOKENS: self.real_tokens, **consumed}
+        dispatched = {} if self.microbatches is None else {DISPATCHED_MICROBATCHES: self.microbatches}
+        return {COMMITTED_TOKENS: self.real_tokens, **consumed, **dispatched}
 
     @property
     def real_tokens(self) -> int:
@@ -555,7 +600,8 @@ class Taken(NamedTuple):
         # A log read late is done no earlier than the one read before it.
         done = max(done, since or 0.0)
         if read.streak is not None:
-            checked_finite(read.streak, self.step, display, skips=self.interval.skips_nonfinite)
+            checked_finite(read.streak, self.step, display, skips=self.interval.skips_nonfinite,
+                           kept=self.interval.kept_paths)
         return read, done - (self.counts.last_log_time if since is None else since), done
 
 
@@ -598,6 +644,8 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
             scalars['train/grad_norm'] = float(norms / commits)
     scalars['train/compiles'] = float(counts.compiles)
     scalars.update(compilation_cache_counts())
+    if counts.step_misses is not None:
+        scalars['train/step_misses'] = float(counts.step_misses)
     peak = peak_memory_gib()
     if peak is not None:
         scalars['train/peak_memory_gib'] = peak
@@ -699,14 +747,27 @@ def on_host[TreeT](counters: TreeT, step: int) -> TreeT:
                            "at the loss counters that read its loss (jit_bookkeep)") from error
 
 
-def checked_finite(streak: Streak, step: int, display: TrainingDisplay, *, skips: bool) -> None:
+def leaf_paths(tree) -> tuple[str, ...]:
+    """`tree`'s leaves by their paths, in its order, by which a stop names one (`Interval.kept_paths`)."""
+    return tuple(jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(tree))
+
+
+def checked_finite(streak: Streak, step: int, display: TrainingDisplay, *, skips: bool,
+                   kept: Sequence[str] = ()) -> None:
     """Stop the run (RuntimeError) at the first step since the last check, ending at `step`, whose loss or
     gradient norm was not finite, naming it and them, as torchtitan stops: its update was taken as it was
     formed, so the run cannot go on from it, and no save writes it (`refuse_non_finite`). A run that `skips`
     such steps (`Trainer(skip_nonfinite=True)`) stops once BAD_LOSS_STEPS of them come in a row, and notes a
-    shorter run. Checked at the logging cadence so the step loop never synchronises; detection is late by
-    at most that many steps, never missed."""
-    worst, layer, first, stepped = (int(value) for value in streak.counts)
+    shorter run. A step whose committed state holds a value not finite (a scaled step accepted on its
+    finite gradient whose update overflowed it) stops the run whatever it skips, naming the first leaf by
+    its path (`kept`): no back-off of the scale brings it back, and a moment gone to infinity stops its
+    parameter with every later loss and gradient finite (row 6748). Checked at the logging cadence so the
+    step loop never synchronises; detection is late by at most that many steps, never missed."""
+    worst, layer, first, stepped, broken, leaf, leaves = (int(value) for value in streak.counts)
+    if broken:
+        named = kept[leaf] if 0 <= leaf < len(kept) else f"leaf {leaf}"
+        raise RuntimeError(f"step {step - stepped + broken}'s update left {leaves} leaf(s) of its state not "
+                           f"finite, the first {named}: no back-off of the loss scale recovers it: stopping")
     loss, norm = (float(value) for value in streak.values)
     # A step updating in its backward moved the layers its walk reached before a gradient not finite.
     walked = (f"; its backward walk first met a gradient not finite in the scanned slot topped by layer "

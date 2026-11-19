@@ -13,6 +13,7 @@ import importlib.util
 
 import jax
 import pytest
+import tier_wire
 from flax.linen.dtypes import canonicalize_dtype
 
 from dew.nn.kernels import gemm, generation
@@ -21,13 +22,41 @@ INTERPRETS = pytest.mark.skipif(jax.default_backend() != "cpu",
                                 reason="interprets the Mosaic GPU kernels, which a CPU process alone does")
 COMPILES_ON_CPU = pytest.mark.skipif(
     jax.default_backend() != "cpu",
-    reason="reads ptxas's reports of kernels a CPU process compiles for a compile-only device; a GPU "
-           "process's read 0 registers (ET-A05A08-TEST6-h100)")
-"""A mark skipping a resource gate (`kernel_compile.mosaic_failures`) where the process has its own GPU."""
+    reason="compiles kernels ahead for compile-only GPUs, a CPU process's work (bible §8: no GPU is held "
+           "for host compiles), judging each by every CUDA build's ptxas, whose nvcc wheels the CPU "
+           "environment alone installs; a GPU process's Mosaic prints a module's PTX at its first compile "
+           "alone, so the gate's re-run of a module it compiled for its own device reads none (EM-GAC, rows "
+           "7355/7356, 29b3c8921)")
+"""A mark placing a resource gate (`kernel_compile.mosaic_failures`) of kernels compiled ahead for
+compile-only GPUs in a CPU process, where its every build's ptxas is installed and each module's PTX is
+printed for it."""
 SUMS_IN_IEEE = pytest.mark.skipif(
     jax.default_backend() != "cpu",
     reason="compares sums bit for bit as a CPU's IEEE fp32 dots give them, which a GPU's tensor cores, "
            "truncating each add, do not")
+
+
+def here() -> str:
+    """This process's device generation as its kernels run: the node's GPU's in a GPU tier part's prepare
+    (`model_flows.node_target`), whose default device, a compile-only GPU, states no generation of its own,
+    so a cell pinned to the node's generation prepares there as its run runs it (train 1013's review F4);
+    else its device's. The one prepare-aware reading of it: `runnable`, `lowers_as` and every matrix case's
+    pin (a `skipif` its module evaluates at import, rows 7868 and 7886) read it."""
+    if tier_wire.preparing():
+        import model_flows
+
+        return model_flows.node_target().generation
+    return generation.device_generation()
+
+
+
+
+
+def pinned(case_generation: str):
+    """A matrix case's pin (`pytest.param(case, marks=pinned(...))`): its cell skips unless this device's
+    generation (`here`, the node's in a GPU part's prepare) is the case's, `case_generation`."""
+    return pytest.mark.skipif(here() != case_generation,
+                              reason=f"a {case_generation} cell runs on its own device alone")
 
 
 def runnable(name: str) -> bool:
@@ -36,15 +65,15 @@ def runnable(name: str) -> bool:
     generation (capability 9.0 alone has the instructions), and any other generation's only if no newer than
     itself and its block
     holds the shared memory `name`'s launches are sized to (an L4's 99 KiB do not an A100's 163)."""
-    here = generation.device_generation()
-    if not here.startswith("sm") or generation.capability(name) is None:
+    current = here()
+    if not current.startswith("sm") or generation.capability(name) is None:
         # A TPU's launches a CPU interprets, and that TPU runs.
-        return here in ("cpu", name)
+        return current in ("cpu", name)
     if generation.gpu_target(name).wgmma:
-        return name == here
-    return (generation.capability(name) <= generation.capability(here)
+        return name == current
+    return (generation.capability(name) <= generation.capability(current)
             and generation.shared_budget(generation.gpu_target(name))
-            <= generation.shared_budget(generation.gpu_target()))
+            <= generation.shared_budget(generation.gpu_target(current if tier_wire.preparing() else None)))
 
 
 def runs(name: str):
@@ -63,8 +92,8 @@ def lowers_as(name: str) -> bool:
     709ddea7a)."""
     if not runnable(name):
         return False
-    here = generation.device_generation()
-    return here == "cpu" or generation.architecture(name).tma == generation.architecture(here).tma
+    current = here()
+    return current == "cpu" or generation.architecture(name).tma == generation.architecture(current).tma
 
 
 def lowers(name: str):

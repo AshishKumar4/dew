@@ -11,6 +11,7 @@ import numpy as np
 import optax
 import pytest
 from lane_environment import per_test_settings
+from interop_support import extract_fixture
 
 from dew.nn.attention import forward_mode_attention, scaled_dot_product_attention
 from dew.objectives.diffusion.consistency import (
@@ -366,7 +367,6 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     built over the pipeline directly samples by: rCM's own few steps, solver
     and unguided draw, on the pipeline's grid, and its published task draws
     the direct one's images, bit for bit, from the same weights and key."""
-    import tarfile
     from pathlib import Path
 
     from diffusion_support import images_of
@@ -382,8 +382,7 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     from dew.objectives.diffusion.objective import model_part
     from dew.registry import to_record
 
-    with tarfile.open(Path(__file__).resolve().parent / "fixtures" / "flux_source.tar.xz") as archive:
-        archive.extractall(tmp_path, filter="data")
+    extract_fixture(Path(__file__).resolve().parent / "fixtures" / "flux_source.tar.xz", tmp_path)
     pipeline = str(tmp_path / "pipeline")
     objective = DiffusionRunConfig(pretrained=pipeline, preset=Flow(), model=precision(),
                                    data=images_of("tfds://oxford_flowers102", 16),

@@ -6,6 +6,8 @@ import subprocess
 import sys
 from collections.abc import Mapping, MutableMapping
 
+import tier_wire
+
 # Enough simulated devices to exercise a 4x2 data/fsdp mesh. A test marked
 # `mesh` needs this many devices, or its `devices=`; a run with fewer, such
 # as one GPU, reports it as skipped with both counts.
@@ -79,7 +81,16 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
         flags.append("--xla_allow_excess_precision=false")
     local = {"cuda": _local_gpus, "tpu": _local_tpus}
     accelerator = next((name for name in platforms if name in local), None)
-    if accelerator is None:
+    # A GPU tier part's prepare runs on the node's CPU, computing nothing, compiling the run's programs for
+    # its GPUs (`tests/truths_ahead.py`), so under the run's own flags, the cuda lane's, its platform still
+    # the CPU: a program compiled under others is refused where it loads (`dew.training.ahead.BuildTarget.
+    # held`: the prepare's CPU lane's eight devices and scheduler beside the run's deterministic GPU ops
+    # refused test_gpu_numerics' vocabulary cell on a GH200). It sees no GPU (its node hides them,
+    # CUDA_VISIBLE_DEVICES empty), so one host device: a CPU client of none fails to open ("Could not
+    # determine process_index", every GPU part's prepare at main b1f2612c4), and how many its run holds is
+    # no part of what either compiles (`ahead.HOST_FLAGS`).
+    flagged = "cuda" if accelerator is None and tier_wire.preparing(environ) else accelerator
+    if flagged is None:
         cpu_devices = MESH_DEVICES
         # XLA:CPU orders the thunks that hold a collective by when each starts, not when it ends
         # (`Resource::kCollectiveCommunicator`, a scheduling edge), and a while loop's thunk returns
@@ -95,11 +106,11 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
         # release orders CPU collectives by completion.
         flags.append("--xla_cpu_scheduler_type=CPU_SCHEDULER_TYPE_MEMORY_OPTIMIZED")
     else:
-        if accelerator == "cuda":
+        if flagged == "cuda":
             flags.extend(USERS_GPU_FLAGS if environ.get(USERS_ARITHMETIC) == "1" else REPEATABLE_GPU_FLAGS)
         if "cpu" not in platforms:
             environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
-        cpu_devices = local[accelerator](environ)
+        cpu_devices = max(1, local[flagged](environ))
     flags.append(f"--xla_force_host_platform_device_count={cpu_devices}")
     environ["XLA_FLAGS"] = " ".join(flags).strip()
     # XLA:CPU runs every device of a launch on one pool of max(cores,

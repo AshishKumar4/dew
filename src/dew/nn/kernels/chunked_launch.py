@@ -373,8 +373,10 @@ class Forked:
     first slot (`firsts` `[B, D]`, `S` past a row's last), the table slot it enters and the stored slot it
     leaves its final in (`loads`, `stores` `[B, D]`), the stored slots' count (`held`), its entry write,
     where the call gives one (`entry`, its `[B, D, Hv, Dk, Dv]` never formed: each walk forms a chunk's
-    own), and the second slot each document adds to the one it enters, where the call gives them (`adds`
-    `[B, D]`, `Chunk.adds`)."""
+    own), the second slot each document adds to the one it enters, where the call gives them (`adds` `[B, D]`,
+    `Chunk.adds`), and where a turned call gives it, the rotation `(cos, sin)` `[B, D, Hv, A]` each document
+    turns the memory it takes up by as its walk loads it, its first `A` key pairs (`turning`,
+    `templates.recurrence.turned`: minus the document's own turns)."""
 
     firsts: jax.Array
     loads: jax.Array
@@ -382,6 +384,7 @@ class Forked:
     entry: tuple | None
     held: int = dataclasses.field(metadata={'static': True})
     adds: jax.Array | None = None
+    turning: tuple | None = None
 
     @classmethod
     def of(cls, operands, starts, firsts, work) -> "Forked":
@@ -402,15 +405,28 @@ class Forked:
 
     @property
     def walked(self) -> tuple:
-        """The operands a walk takes beside the call's (`carrying`): the documents' slots, their added slots
-        and entry write."""
-        return (self.firsts, self.loads, self.stores, *(() if self.adds is None else (self.adds,)),
-                *(() if self.entry is None else self.entry))
+        """The operands a walk takes beside the call's (`carrying`, `specs`): its arrays in their fields'
+        order, the documents' slots, entry write, added slots and load rotation."""
+        return tuple(jax.tree.leaves(self))
 
-    def carrying(self, firsts, loads, stores, *rest) -> "Forked":
+    def carrying(self, *walked) -> "Forked":
         """This call's documents from the operands a product's walk was handed (`walked`)."""
-        adds, entry = (rest[0], rest[1:]) if self.adds is not None else (None, rest)
-        return Forked(firsts, loads, stores, entry or None, self.held, adds)
+        return jax.tree.unflatten(jax.tree.structure(self), walked)
+
+    def specs(self, rows, heads) -> tuple:
+        """`walked`'s placements on a launch's shard map (`manual_map`), in its order, over the mesh axes that
+        split the call's `rows` and value `heads`: the documents' slots and their added slots a row's, the
+        entry write's keys and values `[B, D, R, H, .]` and weights `[B, D, H]` their rows' and heads', and a
+        turned call's load rotation `[B, D, H, A]` its rows' and heads'. Each field's own: a field without one
+        raises, so no launch's specs fall out of step with its operands (row 7973: a launch's copy of this
+        order took the load rotation's none)."""
+        P = jax.sharding.PartitionSpec
+        placed = {'firsts': P(rows, None), 'loads': P(rows, None), 'stores': P(rows, None),
+                  'adds': P(rows, None),
+                  'entry': (P(rows, None, None, heads, None),) * 2 + (P(rows, None, heads),),
+                  'turning': (P(rows, None, heads, None),) * 2}
+        return tuple(placed[path[0].name] if len(path) == 1 else placed[path[0].name][path[1].idx]
+                     for path, _ in jax.tree_util.tree_flatten_with_path(self)[0])
 
     def tokens(self, length: int) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Each of a call's `length` tokens' part in its walk, `[B, S]` int each, the documents walked in
@@ -545,6 +561,15 @@ class ForkedChunks:
                          row.shape[0] - 1)
         return cls(loads, stores, taken, row[owner])
 
+    def turning(self, forked: Forked):
+        """Each chunk's load rotation (`Forked.turning`), the document it takes up's, a unit turn for none:
+        `(cos, sin)` `[NC, Hv, A]`; None where the call gives none."""
+        if forked.turning is None:
+            return None
+        live = (self.taken >= 0)[:, None, None]
+        taken = jnp.maximum(self.taken, 0)
+        cos, sin = (part.reshape(-1, *part.shape[2:])[taken] for part in forked.turning)
+        return jnp.where(live, cos, 1.0), jnp.where(live, sin, 0.0)
     def added(self, forked: Forked) -> jax.Array | None:
         """Each chunk's added slot (`recurrence_chunk.Chunk.adds`), the document it takes up's, zero for none:
         `[NC]`; None where the call adds none."""

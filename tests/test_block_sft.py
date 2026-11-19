@@ -677,13 +677,13 @@ def test_a_canvas_rows_context_reads_an_id_its_vocabulary_also_pads_with(source)
 
 def merged(passes):
     """The union by module path of several passes' `qk` trees, in NumPy: a path more than one pass sowed
-    keeps the elementwise maximum of its sown values, and a path one pass sowed keeps what it sowed."""
-    found = {}
+    holds each pass's calls after the last's, which the clip reads at their largest (row 7909), and a path
+    one pass sowed holds what it sowed."""
+    found: dict[tuple, tuple] = {}
     for tree in passes:
         for path, sown in flatten_dict(tree).items():
-            found.setdefault(path, []).append(sown)
-    return unflatten_dict({path: tuple(np.max(np.stack(column), axis=0) for column in zip(*sown, strict=True))
-                           for path, sown in found.items()})
+            found[path] = (*found.get(path, ()), *(np.asarray(call) for call in sown))
+    return unflatten_dict(found)
 
 
 def peaks(tree):
@@ -734,8 +734,9 @@ def sown_passes(obj, variables, batch, step):
 
 def test_the_block_objective_observes_the_maxima_of_its_three_passes(source):
     """The fixture's model norms its queries and keys, so QK-Clip refuses it at any threshold (`dew.optim`).
-    What the objective owes a clipping step is the observation: `Aux.qk_stats` merges the passes' own maxima
-    by module path, which the same draws give when those passes are called directly."""
+    What the objective owes a clipping step is the observation: `Aux.qk_stats` holds the passes' own maxima
+    by module path, each pass's call after the last's, which the same draws give when those passes are
+    called directly."""
     loaded, batch, step, _ = source
     obj = objective(loaded)
     variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))

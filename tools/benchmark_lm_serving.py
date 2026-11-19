@@ -41,7 +41,6 @@ import platform
 import pstats
 import sys
 import time
-import uuid
 from pathlib import Path
 
 import numpy as np
@@ -205,6 +204,7 @@ def dew_points(args):
 
     import dew
     from dew.inference.serving import Server
+    from dew.inference.tasks import TextGeneration
     from dew.nn.kv_cache import KVCache
     from dew.sampling import Sampling
     from dew.telemetry.compiles import Compiles
@@ -213,6 +213,8 @@ def dew_points(args):
     began = time.perf_counter()
     mesh = None if args.mesh is None else MeshSpec(**args.mesh)
     task = dew.pipeline(args.model, mesh=mesh, dtype="bfloat16", param_dtype="bfloat16")
+    if not isinstance(task, TextGeneration):
+        raise ValueError(f"{args.model} loads a {type(task).__name__}, not a text generation it serves")
     task = dataclasses.replace(task, sampling=Sampling(temperature=0, eos_token_ids=None),
                                logits=None, stopping=())
     if args.vocab_limit > task.model.vocab_size:
@@ -228,7 +230,7 @@ def dew_points(args):
                 "load_seconds": load_seconds,
                 "weights": {"split_over": sorted(split),
                             "devices": len({device for sharding in shardings for device in sharding.device_set})}}
-    layout = KVCache(page_size=16 if args.kv == "paged" else None)
+    layout = KVCache(page_size=args.page_size if args.kv == "paged" else None)
     points = []
     for slots in args.slots:
         count = args.requests or max(64, 2 * slots)
@@ -302,7 +304,7 @@ async def async_open(slots, prompts, output, rate, streamed):
     began = time.perf_counter()
 
     async def arrive(index):
-        await asyncio.sleep(max(0.0, began + arrivals[index] - time.perf_counter()))
+        await asyncio.sleep(max(0.0, began + float(arrivals[index]) - time.perf_counter()))
         stamps = await streamed(prompts[index], output)
         assert len(stamps) == output, (len(stamps), output)
         return stamps[0] - (began + arrivals[index]), np.diff(stamps)
@@ -358,7 +360,7 @@ def closed_loop(streamed):
     return request
 
 
-def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, object]:
+def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, int | bool]:
     """vLLM's engine flags for a `--mesh` of 'tensor' and 'expert' sizes: tensor parallelism over
     their product, its experts split over those ranks where 'expert' is above 1
     (`enable_expert_parallel`), vLLM's one engine's way to spread an MoE's experts over GPUs."""
@@ -370,35 +372,17 @@ def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, object]:
     return {"tensor_parallel_size": mesh.get("tensor", 1) * expert, "enable_expert_parallel": expert > 1}
 
 
-async def engine_points(args):
-    """The same scheduler/stream clocks, without HTTP serialization. Output stays token ids, not text, as
-    Dew's and SGLang's do (`detokenize=False`). An engine over several GPUs starts its workers by
-    spawning them, as vLLM advises once the parent has touched CUDA, which forked workers cannot
-    initialize again."""
-    parallelism = vllm_parallelism(args.mesh)
-    if parallelism.get("tensor_parallel_size", 1) > 1:
-        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    from vllm import SamplingParams
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.inputs import TokensPrompt
-    from vllm.v1.engine.async_llm import AsyncLLM
+async def stamped(stream, produced) -> list[float]:
+    """The time each of a request's tokens reached the client, from an in-process engine's stream of its
+    growing output, `produced(chunk)` the tokens each chunk holds so far."""
+    stamps: list[float] = []
+    async for chunk in stream:
+        stamps.extend([time.perf_counter()] * (produced(chunk) - len(stamps)))
+    return stamps
 
-    engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
-        model=args.model, dtype="bfloat16", max_model_len=args.prompt + args.output,
-        max_num_seqs=max(args.slots), gpu_memory_utilization=0.90,
-        generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True, **parallelism))
 
-    async def streamed(prompt, output):
-        """The time each of a request's tokens reached the client."""
-        policy = SamplingParams(temperature=0, top_p=1, top_k=-1, min_p=0, repetition_penalty=1,
-                                max_tokens=output, ignore_eos=True, detokenize=False)
-        stamps: list[float] = []
-        async for result in engine.generate(TokensPrompt(prompt_token_ids=prompt.tolist()), policy,
-                                            uuid.uuid4().hex):
-            arrived = len(result.outputs[0].token_ids) - len(stamps)
-            stamps.extend([time.perf_counter()] * arrived)
-        return stamps
-
+async def engine_sweep(args, streamed, engine):
+    """An in-process engine's points over its requests (`streamed`), the engine shut down after."""
     try:
         points = await async_sweep(args, closed_loop(streamed), streamed)
     finally:
@@ -406,30 +390,16 @@ async def engine_points(args):
     return {"label": args.hardware}, points
 
 
-async def sglang_points(args):
-    """SGLang's engine in-process, on the same clocks as vllm-engine, its output token ids."""
-    import sglang
-
-    engine = sglang.Engine(model_path=args.model, dtype="bfloat16", context_length=args.prompt + args.output,
-                           max_running_requests=max(args.slots), mem_fraction_static=0.90,
-                           disable_radix_cache=True, skip_tokenizer_init=True, log_level="error")
-    policy = {"temperature": 0, "top_p": 1, "top_k": -1, "min_p": 0, "repetition_penalty": 1,
-              "ignore_eos": True}
-
-    async def streamed(prompt, output):
-        """The time each of a request's tokens reached the client, from SGLang's stream of growing output."""
-        stamps: list[float] = []
-        async for chunk in await engine.async_generate(input_ids=prompt.tolist(), stream=True,
-                                                       sampling_params={**policy, "max_new_tokens": output}):
-            arrived = chunk["meta_info"]["completion_tokens"] - len(stamps)
-            stamps.extend([time.perf_counter()] * arrived)
-        return stamps
-
-    try:
-        points = await async_sweep(args, closed_loop(streamed), streamed)
-    finally:
-        engine.shutdown()
-    return {"label": args.hardware}, points
+def engine_of(backend: str):
+    """`backend`'s points over its engine, each in-process engine's in a module of its own
+    (`serving_vllm_engine`, `serving_sglang_engine`), whose interpreter alone has its engine."""
+    if backend == "vllm":
+        return vllm_points
+    if backend == "vllm-engine":
+        from serving_vllm_engine import engine_points
+        return engine_points
+    from serving_sglang_engine import sglang_points
+    return sglang_points
 
 
 def main():
@@ -445,10 +415,15 @@ def main():
     parser.add_argument("--vocab-limit", type=int, default=150_000)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--admission", type=int, default=0)
-    parser.add_argument("--decode-steps", type=int, default=1)
-    parser.add_argument("--kv", choices=("dense", "paged"), default="dense")
+    parser.add_argument("--decode-steps", type=int, default=None,
+                        help="Dew: the decode iterations a device call runs (1)")
+    parser.add_argument("--kv", choices=("dense", "paged"), default=None,
+                        help="Dew: the server's cache (dense)")
+    parser.add_argument("--page-size", type=int, default=None,
+                        help="Dew: a paged cache's slots a page (--kv paged; 16)")
     parser.add_argument("--mesh", type=json.loads, default=None,
-                        help='Dew: the weights placed on a mesh of these MeshSpec fields ({"tensor": 2})')
+                        help='Dew: the weights placed on a mesh of these MeshSpec fields ({"tensor": 2}); '
+                             "vllm-engine: its tensor and expert parallelism")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-steps", type=int, default=20)
     parser.add_argument("--generations", action="store_true")
@@ -462,6 +437,14 @@ def main():
     args.rate = [float(value) for value in args.rate.split(",") if value]
     if args.rate and args.backend == "vllm":
         parser.error("--rate runs Dew and the in-process engines")
+    # Dew's server's own settings, which every other backend's engine runs its own of.
+    stated = [flag for flag, value in (("--decode-steps", args.decode_steps), ("--kv", args.kv),
+                                       ("--page-size", args.page_size)) if value is not None]
+    if stated and args.backend != "dew":
+        parser.error(f"{', '.join(stated)} set Dew's server; {args.backend} runs its own cache and steps")
+    args.decode_steps = 1 if args.decode_steps is None else args.decode_steps
+    args.kv = "dense" if args.kv is None else args.kv
+    args.page_size = 16 if args.page_size is None else args.page_size
     if args.mesh is not None and args.backend not in ("dew", "vllm-engine"):
         parser.error("--mesh places Dew's weights, or sets vllm-engine's parallelism; a vLLM server "
                      "takes its own flags")
@@ -485,17 +468,24 @@ def main():
     peaks = ([peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", str(index)])
               for index in range(len(args.slots))]
              if args.backend == "dew" and peak_memory.keeps_high_water() else None)
-    engines = {"vllm": vllm_points, "vllm-engine": engine_points, "sglang-engine": sglang_points}
-    hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(engines[args.backend](args))
+    hardware, points = (dew_points(args) if args.backend == "dew"
+                        else asyncio.run(engine_of(args.backend)(args)))
     if args.backend == "dew":
         for point, peak in zip(points, peaks or [[None]] * len(points), strict=True):
-            point["peak_device_bytes"] = None if None in peak else max(peak)
+            kept = [held for held in peak if held is not None]
+            point["peak_device_bytes"] = max(kept) if kept and len(kept) == len(peak) else None
+    # Each setting recorded where its backend applies it: Dew's server's steps, cache and pages, which every
+    # other engine runs its own of, and the mesh, which places Dew's weights or sets vllm-engine's
+    # parallelism (`vllm_parallelism`).
+    served = ({"decode_steps": args.decode_steps, "kv": args.kv,
+               **({"page_size": args.page_size} if args.kv == "paged" else {})}
+              if args.backend == "dew" else {})
+    served |= {"mesh": args.mesh} if args.backend in ("dew", "vllm-engine") else {}
     record = {"backend": args.backend, "model": args.model, "hardware": hardware,
               "prompt": args.prompt, "output": args.output, "vocab_limit": args.vocab_limit,
               "sampling": {"temperature": 0, "ignore_eos": True}, "warm_output": args.output,
               "transport": "HTTP streaming" if args.backend == "vllm" else "in-process",
-              "decode_steps": args.decode_steps, "kv": args.kv, "mesh": args.mesh,
-              "host": platform.processor(), "sweep": points}
+              **served, "host": platform.processor(), "sweep": points}
     args.out.write_text(json.dumps(record, indent=2) + "\n")
 
 

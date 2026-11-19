@@ -98,8 +98,8 @@ def audit_template(name: str, end_token: str | None) -> dict:
 
     tokenizer = load_tokenizer(name)
     end = tokenizer.convert_tokens_to_ids(end_token) if end_token else tokenizer.eos_token_id
-    if end is None:
-        raise ValueError("the tokenizer names no EOS; pass --end-token")
+    if not isinstance(end, int):
+        raise ValueError(f"the tokenizer names no one end token ({end!r}); pass --end-token")
     cases = [template_case(tokenizer, end, role, reasoning=reasoning)
              for role in ("tool", "user") for reasoning in (False, True)]
     cases += [template_case(tokenizer, end, "tool", reasoning=reasoning, **{variant: True})
@@ -144,7 +144,7 @@ def audit_sessions(lines: Sequence[str]) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     template = commands.add_parser("template", help="render a tool episode with a chat template")
     template.add_argument("--tokenizer", required=True, help="Hugging Face tokenizer name or directory")

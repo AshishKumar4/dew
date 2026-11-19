@@ -1,5 +1,5 @@
-"""The XLA options a program compiles with, by the models it runs and the device it runs on, and the
-one place a program over them is compiled (`program`).
+"""The XLA options a program compiles with, and the one place a program over a run's models is compiled
+(`program`).
 
 `dew.nn.kernels.generation` stays free of Dew's imports, since benchmark
 environments load its target table without Dew or JAX; this reads its
@@ -17,11 +17,12 @@ import hashlib
 import json
 import logging
 import threading
+import time
 import types
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, TypedDict, Unpack
 
 import jax
 import numpy as np
@@ -29,74 +30,17 @@ from jax._src import api_util, config as jax_config, core as jax_core
 from jax._src.array import ArrayImpl
 from jax._src.interpreters import pxla
 from jax.experimental.layout import Format
-from jax.sharding import Sharding
+from jax.sharding import AbstractMesh, NamedSharding, Sharding
 
 from dew import _cache, _stated, algebra
 from dew._devices import xla_flag
 from dew._stated import Unestablished
-from dew.nn.kernels.generation import backend, gpu_target, stated, traced_fact
+from dew.nn.kernels.generation import stated, traced_fact
 from dew.nn.nested import staged
 from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
-    from flax import linen as nn
-
-
-class QuantizedDtypes(Protocol):
-    """What the options read of a run's quantization (`dew.quantization.Quantization`, above the kernels):
-    the dtypes its forward and backward quantize to."""
-
-    @property
-    def dtype(self) -> str: ...
-
-    @property
-    def bwd_qtype(self) -> str | None: ...
-
-
-@runtime_checkable
-class Quantized(Protocol):
-    """A model class that carries a run's quantization (`dew.quantization.QuantizedClass`), as the options
-    read it: its two dtypes."""
-
-    _dew_quantization: ClassVar[QuantizedDtypes]
-
-
-type Held = nn.Module | DataclassInstance | Mapping[str, Held] | tuple[Held, ...] | list[Held] | None
-"""What a program runs that may hold a quantized tower (`quantizations`): a model, a record of one (a
-condition's encoder), or a mapping or sequence of them; anything else a record holds is passed over."""
-
-
-def quantizations(*models: Held) -> list[QuantizedDtypes]:
-    """The quantization every model class among `models` carries (`Quantized`), and every tower they
-    hold: each module a model, a task's encoder or any record it is handed holds in its fields,
-    a tuple's or a mapping's entries, at any depth, so a quantized text encoder inside a condition's
-    encoder counts as the denoiser beside it does. Arrays and their trees are not walked."""
-    found: list[QuantizedDtypes] = []
-    # Each object visited, held until the walk ends: a mapping's values may be made as they are read
-    # (a FrozenDict's nested ones), and a freed one's id could name a later, unvisited value.
-    seen: dict[int, Held] = {}
-
-    def walk(value: Held) -> None:
-        if id(value) in seen or isinstance(value, (jax.Array, np.ndarray, str, bytes, int, float, type)):
-            return
-        seen[id(value)] = value
-        if isinstance(value, Quantized):
-            found.append(type(value)._dew_quantization)
-        if isinstance(value, Mapping):
-            for entry in value.values():
-                walk(entry)
-        elif isinstance(value, (tuple, list)):
-            for entry in value:
-                walk(entry)
-        elif dataclasses.is_dataclass(value):
-            for field in dataclasses.fields(value):
-                if field.name not in ("parent", "name"):
-                    walk(getattr(value, field.name, None))
-
-    for model in models:
-        walk(model)
-    return found
 
 
 type Option = bool | int | str
@@ -123,26 +67,14 @@ def compiled_with(options: Mapping[str, Option]) -> Iterator[None]:
         _COMPILED_WITH.reset(token)
 
 
-def compiler_options(*models: Held) -> dict[str, Option]:
-    """The XLA options a program that runs `models` compiles with on the default device, for its
-    `jax.jit(..., compiler_options=)`. Every program Dew compiles over a task's model,
-    autoencoder or encoders, or over an objective's modules, takes them, for every tower they hold
-    (`quantizations`). JAX takes compiler options on a program's outermost jit alone, so a module's
-    own jitted method runs under the options of the program that calls it.
-
-    XLA's Triton GEMM fusion computes some int8 dots as two or four times their product
-    (openxla/xla#51016), silently, on every GPU measured (`GpuTarget.int8_triton_gemm`). A program
-    that runs a model quantized to int8, forward or backward, therefore compiles its GEMMs on
-    cuBLAS. With CUDA 13, cuBLAS refuses some int8 shapes (on an A100 a contraction of 16 or 48),
-    and then the program does not compile rather than compute wrong. A run that sets
-    `xla_gpu_enable_triton_gemm` in XLA_FLAGS keeps its own setting. The options `compiled_with`
-    holds open join them.
-    """
-    int8 = any("int8" in (spec.dtype, spec.bwd_qtype) for spec in quantizations(*models))
+def compiler_options() -> dict[str, Option]:
+    """The XLA options a program Dew compiles takes beyond its target's (`report.targeted`, where a GEMM's
+    backend is chosen from the program's own dots and the device it compiles for), for its
+    `jax.jit(..., compiler_options=)`: those `compiled_with` holds open, each but those the run's
+    XLA_FLAGS sets itself. JAX takes compiler options on a program's outermost jit alone, so a module's
+    own jitted method runs under the options of the program that calls it. It reads no device: a process
+    may form a program's options before it joins its peers (`jax.distributed.initialize`)."""
     options: dict[str, Option] = {}
-    if (int8 and backend() == "gpu" and not gpu_target().int8_triton_gemm
-            and xla_flag("xla_gpu_enable_triton_gemm") is None):
-        options["xla_gpu_enable_triton_gemm"] = False
     for opened in _COMPILED_WITH.get():
         options.update({name: value for name, value in opened.items() if xla_flag(name) is None})
     return options
@@ -332,7 +264,7 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     def attempted() -> None:
         attempt.set_running_or_notify_cancel()
         try:
-            attempt.set_result(context.run(report.attempted, lowered, None))
+            attempt.set_result(context.run(report.attempted, lowered, None, background=True))
         except BaseException as error:
             # Its reader raises it (`attempting`).
             attempt.set_exception(error)
@@ -365,6 +297,34 @@ def attempting(begun: Compiling | None) -> Iterator[None]:
 
 _COLLECTED: contextvars.ContextVar[dict[str, jax.stages.Compiled] | None] = _cache.untraced(
     contextvars.ContextVar("dew_collected_programs", default=None))
+
+
+class Spent(NamedTuple):
+    """One compile through Dew's compile point within `spending`: its program (`OuterProgram.called`), the
+    platform it compiled for, and its seconds tracing and lowering, and compiling (the backend's, or a
+    read of JAX's persistent cache)."""
+
+    program: str
+    platform: str
+    lowered: float
+    compiled: float
+
+
+_SPENT: contextvars.ContextVar[list[Spent] | None] = _cache.untraced(
+    contextvars.ContextVar("dew_spent_compiles", default=None))
+
+
+@contextlib.contextmanager
+def spending() -> Iterator[list[Spent]]:
+    """Within the block, each compile through Dew's compile point (`OuterProgram.compiled`) is told to the
+    list it yields (`Spent`): what a run's startup compiled, by backend
+    (`dew.training.compiler.HostStartup`)."""
+    spent: list[Spent] = []
+    token = _SPENT.set(spent)
+    try:
+        yield spent
+    finally:
+        _SPENT.reset(token)
 
 
 def shapes_of(tree):
@@ -417,6 +377,57 @@ def collecting() -> Iterator[dict[str, jax.stages.Compiled]]:
         yield collected
     finally:
         _COLLECTED.reset(token)
+
+
+_LOWERING: contextvars.ContextVar[tuple[tuple[str, ...], list[tuple[str, jax.stages.Lowered]]] | None] = (
+    _cache.untraced(contextvars.ContextVar("dew_lowering_programs", default=None)))
+
+
+@contextlib.contextmanager
+def lowering(platforms: tuple[str, ...]) -> Iterator[list[tuple[str, jax.stages.Lowered]]]:
+    """Within the block, a call of a program through Dew's compile point (`OuterProgram`) traces and lowers
+    it over its arguments, shapes where a caller hands shapes, and answers with its results' shapes, as a
+    call within `collecting` does, compiling and running nothing: one whose arguments sit on an abstract
+    mesh (the devices of a target this host is not, `generation.gpu_mesh`) lowers for `platforms`, any
+    other for its own devices' backend. The list it yields holds each lowering, in the order of the calls,
+    with its program's name (`OuterProgram.called`): a step lowered for another target whose programs are
+    several (a host step's, `Trainer(lower_for=)`)."""
+    lowered: list[tuple[str, jax.stages.Lowered]] = []
+    token = _LOWERING.set((platforms, lowered))
+    try:
+        yield lowered
+    finally:
+        _LOWERING.reset(token)
+
+
+type Around = Callable[["OuterProgram", jax.stages.Compiled, tuple, dict], contextlib.AbstractContextManager]
+"""What `running` runs each call's executable inside: given its program, the executable and the call's
+arguments (its static ones among them), a context."""
+
+_RUNNING: contextvars.ContextVar[tuple[Around, ...]] = _cache.untraced(
+    contextvars.ContextVar("dew_running_programs", default=()))
+
+
+@contextlib.contextmanager
+def running(around: Around) -> Iterator[None]:
+    """Within the block, each executable a call through Dew's compile point runs over arrays (one its
+    program keeps, one compiled over shapes, one taken, or one compiled at the call) runs inside
+    `around(program, executable, args, kwargs)`, and inside every enclosing block's, the outermost first: an
+    admission that refuses it by raising as it enters (a host run's rollout's, `dew.training.rollout
+    .admitted`), or a profiled trial's record of what it ran (`dew.training.planning.Trials
+    .profiled_programs`). Nothing else of the call changes, and a call within `lowering`, which runs
+    nothing, enters none."""
+    token = _RUNNING.set((*_RUNNING.get(), around))
+    try:
+        yield
+    finally:
+        _RUNNING.reset(token)
+
+
+def _abstractly_placed(tree) -> bool:
+    """Whether a leaf of `tree` sits on an abstract mesh: a target's devices this process holds none of."""
+    return any(isinstance(getattr(leaf, "sharding", None), NamedSharding)
+               and isinstance(leaf.sharding.mesh, AbstractMesh) for leaf in jax.tree.leaves(tree))
 
 
 type Relowered = list[tuple[jax.stages.Wrapped, jax.stages.Lowered]]
@@ -578,6 +589,17 @@ class OuterProgram:
         # Each compiled executable by its key, read without the lock: a call of a signature compiled before
         # costs its key and one lookup (row 3326).
         self._ready: dict[Hashable, jax.stages.Compiled] = {}
+        # Each executable compiled within `collecting` over shapes (or arrays) by the call's abstract
+        # signature (`abstract_of`: shapes, dtypes, weak types, shardings, layouts and the static arguments),
+        # which a later call over arrays alike in it runs, tracing nothing (`_shaped_for`): a run's startup
+        # compiles a host step's programs over its state's shapes, and its steps run them (a host step
+        # compiled ahead, `dew.training.compiler`). A call whose arrays differ in any of it (a sharding the
+        # shapes did not state) misses and traces; it never runs another program's executable. An entry
+        # leaves on its first use for `_ready`, under that call's key, and `CACHED` bounds the two together.
+        # Each with the digest a collection holds it by (`collecting`; None for a program none can state),
+        # which every collection that meets it again records (`__call__`).
+        self._shaped: collections.OrderedDict[Hashable, tuple[jax.stages.Compiled, str | None]] = (
+            collections.OrderedDict())
         self._compiling = threading.Lock()
         _PROGRAMS.add(self)
 
@@ -586,6 +608,7 @@ class OuterProgram:
         with self._compiling:
             self._ready.clear()
             self._executables.clear()
+            self._shaped.clear()
 
     def _jitted(self) -> jax.stages.Wrapped:
         """Its jit, of a callable of its own, past JAX's trace cache (a relowering's, `compiled`)."""
@@ -646,13 +669,78 @@ class OuterProgram:
             return self._nested[_PASSING.get()](*args, **kwargs)
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
             return self._eager(*args, **kwargs)
-        if _COLLECTED.get() is not None:
-            return shapes_of(self.compiled(*args, **kwargs).out_info)
+        if (lowering := _LOWERING.get()) is not None:
+            platforms, lowerings = lowering
+            traced = self.trace(*args, **kwargs)
+            target = platforms if _abstractly_placed((args, kwargs)) else None
+            lowered = traced.lower(lowering_platforms=target)
+            lowerings.append((self.called, lowered))
+            return jax.tree.map(
+                lambda shape, aval: jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=shape.sharding,
+                                                         weak_type=aval.weak_type),
+                shapes_of(lowered.out_info), traced.out_avals)
+        if (collected := _COLLECTED.get()) is not None:
+            abstract = self.abstract_of(args, kwargs)
+            with self._compiling:
+                held = self._shaped.get(abstract)
+            # Compiled once over these shapes: a pass over shapes again (a host step's next step's, whose
+            # state its first returned; another collection's in this process) takes the one it holds, and
+            # its collection records it as the compile recorded it in the first.
+            if held is None:
+                held = self._compiled_digested(*args, **kwargs)
+                with self._compiling:
+                    self._shaped[abstract] = held
+                    self._bounded()
+            executable, digest = held
+            if digest is not None:
+                collected[digest] = executable
+            # Each result with its weak type, which an executable's `out_info` drops and its results over
+            # arrays keep (its trace's, JAX's trace cache holding it): a later call over them keys by it.
+            return jax.tree.map(
+                lambda shape, aval: jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=shape.sharding,
+                                                         weak_type=aval.weak_type),
+                shapes_of(executable.out_info), self.trace(*args, **kwargs).out_avals)
         key, dynamic, named = self.key_of(args, kwargs)
         if (together := _TOGETHER.get()) is not None:
             return self._together(together, key, args, kwargs)
         ready = self._ready.get(key)
-        return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
+        if ready is None:
+            ready = self._shaped_for(key, args, kwargs) or self._kept(key, args, kwargs)
+        if not (arounds := _RUNNING.get()):
+            return ready(*dynamic, **named)
+        with contextlib.ExitStack() as stack:
+            for around in arounds:
+                stack.enter_context(around(self, ready, args, kwargs))
+            return ready(*dynamic, **named)
+
+    def _shaped_for(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
+        """The executable a compile within `collecting` made for a call alike in its abstract signature
+        (`_shaped`), kept from here on under this call's `key` and run, tracing nothing; None where none
+        was made."""
+        if not self._shaped:
+            return None
+        abstract = self.abstract_of(args, kwargs)
+        with self._compiling:
+            held = self._shaped.pop(abstract, None)
+            if held is None:
+                return None
+            executable = held[0]
+            settled: Future[jax.stages.Compiled] = Future()
+            settled.set_result(executable)
+            self._executables[key] = settled
+            self._ready[key] = executable
+            self._bounded()
+        return executable
+
+    def _bounded(self) -> None:
+        """Hold no more than `CACHED` executables, kept (`_executables`) and compiled over shapes
+        (`_shaped`) together: the least recently made over shapes go first, then the least recently used
+        kept. Called with `_compiling` held."""
+        while len(self._executables) + len(self._shaped) > self.CACHED:
+            if self._shaped:
+                self._shaped.popitem(last=False)
+            else:
+                self._ready.pop(self._executables.popitem(last=False)[0], None)
 
     @property
     def options(self) -> jax.stages.CompilerOptions | None:
@@ -678,16 +766,18 @@ class OuterProgram:
 
     def _reserved(self, key: Hashable) -> tuple[Future[jax.stages.Compiled], bool]:
         """The compile kept under `key` and whether this caller owns it: a future its owner settles
-        (`_keep`, `_released`), reserved where none is, the least recently used key's evicted past
-        `CACHED`; the map alone held, so calls of other keys compile at once."""
+        (`_keep`, `_released`), reserved where none is, the bound `CACHED` held over everything it keeps
+        (`_bounded`); the map alone held, so calls of other keys compile at once."""
         with self._compiling:
             pending = self._executables.get(key)
             owner = pending is None
             if owner:
                 pending = self._executables[key] = Future()
-                if len(self._executables) > self.CACHED:
-                    self._ready.pop(self._executables.popitem(last=False)[0], None)
             self._executables.move_to_end(key)
+            if owner:
+                # One bound over every executable it holds, kept and compiled over shapes (`_bounded`):
+                # this key, the most recently used, is never the one it lets go.
+                self._bounded()
         return pending, owner
 
     def _kept(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled:
@@ -700,6 +790,20 @@ class OuterProgram:
             except BaseException as error:
                 self._released(key, pending, error)
         return pending.result()
+
+    def _lowered_aside(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
+        """The call's program lowered, its launches certified aside while it traces
+        (`report.certifying_aside`), and lowered afresh (`_relowered`) for as long as a certification
+        refuses, each refused launch's derivation stepping past its config and certifying the next in
+        turn."""
+        from dew.nn.kernels.templates import report
+
+        with report.certifying_aside() as aside:
+            lowered = self.lower(*args, **kwargs)
+        while report.settled_aside(aside):
+            with report.certifying_aside() as aside:
+                lowered = self._relowered(args, kwargs, relowered)
+        return lowered
 
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
         """A call's program traced afresh past a spill's refused config (`report.compiled`'s `relower`), on
@@ -744,6 +848,45 @@ class OuterProgram:
             if key in self._executables:
                 self._ready[key] = executable
 
+    def keeps(self) -> bool:
+        """Whether it keeps an executable a call over arrays runs (one compiled at a call, or taken from a
+        compile over shapes at one): none before its first call and once released (`released`). It says that
+        one is kept, not that it is the one a call over given arguments runs: a caller reads it of a program
+        called over one shape alone (a kept start's, `dew.training.distributed.start_compiling`)."""
+        with self._compiling:
+            return bool(self._ready)
+
+    def guided(self, executable: jax.stages.Compiled, replacement: jax.stages.Compiled) -> None:
+        """`executable`, one this program holds, replaced by `replacement`, its compile again guided by a
+        profile of its runs (AutoPGLE's, `dew.training.planning.guided_compile`), wherever the program holds
+        it (kept, ready to run, or compiled over shapes) under the same key: its calls run the guided one
+        from here on. A replacement of other inputs' or outputs' types, placements or layouts, leaf by leaf,
+        is refused, as a guided compile is the same program. A collection (`collecting`) holding `executable`
+        by its digest keeps it."""
+        # Their leaves: a tree's static data may hold a closure each trace makes anew (a forward's pullback,
+        # `jax.vjp`'s), the same function of another object.
+        def stated(compiled):
+            return {name: jax.tree.leaves(tree) for name, tree in (
+                ("inputs", compiled.in_avals), ("input formats", compiled.input_formats),
+                ("outputs", compiled.out_info), ("output formats", compiled.output_formats))}
+        differs = {name: (held, guided) for (name, held), guided in zip(
+            stated(executable).items(), stated(replacement).values(), strict=True) if held != guided}
+        if differs:
+            raise ValueError(f"{self.called}'s guided compile states other {', '.join(differs)} than the "
+                             f"executable it replaces: {differs}")
+        with self._compiling:
+            for key, pending in list(self._executables.items()):
+                if pending.done() and pending.exception() is None and pending.result() is executable:
+                    settled: Future[jax.stages.Compiled] = Future()
+                    settled.set_result(replacement)
+                    self._executables[key] = settled
+            for key, ready in list(self._ready.items()):
+                if ready is executable:
+                    self._ready[key] = replacement
+            for abstract, (shaped, digest) in list(self._shaped.items()):
+                if shaped is executable:
+                    self._shaped[abstract] = (replacement, digest)
+
     def _released(self, key: Hashable, pending: Future[jax.stages.Compiled], failure: BaseException) -> None:
         """Fail the compile reserved under `key` (`_reserved`), the program keeping none."""
         with self._compiling:
@@ -756,20 +899,27 @@ class OuterProgram:
         where a kernel spills; one a block hands by its fingerprint (`taking`) runs that executable, its
         lowering what proves it the program: a caller that compiles a call itself (a server choosing its
         state's layout) is handed it as a call is."""
+        return self._compiled_digested(*args, **kwargs)[0]
+
+    def _compiled_digested(self, *args, **kwargs) -> tuple[jax.stages.Compiled, str | None]:
+        """`compiled`, and the digest its collection holds it by where it compiles within `collecting`
+        (None elsewhere, and for a program none can state)."""
         from dew.nn.kernels.templates import report
 
         relowered: Relowered = []
         # A call whose first compile was begun in a thread of its own (`compiling`), the same program over
         # the same abstract inputs, lowers nothing again: the begun lowering is its.
         begun = _ATTEMPTING.get()
+        began = time.perf_counter()
         if begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs):
             lowered = begun.lowered
             begun.taken.set()
         else:
-            lowered = self.lower(*args, **kwargs)
+            lowered = self._lowered_aside(args, kwargs, relowered)
+        lowered_at = time.perf_counter()
         # A program compiled ahead or kept for this target runs as it was compiled (`taking`).
         if (ahead := taken(lowered, self.options)) is not None:
-            return ahead()
+            return ahead(), None
         # Its first compile from that thread, where it lowers the program begun there.
         first = None
         if begun is not None and (lowered is begun.lowered
@@ -781,11 +931,20 @@ class OuterProgram:
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
             self.jitted, lowered = relowered[-1]
-        if (collected := _COLLECTED.get()) is not None:
-            collected[program_digest(lowered, self.options)] = executable
+        # A program no file can hold (its trees hold a node no process names: a pullback's closure) is
+        # collected by no digest; a call over arrays alike still runs it (`_shaped`).
+        digest = None
+        if (collected := _COLLECTED.get()) is not None and (
+                digest := stated_digest(lowered, self.options)) is not None:
+            collected[digest] = executable
         if (kept := _KEEPING.get()) is not None:
             kept(self, lowered, executable)
-        return executable
+        if (spent := _SPENT.get()) is not None:
+            placed = [*jax.tree.leaves(executable.input_shardings),
+                      *jax.tree.leaves(executable.output_shardings)]
+            platform = next(iter(placed[0].device_set)).platform if placed else "none"
+            spent.append(Spent(self.called, platform, lowered_at - began, time.perf_counter() - lowered_at))
+        return executable, digest
 
     def lower(self, *args, **kwargs) -> jax.stages.Lowered:
         return self.trace(*args, **kwargs).lower()
@@ -896,6 +1055,14 @@ def _signature(leaf) -> Hashable:
     return type(leaf), np.shape(leaf), np.result_type(leaf)
 
 
+def abstract_signature(tree) -> Hashable:
+    """`tree`'s arguments as a lowering reads them (`OuterProgram.abstract_of`): its structure and each
+    leaf's abstract signature (`_abstract_signature`), arrays and their shapes alike: what a pass over shapes
+    and the calls over arrays it compiles for are keyed by (`dew.training.compiler.HostRun`)."""
+    leaves, structure = jax.tree.flatten(tree)
+    return structure, tuple(_abstract_signature(leaf) for leaf in leaves)
+
+
 def _abstract_signature(leaf) -> Hashable:
     """What a lowering reads of an argument (`OuterProgram.abstract_of`): an array's or a shape's shape,
     dtype and weak type (its abstract value, a key array's among them), its sharding and its device-local
@@ -903,7 +1070,11 @@ def _abstract_signature(leaf) -> Hashable:
     shapes share it, an array no one committed to its devices lowering as an unplaced shape does, and a
     lowering over one layout is never taken for an array of another (the morning audit of 2026-11-16: a
     begun compile over a default layout taken for a column-major array, which its executable refused);
-    another value's type, shape and dtype."""
+    another value's type, shape and dtype. A float0 (a zero tangent's) is its shape alone, a host value or
+    its shape: no device holds one, and JAX hands a program's float0 result back as a host value, which a
+    pass over shapes knows by its shape (a host step's pullback's cotangent, `dew.training.compiler`)."""
+    if isinstance(leaf, np.ndarray | jax.ShapeDtypeStruct) and leaf.dtype == jax.dtypes.float0:
+        return jax.dtypes.float0, np.shape(leaf)
     if isinstance(leaf, jax.Array | jax.ShapeDtypeStruct):
         shaped = shapes_of(leaf)
         return shaped.shape, shaped.dtype, shaped.weak_type, shaped.sharding, shaped.format.layout
@@ -917,21 +1088,19 @@ whole (`dew.telemetry.benchmark.Ungraphed`), and a server's admitting step's, wh
 command buffer before it can replay (`dew.inference.serving_kernel.decode_programs`)."""
 
 
-def program[**P, R](function: Callable[P, R], *models: Held,
-                    step: Mapping[str, Option] | None = None,
+def program[**P, R](function: Callable[P, R], *, step: Mapping[str, Option] | None = None,
                     **arguments: Unpack[JitArguments]) -> OuterProgram:
-    """`function` jitted with the XLA options a program over `models` compiles with
-    (`compiler_options`), and, where it is part of a training step, the step's own beside them
-    (`step`, `dew.training.memory.step_compiler_options`), with the rest of `jax.jit`'s `arguments`
-    (its static arguments, the arguments it donates, its placements, a tree of formats among them),
-    compiled through the kernel templates' reports (`OuterProgram`): one program for each function,
-    options and arguments, which every call with the same reuses, so a quantized model and another never
-    share one. Every outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's, a
-    load's, a server's (its steps, `dew.inference.serving_kernel.decode_programs`, their own options as
-    `step`) or a simulator's, but those whose owner keeps them: an objective's (`Objective.program`, for
-    what runs its modules, a rollout over an environment included), and a closure's or a bound method's a
-    run makes (`owned_program`)."""
-    options = {**compiler_options(*models), **(step or {})}
+    """`function` jitted with the XLA options a program compiles with (`compiler_options`), and, where it is
+    part of a training step, the step's own beside them (`step`, `dew.training.memory.step_compiler_options`),
+    with the rest of `jax.jit`'s `arguments` (its static arguments, the arguments it donates, its placements,
+    a tree of formats among them), compiled through the kernel templates' reports (`OuterProgram`), which
+    choose each lowering's GEMM backend from its own dots (`report.targeted`): one program for each function,
+    options and arguments, which every call with the same reuses. Every outer program Dew compiles is one of
+    these, a task's, an autoencoder's, a metric's, a load's, a server's (its steps,
+    `dew.inference.serving_kernel.decode_programs`, their own options as `step`) or a simulator's, but those
+    whose owner keeps them: an objective's (`Objective.program`, for what runs its modules, a rollout over an
+    environment included), and a closure's or a bound method's a run makes (`owned_program`)."""
+    options = {**compiler_options(), **(step or {})}
     return _program(
         function, tuple(sorted(options.items())),
         static_argnums=arguments.get("static_argnums"),
@@ -941,14 +1110,13 @@ def program[**P, R](function: Callable[P, R], *models: Held,
         out_shardings=_Placed.of(arguments["out_shardings"]) if "out_shardings" in arguments else None)
 
 
-def owned_program[**P, R](function: Callable[P, R], *models: Held,
-                          step: Mapping[str, Option] | None = None,
+def owned_program[**P, R](function: Callable[P, R], *, step: Mapping[str, Option] | None = None,
                           **arguments: Unpack[JitArguments]) -> OuterProgram:
     """`function` compiled as `program` compiles it, through Dew's compile point, but kept by no cache of
     Dew's: its caller holds it, and it goes with its caller's last reference. A closure or a bound method
     a run makes (its placement's, its host phases') takes this one, as `program`'s process-wide cache
     would keep it and the run it closes over (a trainer, its objective and their arrays) for good."""
-    return OuterProgram(function, compiler_options={**compiler_options(*models), **(step or {})},
+    return OuterProgram(function, compiler_options={**compiler_options(), **(step or {})},
                         **arguments)
 
 

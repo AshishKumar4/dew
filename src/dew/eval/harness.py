@@ -309,7 +309,7 @@ class DewLM(TemplateLM):
                 [rows[index] for index in batch],
                 [len(rows[index]) - len(requests[index][2]) for index in batch], self.task.prefix, share,
                 self.batch_size)
-            scoring = program(_scored, self.task.model, static_argnums=(0,))
+            scoring = program(_scored, static_argnums=(0,))
             # Scored in the attention form the run trained in, as its generation is (`SavedRunTask.traced`).
             with self.task.traced():
                 probabilities, argmax = scoring(self.task.model, self.task.variables, inputs)

@@ -40,6 +40,7 @@ import dew
 from dew._accuracy import rms
 from dew.inference.serving import Server
 from dew.interop import Pretrained
+from dew.interop.pretrained import PretrainedDecoder
 from dew.nn.categorical import token_log_probs
 from dew.nn.inputs import ModelInputs
 from dew.nn.kernels.generation import chosen
@@ -122,7 +123,8 @@ def truth(model_dir: str):
     def scored(prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
         with jax.enable_x64(new_val=True):
             sequence = jnp.asarray(np.concatenate([prompt, forced])[None, :-1], jnp.int32)
-            logits = wide.apply(variables, sequence, train=False, decode=False)[0, len(prompt) - 1:]
+            whole = jnp.asarray(wide.apply(variables, sequence, train=False, decode=False))
+            logits = whole[0, len(prompt) - 1:]
             scores = jax.nn.log_softmax(logits.astype(jnp.float64), axis=-1)
             chosen_scores = jnp.take_along_axis(scores, jnp.asarray(forced)[:, None], axis=-1)[:, 0]
             return np.asarray(chosen_scores, np.float64)
@@ -153,7 +155,7 @@ def prompts(vocab_limit: int, length: int, seed: int) -> np.ndarray:
 def main() -> int:
     from reference_error import as_given, assert_as_exact
 
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--steps", type=int, default=1536)
     parser.add_argument("--prompt", type=int, default=64)
@@ -167,6 +169,8 @@ def main() -> int:
     task = greedy(dew.pipeline(args.model, dtype="bfloat16", param_dtype="bfloat16"))
     loaded = Pretrained.load(args.model, dtype="bfloat16", param_dtype="bfloat16",
                              attention_impl="reference")
+    if not isinstance(loaded, PretrainedDecoder):
+        parser.error(f"{args.model} loads {type(loaded).__name__}, not a decoder")
     reference = greedy(loaded.text_generation())
     pad = task.sampling.pad
     true = truth(args.model)

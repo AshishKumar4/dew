@@ -32,7 +32,8 @@ import numpy as np
 from gpu_flow import Cell, run_cells
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact
-from truths_ahead import compiled_memory, compiled_truths
+from tier_wire import TRUTHS, preparing, unit_needs
+from truths_ahead import admitted_needs, compiled_memory, compiled_truths
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.categorical import token_log_probs
@@ -40,12 +41,6 @@ from dew.nn.kernels import generation
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
-PREPARE = "DEW_TIER_PREPARE"
-"""Set to 1, a flow prepares rather than runs (`preparing`): on the node's CPU, before its GPU run."""
-
-TRUTHS = "DEW_TIER_TRUTHS"
-"""The directory a part's prepare writes its flows' programs and their truths' to and its run reads them
-from."""
 
 PARAMS = "params.pickle"
 """The file of a flow's store holding the parameters its prepare drew (`Flow.params`)."""
@@ -79,11 +74,6 @@ def reference_kernels() -> dict[str, str]:
                              "the reference arm runs one")
         found[str(choice)] = names.pop()
     return found
-
-
-def preparing() -> bool:
-    """Whether this process prepares the tier's flows (`PREPARE`)."""
-    return os.environ.get(PREPARE) == "1"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,12 +134,17 @@ class Flow:
         the CPU's in its last bits, so a draw on the GPU would be other parameters than its prepare's) where
         the flow prepares, or where no tier's store holds them; a run reads its prepare's (`PARAMS`), and
         initializes no model. The initializer runs compiled, one program: run eagerly, it compiled each of
-        its operations apart, 1,416 programs and 70 s over the flows' prepare on armada."""
-        if TRUTHS in os.environ and not preparing():
-            return pickle.loads((store_of(self) / PARAMS).read_bytes())
-        with jax.default_device(jax.devices("cpu")[0]):
-            tokens = jnp.zeros((self.rows, self.length), jnp.int32)
-            return jax.device_get(jax.jit(self.model.init)(jax.random.key(5461), tokens)["params"])
+        its operations apart, 1,416 programs and 70 s over the flows' prepare on armada (`drawn`)."""
+        return drawn(self)
+
+    def initialized(self) -> tuple[jax.Array, ...]:
+        """What the model's `init` reads beside its key: token ids of a draw's shape, zeros."""
+        return (jnp.zeros((self.rows, self.length), jnp.int32),)
+
+    @staticmethod
+    def taken(variables):
+        """What a flow's programs take of its model's variables (`params`): its parameters."""
+        return variables["params"]
 
     @property
     def vocab(self) -> int:
@@ -199,9 +194,139 @@ class Flow:
             return logits[:, self.prefill - 1:]
         return truth
 
+    kinds = ("train", "decode")
+    """The flow's programs: its training step's loss and gradients, and its decode loop's logits."""
 
-KINDS = ("train", "decode")
-"""A flow's programs: its training step's loss and gradients, and its decode loop's logits."""
+    @property
+    def inputs(self) -> list[jax.ShapeDtypeStruct]:
+        """The shapes of a draw's inputs beside the parameters (`draw`): its token ids."""
+        return [jax.ShapeDtypeStruct((self.rows, self.length), np.int32)]
+
+    def program(self, kind: str, model) -> Callable:
+        """`model`'s program `kind` (`kinds`)."""
+        return self.train(model) if kind == "train" else self.decode(model)
+
+    def truth(self, kind: str, model) -> Callable:
+        """The float64 truth of the program `kind` over `model`, its float64 twin."""
+        return self.train(model) if kind == "train" else self.decode_truth(model)
+
+
+@dataclasses.dataclass(frozen=True)
+class ImageFlow:
+    """A denoiser's flow (`dew.nn.backbones.unet.Unet`, the diffusion run's default model) of two levels
+    of `features` channels, the deeper attending, over `channels`-channel latents, computing in `dtype`: its
+    training step and its forward over `rows` latents of `size` square pixels and their timesteps, as `Flow`
+    holds a decoder's, `native` each program's choices a native kernel takes."""
+
+    name: str
+    dtype: str
+    native: Mapping[str, Mapping[str, str]]
+    lane: bool = True
+    features: tuple[int, ...] = (64, 128)
+    channels: int = 4
+    rows: int = 2
+    size: int = 16
+    seeds: Mapping[str, int] = dataclasses.field(default_factory=lambda: {"train": 8, "forward": 8})
+    """Each kind's declared count (`kinds`)."""
+
+    kinds = ("train", "forward")
+    """The flow's programs: its training step's per-element losses and gradients, and its forward's output."""
+
+    @property
+    def precision(self) -> str | None:
+        """As `Flow.precision`."""
+        return "highest" if self.lane else None
+
+    @cached_property
+    def model(self):
+        """The flow's UNet, its attention its selectors' choice (`attention_impl` auto), the deeper stage
+        attending."""
+        from dew.nn.attention_blocks import Stage
+        from dew.nn.backbones.unet import Unet
+
+        return Unet(output_channels=self.channels, emb_features=2 * self.features[-1],
+                    feature_depths=self.features, attention_configs=(None, Stage(heads=4)), num_res_blocks=1,
+                    norm_groups=8, dtype=self.dtype, attention_impl="auto")
+
+    @property
+    def inputs(self) -> list[jax.ShapeDtypeStruct]:
+        """The shapes of a draw's inputs beside the parameters (`draw`): its latents, their timesteps and
+        their targets."""
+        latents = (self.rows, self.size, self.size, self.channels)
+        return [jax.ShapeDtypeStruct(latents, np.float32), jax.ShapeDtypeStruct((self.rows,), np.float32),
+                jax.ShapeDtypeStruct(latents, np.float32)]
+
+    @cached_property
+    def params(self):
+        """The flow's variables, float32, drawn once on the host's CPU, or its prepare's (`Flow.params`): its
+        parameters and its time embedding's frequencies (the `constants` collection), which its programs
+        read and differentiate none of (`drawn`)."""
+        return drawn(self)
+
+    @staticmethod
+    def taken(variables):
+        """What a flow's programs take of its model's variables (`params`): all of them."""
+        return variables
+
+    def initialized(self) -> tuple[jax.Array, ...]:
+        """What the model's `init` reads beside its key: latents and timesteps of a draw's shapes, zeros."""
+        latents, times, _ = self.inputs
+        return jnp.zeros(latents.shape, latents.dtype), jnp.zeros(times.shape, times.dtype)
+
+    def draw(self, seed: int):
+        """A draw's inputs: the flow's parameters, latents and targets of a unit normal's and timesteps in
+        [0, 1), NumPy's from the seed."""
+        rng = np.random.default_rng([5461, seed])
+        latents, times, targets = self.inputs
+        return (self.params, rng.standard_normal(latents.shape).astype(np.float32),
+                rng.random(times.shape).astype(np.float32),
+                rng.standard_normal(targets.shape).astype(np.float32))
+
+    def train(self, model) -> Callable:
+        """`model`'s training step: each element's squared error against its target, `[rows, size, size,
+        channels]`, and every parameter's gradient of their mean (`Flow.train`'s per-element losses)."""
+        def step(variables, latents, times, targets):
+            def loss(params):
+                denoised = model.apply({**variables, "params": params}, latents, times)
+                losses = jnp.square(denoised - targets)
+                return jnp.mean(losses), losses
+            (_, losses), gradients = jax.value_and_grad(loss, has_aux=True)(variables["params"])
+            return losses, gradients
+        return step
+
+    def forward(self, model) -> Callable:
+        """`model`'s forward: its output over the latents at their timesteps."""
+        def forward(variables, latents, times, targets):
+            del targets
+            return model.apply(variables, latents, times)
+        return forward
+
+    def program(self, kind: str, model) -> Callable:
+        """`model`'s program `kind` (`kinds`)."""
+        return self.train(model) if kind == "train" else self.forward(model)
+
+    def truth(self, kind: str, model) -> Callable:
+        """The float64 truth of the program `kind` over `model`, its float64 twin: the program itself."""
+        return self.program(kind, model)
+
+
+type ModelFlow = Flow | ImageFlow
+"""A flow of any family (`FLOWS`): a decoder's, or a denoiser's."""
+
+
+def drawn(flow: ModelFlow):
+    """What the flow's programs take of its model's variables (`ModelFlow.taken`), float32, drawn once on the
+    host's CPU by its compiled initializer where the flow prepares, or where no tier's store holds them; a
+    run's its prepare's (`PARAMS`)."""
+    if TRUTHS in os.environ and not preparing():
+        return pickle.loads((store_of(flow) / PARAMS).read_bytes())
+    with jax.default_device(jax.devices("cpu")[0]):
+        initialized = jax.jit(flow.model.init)(jax.random.key(5461), *flow.initialized())
+        return jax.device_get(flow.taken(initialized))
+
+
+KINDS = Flow.kinds
+"""A decoder flow's programs (`Flow.kinds`)."""
 
 
 NATIVE = "native"
@@ -304,6 +429,8 @@ FLOWS = (
     Flow("lightning attention", "minimax-tiny", LIGHTNING, "bfloat16",
          {"train": {**TEMPLATE, "gated_delta_rule": NATIVE},
           "decode": {**TEMPLATE, "decode": NATIVE, "gated_delta_rule": NATIVE}}),
+    ImageFlow("UNet denoiser bf16", "bfloat16", {"train": {}, "forward": {}}),
+    ImageFlow("UNet denoiser fp32", "float32", {"train": {}, "forward": {}}),
 )
 """Every model flow, by the route it is for (docs/design/testing.md: a kernel's native run is a flow's
 cell): each family that takes a distinct default route on a GPU, its bf16 attention flows twice, under the
@@ -317,29 +444,33 @@ Lightning attention's decay without the delta rule takes the recurrence template
 training the portable math's at its 128-wide heads, whose fast backward's launches pass an A100's registers
 (`template.backward_holds`): fla's port hands it to the portable math (`recurrence_chunk.PORT_SUPPORTS`).
 A latent attention flow's decode loop attends in XLA (the latent decode's own form), and a KDA flow's decode
-step's softmax layer too: no native attention route of theirs there."""
+step's softmax layer too: no native attention route of theirs there. A UNet denoiser's flows (`ImageFlow`, the
+diffusion run's default model) hold its convolutions', norms' and attention's default routes, bf16 and fp32
+(row 7941): no native kernel claims a choice of theirs, so they run on every GPU."""
 
 
-def flow_named(name: str) -> Flow:
+def flow_named(name: str) -> ModelFlow:
     return next(flow for flow in FLOWS if flow.name == name)
 
 
-HOST_FLAGS = ("--xla_force_host_platform_device_count", "--xla_cpu_scheduler_type")
-"""The lane's flags of the host's own backend (tests/lane_environment.py), which compute nothing of a GPU's
-program and part a prepare's CPU process from its run's GPU one."""
+CPU_BACKEND_FLAGS = ("--xla_cpu_scheduler_type",)
+"""The lane's flags of the CPU backend's own (tests/lane_environment.py) that a GPU flow's programs read
+nothing of and a prepare's CPU process sets apart from its run's GPU one; a CPU program's schedule they do
+decide, so `dew.training.ahead.computation_flags` keeps them, and drops the host's device count itself
+(`ahead.HOST_FLAGS`)."""
 
 
-def flow_flags(flow: Flow) -> str:
+def flow_flags(flow: ModelFlow) -> str:
     """The XLA flags a flow compiles its programs under in its prepare and loads them under in its run, the
     same in both (`BuildTarget.held` reads them, in their order): the process's that decide what a program
     computes (`dew.training.ahead.computation_flags`: no phase's own, as a cache directory a process sets
-    after its backend opened), but the host backend's own (`HOST_FLAGS`), then its variant's on a cuda lane,
-    the lane's repeatable flags where `lane`, else a user's (`lane_environment.REPEATABLE_GPU_FLAGS`,
-    `USERS_GPU_FLAGS`)."""
+    after its backend opened, nor the host's device count), but the CPU backend's own (`CPU_BACKEND_FLAGS`),
+    then its variant's on a cuda lane, the lane's repeatable flags where `lane`, else a user's
+    (`lane_environment.REPEATABLE_GPU_FLAGS`, `USERS_GPU_FLAGS`)."""
     from dew.training.ahead import computation_flags
 
     variant = lane_environment.REPEATABLE_GPU_FLAGS if flow.lane else lane_environment.USERS_GPU_FLAGS
-    named = (*HOST_FLAGS, *(flag.split("=")[0] for flag in variant))
+    named = (*CPU_BACKEND_FLAGS, *(flag.split("=")[0] for flag in variant))
     flags = lane_environment.without_flags(" ".join(computation_flags()), *named)
     return " ".join([flags, *variant]).strip()
 
@@ -354,7 +485,7 @@ class WrongProcess(AssertionError):
     """A flow in a process not opened under its variant's flags or matmul precision (`held_process`)."""
 
 
-def held_process(flow: Flow) -> None:
+def held_process(flow: ModelFlow) -> None:
     """Raise unless this process is of the flow's variant (row 5461): XLA parses its flags once a process and
     JAX reads its precision as it starts, so a flow holds only where its process's XLA runtime runs under the
     flow's flags (`flow_flags`) and JAX multiplies at the flow's precision (`Flow.precision`). A prepare's
@@ -373,7 +504,7 @@ def held_process(flow: Flow) -> None:
                            f"{flow.precision!r}")
 
 
-def store_of(flow: Flow) -> Path:
+def store_of(flow: ModelFlow) -> Path:
     """The flow's directory in the tier's store (`TRUTHS`), refused where the tier names none."""
     if TRUTHS not in os.environ:
         raise RuntimeError(f"a model flow reads its truths and programs from {TRUTHS}, which its part's "
@@ -389,18 +520,20 @@ def stamp() -> str:
     return f"{commit()} jax {jax.__version__} jaxlib {importlib.metadata.version('jaxlib')}"
 
 
-def _flat(flow: Flow, program: Callable):
-    """`program(params, ids)` as a function of the parameters' leaves and the ids, and their shapes: a program
-    compiled ahead takes and returns arrays (`compile_programs`)."""
+def _flat(flow: ModelFlow, program: Callable):
+    """`program(params, *inputs)` as a function of the parameters' leaves and the draw's inputs
+    (`ModelFlow.inputs`), and their shapes: a program compiled ahead takes and returns arrays
+    (`compile_programs`)."""
     leaves, tree = jax.tree.flatten(flow.params)
+    count = len(leaves)
 
     def flat(*arguments):
-        return program(jax.tree.unflatten(tree, arguments[:-1]), arguments[-1])
+        return program(jax.tree.unflatten(tree, arguments[:count]), *arguments[count:])
     shapes = [jax.ShapeDtypeStruct(np.shape(leaf), np.asarray(leaf).dtype) for leaf in leaves]
-    return flat, [*shapes, jax.ShapeDtypeStruct((flow.rows, flow.length), np.int32)]
+    return flat, [*shapes, *flow.inputs]
 
 
-def _target():
+def node_target():
     """The node's GPU (`TOPOLOGY`): its generation, its kind's (`generation.gpu_target`), and the facts its
     serialized device states of itself, its multiprocessors and its block's shared memory among them
     (`generation.runtime_facts`), read with no GPU visible, as a prepare runs, so nothing of the CUDA
@@ -417,12 +550,12 @@ def _target():
                                     read=lambda ordinal, attribute: None)
 
 
-def programs_of(flow: Flow) -> dict[str, tuple[Callable, list]]:
-    """The flow's programs by name, each of the parameters' leaves and the ids: its training step and decode
-    loop, Dew's (`dew`) and the reference path's (`reference`)."""
+def programs_of(flow: ModelFlow) -> dict[str, tuple[Callable, list]]:
+    """The flow's programs by name, each of the parameters' leaves and the draw's inputs: each of its kinds
+    (`ModelFlow.kinds`), Dew's (`dew`) and the reference path's (`reference`)."""
     model = flow.model
-    return {f"{kind} {arm}": _flat(flow, getattr(flow, kind)(model))
-            for kind in ("train", "decode") for arm in ("dew", "reference")}
+    return {f"{kind} {arm}": _flat(flow, flow.program(kind, model))
+            for kind in flow.kinds for arm in ("dew", "reference")}
 
 
 class Unreached(AssertionError):
@@ -430,7 +563,7 @@ class Unreached(AssertionError):
     (`held_routes`)."""
 
 
-def claimed(flow: Flow, found: Mapping[str, list]) -> dict[str, set[str]]:
+def claimed(flow: ModelFlow, found: Mapping[str, list]) -> dict[str, set[str]]:
     """Each program's choices the flow is for that a kernel off the reference path claims on the GPU its
     routes (`found`, each program's by its kind) were traced for: a route such a kernel took, or one whose
     `preferred` (what it runs where nothing refuses the call, `generation.Route`) is such a kernel turned
@@ -453,7 +586,7 @@ def claimed(flow: Flow, found: Mapping[str, list]) -> dict[str, set[str]]:
             for kind, choices in flow.native.items()}
 
 
-def held_routes(flow: Flow, found: Mapping[str, list], target: str) -> None:
+def held_routes(flow: ModelFlow, found: Mapping[str, list], target: str) -> None:
     """Raise unless each of the flow's programs, traced for the GPU generation `target` (`found`, each
     program's routes by its kind), took every route it is for that a native kernel claims there
     (`claimed`): a kernel off the reference path among its choice's routes (`NATIVE`), every one of them so
@@ -478,7 +611,7 @@ def held_routes(flow: Flow, found: Mapping[str, list], target: str) -> None:
                                 f"{target}, which a native kernel claims, not {kernel}; refused: {refused}")
 
 
-def held_reference(flow: Flow, found: list) -> None:
+def held_reference(flow: ModelFlow, found: list) -> None:
     """Raise unless the flow's reference arm ran the reference path alone (`generic_kernels`)."""
     generic = generic_kernels()
     if native := sorted({(str(route.choice), route.kernel) for route in found
@@ -486,44 +619,67 @@ def held_reference(flow: Flow, found: list) -> None:
         raise AssertionError(f"{flow.name}: its reference arm ran {native}, not its reference path")
 
 
-def _compiled(named: Mapping[str, tuple[Callable, list]], arm: str, target):
+def _compiled(flow: ModelFlow, named: Mapping[str, tuple[Callable, list]], arm: str, target):
     """The arm's programs of `named` (`programs_of`) compiled for `target` (`compile_programs`), one a call so
-    each program's routes are its own, and each program's routes by its kind."""
+    each program's routes are its own, each program's routes by its kind (`ModelFlow.kinds`), and the names
+    of those its compile refuses to prepare (`report.CompiledOnDevice`: a convolution, whose algorithm only
+    its GPU picks), which its run compiles on its GPU (`loaded`): their routes traced all the same. None of
+    the programs where every one is refused."""
+    from dew.nn.kernels.templates.report import CompiledOnDevice
     from dew.training.ahead import AheadPrograms, compile_programs
 
-    compiled, found = {}, {}
-    for kind in KINDS:
+    compiled, found, on_device = {}, {}, []
+    for kind in flow.kinds:
         name = f"{kind} {arm}"
         with generation.routes() as found[kind]:
-            compiled[kind] = compile_programs({name: named[name]}, target.generation, target.multiprocessors)
-    return AheadPrograms(compiled[KINDS[0]].target, {
-        name: program for each in compiled.values() for name, program in each.programs.items()}), found
+            # Over the node's own topology, tuned as its run's compile would be (row 8422).
+            try:
+                compiled[kind] = compile_programs({name: named[name]}, target.generation,
+                                                  target.multiprocessors, topology=os.environ[TOPOLOGY])
+            except CompiledOnDevice as refused:
+                on_device.extend(refused.programs or (name,))
+    if not compiled:
+        return None, found, on_device
+    return AheadPrograms(next(iter(compiled.values())).target, {
+        name: program for each in compiled.values() for name, program in each.programs.items()},
+        tuned=all(each.tuned for each in compiled.values())), found, on_device
 
 
-def prepare(flow: Flow) -> bool:
+ON_DEVICE = "on_device.json"
+"""A flow's file in its store naming the programs its prepare could not prepare (`report.CompiledOnDevice`),
+each arm's, and why, which its run compiles on its GPU (`loaded`)."""
+
+
+def prepare(flow: ModelFlow) -> bool:
     """The flow's prepare: its programs compiled for the node's GPU into its store, Dew's arm's routes held
     to the ones it is for (`held_routes`), the reference arm's to its reference path; then every draw's truth
     (`judge`). Whether it prepared: none where no kernel off the reference path claims a choice the flow is
     for on the node's GPU (`claimed`), which its store records (`PORTABLE`) for its run to skip."""
     held_process(flow)
-    target = _target()
+    target = node_target()
     directory = store_of(flow)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / PORTABLE).unlink(missing_ok=True)
     named = programs_of(flow)
-    dew, found = _compiled(named, "dew", target)
+    dew, found, on_device = _compiled(flow, named, "dew", target)
     if any(flow.native.values()) and not any(claimed(flow, found).values()):
         # No kernel off the reference path claims a choice the flow is for on this GPU: its run's to skip.
         (directory / PORTABLE).write_text(json.dumps({"stamp": stamp(), "target": target.generation}))
         return False
     (directory / PARAMS).write_bytes(pickle.dumps(flow.params))
-    dew.save(directory / "dew.programs")
     held_routes(flow, found, target.generation)
     with generation.chosen(**reference_kernels()):
-        reference, found = _compiled(named, "reference", target)
-    reference.save(directory / "reference.programs")
-    held_reference(flow, [route for kind in KINDS for route in found[kind]])
-    for kind in KINDS:
+        reference, found, refused = _compiled(flow, named, "reference", target)
+    held_reference(flow, [route for kind in flow.kinds for route in found[kind]])
+    for arm, programs in (("dew", dew), ("reference", reference)):
+        (directory / f"{arm}.programs").unlink(missing_ok=True)
+        if programs is not None:
+            programs.save(directory / f"{arm}.programs")
+    (directory / ON_DEVICE).write_text(json.dumps({
+        "programs": [*on_device, *refused], "stamp": stamp(),
+        "why": "a cuDNN convolution compiled without its GPU leaves its algorithm to run time "
+               "(report.DEVICELESS_CONVOLUTION_PICKS)"}))
+    for kind in flow.kinds:
         judge(flow, {}, kind, target)
     programs = need(dew, reference, directory / "truths")
     (directory / NEED).write_text(json.dumps(programs))
@@ -536,45 +692,15 @@ NEED = "need.json"
 by which the GPU tier admits a part's worker to a slot (`dew.training.memory.admitted` of each)."""
 
 
-UNIT = "DEW_TIER_UNIT"
-"""The name the GPU tier runs a prepare's unit under (a file, or `<file>#G/N` for a group), which its lane
-sets in the prepare's environment: its flows' needs are filed under it (`unit_needs`)."""
-
-
-def unit_needs(programs: list[dict[str, int]]) -> None:
-    """`programs` (`need`'s) added to the needs of the tier's unit this prepare runs (`UNIT`), one file a
-    unit under the tier's store (`TRUTHS`'s `needs/`), from which its lane sizes the unit's worker by Dew's
-    admission of each (`dew.training.memory.admitted`); none outside the tier's prepare, which names no
-    unit."""
-    unit = os.environ.get(UNIT)
-    if unit is None:
-        return
-    path = Path(os.environ[TRUTHS]) / "needs" / f"{hashlib.sha256(unit.encode()).hexdigest()[:16]}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    held = json.loads(path.read_text())["programs"] if path.exists() else []
-    path.write_text(json.dumps({"unit": unit, "programs": [*held, *programs]}))
-
-
 def need(dew, reference, truths: Path) -> dict[str, list[dict[str, int]]]:
-    """A flow's run's programs as the allocator admits them (`dew.training.memory.admitted`), each its
-    compile's memory (`Executable.memory`, `truths_ahead.compiled_memory`) in the admission's own terms
-    (`dew.training.memory.admission`): a float64 truth's or terms program's with the arms' state held beside
-    it (the most any arm takes as arguments, which the run keeps while its truths compute; every program's
-    outputs are fetched to the host, `loaded`, `CompiledTruths.called`). A part's worker fits a slot where
-    every program of its flows is admitted there."""
-    from dew.telemetry.instrumentation import CompiledMemory
-    from dew.training.memory import admission
-
-    arms = [executable.memory for programs in (dew, reference) for executable in programs.programs.values()
-            if executable.memory is not None]
-    state = max((memory.argument for memory in arms), default=0)
-
-    def admitted_as(memory: CompiledMemory, held: int) -> dict[str, int]:
-        return dict(zip(("resident", "beside", "temporaries"), admission(memory, held), strict=True))
-
-    truths_memory = [CompiledMemory(**memory) for memory in compiled_memory(truths)]
-    return {"programs": [*(admitted_as(memory, 0) for memory in arms),
-                         *(admitted_as(memory, state) for memory in truths_memory)]}
+    """A flow's run's programs as the allocator admits them (`truths_ahead.admitted_needs`): its own programs'
+    (Dew's and its reference's, each `Executable.memory`), the state its run holds while its truths compute,
+    and its truths' (`truths_ahead.compiled_memory`)."""
+    # A program its run compiles on its GPU (`ON_DEVICE`) states none ahead, as one whose compile states
+    # none (`Executable.memory`).
+    arms = [executable.memory._asdict() for programs in (dew, reference) if programs is not None
+            for executable in programs.programs.values() if executable.memory is not None]
+    return {"programs": admitted_needs(arms, compiled_memory(truths))}
 
 
 PREPARED_APART = """import sys
@@ -585,7 +711,7 @@ model_flows.prepared_here(sys.argv[1])
 """A flow's prepare process's program (`prepared_apart`)."""
 
 
-def prepared_apart(flow: Flow) -> dict | None:
+def prepared_apart(flow: ModelFlow) -> dict | None:
     """The flow's prepare (`prepare`) in a process of its own (`PREPARED_APART`), started under its XLA
     flags (`flow_flags`) and this process's arithmetic, its variant's (`users_process`): XLA parses its flags
     once a process, as it starts, and the programs it compiles state them (`BuildTarget`). What it took where
@@ -605,42 +731,58 @@ def prepared_here(name: str) -> None:
     print(json.dumps(measured(flow, began) if prepare(flow) else None))
 
 
-def loaded(flow: Flow) -> dict[str, Callable]:
+def loaded(flow: ModelFlow) -> dict[str, Callable]:
     """The flow's programs its prepare compiled, loaded onto this GPU, each a function of the parameters and
-    the ids whose results are fetched to the host, as check 1 holds an arm's (`reference_error`): no arm's
-    outputs stay on the GPU while the next program runs, which the flow's needs count none of (`need`)."""
+    the draw's inputs whose results are fetched to the host, as check 1 holds an arm's (`reference_error`):
+    no arm's outputs stay on the GPU while the next program runs, which the flow's needs count none of
+    (`need`)."""
     from dew.training.ahead import AheadPrograms
 
     directory = store_of(flow)
-    held = {name: program for arm in ("dew", "reference")
-            for name, program in AheadPrograms.load(directory / f"{arm}.programs").loaded().items()}
-    return {name: as_given(lambda params, ids, program=program: jax.device_get(
-                program(*jax.tree.leaves(params), ids))) for name, program in held.items()}
+    on_device = json.loads((directory / ON_DEVICE).read_text())["programs"]
+    held: dict[str, Callable] = {
+        name: program for arm in ("dew", "reference") if (directory / f"{arm}.programs").exists()
+        for name, program in AheadPrograms.load(directory / f"{arm}.programs").loaded().items()}
+    # Each program its prepare could not prepare compiled on this GPU as it first runs, under this process's
+    # flags, traced as its prepare traced it (the reference arm under its reference kernels), said.
+    named = programs_of(flow) if on_device else {}
+    for name in on_device:
+        kernels = reference_kernels() if name.endswith(" reference") else {}
+        held[name] = jax.jit(functools.partial(_traced_under, named[name][0], kernels))
+    if on_device:
+        print(f"{flow.name}: compiled on this GPU, its prepare unable to: {', '.join(on_device)}")
+    return {name: as_given(lambda params, *inputs, program=program: jax.device_get(
+                program(*jax.tree.leaves(params), *inputs))) for name, program in held.items()}
 
 
-def judge(flow: Flow, programs: Mapping[str, Callable], kind: str, target=None) -> None:
-    """Check 1 of the flow's program `kind` (`KINDS`) against its float64 truth, computed on this GPU by the
-    programs the tier's prepare compiled for it (`truths_ahead.compiled_truths`); compiled there where this
-    process prepares (`programs` none), for `target` (the node's GPU, `_target`; this process's devices
-    where none)."""
-    truth_model = float64_twin(flow.model)
-    truth = flow.train(truth_model) if kind == "train" else flow.decode_truth(truth_model)
+def _traced_under(program: Callable, kernels: Mapping[str, str], *arguments):
+    """`program(*arguments)` traced with `kernels` named (`generation.chosen`)."""
+    with generation.chosen(**kernels):
+        return program(*arguments)
+
+
+def judge(flow: ModelFlow, programs: Mapping[str, Callable], kind: str, target=None) -> None:
+    """Check 1 of the flow's program `kind` (`ModelFlow.kinds`) against its float64 truth, computed on this
+    GPU by the programs the tier's prepare compiled for it (`truths_ahead.compiled_truths`); compiled there
+    where this process prepares (`programs` none), for `target` (the node's GPU, `node_target`; this
+    process's devices where none)."""
+    truth = flow.truth(kind, float64_twin(flow.model))
     with compiled_truths(store_of(flow) / "truths", prepare=preparing(), stamp=stamp(), target=target):
         assert_as_exact(programs.get(f"{kind} dew"), programs.get(f"{kind} reference"), flow.draw,
                         f"{flow.name}: {kind}", seeds=flow.seeds[kind], truth_fn=truth)
 
 
-def run(flow: Flow) -> int:
+def run(flow: ModelFlow) -> int:
     """The flow on this GPU from its prepared programs and truths: check 1 of each program its run judges
-    (`KINDS`), each a cell (`gpu_flow.run_cells`, which reports the cells that ran); its device's peak
-    bytes after them, which the test reports."""
+    (`ModelFlow.kinds`), each a cell (`gpu_flow.run_cells`, which reports the cells that ran); its device's
+    peak bytes after them, which the test reports."""
     programs = loaded(flow)
     run_cells([Cell(f"{flow.name}: {kind}", functools.partial(judge, flow, programs, kind))
-               for kind in KINDS])
+               for kind in flow.kinds])
     return int((jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0))
 
 
-def measured(flow: Flow, began: float) -> dict:
+def measured(flow: ModelFlow, began: float) -> dict:
     """What a prepare since `began` took (`prepared_apart`): its seconds, its process's peak resident bytes
     and the bytes it wrote to the flow's store, which size a tier part's prepare on its node."""
     import resource
@@ -651,7 +793,7 @@ def measured(flow: Flow, began: float) -> dict:
             "peak_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}
 
 
-def portable_here(flow: Flow) -> bool:
+def portable_here(flow: ModelFlow) -> bool:
     """Whether the flow's prepare found nothing it is for claimed on this GPU (`PORTABLE`), at this stamp:
     a record another stamp or GPU wrote is refused, never read as this run's."""
     record = store_of(flow) / PORTABLE

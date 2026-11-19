@@ -51,6 +51,7 @@ from jax.core import ShapedArray
 from jax.extend import core as jcore
 
 from dew import _cache
+from dew.nn import derivatives
 from dew.nn.kernels import generation
 from dew.nn.nested import nested
 from dew.nn.programs import RaggedLayout, entrywise, ragged_layout
@@ -253,6 +254,16 @@ def _named_value(equation: jcore.JaxprEqn, shape: tuple[int, ...]) -> bool:
             and all(_shape(var) == shape for var in (*equation.invars, *equation.outvars)))
 
 
+def _activation(equation: jcore.JaxprEqn, shape: tuple[int, ...]) -> bool:
+    """Whether `equation` is a gated product's region (`derivatives.Activation`, `activations.gated_product`'s
+    span over its gate and up projections) on values of `shape`: an epilogue's member (`_regions`), replayed
+    as the activation's arithmetic on the tile (`activations.gated_hook`), never as its body, which on an
+    H100 is SwiGLU's Pallas kernel (a call no epilogue runs)."""
+    kind = equation.params.get("kind") if equation.primitive is derivatives.marked_call_p else None
+    return (isinstance(kind, derivatives.Activation) and kind.gated and len(equation.invars) == 2
+            and all(_shape(var) == shape for var in (*equation.invars, *equation.outvars)))
+
+
 def _captured(index: Index, scanned: Sequence[int], members: set[int], claimed: set[int]) -> set[int]:
     """The layout equations of the captured operands of the equations at `scanned` that only `members` read
     (`CAPTURED`: a bias's broadcast, a row statistic's over the depth), no other region holds (`claimed`)
@@ -319,8 +330,10 @@ def _regions(index: Index) -> list[Region]:
             # entrywise operation, or a remat name on such a value (`checkpoint_name`, a gate's projection
             # before its SwiGLU), which the launch's consumer hands out under its name (`fused_gemm._named`,
             # its residual, row 7131), where it ended the region (row 6102). A name on a prologue's value
-            # stays its boundary: a producer's stage runs no name.
-            if place in claimed or not (_elementwise(later, shape) or _named_value(later, shape)):
+            # stays its boundary: a producer's stage runs no name. A gated product's region (`_activation`) is
+            # one too, its other projection a captured operand.
+            if place in claimed or not (_elementwise(later, shape) or _named_value(later, shape)
+                                        or _activation(later, shape)):
                 at = place
                 break
             places.append(place)
@@ -371,6 +384,11 @@ def _replayed(jaxpr: jcore.Jaxpr, region: Region, fused_gemm):
                 made = [_product(form, operands, equation.params["precision"],
                                  equation.params["preferred_element_type"] or jnp.result_type(*operands[:2]),
                                  fused_gemm)]
+            elif _activation(equation, _shape(equation.outvars[0])):
+                # A gated product's arithmetic as an epilogue traces it, whatever route its span's body took.
+                from dew.nn import activations
+
+                made = [activations.gated_hook(equation.params["kind"].name)(*operands)]
             else:
                 bound = equation.primitive.bind(*operands, **equation.params)
                 made = list(bound) if equation.primitive.multiple_results else [bound]

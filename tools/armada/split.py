@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path
 
+import grading
 import pytest
 import session
 
@@ -36,20 +37,20 @@ def pytest_collection_modifyitems(config, items):
     if group is None:
         return
     index, count = (int(part) for part in group.split("/"))
-    durations = session.cut_record()
-    recorded = json.loads(durations.read_text()) if durations.is_file() else {}
+    recorded = session.costs(session.cut_record())
     nodes = sorted(item.nodeid for item in items)
     known = [recorded[node] for node in nodes if node in recorded]
     mean = sum(known) / len(known) if known else 1.0
     # The plan's groups of each file's recorded tests (`cut`, ci.py's `members`), which this task keeps.
     kept_nodes: set[str] = set()
-    for name in sorted({node.split("::")[0] for node in nodes}):
+    for name in sorted({grading.owning(node) for node in nodes}):
         path = Path(name)
         sites = session.declared_marks(name, path.read_text()) if path.is_file() else {}
-        of_file = {node: seconds for node, seconds in sorted(recorded.items()) if node.split("::")[0] == name}
+        of_file = {node: seconds for node, seconds in sorted(recorded.items())
+                   if grading.owning(node) == name}
         record = session.own(session.standing(name, of_file), sites)
         planned = session.planned(name, list(record), list(record.values()), count)
-        collected = [node for node in nodes if node.split("::")[0] == name]
+        collected = [node for node in nodes if grading.owning(node) == name]
         groups = session.kept(collected, planned, mean)
         # Every collected test in exactly one group: each task cuts the file whole and alike, so the groups
         # together run each test once, and a cut that would not is no task's to run.
@@ -59,7 +60,7 @@ def pytest_collection_modifyitems(config, items):
         kept_nodes |= set(groups[index - 1])
     if unrecorded := os.environ.get("DEW_UNRECORDED"):
         with open(unrecorded, "w") as out:
-            json.dump(sorted({node.split("::")[0] for node in nodes if node not in recorded}), out)
+            json.dump(sorted({grading.owning(node) for node in nodes if node not in recorded}), out)
     kept = {id(item) for item in items if item.nodeid in kept_nodes}
     config.hook.pytest_deselected(items=[item for item in items if id(item) not in kept])
     items[:] = [item for item in items if id(item) in kept]

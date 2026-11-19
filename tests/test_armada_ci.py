@@ -309,6 +309,51 @@ def test_a_targeted_pytest_runs_a_group_as_its_ci_task_would(ci, tmp_path, monke
     assert sorted(test for test, *_ in ran("")) == ["test_other", "test_site"]
 
 
+def test_a_task_fetches_only_the_pins_its_environment_lacks_within_its_deadline(ci, tmp_path):
+    """A commit that pins a fixture its environment's store lacks fetches it, and only it (`--absent`), before
+    its tests or collection; one whose every pin is stored starts no fetch: the environment's key reads no
+    pin. A fetch past the task's deadline is stopped there."""
+    interpreter(tmp_path, "3.12")
+    (tmp_path / "tools").mkdir(exist_ok=True)
+    (tmp_path / "tools/fetched_fixtures.py").write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "with open('fetches', 'a') as out:\n    out.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "Path('tests/fixtures/fetched').mkdir(parents=True, exist_ok=True)\n"
+        f"Path('tests/fixtures/fetched/{'a' * 64}.npz').write_bytes(b'x')\n")
+    pin = tmp_path / "tests/fixtures/x/recorded.npz.fetched.json"
+    pin.parent.mkdir(parents=True)
+    pin.write_text(json.dumps({"sha256": "a" * 64, "bytes": 1, "revision": "r", "repo": "o/r", "path": "p"}))
+    ci.session.fetched_absent("3.12", 600.0, ci.digests.fetched.absent(tmp_path))
+    assert (tmp_path / "fetches").read_text() == "fetch --absent\n"
+    ci.session.fetched_absent("3.12", 600.0, ci.digests.fetched.absent(tmp_path))
+    assert (tmp_path / "fetches").read_text() == "fetch --absent\n"
+    (tmp_path / f"tests/fixtures/fetched/{'a' * 64}.npz").unlink()
+    (tmp_path / "tools/fetched_fixtures.py").write_text("import time\ntime.sleep(30)\n")
+    with pytest.raises(subprocess.TimeoutExpired):
+        ci.session.fetched_absent("3.12", 1.0, ci.digests.fetched.absent(tmp_path))
+
+
+def test_a_targeted_run_and_the_gpu_tier_fetch_the_pins_their_store_lacks_first(ci, tmp_path, monkeypatch):
+    """The pytest operation (a lane's targeted run, the gangs) and the GPU tier's collection fetch the pins
+    their store lacks first, as a task does: the environment's key reads no pin (train 1049's review, F6)."""
+    order = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ci.digests.fetched, "absent", lambda root: {"x": {}})
+    monkeypatch.setattr(ci.session, "fetched_absent",
+                        lambda python, _, lacking: order.append(("fetch", python, sorted(lacking))) or 0.0)
+    monkeypatch.setattr(ci, "targeted",
+                        lambda python, arguments, *rest: order.append(("pytest", arguments)) or 0)
+    monkeypatch.setattr(ci, "marked", lambda python: order.append(("collect", python)) or ({}, {}))
+    report = f"--report={tmp_path / 'r.xml'}"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "pytest", "--python=3.12", report, "--", "tests/test_x.py"])
+    assert ci.main() == 0
+    # The GPU tier collects every test file to choose its marked ones: it fetches first too (its review, P1).
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier"])
+    assert ci.main() == 0
+    assert order == [("fetch", "3.12", ["x"]), ("pytest", ["tests/test_x.py"]), ("fetch", "3.12", ["x"]),
+                     ("collect", "3.12")]
+
+
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     """A failed test, a skip on a missing import and a file that does not
     collect each turn their own file's row red; a passing file and an
@@ -526,6 +571,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
 def named_tier(ci, monkeypatch, capsys, *flags: str, lines: bool = False) -> list:
     """What `ci.py gpu-tier` with `flags` prints: its files (each shard's line; the line of JSON after them,
     each file's pinned generations, is test_gpu_lane.py's), or its lines where `lines`."""
+    monkeypatch.setattr(ci.digests.fetched, "absent", lambda root: {})  # an environment holding every pin
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *flags])
     capsys.readouterr()
     assert ci.main() == 0
@@ -749,8 +795,13 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     attempt's opens. It sets aside exactly those tests, never one whose id theirs begins (pytest's --deselect
     matches by prefix: train 671's review)."""
     (tmp_path / "tests/test_resumed.py").write_text(
+        "import time\n"
         "from pathlib import Path\n"
-        "def test_first():\n"
+        "import pytest\n"
+        "@pytest.fixture\n"
+        "def slow():\n"
+        "    time.sleep(0.3)\n"
+        "def test_first(slow):\n"
         "    with Path('ran').open('a') as ran: ran.write('first ')\n"
         "def test_first_again():\n"
         "    with Path('ran').open('a') as ran: ran.write('again ')\n")
@@ -766,10 +817,16 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     progress = tmp_path / "artifacts" / "progress.jsonl"
     kept = [json.loads(line)["node"] for line in progress.read_text().splitlines()]
     assert kept == ["tests/test_resumed.py::test_first", "tests/test_resumed.py::test_first_again"]
+    # Its seconds are its setup's, call's and teardown's, as JUnit times it and as its `compiled` counts:
+    # a fixture's 0.3 s among them (row 7939's review).
+    assert json.loads(progress.read_text().splitlines()[0])["seconds"] >= 0.3
     # The next, recalled after its first test: that one set aside, the one its name begins run, both in
     # its row.
     (tmp_path / "resume").mkdir()
-    (tmp_path / "resume" / "progress.jsonl").write_text(progress.read_text().splitlines()[0] + "\n")
+    # The test it passed had compiled a program the shared cache lacked: its row still times it cold, and the
+    # progress carried on says so for a later recall (row 7939's review).
+    first = {**json.loads(progress.read_text().splitlines()[0]), "cold": True}
+    (tmp_path / "resume" / "progress.jsonl").write_text(json.dumps(first) + "\n")
     progress.unlink()
     (tmp_path / "ran").unlink()
     monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
@@ -778,7 +835,9 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     assert row["exitCode"] == 0, row["output"]
     assert (tmp_path / "ran").read_text() == "again "
     assert set(row["tests"]) == {f"tests/test_resumed.py::test_first{end}" for end in ("", "_again")}
-    assert [json.loads(line)["node"] for line in progress.read_text().splitlines()] == kept
+    assert row["cold"] == ["tests/test_resumed.py::test_first"]
+    carried = [json.loads(line) for line in progress.read_text().splitlines()]
+    assert [line["node"] for line in carried] == kept and carried[0]["cold"] and "cold" not in carried[1]
     assert stored == {}
     # A split group resumed sets its tests aside after split.py cuts its file, as every group's container
     # cuts it whole: a cut of the rest alone would run another group's tests and none of some (train 674's
@@ -1844,6 +1903,10 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     owner = load("child_groups", "tools/armada").SOURCE.relative_to(ROOT)
     (tmp_path / owner).parent.mkdir(parents=True)
     shutil.copy(ROOT / owner, tmp_path / owner)
+    # The cgroup reader every task reads its peak through (host.py's `cgroups`).
+    reader = Path(load("host", "tools/armada").cgroups().__file__).relative_to(ROOT)
+    (tmp_path / reader).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(ROOT / reader, tmp_path / reader)
     shutil.copy(ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
     module = load("ci", str(tmp_path / "tools/armada"))
     monkeypatch.chdir(tmp_path)

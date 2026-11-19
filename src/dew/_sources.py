@@ -227,6 +227,23 @@ class GeneratedField(NamedTuple):
     parts: tuple[tuple[str, Any], ...] = ()
 
 
+def instance_fields(held: type) -> list[GeneratedField]:
+    """The fields an instance of `held`, a generated class (`generated`), holds: those its nearest class in
+    its method resolution order that a generator made itself recorded (`generated_fields`), so a subclass
+    no generator decorated holds its base's (train 1013's review)."""
+    made = next((base for base in held.__mro__ if "__dataclass_fields__" in vars(base) or attrs_made(base)),
+                held)
+    return generated_fields(made)
+
+
+def decides(field: GeneratedField) -> bool:
+    """Whether `field` takes part in its instances' equality, as its generator records it: a dataclass
+    field's `compare`, an attrs field's `eq`. A field that declares it does not (`compare=False`,
+    `eq=False`: credentials, a timeout) decides no rows, and an identity leaves it out."""
+    parts = dict(field.parts)
+    return parts.get("compare", parts.get("eq", True)) is not False
+
+
 def attrs_made(held: type) -> bool:
     """Whether attrs made `held` itself (its own `__attrs_attrs__`, which a subclass it did not decorate
     inherits)."""
@@ -247,9 +264,7 @@ def generated_instance(value) -> bool:
 def field_names(held: type) -> list[str]:
     """The names of the fields a class generator recorded for `held` (`generated`), in order: what an
     instance of it holds, a record's parts."""
-    if dataclasses.is_dataclass(held):
-        return [field.name for field in dataclasses.fields(held)]
-    return [field.name for field in vars(held)["__attrs_attrs__"]]
+    return [field.name for field in instance_fields(held)]
 
 
 def _setattr_hooks(held: type) -> Mapping[str, Callable]:

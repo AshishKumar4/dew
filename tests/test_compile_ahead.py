@@ -26,6 +26,7 @@ import optax
 import process_support
 import pytest
 from lane_environment import without_flags
+from generation_support import COMPILES_ON_CPU
 from jax.extend import custom_call_targets, xla
 from kernel_compile import gate_generations
 from model_support import TINY_DECODER, memory_limited_to
@@ -94,6 +95,81 @@ def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, 
                    tracker=tracker)
 
 
+def need_ahead(generation: str, *, split: int, remat: str, tiled: bool = False) -> int:
+    """The bytes the fine-tuned step (`fine_tune`) compiled ahead for a compile-only GPU of `generation`
+    needs at `split` microbatches and `remat`, its head tiled where asked: the headroom its compile left of
+    a room past all (`gpus`' 64 GiB, which states exactly that allocator limit, `memory_limited_to`), taken
+    from that room. A cell states its room from such needs, so the plan it claims of a room holds whatever
+    the step's GEMM route or workspace makes them; XLA schedules a tighter room's compile for less, so a cell
+    states the least room its claim allows and reads its premise from the build's own probes too."""
+    from dew.training.ahead import compile_ahead
+
+    room = 2**36
+    trainer = fine_tune(MeshSpec().build(gpus(generation, limit=room)), split=split, remat=remat)
+    if tiled:
+        trainer.objective.tile_head()
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+    return room - record(ahead.plan, "plan")["probes"][0]["headroom"]
+
+
+def need_run(root, generation: str, split: int) -> int:
+    """The bytes a configured run's step (`run_kinds.lm`) compiled ahead for a GPU of `generation` needs at
+    `split` microbatches: its compile's headroom of a room past all (64 GiB its allocator's), taken from the
+    room its build states."""
+    from run_kinds import lm
+
+    from dew.config.lm import LMRunConfig
+    from dew.training.ahead import AheadOfTime, CompiledAhead
+
+    root.mkdir()
+    path = root / "step.dew-aot"
+    run = LMRunConfig.cli(["--trainer.name", "need", "--trainer.checkpoint-dir", str(root / "runs"),
+                           "--trainer.steps", "2", "--trainer.split", str(split),
+                           "--trainer.compile-ahead.generation", generation,
+                           "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
+                           "--trainer.compile-ahead.capacity-gib", capacity_gib(2**36),
+                           "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None"],
+                          default=lm(root, drawn=False))
+    with pytest.raises(CompiledAhead):
+        run.run()
+    ahead = AheadOfTime.load(path)
+    return ahead.built.memory - record(ahead.plan, "plan")["probes"][0]["headroom"]
+
+
+def capacity_gib(room: int) -> str:
+    """`--trainer.compile-ahead.capacity-gib` for a GPU whose allocator is limited to `room` bytes."""
+    return str(memory_limited_to(room) / 2**30)
+
+
+def test_a_background_compile_takes_no_slot_a_step_waits_for():
+    """One compile slot (`report.CompileSlots`), held: a background compile (a start's program, `options
+    .compiling`) and a step's then wait for it, and when it frees the step's takes it first, the background
+    one only once no step's waits."""
+    import threading
+    import time
+
+    from dew.nn.kernels.templates.report import CompileSlots
+
+    slots, order = CompileSlots(1), []
+
+    def compile_(name, background):
+        with slots.held(background=background):
+            order.append(name)
+
+    with slots.held(background=False):
+        waiting = [threading.Thread(target=compile_, args=(name, name == "start"))
+                   for name in ("start", "step")]
+        for thread in waiting:
+            thread.start()
+        # The step's compile waiting before the slot frees: its order is the slots', not the threads'.
+        deadline = time.monotonic() + 10
+        while not slots._waiting and time.monotonic() < deadline:
+            time.sleep(0.01)
+    for thread in waiting:
+        thread.join(timeout=10)
+    assert order == ["step", "start"], order
+
+
 def test_a_program_compiled_ahead_runs_in_place_of_compiling():
     """A program compiled ahead over its arguments' shapes runs where a call of it lowers that program
     (`dew.nn.kernels.options.taking`, by its digest): the call compiles nothing and answers as the program
@@ -141,10 +217,10 @@ begun, ended = threading.Event(), threading.Event()
 compiled = report.attempted
 
 
-def attempted(lowered, held):
+def attempted(lowered, held, **given):
     begun.set()
     try:
-        return compiled(lowered, held)
+        return compiled(lowered, held, **given)
     finally:
         ended.set()
 
@@ -319,6 +395,85 @@ def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_w
         answered = owned_program(lambda values: values * 2 + 1)(values)
     assert [program.kind for program in compiles.programs].count("compiled") == 0
     np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
+
+
+def test_a_program_compiled_over_a_zero_tangents_shape_runs_for_its_host_value():
+    """A program compiled within `collecting` over a float0 shape (a zero tangent's, which a pullback reads
+    for an integer statistic) runs for the host value JAX hands such a tangent back as, tracing nothing
+    (`executable_only`): no device holds a float0, so a call knows it by its shape alone."""
+    from dew.nn.kernels.options import collecting, owned_program
+    from dew.telemetry.compiles import executable_only
+
+    program = owned_program(lambda values, zero: values + 1)
+    placed = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    with collecting():
+        program(jax.ShapeDtypeStruct((4,), jnp.float32, sharding=placed),
+                jax.ShapeDtypeStruct((3,), jax.dtypes.float0))
+    with executable_only():
+        answered = program(jax.device_put(np.zeros(4, np.float32), placed), np.zeros((3,), jax.dtypes.float0))
+    np.testing.assert_array_equal(np.asarray(answered), np.ones(4))
+
+
+def test_a_program_holds_at_most_its_bound_kept_and_compiled_over_shapes_together():
+    """A program called over more distinct shapes than it keeps (its `CACHED`, three here), some of them
+    compiled over shapes first (`collecting`), holds no more executables than its bound across its kept
+    and its shaped stores together: one eviction policy (`_bounded`)."""
+    from dew.nn.kernels.options import collecting, owned_program
+
+    program = owned_program(lambda values: values + 1)
+    program.CACHED = 3
+    with collecting():
+        for size in (1, 2):
+            program(jax.ShapeDtypeStruct((size,), jnp.float32))
+    for size in range(3, 8):
+        program(jnp.zeros((size,), jnp.float32))
+    assert len(program._executables) + len(program._shaped) <= 3
+    # The latest kept, which the bound never lets go: called again, it compiles nothing.
+    with Compiles(None) as compiles:
+        program(jnp.zeros((7,), jnp.float32))
+    assert compiles.count == 0
+
+
+def test_each_collection_in_a_process_holds_every_program_it_called():
+    """Two collections in one process over the same shapes (two equivalent runs compiled ahead) each hold
+    every program their calls reached, the second's taken from the first's compile, not left out: each
+    file its loader reads (`AheadOfTime.starts`) is whole."""
+    from dew.nn.kernels.options import collecting, owned_program
+
+    program = owned_program(lambda values: values * 3 - 1)
+    placed = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    shape = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=placed)
+    held = []
+    for _ in range(2):
+        with collecting() as collected:
+            program(shape)
+        held.append(collected)
+    first, second = held
+    assert len(first) == 1 and second.keys() == first.keys()
+
+
+def test_a_program_compiled_over_shapes_while_collecting_runs_for_arrays_alike_tracing_nothing():
+    """A program called within `collecting` over shapes runs for a later call over arrays alike in shape,
+    dtype and placement with nothing traced, lowered or compiled (`executable_only` allows none): how a run
+    whose startup compiles its host step's programs over its state's shapes steps on them. Arrays placed
+    otherwise than the shapes stated miss it: that call compiles its own program, placed where they are."""
+    from dew.nn.kernels.options import collecting, owned_program
+    from dew.telemetry.compiles import executable_only
+
+    devices = jax.devices()
+    placed = jax.sharding.SingleDeviceSharding(devices[0])
+    program = owned_program(lambda values: values * 2 + 1)
+    with collecting():
+        program(jax.ShapeDtypeStruct((4,), jnp.float32, sharding=placed))
+    with executable_only():
+        answered = program(jax.device_put(np.arange(4, dtype=np.float32), placed))
+    np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
+    elsewhere = jax.sharding.SingleDeviceSharding(devices[-1])
+    with Compiles(None) as compiles:
+        moved = program(jax.device_put(np.arange(4, dtype=np.float32), elsewhere))
+    assert [program.kind for program in compiles.programs].count("compiled") == 1
+    assert moved.sharding == elsewhere
+    np.testing.assert_array_equal(np.asarray(moved), np.arange(4) * 2 + 1)
 
 
 @pytest.mark.parametrize("asked", ["midway", "at its end", "scored to"])
@@ -656,8 +811,9 @@ def test_a_step_prepared_for_a_hosts_gpus_keys_the_cache_as_the_hosts_run_compil
     from dew.nn.kernels.templates.report import CUB_NO_FALLBACK, for_devices, targeted
 
     (device,) = compile_only_gpus("sm90", 1, 40 * 2**30)
+    # A bf16 product, which keeps XLA's Triton GEMM at any precision: the cache's key alone.
     lowered = jax.jit(lambda x: x @ x).trace(jax.ShapeDtypeStruct(
-        (64, 64), jnp.float32, sharding=jax.sharding.SingleDeviceSharding(device))).lower()
+        (64, 64), jnp.bfloat16, sharding=jax.sharding.SingleDeviceSharding(device))).lower()
     with for_devices():
         prepared = targeted(lowered, None)
     assert cache_key_of(lowered, device, prepared) == cache_key_of(
@@ -775,27 +931,40 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     assert trainer.plan == ahead.plan and recompute_record(trainer.objective) == plan["remat"]
 
 
-@pytest.mark.parametrize("capacity", [2**30, 650_000], ids=["one microbatch", "several"])
+@pytest.mark.parametrize("several", [False, True], ids=["one microbatch", "several"])
 def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_fit(tmp_path, monkeypatch,
-                                                                                    capacity):
+                                                                                    several):
     """A step whose plan is the remat ladder's top ('full') lists, past it, the sibling that keeps what
     'minimal' saves in pinned host memory in place of recomputing it ('minimal_offloaded'): as many device
     bytes as 'full', so no fit rung, but another speed, which the GPUs' timing chooses (row 1932). It is
     compiled at the last configuration at 'full' that fit, its head policy put back, whatever head policies
     the frontier then tried at fewer microbatches; and the run, which times nothing, is left at its plan.
-    At 650 kB the plan at 'full' takes two microbatches and the sibling fits there (a sweep at base/kernels
-    e4d702a55 with 2cb8d0bb4: from 500 kB to 600 kB the sibling fits at no plan's split on a device with no
-    host memory of its own, and from 700 kB the plan takes one)."""
+    With room for one microbatch, and with room for what two microbatches and the sibling at two need at
+    'full', their head tiled, and less than one needs (each measured, `need_ahead`), where the plan's
+    compile at one did not fit. Tiled, as the plan's fit there takes it: on cuBLAS's GEMMs the untiled
+    head's workspace makes the offloaded sibling at two need more than 'full' at one, so only the tiled
+    head has a room where 'full' takes two microbatches and the sibling fits."""
     from dew.nn.backbones.decoder_block import REMAT_POLICIES, remat_record
     from dew.training.ahead import compile_ahead
     from dew.training.memory import head_fused_of, head_tile_of, recompute_record
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    capacity = 2**30
+    if several:
+        one, two = (need_ahead("sm90", split=split, remat="full", tiled=True) for split in (1, 2))
+        sibling = need_ahead("sm90", split=2, remat="minimal_offloaded", tiled=True)
+        capacity = max(two, sibling)
+        assert capacity < one, (one, two, sibling)
     trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=capacity)), split=None, remat="full")
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
     full, offloaded = (remat_record(REMAT_POLICIES[name]) for name in ("full", "minimal_offloaded"))
+    if several:
+        whole = [probe for probe in plan["probes"]
+                 if probe["split"] == 1 and probe["remat"] == full and probe["head_tile"] is not None]
+        assert whole and not any(probe["fits"] for probe in whole), plan["probes"]
+        assert plan["head_tile"] is not None, plan
     *rungs, sibling = frontier
     last = [entry for entry in (plan, *rungs) if entry["remat"] == full][-1]
     assert plan["remat"] == full
@@ -812,15 +981,22 @@ def test_a_fused_tiled_heads_plan_compiled_ahead_with_its_frontier_restores_the_
                                                                                               monkeypatch):
     """A fused tiled head's plan compiled ahead with its frontier (`FitSearch.above`, which moves the
     objective up the ladder and to its offloaded sibling) leaves the objective at the admitted plan: its
-    remat, its head's tile and whether it is fused, the trainer's plan the one compiled ahead."""
+    remat, its head's tile and whether it is fused, the trainer's plan the one compiled ahead: in room for
+    what two microbatches need with the head tiled at 'full' and less than one needs (each measured,
+    `need_ahead`), where the plan's compile at one did not fit."""
     from dew.training.ahead import compile_ahead
     from dew.training.memory import head_fused_of, head_tile_of, recompute_record
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
-    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=650_000)), split=None, remat="full")
+    one, room = (need_ahead("sm90", split=split, remat="full", tiled=True) for split in (1, 2))
+    assert room < one, (one, room)
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split=None, remat="full")
     trainer.objective.tile_head()
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
+    whole = [probe for probe in plan["probes"]
+             if probe["split"] == 1 and probe["head_tile"] is not None]
+    assert whole and not any(probe["fits"] for probe in whole), plan["probes"]
     assert plan["remat"] == "full"
     assert plan["head_fused"] and plan["head_tile"] is not None
     assert recompute_record(trainer.objective) == plan["remat"]
@@ -850,8 +1026,9 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
     running = MeshSpec().build(jax.devices()[:1])
 
     def lowered(mesh):
+        # A bf16 product, which keeps XLA's Triton GEMM at any precision: the autotuner's options alone.
         placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-        shape = jax.ShapeDtypeStruct((64, 64), jnp.float32, sharding=placed)
+        shape = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16, sharding=placed)
         return jax.jit(lambda x: x @ x).lower(shape)
 
     # One read offline skips the autotuner; one compiled for a device takes the tuned choices, every one
@@ -866,13 +1043,13 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
             "xla_gpu_require_complete_aot_autotune_results": True}
     assert targeted(lowered(running), {"xla_gpu_enable_triton_gemm": False}) == {
         "xla_gpu_enable_triton_gemm": False}
-    # A step whose options are its towers' own compiles as the half rung of XLA's defaults does, one
+    # A step whose options are the run's own compiles as the half rung of XLA's defaults does, one
     # program (row 3506).
     objective = fine_tune(deviceless, split=None).objective
-    search = FitSearch(lower=None, options=lambda candidate: compiler_options(*objective.towers()) or None,
+    search = FitSearch(lower=None, options=lambda candidate: compiler_options() or None,
                        objective=objective, mesh=deviceless, xla_defaults=False, narrow=False, ns_group=None,
                        base=None, resumed=None)
-    assert search.options(None) == search.required == (compiler_options(*objective.towers()) or None)
+    assert search.options(None) == search.required == (compiler_options() or None)
     # Its compile's stop past the devices' limit is no option of its program's: the ladder asks no rung of
     # XLA's defaults beside each place, the same program (train 993's F3), and does where its options differ.
     start = search.rung_now()
@@ -1094,6 +1271,24 @@ def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets
     assert ("gated_delta_rule", "mosaic_gpu") in {tuple(kernel) for kernel in found["kernels"]}, found
 
 
+def test_a_gemm_asked_to_interpret_on_a_cpu_traced_ahead_for_a_gpu_holds_no_interpreter():
+    """A GEMM asked to interpret its kernel on a CPU (`interpret_on_cpu`), traced on this CPU host for a GPU
+    as a prepare traces a check-1 arm (`lowering_for`): its program holds no interpreted branch, whose host
+    callbacks' ordered effect gave its executable a token parameter its run on the GPU never passed (row
+    8099: a balanced dense kernel gradient's arm, "Execution supplied 2 arguments but compiled program
+    expected 3")."""
+    from dew.nn.kernels import gemm, generation
+    from dew.training.ahead import lowering_for
+
+    def gradient(rows, cotangent):
+        return gemm.gemm_t(rows, cotangent, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)[0]
+
+    with lowering_for("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        traced = jax.make_jaxpr(gradient)(jax.ShapeDtypeStruct((320, 128), jnp.bfloat16),
+                                          jax.ShapeDtypeStruct((320, 2816), jnp.bfloat16))
+    assert not traced.effects, traced.effects
+
+
 EVERY_TEMPLATE_AHEAD = """
 import json, sys
 import jax
@@ -1223,6 +1418,7 @@ def test_a_program_holding_a_kernel_this_host_cannot_lower_is_refused_ahead_nami
                                                                                   "attention")
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("generation", [name for name in gate_generations() if capability(name) >= (9, 0)])
 def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(generation):
     """A Mosaic GPU kernel compiled for a compile-only GPU of each generation from Hopper on, in a process
@@ -1364,7 +1560,8 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     refused; the rung its plan recorded is that GPU's, which a second build for it reuses, apart from the
     canonical build's beside it in one record directory. Its runs score no split midway, whose programs a
     build compiles too (row 4752), so its three builds are their steps' alone (row 3981); the first alone
-    inspects, so compiles a sampled step, which no rung record's key holds."""
+    inspects, so compiles a sampled step, which no rung record's key holds. Its GPUs' room is what the step
+    needs at two microbatches, less than one needs (each measured, `need_run`)."""
     import dataclasses
 
     from run_kinds import lm
@@ -1373,6 +1570,8 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     from dew.nn.kernels.generation import gpu_target
     from dew.training.ahead import AheadOfTime, CompiledAhead
 
+    one, room = (need_run(tmp_path / f"need{split}", "sm90", split) for split in (1, 2))
+    assert room < one, (one, room)
     records = tmp_path / "rungs"
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
 
@@ -1386,7 +1585,7 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
                                "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm90",
                                "--trainer.compile-ahead.devices", "1",
                                "--trainer.compile-ahead.path", str(path),
-                               "--trainer.compile-ahead.capacity-gib", "0.0007",
+                               "--trainer.compile-ahead.capacity-gib", capacity_gib(room),
                                *(["--trainer.inspection.every", "1"] if inspected else []),
                                "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None", *stated],
                               default=lm(root, drawn=False))
@@ -1398,7 +1597,7 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     again = compiled("--trainer.compile-ahead.multiprocessors", "114")
     canonical = compiled()
     assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
-    assert pcie.built.memory == pcie.target.memory == allocator_limit(int(0.0007 * 2**30))
+    assert pcie.built.memory == pcie.target.memory == allocator_limit(int(float(capacity_gib(room)) * 2**30))
     assert pcie.sampled is not None and again.built == pcie.built
     assert canonical.built.multiprocessors == gpu_target("sm90").multiprocessors
     held = dataclasses.replace(gpu_target("sm90"), device_kind="NVIDIA H100 PCIe", multiprocessors=114)
@@ -1447,24 +1646,30 @@ def test_a_build_binds_its_loader_to_its_plugin_and_linked_libraries_and_not_to_
 
 def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_saved_plan(tmp_path):
     """`--trainer.compile-ahead.frontier` (`RunConfig.cli`) asks the step compiled ahead for its frontier,
-    which its saved plan records (rows 3108, 3147): on GPUs of 0.0007 GiB, where the plan needs two
-    microbatches, a rung above it that fits at one."""
+    which its saved plan records (rows 3108, 3147): on GPUs whose room is what the step needs at two
+    microbatches, less than one needs (each measured, `need_run`), where the plan's compile at one did not
+    fit and the plan takes two, a rung above it that fits at one."""
     from run_kinds import lm
 
     from dew.config.lm import LMRunConfig
     from dew.training.ahead import AheadOfTime, CompiledAhead
 
+    one, room = (need_run(tmp_path / f"need{split}", "sm80", split) for split in (1, 2))
+    assert room < one, (one, room)
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
                            "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
                            "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
-                           "--trainer.compile-ahead.capacity-gib", "0.0007",
+                           "--trainer.compile-ahead.capacity-gib", capacity_gib(room),
                            "--trainer.compile-ahead.frontier"],
                           default=lm(tmp_path, drawn=False))
     with pytest.raises(CompiledAhead) as ended:
         run.run()
     assert ended.value.code == 0
     plan = record(AheadOfTime.load(path).plan, "plan")
+    whole = [probe for probe in plan["probes"]
+             if probe["split"] == 1 and probe["remat"] == plan["remat"]]
+    assert whole and not any(probe["fits"] for probe in whole), plan["probes"]
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
     assert plan["split"] == 2 and frontier
     assert all(entry["fits"] is True and entry["split"] < plan["split"] for entry in frontier)
@@ -1760,9 +1965,9 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     off its plan: compiled on compile-only GPUs outside a prepare), whose XLA products ran up to 48 times
     slower on a GH200 (UB-4792-AHEAD-TIME), is not taken where the run's own compile tunes (its step
     compiled on its devices as without a file, said once), and is where it tunes nothing either (XLA_FLAGS
-    setting the autotuner's level 0, as a repeatable lane's do), its products then the run's own. A step
-    of this host's own target stands for the GPU host's here: a CPU is no target a step compiles ahead
-    for."""
+    setting the autotuner's level 0, as a repeatable lane's do), its products then the run's own, unless
+    it leaves a convolution's algorithm to run time (`at_run`). A step of this host's own target stands for
+    the GPU host's here: a CPU is no target a step compiles ahead for."""
     from dew.training.ahead import AheadOfTime, BuildTarget, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
@@ -1783,6 +1988,9 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
     level_zero = dataclasses.replace(handed, built=BuildTarget.of(here))
     assert level_zero.runnable(here) is level_zero
+    # One leaving a convolution's algorithm to run time is never taken: the run's own compile picks it.
+    at_run = dataclasses.replace(level_zero, plan={**record(level_zero.plan, "plan"), "at_run_time": True})
+    assert at_run.runnable(here) is None
     with pytest.raises(ValueError):
         own.runnable(here)
 
@@ -1992,6 +2200,68 @@ def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_
     assert (built.target.generation, built.target.multiprocessors) == ("sm90", 132)
 
 
+
+def test_programs_compiled_ahead_for_a_generation_are_untuned_and_refused_where_a_compile_tunes(
+        tmp_path, monkeypatch):
+    """Named programs compiled for a generation's canonical GPUs (`compile_programs` with no topology) are
+    XLA's untuned programs, which their file says (`AheadPrograms.tuned`), and a process whose own compile
+    tunes refuses to load them (row 8422: untuned convolutions left cuDNN's runtime heuristic to pick a
+    non-deterministic algorithm), where one compiled tuned, or one under the autotuner's level 0, loads.
+    Over a node's own topology the compile takes the GPU kind's tuned choices or is refused, naming the
+    program, where no run has tuned one yet. A program of this host's own target stands for the GPU
+    host's here."""
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.training.ahead import AheadPrograms, BuildTarget, compile_programs
+
+    square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+    built = compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm90")
+    assert not built.tuned
+    here = jax.devices()[:1]
+    with pytest.raises(ValueError):
+        AheadPrograms(BuildTarget.of(here), {}, tuned=False).loaded()
+    assert AheadPrograms(BuildTarget.of(here), {}, tuned=True).loaded() == {}
+    serialized = tmp_path / "topology.bin"
+    serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm90", 1))).serialize())
+    with pytest.raises(ValueError):
+        compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm90", topology=serialized)
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
+    assert AheadPrograms(BuildTarget.of(here), {}, tuned=False).loaded() == {}
+
+
+def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path, monkeypatch):
+    """A compile without a device cannot pick a cuDNN convolution's algorithm, which is then picked at run
+    time, on an A100 not the same each run (`report.DEVICELESS_CONVOLUTION_PICKS`, row 7941): over a node's
+    topology, autotuner off as a repeatable lane runs, and over the generation's canonical GPUs alike, a
+    program holding a convolution is refused before any compiles (`report.CompiledOnDevice`), named, where a
+    product alone compiles."""
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import compile_programs
+
+    serialized = tmp_path / "topology.bin"
+    serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
+    image = jax.ShapeDtypeStruct((1, 8, 8, 4), jnp.float32)
+    kernel = jax.ShapeDtypeStruct((3, 3, 4, 4), jnp.float32)
+    square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+
+    def convolved(x, w):
+        return jax.lax.conv_general_dilated(x, w, (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"))
+
+    with pytest.raises(report.CompiledOnDevice) as refused:
+        compile_programs({"conv": (convolved, [image, kernel])}, "sm80", topology=serialized)
+    assert refused.value.programs == ("conv",)
+    assert list(compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm80",
+                                 topology=serialized).programs) == ["dot"]
+    with pytest.raises(report.CompiledOnDevice) as refused:
+        compile_programs({"conv": (convolved, [image, kernel]),
+                          "dot": (lambda x, y: x @ y, [square, square])}, "sm80")
+    assert refused.value.programs == ("conv",)
+
 def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
     """A device's own target, what a program compiled ahead is checked against, is the one `gpu_target`
     resolves for it unassumed: an H100 PCIe its own kind and peaks with the multiprocessors it reports, and an
@@ -2092,3 +2362,72 @@ def test_cudnn_attentions_gates_read_the_capability_of_the_gpus_a_program_is_tra
         assert cudnn.check_compute_capability("9.0") == (capability >= (9, 0))
         assert cudnn.is_cuda_compute_capability_equal("10.0") == (capability == (10, 0))
     assert not cudnn.check_compute_capability("8.0")
+
+
+@COMPILES_ON_CPU
+def test_a_step_compiled_ahead_is_admitted_at_the_loading_runs_pool_share_not_the_compilers(monkeypatch):
+    """A prepare whose own process holds a sliver of its GPU (a job packed beside others, its pool's
+    fraction 0.08) admits the run it compiles for at the share that run holds (`AheadTarget.share`): Dew's
+    own by default, the run's named one where it names another. It admitted an 80 GiB GPU's step against
+    6.78 GiB, its own share of its own GPU, and refused a state that fits the run (row 7644). Targets of two
+    shares made in one process each keep their own, built before either is read, and so does a direct
+    `compile_only_gpus` (the library's path), where the last target's share was every alike GPU's and a
+    direct one took the process's (train 1026's review, F1)."""
+    from dew._devices import DEW_SHARE, FRACTIONS, device_memory
+    from dew.training.ahead import AheadTarget, compile_only_gpus
+
+    for name in FRACTIONS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(FRACTIONS[1], "0.08")
+    memory = 80 * 2**30
+    made = [(target.compile_only(), share) for target, share in (
+        (AheadTarget("sm90", 2, capacity_gib=80), DEW_SHARE),
+        (AheadTarget("sm90", 2, capacity_gib=80, share=0.5), 0.5))]
+    made.append((compile_only_gpus("sm90", 2, memory), DEW_SHARE))
+    for devices, share in made:
+        assert {device_memory(device)["bytes_limit"] for device in devices} == {int(memory * share)}
+    with pytest.raises(ValueError):
+        AheadTarget("sm90", 2, capacity_gib=80, share=1.5)
+
+
+@COMPILES_ON_CPU
+def test_a_program_compiled_for_a_compile_only_gpu_is_refused_by_the_keeper_not_crashed_on():
+    """A program a process compiles at Dew's compile point for a compile-only GPU (`gpus`), as a GPU cell's
+    prepare does on its host's CPU, is no program of the process's default backend: the keeper
+    (`keeping`) refuses it by name, its executable never loaded, where reading its loaded devices raised
+    AttributeError and failed the A100 tier's recurrence cells (rows 7323, 7866, 7867)."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.options import owned_program
+    from dew.training.ahead import keeping
+
+    placed = jax.ShapeDtypeStruct((3,), jnp.float32, sharding=NamedSharding(
+        Mesh(np.asarray(gpus("sm80")), ("data",)), PartitionSpec()))
+    with keeping() as programs:
+        owned_program(lambda values: values * 2).executable(placed)
+    assert programs.kept == {} and len(programs.refused) == 1
+
+
+@pytest.mark.mesh(devices=2)
+def test_programs_built_for_the_host_cpu_load_onto_it_whatever_the_process_lists_first(monkeypatch):
+    """Programs compiled ahead for the host's CPU (`BuildTarget.cpu`) load onto the host's first CPU
+    (`BuildTarget.own_devices`) in a process whose devices list another first, as a GPU's process lists its
+    GPUs before the CPUs it holds beside them: loaded onto the process's first devices, a CPU's program went
+    to them (row 8376's CPU-placed arms, `reference_error.ahead_arm(host=True)`)."""
+    from dew._cache import uncached
+    from dew.training.ahead import AheadPrograms, BuildTarget, Executable
+
+    host = jax.devices("cpu")
+    x = np.arange(4.0, dtype=np.float32)
+    placed = jax.sharding.SingleDeviceSharding(host[0])
+    # Compiled here, as every program compiled ahead is (`compile_programs`): one XLA loaded from the
+    # persistent cache serializes without its kernels, and loading it fails ("Function ... not found").
+    with uncached():
+        doubled = jax.jit(lambda x: x * 2.0, out_shardings=placed).lower(
+            jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=placed)).compile()
+    programs = AheadPrograms(BuildTarget.of(host[:1]), {"doubled": Executable.of(doubled)})
+    listed = jax.devices
+    # A process listing another device first, the host's first CPU among its CPUs.
+    monkeypatch.setattr(jax, "devices", lambda backend=None: listed(backend) if backend else listed()[1:])
+    ran = programs.loaded()["doubled"](x)
+    assert ran.devices() == {host[0]} and np.asarray(ran).tolist() == [0.0, 2.0, 4.0, 6.0]

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import logging
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import ClassVar
@@ -64,6 +65,7 @@ from dew.data.pipeline import (
     TokenSplit,
     Windows,
     accounts,
+    consumed_by,
     with_children,
 )
 from dew.data.plan import fingerprint
@@ -222,7 +224,7 @@ class _Fetched:
     stage: Stage
 
     def __call__(self, row: tuple[tuple[int, ...], Record]) -> tuple[Record, ...]:
-        return _outputs(self.stage, row[0][0], row[1])
+        return consumed_by(row[1], functools.partial(_outputs, self.stage, row[0][0]))
 
 
 def _memory_stages(
@@ -286,16 +288,25 @@ def _memory_stages(
             expanded: list[tuple[tuple[int, ...], Record]] = []
             pool = pool_of((stage,))
             # A stage with a pool of its own runs that many records at once, handed on in their order as
-            # each is made (`_on_pool`).
-            made = ((_outputs(stage, identifier[0], value, counts=counter) for identifier, value in rows)
-                    if pool is None else _on_pool(pool, _Fetched(stage), rows))
+            # each is made (`_on_pool`). The examples a row marked consumed (a run counting its passes,
+            # `dew.data.bounds._counted`) go to the last row a step makes of it (`consumed_by`), and a
+            # dropped row's to the next row kept (`Owed`), the last kept taking what none after holds.
+            made = (_on_pool(pool, _Fetched(stage), rows) if pool is not None else (
+                consumed_by(value, functools.partial(_outputs, stage, identifier[0], counts=counter))
+                for identifier, value in rows))
+            owed = Owed()
             for (identifier, _), outputs in zip(rows, made, strict=True):
                 for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):
                         counter.dropped(output)
+                        owed.owe(output.consumed, output.drawn)
                     else:
                         output_id = (*identifier, child) if isinstance(stage, FlatMap) else identifier
-                        expanded.append((output_id, output))
+                        kept = owed.paid(output) if isinstance(output, Mapping) else output
+                        expanded.append((output_id, kept))
+            if (owed.examples or owed.drawn) and expanded:
+                identifier, last = expanded[-1]
+                expanded[-1] = (identifier, owed.paid(record(last, "kept row")))
             rows = expanded
         consumed += 1
     if counting:

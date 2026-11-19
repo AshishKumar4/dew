@@ -11,7 +11,9 @@ a session of its own, so a rank's cleanup signals its own (the maintainer, 2026-
 killed owner 43 hours at 195% CPU on the VM). The standard library alone: the CI harness loads this file by
 path (tools/armada/child_groups.py), as importing `dew` sets the process's XLA flags."""
 
+import _thread
 import contextlib
+import functools
 import os
 import select
 import signal
@@ -147,7 +149,8 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     are let go first, their pipes closed. A start interrupted, or whose command cannot execute, stops the
     group it started, lets its lifeline go and closes every descriptor it opened: no caller holds them.
 
-    The start runs on a thread of its own (`_Starting`), which no Python signal handler runs on: one that
+    The start runs on a thread of its own (`_Starting`, started by `_thread` and waited for on a lock alone,
+    `_Done`), which no Python signal handler runs on: one that
     raises (a Ctrl-C, a deadline's alarm) runs on the main thread, whichever thread the signal reached,
     and landing between a descriptor's creation and its holder's holding it, there or inside Popen's
     own, would leak it. An interruption reaches the caller wherever it is (launching the thread, waiting
@@ -156,20 +159,57 @@ def start(command: Sequence[str], **options) -> subprocess.Popen:
     and the caller waits for either before it raises; a second interruption while it waits leaves the
     undoing to finish on its own. A start abandoned before it began starts nothing."""
     starting = _Starting(command, options)
-    worker = threading.Thread(target=starting.run, name="dew-group-start", daemon=True)
     try:
-        worker.start()
+        _thread.start_new_thread(_run, (starting.run,))
         starting.done.wait()
         return starting.result()
     except BaseException:
         process, begun = starting.abandon()
         if process is not None:
-            undoing = threading.Thread(target=_undone, args=(process,), name="dew-group-undo", daemon=True)
-            undoing.start()
-            undoing.join()
+            done = _Done()
+            _thread.start_new_thread(_run, (functools.partial(_undo_and_signal, process, done),))
+            done.wait()
         elif begun:
             starting.done.wait()
         raise
+
+
+def _run(work: Callable[[], None]) -> None:
+    """`work()` on a thread `_thread` started, under the trace and profile hooks a `threading` thread takes
+    (`threading.settrace`, `threading.setprofile`)."""
+    sys.settrace(threading.gettrace())
+    sys.setprofile(threading.getprofile())
+    work()
+
+
+class _Done:
+    """One worker's end, which one caller waits for (`wait`) on a lock alone: a caller's interruption
+    (an exception a signal handler raises) leaves it as it was wherever it lands, where `threading`'s
+    waits (`Thread.start`, `Event.wait`) reacquire a condition's lock as they unwind and an interruption
+    landing there made them raise "release unlocked lock" in its place (row 7619). `finished` is set
+    before the lock is released, so a wait whose acquire had succeeded as it was interrupted never
+    acquires again."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.lock.acquire()
+        self.finished = False
+
+    def set(self) -> None:
+        self.finished = True
+        self.lock.release()
+
+    def wait(self) -> None:
+        if not self.finished:
+            self.lock.acquire()
+
+
+def _undo_and_signal(process: subprocess.Popen, done: _Done) -> None:
+    """`process`'s group undone (`_undone`), then `done` set, however the undoing ends."""
+    try:
+        _undone(process)
+    finally:
+        done.set()
 
 
 class _Starting:
@@ -181,7 +221,7 @@ class _Starting:
     def __init__(self, command: Sequence[str], options: Mapping[str, object]) -> None:
         self.command, self.options = command, options
         self.lock = threading.Lock()
-        self.done = threading.Event()
+        self.done = _Done()
         self.begun = self.abandoned = False
         self.process: subprocess.Popen | None = None
         self.error: BaseException | None = None
@@ -223,7 +263,7 @@ class _Starting:
 def _undone(process: subprocess.Popen) -> None:
     """The group `process` leads stopped, its lifeline let go and its pipes closed: a start its caller
     abandoned (`_Starting`)."""
-    stop(process)
+    stop([process])
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None:
             stream.close()
@@ -309,35 +349,46 @@ def _close(owned: list[int], end: int) -> None:
     os.close(end)
 
 
-def stop(process: subprocess.Popen, grace: float = 0.0, interrupt: int = signal.SIGTERM,
+def stop(processes: Sequence[subprocess.Popen], grace: float = 0.0, interrupt: int = signal.SIGTERM,
          settle: float = SETTLE_SECONDS) -> list[int]:
-    """Stop the group `process` leads: with a `grace`, `interrupt` to every process in it and up to `grace`
-    seconds for the leader to exit, left unreaped; then SIGKILL to the group, while its id is still the
-    leader's own, and, where the group was `start`ed, its lifeline told the group is stopped, which kills
-    what is left by the group's id: a leader reaped before is no bar, which CI's is (it reaps pytest before
-    it stops what pytest left). Then up to `settle` seconds, one budget, for every process of it to end, and
-    the leader reaped once it has exited. Returns the processes still running then (none, normally; a
+    """Stop the groups `processes` lead, together, in their order: with a `grace`, `interrupt` to every
+    process in each and up to `grace` seconds for their leaders to exit, left unreaped; then SIGKILL to
+    every group, each while its id is still its leader's own, and, where a group was `start`ed, its lifeline
+    told the group is stopped, which kills what is left by the group's id: a leader reaped before is no
+    bar, which CI's is (it reaps pytest before it stops what pytest left). Only then up to `settle`
+    seconds, one budget, for every process of them to end, and each leader reaped once it has exited: a
+    group killed after another's settling outlived it, and a pool's worker that saw its peer gone ended
+    on its own before its kill (row 7678). Returns the processes still running then (none, normally; a
     leader the kill has not reached, in uninterruptible sleep, among them), never raised, so a caller can
     still report what ran."""
-    if grace > 0 and exit_code(process) is None and signal_group(process, interrupt):
-        groups_ended((process,), grace)
-    killed = signal_group(process, signal.SIGKILL)
-    with _HELD:
-        held = _LIFELINES.pop(process.pid, None)
-    if held:
-        os.close(held[0])
-        held[1].wait()
-        killed = True
+    if grace > 0:
+        interrupted = [process for process in processes
+                       if exit_code(process) is None and signal_group(process, interrupt)]
+        if interrupted:
+            groups_ended(interrupted, grace)
+    killed = {process.pid: signal_group(process, signal.SIGKILL) for process in processes}
+    for process in processes:
+        with _HELD:
+            held = _LIFELINES.pop(process.pid, None)
+        if held:
+            os.close(held[0])
+            held[1].wait()
+            killed[process.pid] = True
     deadline = time.monotonic() + settle
-    # The leader reaped within the budget: a leader of many threads reads as a zombie, no member, while its
+    # Each leader reaped within the budget: a leader of many threads reads as a zombie, no member, while its
     # other threads end, and only then can it be reaped.
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        process.wait(settle if killed else 0)
-    left = members(process.pid) if killed else []
-    while left and time.monotonic() < deadline:
+    for process in processes:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(max(deadline - time.monotonic(), 0.0) if killed[process.pid] else 0)
+
+    def left() -> list[int]:
+        return [pid for process in processes if killed[process.pid] for pid in members(process.pid)]
+
+    running = left()
+    while running and time.monotonic() < deadline:
         time.sleep(POLL_SECONDS)
-        left = members(process.pid)
-    return left
+        running = left()
+    return running
 
 
 def _outlived(process: subprocess.Popen, left: list[int], settle: float) -> None:
@@ -353,7 +404,7 @@ def end_group(process: subprocess.Popen, grace: float = 0.0, interrupt: int = si
     the leader left running among them, sent before the leader is reaped, while the group's id is
     still its own; then the leader reaped. Returns its exit code. A process that left the group on
     purpose (a session of its own) is out of reach."""
-    left = stop(process, grace, interrupt)
+    left = stop([process], grace, interrupt)
     code = process.wait()
     _outlived(process, left, SETTLE_SECONDS)
     return code
@@ -391,7 +442,7 @@ def owned_group(command: Sequence[str], *, grace: float = 0.0, interrupt: int = 
     given, an error naming the processes that outlived it. The group outlives no owner, as `start`'s
     does not: the one for a long process whose owner may be killed, a worker or a server on a GPU."""
     def ended(process: subprocess.Popen) -> None:
-        _outlived(process, stop(process, grace, interrupt, settle), settle)
+        _outlived(process, stop([process], grace, interrupt, settle), settle)
 
     return _ending(lambda: start(command, **options), ended)
 

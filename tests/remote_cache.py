@@ -70,18 +70,22 @@ from pathlib import Path
 FAILURES = 3
 TIMEOUT_SECONDS = 30.0
 DRAIN_SECONDS = 120.0
-_R2 = importlib.util.spec_from_file_location(
-    "armada_r2", Path(__file__).resolve().parents[1] / "tools" / "armada" / "r2.py")
-r2 = importlib.util.module_from_spec(_R2)
-_R2.loader.exec_module(r2)  # the Worker's one client and its contract (tools/armada/r2.py)
-_HOST = importlib.util.spec_from_file_location(
-    "armada_host", Path(__file__).resolve().parents[1] / "tools" / "armada" / "host.py")
-HOST = importlib.util.module_from_spec(_HOST)
-_HOST.loader.exec_module(HOST)  # the host's CPU class, which keys a bundle (tools/armada/host.py)
-_WATCHED = importlib.util.spec_from_file_location(
-    "armada_watched", Path(__file__).resolve().parents[1] / "tools" / "armada" / "watched.py")
-WATCHED = importlib.util.module_from_spec(_WATCHED)
-_WATCHED.loader.exec_module(WATCHED)  # inotify's one reader (tools/armada/watched.py's `Writes`)
+
+
+def _armada(name: str):
+    """tools/armada's module `name`, loaded by its path (the suite imports no `tools` package)."""
+    spec = importlib.util.spec_from_file_location(
+        f"armada_{name}", Path(__file__).resolve().parents[1] / "tools" / "armada" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+r2 = _armada("r2")  # the Worker's one client and its contract (tools/armada/r2.py)
+HOST = _armada("host")  # the host's CPU class, which keys a bundle (tools/armada/host.py)
+WATCHED = _armada("watched")  # inotify's one reader (tools/armada/watched.py's `Writes`)
+GRADING = _armada("grading")  # which test file a node is of (tools/armada/grading.py's `owning`)
+
 MAX_BYTES = r2.MAX_BYTES
 """The largest bundle sent or read: the Worker's bound (tools/armada/r2.json)."""
 CHUNKS = 32
@@ -214,9 +218,32 @@ class RemoteCache:
         written = self.written.setdefault(self.file, [])
         written += sorted(fresh - set(written))
 
+    def mark(self) -> tuple[str | None, int]:
+        """Where the current bundle's compiled programs stand now (`compiled_since`), read through the watch
+        its account already keeps (`_moved_on`): the local watch's, which a remote given up keeps, so a
+        test that compiled while the Worker was unreachable is still timed cold."""
+        if not self.writes.watching:
+            return None, 0
+        with self.state:
+            self._moved_on()
+            return self.file, len(self.written.get(self.file, [])) if self.file else 0
+
+    def compiled_since(self, mark: tuple[str | None, int]) -> int | None:
+        """The programs compiled since `mark` (`mark`) under the same bundle: a program the shared cache did
+        not hold, so the test that ran meanwhile ran cold; None where it is not known (no shared cache,
+        the bundle moved on, the watch lost events)."""
+        if not self.writes.watching or mark[0] is None:
+            return None
+        with self.state:
+            self._moved_on()
+            if self.file != mark[0] or mark[0] in self.blind:
+                return None
+            return len(self.written.get(mark[0], [])) - mark[1]
+
     def opened(self, file: str) -> None:
-        """Bundle `file` in the local cache, and the programs compiled from here on its."""
-        if not self.available:
+        """Bundle `file` in the local cache, and the programs compiled from here on its: its account kept
+        while the directory is watched, its programs fetched while the remote is available."""
+        if not self.writes.watching:
             return
         try:
             with self.state:
@@ -230,7 +257,7 @@ class RemoteCache:
                 # A bundle written back and now running again (A, B, A) counts what it opens from here on: the
                 # opens since its close, its own reads among them, went to it while sealed (review).
                 self.sealed.discard(file)
-                if file in self.held:
+                if file in self.held or not self.available:
                     return
                 self.held[file] = set()
             # What a prepare fetched into the directory ahead for it (`prefetch`), its values there already,
@@ -414,7 +441,7 @@ def bundle(node: str, group: str | None, worker: str | None) -> str:
     """The bundle of test `node`'s file in its execution partition: a split file's group
     (tools/armada/split.py's `G/N`) and an xdist worker compile apart, so each keeps its own."""
     parts = (group and group.replace("/", "-of-"), worker)
-    return "/".join([node.split("::")[0], *(part for part in parts if part)])
+    return "/".join([GRADING.owning(node), *(part for part in parts if part)])
 
 
 def seeded(directory: Path, key: str, value: bytes) -> bool:

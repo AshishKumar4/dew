@@ -25,6 +25,7 @@ kernels' contract (`_cutlass_takes`).
 import contextlib
 import functools
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -262,8 +263,7 @@ CASES = (
 
 
 @cell("gemm", covers=lambda case: dict(zip(AXES["gemm"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own accelerator alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_gemm_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The route's training step of `case` on its accelerator on par with the reference path's (check 1):

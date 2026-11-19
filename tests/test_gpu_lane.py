@@ -1,7 +1,7 @@
 """CI's GPU lane (tools/armada/ci.py `gpu-lane`): each test file in a process of its own, admitted on the
 GPU memory its runs measured, and tools/armada/gpu_holds.py, what a lane needs to run a file."""
 
-import hashlib
+import functools
 import itertools
 import json
 import os
@@ -9,7 +9,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import jax
 import pytest
+import tier_wire
 from armada_support import LANE_TEST, cached, fetcher, gpu_driver, gpu_lane_at, interpreter, loaded
 from tool_support import load
 
@@ -43,6 +45,26 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
     assert fetched.is_file() and not (tmp_path / "read").exists()
 
 
+def lane_machine(root: Path, monkeypatch, url: str, name: str, source: str) -> None:
+    """A GPU lane's machine at `root` with the test cache at `url` (`gpu_lane_at`), its Python and
+    fetcher, and test file `name` holding `source`."""
+    gpu_lane_at(root, monkeypatch, url, 0)
+    interpreter(root, "3.12")
+    fetcher(root)
+    (root / name).write_text(source)
+
+
+def lane_rows(ci, root: Path, tests: list[str], marks: list[Path],
+              **network: bool) -> list[tuple[str, int]]:
+    """A lane's rows over `tests` at `root`, each name and exit, with the cache on, the files its tests
+    mark that they ran (`marks`) cleared first."""
+    for mark in marks:
+        mark.unlink(missing_ok=True)
+    out = root / "verdict.json"
+    assert ci.gpu_lane("3.12", tests, out, cache="on", processes=1, deadline=600.0, **network) == 0
+    return [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]]
+
+
 def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_records_them_apart(
         ci, tmp_path, monkeypatch, cache_worker):
     """The network lane runs each file's network-marked tests alone, which every other task sets aside,
@@ -50,11 +72,7 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
     runs its other tests and is no reuse of the network lane's run, and a second network lane on the same
     inputs reuses its own (the maintainer, 2026-10-25: no CI run reached the published checkpoints' parity
     tests)."""
-    url, _, _ = cache_worker
-    gpu_lane_at(tmp_path, monkeypatch, url, 0)
-    interpreter(tmp_path, "3.12")
-    fetcher(tmp_path)
-    (tmp_path / "tests/test_hub.py").write_text(
+    lane_machine(tmp_path, monkeypatch, cache_worker[0], "tests/test_hub.py",
         "import os, pytest\nfrom pathlib import Path\n"
         "@pytest.mark.network\ndef test_reads_the_hub():\n"
         "    assert not {'HF_HUB_OFFLINE', 'HF_ENDPOINT'} & set(os.environ), 'the Hub is closed'\n"
@@ -62,16 +80,8 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
         "def test_offline():\n"
         "    assert os.environ['HF_HUB_OFFLINE'] == '1'\n"
         "    Path('offline').write_text('ran')\n")
-    out = tmp_path / "verdict.json"
     hub, offline = tmp_path / "hub", tmp_path / "offline"
-
-    def lane(**network: bool) -> list[tuple[str, int]]:
-        hub.unlink(missing_ok=True)
-        offline.unlink(missing_ok=True)
-        assert ci.gpu_lane("3.12", ["tests/test_hub.py"], out, cache="on", processes=1, deadline=600.0,
-                           **network) == 0
-        return [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]]
-
+    lane = functools.partial(lane_rows, ci, tmp_path, ["tests/test_hub.py"], [hub, offline])
     assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
     assert hub.is_file() and not offline.exists()
     assert lane() == [("3.12:tests/test_hub.py", 0)]
@@ -99,35 +109,36 @@ def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, t
 
 def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_nothing(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A lane's prepare (`gpu-lane --prepare`) runs each of its files that holds a test marked `prepares`, on
-    the CPU under the prepare's word (DEW_TIER_PREPARE, which the suite's conftest reads to skip every other
-    test), with the store its environment names: a cut file's group prepares exactly the tests its run then
-    holds, as both select and cut the file alike (a prepare that selected the marked tests alone would cut
-    them into other groups, and a run would find a test its part never prepared); a file with nothing to
-    prepare starts no process; and a prepare records no row, so no lane or task reuses it as a test's run.
-    The fixtures are fetched first, as a run's are."""
+    """A lane's prepare (`gpu-lane --prepare`) runs every file of its part, on the CPU under the prepare's
+    word (DEW_TIER_PREPARE, under which the suite's conftest has each test prepare what its run reads, one
+    that prepares nothing skipped), with the store its environment names: a cut file's group prepares exactly
+    the tests its run then holds, as both select and cut the file alike (a prepare that selected some tests
+    alone would cut them into other groups, and a run would find a test its part never prepared); every file,
+    so a site its run reaches is never unprepared (Main, 2026-11-17); and a prepare records no row, so no lane
+    or task reuses it as a test's run. The fixtures are fetched first, as a run's are."""
     url, stored, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     interpreter(tmp_path, "3.12")
     fetched = fetcher(tmp_path)
-    monkeypatch.setenv("DEW_TIER_TRUTHS", str(tmp_path / "truths"))
-    # The harness's side, as the suite's own conftest has it: a prepare skips every test but those it
-    # prepares.
+    monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path / "truths"))
+    # The suite's conftest's side, which decides what a test prepares: here, a test not marked
+    # `prepares` prepares nothing and is skipped.
     (tmp_path / "tests/conftest.py").write_text(
         "import os, pytest\n"
         "def pytest_configure(config):\n"
         "    config.addinivalue_line('markers', 'prepares: prepared on the CPU before its GPU run')\n"
         "def pytest_runtest_setup(item):\n"
-        "    if os.environ.get('DEW_TIER_PREPARE') == '1' and item.get_closest_marker('prepares') is None:\n"
+        f"    if os.environ.get('{tier_wire.PREPARE}') == '1' and\\\n"
+        "            item.get_closest_marker('prepares') is None:\n"
         "        pytest.skip('nothing to prepare')\n")
     (tmp_path / "tests/test_flows.py").write_text(
         "import os, pytest\n"
         "def said(name):\n"
-        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
+        f"    kind = 'prepared' if os.environ.get('{tier_wire.PREPARE}') == '1' else 'ran'\n"
         "    with open(f'{kind}.log', 'a') as log:\n"
         "        log.write(' '.join([name, os.environ.get('JAX_PLATFORMS', '-'),\n"
-        "                            os.environ.get('DEW_TIER_TRUTHS', '-'),\n"
-        "                            os.environ.get('DEW_TIER_UNIT', '-')]) + chr(10))\n"
+        f"                            os.environ.get('{tier_wire.TRUTHS}', '-'),\n"
+        f"                            os.environ.get('{tier_wire.UNIT}', '-')]) + chr(10))\n"
         + "".join(f"{'@pytest.mark.prepares' + chr(10) if index % 2 else ''}"
                   f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
     (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
@@ -151,12 +162,12 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         name = f"tests/test_flows.py#{group}"
         assert ci.gpu_prepared("3.12", [name, "tests/test_plain.py"], out, processes=2, deadline=600.0) == 0
         assert [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]] == [
-            (f"3.12:{name}", 0)]
+            (f"3.12:{name}", 0), ("3.12:tests/test_plain.py", 0)]
         lines = said("prepared")
         # Each told the unit it prepares, as the lane names it, under which its programs' memory is filed.
         assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"), name)}
         prepared[group] = {line[0] for line in lines}
-    assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "nothing to prepare starts no process"
+    assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "one that prepares nothing is skipped"
     assert not stored, "a prepare records no row"
     assert not (tmp_path / "artifacts" / "progress.jsonl").exists(), "nor any test as passed (review)"
     monkeypatch.delenv("ARMADA_RESUME")
@@ -251,13 +262,14 @@ def test_a_file_with_tests_for_a_users_process_runs_them_in_a_process_of_their_o
         "    users = os.environ.get('DEW_TEST_USERS_ARITHMETIC') == '1'\n"
         "    if users != (item.get_closest_marker('users_process') is not None):\n"
         "        pytest.skip('another process of the lane runs it')\n"
-        "    if os.environ.get('DEW_TIER_PREPARE') == '1' and item.get_closest_marker('prepares') is None:\n"
+        f"    if os.environ.get('{tier_wire.PREPARE}') == '1' and\\\n"
+        "            item.get_closest_marker('prepares') is None:\n"
         "        pytest.skip('nothing to prepare')\n")
     (tmp_path / "tests/test_flows.py").write_text(
         "import os, pytest\n"
         "from pathlib import Path\n"
         "def said(name):\n"
-        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
+        f"    kind = 'prepared' if os.environ.get('{tier_wire.PREPARE}') == '1' else 'ran'\n"
         # A file a run of its own, written whole: nothing a later run reads, so no record's input.
         "    users = os.environ.get('DEW_TEST_USERS_ARITHMETIC', '0')\n"
         "    Path(f'flow-{kind}-{name}-{os.getpid()}').write_text(users)\n"
@@ -500,6 +512,72 @@ def test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their
     assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "11")
 
 
+def test_a_gpu_lane_given_test_nodes_grades_each_by_its_own_cases(ci, tmp_path, monkeypatch, cache_worker):
+    """A lane given single tests by node id (`file::test`, a parametrized one among them, as a lane's own GPU
+    run names them) grades each by its own cases: one that passed is green, one whose case failed red with
+    it, none "never ran" (2026-11-17: every node id a tier was given read "no evidence ran", its cases matched
+    against their file's name)."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    (tmp_path / "tests/test_nodes.py").write_text(
+        "import pytest\n"
+        "def test_walk():\n    pass\n"
+        "@pytest.mark.parametrize('form', ['pipeline', 'streamed'])\n"
+        "def test_pipeline(form):\n    assert form == 'pipeline'\n"
+        "def test_other():\n    raise SystemExit('not named')\n")
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    out = tmp_path / "verdict.json"
+    nodes = ["tests/test_nodes.py::test_walk", "tests/test_nodes.py::test_pipeline"]
+    ci.gpu_lane("3.12", nodes, out, cache="off", processes=1, deadline=600.0)
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    assert {name: row["exitCode"] for name, row in rows.items()} == {
+        "3.12:tests/test_nodes.py::test_walk": 0, "3.12:tests/test_nodes.py::test_pipeline": 1}
+    assert "test_pipeline[streamed]" in rows["3.12:tests/test_nodes.py::test_pipeline"]["output"]
+    assert all("no evidence" not in row["output"] for row in rows.values())
+
+
+def test_a_test_nodes_green_run_keeps_a_record_its_next_lane_reuses(ci, tmp_path, monkeypatch, cache_worker):
+    """A test node's green run (`file::test`, its parametrized case's id outside the Worker's key alphabet)
+    keeps its file's record under a place the Worker takes (`rows.row_place`), so a second lane on the same
+    inputs reuses it rather than run it again, and another node of the same file is no reuse of it (review of
+    the first node-id grading: a node row found no record of its process, and its place held a colon)."""
+    lane_machine(tmp_path, monkeypatch, cache_worker[0], "tests/test_nodes.py",
+        "import pytest\nfrom pathlib import Path\n"
+        "@pytest.mark.parametrize('form', ['a/b c'])\n"
+        "def test_walk(form):\n    Path('walked').write_text(form)\n"
+        "def test_other():\n    Path('othered').write_text('ran')\n")
+    walked, othered = tmp_path / "walked", tmp_path / "othered"
+
+    def lane(node: str) -> list[tuple[str, int]]:
+        return lane_rows(ci, tmp_path, [node], [walked, othered])
+    walk, other = "tests/test_nodes.py::test_walk", "tests/test_nodes.py::test_other"
+    assert lane(walk) == [(f"3.12:{walk}", 0)]
+    assert walked.read_text() == "a/b c"
+    assert lane(walk) == [(f"3.12:{walk}", 0)]
+    assert not walked.exists(), "the node's green run on the same inputs is reused"
+    assert lane(other) == [(f"3.12:{other}", 0)]
+    assert othered.is_file() and not walked.exists(), "another node of its file runs its own"
+
+
+def test_a_test_nodes_record_is_kept_where_the_worker_takes_it_and_read_back_as_its_node(ci):
+    """A test node's record place (`rows.row_place`) is a key the Worker takes, however its parametrized
+    case is spelled or long, distinct from its file's and its siblings', and its readers (`key_parts`) read
+    it back as the node, a long one as its file's node by digest, never a file of its own; a file whose
+    name holds an escape's characters reads back as itself."""
+    file = "tests/test_nodes.py"
+    nodes = [f"{file}::test_walk", f"{file}::test_walk[a/b c]", f"{file}::Walks::test_walk[\u00e9-..]",
+             f"{file}::test_walk[{'x' * 400}]"]
+    places = [ci.record_key("3.12", ci.row("3.12", node, ""), "sm90") for node in [file, *nodes]]
+    assert all(ci.r2.valid(place) for place in places) and len(set(places)) == len(places)
+    read = [ci.key_parts(place.removeprefix(f"{ci.CACHE_PREFIX}/3.12/"))[1] for place in places]
+    assert read[:4] == [file, *nodes[:3]]
+    assert read[4].startswith(f"{file}::") and read[4] != nodes[3]
+    odd = "tests/test_a=20b.py"
+    assert ci.key_parts(ci.record_key("3.12", ci.row("3.12", odd, ""), "sm90").removeprefix(
+        f"{ci.CACHE_PREFIX}/3.12/"))[1] == odd
+
+
 def test_a_tier_cut_groups_green_row_is_reused_while_its_cut_holds_the_same_tests(
         ci, tmp_path, monkeypatch, cache_worker):
     """A group the tier cuts by its GPUs' own seconds (DEW_SPLIT_DURATIONS) keeps its green row under a key,
@@ -658,26 +736,33 @@ def test_a_tier_cut_group_is_admitted_on_the_most_its_file_held_and_no_need_is_c
 
 def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare_filed(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A lane unit whose prepare filed its programs' memory (`NEEDS`, under the tier's store, its prepare told
+    """A lane unit whose prepare filed its programs' memory (`tier_wire.needs_file`, its prepare told
     which unit it is by DEW_TIER_UNIT) is given no less than the least pool at which Dew's admission
-    (dew.training.memory `needed`) takes the most demanding of them, beside what its runs measured: a part's
-    float64 truths, which no run of it held, are admitted before they run (2026-11-17: two flows' 1.71 GiB
-    terms walk beside 1.1 GiB of arms ran out of a 2.84 GiB share). One past the lane's share is not run
-    below it: its row is red, naming its need and the GPU (Main, 2026-11-17)."""
+    (dew.training.memory `needed`, the GPU's memory, read as its pool's share by `allocator_limit`)
+    takes the most demanding of them, beside what its runs measured: a part's float64 truths, which no
+    run of it held, are admitted before they run (2026-11-17: two flows' 1.71 GiB terms walk beside
+    1.1 GiB of arms ran out of a 2.84 GiB share). One past the lane's share is not run below it: its row
+    has no verdict, naming its need and the GPU (Main, 2026-11-17). Dew's own functions read it, here as
+    the lane does, on a lane a tenth of its GPU, where a need read in the wrong units is ten times off
+    (rows 7460, 7461: red unschedulable at 34.88 GiB)."""
+    from dew._devices import allocator_limit
+    from dew.training.memory import needed
+
     url, stored, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     (tmp_path / "tests/test_flow.py").write_text(LANE_TEST)
     interpreter(tmp_path, "3.12")
     fetcher(tmp_path)
-    # Dew's admission standing in, in the lane's environment as the real one runs: a program's least pool its
-    # resident and beside bytes and twice its temporaries, as a stranding allocator's.
-    monkeypatch.setattr(ci.gpu_measures, "NEEDED", "import json, sys\n"
-                        "units = json.load(sys.stdin)\n"
-                        "print(json.dumps({name: max(p['resident'] + p['beside'] + 2 * p['temporaries'] "
-                        "for p in programs) for name, programs in units.items()}))\n")
     truths = tmp_path / "truths"
-    monkeypatch.setenv("DEW_TIER_TRUTHS", str(truths))
-    gib, total = 2 ** 30, 81920 * 2 ** 20
+    monkeypatch.setenv(tier_wire.TRUTHS, str(truths))
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.1")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    gib, mib, total = 2 ** 30, 2 ** 20, 81920 * 2 ** 20
+    budget, whole = 0.1 * total, float(ci.WHOLE_GPU) * total
+
+    def admitted(*programs: tuple[int, int, int]) -> int:
+        """Dew's admission of `programs` on this device, in its pool's bytes, as the lane reads it."""
+        return allocator_limit(max(needed(jax.local_devices()[0], r, b, m) for r, b, m in programs))
 
     def measured() -> None:
         # Its measured 2 GiB, as each run here records its own (with no GPU, none) over it.
@@ -688,10 +773,9 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
 
     def filed(*programs: tuple[int, int, int]) -> None:
         name = "tests/test_flow.py"
-        (truths / "needs").mkdir(parents=True, exist_ok=True)
         listed = [{"resident": r, "beside": b, "temporaries": m} for r, b, m in programs]
-        (truths / "needs" / f"{hashlib.sha256(name.encode()).hexdigest()[:16]}.json").write_text(
-            json.dumps({"unit": name, "programs": listed}))
+        tier_wire.needs_file(truths, name).parent.mkdir(parents=True, exist_ok=True)
+        tier_wire.needs_file(truths, name).write_text(json.dumps({"unit": name, "programs": listed}))
 
     def lane() -> tuple[float, dict]:
         measured()
@@ -703,22 +787,34 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     # Its measured 2 GiB alone: 3.5 GiB, its peak and headroom.
     share, row = lane()
     assert (share, row["output"]) == (2 * gib * 1.25 + gib, "")
-    # Its arms, and its float64 walk beside them, whose stranded temporaries need 7 GiB: given those.
-    filed((gib, gib // 2, gib // 4), (gib, gib, int(2.5 * gib)))
-    share, row = lane()
-    assert (share, row["output"], row["exitCode"]) == (7 * gib, "", 0)
+    # A GH200 part's flows as their prepare filed them (2026-11-17, MAINGPU-8063e3557-PART3of9's
+    # needs/117ca29968591c89.json, its two largest of 80 programs), and arms beside a float64 walk: each run,
+    # given no less than Dew's admission of them.
+    for programs in (((76 * mib, 107 * mib, 1836 * mib), (76 * mib, 107 * mib, 1428 * mib)),
+                     ((gib, gib // 2, gib // 4), (gib, gib, 5 * gib))):
+        filed(*programs)
+        share, row = lane()
+        assert admitted(*programs) <= budget
+        assert (row["output"], row["exitCode"]) == ("", 0)
+        # Its measured peak's share raised to Dew's admission, exactly as the lane gives it.
+        record = {"depends": ["tests/test_flow.py"], "peak": 2 * gib, "shares": 0, "pools": 0}
+        given = ci.gpu_needs(record, budget, float(admitted(*programs)))[0]
+        assert share == float(str(given / total)) * total
     # Its children each take a share's fraction: what it holds is of its raised share, 7 GiB twice over.
     assert ci.gpu_needs({"depends": [], "peak": 2 * gib, "shares": 1, "pools": 0}, 40 * gib, 7 * gib) == (
         7 * gib, 14 * gib)
-    # Programs past the lane's 40 GiB: none runs, each red as its file, its row naming its need and the GPU,
-    # and saying a lane of the whole GPU holds it only where that lane's 60 GiB (JAX's 75%) does.
-    for need, temporaries, whole in ((50, 24, True), (70, 34, False), (98, 48, False)):
-        filed((gib, gib, temporaries * gib))
+    # Programs past the lane's share: none runs, none with a verdict, its row naming its need and the GPU,
+    # and saying a lane of the whole GPU holds it only where that lane's (JAX's 75%) does.
+    for temporaries in (12 * gib, 70 * gib):
+        filed((gib, gib, temporaries))
+        need = admitted((gib, gib, temporaries))
         runs = len(lane_runs(tmp_path, "test_flow"))
         _, row = lane()
-        assert len(lane_runs(tmp_path, "test_flow")) == runs and row["exitCode"] == 1
-        assert row["kind"] == "whole" and f"{need:.2f} GiB" in row["output"]
-        assert ci.device_class() in row["output"] and ("holds it" in row["output"]) == whole
+        assert need > budget and len(lane_runs(tmp_path, "test_flow")) == runs and row["exitCode"] == 1
+        # No verdict of its tests (`grading.STALE`): Platform's harness evidence, never its file's verdict.
+        assert row["kind"] == ci.grading.STALE and f"{need / gib:.2f} GiB" in row["output"]
+        assert ci.device_class() in row["output"] and ("holds it" in row["output"]) == (need <= whole)
+
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(
         ci, tmp_path, monkeypatch, cache_worker, capsys):

@@ -6,6 +6,7 @@ bits of significand, bfloat16's), and a second product of the rounded values. Tw
 first product summed whole, or in two halves of its depth) round about one of its 16,384 values apart a draw,
 each a quantum of the grid, which no float64 truth that rounds for itself can hold both arms to."""
 
+import arm_forms
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -18,6 +19,7 @@ from reference_error import (
     Rounded,
     UnrecordedTruth,
     UnroundedDecisions,
+    as_recorded,
     assert_as_exact,
     indexed_recording,
     widened,
@@ -75,12 +77,10 @@ def product(x, w):
 
 def decided_apart(one, other, seeds: int) -> int:
     """How many of `seeds` draws two arms round some value of otherwise, each compiled and run as the gate
-    compiles and runs a site's arms (`reference_error._arms`, `_ynn_decided`, `summed_as_run`)."""
-    import reference_error
-
-    first, second = reference_error._arms(one, other)
+    compiles and runs a site's arms (`arm_forms._arms`, `_ynn_decided`, `summed_as_run`)."""
+    first, second = arm_forms._arms(one, other)
     with summed_as_run():
-        reference_error._ynn_decided("decided apart", [first, second], draw(0))
+        arm_forms._ynn_decided("decided apart", [first, second], draw(0))
         return sum(not np.array_equal(*(np.asarray(arm(*draw(seed)).decisions["q"])
                                         for arm in (first, second))) for seed in range(seeds))
 
@@ -135,8 +135,7 @@ def test_values_rounded_that_are_not_the_arms_are_charged():
 def test_a_live_arm_marked_as_a_recording_is_held_as_any_live_arm():
     """A recording's decisions are the reference's own (`indexed_recording`'s arm); a live reference that
     marks itself as recorded is still a live arm, its zeroed decisions refused."""
-    zeroed = layer(product, decided=jnp.zeros_like)
-    zeroed.recorded = True
+    zeroed = as_recorded(layer(product, decided=jnp.zeros_like))
     with pytest.raises(UnroundedDecisions):
         assert_as_exact(layer(product), zeroed, draw, "a live arm marked recorded", seeds=SEEDS,
                         followed=followed)

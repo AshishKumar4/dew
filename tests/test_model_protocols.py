@@ -59,7 +59,19 @@ import numpy as np
 import pytest
 import quantized_arms
 from architecture_cases import CASES as ARCHITECTURES
-from checkpoint_cases import CHECKPOINTS, DECODERS, FIXTURES, LENGTH, OWN, PATHS, ROWS, loaded, reads, tokens
+from checkpoint_cases import (
+    CHECKPOINTS,
+    DECODERS,
+    FIXTURES,
+    LENGTH,
+    OWN,
+    PATHS,
+    ROWS,
+    code_path,
+    loaded,
+    reads,
+    tokens,
+)
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jepa_cases import MASK
 from model_support import float64_twin, floating_gradient, moved
@@ -554,21 +566,34 @@ def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
 
 
 @pytest.mark.parametrize("name", PATHS)
-def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
-    """The resized model reads the same variables to the model's logits, both in one program, bit for bit,
-    and a causal one decodes into a cache of `CAPACITY` slots and draws the same tokens over prompts whose
-    float64 greedy walk clears the selection margin at every step (`_margined_prompts`). Its attention
-    reduces over the shorter cache, so the cached logits are the model's bits or as exact as them
-    (`as_exact`). Each call is compiled, where op by op the logits took a minute of the test, and the
-    greedy decodes run as the check runs its arms (`summed_as_run`), whose programs they share (ledger
-    2957)."""
+def test_a_model_at_a_cache_capacity_computes_the_models_logits(name):
+    """The resized model reads the same variables to the model's logits, both in one program, bit for
+    bit."""
     source, rows = loaded(name), tokens(name)
-    model, variables = source.model, source.variables
-    sized = model.with_cache_capacity(CAPACITY)
+    sized = source.model.with_cache_capacity(CAPACITY)
     same(*jax.jit(lambda variables, rows: [network.apply(variables, rows, method="logits")
-                                           for network in (sized, model)])(variables, rows))
-    if not model.causal:
-        return
+                                           for network in (sized, source.model)])(source.variables, rows))
+
+
+def _decodes(name: str) -> bool:
+    """Whether `name`'s model decodes causally through a cache: DiffusionGemma's clean encoder (`OWN`), and
+    a decoder whose record is causal or whose family only its own translator reads (`code_path`'s
+    direction), as its load builds it (the decode test holds it to `model.causal`)."""
+    path = code_path(name)
+    return name in OWN or len(path) == 2 or path[2][4]
+
+
+@pytest.mark.parametrize("name", [name for name in PATHS if _decodes(name)])
+def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
+    """A causal model decodes into a cache of `CAPACITY` slots and draws the same tokens as at its own over
+    prompts whose float64 greedy walk clears the selection margin at every step (`_margined_prompts`). Its
+    attention reduces over the shorter cache, so the cached logits are the model's bits or as exact as
+    them (`as_exact`). Each call is compiled, where op by op the logits took a minute of the test, and the
+    greedy decodes run as the check runs its arms (`summed_as_run`), whose programs they share (ledger
+    2957). Its logits at the capacity are the model's (the logits test beside it)."""
+    source = loaded(name)
+    model, variables = source.model, source.variables
+    assert model.causal
     call = tuple(_decoding(name).items())
     own, at_capacity = _programs(name, "model", call), _programs(name, "sized", call)
     # Prompts whose float64 greedy walk selects each token by a margin float32's rounding cannot cross, so

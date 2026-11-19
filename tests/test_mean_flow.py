@@ -140,19 +140,24 @@ def meanflow_case(kernel: str):
         return MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
 
     fused, xla = over(kernel, "bfloat16"), over("xla", "bfloat16")
-    template = xla.init(jax.random.PRNGKey(0))
+    # Each a program of its own (row 6857): run op by op, the model's initializer, and check 1's one call
+    # of each arm on a draw holding NumPy arrays (`reference_error._refuse_numpy_arms`), compiled over a
+    # thousand small programs on the GPU a cell holds.
+    template = jax.jit(xla.init)(jax.random.PRNGKey(0))
     tokens = xla.inputs.tokenize(["a", "b", "c", "d"] * 4)
 
+    @jax.jit
     def draw(seed):
         keys = jax.random.split(jax.random.PRNGKey(seed), 4)
         leaves, tree = jax.tree.flatten(xla.init(keys[2])["params"])
         zeroed = jax.random.split(keys[3], len(leaves))
         params = jax.tree.unflatten(tree, [
-            jax.random.normal(key, leaf.shape, leaf.dtype) / np.sqrt(np.prod(leaf.shape[:-1]))
-            if leaf.ndim >= 2 and not np.any(np.asarray(leaf)) else leaf
+            jnp.where(jnp.any(leaf != 0), leaf, (jax.random.normal(key, leaf.shape, leaf.dtype)
+                                                  / np.sqrt(np.prod(leaf.shape[:-1]))).astype(leaf.dtype))
+            if leaf.ndim >= 2 else leaf
             for key, leaf in zip(zeroed, leaves, strict=True)])
-        pixels = np.asarray(jax.random.randint(keys[0], (16, 16, 16, 3), 0, 256), np.uint8)
-        return params, pixels, np.asarray(keys[1])
+        pixels = jax.random.randint(keys[0], (16, 16, 16, 3), 0, 256).astype(jnp.uint8)
+        return params, pixels, keys[1]
 
     def stepped(task):
         def run(params, pixels, key):

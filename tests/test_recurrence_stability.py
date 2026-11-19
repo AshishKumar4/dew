@@ -38,6 +38,7 @@ from test_recurrence_chunk import (
     CHUNK,
     KEY_WIDTH,
     LENGTH,
+    TURNED,
     VALUE_HEADS,
     chunk_on,
     cotangents as drawn_cotangents,
@@ -62,6 +63,13 @@ SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.
 """The template's families as hooks: the gated delta rule's decay a head and a key dimension (its draws'
 sigmoid write gates of unit keys declared, `write_bound`), a decay with a write gate and no delta rule, the
 gated delta net's formed gates, and Mamba2's rated decay."""
+
+PORTABLE_SITES = {**SITES, 'turned': TURNED, 'mamba3': dataclasses.replace(TURNED, reads='apart')}
+"""The portable math's sites: the template's families, and a state turning its key pairs (`Hooks.turns`)
+read after its update and apart from the token's own write (Mamba-3's), whose turns' gradient took a chunk's
+exclusive prefixes as differences under each regime (row 8423). The template's 16-bit turned calls join its
+families with mamba_ssm's recordings at these regimes, its reference at their dtype (testing.md), which
+rounds its turned queries and keys to bf16 as the template does."""
 
 LONG = 1024
 """A long sequence's tokens: 64 chunks, the memory carried through all of them."""
@@ -297,6 +305,58 @@ SEEDS = {
 """Each site's declared seeds for check 1, sized by `seeds_for`: the fewest for
 which the token-by-token reference compared with itself resolves the factor in both leaves."""
 
+TURNED_SEEDS = {
+    ('turned', 'decays near one'): 8,
+    ('turned', 'decays near zero'): 64,
+    ('turned', 'the decay bound'): 64,
+    ('turned', 'aligned keys'): 8,
+    ('turned', 'resets on chunk edges'): 16,
+    ('turned', 'saturated gates'): 16,
+    ('turned', 'spread gates'): 32,
+    ('turned', 'a long sequence'): 8,
+    ('turned', 'a fading memory'): 8,
+    ('turned', 'steep then mild'): 8,
+    ('mamba3', 'decays near one'): 8,
+    ('mamba3', 'decays near zero'): 256,
+    ('mamba3', 'the decay bound'): 256,
+    ('mamba3', 'aligned keys'): 8,
+    ('mamba3', 'resets on chunk edges'): 16,
+    ('mamba3', 'saturated gates'): 16,
+    ('mamba3', 'spread gates'): 32,
+    ('mamba3', 'a long sequence'): 8,
+    ('mamba3', 'a fading memory'): 8,
+    ('mamba3', 'steep then mild'): 8,
+}
+"""The turned sites' declared seeds for check 1 (`PORTABLE_SITES`), sized by `seeds_for` as `SEEDS`
+(jsf-regseeds)."""
+
+TURNED_GRADIENT_SEEDS = {
+    ('turned', 'decays near one'): 64,
+    ('turned', 'decays near zero'): 128,
+    ('turned', 'the decay bound'): 64,
+    ('turned', 'aligned keys'): 64,
+    ('turned', 'resets on chunk edges'): 64,
+    ('turned', 'saturated gates'): 64,
+    ('turned', 'spread gates'): 64,
+    ('turned', 'a long sequence'): 64,
+    ('turned', 'a fading memory'): 64,
+    ('turned', 'steep then mild'): 64,
+    ('mamba3', 'decays near one'): 64,
+    ('mamba3', 'decays near zero'): 128,
+    ('mamba3', 'the decay bound'): 64,
+    ('mamba3', 'aligned keys'): 64,
+    ('mamba3', 'resets on chunk edges'): 64,
+    ('mamba3', 'saturated gates'): 64,
+    ('mamba3', 'spread gates'): 64,
+    ('mamba3', 'a long sequence'): 64,
+    ('mamba3', 'a fading memory'): 64,
+    ('mamba3', 'steep then mild'): 64,
+}
+"""Their gradient's, sized as `GRADIENT_SEEDS`."""
+
+SEEDS |= TURNED_SEEDS
+GRADIENT_SEEDS |= TURNED_GRADIENT_SEEDS
+
 
 
 FLOORS = {'decays near one': -1.5e-4, 'decays near zero': -35.0, 'the decay bound': -5.0,
@@ -365,14 +425,14 @@ def assert_finite_and_on_par(dew, reference, draws, label: str, *, seeds: int, u
         assert_as_exact(dew, upstream, draws, label, seeds=seeds, truth_fn=reference)
 
 
-CASES = [pytest.param(name, regime, id=f'{name}-{regime}') for name in SITES for regime in REGIMES]
+CASES = [pytest.param(name, regime, id=f'{name}-{regime}') for name in PORTABLE_SITES for regime in REGIMES]
 
 
 @pytest.mark.parametrize('name, regime', CASES)
 def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, regime):
     """The portable math's output and final memory finite wherever the float64 reference's are on every
     declared seed, and on par with the reference's from float64 (module docstring)."""
-    hooks = SITES[name]
+    hooks = PORTABLE_SITES[name]
     assert_finite_and_on_par(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK, **bounded(regime)),
                              functools.partial(token_by_token, hooks),
                              functools.partial(stressed, hooks, regime),
@@ -415,7 +475,7 @@ def test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrence
 
 def _gradient_holds_check_1(name, regime):
     """A case's gradient check (`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences`)."""
-    hooks = SITES[name]
+    hooks = PORTABLE_SITES[name]
     assert_finite_and_on_par(
         with_gradients(restarting(
             functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK, **bounded(regime)), regime)),

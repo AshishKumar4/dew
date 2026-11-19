@@ -17,11 +17,11 @@ import hashlib
 import json
 import os
 import shutil
-import tarfile
 from pathlib import Path
 
 import numpy as np
 import pytest
+from interop_support import extract_fixture
 
 from dew.interop import Pretrained, single_file
 from dew.interop.safetensors_io import read_file, write_file
@@ -205,8 +205,7 @@ def test_a_transformer_only_flux_file_converts_as_from_single_file_does_and_load
     from diffusers import FluxTransformer2DModel
 
     repo = tmp_path / "flux"
-    with tarfile.open(Path(__file__).parent / "fixtures" / "flux_source.tar.xz") as archive:
-        archive.extractall(tmp_path / "source", filter="data")
+    extract_fixture(Path(__file__).parent / "fixtures" / "flux_source.tar.xz", tmp_path / "source")
     shutil.copytree(tmp_path / "source" / "pipeline", repo)
     (repo / "transformer" / WEIGHTS["transformer"]).unlink()
     config = json.loads((repo / "transformer" / "config.json").read_text()) | FLUX

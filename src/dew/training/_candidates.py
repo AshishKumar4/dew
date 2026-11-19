@@ -106,6 +106,10 @@ class StepSettings[LossT, EffectsT]:
     ns_group: int | None = None
     """The stacks of one shape the step's Newton-Schulz joins at a time where the run states none, its plan's
     (`dew.newton_schulz.released`, `FitSearch`'s release): None joins them all."""
+    sampled_passes: int | None = None
+    """The pass count the step runs where its run draws one per microbatch
+    (`dew.training.phase_passes.SampledPasses`): its microbatch counts its own rows' work at it
+    (`step_counts`); None for every other run."""
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -181,17 +185,19 @@ def _shapes(tree):
 def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
                                    schedule: Schedule, placement, replicated, split: int, narrow: bool, *,
                                    mesh: Mesh | AbstractMesh | None = None,
-                                   platforms: tuple[str, ...] | None = None) -> Candidate:
+                                   platforms: tuple[str, ...] | None = None,
+                                   copies: dict | None = None) -> Candidate:
     """`_candidate`'s step, or the one an equal trainer traced in this process over the same shapes
     (`Trainer._step_key`; row 3873: each fit of a resumed run traced its step again, 6.5 to 12.9 s, and
     lowered it, 9 s), its pipeline's schedule the one its microbatches make; a trainer whose step no value
-    states traces its own."""
+    states traces its own. `copies`, where given, are the narrow copies it reads (`prepared_for`)."""
     # Read as the candidate is made, at the rung the search put the objective at (row 3873).
     stated = stepping.step_key()
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
         stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow,
+        None if copies is None else tuple(sorted((path, str(dtype)) for path, dtype in copies.items())),
         stepping.settings.ns_group, mesh,
         platforms, stepping.shape.rows,
         stepping.shape.split, stepping.shape.prefetch, stepping.shape.examples, held_context())
@@ -204,7 +210,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
                 return dataclasses.replace(kept, sampled=sampled)
     candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow,
-                           mesh=mesh, platforms=platforms)
+                           mesh=mesh, platforms=platforms, copies=copies)
     if key is not None:
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
         # builds the reader's own).
@@ -214,6 +220,16 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
             while len(_CANDIDATES) > KEPT_CANDIDATES:
                 _CANDIDATES.popitem(last=False)
     return candidate
+
+
+def forget(lowered: jax.stages.Lowered) -> None:
+    """Drop every step this process keeps for a trainer built anew (`candidate_for`) lowered as `lowered`:
+    one whose program a compile guided by a profile supersedes (`Planned.guided`), whose executable a kept
+    lowering would hold alive beside the guided one (JAX keeps each executable of a lowering while it
+    lives)."""
+    with _KEEPING:
+        for key in [key for key, kept in _CANDIDATES.items() if kept.lowered is lowered]:
+            del _CANDIDATES[key]
 
 
 def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Candidate, batch: Batch,
@@ -234,14 +250,15 @@ def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Ca
 def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
                                 schedule: Schedule, placement, replicated, split: int, narrow: bool, *,
                                 mesh: Mesh | AbstractMesh | None = None,
-                                platforms: tuple[str, ...] | None = None) -> Candidate:
+                                platforms: tuple[str, ...] | None = None,
+                                copies: dict | None = None) -> Candidate:
     """The step reading `batch` in `split` microbatches, lowered at the objective's current rung, with what
     the fit check holds beside it. Each launch takes its derived config, but where the run measures configs
     (`tune_kernels`), whose lowering settles them (`tune`). `mesh` and `platforms` lower it for other
     devices, untuned (`lowered_for`)."""
     settings = stepping.settings
     micro = microbatch_shapes(batch, split)
-    shapes, copies, prepared, _ = prepared_for(stepping, state, micro, schedule, split, narrow)
+    shapes, copies, prepared, _ = prepared_for(stepping, state, micro, schedule, split, narrow, copies)
     shardings = stepping.shardings(prepared)
     if mesh is not None:
         shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
@@ -294,11 +311,14 @@ class Prepared(NamedTuple):
 
 
 def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
-                                  schedule: Schedule, split: int, narrow: bool) -> Prepared:
+                                  schedule: Schedule, split: int, narrow: bool,
+                                  copies: dict | None = None) -> Prepared:
     """The loss's shapes (None under a custom step), the narrow copies and the state's shapes with the
     accumulation of an update's window, `split` microbatches a step (DiLoCo's groups' `windowed`), and
     the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
-    `narrow` is off; and the loss's forward program that trace made (None under a custom step)."""
+    `narrow` is off, or `copies` whole where given (a sampled pass count's step takes its cap's, which
+    every step of the window reads: `StepCompiler.admitted_at`), refused where the trace reads a parameter
+    narrow outside them; and the loss's forward program that trace made (None under a custom step)."""
     settings = stepping.settings
     window = split * settings.accumulation
     with group_of(state, batch) as (view, rows):
@@ -312,7 +332,14 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     # A step the trainer composes narrows, from the loss it traced; a custom step's traces none (`traced`
     # None), and a scaled loss's copies none.
     narrows = narrow and not settings.dynamic_scale and settings.diloco is None
-    copies = narrow_copies(state, traced) if narrows and traced is not None else {}
+    own = narrow_copies(state, traced) if narrows and traced is not None else {}
+    if copies is not None:
+        outside = sorted(".".join(path) for path, dtype in own.items()
+                         if path not in copies or jnp.dtype(copies[path]) != jnp.dtype(dtype))
+        if outside:
+            raise ValueError(f"the step reads {outside} through narrow copies its window's other steps hold "
+                             "none of: every step of one window reads one set of copies")
+    copies = own if copies is None else copies
     prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
         lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
     return Prepared(shapes, copies, prepared, traced)
@@ -353,7 +380,8 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
                                               stepping.model_batch(micro), part, batch_tokens(micro),
                                               micro.get(CLOSES_WINDOW), whole)
         stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1,
-                                 batch_consumed(micro), split=split)
+                                 batch_consumed(micro), split=split, part=micro,
+                                 passes=settings.sampled_passes)
         return (apart(stepped)[0], *rest)
 
     returned = (moving, replicated, replicated, replicated, replicated, replicated)
@@ -368,11 +396,8 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tra
     devices, from which JAX's Pallas lowering reads the GPU, at the base rung its trainer put the
     objective at (`StepCompiler.at_base_rung`), its narrow copies where that rung keeps them (`narrow`), and
     the plan's first split: a run that does not fit splits its batch or recomputes more, no other kernel.
-    A CPU-owned state's step realizes its parameters on the host as it runs, and is not lowered."""
+    A step whose state the host holds lowers its programs apart (`StepCompiler._lowered_host`)."""
     settings = stepping.settings
-    if settings.host_master:
-        raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
-                         "the variables on the host")
     mesh = gpu_mesh(settings.device_mesh, generation)
     with assumed(generation), stepping.traced_on(mesh) as schedule:
         state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))

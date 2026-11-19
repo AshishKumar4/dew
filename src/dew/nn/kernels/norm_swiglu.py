@@ -74,7 +74,7 @@ from typing import ClassVar, NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.core import ShapedArray
+from jax.core import ShapedArray, Tracer
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
@@ -90,6 +90,7 @@ from ..precision import (
     at_least_fp32,
     compensated_add,
     compensated_total,
+    logistic_value,
     rms_weighted,
     rounded_to,
     two_product,
@@ -295,16 +296,23 @@ def elementwise(function, shape: tuple[int, ...]) -> bool:
         for equation in jaxpr.eqns:
             avals = [variable.aval for variable in (*equation.invars, *equation.outvars)]
             # A custom reverse derivative has no forward one to state the tile's (`_tangents`).
-            if (equation.primitive not in lowered or equation.primitive is core.primitives.custom_vjp_call_p
+            if (equation.primitive is core.primitives.custom_vjp_call_p
                     or any(not isinstance(aval, ShapedArray) or aval.shape not in (tuple(shape), ())
                            for aval in avals)):
                 return False
-            # A call's program, or each branch of a conditional, mapped too; any other operation entrywise.
+            # A call's program mapped too (a declared tangent's primal and its marked span among them, Dew's
+            # one logistic's): Pallas lowers a call as its body, a marked span by Dew's JAX build's
+            # call-primitive lowering (`eval_jaxpr`'s rule for every call primitive, Triton's among them),
+            # which its rules table does not list. A conditional the lowering takes, each branch mapped;
+            # any other operation entrywise and one the lowering takes.
             called = programs.called(equation)
-            inner = ((called,) if called is not None
-                     else programs.branches(equation) if equation.primitive is jax.lax.cond_p else None)
-            if inner is not None:
-                if not all(mapped(each) for each in inner):
+            if called is not None:
+                if not mapped(called):
+                    return False
+            elif equation.primitive not in lowered:
+                return False
+            elif equation.primitive is jax.lax.cond_p:
+                if not all(mapped(each) for each in programs.branches(equation)):
                     return False
             elif not layout.entrywise(equation):
                 return False
@@ -380,6 +388,14 @@ def _on_tile(jaxpr: core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> l
 
     for equation in jaxpr.eqns:
         given = [read(atom) for atom in equation.invars]
+        if equation.primitive is jax.lax.cond_p and not isinstance(given[0], Tracer):
+            # A conditional whose index is known (a predicate the activation closes over, a constant in its
+            # graph) is the branch it names, run on the tile: Pallas's Triton lowering takes a traced index
+            # alone (its rule reads the index's MLIR type; a constant has none).
+            branch = equation.params["branches"][int(np.asarray(given[0]))]
+            values.update(zip(equation.outvars, _on_tile(branch.jaxpr, branch.consts, logical, tile,
+                                                         *given[1:]), strict=True))
+            continue
         # Each program it runs within it, a call's or each branch's (`programs.with_bodies`), retraced.
         params = programs.with_bodies({key: shaped(value) for key, value in equation.params.items()},
                                       retraced)
@@ -714,7 +730,8 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean
                 else plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32))
         # The gate multiplies the weighted norm in fp32, before the one cast.
         y = rms_weighted(x, _rounded_inverse(inverse, inverse_rounded, y_ref.dtype, interpret)[:, None],
-                         weight=weight, gate=gate, activation=activation,
+                         weight=weight,
+                         gate=None if gate is None else activation_and_slope(gate, activation)[0],
                          rounded=functools.partial(_round, dtype=y_ref.dtype, interpret=interpret)
                          if after_cast and weight is not None
                          else None, weight_first=weight_first)
@@ -1270,7 +1287,7 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, porta
 
 def _product(gate, up, dtype, interpret: bool):
     """SwiGLU of fp32 halves: SiLU rounded to the operands' `dtype`, as the model rounds it, times up."""
-    return _round(gate * jax.nn.sigmoid(gate), dtype, interpret) * up
+    return _round(gate * logistic_value(gate), dtype, interpret) * up
 
 
 def _gradients(gate, up, dy):

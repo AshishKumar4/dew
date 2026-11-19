@@ -52,13 +52,13 @@ def texture(name: str, size: int = 256) -> Image.Image:
     """A Poly Haven texture's diffuse map at 1k, shrunk to `size` pixels square."""
     files = json.loads(fetched(TEXTURES.format(name=name)))
     url = files["Diffuse"]["1k"]["jpg"]["url"]
-    return Image.open(io.BytesIO(fetched(url))).convert("RGB").resize((size, size), Image.LANCZOS)
+    return Image.open(io.BytesIO(fetched(url))).convert("RGB").resize((size, size), Image.Resampling.LANCZOS)
 
 
 def sky(name: str) -> Image.Image:
     """A Poly Haven sky's tonemapped panorama, shrunk to 1024 by 512."""
     return Image.open(io.BytesIO(fetched(TONEMAPPED.format(name=name)))).convert("RGB").resize(
-        (1024, 512), Image.LANCZOS)
+        (1024, 512), Image.Resampling.LANCZOS)
 
 
 def flat(color: tuple[int, int, int]) -> Image.Image:

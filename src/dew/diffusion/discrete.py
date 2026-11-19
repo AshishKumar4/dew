@@ -252,7 +252,7 @@ class DiscreteProcess:
         request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="masked generation")
         plan = request.plan
         generation = program(
-            _generate, model,
+            _generate,
             static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id",
                              "block"),
             in_shardings=(None, plan.sharding, plan.sharding), out_shardings=(plan.sharding, None))

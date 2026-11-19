@@ -23,6 +23,7 @@ import pytest
 from delta_rule_support import fused_step, recurrence, through
 from flax import linen as nn
 from forks_support import LAYOUTS, assert_forks_as_own_rows
+from generation_support import COMPILES_ON_CPU
 from kernel_compile import gate_generations
 from model_support import as_stepped, decode_through, float64_twin
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, widened, with_gradients, without_ynn
@@ -1250,6 +1251,7 @@ def test_a_decode_token_over_a_tensor_mesh_runs_the_step_where_each_shards_heads
                               seeds=SHARDED_SEEDS, truth_fn=_widths_exact, donate=(5,))
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("target", gate_generations(scoped=True))
 def test_the_fused_step_compiles_within_each_gpus_resources(target):
     """The fused decode step, the recurrence template's step on Mosaic GPU, at Qwen3.5-0.8B's widths (16

@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_runs import assert_as_exact_as_recorded
+from recorded_runs import assert_as_exact_as_recorded
 from torch_layout import node
 
 from dew.interop.flaxdiff import SCAN_PROJECTION, scan_projection

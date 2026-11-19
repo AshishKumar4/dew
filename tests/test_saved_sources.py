@@ -11,7 +11,7 @@ import jax
 import numpy as np
 import pytest
 from process_support import run_pool
-from run_kinds import SEQ, decision, diffusion, lm, trained
+from run_kinds import SEQ, captioned, decision, diffusion, lm, pictures, trained
 from saved_run_kinds import over, windows
 from token_support import write_token_corpus
 
@@ -247,33 +247,44 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     assert LMRunConfig.load(str(tmp_path / "runs" / "second")).pretrained == str(source)
 
 
-def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, monkeypatch):
-    """A chat-format decision run, a joint head over Qwen 3.5's chat backbone, its rows framed as a
-    conversation by the backbone's chat template, saved, is a source a second decision run names
-    (`--pretrained <run>`): its release, written by `dew export` and by its task's `save_pretrained`,
-    reloads answering as the run's task serves its written weights, bit for bit; the second run trains
-    on from the first's final weights, head and backbone, its record names the run and step it read, and
-    its task loads and answers (a run from a finished chat-format run, which the export's Laya-only
-    layout refused: "Laya's layout is a marker row over a Hugging Face tokenizer", row 4310); and a
-    third, naming a head of its own, draws it fresh over the first's backbone and trains (it was refused:
-    "a decision release reads with its own")."""
+def joint_flags() -> list[str]:
+    """A chat-format decision run's flags: a joint head over Qwen 3.5's chat backbone, its rows framed as a
+    conversation by the backbone's chat template."""
     from run_kinds import QWEN_TINY
 
-    from dew.decision import Choice, Decide
+    return ["--pretrained", str(QWEN_TINY), "head:joint-shape", "--head.width", "16",
+            "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
+            "--head.feedforward", "32", "--max-len", "768"]
 
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    joint = ["--pretrained", str(QWEN_TINY), "head:joint-shape", "--head.width", "16",
-             "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
-             "--head.feedforward", "32", "--max-len", "768"]
-    first = DecisionRunConfig.cli(joint, default=decision(tmp_path, drawn=False))
-    state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
-    source = tmp_path / "runs" / "first"
-    # Its release, written by `dew export` and by its task's `save_pretrained`, reloads as the run's task
-    # serves its weights as written, on the host (the run's own task is placed on its training mesh).
+
+@pytest.fixture(scope="module")
+def chat_decision_run(tmp_path_factory):
+    """A chat-format decision run (`joint_flags`) trained a step and saved, its directory and its state:
+    the source each of the run-from-run cells below names, trained once for them."""
+    root = tmp_path_factory.mktemp("chat-decision")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("XDG_CACHE_HOME", str(root / "cache"))
+        first = DecisionRunConfig.cli(joint_flags(), default=decision(root, drawn=False))
+        state, _ = trained(first, root, "first", trainer={"checkpoint_final": True})
+    return root / "runs" / "first", state
+
+
+TEAM = {"billing": "payments", "technical": "outages", "sales": "pricing"}
+"""The question the chat-format decision runs answer, `Choice("Which team?", TEAM)`."""
+
+
+def test_a_saved_chat_format_decision_runs_release_answers_as_its_run(chat_decision_run, tmp_path,
+                                                                      monkeypatch):
+    """A chat-format decision run's release, written by `dew export` and by its task's `save_pretrained`,
+    reloads answering as the run's task serves its written weights, bit for bit, on the host (the run's
+    own task is placed on its training mesh)."""
     from dew._cli.main import main
+    from dew.decision import Choice, Decide
     from dew.decision.sources import PretrainedDecision
 
-    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    source, _ = chat_decision_run
+    team = Choice("Which team?", TEAM)
     task = Decide.from_run(str(source))
     assert main(["export", str(source), str(tmp_path / "exported")]) == 0
     task.save_pretrained(tmp_path / "saved")
@@ -284,6 +295,19 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
         for state_text in ("charged twice", "is the site down?"):
             np.testing.assert_array_equal(reloaded(state_text, {"team": team})["team"].probabilities,
                                           served(state_text, {"team": team})["team"].probabilities)
+
+
+def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(chat_decision_run, tmp_path,
+                                                                    monkeypatch):
+    """A saved chat-format decision run is a source a second decision run names (`--pretrained <run>`):
+    the second run trains on from the first's final weights, head and backbone, its record names the run
+    and step it read, and its task loads and answers (a run from a finished chat-format run, which the
+    export's Laya-only layout refused: "Laya's layout is a marker row over a Hugging Face tokenizer", row
+    4310)."""
+    from dew.decision import Choice, Decide
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    source, state = chat_decision_run
     run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest", "--max-len", "768"],
                                 default=decision(tmp_path, drawn=False))
     started = run.prepare().objective.init(jax.random.key(0))
@@ -292,11 +316,22 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     assert int(second.step) == 1
     recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
     assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
-    answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
+    answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice",
+                                                                {"team": Choice("Which team?", TEAM)})["team"]
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
-    # A run naming a head of its own over the finished run draws it fresh over the run's backbone, its
-    # head, layout and calibration set aside: it starts from the run's backbone and from the head a run
-    # drawing the same head over the base draws (row 4310's run-from-run, a fresh head).
+
+
+def test_a_decision_run_naming_its_own_head_draws_it_fresh_over_a_saved_chat_format_runs_backbone(
+        chat_decision_run, tmp_path, monkeypatch):
+    """A run naming a head of its own over a saved chat-format decision run draws it fresh over the run's
+    backbone, its head, layout and calibration set aside: it starts from the run's backbone and from the
+    head a run drawing the same head over the base draws (row 4310's run-from-run, a fresh head), and
+    trains, its task loading and answering (it was refused: "a decision release reads with its own")."""
+    from dew.decision import Choice, Decide
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    source, state = chat_decision_run
+    joint = joint_flags()
     fresh = ["--pretrained", str(source), "--source.step", "latest", *joint[2:]]
     drawn = DecisionRunConfig.cli(fresh, default=decision(tmp_path, drawn=False)).prepare().objective
     over_base = DecisionRunConfig.cli(joint, default=decision(tmp_path, drawn=False)).prepare().objective
@@ -306,7 +341,8 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     third, _ = trained(DecisionRunConfig.cli(fresh, default=decision(tmp_path, drawn=False)), tmp_path,
                        "third", trainer={"checkpoint_final": True})
     assert int(third.step) == 1
-    answer = Decide.from_run(str(tmp_path / "runs" / "third"))("charged twice", {"team": team})["team"]
+    answer = Decide.from_run(str(tmp_path / "runs" / "third"))("charged twice",
+                                                               {"team": Choice("Which team?", TEAM)})["team"]
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
 
 
@@ -506,8 +542,9 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
     starts from the weights the run's own task restores (`TextToImage.from_run`), bit for bit, and samples
     by that task's policy where it states none. It trains a step, and its record names the run it started
     from and the step it read; an adapter over it trains its factors over the run's frozen weights. The
-    source is at the run's own size, another refused, and a language model's loader refuses a diffusion
-    run, which has no release. A run that trained an adapter starts another with its base frozen
+    source binds at the run's own size and at another, from which a run over larger pictures trains (ledger
+    2792, where another size was refused), and a language model's loader refuses a diffusion run, which has
+    no release. A run that trained an adapter starts another with its base frozen
     (`test_a_diffusion_run_starts_from_an_adapted_run_with_its_base_frozen`; the two took 135 s as one
     test, ledger 3899)."""
     first = diffusion(tmp_path, drawn=False)
@@ -532,10 +569,126 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
 
     sized = load_diffusion_source(str(source), dtype="float32", size=task.inputs.sample.shape[:-1])
     assert sized.inputs.sample == task.inputs.sample
-    with pytest.raises(ValueError):
-        load_diffusion_source(str(source), dtype="float32", size=(8, 8))
+    larger = load_diffusion_source(str(source), dtype="float32", size=(8, 8))
+    assert larger.inputs.sample == dataclasses.replace(task.inputs.sample, shape=(8, 8, 3))
+    train, held = pictures()
+    state, _ = trained(dataclasses.replace(run, data=captioned(train, 8, drawn=False),
+                                           validation=captioned(held, 8, drawn=False)), tmp_path, "larger")
+    assert int(state.step) == 1
     with pytest.raises(ValueError):
         released_run(source)
+
+
+PUBLISHED = {"xl": ("tiny_diffusers", "xl"), "flux": ("flux_source", "pipeline")}
+"""Each published pipeline a run trains from (its fixture's archive and folder): SDXL's, whose time ids
+state its size, and Flux's, whose grid's tokens set its resolution shift."""
+
+
+@pytest.mark.parametrize("pipeline", sorted(PUBLISHED))
+def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_does(pipeline, tmp_path):
+    """A run trained a step from a published pipeline and saved binds at another size as the pipeline binds
+    there (ledger 2792, where another size was refused): its sample, an XL composition's size conditioning,
+    its grid's tokens and a resolution shift at that size are the pipeline's own there, each moved from
+    its own size's."""
+    from diffusion_stubs import batch_for
+    from diffusion_support import images_of, saved_after_one_step
+    from interop_support import extract_fixture
+
+    from dew.config import TrainerConfig
+    from dew.interop.conditioners import DiffusionConditioner
+    from dew.interop.pretrained import PretrainedPipeline
+    from dew.interop.saved_sources import RunPipeline
+
+    archive, folder = PUBLISHED[pipeline]
+    directory = extract_fixture(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz", tmp_path / archive)
+    directory = directory / folder
+    own = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    height, width = own.inputs.sample.shape[-3:-1]
+    config = DiffusionRunConfig(
+        pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height), preset=None,
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        val_metrics=(),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+        objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
+    saved_after_one_step(config, lambda task: batch_for(task, 4), tmp_path / "run", 1e-2)
+    # Wider and taller apart: a rectangle's two extents each read where they are.
+    size = (2 * height, width + width // 2)
+    saved = load_diffusion_source(str(tmp_path / "run"), dtype="float32", size=size)
+    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=size)
+    assert isinstance(saved, RunPipeline) and saved.grid is not None
+    assert isinstance(published, PretrainedPipeline) and isinstance(own, PretrainedPipeline)
+    assert saved.inputs.sample == published.inputs.sample != own.inputs.sample
+
+    def time_ids(source) -> dict:
+        return {keyword: condition.encoder.time_id_values for keyword, condition in
+                source.inputs.conditions.items() if isinstance(condition.encoder, DiffusionConditioner)}
+
+    assert time_ids(saved) == time_ids(published)
+    if pipeline == "xl":
+        assert time_ids(saved) and time_ids(saved) != time_ids(own)
+    assert ((saved.grid.tokens, saved.grid.origin, dict(saved.grid.config)) ==
+            (published.task.grid.tokens, published.task.grid.origin, dict(published.task.grid.config)))
+    assert saved.grid.tokens != own.task.grid.tokens
+    # The run named no preset, so it trained the pipeline's own process (`grid_process`), which follows the
+    # grid to the size.
+    assert saved.grid_process
+    if pipeline == "flux":
+        assert flow_shift(saved) == flow_shift(published) != flow_shift(own)
+
+
+def flow_shift(source) -> float:
+    """The shift of `source`'s rectified-flow process."""
+    from dew.diffusion.schedules.flow import FlowMatchingScheduler
+
+    schedule = source.process.schedule
+    assert isinstance(schedule, FlowMatchingScheduler)
+    return schedule.shift
+
+
+def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size(tmp_path):
+    """A run from a published Flux pipeline naming a resolution shift of its own keeps its process at another
+    size, where its source's follows its grid there: the run's shift equals the grid's at its own size,
+    its own shift's constants a mu flat in the token count at the grid's own mu there, so no shift's value
+    tells the two apart, and the record its objective writes does (`DiffusionObjective.grid_process`,
+    ledger 2792), as it does for an objective given a grid of its own."""
+    from diffusion_stubs import batch_for
+    from diffusion_support import images_of, saved_after_one_step
+    from interop_support import extract_fixture
+
+    from dew.config import TrainerConfig
+    from dew.diffusion.presets import Flow, ResolutionShift
+    from dew.interop.pretrained import PretrainedPipeline
+    from dew.interop.saved_sources import RunPipeline
+    from dew.objectives.diffusion import DiffusionObjective
+
+    archive, folder = PUBLISHED["flux"]
+    directory = extract_fixture(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz", tmp_path / archive)
+    directory = directory / folder
+    own = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    assert isinstance(own, PretrainedPipeline)
+    # An objective over the pipeline trains its process over its grid; one given another grid, even an
+    # equal one, trains the pipeline's process over a grid of its own.
+    assert DiffusionObjective(own, ema_decay=None).grid_process
+    assert not DiffusionObjective(own, ema_decay=None, grid=dataclasses.replace(own.grid)).grid_process
+    flow = own.grid.schedule.policy.flow
+    assert flow is not None and flow.dynamic and own.grid.tokens is not None
+    mu = flow.mu(own.grid.tokens)
+    height, width = own.inputs.sample.shape[-3:-1]
+    config = DiffusionRunConfig(
+        pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height),
+        preset=Flow(resolution_shift=ResolutionShift(base_shift=mu, max_shift=mu)),
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+        objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
+    task, _, _ = saved_after_one_step(config, lambda task: batch_for(task, 4), tmp_path / "run", 1e-2)
+    # At its own size the run's process is the grid's, value for value.
+    assert flow_shift(task) == flow_shift(own)
+    size = (2 * height, width + width // 2)
+    saved = load_diffusion_source(str(tmp_path / "run"), dtype="float32", size=size)
+    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=size)
+    assert isinstance(saved, RunPipeline)
+    assert flow_shift(saved) == flow_shift(own) != flow_shift(published)
+    assert not task.grid_process and not saved.grid_process
 
 
 @pytest.mark.mesh(devices=8)

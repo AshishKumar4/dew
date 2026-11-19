@@ -25,7 +25,7 @@ import optax
 import pytest
 from flax import linen as nn
 from process_support import device_flags
-from reference_runs import assert_arms_as_recorded
+from recorded_runs import assert_arms_as_recorded
 from tool_support import REPO_ROOT, load
 
 from dew.batch import TEXT_KEY

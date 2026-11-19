@@ -7,6 +7,8 @@ and no new device_get waits in the step loop. The log's existing counters
 sum these scalars along with losses across the reporting interval.
 """
 
+from collections.abc import Sequence
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -20,9 +22,12 @@ TRAINING_FLOPS = "__dew_training_flops"
 TOKENS = "__dew_real_tokens"
 
 
-def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Batch, *,
-                                 count_model: bool) -> Batch:
-    """Count the source's host rows, preserving its checkpoint and model inputs."""
+def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Batch, *, count_model: bool,
+                                 counts: Sequence[Objective[Loss, Effects]] | None = None) -> Batch:
+    """Count the source's host rows, preserving its checkpoint and model inputs. A run that draws its looped
+    model's pass count per microbatch (`dew.training.phase_passes.SampledPasses`) states `counts`, its
+    objective at each count from 1 to its cap: a row's work then stands at each, `[rows, cap]`, and each
+    microbatch counts its own rows' at the count it runs (`step_counts`)."""
     if not count_model and not objective.counts_tokens:
         return batch
     if any(name in batch for name in (TRAINING_FLOPS, TOKENS)):
@@ -40,22 +45,34 @@ def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Ba
         # Partition the assembled scalar over the batch's real rows. A shared conditioning row is counted
         # once, not once per example.
         held = batch if real.all() else take_batch(batch, np.flatnonzero(real))
-        training = objective.training_flops(None, held) if real.any() else 0.0
-        counted[TRAINING_FLOPS] = np.where(real, training / max(int(real.sum()), 1), 0).astype(np.float32)
+
+        def spread(counted_at: Objective[Loss, Effects]) -> np.ndarray:
+            training = counted_at.training_flops(None, held) if real.any() else 0.0
+            return np.where(real, training / max(int(real.sum()), 1), 0).astype(np.float32)
+
+        counted[TRAINING_FLOPS] = (spread(objective) if counts is None
+                                   else np.stack([spread(each) for each in counts], axis=1))
     return counted
 
 
-def uncounted(batch: Batch) -> Batch:
-    """`batch` with its work unknown: NaN where counted work would be, so a
-    step keeps its program and the global sum reports none (`step_counts`)."""
+def uncounted(batch: Batch, counts: int | None = None) -> Batch:
+    """`batch` with its work unknown: NaN where counted work would be, at each of a sampled pass count's
+    `counts` where it states them (`prepare_counts`), so a step keeps its program and the global sum
+    reports none (`step_counts`)."""
     rows = rows_of(batch)
-    return {**batch, TRAINING_FLOPS: np.full((rows,), np.nan, np.float32)}
+    shape = (rows,) if counts is None else (rows, counts)
+    return {**batch, TRAINING_FLOPS: np.full(shape, np.nan, np.float32)}
 
 
-def step_counts(batch: Batch) -> dict[str, jax.Array]:
-    """Global device-side sums, returned with the step's other scalar metrics."""
-    work = ({TRAINING_FLOPS: jnp.sum(batch[TRAINING_FLOPS], dtype=jnp.float32)}
-            if TRAINING_FLOPS in batch else {})
+def step_counts(batch: Batch, part: Batch | None = None, passes: int | None = None) -> dict[str, jax.Array]:
+    """Global device-side sums, returned with the step's other scalar metrics: the batch's work, or where its
+    program runs a sampled pass count's `passes` (`prepare_counts`'s `counts`), its microbatch `part`'s
+    rows' work at that count, which the step's whole sums over its microbatches (`whole_step`)."""
+    work = {}
+    if TRAINING_FLOPS in batch:
+        worked = (batch[TRAINING_FLOPS] if passes is None or part is None
+                  else part[TRAINING_FLOPS][:, passes - 1])
+        work[TRAINING_FLOPS] = jnp.sum(worked, dtype=jnp.float32)
     if TOKENS in batch:
         work[TOKENS] = TokenCount.sum(batch[TOKENS])
     return work

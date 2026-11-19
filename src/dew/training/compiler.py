@@ -4,34 +4,53 @@ shape, and the links of its mesh's axes, and the compile of its step from what t
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import json
 import logging
-from collections.abc import Callable, Hashable, Mapping
+import time
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
 import numpy as np
 from flax import linen as nn
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
 from dew._records import JSON, boolean, integer, json_value, listed, record
-from dew.batch import CLOSES_WINDOW, Batch
+from dew.batch import CLOSES_WINDOW, Batch, at_path, placed_at
 from dew.distributed.batches import batch_layout, batch_shardings, batch_signature
 from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
-from dew.nn.kernels.generation import gpu_target
-from dew.nn.kernels.options import hold, trace_context
+from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
+from dew.nn.kernels.options import (
+    Spent,
+    abstract_signature,
+    collecting,
+    hold,
+    lowering,
+    owned_program,
+    shapes_of,
+    spending,
+    trace_context,
+)
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
 from dew.state import Accumulation, TrainState, apart, occupied, together
+from dew.telemetry.compiles import Compiles
 from dew.telemetry.instrumentation import StepFlops
-from dew.training._candidates import Stepping, _shaped, candidate_for, lowered_for
+from dew.training._candidates import Stepping, _shaped, candidate_for, forget, lowered_for
 from dew.training._lowering import Lowered, routed
-from dew.training.distributed import link_figure, link_figures, resumed_link_figures
+from dew.training.distributed import (
+    link_figure,
+    link_figures,
+    microbatch,
+    microbatch_shapes,
+    resumed_link_figures,
+)
 from dew.training.memory import (
     climb_to,
     head_tile_of,
@@ -44,13 +63,14 @@ from dew.training.memory import (
 )
 from dew.training.model_flops import batch_consumed, batch_tokens, model_batch
 from dew.training.narrow import holds_copies, narrowing
-from dew.training.phase_passes import PhasePasses
+from dew.training.phase_passes import Holding, PhasePasses, SampledPasses
 from dew.training.planning import (
     Candidate,
     FitSearch,
     Planned,
     PlanRefused,
     Trials,
+    guided_compile,
     held_objects,
     released,
     settled,
@@ -59,10 +79,11 @@ from dew.training.planning import (
 )
 from dew.training.profiling import pgle_runs
 from dew.training.rungs import keep_rung, plan_flops, recorded_rung
-from dew.training.transaction import Transaction, outcome
+from dew.training.transaction import Transaction, outcome_of
 
 if TYPE_CHECKING:
     from dew.training.ahead import AheadOfTime
+    from dew.training.interval import Interval
     from dew.training.transaction import Committed
 
 _log = logging.getLogger(__name__)
@@ -132,6 +153,223 @@ class Plan(NamedTuple):
     resumed: bool = False
 
 
+class HostStartup(NamedTuple):
+    """What a host step's startup compiled over its state's shapes before its first step
+    (`StepCompiler._compile_host`): each program it traced and lowered, and compiled or read from JAX's
+    persistent cache (`options.spending`'s `Spent`), and the seconds it took; its programs' names, how many,
+    and by backend (its CPU companion's, its accelerator's) each one's seconds, read from them: the run's own
+    compiles of a step whose steps then compile nothing. A lowering begun in another thread
+    (`options.compiling`) is that thread's time: this process's `lowered` reads near none of it."""
+
+    spent: tuple[Spent, ...]
+    seconds: float
+    pgle: Mapping[str, int] | None = None
+    """Under JAX's AutoPGLE (`pgle_runs`), the trial steps its profile ran, its bytes and the accelerator's
+    programs compiled again guided by it (`StepCompiler._guided_host`); None where it is off."""
+
+    @classmethod
+    def joined(cls, passes: Sequence[HostStartup]) -> HostStartup:
+        """One startup of several passes' (a run that inspects steps over its sampled body too): their
+        programs and seconds together."""
+        return cls(tuple(each for passed in passes for each in passed.spent),
+                   sum(passed.seconds for passed in passes))
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(sorted({each.program for each in self.spent}))
+
+    @property
+    def programs(self) -> int:
+        return len(self.spent)
+
+    @property
+    def by_backend(self) -> dict[str, dict[str, float]]:
+        """By backend, its programs' count and their seconds lowering and compiling."""
+        by_backend: dict[str, dict[str, float]] = {}
+        for each in self.spent:
+            held = by_backend.setdefault(each.platform, {"programs": 0, "lowered": 0.0, "compiled": 0.0})
+            held["programs"] += 1
+            held["lowered"] += each.lowered
+            held["compiled"] += each.compiled
+        return by_backend
+
+    def record(self) -> dict[str, JSON]:
+        return {"names": list(self.names), "programs": self.programs, "seconds": self.seconds,
+                "by_backend": {name: dict(held) for name, held in self.by_backend.items()},
+                "pgle": None if self.pgle is None else dict(self.pgle)}
+
+
+STEADY = 3
+"""The steps a host step's startup pass steps over shapes before its state's types are those it steps from
+(`StepCompiler._compile_host`): the state as placed, then as a step returns it."""
+
+
+class HostRun:
+    """A step that keeps its variables on the host, as its run calls it (`StepCompiler._compile_host`): each
+    step's microbatches through the transaction's phases (`body`) and the glue between them, every
+    program of which a startup pass compiled over its shapes (`startup`), so its steps compile nothing; a
+    batch of shapes no pass stepped over (a ramp's stage's), or a step called in a trace context none
+    stepped in (a float64 replay's precision), has a pass of its own before its step. A step that still
+    traces or compiles (an input no pass foresaw) does, and says so: each program named in a warning and
+    counted in the fit's record (`StepCompiler.counting`, `train/step_misses`), never silent; a run held
+    to its loaded programs alone refuses it by its own `executable_only` (training.md §6)."""
+
+    def __init__(self, stepping: Stepping, bodies: Mapping[bool, Callable], placement, prepared: TrainState,
+                 shapes, split: int, window: int, empty, whole: Callable):
+        # Its step's body, by whether the step is sampled (a run that inspects: `Trainer.inspection`).
+        self.stepping, self.bodies, self.placement, self.prepared = stepping, bodies, placement, prepared
+        self.shapes, self.split, self.window, self.whole = shapes, split, window, whole
+        # The window built with the step, which its first step takes (`windowed`).
+        self.empty = empty
+        # Its glue between the transaction's phases, a program of its own as the transaction's is
+        # (`Transaction.step`): a microbatch's reading of the batch, and its outcome.
+        self.opened = owned_program(functools.partial(_opened, split=split))
+        self.ended = owned_program(functools.partial(outcome_of, split=split))
+        self.started: set[Hashable] = set()
+        # Where its steps' misses are counted: the fit's interval (`StepCompiler.counting`).
+        self.counted: Callable[[], Interval | None] = lambda: None
+
+    def __call__(self, current, batch, sampled: bool = False):
+        from dew.distributed.host import transfer
+
+        cpu = self.stepping.settings.state_mesh
+        with self.stepping.traced_on(cpu):
+            batch = transfer(batch, batch_shardings(cpu, batch))
+            current = self.windowed(current, batch)
+            sampled = sampled and True in self.bodies
+            if (abstract_signature(batch), trace_context(), sampled) not in self.started:
+                self.startup(current, batch, sampled)
+            with Compiles(None) as compiles:
+                stepped = self.stepped(current, batch, transfer, sampled)
+        missed = [program.name for program in compiles.programs if program.kind == "compiled"]
+        if missed:
+            interval = self.counted()
+            if interval is not None:
+                interval.step_misses = (interval.step_misses or 0) + len(missed)
+            _log.warning("a host step compiled %d programs its startup pass did not (%s): an input no pass "
+                         "stepped over; %d so far", len(missed), ", ".join(sorted(missed)),
+                         0 if interval is None else interval.step_misses)
+        return stepped
+
+    def windowed(self, current: TrainState, batch: Batch) -> TrainState:
+        """`current` with the window its step reads: the one built with the step at a run's first, a
+        ramp's stage's built afresh where its window replays other shapes (`builds_window`)."""
+        stepping, window, split = self.stepping, self.window, self.split
+        if window > 1 and current.accumulation is None and self.empty is not None:
+            empty, self.empty = self.empty, None
+            return dataclasses.replace(current, accumulation=empty,
+                                       window_size=jax.device_put(np.int32(window)))
+        if window > 1 and (current.accumulation is None or (
+                (stepping.shape.ramp or stepping.shape.stage_starts)
+                and not current.accumulation.replays(self.prepared.accumulation))):
+            # The window, and with it the split, the state's from here on, as a device step's.
+            return dataclasses.replace(
+                stepping.initialize_accumulation(current, microbatch_shapes(batch, split), self.shapes,
+                                                 window=window, split=split),
+                window_size=jax.device_put(np.int32(window)))
+        return current
+
+    def stepped(self, current: TrainState, batch: Batch, moved: Callable, sampled: bool = False) -> tuple:
+        """One step over `current` and `batch`, values or shapes, each move made by `moved`; `sampled`, the
+        step whose commit summarizes what the run inspects."""
+        split, body = self.split, self.bodies[sampled]
+        # Every step reads the state where its placement puts it, as the step before it returned it: the
+        # programs its startup compiled over those placements are the ones each step calls.
+        current = moved(current, self.placement)
+        has_batch_stats = (split > 1 and current.window is not None
+                           and current.window.batch_statistics is not None)
+        pooled = self.stepping.model_batch(batch) if has_batch_stats else None
+        outputs = []
+        # Each microbatch an attempt of its own, its device work the accelerator's forward
+        # (`HostExecution`), the step counted at its last.
+        for part in range(split):
+            at = np.int32(part)
+            micro, tokens, closes, consumed = _microbatch_of(self.opened, batch, part, split)
+            advanced, loss, aux, committed = body(current, micro, at, tokens, closes, pooled)
+            count, clock, *output = self.ended(current.step, current.consumed, current.microstep,
+                                               advanced.microstep, loss, aux, committed, batch,
+                                               np.int32(part == split - 1), consumed)
+            current = dataclasses.replace(advanced, step=count, consumed=clock)
+            outputs.append(tuple(output))
+        # A leaf already where its placement says stays the array it
+        # is: the resident frozen collection crosses no boundary.
+        return moved(current, self.placement), *(self.whole(outputs) if split > 1 else outputs[0])
+
+    def startup(self, held: TrainState, batch: Batch, sampled: bool = False) -> HostStartup:
+        """The step over `held`'s and `batch`'s shapes within `collecting` (the `sampled` step's, where it is
+        one; a run that inspects steps over both at its start): every program it calls compiled
+        there as it calls them over arrays, each of them its steps then run (`OuterProgram`'s `_shaped`); a
+        pass that reads and writes nothing of the run. Its first step reads the state as given, each later
+        one the state the step before returned, whose types its programs state (a weak type among them):
+        the pass steps on its own results' shapes until they are the shapes it stepped from. What it
+        compiled (`HostStartup`)."""
+        began = time.perf_counter()
+        with collecting(), spending() as spent:
+            self.settled(held, batch, sampled, contextlib.nullcontext)
+        self.started.add((abstract_signature(batch), trace_context(), sampled))
+        passed = HostStartup(tuple(spent), time.perf_counter() - began)
+        _log.info("a host step's startup compiled %d programs over its state's shapes in %.1f s (%s): %s",
+                  passed.programs, passed.seconds, passed.by_backend, ", ".join(passed.names))
+        return passed
+
+    def settled(self, held: TrainState, batch: Batch, sampled: bool,
+                each: Callable[[], contextlib.AbstractContextManager]) -> None:
+        """Step over `held`'s and `batch`'s shapes, each step within `each()`: its first step reads the state
+        as given, each later one the state the step before returned, whose types its programs state (a weak
+        type among them), until a step returns the shapes it stepped from, its steady steps' programs; a
+        state whose types never settle is refused."""
+        from dew.training.execution import placed_as
+
+        shaped = shapes_of(held)
+        for _ in range(STEADY):
+            with each():
+                returned = self.stepped(shaped, shapes_of(batch), placed_as, sampled)[0]
+            if abstract_signature(returned) == abstract_signature(shaped):
+                return
+            shaped = returned
+        raise ValueError(f"a host step's state takes other types at each of its first {STEADY} steps: its "
+                         "programs settle on none to compile ahead of its first step")
+
+    def lowered(self, held: TrainState, batch: Batch, platforms: tuple[str, ...]
+                ) -> list[tuple[str, jax.stages.Lowered]]:
+        """Each program its steady steps call (`settled`), a sampled step's beside an unsampled one's where
+        the run inspects, lowered over `held`'s and `batch`'s shapes for `platforms` where it runs on the
+        accelerator and for the CPU where on its companion (`options.lowering`), none compiled: the step
+        `Trainer(lower_for=)` lowers for a target this host is not."""
+        programs: list[tuple[str, jax.stages.Lowered]] = []
+        for sampled in self.bodies:
+            last: list[tuple[str, jax.stages.Lowered]] = []
+            self.settled(held, batch, sampled, functools.partial(_lowered_into, last, platforms))
+            programs.extend(last)
+        return programs
+
+
+@contextlib.contextmanager
+def _lowered_into(last: list[tuple[str, jax.stages.Lowered]], platforms: tuple[str, ...]):
+    """A pass of `HostRun.lowered`'s, its lowerings `last`'s in place of an earlier pass's."""
+    with lowering(platforms) as lowered:
+        yield
+    last[:] = lowered
+
+
+def _opened(batch: Batch, part: jax.Array, *, split: int) -> tuple:
+    """A host step's `part`th microbatch of `batch` (`microbatch`), its real tokens and the source examples
+    it consumes (`_microbatch_of`)."""
+    micro = microbatch(batch, part, split)
+    return micro, batch_tokens(micro), batch_consumed(micro)
+
+
+def _microbatch_of(opened: Callable, batch: Batch, part: int, split: int) -> tuple:
+    """A host step's `part`th microbatch of `batch` (`_opened`, its program), the objective's batch of it,
+    its real tokens, whether it closes the window and the source examples it consumes. A field with no rows
+    is the batch's own array, which every microbatch reads whole, and the whole batch is its one microbatch:
+    those the program would hand back as given, which the arrays a call is keyed by keep as they are."""
+    micro, tokens, consumed = opened(batch, np.int32(part))
+    micro = batch if split == 1 else jax.tree.map(
+        lambda sliced, given: sliced if np.ndim(given) else given, micro, batch)
+    return model_batch(micro), tokens, micro.get(CLOSES_WINDOW), consumed
+
+
 class Unplaced(NamedTuple):
     """A fresh run's first step planned before its state was placed (`StepCompiler.planned_unplaced`): the
     signature of the batch it was planned over, its plan and what its compile found, and the record of its
@@ -181,6 +419,9 @@ class Compiled:
     links: Mapping[str, Link] = dataclasses.field(default_factory=dict)
     validation: Validation | None = None
     step: CompiledStep | None = None
+    planned: Planned | None = None
+    """The plan the step runs, as the run keeps it (`Planned.released`), which a sampled pass count's other
+    counts are admitted at (`StepCompiler.admitted_at`); none where a compile ahead reads its plan alone."""
 
 
 def resumed_stepping[L, E](stepping: Stepping[L, E], window_size: int, *, held: bool, pools: bool,
@@ -202,6 +443,88 @@ def resumed_stepping[L, E](stepping: Stepping[L, E], window_size: int, *, held: 
     return stepping
 
 
+def _unlike(cap: Planned, other: Planned) -> list[str]:
+    """What `other`'s step holds or returns otherwise than `cap`'s (`StepCompiler.admitted_at`), each leaf
+    named by its path: the state it prepares, its window among them, with their shapes, dtypes and
+    shardings, and its outputs (`out_info`), the stepped state and the metrics a step's whole pools."""
+    def leaves(tree) -> dict[str, tuple]:
+        return {jax.tree_util.keystr(path): (getattr(leaf, "shape", None), str(getattr(leaf, "dtype", leaf)),
+                                             getattr(leaf, "sharding", None))
+                for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
+
+    unlike: list[str] = []
+    for name, (held, given) in {"state": (cap.candidate.prepared, other.candidate.prepared),
+                                "placement": (cap.candidate.shardings, other.candidate.shardings),
+                                "outputs": (cap.executable.out_info, other.executable.out_info)}.items():
+        ours, theirs = leaves(held), leaves(given)
+        unlike += [f"{name}{path}" for path in sorted(ours.keys() | theirs.keys())
+                   if ours.get(path) != theirs.get(path)]
+    return unlike
+
+
+@dataclasses.dataclass
+class DrawingStep:
+    """The step of a run that draws its looped model's pass count per microbatch (`sampled`): each count's
+    plan at its cap's (`StepCompiler.admitted_at`) and its FLOPs a step, by count (`plans`, `flops`), the
+    call running each of its `split` microbatches by its drawn count's program (`counts`) over the one
+    state. Each call's counts are drawn at the global positions of its microbatches under the run's `key`
+    (`SampledPasses.count`), from the position it holds (`position`): a fit draws them before the call from
+    the microbatches the run dispatched (`drawn`), and a call no fit drew for, as `Trainer.compile`'s caller
+    makes (`dew inspect`, a step called by hand), draws its own from where it stands, its first at its
+    state's step's microbatches."""
+
+    plans: Mapping[int, Planned]
+    flops: Mapping[int, StepFlops | None]
+    split: int
+    sampled: SampledPasses
+    key: tuple[int, ...]
+    """The run's key's words (`jax.random.key_data`), which every draw reads."""
+    run: CompiledStep | None = None
+    counts: list[int] = dataclasses.field(default_factory=list)
+    """The counts of the call in hand: the next call's where `pending`, else the last call's."""
+    pending: bool = False
+    position: int | None = None
+    """The global position of the next draw's first microbatch; None until a fit or the first call sets it."""
+
+    def drawn(self, interval: Interval, step: int) -> StepFlops | None:
+        """The counts of the next call's microbatches at the run's dispatched microbatches
+        (`Interval.microbatches`, the interval's count past them): a run's first step, its fresh start's
+        microbatch 0, a checkpoint's microbatches where it counted them, else (a checkpoint of a run that drew
+        none) its `step`'s, said; and the call's FLOPs, each microbatch's at its count's program's."""
+        if interval.microbatches is None:
+            interval.microbatches = step * self.split
+            if interval.last_saved is not None:
+                _log.info("the run's checkpoint counted none of its dispatched microbatches: its pass counts "
+                          "draw on from step %d's, microbatch %d", step, interval.microbatches)
+        self.position = interval.microbatches
+        interval.microbatches += self.split
+        self._draw()
+        self.pending = True
+        total: StepFlops | None = None
+        for count in self.counts:
+            each = self.flops[count]
+            if each is None:
+                return None
+            total = (1 / self.split) * each if total is None else total + (1 / self.split) * each
+        return total
+
+    def _draw(self) -> None:
+        """The next call's counts, drawn at `position`, which moves past them."""
+        assert self.position is not None
+        self.counts = [self.sampled.count(self.key, self.position + part) for part in range(self.split)]
+        self.position += self.split
+
+    def __call__(self, state: TrainState, batch: Batch, /, sampled: bool = False):
+        assert self.run is not None
+        if not self.pending:
+            # A call no fit drew for draws its own, its first at its state's step's microbatches.
+            if self.position is None:
+                self.position = int(state.step) * self.split
+            self._draw()
+        self.pending = False
+        return self.run(state, batch, sampled)
+
+
 class StepCompiler[L, E]:
     """Where a run's fit ladder stands and the links its traces read, and the compile of its step
     (`compile`): its objective's rung as the first compile found it and as each shape compiled at it, the
@@ -214,6 +537,9 @@ class StepCompiler[L, E]:
         self.objective = objective
         self.phase_passes = phase_passes
         self.ahead = ahead
+        # The step compiled ahead a run was handed, whose counts' family a run that draws its pass count per
+        # microbatch takes after its first compile took the cap's (`admitted_counts`).
+        self.counts_ahead: AheadOfTime | None = None
         self._stated_links = dict(links or {})
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         # The ladder's rungs past the objective's head and remat that a step fit at (no narrow copies, XLA's
@@ -230,6 +556,10 @@ class StepCompiler[L, E]:
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
+        # The fit's interval its host steps count their misses in (`counting`), None outside a fit.
+        self._counted: Interval | None = None
+        # What a host step's startup compiled over its state's shapes (`_compile_host`), None before one.
+        self.host_startup: HostStartup | None = None
         # Where each step's plan stands, by the batch's layout and the pass count it runs (`_plan_key`): the
         # rung and split this process's search found, which every later search of that step starts at
         # (`_planned`), so a process searches a step once; or the rung a resumed checkpoint recorded for
@@ -268,7 +598,7 @@ class StepCompiler[L, E]:
         a step runs."""
         return rung_record(self.objective, self._xla_defaults, narrow=self._narrow, ns_group=self._ns_group)
 
-    def checkpoint_rung(self) -> JSON:
+    def checkpoint_rung(self) -> dict[str, JSON]:
         """The rung a checkpoint records: the run's own, which every newly met
         shape starts from (`rung`'s fields as the first compile found them),
         and under `shapes` the rung each shape compiled at, by its layout
@@ -394,10 +724,13 @@ class StepCompiler[L, E]:
         """
         settings = stepping.settings
         if (target := settings.lower_for) is not None:
-            # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`); it lowers at
-            # the base rung.
+            # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`); a device step
+            # lowers at the base rung, a host step as its compile builds it.
+            if settings.host_master:
+                raise Lowered(target, *routed(lambda: self._lowered_host(stepping, state, batch, target)))
             self.at_base_rung(batch)
-            raise Lowered(target, *routed(lambda: lowered_for(stepping, state, batch, target, self.narrow)))
+            raise Lowered(target, *routed(
+                lambda: [("step", lowered_for(stepping, state, batch, target, self.narrow))]))
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
         # its split, binds it. Read on the host: a reduction on the devices compiles a program of the
         # occupancy's placement, a restored one's another than a fresh one's, which a resume compiles anew.
@@ -409,10 +742,13 @@ class StepCompiler[L, E]:
         if (state.scale is not None) != settings.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
         if settings.host_master:
-            if self.ahead is not None or settings.inspection is not None:
-                raise ValueError("a step compiled ahead or inspected runs where the devices hold the state; "
-                                 "this layout keeps the variables on the host")
-            return Compiled(stepping.shape.split, step=self._compile_host(stepping, state, batch))
+            if self.ahead is not None:
+                raise ValueError("a step compiled ahead runs where the devices hold the state; this layout "
+                                 "keeps the variables on the host")
+            run = self._compile_host(stepping, state, batch)
+            if runs := pgle_runs():
+                self._guided_host(stepping, run, state, batch, trials, runs)
+            return Compiled(stepping.shape.split, step=run)
         held, self._unplaced = self._unplaced, None
         mesh = settings.device_mesh
         fit, headroom = (False, None) if held is None or held.signature != batch_signature(batch) else (
@@ -453,8 +789,26 @@ class StepCompiler[L, E]:
             # Where the devices, the state placed, hold no block for it, the plan's search runs here, on them.
             planned, compiled, keep = self._plan(stepping, state, batch, trials)
             keep()
-        return dataclasses.replace(compiled, step=self.runner(stepping, planned.released(),
-                                                              settings.device_mesh))
+        kept = planned.released()
+        return dataclasses.replace(compiled, step=self.runner(stepping, kept, settings.device_mesh),
+                                   planned=kept)
+
+    def holds_unplaced(self, batch: Batch) -> bool:
+        """Whether a fresh run's first step was planned over `batch`'s shapes before its state was placed
+        (`planned_unplaced`), the plan its first compile takes."""
+        return self._unplaced is not None and self._unplaced.signature == batch_signature(batch)
+
+    def anew(self) -> StepCompiler[L, E]:
+        """A compiler of this one's objective, links, step compiled ahead and pass counts, nothing planned:
+        where a run lays its state out otherwise than the plans this one made were for
+        (`dew.training.streaming.laid_start`), whose ladder climbs and plans read no step of that layout."""
+        return StepCompiler(self.objective, self._stated_links, self.ahead, self.phase_passes)
+
+    @property
+    def unplaced(self) -> Planned | None:
+        """The plan a fresh run's first step took before its state was placed (`planned_unplaced`), None
+        where its devices held none or none was made."""
+        return None if self._unplaced is None else self._unplaced.planned
 
     def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
                          unplaced: int) -> None:
@@ -484,6 +838,138 @@ class StepCompiler[L, E]:
         planned, compiled, keep = self._plan(stepping, state, batch, trials, frontier)
         keep()
         return planned, compiled
+
+    def drawing(self, holder: Holding[L, E], stepping: Callable[[], Stepping], compiled: Compiled,
+                state: TrainState, batch: Batch, key: jax.Array) -> CompiledStep:
+        """`compiled`'s step, or where the run draws its pass count per microbatch (`PhasePasses.sampled`)
+        its every count's step at its cap's plan, drawing under the run's `key` (`sampled_step`)."""
+        assert compiled.step is not None
+        if self.phase_passes.sampled is None:
+            return compiled.step
+        return self.sampled_step(holder, stepping, compiled, state, batch, key)
+
+    @staticmethod
+    def drawn(held: tuple[CompiledStep, StepFlops | None], interval: Interval,
+              step: int) -> tuple[CompiledStep, StepFlops | None]:
+        """A compiled step and its FLOPs (`held`), a drawing step's (`DrawingStep`) its next call's counts
+        drawn at the microbatches `interval` counted, its FLOPs theirs."""
+        compiled, flops = held
+        if isinstance(compiled, DrawingStep):
+            flops = compiled.drawn(interval, step)
+        return compiled, flops
+
+    def sampled_step(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Compiled,
+                     state: TrainState, batch: Batch, key: jax.Array) -> DrawingStep:
+        """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`) over `batch`:
+        `cap`, its cap's step (`compile`), and every other count's admitted at its plan (`admitted_at`), each
+        traced under its count's objective, `holder`'s and the compiler's (`PhasePasses.scoped`), by
+        `stepping`. Its window pools each microbatch's statistics by their mean: one that replays them
+        (`pooled_by_mean`) would replay each at the count closing its window, and is refused where it holds
+        several (row 7884)."""
+        sampled, planned = self.phase_passes.sampled, cap.planned
+        assert sampled is not None and planned is not None, "a sampled count's cap compiled on the devices"
+        # A window that pools its microbatches by their mean holds their gradient's sum and its mass
+        # (`Trainer._initialize_accumulation`), DiLoCo's its groups' (`TrainState.window`); one that replays
+        # them holds their batches instead.
+        window = planned.candidate.prepared.window
+        if window is not None and window.mass is None:
+            raise ValueError(f"{type(self.objective).__name__}'s statistics are no mean its window pools, so "
+                             "its update replays each microbatch at the count that closes it: a pass count "
+                             "drawn per microbatch takes them one microbatch an update (split and "
+                             "accumulation 1), until replays run each at its own (row 7884)")
+        plans, flops = {sampled.cap: planned}, {sampled.cap: cap.step_flops}
+        for count, each in self.admitted_counts(holder, stepping, planned, state, batch):
+            plans[count], flops[count] = each.released(), self._flops(each)
+        self.phase_passes.current = sampled.cap
+        with self.phase_passes.scoped(holder, self):
+            capped = stepping()
+        words = tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
+        step = DrawingStep(plans, flops, planned.split, sampled, words)
+        step.run = self.runner(capped, planned, capped.settings.device_mesh,
+                               parted=lambda: [plans[count] for count in step.counts])
+        return step
+
+    def admitted_counts(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Planned,
+                        state: TrainState, batch: Batch) -> Iterator[tuple[int, Planned]]:
+        """Every count but the cap of a run that draws its pass count per microbatch (`PhasePasses.sampled`)
+        admitted at the cap's plan `cap` (`admitted_at`), each traced under its count's objective, `holder`'s
+        and the compiler's (`PhasePasses.scoped`), by `stepping`, and handed on as it is admitted, so its
+        caller releases or keeps each before the next compiles; each taken from the counts' family of the
+        step compiled ahead where the run was handed one (`counts_ahead`, `AheadOfTime.at_count`), which
+        its first admission consumes as a step compiled ahead is (a later batch's shapes compile their
+        own), else compiled here, as the run says."""
+        sampled = self.phase_passes.sampled
+        assert sampled is not None, "a run that draws its pass count per microbatch"
+        counts, family, self.counts_ahead = range(1, sampled.cap), self.counts_ahead, None
+        if family is None:
+            _log.info("the run draws its pass count per microbatch: it compiles the steps of counts %s at "
+                      "its cap's plan", list(counts))
+        try:
+            for count in counts:
+                self.phase_passes.current = count
+                with self.phase_passes.scoped(holder, self):
+                    planned = self.admitted_at(stepping(), state, batch, cap, count,
+                                               ahead=None if family is None else family.at_count(count))
+                yield count, planned
+        finally:
+            self.phase_passes.current = sampled.cap
+
+    @staticmethod
+    def _flops(planned: Planned) -> StepFlops | None:
+        """A step's FLOPs at `planned`, a microbatch's (`plan_flops`) times its split."""
+        flops, _ = plan_flops(None, planned.executable)
+        return flops and planned.split * flops
+
+    def admitted_at(self, stepping: Stepping, state: TrainState, batch: Batch, cap: Planned, passes: int,
+                    ahead: AheadOfTime | None = None) -> Planned:
+        """The step of a sampled pass count's `passes` (`dew.training.phase_passes.SampledPasses`) at exactly
+        the plan `cap` its cap's step runs: its split, its rung and the narrow copies the cap's step reads
+        (`prepared_for`), so the window's microbatches pass one state between the counts' programs, part by
+        part (`runner`'s `parted`), none remaking copies. Lowered and judged once on the devices
+        (`FitSearch.fits_here`), with no search of its own: one that misses is refused, naming its count,
+        its rung and the bytes it fell short by, and one whose state, window or loss's shapes are other than
+        the cap's step's is refused, naming the leaves. Derived from the cap's plan at each admission, never
+        recorded (`_plans`), so a resume admits each count as the run did. `ahead`, its step compiled ahead
+        (`AheadOfTime.at_count`), runs in place of its compile where it is that program. Unreleased: its
+        caller releases it (`Planned.released`) once it has read its lowering, a step compiled ahead its
+        program's digest."""
+        settings = stepping.settings
+        mesh = settings.device_mesh
+        links = self.links(mesh)
+        # The cap's rung over this count's modules: its remat, head and options, its passes this count's.
+        cap.at.put(self.objective)
+        self.phase_passes.restored(self.objective)
+        stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape, split=cap.split))
+        try:
+            with stepping.traced_on(mesh, links) as schedule, held_objects():
+                replicated, placement = NamedSharding(mesh, P()), batch_shardings(mesh, batch)
+                shaped = self.loss_shaped(stepping, schedule)
+
+                def lower(split: int, narrow: bool, ns_group: int | None) -> Candidate:
+                    grouped = dataclasses.replace(shaped, settings=dataclasses.replace(shaped.settings,
+                                                                                       ns_group=ns_group))
+                    return candidate_for(grouped, state, batch, schedule, placement, replicated, split,
+                                         narrow, copies=cap.candidate.copies)
+
+                gathered = layer_gathers(self.objective, state.variables, mesh.devices.size)
+                search = FitSearch(
+                    lower, lambda candidate: step_options(
+                        self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
+                    self.objective, mesh, cap.at.xla_defaults, cap.at.narrow, cap.at.ns_group,
+                    None if self._base_rung is None else self._base_rung[1], None, ahead=ahead)
+                if not search.fits_here(cap.split):
+                    short = search.probes[-1].headroom
+                    raise ValueError(f"the step of {passes} passes misses the devices at its cap's plan "
+                                     f"({search.rung()}, {cap.split} microbatches a step)"
+                                     + ("" if short is None else f" by {-short} bytes"))
+                planned = search.found(cap.split)
+        finally:
+            self._loss_shapes.clear()
+        unlike = _unlike(cap, planned)
+        if unlike:
+            raise ValueError(f"the step of {passes} passes holds {unlike} other than its cap's step does: a "
+                             "sampled count's steps pass one state between them, its window pooling them all")
+        return planned
 
     def _plan(self, stepping: Stepping, state: TrainState, batch: Batch, trials: Trials | None,
               frontier: bool = False, *, unplaced: int | None = None, provisional: bool = False
@@ -522,9 +1008,11 @@ class StepCompiler[L, E]:
         layout, passes = self._plan_key(batch)
         return self._plans.get((layout, passes), self._plans.get((layout, None)))
 
-    def runner(self, stepping: Stepping, planned: Planned,
-               mesh: Mesh) -> CompiledStep:
-        """The step `planned` compiled, which reads a batch in its microbatches."""
+    def runner(self, stepping: Stepping, planned: Planned, mesh: Mesh,
+               parted: Callable[[], Sequence[Planned]] | None = None) -> CompiledStep:
+        """The step `planned` compiled, which reads a batch in its microbatches: each by `planned`'s program,
+        or by its own of the plans `parted` names for the step's microbatches at each call, programs at
+        `planned`'s plan over the one state (a sampled pass count's, `admitted_at`)."""
         settings = stepping.settings
         # The program compiled above, not the jit: a call through the jit traces and compiles its own,
         # without the step's compiler options, which was 25 s of an A100's cold start.
@@ -537,12 +1025,13 @@ class StepCompiler[L, E]:
         # this step's window first (`laid_out`).
         returned: list[jax.Array | None] = [None]
         # A split step's whole from its microbatches' outputs, its loss as an unsplit step logs it.
-        whole = whole_step_program(self.objective)
+        whole = whole_step_program(self.objective, parted_work=settings.sampled_passes is not None)
 
         def run(current, batch, sampled: bool = False):
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
-            executable = planned.sampled.executable if sampled and planned.sampled is not None else (
-                planned.executable)
+            plans = [planned] * split if parted is None else parted()
+            executables = [held.sampled.executable if sampled and held.sampled is not None
+                           else held.executable for held in plans]
             donor = None
             if current.inner is None and current.window_size is not returned[0]:
                 current, donor = laid_out(current, window)
@@ -561,7 +1050,7 @@ class StepCompiler[L, E]:
                     released([current.compute])
                     # A run handed a step compiled ahead runs the program compiled with it: `fit` runs its
                     # steps within the hand (`Trainer._taking`).
-                    copies = narrowing(candidate.copies, self.objective.towers(), candidate.shardings.compute)
+                    copies = narrowing(candidate.copies, candidate.shardings.compute)
                     current = dataclasses.replace(current, compute=copies(current.variables))
                 if stepping.builds_window(current, candidate, window):
                     # The window, and with it the split, is the state's from here on, built over the one it
@@ -576,7 +1065,7 @@ class StepCompiler[L, E]:
                     released([donor])
                 outputs = []
                 moving, frozen = apart(current)
-                for part in parts:
+                for part, executable in zip(parts, executables, strict=True):
                     moving, *output = executable(moving, frozen, batch, part)
                     outputs.append(tuple(output))
                 stepped = together(moving, frozen)
@@ -666,7 +1155,11 @@ class StepCompiler[L, E]:
             above = search.above(candidates, planned.split) if frontier else None
         for probe in above or ():
             _log.info("above the plan, fitting at fewer microbatches: %s", probe.named())
-        # Consume the artifact only after its program was accepted; a refusal leaves it pending.
+        # Consume the artifact only after its program was accepted; a refusal leaves it pending. A run
+        # that draws its pass count per microbatch keeps its counts' family for their admission
+        # (`admitted_counts`).
+        if self.ahead is not None and search.ahead is None and self.phase_passes.sampled is not None:
+            self.counts_ahead = self.ahead
         self.ahead = search.ahead
         planned.at.put(self.objective)
         self._xla_defaults, self._narrow = planned.at.xla_defaults, planned.at.narrow
@@ -675,11 +1168,14 @@ class StepCompiler[L, E]:
             trials = Trials(state, batch, owned=False) if trials is None else trials
             run = self.runner(stepping, planned, mesh)
             relower = functools.partial(lower, planned.split, planned.at.narrow, planned.at.ns_group)
-            asked = search.compiled_key(planned.candidate.lowered, planned.options)
+            unguided = planned.candidate.lowered
+            asked = search.compiled_key(unguided, planned.options)
             planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
             # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
-            # AutoPGLE: the one the run steps, the unguided one freed with the search.
+            # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
+            # for a refit.
             hold(asked, planned.executable)
+            forget(unguided)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)
@@ -700,48 +1196,131 @@ class StepCompiler[L, E]:
             _log.info("the step fits the devices in the plan %s", plan)
         return planned, flops, plan, validation, keep
 
-    def _compile_host(self, stepping: Stepping, state: TrainState, batch: Batch
-                      ) -> CompiledStep:
+    def counting(self, interval: Interval, *, host: bool) -> Interval:
+        """`interval`, a fit's first, which its host steps (`host`) count the programs they compile past
+        their startup passes in from here on (`HostRun`, `Interval.step_misses`, zero at its start); a fit
+        whose steps are no host's counts none."""
+        self._counted = interval if host else None
+        interval.step_misses = 0 if host else None
+        return interval
+
+    def prepared_host(self, stepping: Stepping, state: TrainState, batch: Batch) -> HostStartup:
+        """A fresh host step's startup over `state`'s and `batch`'s shapes (`_compile_host`), nothing placed:
+        what a build host compiles to warm the shared cache (`dew.training.ahead.prepare_host_step`)."""
+        self._compile_host(stepping, state, batch)
+        assert self.host_startup is not None, "a host step's compile runs its startup pass"
+        return self.host_startup
+
+    def _compile_host(self, stepping: Stepping, state: TrainState, batch: Batch) -> HostRun:
+        """The host step over `state` and `batch` (`_host_run`), its startup run before its first step: each
+        of its steps' bodies, a sampled step's as well where the run inspects (`HostRun.startup`)."""
+        run, held, cpu_batch = self._host_run(stepping, state, batch, stepping.settings.device_mesh)
+        with stepping.traced_on(stepping.settings.state_mesh):
+            passes = [run.startup(held, cpu_batch, sampled) for sampled in run.bodies]
+        self.host_startup = HostStartup.joined(passes)
+        return run
+
+    def _guided_host(self, stepping: Stepping, run: HostRun, state: TrainState, batch: Batch,
+                     trials: Trials | None, runs: int) -> None:
+        """Under JAX's AutoPGLE, `run`'s steps profiled `runs` times on a trial (`trials`', or a copy of
+        `state` beside it, in host memory: `Trials.profiled_programs`), after its startup, as a device plan
+        is profiled before its run (`Planned.guided`); each program they ran on the accelerator compiled
+        again guided by the profile (`guided_compile`) and run in its executable's place
+        (`OuterProgram.guided`), so the run's steps run the guided programs and compile nothing. An empty
+        profile, a backend XLA profiles none of, guides nothing. Its count is the startup's record
+        (`HostStartup.pgle`)."""
+        accelerator = {device.platform for device in stepping.settings.device_mesh.devices.flat} - {"cpu"}
+
+        def on_accelerator(executable: jax.stages.Compiled) -> bool:
+            return any(device.platform in accelerator
+                       for sharding in (*jax.tree.leaves(executable.input_shardings),
+                                        *jax.tree.leaves(executable.output_shardings))
+                       for device in sharding.device_set)
+
+        trials = Trials(state, batch, owned=False) if trials is None else trials
+        profile, ran = trials.profiled_programs(run, runs, on_accelerator)
+        guided = ran if profile else []
+        for program, executable, lowered, relower in guided:
+            program.guided(executable, guided_compile(lowered, program.options, profile, relower))
+        assert self.host_startup is not None, "a host step's compile runs its startup pass"
+        self.host_startup = self.host_startup._replace(
+            pgle={"runs": runs, "bytes": len(profile), "programs": len(guided)})
+
+    def _lowered_host(self, stepping: Stepping, state: TrainState, batch: Batch, target: str
+                      ) -> list[tuple[str, jax.stages.Lowered]]:
+        """The host step's programs lowered for a GPU of the CUDA `target` this host is not (`lower_for`):
+        built as `_compile_host` builds it, under the target's choices (`generation.assumed`) and over an
+        abstract mesh of its devices (`gpu_mesh`) where its realizations run, its companion this host's CPUs,
+        each program its steady steps call lowered and none compiled (`HostRun.lowered`)."""
+        settings = stepping.settings
+        # Shapes alone, a placed state's too: a lowering builds nothing (a window an array state's first
+        # step would build among it).
+        state, batch = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype),
+                                    (state, batch))
+        with assumed(target):
+            run, held, cpu_batch = self._host_run(stepping, state, batch,
+                                                  gpu_mesh(settings.device_mesh, target))
+            with stepping.traced_on(settings.state_mesh):
+                return run.lowered(held, cpu_batch, ("cuda",))
+
+    def _host_run(self, stepping: Stepping, state: TrainState, batch: Batch, accelerator: Mesh | AbstractMesh
+                  ) -> tuple[HostRun, TrainState, Batch]:
+        """The host step over `state` and `batch`, its realizations on `accelerator`: the run, the state its
+        startup steps from (with the window its first step builds) and the batch on its CPU companion."""
         settings = stepping.settings
         from dew.distributed.host import transfer
-        from dew.training.execution import HostExecution, frozen_trees, stack_sites
+        from dew.training.execution import HostExecution, frozen_trees, placed_as, stack_sites
         cpu = settings.state_mesh
         sites = stack_sites(self.objective, state.variables)
-        execution = HostExecution(self.objective, settings.layout, settings.device_mesh, cpu, sites,
+        execution = HostExecution(self.objective, settings.layout, accelerator, cpu, sites,
                                   device=stepping.shape.device,
-                                  gathered=layer_gathers(self.objective, state.variables,
-                                                         settings.device_mesh.devices.size))
-        cpu_batch = transfer(batch, batch_shardings(cpu, batch))
+                                  gathered=layer_gathers(self.objective, state.variables, accelerator.size))
+        # The batch read in the split the run states (no plan chooses one: the step is the host's), its window
+        # that many microbatches an update times the run's accumulation, as a device step's (`step_program`).
+        split = stepping.shape.split or 1
+        window = split * settings.accumulation
+        # A batch of shapes alone (a lowering's, `_lowered_host`) placed as its arrays would be.
+        moved = placed_as if isinstance(jax.tree.leaves(batch)[0], jax.ShapeDtypeStruct) else transfer
+        cpu_batch = moved(batch, batch_shardings(cpu, batch))
         with stepping.traced_on(cpu) as schedule:
-            _, shapes = stepping.loss_shape(state, cpu_batch, settings.accumulation)
+            micro = microbatch_shapes(cpu_batch, split)
+            _, shapes = stepping.loss_shape(state, micro, window, split)
             stepping.staging.refuse_unpipelined(schedule, self.objective)
-            prepared = stepping.initialize_accumulation(state, cpu_batch, shapes,
-                                                        window=settings.accumulation, shape_only=True)
+            prepared = stepping.initialize_accumulation(state, micro, shapes, window=window, split=split,
+                                                        shape_only=True)
             placement = stepping.shardings(prepared)
-            transaction = Transaction(self.objective, settings.optimizer, settings.accumulation, shapes,
-                                      record=settings.record, examples=stepping.shape.examples,
-                                      skip=settings.skip_nonfinite)
-            body = transaction.step(realize=execution.realize, host=True,
-                                    frozen=tuple(path for path, _, _ in frozen_trees(state.variables, sites)))
-
-        def run(current, batch, sampled: bool = False):
-            # A host-master run inspects nothing (`compile` refuses it), so no step of it is sampled.
-            with stepping.traced_on(cpu):
-                batch = transfer(batch, batch_shardings(cpu, batch))
-                if settings.accumulation > 1 and (current.accumulation is None or (
-                        (stepping.shape.ramp or stepping.shape.stage_starts)
-                        and not current.accumulation.replays(prepared.accumulation))):
-                    current = stepping.initialize_accumulation(current, batch, shapes,
-                                                               window=settings.accumulation)
-                # The device steps run in the accelerator's forward (`HostExecution`).
-                advanced, loss, aux, committed = body(current, model_batch(batch), 0, batch_tokens(batch),
-                                                      batch.get(CLOSES_WINDOW))
-                advanced, *stepped = outcome(current, advanced, loss, aux, committed, batch, 1,
-                                             batch_consumed(batch), split=1)
-                # A leaf already where its placement says stays the array it
-                # is: the resident frozen collection crosses no boundary.
-                return transfer(advanced, placement), *stepped
-        return run
+            frozen = tuple(path for path, _, _ in frozen_trees(state.variables, sites))
+            if accelerator is not settings.device_mesh:
+                # The frozen trees beside the target's devices, as beside this host's (`execution.resident`).
+                variables = placement.variables
+                for path in frozen:
+                    variables = placed_at(variables, path, jax.tree.map(
+                        lambda held: NamedSharding(accelerator, held.spec, memory_kind=held.memory_kind),
+                        at_path(variables, path)))
+                placement = dataclasses.replace(placement, variables=variables)
+            # Its step's body, and where the run inspects, a sampled step's (`Trainer.inspection`): the
+            # one whose commit summarizes what it inspects, its forward differentiating the watched
+            # outputs' probes beside its parameters (`HostExecution`), as a device run's sampled step.
+            bodies = {sampled: Transaction(
+                self.objective, settings.optimizer, window, shapes, split=split, record=settings.record,
+                examples=stepping.shape.examples, skip=settings.skip_nonfinite,
+                inspection=settings.inspection if sampled else None).step(
+                    realize=execution.realize, host=True, frozen=frozen)
+                for sampled in ((False, True) if settings.inspection is not None else (False,))}
+        # A state of shapes alone (a build host's, warming the shared cache: `dew.training.ahead
+        # .prepare_host_step`) holds its window's shapes.
+        concrete = not isinstance(jax.tree.leaves(state.variables)[0], jax.ShapeDtypeStruct)
+        # The window a run's first step builds (`builds_window`), built here, with the step: its first
+        # step reads it as built, compiling and tracing nothing (`executable_only`).
+        empty = (None if window == 1 or state.accumulation is not None else stepping.initialize_accumulation(
+            state, microbatch_shapes(cpu_batch, split), shapes, window=window, split=split,
+            shape_only=not concrete).accumulation)
+        run = HostRun(stepping, bodies, placement, prepared, shapes, split, window, empty,
+                      whole_step_program(self.objective))
+        run.counted = lambda: self._counted
+        held = state if empty is None else dataclasses.replace(
+            state, accumulation=empty, window_size=jax.device_put(np.int32(window)))
+        return run, held, cpu_batch
 
     # ------------------------------------------------------------------ The loop
     # ------------------------------------------------------------------
