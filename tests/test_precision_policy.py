@@ -1918,7 +1918,8 @@ def test_a_floats_raw_fields_are_its_bits(dtype):
     assert {field.dtype for field in (bits, sign, biased, fraction)} == {word}
     np.testing.assert_array_equal(bits, expected)
     np.testing.assert_array_equal(sign, expected & word.type(1 << (limits.bits - 1)))
-    np.testing.assert_array_equal(biased, (expected >> limits.nmant) & word.type(2 * limits.maxexp - 1))
+    # The exponent field's own width (`nexp`): E4M3's top binade holds finite values.
+    np.testing.assert_array_equal(biased, (expected >> limits.nmant) & word.type((1 << limits.nexp) - 1))
     np.testing.assert_array_equal(sign | (biased << limits.nmant) | fraction, expected)
 
 
