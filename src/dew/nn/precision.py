@@ -1702,19 +1702,6 @@ def vanishing(dtype, base2: bool = False) -> float:
     return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
 
 
-def _binades(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """A float `x` (fp32 or float64) as its significand in [1, 2) (its sign kept; zero's zero) and its
-    binary exponent as a whole number of its dtype, a subnormal's below the least normal: exactly `x =
-    significand 2^exponent`, from its bits (`float_bits`), so a process whose multiply flushes a subnormal
-    operand (XLA's CPU) keeps it: lifted by a multiply, `2^-140 2^100` summed to zero (base review
-    675f2c056 F2)."""
-    sign, biased, fraction, normalized, exponent = float_bits(x)
-    bias, width = jnp.finfo(x.dtype).maxexp - 1, jnp.finfo(x.dtype).nmant
-    significand = jax.lax.bitcast_convert_type(sign | (bias << width) | normalized, x.dtype)
-    zero = (biased == 0) & (fraction == 0)
-    return jnp.where(zero, jnp.zeros_like(x), significand), exponent.astype(x.dtype)
-
-
 def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
     """The sum of `terms` in float32 or float64 (their widest, at least float32), each the broadcast product
     of its factors, summed over `axis` of each product too where given (kept): the exact sum of the exact
@@ -1760,169 +1747,211 @@ def _aligned_value(shape: tuple[tuple[int, ...], ...], spec: tuple, *flat: jax.A
     return _exact_sum(_regrouped(shape, flat), spec, flat[0].dtype)
 
 
-class _Summands(NamedTuple):
-    """A term's products as exact integer summands: each a whole significand `mantissa` (at most `bits`
-    bits, nonnegative) at the bit place `place` (its lowest bit's power of two), negative where
-    `negative`, the term's space's shape; `reduced` takes an array of that shape to the sum's value."""
+class _Product(NamedTuple):
+    """A term's product, exactly (`_product`): its significand's limbs, the place of its lowest bit, its
+    sign, and its IEEE class where a factor is not finite or zero."""
 
-    mantissa: jax.Array
+    limbs: tuple[jax.Array, ...]
     place: jax.Array
     negative: jax.Array
-    reduced: Callable[[jax.Array], jax.Array]
-    count: int
+    nan: jax.Array
+    infinite: jax.Array
+    zero: jax.Array
 
 
-def _summands(term: Sequence[jax.Array], axis, laid, ints) -> tuple[list[_Summands], jax.Array, jax.Array]:
-    """`term`'s product as exact integer summands (`_Summands`), and the product as IEEE forms it where a
-    factor is not finite (zero elsewhere) and whether one is: each factor's significand an integer of the
-    dtype's significand bits at its lowest bit's place, split in halves, and each product of two halves,
-    at most the full significand's bits, split again as the next factor multiplies it, so `k` factors make
-    `4^(k-1)` summands and no product's bit is rounded away."""
+def _product(term: Sequence[jax.Array], ints) -> _Product:
+    """`term`'s product (`_Product`), exactly, from its factors' bits alone: each significand two digits of
+    half its bits, their convolution carried after each factor, so `k` factors make `k` limbs and no bit
+    rounds; NaN where a factor is NaN or an infinity meets a zero, else a signed infinity where one is, as
+    IEEE's product, so no finite factors' rounded product (`2^-75 2^-75` zero) meets the infinity (base
+    review 6c68b90ad F3)."""
     limits = jnp.finfo(term[0].dtype)
-    half, top = -(-(limits.nmant + 1) // 2), 2 * limits.maxexp - 1
-    # Read from the bits, as every reading here is: a process flushing subnormals (XLA's CPU) compares one
-    # equal to zero.
-    special = functools.reduce(jnp.logical_or, [float_bits(factor)[1] == top for factor in term])
-    plainly = jnp.where(special, functools.reduce(jnp.multiply, term), 0)
+    half, top = _split_bits(term[0].dtype)[2], 2 * limits.maxexp - 1
     low = (1 << half) - 1
-    parts = []
-    for factor in term:
-        sign, biased, fraction, normalized, exponent = float_bits(factor)
-        zero = special | ((biased == 0) & (fraction == 0))
-        mantissa = jnp.where(zero, 0, normalized | (1 << limits.nmant)).astype(ints)
-        place, negative = (exponent - limits.nmant).astype(ints), sign != 0
-        if not parts:
-            parts = [(mantissa, place, negative)]
+    read = [float_bits(factor) for factor in term]
+    special = [biased == top for _, biased, *_ in read]
+    zeros = [(biased == 0) & (fraction == 0) for _, biased, fraction, *_ in read]
+    nan, infinite, zero = (functools.reduce(jnp.logical_or, flags) for flags in (
+        [out & (fraction != 0) for out, (_, _, fraction, *_) in zip(special, read, strict=True)],
+        [out & (fraction == 0) for out, (_, _, fraction, *_) in zip(special, read, strict=True)], zeros))
+    negative = functools.reduce(jnp.logical_xor, [sign != 0 for sign, _, _, _, _ in read])
+    place = functools.reduce(jnp.add, [(exponent - limits.nmant).astype(ints) for *_, exponent in read])
+    digits: list[jax.Array] = []
+    for (_, _, _, normalized, _), out, nothing in zip(read, special, zeros, strict=True):
+        mantissa = jnp.where(out | nothing, 0, normalized | (1 << limits.nmant)).astype(ints)
+        pair = (mantissa & low, mantissa >> half)
+        if not digits:
+            digits = list(pair)
             continue
-        # Each summand's halves times the factor's, each product of halves its significand's bits at most.
-        parts = [(piece * other, at + shift + place + other_shift, sign_ ^ negative)
-                 for whole, at, sign_ in parts
-                 for piece, shift in ((whole >> half, half), (whole & low, 0))
-                 for other, other_shift in ((mantissa >> half, half), (mantissa & low, 0))]
-    shape = jnp.broadcast_shapes(*(np.shape(mantissa) for mantissa, _, _ in parts))
-    if laid is None:
-        axes = () if axis is None else tuple(sorted({int(a) % len(shape) for a in np.atleast_1d(axis)}))
+        sums: list = [0] * (len(digits) + 1)
+        for at, digit in enumerate(digits):
+            for by, other in enumerate(pair):
+                sums[at + by] = sums[at + by] + digit * other
+        digits, carry = [], 0
+        for total in sums:
+            total = total + carry
+            digits.append(total & low)
+            carry = total >> half
+        digits.append(jnp.asarray(carry, ints))
+    limbs = tuple(digits[at] | (digits[at + 1] << half) for at in range(0, len(digits), 2))
+    shape = jnp.broadcast_shapes(*(np.shape(limb) for limb in limbs), np.shape(place), np.shape(negative))
+    return _Product(tuple(jnp.broadcast_to(limb, shape) for limb in limbs), jnp.broadcast_to(place, shape),
+                    jnp.broadcast_to(negative, shape), nan | (infinite & zero), infinite, zero)
 
-        def reduced(x):
-            return jnp.sum(x, axis=axes, keepdims=True) if axes else x
-    else:
-        axes = () if axis is None else tuple(np.atleast_1d(axis))
-        held, out = laid
 
-        def reduced(x):
-            return jnp.broadcast_to(jnp.sum(x, axis=axes, keepdims=True) if axes else x, held).reshape(out)
-    count = math.prod(shape[a] for a in axes)
-    return ([_Summands(*(jnp.broadcast_to(x, shape) for x in part), reduced, count) for part in parts],
-            reduced(plainly), reduced(special.astype(ints)) > 0)
+def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
+    """A term's reduction from its products' `shape` to the sum's value, `op` over its axes (kept), laid
+    where `laid` gives `(held, shape)`, and the count of products a value takes."""
+    axes = () if axis is None else tuple(sorted({int(a) % len(shape) for a in np.atleast_1d(axis)}))
+
+    def reduced(x: jax.Array, op: Callable = jnp.sum, **options) -> jax.Array:
+        x = op(x, axis=axes, keepdims=True, **options) if axes else x
+        return x if laid is None else jnp.broadcast_to(x, laid[0]).reshape(laid[1])
+
+    return reduced, math.prod(shape[a] for a in axes)
 
 
 def _exact_sum(terms, spec, dtype) -> jax.Array:
-    """The sum `_aligned_terms` states, exact: every product an exact sum of integer summands
-    (`_summands`), each summand's bits summed as whole digits of a radix-`2^w` grid from below the least
-    bit any product of the terms' factors holds to above the most (`_digits`, no digit's sum past the
-    integers' range: `w` the integers' bits less two and the bits of the summands a value sums), the digits
-    carried into one nonnegative number and its sign, rounded once to nearest, ties to even, every bit below
-    the rounding place its sticky bit (`_nearest`). So it is the sum correctly rounded whatever its terms
-    cancel: prior bases summed floats, each sum rounding, and some order of terms cancelling past float32's
-    precision lost a smaller one, `[2^153, 2^128, -2^103, -2^128, 2^103, -2^153, fp32's largest]` inf where
-    its sum is the largest (base review af2cca564 F1, row 8757). A non-finite factor's product summed as
-    IEEE sums it (inf - inf NaN), and a sum of negative zeros negative zero."""
+    """The sum `_aligned_terms` states, exact: every product exact (`_product`), each limb's bits summed as
+    whole digits of a radix-`2^w` grid across every place a product of the terms' factors holds, `w` the
+    integers' bits less two and the bits of the count of limbs a value sums, so no digit's sum leaves the
+    integers however long an axis (base review 6c68b90ad F2), the digits carried and rounded
+    once to nearest, ties to even, every bit below the rounding place sticky (`_nearest`): the sum correctly
+    rounded whatever its terms cancel, where floats summed in some order lose a smaller one, `[2^153,
+    2^128, -2^103, -2^128, 2^103, -2^153, fp32's largest]` inf where its sum is the largest (base review
+    af2cca564 F1, row 8757). Non-finite products summed as IEEE sums them (inf - inf NaN), a sum of
+    negative zeros negative zero, of none positive."""
     limits = jnp.finfo(dtype)
     ints = jnp.dtype(f"int{limits.bits}")
     factors = max(map(len, terms))
-    placed, plain, special = [], 0, False
+    parts, nan, positive, negative, live = [], False, False, False, False
     for term, (axis, laid) in zip(terms, spec, strict=True):
-        summands, plainly, any_special = _summands(term, axis, laid, ints)
-        placed += summands
-        plain, special = plain + plainly, special | any_special
-    count = sum(summand.count for summand in placed)
-    if count >= 1 << (limits.bits - 8):
-        raise ValueError(f"an aligned sum of {count} summands a value past its digits' range (2^"
-                         f"{limits.bits - 8})")
-    digit = limits.bits - 2 - max(1, count.bit_length())
+        product = _product(term, ints)
+        reduced, extent = _reduction(product.place.shape, axis, laid)
+        parts.append((product, reduced, extent))
+        nan = nan | reduced(product.nan, jnp.any)
+        positive = positive | reduced(product.infinite & ~product.negative, jnp.any)
+        negative = negative | reduced(product.infinite & product.negative, jnp.any)
+        # A sum of negative zeros alone is one, of none positive zero (base review 6c68b90ad F4).
+        live = live | reduced(~(product.zero & product.negative), jnp.any)
+    if not sum(extent for _, _, extent in parts):
+        live = True
+    count = sum(extent * len(product.limbs) for product, _, extent in parts)
+    # The widest digit whose sum and carry, below `count 2^w`, the integers hold (base review 24283f400 F3).
+    digit = (((1 << (limits.bits - 1)) - 1) // max(count, 1)).bit_length() - 1
+    if digit < 1:
+        raise ValueError(f"an aligned sum of {count} limbs a value, past its integers' digits")
     lowest = factors * (limits.minexp - 2 * limits.nmant)
     highest = factors * (limits.maxexp + 1) + count.bit_length() + 2
     levels = -(-(highest - lowest) // digit)
-    sums = _digits(placed, lowest, digit, levels, ints)
-    exact = _nearest(sums, lowest, digit, limits)
-    negative_zero = functools.reduce(jnp.logical_and, [
-        s.reduced(((s.mantissa == 0) & s.negative).astype(ints)) == s.count for s in placed])
-    exact = jnp.where(negative_zero & (exact == 0), -jnp.zeros_like(exact), exact)
-    return jnp.where(special, jnp.asarray(plain, dtype), exact).astype(dtype)
+    exact = _nearest(parts, lowest, digit, levels, limits)
+    exact = jnp.where(live, exact, -jnp.zeros_like(exact))
+    special = jnp.where(positive, jnp.asarray(jnp.inf, dtype), jnp.asarray(-jnp.inf, dtype))
+    special = jnp.where(nan | (positive & negative), jnp.asarray(jnp.nan, dtype), special)
+    return jnp.where(nan | positive | negative, special, exact).astype(dtype)
 
 
-def _digits(placed: list[_Summands], lowest: int, digit: int, levels: int, ints) -> jax.Array:
-    """The summands' signed sums at each of `levels` digits of `digit` bits from bit `lowest` up, `[levels,
-    *value]`: a digit's sum the sum of each summand's bits there, a whole number below `2^digit` each, so
-    the sum is exact in any order (a mesh's split axis summed shard by shard, a kernel's tile at once)."""
-    bits = jnp.iinfo(ints).bits
+def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
+    """The parts' exact sum (`_exact_sum`'s products and reductions) as the nearest float, ties to even: each
+    of `levels` digits of `digit` bits from bit `lowest` up the sum of every limb's bits there, carried from
+    below as the number's and its negation's digits, the last carry its sign; of the magnitude's, the
+    highest nonzero digit and those below it the significand and two more bits span, and whether any under
+    them is nonzero, kept as the carry passes, then written as the float's bits (`_written`), a subnormal
+    sum where a process flushes subnormals (XLA's CPU). Every reduction states its integers, which x64
+    would widen (base review 6c68b90ad F1)."""
+    ints = jnp.dtype(f"int{limits.bits}")
+    bits, mask, width = limits.bits, (1 << digit) - 1, 2 * _split_bits(limits.dtype)[2]
+    held = 2 + -(-(limits.nmant + 3) // digit)
 
-    def level(index):
-        low = lowest + index * digit
+    def digit_sum(level):
+        low = lowest + level * digit
         total = 0
-        for summand in placed:
-            shift = low - summand.place
-            right = (summand.mantissa >> jnp.clip(shift, 0, bits - 1)) & ((1 << digit) - 1)
-            kept = summand.mantissa & ((1 << jnp.clip(digit + shift, 0, bits - 1)) - 1)
-            left = kept << jnp.clip(-shift, 0, bits - 1)
-            # A summand's bits at the digit: shifted down from above it, or its low bits up into it.
-            taken = jnp.where(shift >= 0, jnp.where(shift < bits - 1, right, 0),
-                              jnp.where(digit + shift > 0, left, 0))
-            total = total + summand.reduced(jnp.where(summand.negative, -taken, taken))
+        for product, reduced, _ in parts:
+            taken = 0
+            for at, limb in enumerate(product.limbs):
+                shift = low - (product.place + at * width)
+                right = (limb >> jnp.clip(shift, 0, bits - 1)) & mask
+                kept = limb & ((1 << jnp.clip(digit + shift, 0, bits - 1)) - 1)
+                left = kept << jnp.clip(-shift, 0, bits - 1)
+                taken = taken + jnp.where(shift >= 0, right, jnp.where(digit + shift > 0, left, 0))
+            total = total + reduced(jnp.where(product.negative, -taken, taken), jnp.sum, dtype=ints)
         return jnp.asarray(total, ints)
 
+    def rolled(state, value, level):
+        # A digit carried in, the window's last out into its sticky part, the window kept where it leads.
+        carry, window, under, lead, kept, sticky = state
+        value = value + carry
+        under = under | (window[-1] != 0)
+        window = (value & mask, *window[:-1])
+        nonzero = window[0] != 0
+        return (value >> digit, window, under, jnp.where(nonzero, level, lead),
+                tuple(jnp.where(nonzero, new, old) for new, old in zip(window, kept, strict=True)),
+                jnp.where(nonzero, under, sticky))
+
+    def step(level, states):
+        level = jnp.asarray(level, ints)
+        value = digit_sum(level)
+        return rolled(states[0], value, level), rolled(states[1], -value, level)
+
+    # Zeros of the value's shape and placement, as each digit's sum is: a loop's carry keeps its type.
+    zeros = functools.reduce(jnp.add, [reduced(jnp.zeros_like(product.place), jnp.sum, dtype=ints)
+                                       for product, reduced, _ in parts])
+    start = (zeros, (zeros,) * held, zeros != 0, zeros - 1, (zeros,) * held, zeros != 0)
+    first, last = _levels(parts, lowest, digit, levels, limits)
+    states = jax.lax.fori_loop(first, last, step, (start, start))
+    negative = states[0][0] < 0
+    _, _, _, lead, kept, sticky = jax.tree.map(lambda p, n: jnp.where(negative, n, p), *states)
+    return _written(lead, kept, sticky, negative, lowest, digit, limits)
+
+
+def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
+    """The digits `_nearest` walks: a kernel's every one, else the nonzero limbs' and a carry's room above."""
     from dew.nn.kernels.launches import interpreting
 
     if interpreting() is not None:
-        # A kernel's body: its levels written out, a loop's stacked carries left to XLA's path.
-        return jnp.stack([level(index) for index in range(levels)])
-    return jax.lax.map(level, jnp.arange(levels, dtype=ints))
+        return 0, levels
+    ints = jnp.dtype(f"int{limits.bits}")
+    width = 2 * _split_bits(limits.dtype)[2]
+    least, most = jnp.iinfo(ints).max, jnp.iinfo(ints).min
+    for product, _, _ in parts:
+        for at, limb in enumerate(product.limbs):
+            place = product.place + at * width
+            least = jnp.minimum(least, jnp.min(jnp.where(limb != 0, place, least), initial=least))
+            most = jnp.maximum(most, jnp.max(jnp.where(limb != 0, place + width, most), initial=most))
+    count = sum(extent * len(product.limbs) for product, _, extent in parts)
+    first = jnp.clip((least - lowest) // digit, 0, levels)
+    last = jnp.clip((most + count.bit_length() + 2 - lowest) // digit + 2, 0, levels)
+    return first, jnp.maximum(first, last)
 
 
-def _nearest(sums: jax.Array, lowest: int, digit: int, limits) -> jax.Array:
-    """The number the digits' signed sums `sums` (`_digits`, the lowest digit at bit `lowest`) make, carried
-    into nonnegative digits below `2^digit` and a sign, as the nearest float, ties to even: its leading bit,
-    the dtype's significand's bits from it (none below the least subnormal's), two more, and a sticky bit of
-    every one below, rounded in integers and written as the float's bits, so a process flushing subnormals
-    (XLA's CPU) writes a subnormal sum, and one past the largest is infinite."""
-    ints = sums.dtype
+def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> jax.Array:
+    """The magnitude's digits from its highest nonzero one at `lead` (`kept`), `sticky` where any under them
+    is nonzero, as the nearest float's bits, ties to even, signed where `negative`: its leading bit, the
+    significand's bits from it (none below the least subnormal's) and two more, rounded in integers."""
+    ints = lead.dtype
     bits = jnp.iinfo(ints).bits
-    mask = (1 << digit) - 1
-
-    def carried(sums):
-        # Each digit's sum and the carry into it, the carry what passes the digit's bits, up to the last.
-        carry, digits = jnp.zeros_like(sums[0]), []
-        for value in sums:
-            value = value + carry
-            carry = value >> digit
-            digits.append(value & mask)
-        return carry, jnp.stack(digits)
-
-    overflow, _ = carried(sums)
-    negative = overflow < 0
-    _, digits = carried(jnp.where(negative, -sums, sums))
-    index = jnp.arange(digits.shape[0], dtype=ints).reshape((-1,) + (1,) * (digits.ndim - 1))
-    length = bits - jax.lax.clz(digits)
-    lead = jnp.max(jnp.where(digits != 0, index * digit + length - 1, -1), axis=0)
+    length = bits - jax.lax.clz(kept[0])
+    top = lead * digit + length - 1
     least = limits.minexp - limits.nmant
     # The rounding place, two bits below the significand's lowest, relative to the lowest digit's bit.
-    place = jnp.maximum(lowest + lead - limits.nmant, least) - 2 - lowest
-    offset = index * digit - place
-    up = digits << jnp.clip(offset, 0, bits - 1)
-    down = digits >> jnp.clip(-offset, 0, bits - 1)
-    whole = jnp.sum(jnp.where(offset >= 0, up, jnp.where(-offset < digit, down, 0)), axis=0)
-    below = digits & ((1 << jnp.clip(-offset, 0, digit)) - 1)
-    sticky = jnp.any(jnp.where(offset >= 0, 0, jnp.where(-offset < digit, below, digits)) != 0, axis=0)
+    place = jnp.maximum(lowest + top - limits.nmant, least) - 2 - lowest
+    whole = jnp.zeros_like(lead)
+    for at, value in enumerate(kept):
+        offset = (lead - at) * digit - place
+        up = value << jnp.clip(offset, 0, bits - 1)
+        down = value >> jnp.clip(-offset, 0, bits - 1)
+        whole = whole + jnp.where(offset >= 0, up, jnp.where(-offset < digit, down, 0))
+        below = value & ((1 << jnp.clip(-offset, 0, digit)) - 1)
+        sticky = sticky | (jnp.where(offset >= 0, 0, jnp.where(-offset < digit, below, value)) != 0)
     whole = whole | sticky.astype(ints)
-    tail, kept = whole & 3, whole >> 2
-    kept = kept + ((tail > 2) | ((tail == 2) & ((kept & 1) == 1))).astype(ints)
-    # The float's bits: its significand (a carry into the next binade adds its exponent's unit) over its
-    # lowest bit's place above the least subnormal's, infinity's where they pass it.
-    infinite = (2 * limits.maxexp - 1) << limits.nmant
+    tail, significand = whole & 3, whole >> 2
+    significand = significand + ((tail > 2) | ((tail == 2) & ((significand & 1) == 1))).astype(ints)
+    # The float's bits: its significand (a carry into the next binade its exponent's unit) at its place.
     field = lowest + place + 2 - least
-    finite = (jnp.clip(field, 0, 2 * limits.maxexp - 3) << limits.nmant) + kept
+    finite = (jnp.clip(field, 0, 2 * limits.maxexp - 3) << limits.nmant) + significand
+    infinite = (2 * limits.maxexp - 1) << limits.nmant
     magnitude = jnp.where(lead < 0, 0, jnp.where(field > 2 * limits.maxexp - 3, infinite, finite))
-    signed = jnp.where(negative, magnitude | np.array(-(1 << (bits - 1)), ints), magnitude)
+    signed = jnp.where(negative & (lead >= 0), magnitude | np.array(-(1 << (bits - 1)), ints), magnitude)
     return jax.lax.bitcast_convert_type(signed, jnp.dtype(limits.dtype))
 
 

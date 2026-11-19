@@ -25,7 +25,6 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import (
     ACCURATE,
     Numerics,
-    _binades,
     _rounded_significand,
     aligned_sum,
     binade_of,
@@ -1568,20 +1567,19 @@ def _edge_values(dtype) -> np.ndarray:
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["fp32", "float64"])
 def test_a_floats_bits_read_as_its_exponent_and_significand(dtype):
-    """`float_bits` and `_binades` of normal, subnormal and zero values of both signs: each nonzero value's
-    exponent `floor(log2 |x|)` (numpy's `frexp`, less one) and its significand in [1, 2) with its sign, the
-    value exactly their product, a subnormal's read from its bits; zero's significand zero."""
+    """`float_bits` of normal, subnormal and zero values of both signs: each nonzero value's exponent
+    `floor(log2 |x|)` (numpy's `frexp`, less one) and its normalized fraction with the implicit bit the
+    value's significand, the value exactly their product, a subnormal's read from its bits."""
     with jax.enable_x64(new_val=dtype == np.float64):
         values = _edge_values(dtype)
-        significand, exponent = (np.asarray(part, np.float64) for part in _binades(jnp.asarray(values)))
-        reported = np.asarray(float_bits(jnp.asarray(values))[4])
+        _, _, _, normalized, exponent = (np.asarray(part) for part in float_bits(jnp.asarray(values)))
     nonzero = values != 0
     expected = np.frexp(values.astype(np.float64))[1] - 1
     np.testing.assert_array_equal(exponent[nonzero], expected[nonzero])
-    np.testing.assert_array_equal(reported[nonzero], expected[nonzero])
-    np.testing.assert_array_equal(np.ldexp(significand, exponent.astype(np.int64)), values.astype(np.float64))
-    assert np.all((np.abs(significand[nonzero]) >= 1) & (np.abs(significand[nonzero]) < 2))
-    np.testing.assert_array_equal(significand[~nonzero], 0.0)
+    nmant = np.finfo(dtype).nmant
+    significand = (normalized.astype(np.float64) + 2.0 ** nmant) / 2.0 ** nmant
+    rebuilt = np.copysign(np.ldexp(significand, exponent.astype(np.int64)), values.astype(np.float64))
+    np.testing.assert_array_equal(rebuilt[nonzero], values.astype(np.float64)[nonzero])
 
 
 def test_binade_of_reads_an_fp32s_exponent_minus_1024_at_zero():
