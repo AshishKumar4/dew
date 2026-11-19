@@ -1135,7 +1135,11 @@ def left_at_run(compiled: jax.stages.Compiled) -> bool:
     3, their instructions, 2, each one's custom call target, 28, and backend config, 43)."""
     executable = compiled.runtime_executable()
     for module in [] if executable is None else executable.hlo_modules():
-        for computation in proto_fields(module.as_serialized_hlo_module_proto()).get(3, []):
+        serialized = module.as_serialized_hlo_module_proto()
+        # A module naming no cuDNN convolution holds none, which most steps' do: not parsed.
+        if CUDNN_CONVOLUTION not in serialized:
+            continue
+        for computation in proto_fields(serialized).get(3, []):
             for instruction in proto_fields(computation).get(2, []):
                 fields = proto_fields(instruction)
                 if not fields.get(28, [b""])[0].startswith(CUDNN_CONVOLUTION):
