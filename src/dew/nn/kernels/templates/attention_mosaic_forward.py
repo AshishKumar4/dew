@@ -100,6 +100,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     stages_after_walks,
     stated,
     transposed_swizzles,
+    value_columns,
 )
 from dew.nn.kernels.templates.cost import estimate
 from dew.nn.kernels.templates.rings import Ref
@@ -406,7 +407,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                ) -> "tuple[tuple, jax.Array, None] | tuple[tuple, None, _Flags]":
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
-        q, form = _rewalked(spec, form, raw, taken, hooks, bundle_of(at, raw.dtype))
+        q, form = _rewalked(spec, form, raw, taken, hooks, bundle_of(at, raw.dtype), parts=parts)
         # A rewalk's flags: those the plain launch stated of its rows (`flagged`), else its live rows'.
         flags = (None if live is None else live if isinstance(live, _Flags)
                  else _Flags.of(live.reshape(*live.shape[:2], -1), at.block_q))
@@ -530,9 +531,9 @@ def _column_blocks(value: jax.Array, hooked: _Hooked, columns: int | None, *, wh
     and `hooked` with the initial state's sums of its own columns (`_Hooked.initial`, its maximum and
     denominator the rows'): where `whole`, the whole, first None, where a block holds every column
     (`Tiles.columns` None)."""
-    if whole and (columns is None or columns >= value.shape[-1]):
+    width = value_columns(value.shape[-1], columns)
+    if whole and width >= value.shape[-1]:
         return [(None, value, hooked)]
-    width = value.shape[-1] if columns is None else columns
 
     def held(first: int) -> _Hooked:
         initial = hooked.initial
@@ -688,10 +689,10 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         # norm): XLA's program before the launch takes it.
         query = prologued(query, hooks.query_mod, hooks.query_params)
         hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
-    # A query its consumers take under its prologue or by its power in their stage enters as the caller's
-    # (`_powered_in_kernel`): avoids an XLA pass over the query before the launch (row 5274, ~1.5 us at B1).
-    fused = _powered_in_kernel(family, query.dtype, hooks)
-    call = padded_call(query if fused else by_power(query, power / taken), key, value, spans, hooks,
+    # The padded query stays unscaled until `_rewalked` decides per launch (plain or natural rewalk, which
+    # may switch families) whether its consumers take the power in their stage (`_powered_in_kernel`) or
+    # XLA multiplies before the launch (row 5274).
+    call = padded_call(query, key, value, spans, hooks,
                        _block(tiles), table, by_position=True,
                        query_block=tiles.consumers * tiles.block_q if inference else None,
                        widths=head_width)
@@ -718,27 +719,28 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     return call, spec, operands, read, taken, hooks
 
 
-def _powered_in_kernel(family: mosaic.Family, dtype, hooks: Hooks) -> bool:
+def _powered_in_kernel(family: mosaic.Family, dtype, hooks: Hooks, *, parts: int = 1) -> bool:
     """Whether a launch's consumers take its query's power of two in their stage (`_query_of`, its form's
-    `prescale`): under a query prologue, or for a 16-bit query on an NVIDIA GPU family whose consumers own
-    their query stage (`across.scale_smem`, row 5274, ~1.5 us at B1; not `places_on_role`, whose issuer
-    waits on `q_loaded`, and not TPU `mxu`)."""
+    `prescale`): under a query prologue, or for a single-part 16-bit query on an NVIDIA GPU family whose
+    consumers own their query stage (`across.scale_smem`, row 5274, ~1.5 us at B1; not fp32 multipart,
+    not `places_on_role`, whose issuer waits on `q_loaded`, and not TPU `mxu`)."""
+    if parts != 1:
+        return False
     if hooks.query_mod is not None:
         return True
     return jnp.dtype(dtype).itemsize == 2 and family.fixes_up and not family.places_on_role
 
 
 def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, taken: float, hooks: Hooks,
-              family: mosaic.Family) -> tuple[jax.Array, algebra.Forward]:
-    """A launch's query operand and form: the fold's natural rewalk (`algebra.unfolded`) of a call whose
-    plain launch took its power of two into its scale (`taken`, `_prepared`) the query taken by the power
-    (in the kernel where `_powered_in_kernel`) and the scale left after it, its products finite where the
-    reference's are; every other launch the call's own."""
-    if taken == 1.0 or form.natural == spec.natural:
+              family: mosaic.Family, parts: int = 1) -> tuple[jax.Array, algebra.Forward]:
+    """A launch's query operand and form: updates the natural rewalk's scale and prescale where the plain
+    launch folded `taken` into its scale, then applies `form.prescale` outside the launch iff `family` does
+    not apply it in the query stage (`_powered_in_kernel`), so a cross-family rewalk never scales twice."""
+    if taken != 1.0 and form.natural != spec.natural:
+        form = dataclasses.replace(form, scale=form.scale / taken, prescale=taken)
+    if form.prescale == 1.0 or _powered_in_kernel(family, query.dtype, hooks, parts=parts):
         return query, form
-    rewalked = dataclasses.replace(form, scale=form.scale / taken, prescale=taken)
-    return (query if _powered_in_kernel(family, query.dtype, hooks) else by_power(query, taken)), rewalked
-
+    return by_power(query, form.prescale), form
 class _Read(NamedTuple):
     """What a forward launch's programs read beside its operands (`_launch`), its kernel's refs flattened:
     the spans' block map, the hooks' arrays, a training walk's anchors, a paged call's table, a masked
@@ -1091,7 +1093,7 @@ def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded
         family.loaded(((q_view, q_smem, q_loaded),))
         if hooks.query_mod is not None:
             _prologued(family, hooks.query_mod, hooks, hooked.query, place, first, q_smem, spec.prescale)
-        elif spec.prescale != 1.0 and _powered_in_kernel(family, q_smem.dtype, hooks):
+        elif spec.prescale != 1.0 and _powered_in_kernel(family, q_smem.dtype, hooks, parts=program.parts):
             across.scale_smem(q_smem, spec.prescale, swizzle=query_swizzle(family), interpret=interpret)
             family.published()
         return family.held(q_smem)

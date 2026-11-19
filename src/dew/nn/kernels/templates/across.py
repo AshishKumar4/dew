@@ -137,7 +137,7 @@ def scale_smem(ref, power: float, *, swizzle: int | None = None, interpret: bool
     bits = (int(np.float32(power).view(np.uint32) >> 16) if bf16
             else int(np.float16(power).view(np.uint16)))
     pair = bits | (bits << 16)
-    transforms = () if swizzle is None else swizzling.staged(ref.shape, dtype, swizzle).transforms
+    transforms = swizzling.staged(ref.shape, dtype, swizzle).transforms
     ref_type = plgpu.RefType(transforms) if transforms else plgpu.RefType()
     body = emission.stating(lambda r: Work(operations=elements, shared_bytes=2 * elements * 2))(
         ScaleSmem(words, pair, bf16))

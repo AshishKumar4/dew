@@ -102,6 +102,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     split_queries,
     stagings,
     streams_operands,
+    value_columns,
     varying_slopes,
     walked_extents,
     walked_layouts,
@@ -933,6 +934,12 @@ class MosaicForward(_Mainloop[Tiles]):
                             query.dtype, stages=min(config.stages, steps), parts=self.parts, coded=coded,
                             scaled=self.scales_in_kernel(ba),
                             training=ba.arguments.get("residuals") is Kept.SPLIT)
+
+    @staticmethod
+    def _value_columns(value: jax.Array, family: mosaic.Family, dtype, config: Tiles) -> int:
+        """The value columns a launch at `config` actually emits (`attention_mosaic_forward._column_blocks`):
+        `config.columns` capped at the padded value width so oversized pins price as launched."""
+        return value_columns(_width(value.shape[-1], family, dtype), config.columns)
 
     def cached(self, table, sources, scales) -> bool:
         """Whether a call walks a cache's keys (masked, split, paged, by rows or over codes: a decode step's
