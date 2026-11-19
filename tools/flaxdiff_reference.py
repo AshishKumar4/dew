@@ -76,7 +76,7 @@ def main(argv=None) -> None:
     sys.path.insert(0, args.flaxdiff_path)
     from flaxdiff.models.common import FourierEmbedding
     if args.architecture == "hybrid_dit":
-        from flaxdiff.models.ssm_dit import HybridSSMAttentionDiT as Model
+        from flaxdiff_hybrid import HybridSSMAttentionDiT as Model
         model_config = {**MODEL, "ssm_state_dim": 8, "ssm_attention_ratio": "3:1",
                         "use_2d_fusion": True, "use_zigzag": True}
         commit = HYBRID_COMMIT

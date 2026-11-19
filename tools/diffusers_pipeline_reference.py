@@ -32,7 +32,8 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_flax_stable_diffusion_xl i
 from diffusers.schedulers.scheduling_ddim_flax import FlaxDDIMScheduler
 from PIL import Image
 from reference_releases import require
-from transformers import CLIPTextConfig, CLIPTokenizer, FlaxCLIPTextModel, FlaxCLIPTextModelWithProjection
+from transformers import CLIPTextConfig, CLIPTokenizer
+from transformers.models.clip.modeling_flax_clip import FlaxCLIPTextModel, FlaxCLIPTextModelWithProjection
 from transformers.models.clip.tokenization_clip import bytes_to_unicode
 
 COHORT = "diffusers-pipelines"

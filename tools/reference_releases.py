@@ -83,6 +83,10 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "flaxdiff": {
         "flaxdiff": "git+https://github.com/AshishKumar4/FlaxDiff@3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a",
         "jax": "0.5.3", "flax": "0.10.6"},
+    # The hybrid DiT's FlaxDiff (flaxdiff_reference's HYBRID_COMMIT), its releases the simple model's.
+    "flaxdiff-hybrid": {
+        "flaxdiff": "git+https://github.com/AshishKumar4/FlaxDiff@94d2d21caeb79aba48a505fa79d9a1a974751234",
+        "jax": "0.5.3", "flax": "0.10.6"},
     # FlaxDiff's source beside Dew's own JAX, for the tools that import Dew too (flaxdiff_pipeline_reference).
     "flaxdiff-source": {
         "flaxdiff": "git+https://github.com/AshishKumar4/FlaxDiff@3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a"},

@@ -191,8 +191,8 @@ def common() -> bytes:
 
 def key(path: Path, requirements: Iterable[str], shared: bytes) -> str:
     """Tool `path`'s verdict's key: `shared` (`common`), its environment (its requirements, and Dew's lock,
-    whose environment every one reads beneath its own: `made`) and the code of its `closure`, each file by its
-    path and bytes."""
+    whose environment Dew's tools and those with `DEW_BENEATH` read) and the code of its `closure`, each file
+    by its path and bytes."""
     digest = hashlib.sha256(shared)
     digest.update(json.dumps(list(requirements)).encode() + (ROOT / "locks" / "cpu.txt").read_bytes())
     for each in closure(path):
@@ -212,19 +212,25 @@ the reference a site runs from its checkout (tools/venv_reference.py's SITES), w
 published."""
 
 
+DEW_BENEATH = "+dew"
+"""A cohort environment's requirement that Dew's own environment be read beneath its pins: its tools import
+Dew too. Only theirs: Dew's typed releases (py.typed) outrank a pin's untyped one wherever both are on the
+path (2026-11-19: Dew's transformers hid diffusers-pipelines' 4.49.0, and its Flax CLIP models with it)."""
+
+
 def made(requirements: list[str]) -> Path:
-    """The interpreter of the environment holding `requirements` over Dew's own, made once under
-    `ENVIRONMENTS` by their digest (a torch from its CPU index, a CUDA extension's build skipped, as pyright
-    reads only its Python); a failed install raises CalledProcessError. A repository pin (`SOURCE`) is never
-    built: it is fetched at its commit beside the environment and put on its path by a .pth file, as its
-    site puts the checkout on its worker's path, which pyright reads as the environment's own; its own
-    dependencies are the cohort's other pins."""
+    """The interpreter of the environment holding `requirements` (over Dew's own with `DEW_BENEATH`), made
+    once under `ENVIRONMENTS` by their digest (a torch from its CPU index, a CUDA extension's build skipped,
+    as pyright reads only its Python); a failed install raises CalledProcessError. A repository pin (`SOURCE`)
+    is never built: it is fetched at its commit beside the environment and put on its path by a .pth file,
+    as its site puts the checkout on its worker's path, which pyright reads as the environment's own; its
+    own dependencies are the cohort's other pins."""
     where = ROOT / ENVIRONMENTS / hashlib.sha256(json.dumps(requirements).encode()).hexdigest()[:16]
     python = where / "bin" / "python"
     if (where / "made").is_file():
         return python
     subprocess.run(["uv", "venv", "--quiet", "--clear", "--python", PYTHON, str(where)], check=True)
-    released = [each for each in requirements if not SOURCE.match(each)]
+    released = [each for each in requirements if not SOURCE.match(each) and each != DEW_BENEATH]
     if released:
         # The pins are the versions the reference's environment held, over what a release of them declares
         # (Kimi K3's: compressed-tensors 0.17.1, which declares torch>=2.10, beside torch 2.8.0).
@@ -236,9 +242,8 @@ def made(requirements: list[str]) -> Path:
     site = subprocess.run([str(python), "-c", purelib], capture_output=True, text=True,
                           check=True).stdout.strip()
     # One .pth, read after the environment's own packages, its lines in order: each repository pin's checkout
-    # (a src layout's packages under its src/, as an editable install puts them on the path), then Dew's
-    # environment beneath them all: a reference tool runs Dew's side and the reference's in one file, each in
-    # its own interpreter, and imports both.
+    # (a src layout's packages under its src/, as an editable install puts them on the path), then, with
+    # `DEW_BENEATH`, Dew's environment beneath them all.
     paths = []
     for source in filter(None, map(SOURCE.match, requirements)):
         checkout = where / "sources" / source["name"]
@@ -247,7 +252,8 @@ def made(requirements: list[str]) -> Path:
                         source["sha"]], check=True)
         subprocess.run(["git", "-C", str(checkout), "checkout", "--quiet", "FETCH_HEAD"], check=True)
         paths.append(checkout / "src" if (checkout / "src").is_dir() else checkout)
-    paths.append(Path(sysconfig.get_paths()["purelib"]))
+    if DEW_BENEATH in requirements:
+        paths.append(Path(sysconfig.get_paths()["purelib"]))
     Path(site, "_tool_types.pth").write_text("".join(f"{path}\n" for path in paths))
     (where / "made").write_text(json.dumps(requirements))
     return python
@@ -323,8 +329,11 @@ def main() -> int:
             print(f"refused: {refused}")
             red += 1
             continue
+        dew = ROOT / "src" / "dew"
+        beneath = [DEW_BENEATH] if any(found.is_relative_to(dew) for found in closure(path)) else []
         for name, requirements in environments:
-            groups.setdefault((name, tuple(requirements)), []).append(path)
+            held = (*requirements, *beneath) if requirements else ()
+            groups.setdefault((name, held), []).append(path)
     if args.list:
         for (name, _), paths in sorted(groups.items()):
             print(f"{name}: {len(paths)} tools: {' '.join(str(path.relative_to(ROOT)) for path in paths)}")
