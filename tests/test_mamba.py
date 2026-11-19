@@ -1,6 +1,7 @@
 """Mamba's selective scan and a `MambaForCausalLM` checkpoint against
 transformers 5.16.1: tools/mamba_reference.py writes tests/fixtures/hf/mamba-tiny."""
 
+import functools
 import json
 from pathlib import Path
 
@@ -10,12 +11,27 @@ import numpy as np
 import pytest
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through, float64_twin
-from reference_error import FEWEST_SEEDS, assert_as_exact
-from selective_support import near_the_largest, rate_past_the_range, stepwise
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
+from selective_support import (
+    DIFFERENTIATED,
+    FAINT_BESIDE_THE_LARGEST,
+    LONG_AXES,
+    NEAR_THE_LARGEST,
+    RATES_PAST_THE_RANGE,
+    faint_beside_the_largest,
+    long_draw,
+    near_the_largest,
+    rate_past_the_range,
+    recurred,
+    second_beside_the_largest,
+    starts_near_the_largest,
+    stepwise,
+)
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 
 from dew.interop import Pretrained
 from dew.nn.mixers.mamba import Mamba, selective_scan
+from dew.nn.ssm import affine_states
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 TINY = ROOT / 'mamba-tiny'
@@ -47,21 +63,137 @@ def test_the_chunked_scan_is_the_recurrence_from_any_state(chunk):
 
 
 @pytest.mark.parametrize('chunk', [16, 64])
-def test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence(chunk):
-    """The chunked scan's output and final state near float32's largest (`near_the_largest`'s entering state:
-    two writes past it together over a state entering near its negative, every state finite) on par from
-    float64 with the recurrence a token at a time (`stepwise`, check 1, which refuses a value not finite
-    where float64's is), where its spans summed the writes from a zero state past float32's largest, inf
-    (row 8465). Its gradients there, and a faint write after them, are row 8486's."""
+@pytest.mark.parametrize('case', list(NEAR_THE_LARGEST))
+def test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence(case, chunk):
+    """The chunked scan near float32's largest (`near_the_largest`), its output and final state, and every
+    input's gradient where a float32 recurrence holds them (`DIFFERENTIATED`), on par from float64 with the
+    recurrence a token at a time (`stepwise`, check 1, which refuses a value not finite where float64's is):
+    its spans summed the writes from a zero state past float32's largest, inf (row 8465), its cotangents'
+    spans did so too, and a halving of them lost a faint write (row 8486)."""
+    starts = starts_near_the_largest(case)
+
     def scan(x, dt, A, B, C, D, state):
-        return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=chunk)
+        return selective_scan(x, dt, A, B, C, D, state=state, starts=starts, chunk_size=chunk)
+
+    def reference(x, dt, A, B, C, D, state):
+        return stepwise(x, dt, A, B, C, D, state, starts)
 
     def draw(seed):
-        return near_the_largest("an entering state", seed)[:-1]
+        *inputs, cotangents = near_the_largest(case, seed)
+        return (*inputs, cotangents) if case in DIFFERENTIATED else tuple(inputs)
 
-    exact = jax.jit(stepwise)
-    assert_as_exact(jax.jit(scan), exact, draw, f"the chunked scan near float32's largest, chunks of {chunk}",
-                    seeds=FEWEST_SEEDS, truth_fn=exact)
+    arm = with_gradients if case in DIFFERENTIATED else (lambda fn: fn)
+    exact = jax.jit(arm(reference))
+    # A gradient's leaves resolve over more draws than the states alone (its skip's at 40 was inconclusive).
+    assert_as_exact(jax.jit(arm(scan)), exact, draw,
+                    f"the chunked scan near float32's largest, {case}, chunks of {chunk}",
+                    seeds=160 if case in DIFFERENTIATED else FEWEST_SEEDS, truth_fn=exact)
+
+
+@pytest.mark.parametrize('axis', [1, -2])
+@pytest.mark.parametrize('case', FAINT_BESIDE_THE_LARGEST)
+def test_an_affine_scans_faint_values_beside_float32s_largest_are_as_exact_as_the_recurrence(case, axis):
+    """Mamba's affine scan (`ssm.affine_states`) along its tokens, named by a positive or a negative axis,
+    over faint values beside sums past float32's largest (`faint_beside_the_largest`): its states, and with
+    a faint cotangent every gradient, on par from float64 with the recurrence a token at a time (`recurred`,
+    check 1): a recurrence halved where it reached the largest flushed its faint half (row 8486), and its
+    transpose reversed a negative axis JAX had not made positive (the head review of 29231f794)."""
+    def scan(decay, write, entering):
+        return affine_states(decay, write, entering, axis=axis)
+
+    def reference(decay, write, entering):
+        return recurred(decay, write, entering, axis=1)
+
+    differentiated = case == "a faint cotangent"
+
+    def draw(seed):
+        *inputs, cotangent = faint_beside_the_largest(case, seed)
+        return (*inputs, cotangent) if differentiated else tuple(inputs)
+
+    arm = with_gradients if differentiated else (lambda fn: fn)
+    exact = jax.jit(arm(reference))
+    assert_as_exact(jax.jit(arm(scan)), exact, draw,
+                    f"an affine scan beside float32's largest, {case}, along axis {axis}", seeds=FEWEST_SEEDS,
+                    truth_fn=exact)
+
+
+@pytest.mark.parametrize('length', LONG_AXES)
+def test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence(length):
+    """Mamba's affine scan (`ssm.affine_states`) over an axis longer than a block (`long_draw`): its states,
+    every gradient and its decays' gradient of the writes' cotangent along a direction, on par from float64
+    with the recurrence a token at a time (`recurred`, check 1)."""
+    def scan(decay, write, entering):
+        return affine_states(decay, write, entering, axis=1)
+
+    def reference(decay, write, entering):
+        return recurred(decay, write, entering, axis=1)
+
+    def second(fn):
+        def run(decay, write, entering, cotangent):
+            def along(decay):
+                _, pull = jax.vjp(lambda write: fn(decay, write, entering), write)
+                return jnp.sum(pull(cotangent)[0] * 0.25)
+
+            return with_gradients(fn)(decay, write, entering, cotangent), jax.grad(along)(decay)
+
+        return run
+
+    exact = jax.jit(second(reference))
+    assert_as_exact(jax.jit(second(scan)), exact, functools.partial(long_draw, length),
+                    f"an affine scan over {length} tokens", seeds=FEWEST_SEEDS, truth_fn=exact)
+
+
+@pytest.mark.parametrize('length', [65, 128, 130, 194])
+def test_an_affine_scans_second_order_past_a_block_is_zero_where_it_is_structurally(length):
+    """Mamba's affine scan over decays of one half, writes of 1/8 from 5/8, its states' cotangents one but
+    1.75 2^127 at the last two tokens of the last whole block: its writes' cotangent's derivative, a quarter
+    of it summed, along the first token's decay, zero, as the recurrence's a token at a time, where a scan
+    of blocks' transpose met an overflowing cotangent with its last carry's zero, NaN (the head review of
+    84cf35dfe)."""
+    decay, write = jnp.full((length, 1), 0.5, jnp.float32), jnp.full((length, 1), 0.125, jnp.float32)
+    end = length // 64 * 64
+    cotangent = jnp.ones((length, 1), jnp.float32).at[end - 2:end].set(1.75 * 2.0 ** 127)
+
+    entering = jnp.full((1,), 0.625, jnp.float32)
+
+    def along(decay):
+        _, pull = jax.vjp(lambda write: affine_states(decay, write, entering, axis=0), write)
+        return jnp.sum(pull(cotangent)[0] * 0.25)
+
+    assert float(jax.grad(along)(decay)[0, 0]) == 0.0
+
+
+@pytest.mark.parametrize('length', LONG_AXES)
+def test_an_affine_scan_over_a_long_axis_takes_empty_lanes_and_a_narrower_entering_state(length):
+    """Mamba's affine scan over an axis longer than a block: of no lanes, its states empty of its shape, and
+    from a bf16 state entering float32 decays and writes, its states float32, where blocks laid by `-1`
+    divided by an empty lane's zero and a scan's carry kept the entering bf16 (the head review of
+    84cf35dfe)."""
+    empty = jnp.zeros((length, 0), jnp.float32)
+    assert affine_states(empty, empty, jnp.zeros((0,), jnp.float32), axis=0).shape == (length, 0)
+    decay, write = jnp.full((length, 4), 0.5, jnp.float32), jnp.full((length, 4), 0.25, jnp.float32)
+    assert affine_states(decay, write, jnp.ones((4,), jnp.bfloat16), axis=0).dtype == jnp.float32
+
+
+def test_an_affine_scans_second_derivative_beside_float32s_largest_is_as_exact_as_the_recurrence():
+    """The decays' gradient of Mamba's affine scan's writes' cotangent along a direction, under a cotangent of
+    2^127 beside a reset (`second_beside_the_largest`): on par from float64 with the recurrence's a token at
+    a time (`recurred`, check 1), every order of the scan its own ranged recurrence, where autodiff of a
+    halving's scaling doubled the cotangent past the largest, NaN (the head review of 29231f794)."""
+    def second(fn):
+        def run(decay, write, entering, cotangent, direction):
+            def along(decay):
+                _, pull = jax.vjp(lambda write: fn(decay, write, entering, axis=1), write)
+                return jnp.sum(pull(cotangent)[0] * direction)
+
+            return jax.grad(along)(decay)
+
+        return run
+
+    exact = jax.jit(second(recurred))
+    assert_as_exact(jax.jit(second(affine_states)), exact, second_beside_the_largest,
+                    "an affine scan's second derivative beside float32's largest", seeds=FEWEST_SEEDS,
+                    truth_fn=exact)
 
 
 def decayed(fn):
@@ -75,20 +207,21 @@ def decayed(fn):
     return run
 
 
+@pytest.mark.parametrize('case', RATES_PAST_THE_RANGE)
 @pytest.mark.parametrize('chunk', [16, 64])
-def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk):
+def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk, case):
     """A scan whose rate `A log2(e)` passes float32's range over a ragged chunk (`rate_past_the_range`): its
     output, final state and its decay's step's and rate's gradients (`decayed`) on par from float64 with the
     recurrence a token at a time (`stepwise`, check 1), where the rate taken to base 2 before the step was
-    -inf and a padded token's zero step made its decay NaN (row 8491). Its B's and C's gradients there are
-    row 8563's."""
+    -inf and a padded token's zero step made its decay NaN (row 8491), and under steps of 2^-126 each decay
+    e^-3, which no clamp of that rate gives (row 8609). Its B's and C's gradients there are row 8563's."""
     def scan(x, dt, A, B, C, D, state):
         return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=chunk)
 
     exact = jax.jit(decayed(stepwise))
-    assert_as_exact(jax.jit(decayed(scan)), exact, rate_past_the_range,
-                    f"the chunked scan at a rate past float32's range, chunks of {chunk}", seeds=FEWEST_SEEDS,
-                    truth_fn=exact)
+    assert_as_exact(jax.jit(decayed(scan)), exact, functools.partial(rate_past_the_range, case),
+                    f"the chunked scan at a rate past float32's range, {case}, chunks of {chunk}",
+                    seeds=FEWEST_SEEDS, truth_fn=exact)
 
 
 def test_a_document_start_drops_the_state_entering_it():

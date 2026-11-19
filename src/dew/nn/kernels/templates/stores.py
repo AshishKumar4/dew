@@ -4,6 +4,7 @@ buffer and its rows stored by a ladder of static-extent copies (`staged_rows`, `
 row by row where a table says (`Scattered`)."""
 
 import dataclasses
+import functools
 import math
 from collections.abc import Callable
 from typing import Any
@@ -103,17 +104,21 @@ def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable 
     chunks' groups run otherwise than one output's tiles in turn, else `buffer_waits`'. A share storing no
     rows (a ragged last tile's second consumer's) stages nothing: no buffer written, no group issued, so
     every chunk staged commits at least one (`buffer_waits`)."""
+    pl.when(place[2] > 0)(functools.partial(staged, smem, value, ref, place, write=write, waits=waits))
+
+
+def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
+           waits: tuple[int, ...] | None = None) -> None:
+    """`staged_chunks`' chunks staged whatever rows `place` stores: each its buffer's wait, its write and
+    its stores."""
     buffers, width = smem.shape[0], smem.shape[-1]
     row_start, first, stored, column, *ladder = place
     chunks = column_chunks(value, width)
     waits = buffer_waits(len(chunks), buffers) if waits is None else waits
-
-    @pl.when(stored > 0)
-    def _():
-        for chunk, (start, piece) in enumerate(chunks):
-            plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
-            staged_rows(smem.at[chunk % buffers], piece, ref, row_start, first, stored, column + start,
-                        *ladder, write=write)
+    for chunk, (start, piece) in enumerate(chunks):
+        plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
+        staged_rows(smem.at[chunk % buffers], piece, ref, row_start, first, stored, column + start, *ladder,
+                    write=write)
 
 
 def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column, most: int,

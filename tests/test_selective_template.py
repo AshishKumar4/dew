@@ -133,7 +133,8 @@ def test_a_rate_past_float32s_range_scans_as_the_recurrence_interpreted():
     template = functools.partial(selective.selective_scan, family=taken_family(jnp.float32),
                                  interpret=INTERPRETED)
     exact = jax.jit(with_gradients(stepwise))
-    assert_as_exact(jax.jit(with_gradients(template)), exact, rate_past_the_range,
+    assert_as_exact(jax.jit(with_gradients(template)), exact,
+                    functools.partial(rate_past_the_range, "vanishing decays"),
                     "the selective template at a rate past float32's range", seeds=FEWEST_SEEDS,
                     truth_fn=exact)
 

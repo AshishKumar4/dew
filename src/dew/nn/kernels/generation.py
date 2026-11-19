@@ -593,6 +593,12 @@ class GpuTarget:
     step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
     measured per device as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None
     where none was."""
+    vmem_rate: float | None = None
+    """A TPU's VMEM bytes a second, read and written by its vector unit: what XLA's path moves between its
+    vector registers and VMEM costs (`templates.cost.Work.kept_bytes`, `templates.cost.rates`), measured as a
+    Pallas chain's fixed cost an iteration of reading and writing one 2 MiB fp32 block (4 MiB an iteration)
+    beside its steps, on Colab's TPUs, two rounds each (rows 7201 and 7283, colab7062's rates2 and rates3);
+    None where none was, so those bytes are priced by no time there."""
     host_links: Mapping[str, float] = dataclasses.field(kw_only=True, hash=False)
     """Each part's link to its host's memory (by the device-kind prefixes `dense_peaks` keys), in bytes a
     second one way, its datasheet's peak: PCIe's x16 lanes or NVLink-C2C, whose sheets state both ways
@@ -935,7 +941,9 @@ TARGETS = {target.generation: target for target in (
               # loop's slopes +-1e-9 s, zero.
               step_seconds=1.77e-6 / 2,
               # In-kernel: a dependent lane reduction's 133.8 ns (its two rounds 133.78 and 133.70).
-              kernel_step_seconds=133.8e-9),
+              kernel_step_seconds=133.8e-9,
+              # 0.65 us an iteration of 4 MiB (`vmem_rate`).
+              vmem_rate=6.5e12),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}},
               host_links={}),
     # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
@@ -949,7 +957,9 @@ TARGETS = {target.generation: target for target in (
               # loop's slopes 6e-9 and 2e-10 s.
               step_seconds=2.45e-6 / 2,
               # In-kernel: a dependent lane reduction's 141.1 ns (its two rounds 141.12 and 141.07).
-              kernel_step_seconds=141.1e-9),
+              kernel_step_seconds=141.1e-9,
+              # 0.28 us an iteration of 4 MiB (`vmem_rate`).
+              vmem_rate=1.5e13),
 )}
 
 

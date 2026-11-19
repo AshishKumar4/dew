@@ -554,7 +554,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
     block's entering state by a scan (`block_scan.linear_scan`, each token's state before it, `h_{t-1}`), then
     its cotangents back by a reverse one from the state's carried from the block after (`dfinal` past the
     last): `q_t = a_t (C_t dy_t + q_{t+1})`, the cotangent a token passes the state before it, so
-    `g_t = C_t dy_t + q_{t+1}` the state's own, its decay `a_t = exp2(dt_t rate)` (zero at a document's
+    `g_t = C_t dy_t + q_{t+1}` the state's own, its decay `a_t = exp(dt_t A)` (zero at a document's
     first token). The channel's gradients sum over its states in registers; the states' B and C gradients
     sum over the channels in global memory, each program's added atomically (mamba_ssm's atomicAdd), a
     block's tokens across the threads so a warp's adds are adjacent (cub's BlockedToStriped), into one of
