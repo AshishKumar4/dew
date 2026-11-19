@@ -39,6 +39,7 @@ from dew.nn.kernels.templates import (
     attention_route,
     bundles,
     report,
+    resources,
 )
 
 pytestmark = pytest.mark.kernel
@@ -774,6 +775,74 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
     assert cold and not any(stored for _, stored, _ in cold), cold
     assert all(stored for _, stored, _ in warm), warm
     assert certified(warm) == certified(cold)
+
+
+@COMPILES_ON_CPU
+def test_a_ladder_that_spills_throughout_certifies_its_ends_alone():
+    """The accurate backward under an alibi hook 64 wide on an H100, whose dQ spills at every query block the
+    derivation offers (row 7938): certification refuses each of them, as it would certifying every rung,
+    having certified fewer of its configs than it refused, the rungs between a regime's two refused ends
+    refused by inference (`tuning.KernelOp._spanned`)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    op, ba, derived = _gated_backward("sm90", 64, accurate=True, hooks="alibi")
+    assert derived is not None
+    with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]):
+        before = len(report.certifications())
+        taken = op._certified(ba, derived)
+        certified = {certification.config for certification in report.certifications()[before:]
+                     if certification.op == type(op).__name__}
+        rungs = tuple(dataclasses.replace(derived, block_q=block) for block in (256, 192, 128, 64)
+                      if block <= derived.block_q)
+        refused = {rung for rung in rungs if report.refused(op, ba, rung)}
+    assert taken is None or taken not in refused, taken
+    assert refused == set(rungs), (rungs, refused)
+    assert len(certified & set(rungs)) < len(rungs), (certified, rungs)
+
+
+@COMPILES_ON_CPU
+def test_a_ladder_holds_no_rung_its_assembler_caps_otherwise():
+    """The accurate backward under an alibi hook 64 wide on an H100, at a 128-row query block: its dQ's
+    program moves registers there and not at 64 rows, so its kernels assemble under other caps (248 against
+    255), and its ladder (`MosaicBackward.ladder`, whose rungs a refusal infers refused) holds no rung whose
+    launches' stated caps or register movement differ from its own (row 8467)."""
+    op, ba, derived = _gated_backward("sm90", 64, accurate=True, hooks="alibi")
+    with generation.assumed("sm90"):
+        config = dataclasses.replace(derived, block_q=128)
+        dtype = ba.arguments["query"].dtype
+
+        def stated(tiles):
+            dq, dkv = op._launch_registers(ba, tiles)
+            launches = ((tiles.dkv, dkv),) if tiles.fused else ((tiles, dq), (tiles.dkv, dkv))
+            return [(model.cap(1), model.moves) for model in (
+                resources.register_model(attention_mosaic.bundle_of(each, dtype), each.consumers, registers)
+                for each, registers in launches)]
+
+        assert stated(dataclasses.replace(config, block_q=64)) != stated(config)
+        assert all(stated(rung) == stated(config) for rung in op.ladder(ba, config)), op.ladder(ba, config)
+
+
+@COMPILES_ON_CPU
+def test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks():
+    """An A100's backward at mma.sync's fewer rows (32 a consumer, `fewer_rows`) from a 128-row query block:
+    its ladder (`MosaicBackward.ladder`) offers the query blocks its derivation walks at those rows
+    (`_sides` on the layout it derives on, not `bundle_of`'s, whose warps are already arranged for 32
+    rows), each one its launch takes within the config's cap and residency (row 8487)."""
+    from dew.nn.kernels.templates.attention_mosaic_program import fewer_rows
+
+    op, ba, derived = _gated_backward("sm80", 64, accurate=True)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        query = ba.arguments["query"]
+        layout = op._named(target.generation, query.dtype, query.shape[1])[derived.family]
+        assert 32 in fewer_rows(layout), fewer_rows(layout)
+        config = dataclasses.replace(derived, block_q=128, block_k=32)
+        walked = {block for block in attention_mosaic._sides(32, layout, query.dtype, query.shape[1])
+                  if block < 128 and op.takes(ba, dataclasses.replace(config, block_q=block), target)
+                  and op._regime(ba, dataclasses.replace(config, block_q=block), target)
+                  == op._regime(ba, config, target)}
+        ladder = {rung.block_q for rung in op.ladder(ba, config)}
+    assert walked and ladder == walked, (ladder, walked)
 
 
 @COMPILES_ON_CPU

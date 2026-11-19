@@ -17,7 +17,18 @@ from jax.sharding import Mesh
 from kernel_compile import gate_generations, stated_outputs
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, handoffs, mosaic, outputs, product, rings, stores, swizzling
+from dew.nn.kernels.templates import (
+    across,
+    emission,
+    handoffs,
+    mosaic,
+    outputs,
+    product,
+    rings,
+    stores,
+    swizzling,
+)
+from dew.nn.kernels.templates.cost import Stated
 
 pytestmark = pytest.mark.kernel
 
@@ -45,7 +56,8 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
         def _(smem, full, consumed, out_smem):
             ring = rings.Ring(smem, full, consumed)
 
-            def producer():
+            def producer(index):
+                del index  # one producer warpgroup
                 @plgpu.nd_loop((TILES,), collective_axes="sm")
                 def _(loop: plgpu.NDLoopInfo):
                     tile = loop.index[0]
@@ -460,6 +472,20 @@ def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
     with pytest.raises(ValueError):
         handoffs.Schedule((handoffs.Role("consumer"), handoffs.Role("producer", weight=0),
                            *mosaic_sm100.ISSUING))
+
+
+def test_warp_roles_take_their_warps_in_turn_within_one_warpgroup():
+    """A schedule's warp roles each take `count` warps of its last warpgroup in turn (`Schedule.places`):
+    tcgen05's load warps every warp its product warp leaves, then the product warp; warp roles of more
+    warps than a warpgroup holds are refused."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    schedule = handoffs.Schedule((handoffs.Role("epilogue"), *mosaic_sm100.ISSUING))
+    assert schedule.places() == {"load": 0, "mma": handoffs.WARPS - 1}
+    assert schedule.role("load").count + schedule.role("mma").count == handoffs.WARPS
+    with pytest.raises(ValueError):
+        every_warp = handoffs.Role("load", handoffs.WARPS, warp=True, weight=0)
+        handoffs.Schedule((handoffs.Role("epilogue"), every_warp, mosaic_sm100.PRODUCTS)).places()
 
 
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
@@ -935,12 +961,15 @@ def _relayed_products(q, k, v, *, interpret, weighed=lambda scores, side: scores
                 plgpu.copy_smem_to_gmem(o_smem, o_gmem)
                 plgpu.wait_smem_to_gmem(0)
 
-            def load():
+            def load(index):
+                if index:  # the first load warp's copies alone: one arrival each at `loaded`
+                    return
                 for at, (gmem, smem) in enumerate(zip((q_gmem, k_gmem, v_gmem, *side_gmem),
                                                       (q_smem, k_smem, v_smem, *side_smem), strict=True)):
                     plgpu.copy_gmem_to_smem(gmem, smem, loaded.at[at])
 
-            def products():
+            def products(index):
+                del index  # one product warp
                 for at in range(3):
                     plgpu.barrier_wait(loaded.at[at], phase=0)
                 family.products(s, q_smem, k_smem)
@@ -2089,3 +2118,69 @@ def test_a_values_parts_sum_back_to_it_exactly_fp32s_largest_among_them():
     past = 2.0**128 - 2.0**111
     x = jnp.asarray([largest, past, -largest, -past, 1.0 + 2.0**-23], jnp.float32)
     np.testing.assert_array_equal(np.asarray(product.whole(product.formed(x, 3))), np.asarray(x))
+
+STAGED = (8, 32, 3)
+"""A staged output's tile: its rows, a chunk buffer's columns, and its chunks (two buffers, two tiles)."""
+
+
+def _staged_launch(waits: tuple[int, ...], **launch):
+    """A kernel storing two tiles in turn of an output staged through two chunk buffers, `STAGED`'s chunks
+    a tile (`stores.staged_chunks` at `waits`, chunk c in buffer c % 2), each tile its columns' indices plus
+    a thousand times its own; `launch` the kernel's other arguments."""
+    rows, width, chunks = STAGED
+
+    def body(out_gmem):
+        def scoped(smem):
+            for tile in range(2):
+                value = jax.lax.broadcasted_iota(jnp.float32, (rows, chunks * width), 1) + 1000.0 * tile
+                stores.staged_chunks(smem, value, out_gmem, (tile * rows, 0, jnp.int32(rows), 0, rows, rows),
+                                     waits=waits)
+            plgpu.wait_smem_to_gmem(0)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, rows, width), jnp.float32))
+
+    return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((2 * rows, chunks * width), jnp.float32),
+                        **launch)
+
+
+@pytest.mark.parametrize("loosened", [None, 0, 2], ids=["derived", "first-chunk", "third-chunk"])
+def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loosened):
+    """An output staged through two chunk buffers three chunks a tile, two tiles in turn (`_staged_launch`),
+    under the GPU interpreter's race detection: at the derived waits (`stores.buffer_waits`: none left in
+    flight before a tile's first chunk, whose buffer the tile before stored last, two before its second, one
+    before its third) every buffer is rewritten only once its last TMA store has read it, the output the
+    tiles' values; a wait allowing one group more at a tile's first chunk or its third rewrites a buffer a
+    store still reads, which the detector names (its second's buffer the first's drain already freed)."""
+    from jax._src.pallas.mosaic_gpu.interpret.interpret_pallas_call import reset_gpu_interpret_mode_state
+
+    rows, width, chunks = STAGED
+    waits = list(stores.buffer_waits(chunks, 2))
+    assert waits == [0, 2, 1]
+    if loosened is not None:
+        waits[loosened] += 1
+    kernel = _staged_launch(tuple(waits), interpret=plgpu.InterpretGPUParams(detect_races=True))
+    if loosened is None:
+        tiles = 1000.0 * np.repeat([0, 1], rows)[:, None]
+        columns = np.arange(chunks * width, dtype=np.float32)
+        np.testing.assert_array_equal(np.asarray(kernel()), columns + tiles)
+        return
+    try:
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            kernel()
+    finally:
+        reset_gpu_interpret_mode_state()
+
+
+def test_a_staged_outputs_launch_states_its_cost():
+    """The staged output's launch (`_staged_launch`, its chunks' stores committed a group a chunk) costed as
+    the toolkit's launches are (`emission.costed`, the estimate XLA and Dew's FLOP count read): it states the
+    bytes it is given and no arithmetic, a store group's commit priced as the synchronization it is."""
+    from reference_error import equations
+
+    rows, width, chunks = STAGED
+    stored = 2 * rows * chunks * width * 4
+    launch = _staged_launch(stores.buffer_waits(chunks, 2))
+    traced = jax.make_jaxpr(emission.costed(launch, Stated(steps=1, bytes_accessed=stored)))()
+    [estimate] = [equation.params["cost_estimate"] for equation in equations(traced.jaxpr)
+                  if "cost_estimate" in equation.params]
+    assert (estimate.bytes_accessed, estimate.flops, estimate.transcendentals) == (stored, 0, 0)

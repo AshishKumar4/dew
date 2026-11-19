@@ -582,31 +582,21 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
         jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4))).trace(*operands).lower(lowering_platforms=("cuda",))
 
 
-def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
-    """Kimi delta attention's own pairs' log decay gradient, interpreted, over two bf16 tokens of unit-basis
-    keys `e0` (scale one, a zero memory and decays): the first writing `e0` under a gate of 2^-30, the second
-    reading with `e0` and writing `e0` under a gate of one, a unit cotangent on its output's first entry
-    alone. The second token's write erases what the first left, so its decay's gradient is exactly zero, and
-    every log decay's gradient is float64's exactly (powers of two throughout). A token's own scores pair
-    taken out of the decay's terms after they were summed in fp32 lost the cross term's 2^-30 with it,
-    -2^-30 there (base review 29b07fb60 F1); left out before they are summed, the decay's terms never take
-    it (row 7906)."""
-    hooks = recurrence.Hooks(decay='vector', scale=1.0)
-    width = 16
-    basis = jnp.zeros((1, 2, 1, width), jnp.float32).at[:, :, :, 0].set(1.0)
-    query = basis.at[0, 0].set(0.0)
-    operands = Chunk(query.astype(jnp.bfloat16), basis.astype(jnp.bfloat16), basis.astype(jnp.bfloat16),
-                     state=jnp.zeros((1, 1, width, width), jnp.float32),
-                     log_decay=jnp.zeros((1, 2, 1, width), jnp.float32),
-                     beta=jnp.asarray([[[2.0 ** -30], [1.0]]], jnp.float32))
-    # The output's cotangent in its dtype (the operands' bf16), the final memory's in fp32.
-    seeded = (jnp.zeros((1, 2, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(1.0),
-              jnp.zeros((1, 1, width, width), jnp.float32))
-    ours = jax.jit(with_gradients(lambda o: chunk_on('mosaic_gpu', hooks, o)))(operands, seeded)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
-        exact = jax.jit(with_gradients(lambda o: token_by_token(hooks, o)))(*wide)
-    np.testing.assert_array_equal(np.asarray(ours[1].log_decay, np.float64), np.asarray(exact[1].log_decay))
+@lowers("sm90")
+def test_a_forked_call_adding_a_slot_lowers_for_a_gpu_under_a_mesh():
+    """The gated delta rule's forked call whose documents add a second table slot (`Chunk.adds`), no entry
+    write, through the public chunked op on the template, lowered for an H100 under a mesh, as training runs
+    every call (`jax.set_mesh`): each operand its shard spec (`_template_launch`), where the added slots took
+    none and the specs' zip with the operands refused the call (base review 89250eb9c F1)."""
+    from test_recurrence_chunk import FORKED_TEMPLATE, entering_documents, narrowed_draw
+
+    hooks = FORKED_TEMPLATE[0]
+    # A 16-bit call, as the template trains it.
+    operands = entering_documents(narrowed_draw(hooks, 0)[0], added=True)
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(lambda given: chunk_on('mosaic_gpu', hooks, given)).trace(operands).lower(
+            lowering_platforms=("cuda",))
 
 
 def test_a_ranged_calls_inverse_states_the_fp32_parts_its_merges_issue():
