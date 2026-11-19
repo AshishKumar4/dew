@@ -1311,15 +1311,6 @@ def test_an_aligned_sums_mixed_derivative_holds_a_constant_infinity_still():
     assert float(jax.jvp(along_x, (one,), (one,))[1]) == 1.0
 
 
-def test_an_aligned_sum_over_2_31_less_2_terms_lowers():
-    """`aligned_sum([(x,)], axis=0)` over `2^31 - 2` fp32 terms, lowered: its carry, in `[-(n + 1), n]`, and
-    its one-bit digits' partial sums held by int32, where a looser bound refused it (base review 0c6ef9c11
-    F3)."""
-    lowered = jax.jit(lambda x: aligned_sum([(x,)], axis=0)).trace(
-        jax.ShapeDtypeStruct((2 ** 31 - 2,), jnp.float32)).lower()
-    assert lowered.out_info.shape == (1,)
-
-
 def test_an_aligned_sums_tangent_keeps_the_values_placement():
     """The tangent along a scalar `x` of `aligned_sum([(x,), (v,)])` beside a constant `v` of `[10, 20]`
     split over an Explicit two-device data axis: `[1, 1]` placed as `v`'s value is, where the moving term
@@ -1342,11 +1333,85 @@ def test_an_aligned_sum_over_two_terms_of_2_30_lowers():
     assert lowered.out_info.shape == (1,)
 
 
-def test_an_aligned_sum_over_2_30_terms_lowers():
-    """`aligned_sum([(x,)], axis=0)` over 2^30 fp32 terms, lowered: one-bit digits whose partial sum the
-    integers hold, the carry apart, where it was refused (base review ee7d1e761 F2, row 8757)."""
+def test_an_aligned_sums_second_order_holds_a_constant_direction_still():
+    """The tangent along `db` of the tangent of `aligned_sum([(a, b)])` at `a` one and `b` infinite, `a`'s
+    direction a constant one: `a`, one, where the constant direction's zero second-order tangent met the
+    infinity, NaN (row 8757)."""
+    one, infinite = jnp.float32(1.0), jnp.float32(jnp.inf)
+
+    def tangent(db):
+        return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (one, infinite), (one, db))[1]
+
+    assert float(jax.jvp(tangent, (one,), (one,))[1]) == 1.0
+
+
+def test_an_aligned_sums_second_order_is_one_exact_sum():
+    """The tangent along `(b, db)` of the tangent of `aligned_sum([(a, b)])` along `(a, db)` at `a` 2^70, `da`
+    `a` itself, outer direction `(-2^70, 2^70)`: `a vb + a vdb`, its parts `-2^140` and `2^140` summed to
+    zero, where each, rounded apart, overflowed and added to inf - inf, NaN (row 8757)."""
+    a = jnp.float32(2.0 ** 70)
+
+    def tangent(b, db):
+        return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (a, b), (a, db))[1]
+
+    direction = (jnp.float32(-(2.0 ** 70)), jnp.float32(2.0 ** 70))
+    assert float(jax.jvp(tangent, (jnp.float32(1.0), jnp.float32(0.0)), direction)[1]) == 0.0
+
+
+def test_an_aligned_sums_second_order_keeps_a_lone_parts_sign():
+    """The tangent along `db` alone of the tangent of `aligned_sum([(a, b)])` at `a` one, `db`'s direction a
+    negative zero: a negative zero, where its one part's plain sum added it to a positive zero (row 8757)."""
+    one = jnp.float32(1.0)
+
+    def tangent(db):
+        return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (one, one), (one, db))[1]
+
+    found = np.asarray(jax.jvp(tangent, (one,), (jnp.float32(-0.0),))[1])
+    assert found == 0.0 and np.signbit(found)
+
+
+def test_an_aligned_sums_tangent_pulls_back_inside_its_sum():
+    """The gradient in `b` of `aligned_sum([(a, b), (v,)])`'s tangent along `a`'s direction a quarter, `v`
+    a constant `[0, 0]`, under a cotangent of `[fp32's largest] * 2`: half the largest, where the tangent
+    broadcast to the value's layout outside the sum, its transpose summing the cotangents first, inf (base
+    review 89fc6bccd F1, row 8757)."""
+    largest, v = float(np.finfo(np.float32).max), jnp.zeros((2,), jnp.float32)
+
+    def tangent(b):
+        return jax.jvp(lambda a: aligned_sum([(a, b), (v,)]), (jnp.float32(1.0),), (jnp.float32(0.25),))[1]
+
+    _, pulled = jax.vjp(tangent, jnp.float32(1.0))
+    assert float(pulled(jnp.full((2,), largest, jnp.float32))[0]) == np.float32(largest / 2)
+
+
+def test_an_aligned_sum_in_an_interpreted_kernel_keeps_its_derivative():
+    """The tangent of a Pallas launch, interpreted, writing `aligned_sum([(x,)], axis=0)` of a `[16, 16]`
+    tile: the direction's own sum, where an interpreted body took the bare bits, which carry none, zero
+    (base review 89fc6bccd F2, row 8757)."""
+    from jax.experimental import pallas as pl
+
+    from dew.nn.kernels import launches
+
+    def body(x_ref, out_ref):
+        out_ref[...] = aligned_sum([(x_ref[...],)], axis=0)
+
+    call = launches.pallas_call(body, grid=(), in_specs=[pl.BlockSpec((16, 16), lambda: (0, 0))],
+                                out_specs=pl.BlockSpec((1, 16), lambda: (0, 0)),
+                                out_shape=jax.ShapeDtypeStruct((1, 16), jnp.float32), interpret=True,
+                                name="aligned_sum_interpreted")
+    x, direction = jnp.ones((16, 16), jnp.float32), jnp.arange(256, dtype=jnp.float32).reshape(16, 16)
+    tangent = jax.jvp(call, (x,), (direction,))[1]
+    np.testing.assert_array_equal(np.asarray(tangent), np.asarray(direction).sum(0, keepdims=True))
+
+
+@pytest.mark.parametrize("length", [2 ** 30, 2 ** 31 - 2, 2 ** 31 - 1], ids=["2^30", "2^31 - 2", "2^31 - 1"])
+def test_an_aligned_sum_over_one_long_axis_lowers(length):
+    """`aligned_sum([(x,)], axis=0)` over `length` fp32 terms, up to its cap of `2^31 - 1` products a value,
+    lowered: one-bit digits whose one term's sum int32 holds, its quotient carried before its remainder
+    adds and the carry in `[-n, n - 1]`, where they were refused (base reviews ee7d1e761 F2, 0c6ef9c11 F3,
+    43f8e75e7 F3, row 8757)."""
     lowered = jax.jit(lambda x: aligned_sum([(x,)], axis=0)).trace(
-        jax.ShapeDtypeStruct((2 ** 30,), jnp.float32)).lower()
+        jax.ShapeDtypeStruct((length,), jnp.float32)).lower()
     assert lowered.out_info.shape == (1,)
 
 
