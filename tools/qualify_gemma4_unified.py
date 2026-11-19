@@ -27,15 +27,24 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 RECORDINGS = "tests/fixtures/hf/gemma4-unified-native-tiny"
 """Where the Unified fixture and its sites' recordings are, from the checkout."""
 
+type Arrays = dict[str, np.ndarray]
+"""A site's arrays by name: a draw's inputs, a reference's or a truth's outputs."""
 
-def workload(site, directory, device) -> tuple[Callable[..., Any], Callable[..., Any],
-                                                Callable[[int], tuple[Any, ...]], Path]:
+type Arguments = tuple[Arrays] | tuple[Arrays, np.ndarray]
+"""A draw's arguments: its inputs, and the cached site's continuation after them."""
+
+
+def workload(site, directory, device) -> tuple[Callable[..., Arrays], Callable[..., Arrays],
+                                                Callable[[int], Arguments], Path]:
     """`site`'s reference and float64 truth, each called with a draw's arguments, its draw of a seed's
     arguments (the cached site's inputs and continuation, every other one input), and its source's
     directory."""
@@ -190,9 +199,11 @@ def record_site(site, output, device, *, shards=()):
             reference, truth, draw, source = workload(site, Path(directory), device)
 
             def drawn(seed):
-                arguments = draw(seed)
-                return ({**arguments[0], "continuation": arguments[1]} if site == "cached"
-                        else arguments[0])
+                match draw(seed):
+                    case (inputs, continuation):
+                        return {**inputs, "continuation": continuation}
+                    case (inputs,):
+                        return inputs
 
             def evaluate(inputs):
                 arguments = (({name: value for name, value in inputs.items() if name != "continuation"},
@@ -248,8 +259,8 @@ def main():
         start, stop = (int(bound) for bound in args.shard.split(":"))
         shard, _ = backward_recording(args.device, range(start, stop))
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        arrays: dict[str, Any] = {**shard, ENVIRONMENT: np.asarray(json.dumps(environment(args.device)))}
-        np.savez(args.output, **arrays)
+        np.savez(args.output, allow_pickle=False, **shard,
+                 **{ENVIRONMENT: np.asarray(json.dumps(environment(args.device)))})
         return
     if args.record or args.merge:
         record_site(args.site, args.output, args.device, shards=args.merge)

@@ -47,11 +47,12 @@ import time
 from collections.abc import Iterator, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import httpx
 
 from dew._cleanup import owned_group
+from dew._records import JSON
 from dew.interop.gateway import Gateway
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -160,9 +161,9 @@ Engine = Literal["vllm", "sglang"]
 
 
 class _Proxy(ThreadingHTTPServer):
-    """The proxy between the rollout server and the engine, the exchanges it forwarded (`_Recorded`)."""
+    """Serve the rollout server's requests to the engine, keeping each exchange `_Recorded` forwards."""
 
-    exchanges: list[dict[str, Any]]
+    exchanges: list[dict[str, JSON]]
 
 
 class _Recorded(BaseHTTPRequestHandler):
@@ -178,8 +179,8 @@ class _Recorded(BaseHTTPRequestHandler):
         # A streamed answer is kept as the server-sent events it was, a whole one as its JSON.
         streamed = kind.startswith("text/event-stream")
         proxy.exchanges.append({"path": self.path, "request": json.loads(raw) if raw else None,
-                                      "status": answer.status_code,
-                                      **({"stream": answer.text} if streamed else {"response": answer.json()})})
+                                "status": answer.status_code,
+                                **({"stream": answer.text} if streamed else {"response": answer.json()})})
         self.send_response(answer.status_code)
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(answer.content)))
@@ -215,7 +216,7 @@ def _native_eos(tokenizer, listed) -> list[int]:
 
 
 def _decoded(tokenizer, ids: Sequence[int]) -> str:
-    """One sequence's text: a list of ids decodes to one string."""
+    """Decode one sequence of token ids to its text."""
     text = tokenizer.decode(list(ids))
     assert isinstance(text, str)
     return text
