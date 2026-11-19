@@ -73,10 +73,16 @@ def placed_like(leaf: jax.Array, value: jax.Array) -> jax.Array:
 
 
 def stored_at(bank: jax.Array, value: jax.Array, index: Index | tuple[Index, ...],
-              axis: int | tuple[int, ...] = 0) -> jax.Array:
+              axis: int | tuple[int, ...] = 0, *, kept: jax.Array | None = None) -> jax.Array:
     """`bank` with `value` its entry `index` along `axis` (or along each of several axes), where `bank` lies
     (`fetched_at`'s inverse): the axes restored in device memory, the entry copied to the bank's memory and
-    written there."""
+    written there; where `kept` is given, written only where it holds (a place past a pool writes nothing).
+    The entry is copied to the bank's memory before that choice: XLA:GPU's host offloading reads no copy to
+    the host made inside a conditional's branch, and refuses the bank as a host parameter."""
     axes, indices = _entry(index, axis)
     entry = placed_like(bank, jnp.expand_dims(value.astype(bank.dtype), axes))
-    return jax.lax.dynamic_update_slice(bank, entry, _starts(bank.ndim, axes, indices))
+    starts = _starts(bank.ndim, axes, indices)
+    if kept is None:
+        return jax.lax.dynamic_update_slice(bank, entry, starts)
+    return jax.lax.cond(kept, lambda bank: jax.lax.dynamic_update_slice(bank, entry, starts),
+                        lambda bank: bank, bank)

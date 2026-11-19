@@ -682,8 +682,7 @@ def pages_written(leaf: jax.Array, places: jax.Array, values: jax.Array, axis: i
 
     def page(index: jax.Array, pool: jax.Array) -> jax.Array:
         place = places[index]
-        return jax.lax.cond(place <= last, lambda held: stored_at(held, values[index], place, axis),
-                            lambda held: held, pool)
+        return stored_at(pool, values[index], place, axis, kept=place <= last)
 
     return jax.lax.fori_loop(0, places.shape[0], page, leaf)
 
@@ -1667,9 +1666,7 @@ def _banked_page_copies(bank: jax.Array, own: jax.Array, parents: jax.Array) -> 
 
         def write(row, pool: jax.Array) -> jax.Array:
             target = own[layer, row]
-            return jax.lax.cond(target <= last,
-                                lambda pool: stored_at(pool, held[row], (layer, target), (0, 2)),
-                                lambda pool: pool, pool)
+            return stored_at(pool, held[row], (layer, target), (0, 2), kept=target <= last)
 
         return jax.lax.fori_loop(0, count, write, pool)
 

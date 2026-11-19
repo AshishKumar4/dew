@@ -827,6 +827,23 @@ def test_an_offloaded_banks_regrouped_page_copies_lower_with_the_bank_in_host_me
     compile_programs({"regrouped": (regrouped, shapes)}, "sm80")
 
 
+def test_an_offloaded_pools_page_writes_lower_with_the_pool_in_host_memory():
+    """`pages_written` over a pool in host memory (`KVCache.offloaded`'s) compiles for an A100
+    (`compile_programs`), a place past the pool writing nothing, its result in host memory: each page copied to
+    the pool's memory before the choice to write it (`host_memory.stored_at`'s `kept`), where XLA:GPU's host
+    offloading reads the copy (row 8507)."""
+    from dew.training.ahead import compile_programs
+
+    def written(pool, places, values):
+        held = pages_written(jax.device_put(pool, jax.memory.Space.Host), places, values, 1)
+        assert jax.typeof(held).memory_space is jax.memory.Space.Host
+        return held
+
+    shapes = [jax.ShapeDtypeStruct((1, 6, 2, 1), jnp.float32), jax.ShapeDtypeStruct((3,), jnp.int32),
+              jax.ShapeDtypeStruct((3, 1, 2, 1), jnp.float32)]
+    compile_programs({"written": (written, shapes)}, "sm80")
+
+
 @pytest.mark.parametrize(("layout", "rebuilds", "row"), [(KVCache(page_size=2, groups=2), False, 8493),
                                                           (KVCache(page_size=2), True, 8494)],
                          ids=["groups", "rebuilds"])
