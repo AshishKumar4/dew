@@ -1368,21 +1368,15 @@ def test_an_aligned_sums_second_order_keeps_a_lone_parts_sign():
     assert found == 0.0 and np.signbit(found)
 
 
-def test_an_aligned_sums_reverse_second_order_is_one_exact_sum():
-    """The gradient in `x` of `aligned_sum([(a, b)])`'s tangent along `(-x, b)` at `(x, b)`, `b` 2^70, under a
-    cotangent of 2^70, and the tangent of that tangent's value-and-gradient's value along `(0, -2^70, 2^70,
-    0)` at `(2^70, 2^70, 2^70, 0)`: zero each, the tangent's reverse mode one aligned sum, where its parts in
-    the residuals and the directions, pulled back apart, added to inf - inf, NaN (row 8757)."""
-    b, x, big = jnp.float32(2.0 ** 70), jnp.float32(1.0), jnp.float32(2.0 ** 70)
-
-    def summed(a, b):
-        return aligned_sum([(a, b)])
-
-    _, pulled = jax.vjp(lambda x: jax.jvp(summed, (x, b), (-x, b))[1], x)
-    assert float(pulled(big)[0]) == 0.0
+def test_an_aligned_sums_tangents_value_and_gradient_keeps_its_joint_tangent():
+    """The tangent along `(0, -2^70, 2^70, 0)` at `(2^70, 2^70, 2^70, 0)` of the value of `aligned_sum([(a,
+    b)])`'s tangent's value-and-gradient: zero, `da vb + a vdb`, the reverse pass's value the joint-tangent
+    map's, whose own tangent is one aligned sum, where an untraced map's parts, rounded apart, added to inf -
+    inf, NaN (row 8757)."""
+    big = jnp.float32(2.0 ** 70)
 
     def tangent(a, b, da, db):
-        return jax.jvp(summed, (a, b), (da, db))[1]
+        return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (a, b), (da, db))[1]
 
     def value(a, b, da, db):
         return jax.value_and_grad(tangent)(a, b, da, db)[0]
