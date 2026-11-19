@@ -475,6 +475,8 @@ def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
         exact = jax.jit(with_gradients(lambda given: token_by_token(TURNED, given)))(*wide)
     leaves = jax.tree_util.tree_leaves_with_path(ours)
     for (path, made), truth in zip(leaves, jax.tree.leaves(exact), strict=True):
+        if not np.issubdtype(np.asarray(made).dtype, np.floating):
+            continue  # A mark's gradient (its starts'), none.
         held = normal_float32(np.asarray(truth))
         wrong = held & ~np.isfinite(np.asarray(made))
         assert not wrong.any(), (jax.tree_util.keystr(path), int(wrong.sum()))
