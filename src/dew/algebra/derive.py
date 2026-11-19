@@ -891,8 +891,8 @@ def _anchor_degree(term: Term, made: _Forms, index: int, carried: dict, memo: di
     def degree(of: Term):
         return _anchor_degree(of, made, index, carried, memo)
 
-    def given(position: int) -> tuple:
-        return made.region.params[terms.integer(args[position])]
+    def given(argument) -> tuple:
+        return made.region.params[terms.integer(argument)]
 
     region, found = made.region, None
     if (args := get_callable_args(term, Term.state)) is not None:
@@ -903,7 +903,7 @@ def _anchor_degree(term: Term, made: _Forms, index: int, carried: dict, memo: di
     elif (args := get_callable_args(term, Term.literal)) is not None:
         found = ZERO if not np.any(np.asarray(region.literals[terms.integer(args[0])])) else 0
     elif (args := get_callable_args(term, Term.binary)) is not None:
-        primitive, operands = given(3)[0], (degree(args[0]), degree(args[2]))
+        primitive, operands = given(args[3])[0], (degree(args[0]), degree(args[2]))
         found = (_product(*operands, sign=1 if primitive is jax.lax.mul_p else -1)
                  if primitive in (jax.lax.mul_p, jax.lax.div_p) else _joined(*operands)
                  if primitive in (jax.lax.add_p, jax.lax.sub_p, jax.lax.max_p, jax.lax.min_p)
@@ -911,23 +911,25 @@ def _anchor_degree(term: Term, made: _Forms, index: int, carried: dict, memo: di
     elif (args := get_callable_args(term, Term.compare)) is not None:
         found = None if _joined(degree(args[0]), degree(args[2])) is None else 0
     elif (args := get_callable_args(term, Term.dot)) is not None:
-        found = _contracted(made, args, degree(args[0]), degree(args[1]), given(2)[1]["dimension_numbers"])
+        numbers = given(args[2])[1]["dimension_numbers"]
+        found = _contracted(made, args, degree(args[0]), degree(args[1]), numbers)
     elif (args := get_callable_args(term, Term.select)) is not None:
         found = _guarded(made, args, degree)
     elif (args := get_callable_args(term, Term.unary)) is not None:
         inner = degree(args[0])
-        found = inner if given(2)[0] in (jax.lax.neg_p, jax.lax.abs_p) else 0 if inner in (0, ZERO) else None
+        kept = given(args[2])[0] in (jax.lax.neg_p, jax.lax.abs_p)
+        found = inner if kept else 0 if inner in (0, ZERO) else None
     elif (args := get_callable_args(term, Term.convert)) is not None:
-        inner, target = degree(args[0]), given(1)[1].get("new_dtype")
+        inner, target = degree(args[0]), given(args[1])[1].get("new_dtype")
         source = region.dtypes.get(terms.key(args[0]))
         widening = (target is not None and source is not None and jnp.issubdtype(target, jnp.floating)
                     and jnp.issubdtype(source, jnp.floating)
                     and np.dtype(target).itemsize >= np.dtype(source).itemsize)
         found = inner if widening or inner in (0, ZERO, None) else None
     elif (args := get_callable_args(term, Term.shaped)) is not None:
-        found = _reshaped(degree(args[0]), *given(2))
+        found = _reshaped(degree(args[0]), *given(args[2]))
     elif (args := get_callable_args(term, Term.reduce)) is not None:
-        inner, reduced = degree(args[0]), tuple(given(3)[1]["axes"])
+        inner, reduced = degree(args[0]), tuple(given(args[3])[1]["axes"])
         kept = terms.text(args[1]) in ("sum", "max", "min") and not set(_axes(inner)) & set(reduced)
         found = (inner if inner in (0, ZERO, None) else None if not kept
                  else (inner[0], tuple(axis - sum(r < axis for r in reduced) for axis in inner[1])))
