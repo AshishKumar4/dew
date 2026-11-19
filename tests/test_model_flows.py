@@ -704,3 +704,47 @@ def test_a_host_placed_arm_is_prepared_and_run_on_the_host(tmp_path, monkeypatch
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         ran = ahead_arm(jax.jit(scaled), "a host-placed product", host=True)(a, b)
     assert not traced and np.asarray(ran).tolist() == (a * b + 1.0).tolist()
+
+
+CHILD_ARM = """
+import json
+import jax
+import numpy as np
+from reference_error import ahead_arm
+from test_model_flows import CHILD_TRACED, child_scaled
+from truths_ahead import of_the_parent
+
+a = np.arange(6, dtype=np.float32)
+with of_the_parent():
+    made = ahead_arm(jax.jit(child_scaled), "a child's product")(a, a)
+print(json.dumps({"traced": len(CHILD_TRACED), "made": np.asarray(made).tolist()}))
+"""
+"""A child process's site-free arm (`test_a_child_process_prepares_and_runs_from_its_tests_store`), a function
+of this module, which its statement names (`truths_ahead.arm_role`)."""
+
+CHILD_TRACED: list[None] = []
+"""Each trace of `child_scaled` in its process."""
+
+
+def child_scaled(a, b):
+    """A child process's arm (`CHILD_ARM`), its traces counted."""
+    CHILD_TRACED.append(None)
+    return a * b + 1.0
+
+
+def test_a_child_process_prepares_and_runs_from_its_tests_store(tmp_path):
+    """A computation that needs a process of its own (a backend option set once a process: the approximate
+    divider's), run in a child of its test, opens its test's store (`truths_ahead.for_a_child`,
+    `of_the_parent`): in the test's prepare it traces and compiles its arm into that store, giving zeros;
+    in the test's run it computes the arm from that program, tracing none, its sites the test's, none of
+    them unprepared."""
+    from process_support import fresh
+    from truths_ahead import for_a_child
+
+    a = np.arange(6, dtype=np.float32)
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        prepared = fresh(CHILD_ARM, variables=for_a_child())
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        ran = fresh(CHILD_ARM, variables=for_a_child())
+    assert prepared["traced"] and prepared["made"] == [0.0] * 6
+    assert ran == {"traced": 0, "made": (a * a + 1.0).tolist()} and not (tmp_path / UNPREPARED).exists()

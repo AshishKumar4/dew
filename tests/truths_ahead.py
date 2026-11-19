@@ -311,6 +311,47 @@ def judged(label: str) -> Iterator[None]:
         SITE_IN_PROGRESS.reset(token)
 
 
+PARENT = "DEW_PARENT_STORE"
+"""The environment variable a child process of a test opens its test's store by (`for_a_child`)."""
+
+PARENT_STORE = "parent.pkl"
+"""A store's own record of how its test's process opened it, which a child process reads (`of_the_parent`)."""
+
+
+def for_a_child() -> dict[str, str]:
+    """The environment a child process of this test opens its test's store with (`of_the_parent`): the
+    store's directory, beside its sites its own record (whether it prepares, its stamp and its target), so a
+    computation that needs a process of its own (its XLA flags, a backend option set once a process: the
+    approximate divider's) prepares and runs from its test's store, its sites the test's; none outside a
+    part's prepare or run."""
+    store = COMPILED.get()
+    if store is None:
+        return {}
+    store.directory.mkdir(parents=True, exist_ok=True)
+    (store.directory / PARENT_STORE).write_bytes(pickle.dumps((store.prepare, store.stamp, store.target)))
+    return {PARENT: str(store.directory)}
+
+
+@contextlib.contextmanager
+def of_the_parent() -> Iterator[CompiledTruths | None]:
+    """In a child process of a test (`for_a_child`), its test's store as the test's process opened it:
+    preparing it, its target's compile-only GPU the default device as a part's prepare's (`prepared`), or
+    reading it; outside one, none."""
+    directory = os.environ.get(PARENT)
+    if directory is None:
+        yield None
+        return
+    prepare, stamp, target = pickle.loads((Path(directory) / PARENT_STORE).read_bytes())
+    with compiled_truths(directory, prepare=prepare, stamp=stamp, target=target) as store:
+        if not prepare or target is None:
+            yield store
+            return
+        from dew.nn.kernels.generation import compile_only_gpus
+
+        with jax.default_device(compile_only_gpus(target.generation, 1)[0]):
+            yield store
+
+
 def running() -> tuple[CompiledTruths, str] | None:
     """The store whose programs compute the truths of the site in progress, and its label: where a run reads
     a store (`compiled_truths(prepare=False)`) within a site (`judged`) its prepare reached, else None. A
