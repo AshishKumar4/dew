@@ -47,13 +47,23 @@ with open(sys.argv[4], "wb") as file:
 """
 """A fresh process compiling the programs for argv[1] on this GPU at argv[2] multiprocessors, as the build
 compiles them, and running them on the arguments at argv[3], their outputs written to argv[4]."""
-BUILD = """
+UNTUNED = 3
+"""The status the build exits with where its compile is refused for a choice no run of the GPU tuned
+(`report.Untuned`), apart from any other failure's."""
+BUILD = f"""
 import sys
 
+from dew.nn.kernels.templates import report
 from dew.training.ahead import compile_programs
 from ahead_programs import programs
 
-compile_programs(programs(sys.argv[1]), sys.argv[1], int(sys.argv[3]), topology=sys.argv[4]).save(sys.argv[2])
+try:
+    built = compile_programs(programs(sys.argv[1]), sys.argv[1], int(sys.argv[3]), topology=sys.argv[4])
+except ValueError as refused:
+    if isinstance(refused.__cause__, report.Untuned):
+        sys.exit({UNTUNED})
+    raise
+built.save(sys.argv[2])
 """
 RUN = """
 import pickle
@@ -306,7 +316,7 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
     build = [sys.executable, str(tmp_path / "build.py"), generation, str(tmp_path / "programs.dew-aot"),
              str(own.multiprocessors), str(topology)]
     deviceless = {**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}
-    assert subprocess.run(build, env=deviceless).returncode != 0
+    assert subprocess.run(build, env=deviceless).returncode == UNTUNED
     # Compiled on this GPU, which tunes them and leaves its choices in the store the build reads (row 8422:
     # a node's programs compile tuned or are refused); then built.
     subprocess.run([sys.executable, str(tmp_path / "here.py"), generation, str(own.multiprocessors),
