@@ -560,17 +560,18 @@ def test_the_mosaic_walk_drops_a_slice_at_its_global_places(training, sliced):
 
 
 def test_a_mosaic_dropping_backwards_tiny_split_mean_keeps_its_query_gradient():
-    """A bf16 Mosaic call interpreted for an H100, one query of first coordinate 1 over keys of second
-    coordinate 1 and of first -22, values 0 and of first 2^-126, dO of first 2^73, scale 1, at a rate of
-    1 - 2^-53 drawing words (3181759654, 0): the split mean
-    of the second key's value, weighed e^-22, is below fp32's least subnormal once its power of 2^53 comes
-    out, so D contracts it with dO in the power its sums hold (`attention_gradient.split_delta`): dQ about
-    -2.79e-10, on par with the reference's (check 1), where it was 0 (the base review of eb3ab2670, F1)."""
+    """A bf16 Mosaic call interpreted for an H100, with logits 0 and -22, values 0 and 2^-126, dO 2^73,
+    and dropout at rate 1 - 2^-53 keeping only the second key. Its split mean is below fp32's least
+    subnormal once the power of 2^53 comes out, so D contracts it with dO in the power its sums hold
+    (`attention_gradient.split_delta`): dQ's second coordinate is about -2.79e-10, where it was 0
+    (the base review of eb3ab2670, F1). The -22 logit is a sum of powers of two so the gradients'
+    products do not add a second rounding to the fast form's bf16 score cotangents."""
     rate = 1.0 - 2.0 ** -53
     words = jnp.asarray([3181759654, 0], jnp.uint32)
     hooks, spans = hooked(words, 1, 1, rate), template.spans(1, 2, 1)
-    query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(1)
-    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 1].set(1).at[0, 1, 0, 0].set(-22)
+    query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(1).at[..., 2:4].set(1)
+    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 1].set(1).at[0, 1, 0, 0].set(-16)
+    key = key.at[0, 1, 0, 2].set(-4).at[0, 1, 0, 3].set(-2)
     value = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 1, 0, 0].set(2.0 ** -126)
     dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(2.0 ** 73)
 
