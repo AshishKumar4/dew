@@ -120,7 +120,7 @@ class CompiledTruths:
         """Records in the store that its test compiled a site's programs on its GPU as its prepare stated
         (`at_run`, `AT_RUN`), where in its file this process stands: a decision its run names, not drift."""
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
-        unprepared(self.directory, test, [(frame.filename, frame.lineno) for frame in inspect.stack()], why,
+        unprepared(self.directory, test, [(frame.filename, frame.lineno) for frame in inspect.stack(0)], why,
                    record=AT_RUN)
 
     def unprepared(self, why: str) -> None:
