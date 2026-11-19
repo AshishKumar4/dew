@@ -145,9 +145,9 @@ in one case took 127 to 156 s near float32's largest, each order's program compi
 of its own."""
 
 
-def outside(taken: str) -> tuple[str, ...]:
-    """The orders outside `taken`'s set (`ORDER_SETS`), which its case leaves to the others."""
-    return tuple(name for orders in ORDER_SETS.values() for name in orders if name not in ORDER_SETS[taken])
+def outside(taken: tuple[str, ...]) -> tuple[str, ...]:
+    """The orders (`ORDER_SETS`') outside those a case takes (`taken`), which it leaves to the others."""
+    return tuple(name for orders in ORDER_SETS.values() for name in orders if name not in taken)
 
 
 INTERPRETED_REMAT = ("jvp of grad, remat", "second jvp, remat") if INTERPRETED else ()
@@ -203,7 +203,7 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     # Each order one program (`jax.jit`): run op by op, an order's eager dispatch compiled 2,570 programs of
     # one or two ops, 109 of the case's 156 s near float32's largest (cProfile on armada, row 4433).
     assert_contract(jax.jit(rule), primals, direction, cotangent, f"the chunked delta rule {edge}",
-                    truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain), without=outside(taken),
+                    truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain), without=outside(ORDER_SETS[taken]),
                     draw=measured(edge, draw))
 
 
@@ -377,7 +377,8 @@ def test_the_delta_rule_ports_hold_their_orders(per_key, edge, taken):
 
     assert_contract(jax.jit(ported), *draw(0),
                     f"the {'kda' if per_key else 'gdn'} port {edge}", truth_fn=jax.jit(recurrent),
-                    plain_fn=jax.jit(recurrent), without=outside(taken), draw=measured(edge, draw))
+                    plain_fn=jax.jit(recurrent), without=outside(ORDER_SETS[taken]),
+                    draw=measured(edge, draw))
 
 
 # The template rule near float32's largest: its reverse derivative is NaN at entries fla's chunked form keeps
@@ -414,7 +415,7 @@ def test_the_template_rule_holds_its_orders(edge, taken):
 
     assert_contract(jax.jit(rule), primals, direction, cotangent, f"the template rule {edge}",
                     truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent),
-                    without=outside(taken) + INTERPRETED_REMAT, draw=measured(edge, draw))
+                    without=outside(ORDER_SETS[taken]) + INTERPRETED_REMAT, draw=measured(edge, draw))
 
 
 EDGES_BEYOND = [edge for edge in EDGES if edge != "normal"]
@@ -428,22 +429,37 @@ a normal case took 382 to 720 s (rows 8414, 8488, 8525, 8552, 8553, 8558); each 
 @pytest.mark.parametrize("edge", EDGES_BEYOND)
 def test_the_selective_scan_holds_its_orders(edge, taken):
     """`assert_selective_contract` at an edge of float32's range."""
-    assert_selective_contract(edge, taken)
+    assert_selective_contract(edge, ORDER_SETS[taken])
 
 
-@pytest.mark.parametrize("taken", list(ORDER_SETS))
-@pytest.mark.check1_shards(seeds=8, per_task=4)
+@pytest.mark.parametrize("taken", [
+    pytest.param(("primal", "jvp", "vjp"), id="first-orders",
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
+    pytest.param(("jvp of grad",), id="jvp-of-grad",
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
+    pytest.param(("second jvp",), id="second-jvp",
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
+    pytest.param(("grad of grad",), id="grad-of-grad",
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
+    pytest.param(("jvp of grad, remat", "second jvp, remat", "jvp of grad, nested jit"),
+                 id="staged-and-nested", marks=pytest.mark.check1_shards(seeds=8, per_task=8)),
+    pytest.param(("jvp of grad, scanned",), id="scanned",
+                 marks=pytest.mark.check1_shards(seeds=8, per_task=8))])
 def test_the_selective_scan_holds_its_orders_over_normal_draws(taken, request):
-    """`assert_selective_contract` in the normal domain, check 1 over its declared draws."""
+    """`assert_selective_contract` in the normal domain, check 1 over its declared draws: a site an order,
+    the first orders together, whose programs one map task compiles once for all its draws (an interpreted
+    second order's 60 to 170 s; the five order sets in two tasks of four draws each ran past 20 minutes a
+    task), the remat orders, which an interpreted kernel takes none of (`INTERPRETED_REMAT`), beside the
+    nested one."""
     assert_selective_contract("normal", taken, seeds=marked_seeds(request))
 
 
-def assert_selective_contract(edge: str, taken: str, seeds: int | None = None) -> None:
+def assert_selective_contract(edge: str, taken: tuple[str, ...], seeds: int | None = None) -> None:
     """Mamba's selective scan on the recurrence template (`selective.selective_scan`, a custom VJP over its
     forward and backward launches, interpreted off a GPU) as every caller reaches it: the scan's route with
     the template named (`recurrence_chunk.selective_scan`), whose products' wrapper takes every order through
     the portable scan (`_per_product`, row 2655), fp32 over one block of 128 channels and 16 states from no
-    state: each order of `taken`'s set finite wherever float64 is a normal float32 and the portable scan is
+    state: each order of `taken` finite wherever float64 is a normal float32 and the portable scan is
     (`dew.nn.mixers.mamba.selective_scan`, in float64 the truth), at inputs and skips scaled to the edge."""
     from dew.nn.mixers.mamba import selective_scan as portable
 
@@ -584,8 +600,8 @@ def test_the_ssd_port_holds_its_orders(edge, taken):
             return chunk_ssd(*operands, chunk_size=64)
 
     assert_contract(jax.jit(ported), primals, direction, cotangent, f"the ssd port {edge}",
-                    truth_fn=jax.jit(plain_ssd), plain_fn=jax.jit(plain_ssd), without=outside(taken),
-                    draw=measured(edge, draw))
+                    truth_fn=jax.jit(plain_ssd), plain_fn=jax.jit(plain_ssd),
+                    without=outside(ORDER_SETS[taken]), draw=measured(edge, draw))
 
 
 # A TPU's scan near float32's largest is out of its contract: at the 2^63 draw 23 of the 731 outputs float64
