@@ -1715,8 +1715,24 @@ def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Arr
         shape.append(tuple(indices))
     from dew.nn.kernels.launches import interpreting
 
+    # Each term's axes checked and made one sorted tuple of nonnegative axes once, for the value and its
+    # transpose alike (row 8837).
+    spec = tuple((_axes(axis, max(map(np.ndim, term))), laid)
+                 for term, (axis, laid) in zip(terms, spec, strict=True))
     # A compiled kernel's body bare, as Mosaic lowers no symbolic zeros' rule; an interpreted one declared.
-    return (_aligned_value if interpreting() is False else _aligned)(tuple(shape), tuple(spec), *factors)
+    return (_aligned_value if interpreting() is False else _aligned)(tuple(shape), spec, *factors)
+
+
+def _axes(axis, rank: int) -> tuple[int, ...] | None:
+    """`axis` of a term of `rank` as sorted nonnegative axes, None for none; a ValueError for one out of
+    range or repeated, as `jnp.sum`'s: wrapped by the rank, a third axis of a matrix reduced its first (row
+    8837)."""
+    if axis is None:
+        return None
+    given = [int(a) for a in np.atleast_1d(axis)]
+    if any(not -rank <= a < rank for a in given) or len({a % rank for a in given}) < len(given):
+        raise ValueError(f"an aligned sum's axis {axis} is out of range or repeated in a term of rank {rank}")
+    return tuple(sorted(a % rank for a in given))
 
 
 def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
@@ -1780,7 +1796,7 @@ def _product(term: Sequence[jax.Array], ints) -> _Product:
 
 def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
     """A term's reduction to the sum's value, `op` over its axes (kept) and laid, and its count."""
-    axes = () if axis is None else tuple(sorted({int(a) % len(shape) for a in np.atleast_1d(axis)}))
+    axes = axis or ()
 
     def reduced(x: jax.Array, op: Callable = jnp.sum, **options) -> jax.Array:
         x = op(x, axis=axes, keepdims=True, **options) if axes else x
@@ -1940,9 +1956,9 @@ def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, t
                                       jax.typeof(value), live)
 
 
-def _placed_as(x: jax.Array, like) -> jax.Array:
-    """`x` placed as `like`'s type (an array's or its aval), whole too, where its mesh has an Explicit one."""
-    placed = (like if isinstance(like, ShapedArray) else jax.typeof(like)).sharding
+def _placed_as(x: jax.Array, like: ShapedArray) -> jax.Array:
+    """`x` placed as the type `like`, whole too, where its mesh has an Explicit axis (rows 8757, 8849)."""
+    placed = like.sharding
     typed = isinstance(placed, jax.sharding.NamedSharding) and placed.mesh.explicit_axes
     return jax.sharding.reshard(x, placed) if typed else x
 
@@ -1956,7 +1972,7 @@ def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.
     reduced one, the product's own (row 8501; mixed ranks reduced against another term's axis, base review
     f5e6e678d F2)."""
     rank = max(np.ndim(factor) for factor in term)
-    reduced = set() if axis is None else {int(a) % rank for a in np.atleast_1d(axis)}
+    reduced = set(axis or ())
     lead = cotangent.ndim - rank
 
     def laid(x):
@@ -2005,7 +2021,8 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
                         along = tuple(d for d, size in enumerate(held) if size == 1)
                         terms.append(products)
                         laid.append((along if along else None, (held, factor.shape)))
-            gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype), factor))
+            gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype),
+                                        jax.typeof(factor)))
         return gradients
 
     return generation.linear_map(applied, pulled, list(primals), list(tangents),
