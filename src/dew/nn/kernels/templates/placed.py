@@ -371,11 +371,19 @@ class Tcgen05Placed(Tcgen05Rings):
                 plgpu.barrier_wait(barrier)
         mosaic.looped(issued(score, weigh, lo, hi), None, ())
 
+    def stored_row(self, vector: jax.Array, smem) -> jax.Array:
+        """`vector` `[rows]` in the epilogue's row layout (`STORED.reduce(1)`), relayed through `smem` once
+        so `stored` scales each read-out block in registers instead of writing the whole sums back to tensor
+        memory and reading them again (row 5368)."""
+        smem[...] = vector
+        plgpu.commit_smem()
+        return plgpu.load(smem, layout=STORED.reduce(1), optimized=False)
+
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
-        # Sums kept past the walk (`mosaic.Kept`), each in turn, taken by their scale in place in tensor
-        # memory's own layout (a row a thread), then read out a swizzle tile of columns at a time in the
-        # epilogue's layout (`STORED`) into `smem`, and stored a stage of columns at a time (the whole where
-        # `smem` holds them, CUTLASS's sub-tiled epilogue where it is narrower); every other part as a
+        # Sums kept past the walk (`mosaic.Kept`), each in turn, read out a swizzle tile of columns at a time
+        # in the epilogue's layout (`STORED`), taken by their scale in registers (`stored_row`) into `smem`,
+        # and stored a stage of columns at a time (the whole where `smem` holds them, CUTLASS's sub-tiled
+        # epilogue where it is narrower), avoiding a full TMEM write-back and re-read; every other part as a
         # register family's.
         if not any(isinstance(part, mosaic.Kept) for part in parts):
             return super().stored(parts, views, smem=smem, wait=wait)
@@ -383,15 +391,14 @@ class Tcgen05Placed(Tcgen05Rings):
         read = min(stage, swizzling.swizzle_columns(dtype, swizzling.swizzle_for(dtype, stage)))
         for index, (kept, view) in enumerate(zip(parts, views, strict=True)):
             acc = kept.acc
-            if kept.scale is not None:
-                _rescaled(self, acc, kept.scale)
-                plgpu.commit_tmem()
             for column in range(0, acc.shape[1], stage):
                 if wait or index or column:
                     # The stage's last copy out read before it is written again.
                     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
                 for part in range(0, min(stage, acc.shape[1] - column), read):
                     value = self.read(acc, first=column + part, columns=read)
+                    if kept.scale is not None:
+                        value = kept.scale(value)
                     smem[:, pl.ds(part, read)] = value.astype(dtype)
                 plgpu.commit_smem()
                 whole = stage >= acc.shape[1]

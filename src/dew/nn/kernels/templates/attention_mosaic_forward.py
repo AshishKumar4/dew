@@ -1440,6 +1440,10 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             # never wrote.
             maximum, denominator = algebra.finished_rows(spec, state, initial=False)
             total, factor = state.total, algebra.inverse(state.total)
+            if hasattr(family, "stored_row"):
+                factor = family.stored_row(factor, row_smem)
+                if interpret:
+                    total = family.stored_row(total, row_smem)
 
             def ratio(block: jax.Array) -> jax.Array:
                 taken = algebra.quotient(lambda held: held * factor[:, None], block, total)
