@@ -2018,12 +2018,18 @@ class ForwardRegisters:
                   else prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue))
         if peaks:
             return max(before, peaks_registers(family, tiles, self.dtype, params=self.params, width=width))
-        value_width = columns or tiles.columns or _width(self.value_width, family, self.dtype)
+        value_width = value_columns(_width(self.value_width, family, self.dtype), columns or tiles.columns)
         return max(before, forward_registers(
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
             scaled=self.scaled, codes=self.codes,
             positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started))
+
+
+def value_columns(padded: int, columns: int | None) -> int:
+    """The value columns a launch emits for padded width `padded` and optional block cap `columns`:
+    capped at `padded` so slicing, resource planning and register sizing agree on oversized pins."""
+    return min(columns, padded) if columns else padded
 
 
 def prologue_registers(family: mosaic.Family, block_q: int, width: int, dtype, hook: Callable,

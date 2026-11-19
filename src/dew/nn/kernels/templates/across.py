@@ -6,14 +6,16 @@ import dataclasses
 from collections.abc import Callable
 
 import jax
+import numpy as np
 from jax import numpy as jnp
+from jax._src.lib.mlir.dialects import llvm
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith
 
-from dew.nn.kernels.templates import emission, resources
+from dew.nn.kernels.templates import emission, resources, swizzling
 from dew.nn.kernels.templates.cost import Work
 
 
@@ -85,6 +87,62 @@ class LaneZero:
 # One shuffle a thread: an operation of the CUDA cores, no memory read or written.
 LANE_ZERO = emission.stating(lambda value: Work(operations=1))(LaneZero())
 """The one `LaneZero` body every `uniform` inlines, its work stated once (`emission.stating`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ScaleSmem:
+    """`scale_smem`'s body (`plgpu.inline_mgpu`'s): scales every 16-bit element of a shared-memory tile in
+    place by a scalar power of two (swizzle-agnostic since scalar multiplication commutes with every
+    permutation), avoiding layout inference on small or swizzled query stages (row 5274)."""
+
+    words: int
+    pair: int
+    bf16: bool
+
+    def __call__(self, ctx, ref) -> None:
+        del ctx
+        i32 = ir.IntegerType.get_signless(32)
+        base = mgpu_utils.memref_ptr(ref)
+        thread = arith.remui(mgpu_utils.thread_idx(), mgpu_utils.c(resources.THREADS, i32))
+        pair = mgpu_utils.c(self.pair, i32)
+        zero = mgpu_utils.c(0, i32)
+        for word in range(0, self.words, resources.THREADS):
+            offset = arith.addi(thread, mgpu_utils.c(word, i32))
+            ptr = mgpu_utils.getelementptr(base, [offset], i32)
+            loaded = llvm.load(i32, ptr)
+            if self.bf16:
+                scaled = mgpu_utils.inline_ptx("fma.rn.bf16x2 $0, $1, $2, $3;", loaded, pair, zero,
+                                               result_types=i32)
+            else:
+                scaled = mgpu_utils.inline_ptx("mul.rn.f16x2 $0, $1, $2;", loaded, pair, result_types=i32)
+            llvm.store(scaled, ptr)
+        mgpu_utils.warpgroup_barrier()
+
+
+def scale_smem(ref, power: float, *, swizzle: int, interpret: bool = False) -> None:
+    """Scales every 16-bit element of shared-memory tile `ref` in place by `power` (a power of two),
+    swizzle-agnostically (`ScaleSmem`): avoids a separate XLA pass over the query before the launch
+    (row 5274, ~1.5 us at batch 1)."""
+    if power == 1.0:
+        return
+    if interpret:
+        ref[...] = ref[...] * jnp.asarray(power, ref.dtype)
+        return
+    dtype = jnp.dtype(ref.dtype)
+    elements = int(np.prod(ref.shape))
+    words = elements // 2
+    if swizzle is None or dtype.itemsize != 2 or words % resources.THREADS != 0:
+        raise ValueError(f"scale_smem takes an explicitly swizzled 16-bit tile of whole warpgroup word "
+                         f"stripes, not {ref.shape} {dtype} swizzle={swizzle}")
+    bf16 = dtype == jnp.dtype(jnp.bfloat16)
+    bits = (int(np.float32(power).view(np.uint32) >> 16) if bf16
+            else int(np.float16(power).view(np.uint16)))
+    pair = bits | (bits << 16)
+    transforms = () if swizzle == swizzling.UNSWIZZLED else swizzling.swizzle_transforms(dtype, swizzle)
+    ref_type = plgpu.RefType(transforms) if transforms else plgpu.RefType()
+    body = emission.stating(lambda r: Work(operations=elements, shared_bytes=2 * elements * 2))(
+        ScaleSmem(words, pair, bf16))
+    plgpu.inline_mgpu(arg_types=(ref_type,))(body)(ref)
 
 
 def lane_value(value: ir.Value, lane: int) -> ir.Value:

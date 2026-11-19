@@ -451,9 +451,25 @@ before it completes, their reads ending then, and arriving at its barrier then: 
 too, only through a wait that observes that arrival."""
 
 
+def _tmem_copy(self: _Interpreter, equation, values) -> list:
+    """`async_copy_smem_to_tmem`: reads its SMEM source asynchronously (retired by `tcgen05_commit_arrive`)
+    and writes its TMEM destination (ordered before any following `tcgen05_mma` on the issuing warp)."""
+    params = equation.params
+    smem_ref, tmem_ref = values[0], values[1]
+    smem_tree, tmem_tree = params["smem_tree"], params["tmem_tree"]
+    smem_count = smem_tree.num_leaves
+    leaves = values[2:]
+    if isinstance(tmem_ref, Ref):
+        self.emit("write", _slot(tmem_ref, tmem_tree, leaves[smem_count:smem_count + tmem_tree.num_leaves]))
+    if isinstance(smem_ref, Ref):
+        self.emit("product", (), (_slot(smem_ref, smem_tree, leaves[:smem_count]),))
+    return []
+
+
 SYNC: dict[str, Callable] = {
     "barrier_wait": _wait, "barrier_arrive": _arrival("transforms_treedef"),
-    "tcgen05_mma": _tcgen05_product, "tcgen05_commit_arrive": _tcgen05_commit, "copy_gmem_to_smem": _load,
+    "tcgen05_mma": _tcgen05_product, "tcgen05_commit_arrive": _tcgen05_commit,
+    "async_copy_smem_to_tmem": _tmem_copy, "copy_gmem_to_smem": _load,
     "copy_smem_to_gmem": _store, "commit_group": _store_group, "wait_smem_to_gmem": _store_wait,
     "commit_smem": _commit,
     "get": _access("read", 1), "swap": _access("write", 2), "wgmma": _product, "wgmma_ref": _wgmma_product,
@@ -507,6 +523,14 @@ def _unsynchronized(self: _Interpreter, body, values, located) -> None:
     del self, body, values, located
 
 
+def _scale_smem(self: _Interpreter, body: across.ScaleSmem, values, located) -> None:
+    """In-place SMEM query scaling (`across.ScaleSmem`): reads and overwrites the query stage."""
+    del body, values
+    (slot,) = located
+    self.emit("read", slot)
+    self.emit("write", slot)
+
+
 def _filled(self: _Interpreter, body: gathered.Filled, values, located) -> None:
     """A load warp's fill of its next step's entries (`gathered.Filled`, where the walk has a next step):
     one asynchronous write of the parity it fills, its tiles' all, a cp.async group the next step awaits."""
@@ -516,7 +540,7 @@ def _filled(self: _Interpreter, body: gathered.Filled, values, located) -> None:
 
 INLINED: dict[type, Callable] = {gathered.Initialized: _initialized, gathered.Waited: _waited,
                                  gathered.Gathers: _gathers, gathered.Filled: _filled,
-                                 across.LaneZero: _unsynchronized}
+                                 across.LaneZero: _unsynchronized, across.ScaleSmem: _scale_smem}
 """Each inlined body a checked kernel takes (`plgpu.inline_mgpu`'s function, by its type), as the `Event`s
 its fields and its operands state: the arrivals a phase of the barriers a gathered ring initializes, its
 parity waits at a turn's rotation, and its load warps' gathers. A body of no synchronization (a fence, a
