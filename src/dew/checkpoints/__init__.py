@@ -1457,54 +1457,37 @@ class Checkpoints:
         hosts that keep the state there because device memory is short.
         """
         mapping = isinstance(state, Mapping)
+        if mapping and (saved is not None or share is not None or weights_only or rung is not None
+                        or artifact is not None or rollout is not None or tokenizer is not None):
+            raise ValueError("a mapping is saved as it is: it takes no data position, share, weights-only "
+                             "split, rung, artifact or rollout, which a train state's save records")
         if not mapping:
             # No tier writes a non-finite state, before any write or retention (`refuse_non_finite`).
             from dew.training.transaction import refuse_non_finite
             refuse_non_finite(state, step, lambda: self.latest)
         persistent = self._open()
         self._project()
-        if not mapping:
-            self._identify_run()
-            # A run's trainer hands its objective's tokenizer (`Trainer`); a direct save holds none.
-            self._hold(artifact, tokenizer)
         if mapping:
-            if (saved is not None or share is not None or weights_only or rung is not None
-                    or artifact is not None or rollout is not None or tokenizer is not None):
-                raise ValueError("a mapping is saved as it is: it takes no data position, share, "
-                                 "weights-only split, rung, artifact or rollout, which a train state's save "
-                                 "records")
             profiles, state_tree, frozen, deltas = None, dict(state), {}, {}
             payloads = {ONE_ITEM: state_tree}
         else:
-            if weights_only and rollout is not None:
-                raise ValueError("a weights-only snapshot resumes nothing, so it holds no rollout's state")
-            state_tree = self._item(state, saved, share, rollout)
-            if weights_only:
-                from dew.state import MODEL_STATE
-                state_tree = {name: state_tree[name] for name in MODEL_STATE}
-            profiles = None if weights_only else _profiles_at(state_tree)
-            state_tree, frozen = self._frozen(state_tree)
-            state_tree, deltas = _with_ema_deltas(state_tree)
-            payloads = _in_payloads(state_tree, None if profiles is None else profiles[0])
+            self._identify_run()
+            # A run's trainer hands its objective's tokenizer (`Trainer`); a direct save holds none.
+            self._hold(artifact, tokenizer)
+            profiles, state_tree, frozen, deltas, payloads = self._state_items(state, saved, share, rollout,
+                                                                               weights_only)
         profile_metadata = None if profiles is None else {**_profile_record(profiles[1]),
                                                           'at': _named(profiles[0])}
         self._metadata = None
         if profiles is not None:
             self._profile_snapshots.add(step)
-        scores = dict(metrics or {})
-        if weights_only:
-            scores['checkpoint/weights_only'] = 1.0
+        scores = {**(metrics or {}), **({'checkpoint/weights_only': 1.0} if weights_only else {})}
         rankings = () if ranking is None else (ranking,) if isinstance(ranking, Ranking) else ranking
         rules = self._ranked(rankings, scores)
-        custom = {
-            **step_record(deltas, control, rung, artifact, boxed, state_tree),
-            "profiles": profile_metadata,
-            "rankings": rules,
-            "primary": primary or (rankings[0].metric if rankings else None),
-            "weights_only": weights_only,
-            "frozen": frozen,
-            "tree": mapping,
-        }
+        custom = {**step_record(deltas, control, rung, artifact, boxed, state_tree),
+                  "profiles": profile_metadata, "rankings": rules,
+                  "primary": primary or (rankings[0].metric if rankings else None),
+                  "weights_only": weights_only, "frozen": frozen, "tree": mapping}
         # The retention policy reads this step's record without waiting for its metadata to commit;
         # a save Orbax refuses leaves the step's committed record as it was, and one it takes replaces it.
         self._staged[step] = (copy.deepcopy(custom),
@@ -1807,6 +1790,23 @@ class Checkpoints:
         if grouped:
             total = jax.tree.map(lambda leaf: np.mean(leaf, axis=0), total)
         return jax.tree.map(lambda leaf, dtype: leaf.astype(dtype), total, dtypes)
+
+    def _state_items(self, state: TrainState, saved: bytes | None, share: DataPartition | None,
+                     rollout: Mapping[str, object] | None, weights_only: bool) -> tuple:
+        """`state`'s items as `save` writes them: its profiles where it records them, its tree less its
+        frozen trees and its EMA as deltas (`_with_ema_deltas`), those frozen trees, the deltas and the
+        payloads its items make (`_in_payloads`), its model alone where `weights_only`."""
+        if weights_only and rollout is not None:
+            raise ValueError("a weights-only snapshot resumes nothing, so it holds no rollout's state")
+        state_tree = self._item(state, saved, share, rollout)
+        if weights_only:
+            from dew.state import MODEL_STATE
+            state_tree = {name: state_tree[name] for name in MODEL_STATE}
+        profiles = None if weights_only else _profiles_at(state_tree)
+        state_tree, frozen = self._frozen(state_tree)
+        state_tree, deltas = _with_ema_deltas(state_tree)
+        return profiles, state_tree, frozen, deltas, _in_payloads(state_tree, None if profiles is None
+                                                                  else profiles[0])
 
     def save_local(
         self,

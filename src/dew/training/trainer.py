@@ -362,7 +362,7 @@ class Trainer(Generic[Loss, Effects]):
         # The later data phases' steps of the fit in progress, planned off its loop (`LaterPlans`).
         self._later: LaterPlans | None = None
         if diloco is not None:
-            diloco.admits(layout.host, record)
+            diloco.admits(() if layout is None else layout.host, record)
         # Where the fit ladder stands and the links its traces read (`StepCompiler`), and what the last
         # compile found (`Compiled`), which `plan`, `memory`, `executable`, `step_flops` and `links` read.
         # A step compiled ahead is taken once the process is readied (`_handed_ahead`): constructing a trainer

@@ -1280,12 +1280,16 @@ def held_state(params, ema):
 
 
 def bit_patterns(shape, dtype, seed):
-    """Values drawn bit by bit, so NaN payloads and subnormals turn up, with
-    both zeros, a NaN of every payload bit set and the smallest subnormal first."""
+    """Finite values drawn bit by bit, so subnormals and every sign and mantissa turn up, with both zeros,
+    the largest magnitude of every mantissa bit set and the smallest subnormal first: a non-finite one has
+    the lowest bit of its all-ones exponent cleared, as no save writes a state holding one (row 9021)."""
     kind = np.dtype(f"u{np.dtype(dtype).itemsize}")
     bits = np.random.default_rng(seed).integers(0, np.iinfo(kind).max, size=shape,
                                                 dtype=kind, endpoint=True)
     bits.flat[:4] = [1 << (8 * kind.itemsize - 1), 0, np.iinfo(kind).max, 1]
+    lowest_exponent = kind.type(1 << int(jnp.finfo(dtype).nmant))
+    unfinite = ~np.isfinite(bits.view(dtype).astype(np.float32))
+    bits[unfinite] ^= lowest_exponent
     return bits.view(dtype)
 
 
@@ -1308,7 +1312,7 @@ def awkward_state():
 
 
 def test_the_ema_comes_back_bit_for_bit_however_it_is_read(tmp_path):
-    """Every NaN payload, signed zero and subnormal of the EMA survives a save,
+    """Every signed zero, subnormal and finite bit pattern of the EMA survives a save,
     read whole, typed, without the weights beside it, into pinned host memory
     and as the shapes the checkpoint reports."""
     state = awkward_state()
