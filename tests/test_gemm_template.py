@@ -1187,7 +1187,8 @@ def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, 
         return jnp.dot(x.T.astype(wide), dy.astype(wide)).astype(out)
 
     with generation.assumed(target), generation.chosen(grouped_matmul="mosaic"):
-        assert_as_exact(jax.jit(dew), jax.jit(plain), draw, f"balanced dense gradient {rows}x{depth}x{width}",
+        assert_as_exact(jax.jit(dew), jax.jit(plain), draw,
+                        f"balanced dense gradient {rows}x{depth}x{width} into {jnp.dtype(out_dtype).name}",
                         seeds=SEEDS, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 

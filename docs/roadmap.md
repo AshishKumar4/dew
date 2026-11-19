@@ -10,7 +10,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
 - finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
-- Wrong result found by the contract draws. [8428]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -48,9 +47,13 @@ This page is generated from the maintainers' findings ledger as each change land
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - A certification verdict's key names the ptxas that assembled it by the installed nvcc wheels alone. [7309]
 - The GPU interpreter's race detection (plgpu.InterpretGPUParams(detect_races=True)) flags a correctly ordered consumer-fed ring at one consumer. [7853]
+- The GEMM's quantizing epilogue, algebra.md §7.3 and §7.4's encode consumer. [8547]
+- FP8 weights on sm80 decoded in the GEMM's mainloop, algebra.md §7.3 and §7.4. [8548]
+- An FP8 key-value cache's codes decoded in the attention kernel on sm80, algebra.md §7.3's FP8 decodes. [8549]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
+- Jax fork, sm80: lax_test RaggedTest.test_ragged_dot_prefix_rounds_once's F16_F16_F32 cells (8, 9) fail on an A100 with INVALID_ARGUMENT 'Unsupported dot…. [8554]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
 - The suite's wall. [5478]
@@ -74,7 +77,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - XLA:CPU edges. [1591]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
@@ -86,11 +88,13 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Data
 
 - Training and serving efficiency. [5292]
+- A device-plan search whose devices hold no plan walks the whole remat/head ladder before refusing. [8541]
 - The diffusion kinds' starts keep no record and their refits trace again. [6297]
 
 ## RL and serving
 
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
+- An NVFP4 source's weights served packed, algebra.md §7.4's prepare step. [8550]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - A served rollout's or episode cohort's server pages its cache wherever pages serve the policy as it draws (serving.served_layout, theme 15), at every prompt…. [7420]
@@ -102,8 +106,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
 - The merge law's placed sum keeps two bands of a term's span, not three. [8061]
-- Tests/reference_error.py:1455 refuses to prepare a check-1 site with a library arm. [8468]
-- Tests/reference_error.py _arm_program (arm_arithmetic.py:193) traces a site's arm nested in make_jaxpr, so an arm that is a jit of its own compiler_options…. [8469]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]

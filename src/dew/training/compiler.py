@@ -155,41 +155,43 @@ class Plan(NamedTuple):
 
 class HostStartup(NamedTuple):
     """What a host step's startup compiled over its state's shapes before its first step
-    (`StepCompiler._compile_host`): its programs' names, how many, the seconds it took, and by backend
-    (`options.spending`: its CPU companion's, its accelerator's) each one's seconds tracing and lowering,
-    and compiling or reading JAX's persistent cache: the run's own compiles of a step whose steps then
-    compile nothing. A lowering begun in another thread (`options.compiling`) is that thread's time: this
-    process's `lowered` reads near none of it."""
+    (`StepCompiler._compile_host`): each program it traced and lowered, and compiled or read from JAX's
+    persistent cache (`options.spending`'s `Spent`), and the seconds it took; its programs' names, how many,
+    and by backend (its CPU companion's, its accelerator's) each one's seconds, read from them: the run's own
+    compiles of a step whose steps then compile nothing. A lowering begun in another thread
+    (`options.compiling`) is that thread's time: this process's `lowered` reads near none of it."""
 
-    names: tuple[str, ...]
-    programs: int
+    spent: tuple[Spent, ...]
     seconds: float
-    by_backend: Mapping[str, Mapping[str, float]]
     pgle: Mapping[str, int] | None = None
     """Under JAX's AutoPGLE (`pgle_runs`), the trial steps its profile ran, its bytes and the accelerator's
     programs compiled again guided by it (`StepCompiler._guided_host`); None where it is off."""
 
     @classmethod
     def joined(cls, passes: Sequence[HostStartup]) -> HostStartup:
-        """One startup of several passes' (a run that inspects steps over its sampled body too)."""
-        by_backend: dict[str, dict[str, float]] = {}
-        for each in passes:
-            for name, held in each.by_backend.items():
-                into = by_backend.setdefault(name, {"programs": 0, "lowered": 0.0, "compiled": 0.0})
-                for field, value in held.items():
-                    into[field] += value
-        return cls(tuple(sorted({name for each in passes for name in each.names})),
-                   sum(each.programs for each in passes), sum(each.seconds for each in passes), by_backend)
+        """One startup of several passes' (a run that inspects steps over its sampled body too): their
+        programs and seconds together."""
+        return cls(tuple(each for passed in passes for each in passed.spent),
+                   sum(passed.seconds for passed in passes))
 
-    @classmethod
-    def of(cls, spent: Sequence[Spent], seconds: float) -> HostStartup:
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(sorted({each.program for each in self.spent}))
+
+    @property
+    def programs(self) -> int:
+        return len(self.spent)
+
+    @property
+    def by_backend(self) -> dict[str, dict[str, float]]:
+        """By backend, its programs' count and their seconds lowering and compiling."""
         by_backend: dict[str, dict[str, float]] = {}
-        for each in spent:
+        for each in self.spent:
             held = by_backend.setdefault(each.platform, {"programs": 0, "lowered": 0.0, "compiled": 0.0})
             held["programs"] += 1
             held["lowered"] += each.lowered
             held["compiled"] += each.compiled
-        return cls(tuple(sorted({each.program for each in spent})), len(spent), seconds, by_backend)
+        return by_backend
 
     def record(self) -> dict[str, JSON]:
         return {"names": list(self.names), "programs": self.programs, "seconds": self.seconds,
@@ -305,7 +307,7 @@ class HostRun:
         with collecting(), spending() as spent:
             self.settled(held, batch, sampled, contextlib.nullcontext)
         self.started.add((abstract_signature(batch), trace_context(), sampled))
-        passed = HostStartup.of(spent, time.perf_counter() - began)
+        passed = HostStartup(tuple(spent), time.perf_counter() - began)
         _log.info("a host step's startup compiled %d programs over its state's shapes in %.1f s (%s): %s",
                   passed.programs, passed.seconds, passed.by_backend, ", ".join(passed.names))
         return passed
