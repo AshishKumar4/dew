@@ -355,7 +355,6 @@ def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):
     assert all(program["beside"] >= state for program in filed[len(arms):])
 
 
-
 def test_a_convolution_sites_truths_compute_on_the_host_and_its_arms_compile_on_its_gpu(tmp_path,
                                                                                          monkeypatch):
     """A site holding a convolution, prepared for a node's GPU (`truths_ahead.prepared`): no compile without
@@ -393,6 +392,7 @@ def test_a_convolution_sites_truths_compute_on_the_host_and_its_arms_compile_on_
     with compiled_truths(store, prepare=False, stamp="a"):
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
     assert (store / AT_RUN).exists() and not (store / UNPREPARED).exists()
+
 
 def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     """Judged from programs compiled ahead (`compiled_truths(prepare=False)`), a site's run computes every
