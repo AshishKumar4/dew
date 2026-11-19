@@ -1375,6 +1375,24 @@ def test_an_aligned_sums_second_order_keeps_a_lone_parts_sign():
     assert found == 0.0 and np.signbit(found)
 
 
+def test_an_aligned_sums_tangents_value_and_gradient_keeps_its_joint_tangent():
+    """The tangent along `(0, -2^70, 2^70, 0)` at `(2^70, 2^70, 2^70, 0)` of the value of `aligned_sum([(a,
+    b)])`'s tangent's value-and-gradient: zero, `da vb + a vdb`, the reverse pass's value the joint-tangent
+    map's, whose own tangent is one aligned sum, where an untraced map's parts, rounded apart, added to inf -
+    inf, NaN (row 8757)."""
+    big = jnp.float32(2.0 ** 70)
+
+    def tangent(a, b, da, db):
+        return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (a, b), (da, db))[1]
+
+    def value(a, b, da, db):
+        return jax.value_and_grad(tangent)(a, b, da, db)[0]
+
+    point = (big, big, big, jnp.float32(0.0))
+    direction = (jnp.float32(0.0), -big, big, jnp.float32(0.0))
+    assert float(jax.jvp(value, point, direction)[1]) == 0.0
+
+
 def test_an_aligned_sums_tangent_pulls_back_inside_its_sum():
     """The gradient in `b` of `aligned_sum([(a, b), (v,)])`'s tangent along `a`'s direction a quarter, `v`
     a constant `[0, 0]`, under a cotangent of `[fp32's largest] * 2`: half the largest, where the tangent
@@ -1427,6 +1445,15 @@ def test_an_aligned_sums_tangent_leaks_no_tracer():
     with jax.checking_leaks():
         jax.jvp(lambda a: aligned_sum([(a, one)]), (one,), (one,))
         jax.grad(lambda a: aligned_sum([(a, one)]))(one)
+
+
+@pytest.mark.parametrize("axis", [2, -3, (0, 0), (1, -1)], ids=["past the rank", "before it", "repeated",
+                                                               "repeated by its sign"])
+def test_an_aligned_sum_refuses_an_axis_its_term_has_not(axis):
+    """`aligned_sum([(x,)], axis)` of a `[2, 3]` term over an axis past its rank or repeated: a ValueError, as
+    `jnp.sum`'s, where the axis wrapped by the rank reduced another (row 8837)."""
+    with pytest.raises(ValueError):
+        aligned_sum([(jnp.ones((2, 3), jnp.float32),)], axis=axis)
 
 
 def test_an_aligned_sum_over_an_empty_axis_is_positive_zero():

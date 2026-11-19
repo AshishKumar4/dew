@@ -1635,9 +1635,11 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
     derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
     avals like it), which `apply` is then traced for only where forward mode runs it. With `zero_cotangents`,
     a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros. With
-    `traced_tangent`, its tangent is one jvp of `apply` in the residuals and moving leaves a tangent reaches,
-    the others held as constants: an `apply` whose own derivative sums both in one (an aligned sum's, whose
-    two parts added overflowed to inf - inf, and a zero direction met an infinite factor, NaN; row 8757)."""
+    `traced_tangent`, for an `apply` whose derivatives at every order are declared (an aligned sum's), its
+    tangent is one jvp of `apply` in the residuals and moving leaves a tangent reaches, the others held as
+    constants, and reverse mode past the map's own transpose (`pullback`'s) that tangent's, `apply`'s
+    declared ones: split into the map and its residuals' part, an aligned sum's two parts added overflowed to
+    inf - inf, and a zero direction met an infinite factor, NaN (row 8757)."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
