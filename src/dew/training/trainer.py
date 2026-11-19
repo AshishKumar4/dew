@@ -360,7 +360,8 @@ class Trainer(Generic[Loss, Effects]):
         the run's data, and `sampled_passes` one drawn per microbatch (`dew.training.phase_passes`).
         """
         self.objective = objective
-        # A config's groups take what the objective draws fresh, as a run's do (`OptimConfig.claiming`).
+        # A config's groups take what the objective draws fresh (`OptimConfig.claiming`); a built one keys.
+        self._given = optimizer if isinstance(optimizer, optax.GradientTransformation) else None
         self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
                                          if isinstance(optimizer, optax.GradientTransformation) else
                                          (optimizer.claiming(*objective.fresh_trained()), None))
@@ -571,7 +572,7 @@ class Trainer(Generic[Loss, Effects]):
         (`dew.training._candidates.candidate_for`; row 3873), and the start it traced (`traced_start`): the
         objective's own (`Objective.trace_key`, its EMA among it) at its current rung, the optimizer's config
         and the updates or examples it was built for, or an Optax transformation given built by the object
-        itself (`Held`: its trainer's refits read their step, PF03), the reader's device steps, and every
+        given (`Held`: a trainer handed it again reads the step, PF03), the reader's device steps, and every
         setting the step reads; its links the candidate's key's (row 6022). None where a value states none of
         it: an objective that states no trace, a custom step, a device step or a setting compared by identity
         (`frozen_value`), a loss scale given built, stated links, or a run measuring its kernels' configs."""
@@ -585,7 +586,7 @@ class Trainer(Generic[Loss, Effects]):
                                  self.param_dtype, self.diloco))
         if settings is UNKEYED:
             return None
-        return (type(objective), stated, settings, Held(self._optimizer) if self._config is None else None,
+        return (type(objective), stated, settings, None if self._given is None else Held(self._given),
                 self._shape.updates, self._shape.examples, self._microbatches, self.accumulation, self.split,
                 self._scaled, self.lower_for, compiler.narrow, self.record, self.skip_nonfinite,
                 self.phase_passes.sampled)
