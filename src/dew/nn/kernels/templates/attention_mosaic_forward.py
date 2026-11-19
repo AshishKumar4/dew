@@ -636,7 +636,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`), a dropping
         # call's over the rest of its multiplier too, in the one division (`algebra.dropped_total`).
         total = rows[1] if not form.headroom else algebra.power2(rows[1], -split.shift, reach=2 * 127)
-        out = algebra.output_of(acc, algebra.dropped_total(form, total),
+        out = algebra.output_of(*algebra.dropped_total(form, acc, total),
                                 guarded=form.guarded or hooks.initial is not None)
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None

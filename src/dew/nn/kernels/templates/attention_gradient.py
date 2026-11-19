@@ -261,16 +261,18 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     multiplier = np.float32(dropped)
     over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
     # A normalized row's sums are its output, which took the multiplier (`algebra.dropped_total`); another
-    # row's hold its power of two, taken out exactly.
-    others_over = (over if dropped == 1.0 else
-                   jnp.where(normalized_rows(shift), np.float32(1 / dropped), over * np.float32(1 / power)))
+    # row's hold its power of two, taken out exactly after the total (before it, over 2^-126 times 2^-24
+    # flushed to 0).
+    taken = (None if dropped == 1.0 else
+             jnp.where(normalized_rows(shift), np.float32(1 / dropped), np.float32(1 / power)))
     # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
     # and the state's share of D about the anchor with it (row 2466).
     state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = rows(anchor_value, cotangent)
-    others = others * expand(others_over, others)
+    others = others * expand(over, others)
+    others = others if taken is None else others * expand(taken, others)
     own, others_total = own * over, others_total * over
     about_zero = rows(read(split_output(others, own, anchor_value), cotangent), cotangent)
     off_anchor = others - expand(others_total, anchor_value) * anchor_value
@@ -583,8 +585,12 @@ def centre_finish(state: Centre, state_total: jax.Array, initial: jax.Array, exp
     share = state_total / divisor
 
     def mean(summed: Running, centre: jax.Array) -> jax.Array:
+        # Taken back in the division where the total holds it (a scaled mean below fp32's least normal lost
+        # bits, a state of 2^126 beside products of 1), at the scale where it does not.
+        direct = running_total(summed) / power2(divisor, k) + share * (initial - centre)
         scaled = running_total(summed) / divisor + share * (power2(initial, k) - power2(centre, k))
-        return jnp.where(total > 0, power2(scaled, -k), 0.0)
+        scaled = power2(scaled, -k)
+        return jnp.where(total > 0, jnp.where(finite(direct), direct, scaled), 0.0)
 
     about_anchor, about_zero = mean(state.residual, state.centre), mean(state.zero, jnp.zeros_like(total))
     # A residual past fp32's largest about the centre takes zero's, which holds D whole.
