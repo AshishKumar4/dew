@@ -52,6 +52,8 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
              precision_policy.divides_as_ieee_division_at_its_edges, fault=OWN),
         Cell("a correctly rounded division is IEEE division's on a GPU dividing approximately",
              precision_policy.divides_as_ieee_division_on_an_approximate_divider, fault=OWN),
+        Cell("a power of two's scaling rounds a subnormal result once on a GPU",
+             precision_policy.power2_rounds_a_subnormal_result_once, fault=OWN),
         *(Cell(f"a compensated primitive under jit is its eager arithmetic on a GPU: {shape}",
                functools.partial(precision_policy.compensated_primitives_hold_under_jit, shape), fault=OWN)
           for shape in precision_policy.COMPENSATED_SHAPES),

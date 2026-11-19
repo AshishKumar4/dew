@@ -1437,6 +1437,34 @@ def _ones(digits: int, exponent: int) -> float:
     return (2 ** digits - 1) / 2 ** (digits - 1) * 2.0 ** exponent
 
 
+@pytest.mark.parametrize(("dtype", "left", "right"), [
+    (jnp.float32, _ones(24, 60), _ones(24, 59) - 2.0 ** (59 - 22)),
+    (jnp.float64, _ones(53, 500), _ones(53, 499) - 2.0 ** (499 - 51)),
+    (jnp.float64, _ones(53, 1023), _ones(53, -1) - 2.0 ** (-1 - 51)),
+    (jnp.float16, _ones(11, 15), _ones(11, -1) - 2.0 ** (-1 - 9)),
+    (jnp.bfloat16, _ones(8, 60), _ones(8, 59) - 2.0 ** (59 - 6)),
+    (jnp.float64, _ones(53, 511), _ones(53, 511)),
+    (jnp.float16, _ones(11, 7), _ones(11, 7)),
+], ids=["fp32 edge", "float64 edge", "float64 top", "float16 top", "bfloat16 edge", "float64 top product",
+        "float16 top product"])
+def test_an_exact_product_at_a_dtypes_edge_keeps_its_residual(dtype, left, right):
+    """`precision.two_product`'s range-safe split (`bit_split`) at the top of each dtype's range, its
+    operands' significands all ones (and two less): their product and its residual sum to the exact
+    rational product, a product in the top binade's too.
+    A Veltkamp split multiplies by `2^(p/2) + 1` first and overflows to NaN (past 2^115 in fp32, 2^996 in
+    float64; base reviews 9bc4326dd F1, 1fe546a10 F1); an odd significand's truncated cut left its low parts'
+    product past `p` bits, rounded (float64's 27 and 26 bits; the precision owner's review); the top binade's
+    rounded cut carried past the largest float, and two cuts rounded up a product in it ((2 - 2^-52)
+    2^511 squared, 255.875 squared in float16: train 1018's review F1)."""
+    from dew.nn.precision import two_product
+
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        a, b = jnp.asarray(left, dtype), jnp.asarray(right, dtype)
+        product, residual = two_product(a, b, bit_split=True)
+        exact = Fraction(float(a)) * Fraction(float(b))
+        assert Fraction(float(product)) + Fraction(float(residual)) == exact
+
+
 def edge_values(dtype) -> np.ndarray:
     """A float format's values across every binade, of both signs, from their bits: zeros, subnormals of
     every leading bit's place and the least and largest, the least normal and the largest, normals across
@@ -1456,7 +1484,8 @@ def edge_values(dtype) -> np.ndarray:
     return np.concatenate([values, -values])
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.bfloat16])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
+                                   jnp.float8_e5m2])
 def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
     """`dew.nn.precision.exact_power2` is `2^n` in its format, bit for bit, at every normal exponent from the
     least to the largest, and +0 one below them (a zero a caller encodes so), compiled."""
@@ -1469,6 +1498,19 @@ def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
     assert found.dtype == dtype
     expected = np.asarray([0.0, *(2.0 ** int(n) for n in exponents[1:])], np.float64).astype(dtype)
     np.testing.assert_array_equal(found.view(f"uint{limits.bits}"), expected.view(f"uint{limits.bits}"))
+
+
+def power2_rounds_a_subnormal_result_once():
+    """`dew.nn.precision.power2` by greedy factors rounds a result below the least normal once, at its last
+    factor, on a device that keeps subnormals (a GPU's XLA, whose fp32 arithmetic keeps them where XLA:CPU's
+    flushes them): `(0.5 + 2^-24) 2^-149` is `2^-149`, where a whole factor first rounded the partial product
+    to `2^-127` and the remainder's then rounded its tie to zero (base review 54bb1f61a F2). A GPU numerics
+    cell (tests/test_gpu_numerics.py)."""
+    from dew.nn.precision import power2
+
+    found = np.asarray(jax.jit(power2)(jnp.float32(0.5 + 2.0 ** -24), jnp.int32(-149)))
+    # Its one correctly rounded answer, the least subnormal's bits.
+    assert found.dtype == np.float32 and found.view(np.uint32) == 1, found.view(np.uint32)
 
 
 def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():

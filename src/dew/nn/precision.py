@@ -476,14 +476,16 @@ def _exp_value(base2: bool, x) -> jax.Array:
 
 def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax.Array:
     """`2^n` in `dtype`, exactly, for an integral `n` (an integer, or a float holding one) within its normal
-    exponents ([-126, 127] in float32), set in its exponent bits, and +0 at one below them (`minexp - 1`,
-    a zero a caller encodes so): the one owner of an exact power of two (`power2`'s factors, a kernel
-    template's). No `exp2`, which XLA computes as `exp(n ln 2)`, inexactly, and whose products its algebraic
-    simplifier fuses into one `exp` of their sum (`exp(a) exp(b) -> exp(a + b)`), past the format where each
-    factor is in it."""
+    exponents ([-126, 127] in float32, [-6, 8] in float8_e4m3fn), set in its exponent bits at the format's own
+    bias (its encoding of 1.0's), and +0 at one below them (`minexp - 1`, a zero a caller encodes so), in a
+    format whose biased exponent 0 holds its zero (IEEE's binary formats, bfloat16, the float8s with a
+    mantissa): the one owner of an exact power of two (`power2`'s factors, a kernel template's). No `exp2`,
+    which XLA computes as `exp(n ln 2)`, inexactly, and whose products its algebraic simplifier fuses into one
+    `exp` of their sum (`exp(a) exp(b) -> exp(a + b)`), past the format where each factor is in it."""
     limits = jnp.finfo(dtype)
     word = jnp.dtype(f"int{limits.bits}")
-    biased = jnp.asarray(n).astype(word) + word.type(limits.maxexp - 1)
+    bias = int(np.asarray(1.0, dtype).view(f"uint{limits.bits}")) >> limits.nmant
+    biased = jnp.asarray(n).astype(word) + word.type(bias)
     bits = jax.lax.shift_left(biased, jnp.full_like(biased, limits.nmant))
     return jax.lax.bitcast_convert_type(bits, dtype)
 
@@ -511,13 +513,14 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     `raised_exactly` raises one from its bits.
 
     Past twice the least of the normal exponents' bounds, each factor takes as much of what is left of `k` as
-    the normal exponents hold, as many factors as `reach` needs, so on a backend that keeps subnormals a
-    result below the least normal rounds once wherever `|k|` fits one factor, where a split into equal parts
-    rounded it again at each part past the normal range. Within it (`TWO_FACTOR_REACH` in float32, both halves
-    normal powers) a caller stating its `reach` takes two factors, `k`'s halves, each built as its product
-    takes it: one integer tile live, not two (et-livehook1: the factor tiles 66 of an attention template's
-    natural forward's 281 registers at its peak), a subnormal result rounded at each half past the normal
-    range."""
+    the normal exponents hold, as many factors as `reach` needs, the largest last, so every partial product
+    before the last is at least the result's `2^126` (a normal value wherever the result can round to any but
+    zero) and, on a backend that keeps subnormals, a result below the least normal rounds once, at the last
+    factor, where a split into equal parts rounded it again at each part past the normal range. Within it
+    (`TWO_FACTOR_REACH` in float32, both halves normal powers) a caller stating its `reach` takes two
+    factors, `k`'s halves, each built as its product takes it: one integer tile live, not two (et-livehook1:
+    the factor tiles 66 of an attention template's natural forward's 281 registers at its peak), a subnormal
+    result rounded at each half past the normal range."""
     x = jnp.asarray(x)
     dtype = jnp.result_type(x, jnp.float32)
     limits = jnp.finfo(dtype)
@@ -539,9 +542,15 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
         return (x * exact_power2(half, dtype)
                 * exact_power2((k - half.astype(jnp.float32)).astype(jnp.int32), dtype))
     k = k.astype(jnp.int32)
+    parts = []
     for _ in range(math.ceil(held / -least)):
         part = jnp.clip(k, least, largest)
-        x, k = x * exact_power2(part, dtype), k - part
+        parts.append(part)
+        k = k - part
+    # The remainder first and the whole factors after it: a factor past the normal range rounds a partial
+    # product the next factor would round again (0.5 + 2^-24 by 2^-126, then 2^-23: zero, not 2^-149).
+    for part in reversed(parts):
+        x = x * exact_power2(part, dtype)
     return x
 
 
