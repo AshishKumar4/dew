@@ -1222,6 +1222,21 @@ def test_an_aligned_sums_derivatives_hold_a_cancelling_shared_factors_range():
         np.testing.assert_array_equal(np.asarray(found, np.float64), expected)
 
 
+def test_an_aligned_sums_gradient_scales_a_cotangent_before_its_broadcast_sum():
+    """`aligned_sum([(x, y), (z,)])` of one-element `x` 2^-20 and `y` 2^-100 beside `z` of two, under a
+    cotangent of 1.5 2^127 on each: `x`'s gradient 3 2^27 and `y`'s 3 2^107, float64's, where the cotangent's
+    sum across the broadcast came before its products, 3 2^127 past float32's largest (base review d6c1b2c1a
+    F1)."""
+    x, y, z = (jnp.asarray(v, jnp.float32) for v in ([2.0 ** -20], [2.0 ** -100], [0.0, 0.0]))
+    cotangent = jnp.full((2,), 1.5 * 2.0 ** 127, jnp.float32)
+    def loss(x, y, z):
+        return jnp.sum(aligned_sum([(x, y), (z,)]) * cotangent)
+
+    gradients = jax.grad(loss, argnums=(0, 1))(x, y, z)
+    np.testing.assert_array_equal(np.asarray(gradients[0], np.float64), [3.0 * 2.0 ** 27])
+    np.testing.assert_array_equal(np.asarray(gradients[1], np.float64), [3.0 * 2.0 ** 107])
+
+
 def test_an_aligned_sum_of_a_subnormal_factor_raises_it_by_its_bits():
     """`aligned_sum` of a term whose factor is fp32-subnormal (`2^-140`) and whose product is in range
     (`2^-140 2^100`): `2^-40` exactly, the factor normalized by its bits, where lifted by a multiply XLA:CPU
