@@ -239,10 +239,11 @@ class CompiledTruths:
         generation.reported(self._site(label)[1][named(role, inputs)]["routes"])
         return found
 
-    def walked(self, label: str, role: str, inputs) -> bool:
-        """Whether the site's program `role` at `inputs` is one its run walks as it runs (`float64_terms`),
-        its prepare having found it steered by its values, which no program compiled ahead holds."""
-        return "walked" in self._site(label)[1].get(named(role, inputs), {})
+    def walked(self, label: str, role: str, inputs) -> str | None:
+        """Why the site's program `role` at `inputs` is one its run walks as it runs (`float64_terms`), as its
+        prepare stated, having found it steered by its values, which no program compiled ahead holds; None
+        for one its prepare compiled."""
+        return self._site(label)[1].get(named(role, inputs), {}).get("walked")
 
     def tree(self, label: str, role: str, inputs):
         """The output tree the site's program `role` at `inputs` was traced with (`held`)."""
@@ -306,12 +307,20 @@ SITE_IN_PROGRESS: contextvars.ContextVar[str | None] = contextvars.ContextVar("t
 """The label of the check-1 site whose truths are computed (`judged`), None outside one."""
 
 
+READ: list[Path] = []
+"""Each store this process's runs read, in order (`compiled_truths`): a test's own and a flow's alike, whose
+records of what its run compiled on its GPU (`AT_RUN`, `UNPREPARED`) the run's summary names
+(tests/conftest.py's `compiled_ahead`)."""
+
+
 @contextlib.contextmanager
 def compiled_truths(directory: str | Path, *, prepare: bool, stamp: str,
                     target=None) -> Iterator[CompiledTruths]:
     """Within the block, check 1's sites compile their float64 programs ahead into `directory` (`prepare`)
     or compute their truths from those programs (the module's account)."""
     store = CompiledTruths(Path(directory), prepare, stamp, target)
+    if not prepare:
+        READ.append(store.directory)
     token = COMPILED.set(store)
     try:
         yield store

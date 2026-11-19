@@ -872,3 +872,31 @@ def test_a_walk_its_values_steer_runs_on_the_runs_device_named_at_run(tmp_path, 
         assert_as_exact(dew, reference, draw, "a steered product", seeds=8, truth_fn=steered, terms=True)
     assert walked and sized and set(walked) == set(sized) == {jax.devices()[1]}
     assert (tmp_path / AT_RUN).is_file() and not (tmp_path / UNPREPARED).exists()
+
+
+def test_a_site_whose_truths_alone_are_at_run_computes_its_reference_as_its_truth(tmp_path, monkeypatch):
+    """A site naming no truth whose prepare writes its truths at run (`compile_site`'s `at_run`: their
+    programs hold a choice its GPU makes) and compiles its arms: its run computes its truth from its
+    reference as compiled there (`_site_judged`), its arms from the store, the truths named at run alone,
+    nothing unprepared; the truth fell back to the reference arm read from the store, called at float64
+    inputs it holds no program for (`MissingTruth`, the review of rows 8576 and 8579)."""
+    from truths_ahead import AT_RUN, CompiledTruths
+
+    from dew.nn.kernels.templates import report
+
+    dew, reference, draw = _site()
+    real = CompiledTruths.compile_site
+
+    def refusing_truths(store, label, programs, held, **options):
+        # A choice its GPU makes, which no compile without that GPU holds, in its truths' programs alone.
+        if programs and not options.get("arms", False):
+            raise report.CompiledOnDevice(jax.jit(lambda x: x).lower(np.zeros(1, np.float32)), ["truth"])
+        return real(store, label, programs, held, **options)
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"), monkeypatch.context() as at_run:
+        at_run.setattr(CompiledTruths, "compile_site", refusing_truths)
+        assert_as_exact(dew, reference, draw, "a product whose truths are at run", seeds=8)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product whose truths are at run", seeds=8)
+    assert len(json.loads((tmp_path / AT_RUN).read_text())["reasons"]) == 1
+    assert not (tmp_path / UNPREPARED).exists()

@@ -148,7 +148,8 @@ def _termed(fn, args, *, power: int):
     """`fn(*args)`'s outputs' tree, their values and each one's terms summed at `power` (`POWER`: their
     squares, or their magnitudes), the evaluation `float64_terms` describes."""
     ran = running()
-    if ran is not None and not ran[0].walked(ran[1], f"terms {power}", args):
+    steered = None if ran is None else ran[0].walked(ran[1], f"terms {power}", args)
+    if ran is not None and steered is None:
         # A run reading programs compiled ahead (`truths_ahead`): the truth's compiled run and the walk's,
         # its terms alone, in turn (`reference_error._held_walk`); a walk its values steer runs as it is
         # walked, on the GPU, named.
@@ -162,8 +163,7 @@ def _termed(fn, args, *, power: int):
     if ran is not None:
         # In a part's run, a walk its values steer (its prepare held none) compiles its spans on the GPU as
         # it walks, its float64 on the GPU's FP64 units (bible §8), named as its prepare declared it.
-        ran[0].unprepared(f"{ran[1]}: its terms walk: its truth takes a branch or loop its values pick, "
-                          "which the walk reads as it runs", AT_RUN)
+        ran[0].unprepared(f"{ran[1]}: its terms walk: {steered}", AT_RUN)
     token = POWER.set(power)
     try:
         with on_float64_device(), evaluated_on(leaves):
