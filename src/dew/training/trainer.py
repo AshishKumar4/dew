@@ -448,7 +448,11 @@ class Trainer(Generic[Loss, Effects]):
             # Outside any trace, one program, not each operation's (`built_start`): the moving state its
             # buffers, the frozen tree the held arrays. This body's, not the bound override's, which then
             # changes it once (row 8730). A state held on the host takes the arrays over as it is placed.
-            return built_start(functools.partial(Trainer.initial_state, self), initializer, key)
+            return built_start(self._fresh_state, initializer, key)
+        return self._fresh_state(initializer, key)
+
+    def _fresh_state(self, initializer: Initializer, key: jax.Array) -> TrainState:
+        """`initial_state`'s body, which an override reaches through the base alone (`super()`)."""
         init_key, run_key = jax.random.split(key)
         initialized = initializer(init_key)
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
