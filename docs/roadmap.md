@@ -10,6 +10,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
 - finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
+- Jax fork, sm80: lax_test RaggedTest.test_ragged_dot_prefix_rounds_once's F16_F16_F32 cells (8, 9) fail on an A100 with INVALID_ARGUMENT 'Unsupported dot…. [8554]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -53,7 +54,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
-- Jax fork, sm80: lax_test RaggedTest.test_ragged_dot_prefix_rounds_once's F16_F16_F32 cells (8, 9) fail on an A100 with INVALID_ARGUMENT 'Unsupported dot…. [8554]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
 - The suite's wall. [5478]
@@ -104,6 +104,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - A ratio's transpose sums landed quotients along an axis its denominator varies over. [8292]
 - The merge law's derivative programs nearly doubled since the base review's fixes. [8427]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
+- Tests: a check1_shards site's map tasks draw every staged unit up front (ci.py marked_sites: staged(declared) by PARITY_STAGES), where an unsharded site stops…. [8561]
 - Bit-level synthesis in dew.algebra. [3733]
 - The merge law's placed sum keeps two bands of a term's span, not three. [8061]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
