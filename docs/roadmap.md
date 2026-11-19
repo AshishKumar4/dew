@@ -35,7 +35,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Attention tests to the bible's §6 and §7 test rules. [8437]
 - Certification's stored verdict is keyed by Dew's whole package digest (report._verdict_key: package_digest beside the launch identity, config, direction, the…. [8650]
 - Tests/ring_protocol.py:422-435 reads gathered.Gathers' bodies by their fields (fill, fill_wait, read events written by hand) and test_ring_protocol.py:557-568…. [8657]
-- Tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm90-gated forward ...]. [8669]
 - Tests/ring_protocol.py:838-839 accepts a read of an entries parity whose contents are a stale step's. [8678]
 - Tests/test_gemm_gather.py:200-242 (the strided-table gathers kernel) duplicates tests/test_ring_protocol.py:382-424's gathered walk fixture. [8679]
 - Tests/test_gemm_paired.py:649-669 passes a two-launch chained gradient to ring_protocol.programs, which explores only the first mpmd_map. [8680]
