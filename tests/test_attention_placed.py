@@ -392,13 +392,14 @@ def test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_inte
     """The fused keys-first dK/dV launch on a B200 (`KEYS_TILES["fused"]` at width 64: each compute
     warpgroup's step's dQ filled a slot at a time into its ring, which its reducer warp's TMA adds read, a
     slot's fill and free a barrier's phase each, `attention_mosaic_dkv._PlacedDq`), traced as a B200 builds
-    it over 128 keys and four query steps, the full call's and the causal's (whose program walks fewer):
+    it over 128 keys and three query steps, the full call's and the causal's (whose program walks fewer):
     every interleaving of its compute warpgroups, its load, issuer and two reducer warps and its copies'
     landings explored (`ring_protocol.explore`), no deadlock, every barrier's phase whole and observed, and
-    no slot written while an add still reads it."""
+    no slot written while an add still reads it. Three query steps reuse a slot of the two (the fourth's
+    interleavings passed the checker's bound once its stores' groups and fills were events)."""
     from ring_protocol import explore, programs
 
-    tokens, width = 256, 64
+    tokens, width = 192, 64
     query = jnp.ones((1, tokens, 1, width), jnp.bfloat16)
     key = jnp.ones((1, 128, 1, width), jnp.bfloat16)
     spans = template.spans(tokens, 128, 1, **CALLS[call])
