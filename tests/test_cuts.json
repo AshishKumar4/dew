@@ -1647,9 +1647,6 @@
 "tests/test_diffusion_run_sources.py::test_diffusion_nft_trains_from_the_run_config_on_a_registered_reward",
 "tests/test_diffusion_run_sources.py::test_flow_grpo_trains_from_the_run_config_on_a_registered_reward"
 ],
-"tests/test_discrete.py": [
-"tests/test_discrete.py::test_masked_diffusion_lm_memorises_the_toy_corpus"
-],
 "tests/test_disk_banks.py": [
 "tests/test_disk_banks.py::test_disk_moe_logits_and_cached_decode_equal_resident[False-None]"
 ],
@@ -2286,9 +2283,9 @@
 "tests/test_kernel_configs.py::test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block[sm89-sm89/chunk_fwd_h/float32/bv64-stages1-warps2/0.8b]",
 "tests/test_kernel_configs.py::test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block[sm89-sm89/kkt_solve/bfloat16/bk64-stages3-warps1/27b]",
 "tests/test_kernel_configs.py::test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block[sm89-sm89/kkt_solve/float32/bk64-stages3-warps1/0.8b]",
-"tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm100-unaligned in whole 16 bytes]",
-"tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm86-deepseek-v3 up]",
-"tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm89-mixtral up]",
+"tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm120-qwen3.5-4b down]",
+"tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm86-llama up]",
+"tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm89-qwen3 gate]",
 "tests/test_kernel_configs.py::test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block[sm80]",
 "tests/test_kernel_configs.py::test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block[sm89]",
 "tests/test_kernel_configs.py::test_programs_compiled_at_once_are_the_ones_compiled_in_turn",
