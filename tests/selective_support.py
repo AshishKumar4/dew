@@ -282,3 +282,17 @@ def second_beside_the_largest(seed: int) -> tuple:
     return tuple(jnp.asarray(t, jnp.float32) for t in (decay, np.zeros(shape), np.zeros((1, 64)), cotangent,
                                                         direction))
 
+
+LONG_AXES = (65, 128, 130, 194)
+"""`long_draw`'s lengths: one past a block, two blocks, past two with a remainder, and a block scanned
+between a first and a last."""
+
+
+def long_draw(length: int, seed: int) -> tuple:
+    """`seed`'s fp32 `(decay, write, entering)` of an affine scan `[1, length, 16]` and the cotangent of its
+    states: decays uniform in [0, 1], writes, the state entering and the cotangents standard normal."""
+    rng = np.random.default_rng([8486, 3, seed])
+    shape = (1, length, 16)
+    drawn = (rng.uniform(0.0, 1.0, shape), rng.standard_normal(shape), rng.standard_normal((1, 16)),
+             rng.standard_normal(shape))
+    return tuple(jnp.asarray(t, jnp.float32) for t in drawn)

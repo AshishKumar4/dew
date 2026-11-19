@@ -1,6 +1,7 @@
 """Mamba's selective scan and a `MambaForCausalLM` checkpoint against
 transformers 5.16.1: tools/mamba_reference.py writes tests/fixtures/hf/mamba-tiny."""
 
+import functools
 import json
 from pathlib import Path
 
@@ -14,8 +15,10 @@ from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 from selective_support import (
     DIFFERENTIATED,
     FAINT_BESIDE_THE_LARGEST,
+    LONG_AXES,
     NEAR_THE_LARGEST,
     faint_beside_the_largest,
+    long_draw,
     near_the_largest,
     rate_past_the_range,
     recurred,
@@ -111,6 +114,64 @@ def test_an_affine_scans_faint_values_beside_float32s_largest_are_as_exact_as_th
     assert_as_exact(jax.jit(arm(scan)), exact, draw,
                     f"an affine scan beside float32's largest, {case}, along axis {axis}", seeds=FEWEST_SEEDS,
                     truth_fn=exact)
+
+
+@pytest.mark.parametrize('length', LONG_AXES)
+def test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence(length):
+    """Mamba's affine scan (`ssm.affine_states`) over an axis longer than a block (`long_draw`): its states,
+    every gradient and its decays' gradient of the writes' cotangent along a direction, on par from float64
+    with the recurrence a token at a time (`recurred`, check 1)."""
+    def scan(decay, write, entering):
+        return affine_states(decay, write, entering, axis=1)
+
+    def reference(decay, write, entering):
+        return recurred(decay, write, entering, axis=1)
+
+    def second(fn):
+        def run(decay, write, entering, cotangent):
+            def along(decay):
+                _, pull = jax.vjp(lambda write: fn(decay, write, entering), write)
+                return jnp.sum(pull(cotangent)[0] * 0.25)
+
+            return with_gradients(fn)(decay, write, entering, cotangent), jax.grad(along)(decay)
+
+        return run
+
+    exact = jax.jit(second(reference))
+    assert_as_exact(jax.jit(second(scan)), exact, functools.partial(long_draw, length),
+                    f"an affine scan over {length} tokens", seeds=FEWEST_SEEDS, truth_fn=exact)
+
+
+@pytest.mark.parametrize('length', [65, 128, 130, 194])
+def test_an_affine_scans_second_order_past_a_block_is_zero_where_it_is_structurally(length):
+    """Mamba's affine scan over decays of one half, writes of 1/8 from 5/8, its states' cotangents one but
+    1.75 2^127 at the last two tokens of the last whole block: its writes' cotangent's derivative, a quarter
+    of it summed, along the first token's decay, zero, as the recurrence's a token at a time, where a scan
+    of blocks' transpose met an overflowing cotangent with its last carry's zero, NaN (the head review of
+    84cf35dfe)."""
+    decay, write = jnp.full((length, 1), 0.5, jnp.float32), jnp.full((length, 1), 0.125, jnp.float32)
+    end = length // 64 * 64
+    cotangent = jnp.ones((length, 1), jnp.float32).at[end - 2:end].set(1.75 * 2.0 ** 127)
+
+    entering = jnp.full((1,), 0.625, jnp.float32)
+
+    def along(decay):
+        _, pull = jax.vjp(lambda write: affine_states(decay, write, entering, axis=0), write)
+        return jnp.sum(pull(cotangent)[0] * 0.25)
+
+    assert float(jax.grad(along)(decay)[0, 0]) == 0.0
+
+
+@pytest.mark.parametrize('length', LONG_AXES)
+def test_an_affine_scan_over_a_long_axis_takes_empty_lanes_and_a_narrower_entering_state(length):
+    """Mamba's affine scan over an axis longer than a block: of no lanes, its states empty of its shape, and
+    from a bf16 state entering float32 decays and writes, its states float32, where blocks laid by `-1`
+    divided by an empty lane's zero and a scan's carry kept the entering bf16 (the head review of
+    84cf35dfe)."""
+    empty = jnp.zeros((length, 0), jnp.float32)
+    assert affine_states(empty, empty, jnp.zeros((0,), jnp.float32), axis=0).shape == (length, 0)
+    decay, write = jnp.full((length, 4), 0.5, jnp.float32), jnp.full((length, 4), 0.25, jnp.float32)
+    assert affine_states(decay, write, jnp.ones((4,), jnp.bfloat16), axis=0).dtype == jnp.float32
 
 
 def test_an_affine_scans_second_derivative_beside_float32s_largest_is_as_exact_as_the_recurrence():
