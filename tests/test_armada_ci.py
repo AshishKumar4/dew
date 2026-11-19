@@ -76,6 +76,17 @@ def test_a_targeted_group_runs_what_cis_task_runs_and_a_site_runs_in_its_own_tas
     assert seen == expected[split]
 
 
+def test_a_targeted_run_of_a_named_site_runs_it(ci, tmp_path, monkeypatch):
+    """A node id named with no split (tmp/run_tests.py's `file::test`) runs the test it names, a site among
+    them, which a file's group sets aside (row 8963: it selected nothing)."""
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setenv("SEEN", str(tmp_path / "seen.jsonl"))
+    written(tmp_path, {"test_sites.py": SITED})
+    assert ci.targeted("3.12", ["tests/test_sites.py::test_check1"], tmp_path / "report.xml") == 0
+    seen = [json.loads(line)[0] for line in (tmp_path / "seen.jsonl").read_text().splitlines()]
+    assert seen == ["check1"]
+
+
 def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(ci, tmp_path, monkeypatch):
     """On 3.12 files are packed near the target by armada's medians, else
     the recorded durations; a file nothing has timed runs alone; a file

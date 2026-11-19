@@ -18,6 +18,7 @@ import sys
 import time
 import types
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING, TypedDict
 
 import grain.python as pygrain
@@ -43,6 +44,7 @@ from dew.data.dataset import (
     PhasedStream,
     Position,
     RampedStream,
+    Stage,
     StepPhases,
     row_field,
     rows_of,
@@ -74,6 +76,7 @@ from dew.training.selection import Best, HeldBest
 
 if TYPE_CHECKING:
     from dew.objectives.base import Objective
+    from dew.training._candidates import RunShape
     from dew.training.distributed import StartBuild
     from dew.training.startup import Startup
 
@@ -456,6 +459,15 @@ class FitRun:
     """The stream the start read its first batch from to declare its input (`Trainer._primed_first`): the
     share it reads, the stream, the batch and the stream's position after it, which a fresh start's
     prefetcher takes over (`Trainer._opened`) and any other start closes."""
+    stages: tuple[tuple[Stage, ...], tuple[Stage, ...]] = ((), ())
+    searched: Hashable | None = None
+    """What the run's first step was searched over before its state was placed
+    (`StepCompiler.planned_unplaced`: its batch's signature and the run's shape), its plan held or none
+    found: the start searches it again over nothing else (row 8959: a run whose layout choice found neither
+    the devices' plan nor the streamed step searched the devices' again in its start). A fit's own, so a
+    later fit of the trainer searches afresh."""
+    """The stages that stream reads in and those of them a ramp's (`stages_of`), read as it opened, its
+    first batch read or none: what the layout choice plans its first step over (`staged`)."""
     signatures: dict[Hashable, str] = dataclasses.field(default_factory=dict)
     """Each batch signature's digest the run compiled a step for (`dew.training.trainer.signature_digest`),
     computed as it compiled."""
@@ -921,6 +933,38 @@ def counted_step(interval: Interval, run: FitRun, row_tokens: Callable[[Batch], 
                                                                                    rows_of(device)))
 
 
+def stages_of(source: Iterator[Batch]) -> tuple[tuple[Stage, ...], tuple[Stage, ...]]:
+    """The stages the training stream `source` reads in, a ramp's and phases' of other batches
+    (`PhasedStream.stages`), and those of them a ramp's (none where it ramps none)."""
+    stages = source.stages if isinstance(source, RampedStream | PhasedStream | StepPhases) else ()
+    return stages, stages if isinstance(source, RampedStream) else ()
+
+
+def staged(shape: RunShape, stages: tuple[tuple[Stage, ...], tuple[Stage, ...]]) -> RunShape:
+    """`shape` as a training stream's `stages` (`stages_of`) stage the run: the steps a stage after the
+    first begins at, each where an update does (`Ramp.stages`; a schedule's as each begins,
+    `Trainer._scheduled`), where the step lays its window out; each stage's batch of a ramp read whole, no
+    plan splitting a ramp's (`Trainer._laid_out` keeps it whole). Read wherever a plan of the run's first
+    step is made over the shape, before the run opens its stream (`streaming.laid_start`, the stages of the
+    stream its start read first, `FitRun.stages`, on a process whose share reads no batch too) and as it
+    opens it (`Trainer._opened`), so the first compile takes the plan the layout's choice made
+    (`FitRun.searched`), where a ramped or phased run planned and compiled its first step
+    twice."""
+    every, ramp = stages
+    return dataclasses.replace(shape, ramp=ramp, split=1 if ramp else shape.split, stage_starts=frozenset(
+        accumulate((after.records - stage.records) // stage.batch for stage, after in pairwise(every))))
+
+
+def handed(batch: Batch, examples: int | None) -> Batch:
+    """A run's first batch as its loop hands the step it (`read_batch`), counted and its rows marked
+    (`dew.training.distributed.marked`), its arrays or their placed shapes: its device fields alone
+    (`split_fields`), on the examples clock marked as closing no window (`closes_window`). The one form
+    every plan of a run's first step is made over: the layout choice's (`streaming.laid_start`), the start's
+    (`Trainer._compiled_fresh`) and a step compiled ahead (`dew.training.ahead.step_batch`), so the run's
+    first compile takes the plan the choice made (`FitRun.searched`)."""
+    return closes_window(split_fields(batch)[0], examples)
+
+
 def closes_window(batch: Batch, examples: int | None, *, last: bool = False) -> Batch:
     """`batch` as a run on the examples clock (bounded to `examples`) hands its step: marked whether it is
     the run's `last`, closing its update window (`CLOSES_WINDOW`), every batch of such a run marked, so
@@ -1253,7 +1297,7 @@ def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int]
 class Start:
     """What `Trainer.place` reads before it places the state (`Trainer._started`): the objective's
     held tree and the key, the state's shapes and which frozen leaves its init passes through
-    (`traced_start`), the checkpoint step a run resumes from, the state's placement and its build."""
+    (`traced_draw`), the checkpoint step a run resumes from, the state's placement and its build."""
 
     initializer: Initializer
     key: jax.Array
@@ -1262,11 +1306,14 @@ class Start:
     resume: int | None
     shardings: Placement[TrainState]
     build: Callable[[Initializer, jax.Array], TrainState]
-    """The fresh state's build replayed from the program its shapes were traced from (`traced_start`),
+    """The fresh state's build replayed from the program its shapes were traced from (`traced_draw`),
     which the start's program traces in place of the objective's init."""
     held: Mapping[int, int]
     """Each device's bytes of the state, by its id, as the layout validates its placement
     (`Validation.device_bytes`): its own memory's alone, none of a field kept in the host's."""
+    kept: bool = False
+    """Whether its build is the one its process keeps for the trainer's refits (`traced_start`'s, under the
+    trainer's step key): only such a build's program a refit reads again (`start_build`)."""
 
     def unplaced(self, mesh: Mesh) -> int:
         """The most bytes any of this process's devices of `mesh` takes as the start places the state: the
@@ -1295,7 +1342,7 @@ class Start:
         (`placed_host`)."""
         from dew.training.distributed import start_build
 
-        return start_build(self.build, self.initializer, self.shardings, self.through)
+        return start_build(self.build, self.initializer, self.shardings, self.through, kept=self.kept)
 
 
 def _rollout_admitted(rollout: Rollout | None) -> Rollout | None:

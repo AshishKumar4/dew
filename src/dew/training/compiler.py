@@ -41,7 +41,7 @@ from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
 from dew.state import Accumulation, TrainState, apart, occupied, together
 from dew.telemetry.compiles import Compiles
-from dew.telemetry.instrumentation import StepFlops
+from dew.telemetry.instrumentation import StepFlops, compiled_memory
 from dew.training._candidates import RunShape, Stepping, _shaped, candidate_for, forget, lowered_for
 from dew.training._lowering import Lowered, routed
 from dew.training.distributed import (
@@ -57,6 +57,7 @@ from dew.training.memory import (
     layer_gathers,
     local_devices,
     memory_record,
+    placed_beside,
     rung_record,
     step_fits,
     step_options,
@@ -899,10 +900,15 @@ class StepCompiler[L, E]:
             held.keep()
             plan = record(compiled.plan, "plan")
             # The search's probes, its own read at the headroom the placed devices hold (what a step's need is
-            # read from), and the placed judgement whole (`placed`): that headroom with its copies built, and
-            # the bytes it held beside the step that the allocators did not (its window, its batches).
+            # read from) with the bytes that judgement placed beside the step, not the unplaced search's
+            # charge of a state the devices held none of (row 8962: a headroom and a charge of two
+            # judgements in one record); and the placed judgement whole (`placed`): that headroom with its
+            # copies built, and the bytes it held beside the step that the allocators did not.
             held_out = judging.charged[0]
-            probes = [*probes[:own], {**probes[own], "headroom": headroom}, *probes[own + 1:]]
+            stats = compiled_memory(planned.executable)
+            beside = None if stats is None else placed_beside(stats, held_out)
+            probes = [*probes[:own], {**probes[own], "headroom": headroom, "beside": beside},
+                      *probes[own + 1:]]
             memory = memory_record(planned.executable, local_devices(mesh), held_out, fits=True)
             compiled = dataclasses.replace(
                 compiled, plan={**plan, "probes": probes, "placed": {"headroom": headroom, "held": held_out}},
@@ -914,13 +920,6 @@ class StepCompiler[L, E]:
         kept = planned.released()
         return dataclasses.replace(compiled, step=self.runner(stepping, kept, settings.device_mesh),
                                    planned=kept)
-
-    def holds_unplaced(self, batch: Batch, shape: RunShape) -> bool:
-        """Whether a fresh run's first step was planned over `batch`'s shapes before its state was placed
-        (`planned_unplaced`), the plan its first compile takes, and under the run's `shape` as it stands:
-        a plan made before the run decided how its batches are cut (a ramp's, each batch read whole) is no
-        plan of its step."""
-        return self._unplaced is not None and self._unplaced.signature == planned_over(batch, shape)
 
     def anew(self) -> StepCompiler[L, E]:
         """A compiler of this one's objective, links, step compiled ahead and pass counts, nothing planned:
@@ -935,7 +934,7 @@ class StepCompiler[L, E]:
         return None if self._unplaced is None else self._unplaced.planned
 
     def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
-                         unplaced: int) -> None:
+                         unplaced: int) -> Hashable:
         """A fresh run's first step planned and compiled over `state`, its shapes, before the `unplaced`
         bytes a device holds of it are placed, so the step compiles while the run's start builds the state
         (`Trainer._opened`), not after it: each candidate is judged on the devices' free bytes in all beside
@@ -946,13 +945,18 @@ class StepCompiler[L, E]:
         does not fit the placed devices, or none fitted before the state was placed, that compile plans once
         the state is placed, from the plan's rung and split (`_plans`), not from the ladder's foot, its
         search finding the executables this one compiled, which the process holds
-        (`dew.nn.kernels.options.held`)."""
+        (`dew.nn.kernels.options.held`). What it searched over (`planned_over`), its plan held or none
+        found, which the fit searching it keeps (`FitRun.searched`): no fit searches it twice before placing
+        its state."""
+        signature = planned_over(batch, stepping.shape)
         try:
             planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced)
         except PlanRefused as refused:
             _log.info("the step fits no plan before its state is placed, planned once it is: %s", refused)
-            return
-        self._unplaced = Unplaced(planned_over(batch, stepping.shape), planned, compiled, keep)
+            self._unplaced = None
+            return signature
+        self._unplaced = Unplaced(signature, planned, compiled, keep)
+        return signature
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
              trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:

@@ -54,15 +54,19 @@ def assert_sharded(tree, mesh: jax.sharding.Mesh) -> None:
     assert not missing, f"no parameter is split over {sorted(missing)}, so this mesh runs as data parallelism"
 
 
-def collectives(text: str) -> list[tuple[str, list[tuple[int, ...]]]]:
-    """`(op, result shapes)` of every collective in compiled HLO `text`, read by the profiler's own
-    parser (`hlo_instructions`): an async pair once, by its `-done`, which holds what moved."""
+def collectives(text: str | jax.stages.Compiled) -> list[tuple[str, list[tuple[int, ...]]]]:
+    """`(op, result shapes)` of every collective in compiled HLO `text` (or a compiled executable's module,
+    `collective_axes`), read by the profiler's own parser (`hlo_instructions`): an async pair once, by its
+    `-done`, which holds what moved."""
     return [(kind, list(instruction.shapes)) for instruction in hlo_instructions(text).values()
             if (kind := collective(instruction.op)) and not instruction.op.endswith("-start")]
 
 
-def collective_axes(text: str, mesh: jax.sharding.Mesh) -> set[tuple[str, frozenset[str]]]:
-    """`(op, axes)` of every collective in compiled HLO `text` over `mesh`: the axes along which
+def collective_axes(text: str | jax.stages.Compiled, mesh: jax.sharding.Mesh
+                    ) -> set[tuple[str, frozenset[str]]]:
+    """`(op, axes)` of every collective in compiled HLO `text` (or a compiled executable's module, read
+    without printing it: XLA prints attributes its parser refuses, an all-reduce-start's
+    `output_to_operand_aliasing`) over `mesh`: the axes along which
     the devices of one of its groups (`HloInstruction.groups`) differ, each group's positions read
     in the program's device assignment, `mesh`'s devices in order. An async pair once, by its
     `-start`, which holds the groups."""
@@ -77,8 +81,9 @@ def collective_axes(text: str, mesh: jax.sharding.Mesh) -> set[tuple[str, frozen
     return found
 
 
-def collective_bytes(text: str, ops) -> int:
-    """Bytes of the results of every collective among `ops` in compiled HLO `text`, as XLA sizes
+def collective_bytes(text: str | jax.stages.Compiled, ops) -> int:
+    """Bytes of the results of every collective among `ops` in compiled HLO `text` (or a compiled
+    executable's module, `collective_axes`), as XLA sizes
     them (`HloInstruction.buffers`): a measure no combining of collectives into one, or flattening
     of their operands, changes."""
     return sum(sum(instruction.buffers) for instruction in hlo_instructions(text).values()
@@ -265,7 +270,9 @@ def assert_kernel_runs_per_shard(choice: str, kernel: str, shard: Shard) -> None
     named = {name for spec in jax.tree.leaves(specs, is_leaf=lambda leaf: isinstance(leaf, PartitionSpec))
              for axes in spec if axes is not None for name in ((axes,) if isinstance(axes, str) else axes)}
     assert shard.split in named and mesh.shape[shard.split] > 1, (shard.split, sorted(named), mesh.shape)
-    target = (generation.assumed(shard.target, interpreted=True) if jax.default_backend() == "cpu"
+    from generation_support import here
+
+    target = (generation.assumed(shard.target, interpreted=True) if here() == "cpu"
               else contextlib.nullcontext())
     with target, generation.chosen(**{choice: kernel}), shard.context():
         with generation.routes() as routes:
