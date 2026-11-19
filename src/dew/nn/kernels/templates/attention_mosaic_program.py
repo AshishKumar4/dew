@@ -2026,11 +2026,11 @@ class ForwardRegisters:
             positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started))
 
 
-
 def value_columns(padded: int, columns: int | None) -> int:
-    """The value columns a launch emits for a padded value width `padded` and optional block cap `columns`:
-    `columns` capped at `padded` so slicing, resource planning and register sizing agree on oversized pins."""
+    """The value columns a launch emits for padded width `padded` and optional block cap `columns`:
+    capped at `padded` so slicing, resource planning and register sizing agree on oversized pins."""
     return min(columns, padded) if columns else padded
+
 
 def prologue_registers(family: mosaic.Family, block_q: int, width: int, dtype, hook: Callable,
                        kinds: tuple[Kind, ...], dtypes: tuple[str, ...]) -> int:
