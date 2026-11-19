@@ -406,6 +406,25 @@ def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
     assert row["exitCode"] == 0, row["output"]
 
 
+def test_a_tasks_pytest_keeps_its_temp_dirs_under_a_root_of_its_own(ci, tmp_path, tmp_path_factory):
+    """A task's pytest takes its temp directories under a root no other process on the node shares, gone once
+    it exits: pytest's default root is one per user, and one process's exit, pruning it, raced another's
+    `pytest-current` link (row 8298: a green GPU file red in pytest's atexit cleanup)."""
+    (tmp_path / "tests/test_temp.py").write_text(
+        "from pathlib import Path\n"
+        "def test_temp(tmp_path):\n"
+        "    Path('temp.txt').write_text(str(tmp_path))\n")
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    ci.task("3.12", ["tests/test_temp.py"], "", out, 600.0)
+    [row] = json.loads(out.read_text())["rows"]
+    assert row["exitCode"] == 0, row["output"]
+    used = Path((tmp_path / "temp.txt").read_text())
+    # This process's root: its base temp's parent is pytest's per-user directory under it.
+    assert not used.is_relative_to(tmp_path_factory.getbasetemp().parent.parent)
+    assert not used.exists()
+
+
 def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_every_test_deselected(
         ci, tmp_path):
     """Every requested file is accounted for by its tests' rows, or by its collection: one whose every

@@ -137,6 +137,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -1624,15 +1625,18 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     aside = out.with_name(f"{out.name}.set-aside.json")
     aside.write_text(json.dumps(sorted(done_before)))
     command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
-    environment = session.pytest_environment({**environ, **site_environment(site),
-                                              "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
-                                              "DEW_UNRECORDED": str(unrecorded), "DEW_PYTEST_PID": str(pid),
-                                              "DEW_STACKS_READER": str(os.getpid()),
-                                              **({progress.SET_ASIDE: str(aside)} if resumes else {})})
-    if network:
-        environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
-        command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
+    # Its own temp root (row 8298): pytest's default, /tmp/pytest-of-<user>, is one per node, and a process's
+    # exit, pruning it, resolves the `pytest-current` link another process is replacing.
+    with tempfile.TemporaryDirectory(prefix="pytest-root-", ignore_cleanup_errors=True) as root:
+        environment = session.pytest_environment({
+            **environ, **site_environment(site), "DEW_EXECUTED_LOG": str(log),
+            "DEW_COLLECTED": str(collection), "DEW_UNRECORDED": str(unrecorded), "DEW_PYTEST_PID": str(pid),
+            "DEW_STACKS_READER": str(os.getpid()), "PYTEST_DEBUG_TEMPROOT": root,
+            **({progress.SET_ASIDE: str(aside)} if resumes else {})})
+        if network:
+            environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
+        returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
+            command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
     # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
     peaks = [found for found in (progress.task_peak(host), peak_before) if found is not None]
     peak = max(peaks, default=None)
