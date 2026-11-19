@@ -2340,19 +2340,16 @@ def lazy_margin(spec: Forward, weights, bound: float = 1.0) -> float | None:
 
 def lazy_anchor(margin: float | None, binade: float = 1.0) -> Callable | None:
     """The walk's anchor (`forms.step`'s `anchor`): a row's maximum kept unless the tile's passes it by more
-    than `margin` (`lazy_margin`), then the tile's; past it by more than `FAR_BINADES` (in the walk's units,
-    a `binade` each), the tile's less the margin, its factor never below the one a walk anchored at every
-    larger maximum takes (whose last is within the margin of the kept one): moved to the tile's, tiles at 0,
-    22 and 105 nats took e^-105 at once, which flushed sums an anchor at 22 keeps (the base review of
-    13eba49bd, F1). None where the walk anchors at every larger maximum."""
+    than `margin` (`lazy_margin`), then the tile's, or past `FAR_BINADES` (a `binade` each in the walk's
+    units) the tile's less the margin, its factor never below an every-maximum walk's (tiles at 0, 22 and
+    105 nats took e^-105 at once, flushing what an anchor at 22 keeps, the base review of 13eba49bd, F1)."""
     if margin is None:
         return None
     gap, far = np.float32(margin), np.float32(FAR_BINADES * binade)
 
     # Each distance exact where they are close (Sterbenz): the kept one plus the margin rounded at 2^29 (an
     # fp16 raw fold's, scale 0.24) up to a maximum 64 past it, past a margin of 43.3, so the anchor stayed
-    # and weighed e^15.4, fp16's infinity (the base review of a71e85d7a, F2). Where the margin rounds off a
-    # far tile's maximum, the maximum.
+    # and weighed e^15.4, fp16's infinity (the base review of a71e85d7a, F2); where it rounds, the maximum.
     def anchor(kept, exact):
         below = exact - gap
         moved = jnp.where((exact - kept > far) & (exact - below <= gap), below, exact)
@@ -2362,8 +2359,7 @@ def lazy_anchor(margin: float | None, binade: float = 1.0) -> Callable | None:
 
 
 FAR_BINADES = 64
-"""The binades past which a lazy walk's anchor moves to a tile's maximum less its margin (`lazy_anchor`): a
-factor of a move within them is a normal number."""
+"""The binades past which a lazy anchor moves below a tile's maximum (`lazy_anchor`), a nearer one normal."""
 
 
 def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
