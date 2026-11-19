@@ -885,7 +885,7 @@ def test_a_token_loops_states_are_kept_each_token(apart):
     c, k, v = 16, 32, 64
     work = linear_scan._work(linear_scan.Chunk.plain(linear_scan.Chunk.token("U")),
                              linear_scan.Extents(c, k, v, 1, apart=apart), lambda value: (0, 0), None)
-    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * cost.LANE_BYTES * k * v
+    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * 4 * k * v
 
 
 def test_device_memory_is_priced_at_the_parts_measured_stream():
