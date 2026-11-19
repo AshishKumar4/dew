@@ -13,8 +13,8 @@ from model_support import TINY_DECODER
 from test_compile_ahead import BATCH, SEQ_LEN, TINY_SHARD, VOCAB, gpus
 from token_support import token_rows
 
-from dew import models
 from dew.objectives.lm import LMObjective
+from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 
 
