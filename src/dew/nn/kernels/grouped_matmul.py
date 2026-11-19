@@ -45,6 +45,7 @@ from .grouped_cells import (
     M_EM_52,
     M_EM_65,
     M_EM_67,
+    M_EM_73,
     MEASURED,
     NORMED_08B,
     NORMED_4B_8B,
@@ -1944,6 +1945,7 @@ DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str
         (XLA, "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
         (XLA, "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, together=True)): (MOSAIC, M_EM_73),
     ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 9216))): (
         MOSAIC, f"{M_EM_36}: the template 0.866x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(9216, 2560))): (
@@ -2035,8 +2037,12 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
                                           for timed in MEASURED.get((family, made, formed), ()))
 
     formed = options['hooks'].prologue is not None and timed(formed=True)
+    # Products side by side or chained are one launch's, a cell of their own whatever their first matrix.
+    together = any(bound.arguments.get('beside') or bound.arguments.get('chained')
+                   for _, bound in call.bound.values())
     kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered,
-                matrix=matrix if formed or timed(formed=False) else None, formed=formed)
+                matrix=None if together or not (formed or timed(formed=False)) else matrix, formed=formed,
+                together=together)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
@@ -2075,24 +2081,32 @@ def _rows_of(launches, arguments) -> int:
     return (arguments[7] if len(arguments) > 7 and arguments[7] is not None else arguments[0]).shape[0]
 
 
-def launched(launches, arguments, options, *, product: Product, whole: bool):
+def launched(launches, arguments, options, *, product: Product, whole: bool,
+             selected: generation.Route | None = None):
     """The launch of `launches` that runs the call (`arguments`, `options`) as `GROUPED` selects it,
     ready to call, `APART` where a paired call's products run apart, or None where XLA's program takes it:
     on the call's target, a CPU process's own (whose
     kernels run nowhere, so XLA's program takes every call and a kernel `generation.chosen` names raises)
-    or the GPU it states (`generation.assumed`). Every branch insists on a named kernel."""
+    or the GPU it states (`generation.assumed`). Every branch insists on a named kernel. `selected`, the
+    route a caller's own selection of this call found unreported (a reverse pass's one launch for several
+    products, `gemm._one_launch`): taken and reported as it is, the call selected once (row 8735)."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
-    route = selection.select(GROUPED, case)
+    if selected is None:
+        route = selection.select(GROUPED, case)
+    else:
+        route = selected
+        generation.reported((route,))
     if route.kernel in ('xla', APART.name):
         return None if route.kernel == 'xla' else APART
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)
 
 
 def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
-             paired: jax.Array | None = None, first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, joined: jax.Array | None = None, beside: tuple = (),
-             chained: tuple = (), *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool,
-             promoted: bool = False, dense: bool = False) -> tuple:
+             paired: jax.Array | jax.ShapeDtypeStruct | None = None, first: jax.Array | None = None,
+             gather: jax.Array | None = None, scatter: jax.Array | None = None,
+             joined: jax.Array | None = None, beside: tuple = (), chained: tuple = (), *, out_dtype,
+             trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
+             dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` times its matrix of `kernel`,
     both of one dtype, with the template's hooks (`gemm.gemm`). `promoted`,
     the declared product's (`templates.product.Product`), adds each depth step's partial apart
