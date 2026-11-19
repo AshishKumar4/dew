@@ -94,9 +94,11 @@ FP32_SEEDS = 8
 
 
 def kernel_conv(x, weights, activation, shift, *, valid, segments, parts, dtype):
+    from generation_support import interprets
+
     return short_conv.conv(x, weights, shift, None if valid is None else valid.astype(jnp.int8), segments,
                            parts, activation=activation, eps=1e-6, dtype=jnp.dtype(dtype),
-                           interpret=jax.default_backend() != "gpu")
+                           interpret=interprets())
 
 
 TANGENT_SEEDS = 8

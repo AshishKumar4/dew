@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import interprets
 from reference_error import assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import (
     CASES,
@@ -27,7 +28,7 @@ from dew.nn.kernels.templates import (
     attention_triton,
 )
 
-ON_GPU = jax.default_backend() == "gpu"
+ON_GPU = not interprets()
 SEEDS = 8
 """The forward's declared draws (check 1), sized by `seeds_for`."""
 
@@ -113,7 +114,7 @@ def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> te
         (template.Param(slopes, template.Kind.HEAD),) if "alibi" in names else (),
         template.sinks(SINKS, ROWS, queries, value_width) if "sinks" in names else None,
         output_mod if "gate" in names else None,
-        (template.Param(gate, template.Kind.OUTPUT),) if "gate" in names else ())
+        (template.Param(jnp.asarray(gate), template.Kind.OUTPUT),) if "gate" in names else ())
 
 
 HOOKS = {"none": frozenset(), "softcap": frozenset({"softcap"}), "sinks": frozenset({"sinks"}),
