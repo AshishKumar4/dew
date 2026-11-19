@@ -742,13 +742,16 @@ def raised(bits: jax.Array, power: int, dtype=jnp.float32) -> jax.Array:
     sign = bits & jnp.uint32(0x80000000)
     rebased = bits + jnp.uint32(power << 23)
     normal = jax.lax.bitcast_convert_type(rebased, jnp.float32)
-    if jnp.finfo(dtype).bits > 32:
-        fraction = (rebased & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** -149, dtype)
+    # Formed in float32 at least, cast once: a narrower format holds neither the fraction field (to 2^23)
+    # nor its power (row 8660's head review: a float16 restore of the half code overflowed its fraction).
+    wide = jnp.promote_types(dtype, jnp.float32)
+    if jnp.finfo(wide).bits > 32:
+        fraction = (rebased & jnp.uint32(0x7FFFFF)).astype(wide) * jnp.asarray(2.0 ** -149, wide)
         tiny = jnp.where(rebased >> jnp.uint32(31) != 0, -fraction, fraction)
-        normal = jnp.where(rebased & jnp.uint32(0x7F800000) == 0, tiny, normal.astype(dtype))
-    mantissa = (bits & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** (power - 149), dtype)
+        normal = jnp.where(rebased & jnp.uint32(0x7F800000) == 0, tiny, normal.astype(wide))
+    mantissa = (bits & jnp.uint32(0x7FFFFF)).astype(wide) * jnp.asarray(2.0 ** (power - 149), wide)
     subnormal = jnp.where(sign != 0, -mantissa, mantissa)
-    return jnp.where(bits & jnp.uint32(0x7F800000) == 0, subnormal, normal)
+    return jnp.where(bits & jnp.uint32(0x7F800000) == 0, subnormal, normal).astype(dtype)
 
 
 def scales_decoded(codes: jax.Array) -> jax.Array:

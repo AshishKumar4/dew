@@ -1100,8 +1100,9 @@ def test_a_parts_units_are_priced_at_the_clock_it_holds_under_load():
     # The CUDA cores, the special-function units and shared memory: the clock's alone.
     again = cost.rates(restated, device=False)
     assert (loaded.cuda, loaded.special, loaded.shared) == (again.cuda, again.special, again.shared)
-    assert all(rate < boosted for rate, boosted in zip(loaded[:6], stated[:6], strict=True)
-               if rate is not None)
+    clocked = ("tensor", "tf32", "eight", "cuda", "special", "shared")
+    assert all(getattr(loaded, unit) < getattr(stated, unit) for unit in clocked
+               if getattr(loaded, unit) is not None)
     assert unmeasured.loaded_clock_hz == unmeasured.clock_hz
     assert cost.rates(b200, device=True).device == cost.rates(unmeasured, device=True).device
 
