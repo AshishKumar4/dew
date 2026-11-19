@@ -33,7 +33,7 @@ import functools
 import math
 import os
 from collections.abc import Callable, Hashable, Sequence
-from typing import Literal, overload
+from typing import Literal, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -1717,26 +1717,18 @@ def _binades(x: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
     """The sum of `terms` in float32 or float64 (their widest, at least float32), each the broadcast product
-    of its factors, summed over `axis` of each product too where given (kept): every product formed as its
-    factors' significands' (each below two) times a power of two, aligned to its band's largest binade
-    before the sum and scaled back after in steps each within float32's normal exponents, so a sum in range
-    is its value though its terms leave float32's range: entry writes of keys of +-2^60 and values of 2^-20
-    under a weight of 2^100, each term 2^140 and their sum zero, where summed as formed it was inf - inf,
-    NaN (base review ead11c83a F1). A product a term at a time (`twice_scaled`) holds each term's range, not
-    a sum's. Summed band by band (`_banded`), each band's products within float32's exponent range of its
-    largest and the next band's those below it, so terms that cancel leave the ones far below them: aligned
-    to the largest alone, a unit below two cancelling terms of 2^127 was dropped before they cancelled, zero
-    (base review 224fcf53a F1). Its error bound is Sum2's (Ogita, Rump and Oishi) over the products as
-    formed (each product's significands rounded twice): their twice-precise sum rounded once, `u |s| + g^2
-    sum |t|` for `u` 2^-24 and `g = n u / (1 - n u)` over `n` terms, a product dropped only below the dtype's
-    least subnormal; so terms cancelling past twice float32's precision (a condition number past 2^48) are
-    not summed exactly (Main's ruling on base review f5e6e678d F1, 2^80 + 2^50 + 1 - 2^50 - 1 - 2^80). Its
-    tangent is its terms' own, each factor's direction times its term's other factors, and each factor's
-    gradient the cotangent times its terms' other factors, each summed aligned as its value is
-    (`_aligned_directions`): its bits carry none, so differentiated as formed every factor's was zero, and
-    summed plainly a cancelling entry write's terms of 2^160 were inf - inf (row 8501). A factor several terms
-    share (one array: an entry write's weight) is one factor, its gradient one aligned sum over them.
-    Elementwise and over a 2-D array's axes, so a Pallas TPU kernel forms it in place."""
+    of its factors, summed over `axis` of each product too where given (kept): the exact sum of the exact
+    products, rounded once to nearest, ties to even (`_exact_sum`), so a sum in range is its value though its
+    terms leave float32's range and cancel: entry writes of keys of +-2^60 and values of 2^-20 under a weight
+    of 2^100, each term 2^140 and their sum zero, where summed as formed it was inf - inf, NaN (base review
+    ead11c83a F1), and no order of terms that cancel drops a smaller one, as floats summed did, each sum
+    rounding (base reviews 224fcf53a to af2cca564, row 8757). A product a term at a time (`twice_scaled`)
+    holds each term's range, not a sum's. Its tangent is its terms' own, each factor's direction times its
+    term's other factors, and each factor's gradient the cotangent times its terms' other factors, each summed
+    aligned as its value is (`_aligned_directions`): its bits carry none, so differentiated as formed every
+    factor's was zero, and summed plainly a cancelling entry write's terms of 2^160 were inf - inf (row 8501).
+    A factor several terms share (one array: an entry write's weight) is one factor, its gradient one aligned
+    sum over them. Elementwise and over a 2-D array's axes, so a Pallas TPU kernel forms it in place."""
     return _aligned_terms(terms, ((axis, None),) * len(terms))
 
 
@@ -1764,153 +1756,174 @@ def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) ->
 
 
 def _aligned_value(shape: tuple[tuple[int, ...], ...], spec: tuple, *flat: jax.Array) -> jax.Array:
-    """`_aligned_terms` of its terms' factors in a row (`_regrouped`): held scaled (`_scaled_sum`), then
-    scaled back once."""
-    dtype, factors = flat[0].dtype, max(map(len, shape))
-    return _raised(*_scaled_sum(_regrouped(shape, flat), spec, dtype), dtype, factors)
+    """`_aligned_terms` of its terms' factors in a row (`_regrouped`), summed exactly (`_exact_sum`)."""
+    return _exact_sum(_regrouped(shape, flat), spec, flat[0].dtype)
 
 
-def _scaled_sum(terms, spec, dtype) -> tuple[jax.Array, jax.Array]:
-    """The aligned sum of `terms` (each its factors) held scaled, its sum and that sum's binade: each term's
-    product (its factors' significands times a power of two) summed over `axis` in its own shape band by
-    band (`_banded`), every band's pair at its binade, then all of them summed band by band (`_merged`). A
-    term reduced against a shared top broadcast to the value's shape was laid along another term's axis
-    (base review db30f3e80 F2)."""
-    factors, shaped = max(map(len, terms)), {}
-    for term, (axis, laid) in zip(terms, spec, strict=True):
-        significand, exponent = _binades(term[0])
-        for factor in term[1:]:
-            more, power = _binades(factor)
-            significand, exponent = significand * more, exponent + power
-        shaped.setdefault((significand.shape, axis, laid), []).append((significand, exponent))
-    totals = []
-    # The products of one shape and spec banded together, each reduced in that shape, then laid.
-    for (_, axis, laid), products in shaped.items():
-        parts = products if axis is None else [
-            (part, power + top) for pair, top in _banded(products, axis, dtype, factors)
-            for part, power in map(_binades, pair)]
-        totals.extend(parts if laid is None else [
-            tuple(jnp.broadcast_to(x, laid[0]).reshape(laid[1]) for x in part) for part in parts])
-    return _merged(totals, dtype, factors)
+class _Summands(NamedTuple):
+    """A term's products as exact integer summands: each a whole significand `mantissa` (at most `bits`
+    bits, nonnegative) at the bit place `place` (its lowest bit's power of two), negative where
+    `negative`, the term's space's shape; `reduced` takes an array of that shape to the sum's value."""
+
+    mantissa: jax.Array
+    place: jax.Array
+    negative: jax.Array
+    reduced: Callable[[jax.Array], jax.Array]
+    count: int
 
 
-def _merged(totals, dtype, factors: int) -> tuple[jax.Array, jax.Array]:
-    """`aligned_sum`'s bands' pairs (`totals`, each part a significand and binary exponent) summed: the
-    largest band of them (`_band`) summed as a pair, which joins those it left in the next, so a lower
-    band's total stays until the higher ones cancel (aligned at once, 2^-100 was dropped before 2^25 and
-    -2^25 cancelled, base review f5e6e678d F1), as many bands as `_banded` spans (each one at least a band
-    below the one before, or its pair joining the next); the sum rounded once and its binade."""
-    held = [significand != 0 for significand, _ in totals]
-    pair, top, taken = _band(totals, held, None, dtype)
-    for _ in range(min(len(totals), _bands(dtype, factors)) - 1):
-        held = [kept & ~took for kept, took in zip(held, taken[-len(totals):], strict=True)]
-        carried = [(significand, exponent + top) for significand, exponent in map(_binades, pair)]
-        pair, top, taken = _band(carried + totals, [significand != 0 for significand, _ in carried] + held,
-                                 None, dtype)
-    return pair[0] + pair[1], top
+def _summands(term: Sequence[jax.Array], axis, laid, ints) -> tuple[list[_Summands], jax.Array, jax.Array]:
+    """`term`'s product as exact integer summands (`_Summands`), and the product as IEEE forms it where a
+    factor is not finite (zero elsewhere) and whether one is: each factor's significand an integer of the
+    dtype's significand bits at its lowest bit's place, split in halves, and each product of two halves,
+    at most the full significand's bits, split again as the next factor multiplies it, so `k` factors make
+    `4^(k-1)` summands and no product's bit is rounded away."""
+    limits = jnp.finfo(term[0].dtype)
+    half, top = -(-(limits.nmant + 1) // 2), 2 * limits.maxexp - 1
+    # Read from the bits, as every reading here is: a process flushing subnormals (XLA's CPU) compares one
+    # equal to zero.
+    special = functools.reduce(jnp.logical_or, [float_bits(factor)[1] == top for factor in term])
+    plainly = jnp.where(special, functools.reduce(jnp.multiply, term), 0)
+    low = (1 << half) - 1
+    parts = []
+    for factor in term:
+        sign, biased, fraction, normalized, exponent = float_bits(factor)
+        zero = special | ((biased == 0) & (fraction == 0))
+        mantissa = jnp.where(zero, 0, normalized | (1 << limits.nmant)).astype(ints)
+        place, negative = (exponent - limits.nmant).astype(ints), sign != 0
+        if not parts:
+            parts = [(mantissa, place, negative)]
+            continue
+        # Each summand's halves times the factor's, each product of halves its significand's bits at most.
+        parts = [(piece * other, at + shift + place + other_shift, sign_ ^ negative)
+                 for whole, at, sign_ in parts
+                 for piece, shift in ((whole >> half, half), (whole & low, 0))
+                 for other, other_shift in ((mantissa >> half, half), (mantissa & low, 0))]
+    shape = jnp.broadcast_shapes(*(np.shape(mantissa) for mantissa, _, _ in parts))
+    if laid is None:
+        axes = () if axis is None else tuple(sorted({int(a) % len(shape) for a in np.atleast_1d(axis)}))
+
+        def reduced(x):
+            return jnp.sum(x, axis=axes, keepdims=True) if axes else x
+    else:
+        axes = () if axis is None else tuple(np.atleast_1d(axis))
+        held, out = laid
+
+        def reduced(x):
+            return jnp.broadcast_to(jnp.sum(x, axis=axes, keepdims=True) if axes else x, held).reshape(out)
+    count = math.prod(shape[a] for a in axes)
+    return ([_Summands(*(jnp.broadcast_to(x, shape) for x in part), reduced, count) for part in parts],
+            reduced(plainly), reduced(special.astype(ints)) > 0)
 
 
-def _band_width(dtype) -> int:
-    """The binades an `aligned_sum` band spans below its largest product: a significand's every bit then
-    lies at or above the dtype's least normal once scaled, so no sum within the band is subnormal, which a
-    process flushing subnormals (XLA's CPU) would zero (102 for float32)."""
+def _exact_sum(terms, spec, dtype) -> jax.Array:
+    """The sum `_aligned_terms` states, exact: every product an exact sum of integer summands
+    (`_summands`), each summand's bits summed as whole digits of a radix-`2^w` grid from below the least
+    bit any product of the terms' factors holds to above the most (`_digits`, no digit's sum past the
+    integers' range: `w` the integers' bits less two and the bits of the summands a value sums), the digits
+    carried into one nonnegative number and its sign, rounded once to nearest, ties to even, every bit below
+    the rounding place its sticky bit (`_nearest`). So it is the sum correctly rounded whatever its terms
+    cancel: prior bases summed floats, each sum rounding, and some order of terms cancelling past float32's
+    precision lost a smaller one, `[2^153, 2^128, -2^103, -2^128, 2^103, -2^153, fp32's largest]` inf where
+    its sum is the largest (base review af2cca564 F1, row 8757). A non-finite factor's product summed as
+    IEEE sums it (inf - inf NaN), and a sum of negative zeros negative zero."""
     limits = jnp.finfo(dtype)
-    return -limits.minexp - limits.nmant - 1
+    ints = jnp.dtype(f"int{limits.bits}")
+    factors = max(map(len, terms))
+    placed, plain, special = [], 0, False
+    for term, (axis, laid) in zip(terms, spec, strict=True):
+        summands, plainly, any_special = _summands(term, axis, laid, ints)
+        placed += summands
+        plain, special = plain + plainly, special | any_special
+    count = sum(summand.count for summand in placed)
+    if count >= 1 << (limits.bits - 8):
+        raise ValueError(f"an aligned sum of {count} summands a value past its digits' range (2^"
+                         f"{limits.bits - 8})")
+    digit = limits.bits - 2 - max(1, count.bit_length())
+    lowest = factors * (limits.minexp - 2 * limits.nmant)
+    highest = factors * (limits.maxexp + 1) + count.bit_length() + 2
+    levels = -(-(highest - lowest) // digit)
+    sums = _digits(placed, lowest, digit, levels, ints)
+    exact = _nearest(sums, lowest, digit, limits)
+    negative_zero = functools.reduce(jnp.logical_and, [
+        s.reduced(((s.mantissa == 0) & s.negative).astype(ints)) == s.count for s in placed])
+    exact = jnp.where(negative_zero & (exact == 0), -jnp.zeros_like(exact), exact)
+    return jnp.where(special, jnp.asarray(plain, dtype), exact).astype(dtype)
 
 
-def _kept_sum(pairs, axis) -> tuple[jax.Array, jax.Array]:
-    """The sum of `(high, low)` pairs, each over `axis` first where given (kept), as a pair: each addition's
-    rounding kept in the low part (`two_sum`), an axis summed in halves (`_halved_over`), so the pair rounded
-    once is the sum's twice-precise value rounded (Ogita, Rump and Oishi's Sum2): a band's sum rounded alone
-    lost what a lower band's cancelled, -2^25 - 2 tied to -2^25 beside 2^25 (base review 644ef5535 F1)."""
-    (high, low), *rest = (_halved_over(pair, axis) for pair in pairs)
-    for part_high, part_low in rest:
-        high, dropped = two_sum(high, part_high)
-        low = low + part_low + dropped
-    return high, low
+def _digits(placed: list[_Summands], lowest: int, digit: int, levels: int, ints) -> jax.Array:
+    """The summands' signed sums at each of `levels` digits of `digit` bits from bit `lowest` up, `[levels,
+    *value]`: a digit's sum the sum of each summand's bits there, a whole number below `2^digit` each, so
+    the sum is exact in any order (a mesh's split axis summed shard by shard, a kernel's tile at once)."""
+    bits = jnp.iinfo(ints).bits
 
+    def level(index):
+        low = lowest + index * digit
+        total = 0
+        for summand in placed:
+            shift = low - summand.place
+            right = (summand.mantissa >> jnp.clip(shift, 0, bits - 1)) & ((1 << digit) - 1)
+            kept = summand.mantissa & ((1 << jnp.clip(digit + shift, 0, bits - 1)) - 1)
+            left = kept << jnp.clip(-shift, 0, bits - 1)
+            # A summand's bits at the digit: shifted down from above it, or its low bits up into it.
+            taken = jnp.where(shift >= 0, jnp.where(shift < bits - 1, right, 0),
+                              jnp.where(digit + shift > 0, left, 0))
+            total = total + summand.reduced(jnp.where(summand.negative, -taken, taken))
+        return jnp.asarray(total, ints)
 
-def _halved_over(pair, axis) -> tuple[jax.Array, jax.Array]:
-    """A `(high, low)` pair summed over `axis` (kept; none where None), each addition's rounding kept in the
-    low part: one XLA reduction of pairs (`_renormalized`), which partitions as any reduction does, so an
-    axis a mesh shards is summed a shard at a time and then across (sliced in halves, its shards split at
-    a size their count does not divide, base review 9e56c760b F1), an empty axis its identity; in a launch's
-    body (`launches.interpreting` not None), compiled or interpreted alike, in halves (`two_sum`),
-    elementwise and slices alone, which a Pallas TPU kernel forms (base review 8d59803fd F3)."""
     from dew.nn.kernels.launches import interpreting
 
-    high, low = pair
-    axes = () if axis is None else tuple(sorted({int(a) % high.ndim for a in np.atleast_1d(axis)}))
-    if axes and interpreting() is None:
-        zero = jnp.zeros((), high.dtype)
-        high, low = jax.lax.reduce((high, low), (zero, zero), _renormalized, axes)
-        return jnp.expand_dims(high, axes), jnp.expand_dims(low, axes)
-    for along in axes:
-        if high.shape[along] == 0:
-            high, low = (jnp.zeros((*x.shape[:along], 1, *x.shape[along + 1:]), x.dtype) for x in (high, low))
-        while high.shape[along] > 1:
-            size, half = high.shape[along], high.shape[along] // 2
-            first, second = ([jax.lax.slice_in_dim(x, start, start + half, axis=along) for x in (high, low)]
-                             for start in (0, half))
-            summed, dropped = two_sum(first[0], second[0])
-            halves = (summed, first[1] + second[1] + dropped)
-            # An odd size's last element waits for the next halving; an even size leaves no tail, whose empty
-            # slice Mosaic refuses (a vector of no rows, base review 68c63603f F1).
-            high, low = halves if size % 2 == 0 else (
-                jnp.concatenate([part, jax.lax.slice_in_dim(x, 2 * half, size, axis=along)], axis=along)
-                for part, x in zip(halves, (high, low), strict=True))
-    return high, low
+    if interpreting() is not None:
+        # A kernel's body: its levels written out, a loop's stacked carries left to XLA's path.
+        return jnp.stack([level(index) for index in range(levels)])
+    return jax.lax.map(level, jnp.arange(levels, dtype=ints))
 
 
-def _band(products, held, axis, dtype):
-    """One band of `aligned_sum`'s `products` (each a significand and binary exponent): of those `held`, each
-    within `_band_width` binades of their largest's (`top`, per element of the value reduced over `axis`,
-    zero where none is held) scaled to it and summed (`_kept_sum`, over `axis` too); returns the sum's pair,
-    `top` and which products it took."""
-    width = _band_width(dtype)
-    top = functools.reduce(jnp.maximum, [
-        jnp.where(kept, exponent, -jnp.inf) if axis is None
-        else jnp.max(jnp.where(kept, exponent, -jnp.inf), axis=axis, keepdims=True, initial=-jnp.inf)
-        for kept, (_, exponent) in zip(held, products, strict=True)])
-    top = jnp.where(jnp.isfinite(top), top, 0.0)
-    taken = [kept & (exponent - top >= -width) for kept, (_, exponent) in zip(held, products, strict=True)]
-    scaled = [jnp.where(took, significand * _power_of_two(jnp.clip(exponent - top, -width, 0.0), dtype), 0.0)
-              for took, (significand, exponent) in zip(taken, products, strict=True)]
-    return _kept_sum([(x, jnp.zeros_like(x)) for x in scaled], axis), top, taken
+def _nearest(sums: jax.Array, lowest: int, digit: int, limits) -> jax.Array:
+    """The number the digits' signed sums `sums` (`_digits`, the lowest digit at bit `lowest`) make, carried
+    into nonnegative digits below `2^digit` and a sign, as the nearest float, ties to even: its leading bit,
+    the dtype's significand's bits from it (none below the least subnormal's), two more, and a sticky bit of
+    every one below, rounded in integers and written as the float's bits, so a process flushing subnormals
+    (XLA's CPU) writes a subnormal sum, and one past the largest is infinite."""
+    ints = sums.dtype
+    bits = jnp.iinfo(ints).bits
+    mask = (1 << digit) - 1
 
+    def carried(sums):
+        # Each digit's sum and the carry into it, the carry what passes the digit's bits, up to the last.
+        carry, digits = jnp.zeros_like(sums[0]), []
+        for value in sums:
+            value = value + carry
+            carry = value >> digit
+            digits.append(value & mask)
+        return carry, jnp.stack(digits)
 
-def _banded(products, axis, dtype, factors: int) -> list[tuple[tuple[jax.Array, jax.Array], jax.Array]]:
-    """`aligned_sum`'s products summed band by band (`_band`), each band over those the bands above it left:
-    as many bands as span the largest binade a product of `factors` factors reaches down to below the dtype's
-    least subnormal, so a band whose products cancel leaves the next band's sum, no term dropped beneath it;
-    each band's sum's pair and its top."""
-    held = [significand != 0 for significand, _ in products]
-    bands = []
-    for _ in range(_bands(dtype, factors)):
-        pair, top, taken = _band(products, held, axis, dtype)
-        bands.append((pair, top))
-        held = [kept & ~took for kept, took in zip(held, taken, strict=True)]
-    return bands
-
-
-def _bands(dtype, factors: int) -> int:
-    """The bands that span the largest binade a product of `factors` factors reaches down to below the
-    dtype's least subnormal, each band's top more than its width below the one before's."""
-    limits = jnp.finfo(dtype)
-    span = factors * limits.maxexp - (limits.minexp - limits.nmant - 1)
-    return -(-span // (_band_width(dtype) + 1))
-
-
-def _raised(total, top, dtype, factors: int) -> jax.Array:
-    """`total 2^top` for `top` the binade of a product of up to `factors` factors, by powers of two each
-    within the dtype's normal exponents, as many as reach its largest binade and its least subnormal's."""
-    limits = jnp.finfo(dtype)
-    least, most = limits.minexp, limits.maxexp - 1
-    reach = max(-(-factors * limits.maxexp // most), -(-factors * (limits.nmant - least) // -least))
-    for _ in range(reach):
-        step = jnp.clip(top, least, most)
-        total, top = total * _power_of_two(step, dtype), top - step
-    return total
+    overflow, _ = carried(sums)
+    negative = overflow < 0
+    _, digits = carried(jnp.where(negative, -sums, sums))
+    index = jnp.arange(digits.shape[0], dtype=ints).reshape((-1,) + (1,) * (digits.ndim - 1))
+    length = bits - jax.lax.clz(digits)
+    lead = jnp.max(jnp.where(digits != 0, index * digit + length - 1, -1), axis=0)
+    least = limits.minexp - limits.nmant
+    # The rounding place, two bits below the significand's lowest, relative to the lowest digit's bit.
+    place = jnp.maximum(lowest + lead - limits.nmant, least) - 2 - lowest
+    offset = index * digit - place
+    up = digits << jnp.clip(offset, 0, bits - 1)
+    down = digits >> jnp.clip(-offset, 0, bits - 1)
+    whole = jnp.sum(jnp.where(offset >= 0, up, jnp.where(-offset < digit, down, 0)), axis=0)
+    below = digits & ((1 << jnp.clip(-offset, 0, digit)) - 1)
+    sticky = jnp.any(jnp.where(offset >= 0, 0, jnp.where(-offset < digit, below, digits)) != 0, axis=0)
+    whole = whole | sticky.astype(ints)
+    tail, kept = whole & 3, whole >> 2
+    kept = kept + ((tail > 2) | ((tail == 2) & ((kept & 1) == 1))).astype(ints)
+    # The float's bits: its significand (a carry into the next binade adds its exponent's unit) over its
+    # lowest bit's place above the least subnormal's, infinity's where they pass it.
+    infinite = (2 * limits.maxexp - 1) << limits.nmant
+    field = lowest + place + 2 - least
+    finite = (jnp.clip(field, 0, 2 * limits.maxexp - 3) << limits.nmant) + kept
+    magnitude = jnp.where(lead < 0, 0, jnp.where(field > 2 * limits.maxexp - 3, infinite, finite))
+    signed = jnp.where(negative, magnitude | np.array(-(1 << (bits - 1)), ints), magnitude)
+    return jax.lax.bitcast_convert_type(signed, jnp.dtype(limits.dtype))
 
 
 def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents):
