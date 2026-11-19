@@ -716,7 +716,14 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
     elif (args := get_callable_args(node, Chunk.rows)) is not None:
         value = of(args[1])[:, None] * of(args[0])
     elif (args := get_callable_args(node, Chunk.times)) is not None:
-        value = of(args[0]) * of(args[1])
+        left, right = of(args[0]), of(args[1])
+        # A decay that vanished (a document's start) takes its factor out by select before the product, so
+        # a memory past the largest read before its reset is no 0 times inf, nor its gradient (row 8560).
+        if get_callable_args(args[1], Chunk.decay) is not None:
+            left = jnp.where(right == 0, 0.0, left)
+        elif get_callable_args(args[0], Chunk.decay) is not None:
+            right = jnp.where(left == 0, 0.0, right)
+        value = left * right
     elif (args := get_callable_args(node, Chunk.matmul)) is not None:
         # The chunk's scores (a pairing of its tokens through their decays, not the solve's) applied to its
         # tokens' values is its local readout, `readout_local` (`carry.EMIT_ROLES`), as the hand form's.
