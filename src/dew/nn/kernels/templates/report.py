@@ -1183,13 +1183,27 @@ def xla_compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
     devices = target_devices(lowered)
     if devices is not None and not offline(devices) and at_run_time(lowered):
         raise CompiledOnDevice(lowered)
+    compiled_with = targeted(lowered, options)
+    # Its options as JAX's persistent cache keys its compile by them (tests/cache_keys.py reads them),
+    # written only where the log is read.
+    _log.debug("a compile's options: %s", Said(compiled_with))
     try:
         with compile_slots().held(background=background):
-            return lowered.compile(targeted(lowered, options))
+            return lowered.compile(compiled_with)
     except jax.errors.JaxRuntimeError as error:
         if untuned(error.error_code_string, str(error)):
             raise Untuned(str(error), lowered) from error
         raise
+
+
+class Said:
+    """A compile's options as a log line writes them, made only where the line is written (`str`)."""
+
+    def __init__(self, options: jax.stages.CompilerOptions | None):
+        self.options = options
+
+    def __str__(self) -> str:
+        return json.dumps(sorted((self.options or {}).items()), default=str)
 
 
 CUB_NO_FALLBACK = 3
