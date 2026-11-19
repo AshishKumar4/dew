@@ -516,6 +516,24 @@ def test_a_write_between_two_commits_is_unordered_with_a_read_after_the_first_co
         explore([products, reader], {"A": 1, "B": 1})
 
 
+@pytest.mark.parametrize(("kept", "races"), [(1, False), (2, True)], ids=["derived", "loosened"])
+def test_a_store_wait_retires_whole_groups(kept, races):
+    """A thread storing three chunks through two buffers, a chunk's two copies one group (the second
+    committing it), then rewriting the first buffer after a wait leaving `kept` groups in flight: one left,
+    the first chunk's group has been read and the write is ordered after it; two left, both its copies may
+    still read the buffer, which the checker finds, where counting copies one by one retired them (row
+    ca3f0ad22 F2)."""
+    def chunk(buffer):
+        return [Event("store", ("smem", buffer), argument=commits) for commits in (False, True)]
+
+    program = [*chunk(0), *chunk(1), Event("store_wait", (), kept), Event("write", ("smem", 0))]
+    if races:
+        with pytest.raises(Violation):
+            explore([program], {})
+    else:
+        assert explore([program], {}) > 0
+
+
 def test_a_gathered_load_warp_skipping_its_slots_release_wait_is_caught():
     """The gathered walk's programs with the second load warp's waits for its slots' release left out (the
     waits `Committed.load` makes first, `rings.Ring.free`), the first warp's arrival still in order: its copy

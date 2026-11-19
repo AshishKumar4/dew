@@ -70,7 +70,7 @@ from dew.nn.kernels.templates.rings import (
     released,
     streamed,
 )
-from dew.nn.kernels.templates.stores import output_staging, staged_rows, written
+from dew.nn.kernels.templates.stores import column_chunks, output_staging, staged_chunks, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 if TYPE_CHECKING:
@@ -405,14 +405,6 @@ def loaded(copies, issued: jax.Array | bool = True) -> None:
 
     for _, _, barrier in copies:
         plgpu.barrier_wait(barrier)
-
-
-def column_chunks(value: jax.Array, width: int) -> list[tuple[int, jax.Array]]:
-    """`value` `width` of its columns at a time, each chunk with its first column, the whole where it is no
-    wider: a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
-    if width >= value.shape[-1]:
-        return [(0, value)]
-    return [(first, value[..., first:first + width]) for first in range(0, value.shape[-1], width)]
 
 
 def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, Ref]]:
@@ -2324,18 +2316,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         """Consumer `index`'s `store(output, value, ref, place)` (`persist`'s): its share of each output
         staged in chunks (`output_staging`: two buffers of `staged_columns`, `smems`), written from its
         issuer's layout (`Issuer.written`), and stored by TMA, waiting only for a buffer's last store to read
-        it before it writes it again."""
+        it before it writes it again (`stores.staged_chunks`, `stores.buffer_waits`)."""
         def store(output, value, ref, place):
-            smem = smems[output].at[index]
-            buffers, width = smem.shape[0], smem.shape[-1]
-            row_start, first, stored, column, *ladder = place
-            for chunk, (start, piece) in enumerate(column_chunks(value, width)):
-                if chunk == 0 or chunk >= buffers:
-                    # The buffer's last store (the last tile's, at its first chunk) has read it.
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                buffer = smem.at[chunk % buffers]
-                staged_rows(buffer, piece, ref, row_start, first, stored, column + start, *ladder,
-                            write=self.written)
+            staged_chunks(smems[output].at[index], value, ref, place, write=self.written)
 
         return store
 
