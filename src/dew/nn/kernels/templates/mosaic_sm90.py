@@ -98,19 +98,19 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         plgpu.wgmma(acc, lhs, rhs)
         return acc
 
-    def issued_unless(self, idle, acc, issue):
-        # The warpgroup's accumulator its MMAs write in place: issued under a branch on `idle`, its groups
+    def issued_when(self, issuing, acc, issue):
+        # The warpgroup's accumulator its MMAs write in place: issued under a branch on `issuing`, its groups
         # counted either way (`Issuer.settled` waits until at most so many are in flight, which fewer meet); a
         # value (a running sum's, an interpreted walk's) by the issuer's own branch.
         if not (isinstance(acc, state_types.TransformedRef)
                 or isinstance(jax.typeof(acc), state_types.AbstractRef)):
-            return super().issued_unless(idle, acc, issue)
-        @pl.when(~idle)
+            return super().issued_when(issuing, acc, issue)
+
+        @pl.when(issuing)
         def _():
             issue()  # into `acc` in place; its returned ref no branch's value
 
         return acc
-
     def read(self, acc, *, first: int = 0, columns: int | None = None, pending: int = 0) -> jax.Array:
         # A scoped warpgroup accumulator read once at most `pending` of the warpgroup's product groups are in
         # flight (`wgmma_accumulator_load`'s wait), the later ones running on; interpreted, its value.

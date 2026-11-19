@@ -48,13 +48,25 @@ class Rows:
 
 @dataclasses.dataclass(frozen=True)
 class Among:
-    """A step's source chosen at run time among several arrays' views (`which`, traced, the index of the one
-    a tile reads: a launch's column tile among matrices side by side, `mosaic_gpu.Beside`): `viewed` takes
-    each source's tile at the step's indices, and a ring's load copies the chosen one's alone (`Ring.copy`),
-    one copy a step as any other view's."""
+    """A stream's view whose source is chosen at run time among several arrays' views, standing for the
+    whole view (`viewed`): `which(step)` the index of the one step `step` reads (traced: a launch's column
+    tile among matrices side by side, `mosaic_gpu.Beside`, the same at every step; the product a step of a
+    concatenated contraction falls in, `mosaic_gpu.Chained`), each of `sources` a view `(ref, index_map)` of
+    its own. At a step another source is chosen for, a source's map may give indices past its array: its
+    tile stays address arithmetic, never copied or prefetched (`Chosen`)."""
+
+    which: Callable
+    sources: tuple
+
+
+@dataclasses.dataclass(frozen=True)
+class Chosen:
+    """A step's tile of an `Among` view (`viewed`): `which`, the traced index of the source the step reads,
+    and each source's tile at the step; a ring's load copies the chosen one's alone (`Ring.copy`), one copy a
+    step as any other view's, and a prefetch reads it alone (`prefetch`)."""
 
     which: Any
-    sources: tuple
+    tiles: tuple
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,25 +89,25 @@ class Split:
 
 
 def prefetch(view) -> None:
-    """An L2 prefetch of a step's view (`viewed`, `plgpu.async_prefetch`): an `Among`'s chosen source's
+    """An L2 prefetch of a step's view (`viewed`, `plgpu.async_prefetch`): a `Chosen` tile's chosen source's
     alone, as a ring's load copies it (`Ring.copy`)."""
-    if isinstance(view, Among):
-        for index, source in enumerate(view.sources):
-            pl.when(view.which == index)(functools.partial(prefetch, source))
+    if isinstance(view, Chosen):
+        for index, tile in enumerate(view.tiles):
+            pl.when(view.which == index)(functools.partial(prefetch, tile))
         return
     plgpu.async_prefetch(view)
 
 
-def viewed(view: tuple, block: tuple, step):
+def viewed(view: "Among | tuple", block: tuple, step):
     """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
     `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does; where it gives
     `Rows`, each run's view at its table's entry; where it gives `Paired`, the pair's block (`block` twice
     along its axis) as a `Split`, each CTA's half its own; where `ref` is `Pieces` of refs (an fp32 operand's
     bf16 parts, each its own array's), each one's tile at the indices, its share of the block's rows, in
-    order; where `ref` is `Among` refs, each one's tile at the indices, a load copying the chosen one's."""
+    order; where the view is an `Among`, each source's tile at the step and the one it reads (`Chosen`)."""
+    if isinstance(view, Among):
+        return Chosen(view.which(step), tuple(viewed(source, block, step) for source in view.sources))
     ref, index_map = view
-    if isinstance(ref, Among):
-        return Among(ref.which, tuple(viewed((each, index_map), block, step) for each in ref.sources))
     indices = index_map(step)
     if isinstance(ref, Pieces):
         share = (block[0] // len(ref), *block[1:])
@@ -337,10 +349,10 @@ class Ring:
         """A step copied from `view` into `slot` (its index `opaque`), freed (`free`): `Pieces` each into its
         part of the slot's rows, one arrival each at the slot's load barrier, which takes as many (`ring`'s
         `copies`, a joined pair's every member's, `joined`)."""
-        if isinstance(view, Among):
+        if isinstance(view, Chosen):
             # The chosen source's copy alone, one arrival as any view's.
-            for index, source in enumerate(view.sources):
-                pl.when(view.which == index)(functools.partial(self.copy, slot, source))
+            for index, tile in enumerate(view.tiles):
+                pl.when(view.which == index)(functools.partial(self.copy, slot, tile))
             return
         if not isinstance(view, Pieces):
             plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot],
