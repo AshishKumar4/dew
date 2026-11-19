@@ -529,15 +529,15 @@ def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recu
                     "a turned call's mixed derivative at zero queries", seeds=32, truth_fn=exact)
 
 
-def assert_finite_where_float64_is(operands, seeded) -> None:
-    """`TURNED`'s chunked op over `operands` on the portable math, its output and every gradient under the
+def assert_finite_where_float64_is(operands, seeded, hooks=TURNED) -> None:
+    """`hooks`' chunked op over `operands` on the portable math, its output and every gradient under the
     cotangents `seeded`: finite wherever the recurrence a token at a time's in float64 is a normal float32,
     the leaf named where one is not (a mark's gradient, float0, skipped)."""
-    ours = jax.jit(with_gradients(lambda given: chunk_on('xla', TURNED, given, chunk_size=CHUNK)))(operands,
-                                                                                                    seeded)
+    ours = jax.jit(with_gradients(lambda given: chunk_on('xla', hooks, given, chunk_size=CHUNK)))(operands,
+                                                                                                   seeded)
     with jax.enable_x64(new_val=True), on_float64_device():
-        exact = jax.jit(with_gradients(lambda given: token_by_token(TURNED, given)))(*widened((operands,
-                                                                                               seeded)))
+        exact = jax.jit(with_gradients(lambda given: token_by_token(hooks, given)))(*widened((operands,
+                                                                                              seeded)))
     leaves = jax.tree_util.tree_leaves_with_path(ours)
     for (path, made), truth in zip(leaves, jax.tree.leaves(exact), strict=True):
         if not jnp.issubdtype(made.dtype, jnp.floating):
@@ -564,6 +564,23 @@ def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
     d_out = jnp.zeros_like(operands.value).at[..., :2].set(2.0)
     seeded = (d_out, jnp.zeros_like(operands.state))
     assert_finite_where_float64_is(operands, seeded)
+
+
+@pytest.mark.parametrize('hooks', [*HOOKS, TURNED], ids=str)
+def test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it(hooks):
+    """A one-token call whose token begins a document, its memory entering 2^127 in every entry (discarded),
+    unit queries over every key, zero keys, values, turns and log decays, a unit output cotangent: its output
+    and every gradient finite wherever float64's is a normal float32, on the portable math, where the
+    memory was read, its sum over the keys past float32's largest, before the start took it out, zero times
+    inf (row 8560)."""
+    (operands,) = draw(hooks, packed=False, seed=0, length=1)
+    names = [name for name in ('key', 'value', 'log_decay', 'turn') if getattr(operands, name) is not None]
+    operands = dataclasses.replace(operands, query=jnp.ones_like(operands.query),
+                                   state=jnp.full_like(operands.state, 2.0 ** 127),
+                                   starts=jnp.ones(operands.value.shape[:2], bool),
+                                   **{name: jnp.zeros_like(getattr(operands, name)) for name in names})
+    seeded = (jnp.ones_like(operands.value), jnp.zeros_like(operands.state))
+    assert_finite_where_float64_is(operands, seeded, hooks)
 
 
 def test_a_turned_calls_cotangent_near_the_largest_across_documents_keeps_every_gradient_finite():
