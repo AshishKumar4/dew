@@ -1133,7 +1133,8 @@ def left_at_run(compiled: jax.stages.Compiled) -> bool:
     an executable compiled ahead that its load must not take (`dew.training.ahead.AheadOfTime.at_run`), read
     from each module's instructions as XLA serialized them (`proto_fields`: a module's computations, field
     3, their instructions, 2, each one's custom call target, 28, and backend config, 43)."""
-    for module in compiled.runtime_executable().hlo_modules():
+    executable = compiled.runtime_executable()
+    for module in [] if executable is None else executable.hlo_modules():
         for computation in proto_fields(module.as_serialized_hlo_module_proto()).get(3, []):
             for instruction in proto_fields(computation).get(2, []):
                 fields = proto_fields(instruction)

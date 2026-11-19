@@ -632,7 +632,8 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
             except report.CompiledOnDevice as refused:
                 # Check 1 measures the arms as their GPU compiles them, a choice no compile without it
                 # holds: every arm of the site compiles in its run, as the prepare states (`_stored_arm`).
-                store.compile_site(armed(label), {}, {}, arms=True, at_run=str(refused))
+                store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain), arms=True,
+                                   at_run=str(refused))
 
 
 def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference: bool):
