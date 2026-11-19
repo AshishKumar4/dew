@@ -17,13 +17,13 @@ def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax
     the format's own bias (its encoding of 1.0's), and +0 at `minexp - 1` in a format whose biased exponent 0
     holds its zero (IEEE's binary formats, bfloat16, the float8s): the one owner of an exact power of two. No
     `exp2`, which XLA computes as `exp(n ln 2)` and whose products it fuses into one `exp` of their sum. A
-    sub-byte format (FP6, FP4), whose width no integer holds, takes float32's power cast to it, exactly, its
-    sentinel its own zero."""
+    format whose width no integer holds (FP6) takes float32's power, its sentinel its own zero, cast to it,
+    exactly."""
     limits = jnp.finfo(dtype)
-    if limits.bits not in (8, 16, 32, 64):
+    if not hasattr(jnp, f"int{limits.bits}"):
         n = jnp.asarray(n)
-        power = exact_power2(n, jnp.float32).astype(dtype)
-        return jnp.where(n == limits.minexp - 1, jnp.zeros_like(power), power)
+        power = jnp.where(n == limits.minexp - 1, np.float32(0), exact_power2(n, jnp.float32))
+        return power.astype(dtype)
     word = jnp.dtype(f"int{limits.bits}")
     bias = int(np.asarray(1.0, dtype).view(f"uint{limits.bits}")) >> limits.nmant
     biased = jnp.asarray(n).astype(word) + word.type(bias)
