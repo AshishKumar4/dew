@@ -34,6 +34,7 @@ import numpy as np
 import pytest
 from arm_arithmetic import Truth
 from attention_oracle import exact_attention
+from generation_support import here, interprets
 from reference_error import as_given, assert_as_exact, widened, with_gradients
 
 from dew.nn.documents import CrossDocuments
@@ -52,7 +53,7 @@ PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
 """The Triton mainloop's tiles: a family is a block or less, so one tile walks it, but the equal-weight ones
 over 64 and 256 keys, which walk two and eight."""
 
-INTERPRETED = jax.default_backend() == "cpu"
+INTERPRETED = interprets()
 """Whether the Pallas-Triton mainloop runs interpreted, in a CPU process, or compiled, on a GPU: the A100's
 default for every template call and the H100's for fp16 and the hooks Mosaic refuses, so the GPU tier
 proves on the compiled kernel what the interpreter covers."""
@@ -1044,7 +1045,7 @@ TWO_LAUNCHES = attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=False, family=
 refined D: a hookless fast-form call's in deterministic mode, where its derived one is one launch."""
 
 
-ON_HOPPER = generation.device_generation() == "sm90"
+ON_HOPPER = here() == "sm90"
 """Whether the Mosaic mainloop runs here, compiled on an H100: interpreted, a family takes it 6 to 33 minutes
 on a CPU, past a CI task's time, and the interpreter is coverage, not proof (`test_attention_mosaic`)."""
 
@@ -1485,7 +1486,7 @@ parts, `MosaicForward.parts`); a decode step's alone (`Family.decode_only`) wher
 mainloop."""
 
 
-@pytest.mark.skipif(not INTERPRETED and generation.device_generation() != "sm90",
+@pytest.mark.skipif(not INTERPRETED and here() != "sm90",
                     reason="the template's decode runs on warpgroup MMA's Mosaic mainloop")
 @pytest.mark.parametrize("family", TEMPLATE_DECODED)
 def test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family):
