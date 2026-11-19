@@ -547,7 +547,7 @@ def _start_shapes(start: StartBuild, initializer: Initializer, abstract: TrainSt
 KEPT_STARTS = 4
 """The start builds a process keeps for a refit to read (`start_build`), the latest of them."""
 
-HELD_APART: Parts[TrainState] = Parts(apart, together)
+HELD_APART: Parts[TrainState, TrainState, dict[str, Variables]] = Parts(apart, together)
 """A fresh state's parts as a draw reads them (`dew.objectives.drawn.Parts`): its moving trees and its frozen
 tree, whose leaves may be held arrays its init passes through."""
 
