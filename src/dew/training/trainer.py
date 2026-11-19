@@ -1563,18 +1563,18 @@ class Trainer(Generic[Loss, Effects]):
         beginning where updates do (`window`, `Ramp.stages`)."""
         return DataPartition.of(self.device_mesh, window=self.accumulation)
 
-    def _primed_first(self, run: FitRun, dataset: Loader, position: bytes | None = None) -> Batch:
+    def _primed_first(self, run: FitRun, dataset: Loader, saved: bytes | None = None) -> Batch:
         """The first batch of this process's share of `dataset`'s training stream, its stream kept open with
         its position after it (`FitRun.primed`), which a fresh start's prefetcher hands on as its first
         batch (`_opened`), so the run reads it once (training.md, the batch contract; row 6663); a share
-        that reads none of its own reads its pool's (`first_batch`). A resume's from its saved `position`,
+        that reads none of its own reads its pool's (`first_batch`). A resume's from its `saved` position,
         its plan checked before any batch is read (`restored_or_restarted`; row 9013: the stream was read
         from its start, the replacement plan unchecked)."""
         partition = self._stream_partition()
         stream = dataset.train(partition)
         try:
-            if position is not None and isinstance(stream, Checkpointable):
-                restored_or_restarted(stream, position, resume=self.data_resume, step=run.current)
+            if saved is not None and isinstance(stream, Checkpointable):
+                restored_or_restarted(stream, saved, resume=self.data_resume, step=run.current)
             batch = next(iter(stream), None)
             position = stream.get_state() if isinstance(stream, Checkpointable) else None
         except BaseException:
