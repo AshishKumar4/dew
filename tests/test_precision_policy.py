@@ -1420,21 +1420,35 @@ def test_an_aligned_sums_second_order_keeps_a_lone_parts_sign():
 
 
 def test_an_aligned_sums_tangents_value_and_gradient_keeps_its_joint_tangent():
-    """The tangent along `(0, -2^70, 2^70, 0)` at `(2^70, 2^70, 2^70, 0)` of the value of `aligned_sum([(a,
-    b)])`'s tangent's value-and-gradient: zero, `da vb + a vdb`, the reverse pass's value the joint-tangent
-    map's, whose own tangent is one aligned sum, where an untraced map's parts, rounded apart, added to inf -
-    inf, NaN (row 8757)."""
-    big = jnp.float32(2.0 ** 70)
+    """The tangent along `(0, -2^70, 2^70 (1 + k 2^-23), 0)` at `(2^70, 2^70, 2^70, 0)`, `k` drawn from 0
+    to 8, of the value of `aligned_sum([(a, b)])`'s tangent's value-and-gradient, `da vb + vda b`: `k 2^117`,
+    its two products each 2^140 past float32's largest, cancelling exactly at `k` zero, held by check 1
+    against the formula in float64 rounded once (exact, so Dew must be) where an untraced map's parts, rounded
+    apart, added to inf - inf, NaN (rows 8757, 8975)."""
+    from arm_forms import as_given
+
+    big = 2.0 ** 70
+
+    def draw(seed):
+        k = np.random.default_rng([8975, seed]).integers(0, 9)
+        point, direction = (big, big, big, 0.0), (0.0, -big, big * (1 + k * 2.0 ** -23), 0.0)
+        return tuple(np.float32(x) for x in (*point, *direction))
 
     def tangent(a, b, da, db):
         return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (a, b), (da, db))[1]
 
-    def value(a, b, da, db):
-        return jax.value_and_grad(tangent)(a, b, da, db)[0]
+    def ours(*inputs):
+        def value(*point):
+            return jax.value_and_grad(tangent)(*point)[0]
 
-    point = (big, big, big, jnp.float32(0.0))
-    direction = (jnp.float32(0.0), -big, big, jnp.float32(0.0))
-    assert float(jax.jvp(value, point, direction)[1]) == 0.0
+        return jax.jvp(value, inputs[:4], inputs[4:])[1]
+
+    def formula(a, b, da, db, va, vb, vda, vdb):
+        return vda * b + da * vb + va * db + a * vdb
+
+    rounded = as_given(lambda *inputs: np.float32(formula(*(np.float64(x) for x in inputs))))
+    assert_as_exact(jax.jit(ours), rounded, draw, "an aligned sum's tangent's value and gradient", seeds=8,
+                    truth_fn=jax.jit(formula))
 
 
 def test_an_aligned_sums_tangent_pulls_back_inside_its_sum():

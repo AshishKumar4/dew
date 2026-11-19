@@ -43,6 +43,7 @@ from jax.core import ShapedArray
 from jax.extend import core
 from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
+from numpy.lib.array_utils import normalize_axis_tuple
 
 from dew.nn.derivatives import (
     Protected,
@@ -1714,24 +1715,14 @@ def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Arr
         shape.append(tuple(indices))
     from dew.nn.kernels.launches import interpreting
 
-    # Each term's axes checked and made one sorted tuple of nonnegative axes once, for the value and its
-    # transpose alike (row 8837).
-    spec = tuple((_axes(axis, max(map(np.ndim, term))), laid)
-                 for term, (axis, laid) in zip(terms, spec, strict=True))
+    # Each term's axes checked and made one sorted tuple of nonnegative axes once, as numpy normalizes them
+    # (an AxisError, a ValueError, for one out of range or repeated), for its value and transpose alike
+    # (rows 8837, 8974).
+    ranks = [max(map(np.ndim, term)) for term in terms]
+    spec = tuple((axis if axis is None else tuple(sorted(normalize_axis_tuple(axis, rank))), laid)
+                 for rank, (axis, laid) in zip(ranks, spec, strict=True))
     # A compiled kernel's body bare, as Mosaic lowers no symbolic zeros' rule; an interpreted one declared.
     return (_aligned_value if interpreting() is False else _aligned)(tuple(shape), spec, *factors)
-
-
-def _axes(axis, rank: int) -> tuple[int, ...] | None:
-    """`axis` of a term of `rank` as sorted nonnegative axes, None for none; a ValueError for one out of
-    range or repeated, as `jnp.sum`'s: wrapped by the rank, a third axis of a matrix reduced its first (row
-    8837)."""
-    if axis is None:
-        return None
-    given = [int(a) for a in np.atleast_1d(axis)]
-    if any(not -rank <= a < rank for a in given) or len({a % rank for a in given}) < len(given):
-        raise ValueError(f"an aligned sum's axis {axis} is out of range or repeated in a term of rank {rank}")
-    return tuple(sorted(a % rank for a in given))
 
 
 def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
