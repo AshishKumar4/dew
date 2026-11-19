@@ -1441,13 +1441,11 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
     clock whether it closes its update window (`closes_window`). A batch of every row, read whole on
     each process, is `DataPartition()`'s."""
     from dew.data.dataset import DataPartition
-    from dew.distributed.batches import split_fields
-    from dew.training._fit import closes_window
+    from dew.training._fit import handed
     from dew.training.distributed import marked
 
     partition = DataPartition.of(trainer.device_mesh) if partition is None else partition
-    device, _ = split_fields(marked(partition, trainer._counted_batch)(batch))
-    return closes_window(device, trainer._shape.examples)
+    return handed(marked(partition, trainer._counted_batch)(batch), trainer._shape.examples)
 
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool = False,
