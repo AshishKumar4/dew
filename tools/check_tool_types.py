@@ -261,7 +261,9 @@ def checked(environment: Path, paths: list[Path]) -> dict[Path, list[str]]:
     configuration = {**{name: value for name, value in configuration.items() if name != "include"},
                      "venvPath": str(environment.parent), "venv": environment.name,
                      "stubPath": str(ROOT / configuration["stubPath"]),
-                     "extraPaths": [str(ROOT / path) for path in configuration.get("extraPaths", [])],
+                     # The checkout first: read in place, the configuration's own directory is the root
+                     # `import tools.x` resolves from; this one is read from beside the environment.
+                     "extraPaths": [str(ROOT), *(str(ROOT / path) for path in configuration["extraPaths"])],
                      "executionEnvironments": [
                          {**each, "root": str(ROOT / each["root"]),
                           "extraPaths": [str(ROOT / path) for path in each.get("extraPaths", [])]}
