@@ -14,7 +14,9 @@ warpgroup product (`wgmma`, reading shared memory until `wgmma_wait` retires it)
 (`tcgen05_mma`, until its thread's next commit completes), a shared-memory read or write (`get`, `swap`),
 and an inlined body's (`inline_mgpu`, lane-level code the jaxpr does not show) as its body's own fields
 state them (`INLINED`: a gathered ring's barriers' arrivals, its parity waits, and each load warp's gathers
-and the first's expecting arrival). Index arithmetic, loops and branches are evaluated concretely per
+and the first's expecting arrival, its step's entries read where the step before filled them, and the next
+step's filled: `fill`, an asynchronous write landing later, `fill_wait` its thread's wait for its fills,
+cp.async's). Index arithmetic, loops and branches are evaluated concretely per
 warpgroup and warp (`axis_index`), so each program is its own fixed sequence of events: no control flow
 reads shared memory a peer writes.
 
@@ -249,18 +251,42 @@ def _slot(ref, treedef, leaves) -> tuple:
 
 
 def _located(ref, transforms) -> tuple:
-    """A ref's location through `transforms`: the ref and its leading index where it is one value (a ring's
-    slot, or a one-entry slice of its leading axis: a gathered ring's slot mbarrier, `gathered.Ring`), else
-    the ref whole."""
+    """A ref's location through `transforms`: the ref and each leading index that is one value, in order (a
+    ring's slot; a consumer's staging buffer and its chunk's buffer within it, `stores.staged_chunks`; a
+    one-entry slice of an axis, which keeps it, last: a gathered ring's slot mbarrier, `gathered.Ring`), else
+    the ref whole. Two locations share memory where one's indices are a prefix of the other's (`_overlaps`):
+    a consumer's two chunk buffers, keyed by its own index alone, read as one buffer, so its double-buffered
+    stores raced (base review f86cb5b03's witness at 128 x 256)."""
+    found = []
+
+    def whole(index, extent) -> bool:
+        return (hasattr(index, "start") and index.start is not None and int(np.asarray(index.start)) == 0
+                and index.size == extent)
+
     for transform in transforms or ():
-        indices = getattr(transform, "indices", None)
-        if indices:
-            first = indices[0]
-            if hasattr(first, "start") and first.size == 1 and first.start is not None:
-                return (ref.name, int(np.asarray(first.start)))
-            if not hasattr(first, "start") and first is not None:
-                return (ref.name, int(np.asarray(first)))
-    return (ref.name, None)
+        if getattr(transform, "indices", None) is None:
+            # A transform that moves axes (a transpose, a reshape): later indices are not the base's
+            # coordinates, so the location stops at the prefix known (base review 2e4651b2e F3). A tiling's,
+            # a swizzle's or a bitcast's changes the trailing axes alone, the leading ones indexed as before.
+            if hasattr(transform, "permutation") or "reshape" in type(transform).__name__.lower():
+                return (ref.name, *found) if found else (ref.name, None)
+            continue
+        indices, shape = transform.indices, getattr(transform, "shape", None)
+        for axis, index in enumerate(indices):
+            if index is None:
+                return (ref.name, *found) if found else (ref.name, None)
+            if not hasattr(index, "start"):
+                found.append(int(np.asarray(index)))
+                continue
+            # A slice: the axes from it on whole, the next transform indexes them; else its one entry, if it
+            # takes one, the location's last.
+            if shape is not None and all(whole(rest, shape[at])
+                                         for at, rest in enumerate(indices) if at >= axis):
+                break
+            if index.size == 1 and index.start is not None:
+                found.append(int(np.asarray(index.start)))
+            return (ref.name, *found) if found else (ref.name, None)
+    return (ref.name, *found) if found else (ref.name, None)
 
 
 def _governing(value, what: str):
@@ -404,32 +430,58 @@ def _waited(self: _Interpreter, body: gathered.Waited, values, located) -> None:
 def _gathers(self: _Interpreter, body: gathered.Gathers, values, located) -> None:
     """A load warp's gathers of a step (`gathered.Gathers`): the first warp's arrival expecting every tile's
     copy, and a copy of each tile the warp issues into its part of the slot, each completing its bytes at
-    the slot's barrier."""
-    _, _, slot, barrier, _ = located
+    the slot's barrier; read a step ahead (`body.ahead`), its tiles' entries read from the entries' parity
+    the step before filled, once its fills are awaited (`gathered.Held.awaited`), a warp's fills an
+    asynchronous write of its own; a tile's first step fills its own entries first (`gathered.Held.awaited`);
+    the next step's fill is the load's next body (`_filled`).
+    The warp's lanes are its one program: the body's warp syncs, which make a lane's fill seen by the
+    others, are its own statement, not an event."""
+    _, _, slot, barrier, _, *ahead = located
     # The slot's tiles: its leading axis as its allocation stages it (`swizzling.swizzle_transforms`'
     # `TILE_ROWS`-row tiles), the memref's the body reads.
     tiles = values[2].shape[1]
     if body.expects:
         self.emit("expect", barrier, tiles)
+    if body.ahead:
+        entries = ahead[0]
+        parity, held = (int(np.asarray(_governing(value, "an entry's parity"))) for value in ahead[1:])
+        # A warp's fills of a step are one cp.async group, awaited together: one write of its parity's
+        # entries, its tiles' all (each warp's its own rows: `gathered.Gathers.tiles`).
+        warp = body.share[0]
+        if not held:
+            self.emit("fill", (entries[0], parity, warp))
+        self.emit("fill_wait")
+        # A read of entries a fill must have written: no fill ordered before it is a read of nothing.
+        self.emit("read", (entries[0], parity, warp), "filled")
     for tile in body.tiles(tiles):
         self.emit("copy", (*slot, tile), barrier)
 
 
+def _filled(self: _Interpreter, body: gathered.Filled, values, located) -> None:
+    """A load warp's fill of its next step's entries (`gathered.Filled`, where the walk has a next step):
+    one asynchronous write of the parity it fills, its tiles' all, a cp.async group the next step awaits."""
+    entries, _, parity = located
+    self.emit("fill", (entries[0], int(np.asarray(_governing(parity, "an entry's parity"))), body.share[0]))
+
+
 INLINED: dict[type, Callable] = {gathered.Initialized: _initialized, gathered.Waited: _waited,
-                                 gathered.Gathers: _gathers}
+                                 gathered.Gathers: _gathers, gathered.Filled: _filled}
 """Each inlined body a checked kernel takes (`plgpu.inline_mgpu`'s function, by its type), as the `Event`s
 its fields and its operands state: the arrivals a phase of the barriers a gathered ring initializes, its
 parity waits at a turn's rotation, and its load warps' gathers. A body of no synchronization (a fence, a
 register form) takes a reader that emits nothing, its reason beside it; one of no type here is refused."""
 
 
-def programs(kernel: Callable, *operands, threads: int) -> tuple[list[list[Event]], dict[str, int]]:
-    """Each program of `kernel` (a Mosaic GPU launch the toolkit built, `mosaic.kernel`) over `operands`, of
-    its `threads` warpgroups: a warpgroup's events, or where it runs warp roles, each of its warps' in turn
-    (`_Interpreter.programs`), by warpgroup index; and each barrier's arrivals a phase, by name: a barrier
-    allocation's, or a shared `uint64`'s its inlined initialization states (`gathered.Initialized`)."""
+def programs(kernel: Callable, *operands, threads: int, launch: int = 0
+             ) -> tuple[list[list[Event]], dict[str, int]]:
+    """Each program of `kernel`'s `launch`-th Mosaic GPU launch (one the toolkit built, `mosaic.kernel`, in
+    the order its trace makes them: a chained input gradient's flagged walk, then its bounded one) over
+    `operands`, of its `threads` warpgroups: a warpgroup's events, or where it runs warp roles, each of its
+    warps' in turn (`_Interpreter.programs`), by warpgroup index; and each barrier's arrivals a phase, by
+    name: a barrier allocation's, or a shared `uint64`'s its inlined initialization states
+    (`gathered.Initialized`)."""
     closed = jax.make_jaxpr(kernel)(*operands)
-    body = _body(closed.jaxpr)
+    body = list(_bodies(closed.jaxpr))[launch]
     found, arrivals = [], {}
     for thread in range(threads):
         interpreter = _Interpreter(thread)
@@ -441,27 +493,26 @@ def programs(kernel: Callable, *operands, threads: int) -> tuple[list[list[Event
     return found, arrivals
 
 
-def _body(jaxpr: jcore.Jaxpr) -> jcore.ClosedJaxpr:
-    """The kernel body's jaxpr inside a traced launch: the per-program jaxpr of its `mpmd_map`."""
+def _bodies(jaxpr: jcore.Jaxpr) -> Iterator[jcore.ClosedJaxpr]:
+    """The kernel bodies' jaxprs inside a traced program, in its order: each `mpmd_map`'s per-program
+    jaxpr."""
     for equation in jaxpr.eqns:
         if equation.primitive.name == "mpmd_map":
             (inner,) = equation.params["jaxprs"]
-            return inner if isinstance(inner, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(inner, ())
+            yield inner if isinstance(inner, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(inner, ())
+            continue
         for value in equation.params.values():
             for inner in value if isinstance(value, (tuple, list)) else (value,):
                 nested = inner.jaxpr if isinstance(inner, jcore.ClosedJaxpr) else inner
                 if isinstance(nested, jcore.Jaxpr):
-                    try:
-                        return _body(nested)
-                    except LookupError:
-                        continue
-    raise LookupError("no Mosaic GPU kernel body in the traced launch")
+                    yield from _bodies(nested)
 
 
 @dataclasses.dataclass
 class Violation(AssertionError):
     """A property the exploration found broken: its class (`kind`: "deadlock", "unfinished" phase,
-    "unobserved" phase, "aliased" parity, "early" arrival, "unordered" access, "unfenced" store, "bounds"),
+    "unobserved" phase, "aliased" parity, "early" arrival, "unordered" access, "unfenced" store, "bounds",
+    an "unwritten" entries' read),
     what broke (`what`), and the
     interleaving reaching it (`trace`, each move a thread's index and its event's place, or a landing)."""
 
@@ -677,6 +728,12 @@ class _State:
             made.flight = self.flight | {(thread, self.positions[thread], event.argument)}
         elif event.kind == "committed":
             made.flight = self.flight | {(thread, self.positions[thread], event.at)}
+        elif event.kind == "fill":
+            # A thread's asynchronous write (cp.async's), no barrier's: it lands later, `fill_wait` its wait.
+            made.flight = self.flight | {(thread, self.positions[thread], None)}
+        elif event.kind == "fill_wait" and any(issuer == thread and barrier is None
+                                                for issuer, _, barrier in self.flight):
+            return None
         return made
 
     def check(self, awaited, trace) -> None:
@@ -733,6 +790,7 @@ class _Order:
         self.issued: dict = {}
         self.committed: list = [[] for _ in threads]
         self.committing: dict = {}
+        self.fills: dict = {}
 
     def arrived(self, at, clock, *, counted: bool, transaction: int) -> None:
         joined, count, flying = self.accumulating.get(at, ({}, 0, 0))
@@ -781,7 +839,9 @@ class _Order:
             return
         self.ordered(event.at, landing, event, write=True)
         self.writes.append((event.at, landing, event))
-        if event.argument:
+        if event.kind == "fill":
+            self.fills.setdefault(thread, []).append(landing)
+        elif event.argument:
             self.arrived(event.argument, landing, counted=False, transaction=-1)
 
     def moved(self, thread, position, event) -> None:
@@ -794,11 +854,20 @@ class _Order:
             self.arrived(event.at, clock, counted=True, transaction=0)
         elif kind == "expect":
             self.arrived(event.at, clock, counted=True, transaction=event.argument)
-        elif kind in ("load", "copy"):
+        elif kind == "fill_wait":
+            # Its fills landed (`_State.step` holds it till then): each landing before it.
+            for landing in self.fills.pop(thread, ()):
+                clock = _joined(clock, landing)
+            self.clocks[thread] = clock
+        elif kind in ("load", "copy", "fill"):
             self.issued[(thread, position)] = dict(clock)
             if event.argument and kind == "load":
                 self.arrived(event.argument, clock, counted=True, transaction=1)
         elif kind in ("read", "write"):
+            if kind == "read" and event.argument == "filled" and not any(
+                    where == event.at and _before(prior, clock) for where, prior, _ in self.writes):
+                raise Violation("unwritten", f"read of {event.at}, which no fill ordered before it wrote",
+                                [(thread, event)])
             self.ordered(event.at, clock, event, write=kind == "write")
             (self.writes if kind == "write" else self.reads).append((event.at, dict(clock), event))
             if kind == "write":

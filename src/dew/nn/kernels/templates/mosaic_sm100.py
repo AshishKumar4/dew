@@ -311,7 +311,8 @@ class PairedRing(CommittedRing):
 
     topology: Topology = PAIRED
 
-    def load(self, turn: rings.Turn, view) -> None:
+    def load(self, turn: rings.Turn, view, ahead: rings.Ahead | None = None) -> None:
+        del ahead  # A pair's rows are a tile's own, read by no table (`rings.reads_ahead`).
         if not isinstance(view, rings.Split):
             raise ValueError(f"a pair's step is the pair's block (`rings.Paired` indices), not {view}")
         slot = rings.opaque(turn.slot)
@@ -558,6 +559,22 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, released,
                           accumulate=acc.accumulate if accumulate else False, **self.topology.issued())
         return dataclasses.replace(acc, accumulate=True)
+
+    def issued_when(self, issuing, acc, issue):
+        # Tensor memory its products write in place: issued under a branch on `issuing`, `acc` as it was (its
+        # `accumulate` the walk's); a value (an interpreted walk's) by the issuer's own branch.
+        if not isinstance(acc, Accumulator):
+            return super().issued_when(issuing, acc, issue)
+
+        @pl.when(issuing)
+        def _():
+            issue()  # into tensor memory in place; its returned accumulator no branch's value
+
+        return acc
+
+    def added_onto(self, acc, adds):
+        # A sum's first step overwrites tensor memory (`accumulate` false), as a walk's first step does.
+        return dataclasses.replace(acc, accumulate=adds) if isinstance(acc, Accumulator) else acc
 
     def scaled_products(self, acc: Accumulator, lhs, rhs, scales: tuple) -> Accumulator:
         """`products` of block-scaled operands (an MX product's: each 32 depths of `lhs`'s rows and `rhs`'s

@@ -73,8 +73,9 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
             def schedule(index):
                 tile = index[0]
                 steps = _at(tile, tiles)
-                source = rings.Among(tile % 2, (x_gmem, x_gmem)) if among else x_gmem
-                views = {name: (source, lambda step: (_at(tile, starts) + step, 0)) for name in names}
+                view = (x_gmem, lambda step: (_at(tile, starts) + step, 0))
+                source = rings.Among(lambda step: tile % 2, (view, view)) if among else view
+                views = dict.fromkeys(names, source)
                 return (steps > 0) | empty_active, steps, views, tile
 
             def issue(wg, tile, walk, *, active):
@@ -532,6 +533,56 @@ def test_a_store_wait_retires_whole_groups(kept, races):
             explore([program], {})
     else:
         assert explore([program], {}) > 0
+
+
+def test_the_load_warps_read_each_steps_entries_a_step_ahead():
+    """The gathered walk's load warps (`gathered.Held`): at each step but a tile's last, every loader fills
+    the next step's entries of its own tiles into the parity its counter's next takes, after its gathers;
+    at each step it awaits its fills (`fill_wait`) and reads its tiles' entries from the parity they were
+    filled into, before its gathers, a tile's first step filling its own first."""
+    steps = 3
+    threads, _ = gathered_walk(2, (steps,))
+    loaders = [program for program in threads if any(event.kind == "copy" for event in program)]
+    for program in loaders:
+        kinds = [event.kind for event in program if event.kind in ("fill", "fill_wait", "read", "copy")]
+        tiles = sum(kind == "copy" for kind in kinds) // steps
+        step = ["copy"] * tiles
+        assert kinds == ["fill", "fill_wait", "read", *step, "fill",
+                         "fill_wait", "read", *step, "fill",
+                         "fill_wait", "read", *step], kinds
+        fills = [event.at[1] for event in program if event.kind == "fill"]
+        reads = [event.at[1] for event in program if event.kind == "read"]
+        assert fills == reads and fills[0] != fills[1], (fills, reads)
+
+
+def test_a_load_warp_reading_its_entries_before_their_fills_land_is_caught():
+    """The gathered walk's programs with a load warp's waits for its entries' fills left out (`fill_wait`,
+    cp.async's wait for its group): its read of a step's entries may come before the fill the step before
+    issued lands, which the explorer finds."""
+    threads, arrivals = gathered_walk(1, (3,))
+    [at, *_] = [index for index, program in enumerate(threads)
+                if any(event.kind == "fill" for event in program)]
+    mutated = [*threads]
+    mutated[at] = [event for event in threads[at] if event.kind != "fill_wait"]
+    assert len(mutated[at]) < len(threads[at])
+    with pytest.raises(Violation):
+        explore(mutated, arrivals)
+
+
+def test_a_load_warp_reading_entries_no_fill_wrote_is_caught():
+    """The gathered walk's programs with a load warp's fill of its next step's entries left out (the fill
+    `gathered.Held.copied_ahead` issues after a step's gathers): the next step reads the other parity's
+    entries, which no fill wrote, and the explorer refuses it ("unwritten"), where a read was ordered only
+    against writes and passed a parity never filled (base review ae8a242ed F3)."""
+    threads, arrivals = gathered_walk(1, (3,))
+    [at, *_] = [index for index, program in enumerate(threads)
+                if any(event.kind == "fill" for event in program)]
+    fills = [position for position, event in enumerate(threads[at]) if event.kind == "fill"]
+    mutated = [*threads]
+    mutated[at] = [event for position, event in enumerate(threads[at]) if position != fills[1]]
+    with pytest.raises(Violation) as found:
+        explore(mutated, arrivals)
+    assert found.value.kind == "unwritten"
 
 
 def test_a_gathered_load_warp_skipping_its_slots_release_wait_is_caught():

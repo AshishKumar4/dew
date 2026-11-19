@@ -48,13 +48,25 @@ class Rows:
 
 @dataclasses.dataclass(frozen=True)
 class Among:
-    """A step's source chosen at run time among several arrays' views (`which`, traced, the index of the one
-    a tile reads: a launch's column tile among matrices side by side, `mosaic_gpu.Beside`): `viewed` takes
-    each source's tile at the step's indices, and a ring's load copies the chosen one's alone (`Ring.copy`),
-    one copy a step as any other view's."""
+    """A stream's view whose source is chosen at run time among several arrays' views, standing for the
+    whole view (`viewed`): `which(step)` the index of the one step `step` reads (traced: a launch's column
+    tile among matrices side by side, `mosaic_gpu.Beside`, the same at every step; the product a step of a
+    concatenated contraction falls in, `mosaic_gpu.Chained`), each of `sources` a view `(ref, index_map)` of
+    its own. At a step another source is chosen for, a source's map may give indices past its array: its
+    tile stays address arithmetic, never copied or prefetched (`Chosen`)."""
+
+    which: Callable
+    sources: tuple
+
+
+@dataclasses.dataclass(frozen=True)
+class Chosen:
+    """A step's tile of an `Among` view (`viewed`): `which`, the traced index of the source the step reads,
+    and each source's tile at the step; a ring's load copies the chosen one's alone (`Ring.copy`), one copy a
+    step as any other view's, and a prefetch reads it alone (`prefetch`)."""
 
     which: Any
-    sources: tuple
+    tiles: tuple
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,25 +89,25 @@ class Split:
 
 
 def prefetch(view) -> None:
-    """An L2 prefetch of a step's view (`viewed`, `plgpu.async_prefetch`): an `Among`'s chosen source's
+    """An L2 prefetch of a step's view (`viewed`, `plgpu.async_prefetch`): a `Chosen` tile's chosen source's
     alone, as a ring's load copies it (`Ring.copy`)."""
-    if isinstance(view, Among):
-        for index, source in enumerate(view.sources):
-            pl.when(view.which == index)(functools.partial(prefetch, source))
+    if isinstance(view, Chosen):
+        for index, tile in enumerate(view.tiles):
+            pl.when(view.which == index)(functools.partial(prefetch, tile))
         return
     plgpu.async_prefetch(view)
 
 
-def viewed(view: tuple, block: tuple, step):
+def viewed(view: "Among | tuple", block: tuple, step):
     """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
     `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does; where it gives
     `Rows`, each run's view at its table's entry; where it gives `Paired`, the pair's block (`block` twice
     along its axis) as a `Split`, each CTA's half its own; where `ref` is `Pieces` of refs (an fp32 operand's
     bf16 parts, each its own array's), each one's tile at the indices, its share of the block's rows, in
-    order; where `ref` is `Among` refs, each one's tile at the indices, a load copying the chosen one's."""
+    order; where the view is an `Among`, each source's tile at the step and the one it reads (`Chosen`)."""
+    if isinstance(view, Among):
+        return Chosen(view.which(step), tuple(viewed(source, block, step) for source in view.sources))
     ref, index_map = view
-    if isinstance(ref, Among):
-        return Among(ref.which, tuple(viewed((each, index_map), block, step) for each in ref.sources))
     indices = index_map(step)
     if isinstance(ref, Pieces):
         share = (block[0] // len(ref), *block[1:])
@@ -129,20 +141,43 @@ def held_together(rings: dict) -> list[dict]:
     return groups
 
 
-def stepped_in(rings: dict, turn_of: Callable, view_of: Callable) -> None:
-    """A step's loads into `rings` (`turn_of(key, ring)` its turn, `view_of(key, ring)` its source), a barrier
+@dataclasses.dataclass(frozen=True)
+class Ahead:
+    """The next step's view of a ring whose views read memory to address a step (a `Rows` table's entries:
+    `reads_ahead`), handed to its load (`Ring.load`'s `ahead`) so it reads those of the next step under this
+    one's copies (`gathered.Committed`): `view` the next step's, resolved by the load that reads it ahead
+    (a call: an ordinary ring, which reads no step ahead, never resolves it, so no step past the walk's last
+    is addressed, base review 103007773 F1), `live` whether the walk has that step, and `held` whether this
+    step's own were read at the step before (not a walk's first step)."""
+
+    view: Callable[[], Any]
+    live: Any
+    held: Any
+
+
+def reads_ahead(indices) -> bool:
+    """Whether a stream's step `indices` (its view's index map's at the step) read memory to address it: a
+    table's (`Rows`), whose entries its load reads at the step before (`Ahead`)."""
+    return isinstance(indices, Rows)
+
+
+def stepped_in(rings: dict, turn_of: Callable, view_of: Callable, ahead_of: Callable | None = None) -> None:
+    """A step's loads into `rings` (`turn_of(key, ring)` its turn, `view_of(key, ring)` its source,
+    `ahead_of(key, ring)` the next step's where its views read memory: `Ahead`, None otherwise), a barrier
     pair at a time (`held_together`, `_loaded`): the one loader a producer's and a loading consumer's walks
     (`fed.Feed`) take."""
     for group in held_together(rings):
-        _loaded(group, turn_of, view_of)
+        _loaded(group, turn_of, view_of, ahead_of)
 
 
-def _loaded(group: dict, turn_of: Callable, view_of: Callable) -> None:
+def _loaded(group: dict, turn_of: Callable, view_of: Callable, ahead_of: Callable | None = None) -> None:
     """A group's step loaded (`held_together`): a ring holding its own pair by its own load (`Ring.load`, a
-    gathered ring's its own copies), a joined pair's slot freed once and each member copied into it."""
+    gathered ring's its own copies, with the next step's view where it reads ahead, `Ahead`), a joined
+    pair's slot freed once and each member copied into it."""
     if len(group) == 1:
         [(key, ring)] = group.items()
-        ring.load(turn_of(key, ring), view_of(key, ring))
+        ahead = None if ahead_of is None else ahead_of(key, ring)
+        ring.load(turn_of(key, ring), view_of(key, ring), ahead)
         return
     key, lead = next(iter(group.items()))
     # One slot for the pair (its rings hold one depth, `joined`), its index formed once (`Ring.load`).
@@ -165,13 +200,28 @@ def _lead(group: dict) -> "Ring":
 
 def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
     """A producer's loads of one persistent tile (`persistent.tiled`'s visit): each of its steps' blocks
-    into its stream's ring at the step the rings are at (`counter`), none where it streams nothing."""
+    into its stream's ring at the step the rings are at (`counter`), none where it streams nothing; a ring
+    whose views read memory to address a step (`reads_ahead`) given the next step's view (`Ahead`), so it
+    reads that step's addresses under this one's copies (an emulated B200's gathered kernel gradient waited
+    805 cycles of its load warps' 1,700-1,900 a step for its table entries, its slot's release 72: em7x-3)."""
     del tile, done
+    walked = jnp.where(active, steps, 0)
 
-    @pl.loop(0, jnp.where(active, steps, 0))
+    @pl.loop(0, walked)
     def _(step):
+        # Each view's index map evaluated once at the step (base review ae8a242ed F5), its view fixed there.
+        fixed = {name: view if not isinstance(view, tuple) else
+                 (view[0], functools.partial(lambda indices, _: indices, view[1](step)))
+                 for name, view in views.items()}
+
+        def ahead(name, ring):
+            view = fixed[name]
+            if not (isinstance(view, tuple) and reads_ahead(view[1](step))):
+                return None
+            return Ahead(functools.partial(ring.viewed, views[name], step + 1), step + 1 < walked, step > 0)
+
         stepped_in(rings, lambda name, ring: ring.turn(counter + step),
-                   lambda name, ring: ring.viewed(views[name], step))
+                   lambda name, ring: ring.viewed(fixed[name], step), ahead)
 
 
 def loaded_once(rings: dict, views: dict) -> None:
@@ -318,11 +368,15 @@ class Ring:
         """Step `step`'s source of the stream's view (`viewed`), as `load` takes it."""
         return viewed(view, self.block, step)
 
-    def load(self, turn: Turn, view) -> None:
+    def load(self, turn: Turn, view, ahead: Ahead | None = None) -> None:
         """The producer's load of `turn`'s step from `view`, once its slot is free (`free`, `copy`): the
         slot's index formed once (`opaque`) for its wait and its copies, as an index each formed apart repeats
         its arithmetic past the barrier (+16 mov, +8 each of four integer ops and a register at an H100's
-        fused dK/dV, 2.9% of its time, M-ET-87)."""
+        fused dK/dV, 2.9% of its time, M-ET-87). A view that reads its addresses (`Rows`, `ahead` the next
+        step's) reads them as it copies: an interpreted walk's pieces, each run's entry read where it is
+        copied; a ring reading a step's addresses under the step before's copies is its own
+        (`gathered.Committed`)."""
+        del ahead
         slot = opaque(turn.slot)
         self.free(turn, slot)
         self.copy(slot, view)
@@ -337,10 +391,10 @@ class Ring:
         """A step copied from `view` into `slot` (its index `opaque`), freed (`free`): `Pieces` each into its
         part of the slot's rows, one arrival each at the slot's load barrier, which takes as many (`ring`'s
         `copies`, a joined pair's every member's, `joined`)."""
-        if isinstance(view, Among):
+        if isinstance(view, Chosen):
             # The chosen source's copy alone, one arrival as any view's.
-            for index, source in enumerate(view.sources):
-                pl.when(view.which == index)(functools.partial(self.copy, slot, source))
+            for index, tile in enumerate(view.tiles):
+                pl.when(view.which == index)(functools.partial(self.copy, slot, tile))
             return
         if not isinstance(view, Pieces):
             plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot],

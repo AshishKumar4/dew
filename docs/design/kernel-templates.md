@@ -361,6 +361,8 @@ A second copy of the algebra written in triton.language is not an acceptable ans
 **Boundary tests.**
 Two measures decide whether a mainloop lands and whether it replaces a route: the accuracy gate (check 1 against float64, and the stability suite), and performance, compute time and peak memory, on the operator rows and the model step. No code-equality or bitwise agreement between implementations is a gate; a bitwise comparison of two mainloops in interpret mode may stay as a cheap debugging aid, never blocking.
 
+The same holds for a launch that joins several products' contractions end to end into one accumulator (`chained.Chained`: a multi-matrix input gradient, row 8282). Its contract is a GEMM's over the joined depth: check 1 against float64, and finiteness wherever float64 and the plain float32 program are finite, which its flagged tiles' bounded replay keeps (`chained.guarded_walk`). It is not each product's float32 sum combined in the plain program's order. A finite cancellation across a product boundary (1, then 2^30, then −2^30) comes out of the one accumulator as it would from a single GEMM over the same depth; that is the reassociation every contraction's walk makes, ruled no defect on 2026-11-19 (base review c3b97e20f F1).
+
 1. **Check 1 per mainloop**, in interpret mode on a CPU and compiled on a GPU, and the stability suite.
 2. **A same-schedule reproducibility test**: in deterministic mode, one mainloop, one schedule, the same bits run to run (determinism, not a comparison of implementations).
 3. **Zero cost, per scoreboard row,** in compute time and peak memory: with no hooks, at a given configuration, the template runs within noise of its named comparator:
