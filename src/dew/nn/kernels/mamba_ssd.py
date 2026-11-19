@@ -273,14 +273,6 @@ class _Passing(_Launch):
         tail = [whole, *([] if seq is None else [pl.BlockSpec((None, padded), lambda i, b, h: (b, 0))])]
         return rows, whole, [(pl.BlockSpec((None, None, padded), lambda i, b, h: (b, h, 0)),) * 2, *tail]
 
-    @staticmethod
-    def _table(states: jax.Array, slots: int, size: int):
-        """A row's head's `[slots, size]` block of a table of memories (`ssd_scan`'s forked `documents`),
-        and its row's `[NC]` slots each chunk takes up and leaves its memory in."""
-        chunks = states.shape[1]
-        return (pl.BlockSpec((None, slots, None, size), lambda i, b, h: (b, 0, h, i)),
-                pl.BlockSpec((None, chunks), lambda i, b, h: (b, 0)))
-
 
 class _StateGradient(_Launch):
     """The state gradients' tiles, the keys' and the queries' (`ChunkStateBwdDb`, `ChunkScanBwdDc`, which
@@ -429,46 +421,16 @@ class ChunkState(_Launch):
         return states, None
 
 
-def _table_read(given_ref, table_ref, slot):
-    """The memory block at one-based table slot `slot` (`recurrence_chunk.table_read`): `given_ref`'s
-    `[S', size]` first, then `table_ref`'s `[held, size]` stored ones (None for none), zero at slot zero."""
-    count = given_ref.shape[0]
-    taken = given_ref[jnp.clip(slot - 1, 0, count - 1)]
-    if table_ref is not None:
-        taken = jnp.where(slot > count, table_ref[jnp.clip(slot - count - 1, 0, table_ref.shape[0] - 1)],
-                          taken)
-    return jnp.where(slot > 0, taken, 0.0)
-
-
-def _state_passing_kernel(states_ref, da_ref, h0_ref, *refs, chunk: int, documents: bool = False,
-                          held: int = 0, entered: bool = False):
+def _state_passing_kernel(states_ref, da_ref, h0_ref, *refs, chunk: int):
     """mamba_ssm's `_state_passing_fwd_kernel` (ssd_state_passing.py:29-87) for one row's head and a
     block of its flattened `[P * N]` state: chunk by chunk, store the state the chunk enters in the
     output's dtype, then decay it by the chunk's total and add the chunk's own write, from zero where
     the chunk ends in another document than its predecessor did. What leaves the last chunk is the
-    final state, fp32. A forked call's (`documents`, `ssd_scan`'s): a chunk whose `load` is past -1 enters
-    that table slot's memory (`given` then the `held` stored, `_table_read`) in place of the carried one,
-    and one whose `store` is past zero leaves its memory in that stored slot (`table`, fp32), which a
-    later chunk takes up; where `entered`, a chunk taking a slot up adds its entry write (`entries`) to
-    the memory it takes."""
-    # A forked call's given memories, loads and stores, its entry writes, and its table of stored memories.
-    forked = table = entries = None
-    if documents:
-        given_ref, loads_ref, stores_ref, *refs = refs
-        entries = refs.pop(0) if entered else None
-        out_ref, final_ref, *stored = refs
-        forked, seq = (given_ref, loads_ref, stores_ref), ()
-        table = stored[0] if held else None
-    else:
-        *seq, out_ref, final_ref = refs
+    final state, fp32."""
+    *seq, out_ref, final_ref = refs
 
     def step(c, carry):
         state, document = carry
-        if forked is not None:
-            given, loads, _ = forked
-            load = loads[c]
-            taken = _table_read(given, table, load)
-            state = jnp.where(load >= 0, taken if entries is None else taken + entries[c], state)
         out_ref[c] = state.astype(out_ref.dtype)
         end = c * chunk + chunk - 1
         scale = jnp.exp(sum(_read(da_ref, end)))
@@ -477,10 +439,6 @@ def _state_passing_kernel(states_ref, da_ref, h0_ref, *refs, chunk: int, documen
             scale = jnp.where(current == document, scale, 0.0)
             document = current
         leaving = scale * state + states_ref[c]
-        if forked is not None and table is not None:
-            store = forked[2][c]
-            at = jnp.maximum(store - 1, 0)
-            table[at] = jnp.where(store > 0, leaving, table[at])
         return leaving, document
 
     final, _ = jax.lax.fori_loop(0, out_ref.shape[0], step, (h0_ref[...], jnp.int32(0)))
@@ -494,34 +452,22 @@ class StatePassing(_Passing):
     NAME = "state_passing"
 
     def _fwd(self, states: jax.Array, da: jax.Array, h0: jax.Array, seq: jax.Array | None, *, chunk: int,
-             dtype: str, interpret: bool, config: Tiles, return_residuals: bool = False,
-             documents: tuple | None = None, held: int = 0):
+             dtype: str, interpret: bool, config: Tiles, return_residuals: bool = False):
         batch, _, heads, flat = states.shape
         size = config.bm
-        # A forked call's table (`given` `[B, S', H, P * N]`, its `loads` and `stores` `[B, NC]`, the entry
-        # writes `[B, NC, H, P * N]` or None), in place of `seq`, and the `held` memories it stores.
         rows, final, inputs = self._blocks(states, da, seq, size)
         out_shape = [jax.ShapeDtypeStruct(states.shape, jnp.dtype(dtype)),
                      jax.ShapeDtypeStruct((batch, heads, flat), jnp.float32)]
-        extra, stored, passed = [], [], ()
-        if documents is not None:
-            passed = tuple(part for part in documents if part is not None)
-            slots, chunked = self._table(states, documents[0].shape[1], size)
-            extra = [slots, chunked, chunked, *([rows] if len(passed) > 3 else [])]
-            if held:
-                stored = [self._table(states, held, size)[0]]
-                out_shape.append(jax.ShapeDtypeStruct((batch, held, heads, flat), jnp.float32))
         outs = launches.pallas_call(
-            functools.partial(_state_passing_kernel, chunk=chunk, documents=documents is not None, held=held,
-                              entered=len(passed) > 3),
+            functools.partial(_state_passing_kernel, chunk=chunk),
             grid=(flat // size, batch, heads),
-            in_specs=[rows, *inputs, *extra],
-            out_specs=[rows, final, *stored],
+            in_specs=[rows, *inputs],
+            out_specs=[rows, final],
             out_shape=out_shape,
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_state_passing_fwd",
-        )(states, da, h0, *([] if seq is None else [seq]), *passed)
-        return tuple(outs[:2]), None
+        )(states, da, h0, *([] if seq is None else [seq]))
+        return tuple(outs), None
 
 
 def _bmm_kernel(a_ref, b_ref, *refs, length: int, chunk: int, groups: int, bm: int, bn: int, bk: int,
@@ -720,40 +666,20 @@ class ChunkScanBwdDstates(_Launch):
         return dstates, None
 
 
-def _state_passing_bwd_kernel(dout_ref, states_ref, da_ref, dfinal_ref, *refs, chunk: int,
-                              documents: bool = False, held: int = 0, entered: bool = False):
+def _state_passing_bwd_kernel(dout_ref, states_ref, da_ref, dfinal_ref, *refs, chunk: int):
     """mamba_ssm's `_state_passing_bwd_kernel` (ssd_state_passing.py:101-193) with an initial state and
     the states converted, for one row's head and a block of its flattened state: chunk by chunk from
     the last, store the gradient of the state the chunk leaves in the output's dtype and the state it
     entered in the same, the gradient of the chunk's total decay `exp(total) (entered . dleave)`, then
     `dleave <- exp(total) dleave + dentered`, with no decay where the chunk ends in another document
-    than its predecessor did. What leaves the first chunk is the initial state's gradient. A forked
-    call's (`_state_passing_kernel`'s): at a chunk that stored a slot, the slot's gradient (`dtable`, each
-    later chunk that took it up's) joins the state it left; at a chunk that took a slot up, the gradient
-    of the state it entered goes to that slot's (`dgiven` for a given memory's), and to its entry write's
-    (`dentries`, where `entered`), and none carries before it."""
-    forked = dtable = dentries = None
-    if documents:
-        loads_ref, stores_ref, dstates_ref, dtotal_ref, dinit_ref, converted_ref, dgiven_ref, *stored = refs
-        forked, seq = (loads_ref, stores_ref, dgiven_ref), ()
-        dentries = stored.pop() if entered else None
-        dtable = stored[0] if held else None
-        for ref in (dgiven_ref, *stored):
-            for slot in range(ref.shape[0]):
-                ref[slot] = jnp.zeros(ref.shape[1:], ref.dtype)
-    else:
-        *seq, dstates_ref, dtotal_ref, dinit_ref, converted_ref = refs
+    than its predecessor did. What leaves the first chunk is the initial state's gradient."""
+    *seq, dstates_ref, dtotal_ref, dinit_ref, converted_ref = refs
     chunks = dstates_ref.shape[0]
     document = seq[0][seq[0].shape[0] - 1] if seq else jnp.int32(0)
 
     def step(i, carry):
         dstate, document = carry
         c = chunks - 1 - i
-        if forked is not None and dtable is not None:
-            store = forked[1][c]
-            at = jnp.maximum(store - 1, 0)
-            dstate = dstate + jnp.where(store > 0, dtable[at], 0.0)
-            dtable[at] = jnp.where(store > 0, 0.0, dtable[at])
         dstates_ref[c] = dstate.astype(dstates_ref.dtype)
         entered = states_ref[c]
         converted_ref[c] = entered.astype(converted_ref.dtype)
@@ -764,18 +690,6 @@ def _state_passing_bwd_kernel(dout_ref, states_ref, da_ref, dfinal_ref, *refs, c
             document = earlier
         dtotal_ref[c] = jnp.sum(entered * dstate) * scale
         dentered = scale * dstate + dout_ref[c]
-        if forked is not None:
-            loads, _, dgiven = forked
-            load = loads[c]
-            count = dgiven.shape[0]
-            at = jnp.clip(load - 1, 0, count - 1)
-            dgiven[at] = dgiven[at] + jnp.where((load > 0) & (load <= count), dentered, 0.0)
-            if dtable is not None:
-                at = jnp.clip(load - count - 1, 0, held - 1)
-                dtable[at] = dtable[at] + jnp.where(load > count, dentered, 0.0)
-            if dentries is not None:
-                dentries[c] = jnp.where(load >= 0, dentered, 0.0)
-            dentered = jnp.where(load >= 0, 0.0, dentered)
         return dentered, document
 
     dinit, _ = jax.lax.fori_loop(0, chunks, step, (dfinal_ref[...], document))
@@ -790,43 +704,25 @@ class StatePassingBwd(_Passing):
 
     def _fwd(self, dout: jax.Array, states: jax.Array, da: jax.Array, dfinal: jax.Array,
              seq: jax.Array | None, *, chunk: int, dtype: str, interpret: bool, config: Tiles,
-             return_residuals: bool = False, documents: tuple[jax.Array, jax.Array] | None = None,
-             given: int = 0, held: int = 0, entered: bool = False):
+             return_residuals: bool = False):
         batch, chunks, heads, flat = states.shape
         size = config.bm
-        # A forked call's `loads` and `stores` `[B, NC]`, in place of `seq`, and the gradients of its
-        # `given` memories `[B, S', H, P * N]` (and of the `held` it stored, its walk's own), and of its entry
-        # writes `[B, NC, H, P * N]` where `entered`.
         rows, whole, inputs = self._blocks(states, da, seq, size)
         out_shape = [jax.ShapeDtypeStruct(states.shape, jnp.dtype(dtype)),
                      jax.ShapeDtypeStruct((batch, heads, chunks, flat // size), jnp.float32),
                      jax.ShapeDtypeStruct((batch, heads, flat), jnp.float32),
                      jax.ShapeDtypeStruct(states.shape, jnp.dtype(dtype))]
-        extra, tables = [], []
-        if documents is not None:
-            slots, chunked = self._table(states, given, size)
-            extra = [chunked, chunked]
-            tables = [slots, *([self._table(states, held, size)[0]] if held else [])]
-            out_shape.append(jax.ShapeDtypeStruct((batch, given, heads, flat), jnp.float32))
-            if held:
-                out_shape.append(jax.ShapeDtypeStruct((batch, held, heads, flat), jnp.float32))
-            if entered:
-                tables.append(rows)
-                out_shape.append(jax.ShapeDtypeStruct(states.shape, jnp.float32))
-        dstates, dtotal, dinit, converted, *dgiven = launches.pallas_call(
-            functools.partial(_state_passing_bwd_kernel, chunk=chunk, documents=documents is not None,
-                              held=held, entered=entered),
+        dstates, dtotal, dinit, converted = launches.pallas_call(
+            functools.partial(_state_passing_bwd_kernel, chunk=chunk),
             grid=(flat // size, batch, heads),
-            in_specs=[rows, rows, *inputs, *extra],
+            in_specs=[rows, rows, *inputs],
             out_specs=[rows, pl.BlockSpec((None, None, chunks, None), lambda i, b, h: (b, h, 0, i)), whole,
-                       rows, *tables],
+                       rows],
             out_shape=out_shape,
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_state_passing_bwd",
-        )(dout, states, da, dfinal, *([] if seq is None else [seq]),
-          *(() if documents is None else documents))
-        return (dstates, jnp.sum(dtotal, axis=-1), dinit, converted, *dgiven[:1],
-                *(dgiven[len(dgiven) - 1:] if entered else ())), None
+        )(dout, states, da, dfinal, *([] if seq is None else [seq]))
+        return (dstates, jnp.sum(dtotal, axis=-1), dinit, converted), None
 
 
 def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_ref, *refs, batch: int,
@@ -1290,44 +1186,33 @@ def _flat(states):
     return states.reshape(*states.shape[:-2], -1)
 
 
-def _scan(x, dt, A, b, c, d, h0, seq, documents, chunk: int, interpret: bool, held: int = 0):
-    return _scan_fwd(x, dt, A, b, c, d, h0, seq, documents, chunk, interpret, held)[0]
+def _scan(x, dt, A, b, c, d, h0, seq, chunk: int, interpret: bool):
+    return _scan_fwd(x, dt, A, b, c, d, h0, seq, chunk, interpret)[0]
 
 
-def _passed_documents(documents):
-    """`ssd_scan`'s forked `documents` `(given [B, S', H, P, N], loads [B, NC], stores [B, NC], entries
-    [B, NC, H, P, N] or None)` as the state passing reads them: the memories flattened `[B, ., H, P * N]`
-    float32."""
-    given, loads, stores, entries = documents
-    return (_flat(given).astype(jnp.float32), jnp.asarray(loads, jnp.int32), jnp.asarray(stores, jnp.int32),
-            None if entries is None else _flat(entries).astype(jnp.float32))
-
-
-def _scan_fwd(x, dt, A, b, c, d, h0, seq, documents, chunk: int, interpret: bool, held: int = 0):
+def _scan_fwd(x, dt, A, b, c, d, h0, seq, chunk: int, interpret: bool):
     """mamba_ssm's `_mamba_chunk_scan_combined_fwd` (ssd_combined.py:343-394): each chunk's own state,
     the states across chunks (stored in `C`'s dtype), each chunk's `C B^T`, then the output. Saves the
-    inputs alone, as mamba_ssm does. A forked call's (`documents`) chunks take their table's memories up
-    and leave theirs in it, `held` stored."""
+    inputs alone, as mamba_ssm does."""
     groups = b.shape[2]
     launch = {"chunk": chunk, "interpret": interpret}
     seqp = _documents_padded(seq, chunk)
     dtp, da = _CHUNK_CUMSUM(dt, A, seqp, **launch)
     states = _CHUNK_STATE(x, b, dtp, da, seqp, groups=groups, **launch)
-    passed = None if documents is None else _passed_documents(documents)
     states, final = _STATE_PASSING(_flat(states), da, _flat(h0).astype(jnp.float32), seqp,
-                                   dtype=jnp.dtype(c.dtype).name, documents=passed, held=held, **launch)
+                                   dtype=jnp.dtype(c.dtype).name, **launch)
     cb = _BMM_CHUNK(c, b, seqp, padded=dtp.shape[-1], **launch)
     y = _CHUNK_SCAN(cb, x, dtp, da, c, states.reshape(*states.shape[:3], *h0.shape[2:]),
                     d.astype(jnp.float32), seqp, **launch)
-    return (y, final.reshape(h0.shape)), (x, dt, A, b, c, d, h0, seq, documents)
+    return (y, final.reshape(h0.shape)), (x, dt, A, b, c, d, h0, seq)
 
 
-def _scan_bwd(chunk: int, interpret: bool, held: int, residual, cotangent):
+def _scan_bwd(chunk: int, interpret: bool, residual, cotangent):
     """mamba_ssm's `_mamba_chunk_scan_combined_bwd` (ssd_combined.py:397-516): the states and `C B^T`
     recomputed, the entered states' gradient, the reverse state passing, then `x`'s, `B`'s, `C`'s and
     `C B^T`'s gradients, `C B^T`'s carried into `B` and `C`, and the decay's from its three parts,
     which gives `dt`'s and `A`'s."""
-    x, dt, A, b, c, d, h0, seq, documents = residual
+    x, dt, A, b, c, d, h0, seq = residual
     dy, dfinal = cotangent
     groups = b.shape[2]
     shape = h0.shape
@@ -1336,16 +1221,12 @@ def _scan_bwd(chunk: int, interpret: bool, held: int, residual, cotangent):
     dtp, da = _CHUNK_CUMSUM(dt, A, seqp, **launch)
     cb = _BMM_CHUNK(c, b, seqp, padded=dtp.shape[-1], **launch)
     states = _CHUNK_STATE(x, b, dtp, da, seqp, groups=groups, **launch)
-    passed = None if documents is None else _passed_documents(documents)
     states, _ = _STATE_PASSING(_flat(states), da, _flat(h0).astype(jnp.float32), seqp, dtype="float32",
-                               documents=passed, held=held, **launch)
+                               **launch)
     dy = dy.astype(x.dtype)
     dentered = _DSTATES(dy, c, da, seqp, **launch)
-    sent = None if passed is None else passed[1:3]
-    entered = passed is not None and passed[3] is not None
-    dstates, dtotal, dh0, states, *dforked = _STATE_PASSING_BWD(
+    dstates, dtotal, dh0, states = _STATE_PASSING_BWD(
         _flat(dentered), states, da, _flat(dfinal).astype(jnp.float32), seqp, dtype=jnp.dtype(x.dtype).name,
-        documents=sent, given=0 if passed is None else passed[0].shape[1], held=held, entered=entered,
         **launch)
     dstates, states = (s.reshape(*s.shape[:3], *shape[2:]) for s in (dstates, states))
     dx, ddt, dd = _DX(x, cb, dy, dtp, da, d.astype(jnp.float32), b, dstates, seqp, **launch)
@@ -1357,29 +1238,23 @@ def _scan_bwd(chunk: int, interpret: bool, held: int, residual, cotangent):
     dintra = jnp.sum(_DDACS(x, dy, dtp, da, cb, **launch), axis=3)
     dacs = _decay_gradient(dnext, dprev, dtotal, dintra, chunk)
     ddt, dA = _CHUNK_CUMSUM_BWD(dacs, ddt, dt, A, **launch)
-    ddocuments = None if documents is None else (
-        dforked[0].reshape(documents[0].shape).astype(documents[0].dtype), None, None,
-        dforked[1].reshape(documents[3].shape).astype(documents[3].dtype) if entered else None)
     # The inputs' cotangents leave only with A's and D's gradients formed (`with_gradients_formed`).
-    (dx, ddt, db, dc, dh0, ddocuments), (dA, dd) = derivatives.with_gradients_formed(
-        (dx, ddt.astype(dt.dtype), db, dc, dh0.reshape(shape).astype(h0.dtype), ddocuments),
+    (dx, ddt, db, dc, dh0), (dA, dd) = derivatives.with_gradients_formed(
+        (dx, ddt.astype(dt.dtype), db, dc, dh0.reshape(shape).astype(h0.dtype)),
         (dA.astype(A.dtype), dd.astype(d.dtype)))
-    return dx, ddt, dA, db, dc, dd, dh0, None, ddocuments
+    return dx, ddt, dA, db, dc, dd, dh0, None
 
 
 ssd_scan = derivatives.contracted("test_the_ssd_port_holds_its_orders")(
     derivatives.declared_derivative(derivatives.KernelGlue(), _scan, _scan_fwd, _scan_bwd,
-                                    nondiff_argnums=(9, 10, 11)))
+                                    nondiff_argnums=(8, 9)))
 """mamba_ssm's chunked SSD scan on the ported kernels: `(y, final)` for `x` `[B, T, H, P]`, the step
 `dt` `[B, T, H]` through its bias, softplus and limit, `A` `[H]`, `B` and `C` `[B, T, G, N]` in `x`'s
 dtype, `D` `[H]`, each row's initial state `h0` `[B, H, P, N]` and each token's document `seq` `[B, T]`
-int32 (mamba_ssm's `seq_idx`, counted from 0 at the initial state's) or None, and `documents`: None, or
-a forked call's `(given [B, S', H, P, N] float32, loads [B, NC], stores [B, NC] int32, entries [B, NC,
-H, P, N] float32 or None)` for documents each starting a chunk (`seq` None): a chunk whose `load` is past
--1 enters that one-based table slot's memory (`given`'s first, then the `held` its chunks store; zero a
-zero memory) with its entry write added, and one whose `store` is past zero leaves its memory in that
-stored slot (`recurrence_chunk.Chunk.loads`), over chunks of `chunk`
-tokens. `y` and the final state are fp32. P, N and the chunk are powers
-of two of at least 16. Its numbers are mamba_ssm's: operands in their own dtype into fp32 accumulation,
-the states the chunks enter in the operands' dtype, the decay and the states across chunks in fp32; the
-output's cotangent is rounded to the operands' dtype for its products, as mamba_ssm's arrives."""
+int32 (mamba_ssm's `seq_idx`, counted from 0 at the initial state's) or None, over chunks of `chunk`
+tokens. A forked call (`recurrence_chunk.Chunk.loads`) it takes none of: its state passing takes a memory
+at a sequence's first chunk alone, where a forked document takes its own mid-chunk. `y` and the final state
+are fp32. P, N and the chunk are powers of two of at least 16. Its numbers are mamba_ssm's: operands in
+their own dtype into fp32 accumulation, the states the chunks enter in the operands' dtype, the decay and
+the states across chunks in fp32; the output's cotangent is rounded to the operands' dtype for its
+products, as mamba_ssm's arrives."""

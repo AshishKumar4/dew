@@ -33,11 +33,14 @@ def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: 
     active, steps, views, tile, done)` at the step its streams are at across the tiles (`counter`: the steps
     of the active tiles before it) and its turn round accumulators (`done`: the turns the active tiles before
     it took, one a tile, or `turns(steps)` where given: an exactly summed tile's windows). Returns both past
-    the last tile."""
+    the last tile. A schedule's `active` reaches `visit` a traced boolean however the schedule states it (a
+    Python `True` of a tile always active): `~active` its negation, where Python's `~True`, -2, is a true
+    predicate, and a visit's inactive branch ran beside its active one (base review of 571a5ee10, F1)."""
     @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=(jnp.int32(0), jnp.int32(0)))
     def ended(loop: plgpu.NDLoopInfo, carry):  # nd_loop passes its carry by this name
         counter, done = carry
         active, steps, views, tile = schedule(loop.index)
+        active = jnp.asarray(active, jnp.bool_)
         visit(counter, active, steps, views, tile, done)
         taken = 1 if turns is None else turns(steps)
         return counter + jnp.where(active, steps, 0), done + jnp.where(active, taken, 0)

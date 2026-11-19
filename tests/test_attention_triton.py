@@ -497,6 +497,12 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
     np.testing.assert_array_equal(np.asarray(grads[0].query), np.asarray(grads[1].query))
 
 
+def bucketed(s, q_pos, k_pos, bucket):
+    """A score hook of an int32 key parameter: a key's bucket, its low bit a bias."""
+    del q_pos, k_pos
+    return s + (bucket & 1).astype(s.dtype)
+
+
 def test_an_integer_parameter_keys_and_runs():
     """A hook reading an int32 key parameter (a bucket's low bit) keys its launches at that dtype and
     runs, forward and backward, on par with the reference arithmetic from float64."""
@@ -504,11 +510,7 @@ def test_an_integer_parameter_keys_and_runs():
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     buckets = jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32), (ROWS, 4, keys))
-
-    def score_mod(s, q_pos, k_pos, bucket):
-        return s + (bucket & 1).astype(s.dtype)
-
-    hooks = template.Hooks(score_mod, (template.Param(buckets, template.Kind.KEY),))
+    hooks = template.Hooks(bucketed, (template.Param(buckets, template.Kind.KEY),))
     draw_qkv = drawing(queries, keys, jnp.float32)
 
     def draw(seed):
@@ -706,9 +708,9 @@ def test_the_backward_walks_many_key_tiles(case):
 def every_backward_config_on_a_gpu(case):
     """Every tile a derivation or a pin may run (`BACKWARD_TILES`), bf16, a softcap, sinks and
     ALiBi, over causal documents under a window and over the irregular full and causal calls (`IRREGULAR`):
-    those the launch holds at the call (`TritonBackward.legal`: its threads within their registers, its
-    programs within a block's shared memory) on par with the reference in one check, and each other
-    refused where it is pinned (`tuning.Unpinnable`), so no call runs it."""
+    those the launch takes at the call (`TritonBackward.legal`: its programs within a block's shared memory,
+    its registers the assembler's) on par with the reference in one check, and each other refused where it
+    is pinned (`tuning.Unpinnable`), so no call runs it."""
     import tokamax
 
     from dew.nn.kernels import generation
@@ -806,7 +808,7 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     launches = [(attention_triton.TritonForward(score_kinds=score_kinds), config)]
     if step:
         launches.append((attention_triton.TritonBackward(score_kinds=score_kinds), backward))
-    if not all(op.legal(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches):
+    if not all(op.takes(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches):
         return {}
     pins = {attention_triton.TritonForward: config, attention_triton.TritonBackward: backward}
     record: dict = {}
@@ -990,6 +992,39 @@ def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(tar
     assert len(found) == 2
     assert not failures(found), "\n".join(failures(found))
     assert all(record["shared"] > 0 for record in found), found
+
+
+@pytest.mark.gpu(reason="runs a Pallas Triton kernel's arithmetic on this GPU")
+@pytest.mark.generations("sm80", "sm90", "sm100")
+def test_tritons_compiler_rounds_a_product_and_the_sum_it_feeds_apart():
+    """A Pallas Triton kernel's product and the sum it feeds, alone (`a * b + c`) and inside a compensated
+    sum's TwoSum (`precision.two_sum`, as the online softmax's merge recovers its error), run on this GPU,
+    each operation rounding on its own: where `a * b` is exact only past fp32 and `c` cancels its rounded
+    value, the sum is zero and the TwoSum's error term is zero. A multiply and an add contracted into one
+    fused multiply-add would keep the product's dropped bits, `2^-24`, and the merge's recovery would read
+    the product's rounding error as the sum's. (On an H100 compile, Triton's `a * b + c` assembles to FMUL
+    and FADD, no FFMA: XLA compiles a Triton call with no floating-point contraction.)"""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as plt
+
+    from dew.nn import precision
+
+    def alone(a_ref, b_ref, c_ref, s_ref, e_ref):
+        s_ref[...] = a_ref[...] * b_ref[...] + c_ref[...]
+        e_ref[...] = jnp.zeros_like(c_ref[...])
+
+    def two_sum(a_ref, b_ref, c_ref, s_ref, e_ref):
+        s_ref[...], e_ref[...] = precision.two_sum(a_ref[...] * b_ref[...], c_ref[...])
+
+    # (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24, its last bit half an fp32 ulp: rounded, 1 + 2^-11, which c cancels.
+    a = np.full((256,), 1 + 2.0**-12, np.float32)
+    c = -(a * a)
+    vector = jax.ShapeDtypeStruct(a.shape, jnp.float32)
+    for kernel in (alone, two_sum):
+        total, error = pl.pallas_call(kernel, out_shape=(vector, vector),
+                                      compiler_params=plt.CompilerParams(num_warps=4, num_stages=1))(a, a, c)
+        np.testing.assert_array_equal(np.asarray(total), np.zeros_like(a), err_msg=kernel.__name__)
+        np.testing.assert_array_equal(np.asarray(error), np.zeros_like(a), err_msg=kernel.__name__)
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm90"])

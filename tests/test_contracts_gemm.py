@@ -124,6 +124,32 @@ def test_a_grouped_gemm_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_matrices_side_by_side_hold_every_order(edge):
+    """`gemm.gemm` of matrices side by side (`beside`: the rows' products with each, each its own output,
+    its custom derivative the grouped GEMM's, through `generation.linear_tangent`): every order runs in the
+    rows and the matrices, finite wherever float64 is a normal float32 and wherever the products apart are
+    (each row's product with its group's matrix, by a mask, its float64 run the truth), at values whose
+    products near float32's ends."""
+    sizes = jnp.asarray([3, 0, 5], jnp.int32)
+    groups = jnp.repeat(jnp.arange(3), sizes, total_repeat_length=8)
+    shapes = ((8, 16), (3, 16, 4), (3, 16, 8))
+    primals = normal_draw(6794, *shapes, scale=EDGES[edge])
+    direction = normal_draw(6795, *shapes, scale=EDGES[edge])
+    (cotangent,) = normal_draw(6796, (8, 12))
+
+    def side_by_side(rows, first, second):
+        return jnp.concatenate(gemm.gemm(rows, first, sizes, beside=(second,), out_dtype=rows.dtype), axis=-1)
+
+    def plain(rows, first, second):
+        hot = jax.nn.one_hot(groups, 3, dtype=rows.dtype)
+        products = [jnp.einsum("rg,rk,gkn->rn", hot, rows, matrices) for matrices in (first, second)]
+        return jnp.concatenate(products, axis=-1)
+
+    assert_contract(side_by_side, primals, direction, cotangent, f"matrices side by side {edge}",
+                    truth_fn=plain, plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_an_adapted_product_holds_every_reverse_order(edge):
     """`low_rank.low_rank` (LoRA's adapted product as one product over the depth its rank extends, its custom
     VJP declared through `derivatives.declared_derivative`): every reverse order, under a nested jit and a
