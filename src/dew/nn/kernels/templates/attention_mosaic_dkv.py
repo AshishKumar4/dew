@@ -114,8 +114,7 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         # compute warpgroup's arrival) and one for its free (the reducer's), `_PlacedDq`.
         scoped.append(family.staged_memory((consumers, block_k, rows), dtype))
         if family.places_on_role:
-            # A slot a buffer of its own, each warpgroup's `REDUCED` in turn, as its barriers are laid.
-            scoped += [family.staged_memory((consumers * REDUCED, rows, out_width // REDUCED), jnp.float32),
+            scoped += [family.staged_memory((consumers, REDUCED, rows, out_width // REDUCED), jnp.float32),
                        *(plgpu.Barrier(num_arrivals=1, num_barriers=consumers * REDUCED) for _ in range(2))]
         else:
             scoped.append(family.staged_memory((consumers, rows, width), jnp.float32))
@@ -318,7 +317,7 @@ class _PlacedDq:
 
     def _turn(self, role, ordinal, piece: int):
         """Piece `piece` of a compute warpgroup's (`role`'s) `ordinal`-th step's turn of its ring, and its
-        slot's index among the rings' buffers and barriers (each warpgroup's `REDUCED` in turn)."""
+        barrier's index among the ring's (each warpgroup's `REDUCED` in turn)."""
         turn = rings.Turn.of(ordinal * len(self.pieces()) + piece, REDUCED)
         return turn, role * REDUCED + turn.slot
 
@@ -337,7 +336,7 @@ class _PlacedDq:
             for half in halves:
                 columns = half.shape[1]
                 family.added(half, self._view(q_first, slots.turn).at[:, pl.ds(first, columns)], True,
-                             smem=stage.at[0])
+                             smem=stage.at[slots.turn, 0])
                 first += columns
             return
         ordinal = slots.n // placed.TURNS
@@ -347,7 +346,7 @@ class _PlacedDq:
             before = rings.Turn.of(turn.counter - REDUCED, REDUCED)
             pl.when(turn.counter >= REDUCED)(lambda before=before, at=at: plgpu.barrier_wait(
                 emptied.at[at], phase=before.rotation))
-            stage.at[at][...] = piece
+            stage.at[slots.turn, turn.slot][...] = piece
             plgpu.commit_smem()
             plgpu.barrier_arrive(filled.at[at])
 
@@ -367,7 +366,8 @@ class _PlacedDq:
             for index, (first, columns) in enumerate(self.pieces()):
                 turn, at = self._turn(role, ordinal, index)
                 plgpu.barrier_wait(filled.at[at], phase=turn.rotation)
-                plgpu.copy_smem_to_gmem(stage.at[at], view.at[:, pl.ds(first, columns)], reduction_op="add")
+                plgpu.copy_smem_to_gmem(stage.at[role, turn.slot], view.at[:, pl.ds(first, columns)],
+                                        reduction_op="add")
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
                 plgpu.barrier_arrive(emptied.at[at])
             return carry
