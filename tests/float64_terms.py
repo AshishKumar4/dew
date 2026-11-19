@@ -16,7 +16,7 @@ import numpy as np
 from arm_arithmetic import on_float64_device, on_float64_host, unrewritten
 from jax.extend.core import primitives
 from jax.interpreters import partial_eval as pe
-from truths_ahead import AT_RUN, running
+from truths_ahead import AT_RUN, COMPILED as STORE, running
 
 from dew.nn import programs
 from dew.nn.precision import correctly_rounded_divide_p
@@ -155,9 +155,15 @@ def _termed(fn, args, *, power: int):
     """`fn(*args)`'s outputs' tree, their values and each one's terms summed at `power` (`POWER`: their
     squares, or their magnitudes), the evaluation `float64_terms` describes. Under a trace (`_tracing`: a
     site's terms program traced whole) its compiled evaluation inlined into the trace, its outputs the
-    trace's own, nothing on the host: a program whose values steer it (`static` none) no trace holds, and is
-    refused there."""
+    trace's own, nothing on the host, a branch its platform picks read for the platform of the store's
+    device its prepare compiles for (`truths_ahead.CompiledTruths.device`), which the program lowers for. A
+    trace outside a store's prepare, whose lowering's platform no trace states (a CPU's inputs under a GPU's
+    default), and a program whose values steer it (`static` none), which no trace holds, are refused."""
     if _tracing(args):
+        store = STORE.get()
+        if store is None or not store.prepare:
+            raise TypeError("float64_terms: a traced call reads the branches its platform picks for the "
+                            "device a store's prepare compiles for, and none is preparing")
         # Traced afresh, its constants this trace's, never a cached trace's (`traced`'s).
         closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
         if not static(closed.jaxpr):
@@ -165,7 +171,7 @@ def _termed(fn, args, *, power: int):
                             "walked as it runs, which no trace holds")
         token = POWER.set(power)
         try:
-            with evaluated_on([]):
+            with jax.default_device(store.device()), evaluated_on([]):
                 values, energies = _compiled(closed.jaxpr)(closed.consts, jax.tree.leaves(args))
                 return jax.tree.structure(shapes), values, [_or_size(energy, value) for energy, value
                                                             in zip(energies, values, strict=True)]

@@ -236,13 +236,14 @@ def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path
 def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unrecorded(tmp_path, monkeypatch):
     """In a GPU tier part's prepare, a cell that compiled a site and then raised, checking what its prepare
     gives in its programs' place (`ahead_arm`'s zeros), passes its prepare with nothing recorded, its run
-    judging it; only a cell that compiled nothing before it raised is deferred (row 8555: every such cell
-    was recorded deferred and its test named unprepared, falsely)."""
+    judging it (row 8555: every such cell was recorded deferred and its test named unprepared, falsely);
+    a cell whose site's compile itself raised, the site begun and unfinished, is deferred, its failure
+    recorded where it raised (the review)."""
     import jax
     import numpy as np
     import tier_wire
     from reference_error import ahead_arm
-    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths
+    from truths_ahead import DEFERRED, UNPREPARED, CompiledTruths, compiled_truths
 
     def checked():
         made = ahead_arm(jax.jit(lambda x: x + 1.0), "a checked product")(np.zeros(3, np.float32))
@@ -252,3 +253,12 @@ def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unreco
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
         run_cells([Cell("checks its product", checked)])
     assert not (tmp_path / DEFERRED).exists() and not (tmp_path / UNPREPARED).exists()
+
+    def unfinished(store, programs, compiled, host=False):
+        raise RuntimeError("its compile failed")
+
+    monkeypatch.setattr(CompiledTruths, "_compiled", unfinished)
+    with compiled_truths(tmp_path / "unfinished", prepare=True, stamp="a"):
+        run_cells([Cell("compiles nothing", lambda: ahead_arm(jax.jit(lambda x: x * 2.0), "a failed product")(
+            np.zeros(3, np.float32)))])
+    assert (tmp_path / "unfinished" / DEFERRED).is_file()

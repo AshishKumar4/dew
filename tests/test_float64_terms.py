@@ -284,6 +284,26 @@ def a_dense_layers_terms_are_its_placements_own_on_a_gpu_host(tmp_path):
                 np.testing.assert_array_equal(found, want, err_msg=f"{platform} after {order}")
 
 
+def test_a_traced_call_reads_its_platforms_branch_for_the_device_a_store_prepares_for(tmp_path):
+    """`float64_terms` traced whole (`jax.jit`) reads the branch its platform picks (`picked`) for the device
+    a store's prepare compiles for (`truths_ahead.CompiledTruths.device`), the CPU's product here, its
+    terms that product's; traced outside a store's prepare, where no trace states the platform its lowering
+    runs on (a CPU's inputs under a GPU's default device took the GPU's branch: the review), it is refused."""
+    from truths_ahead import compiled_truths
+
+    rng = np.random.default_rng(5)
+    x, weight = rng.normal(size=(4, 8)), rng.normal(size=(8, 3))
+    with jax.enable_x64(new_val=True):
+        with compiled_truths(tmp_path, prepare=True, stamp="a"):
+            value, terms = jax.jit(lambda x, weight: float64_terms(picked, x, weight))(x, weight)
+        with pytest.raises(TypeError):
+            jax.jit(lambda x, weight: float64_terms(picked, x, weight))(x, weight)
+    size = np.sqrt(np.square(x) @ np.square(weight))
+    assert within(np.abs(np.asarray(value) - x @ weight),
+                  reduction_bound(np.abs(x) @ np.abs(weight), x.shape[1], np.float64))
+    assert within(np.abs(np.asarray(terms) - size), reduction_bound(size, x.shape[1], np.float64))
+
+
 def test_a_grouped_matmul_sums_each_groups_terms_as_a_dot_does():
     """An expert layer's grouped matmul (`jax.lax.ragged_dot`) and its kernel's gradient sum their
     rows' products within each group: their terms are each group's dense dot's, not their own
