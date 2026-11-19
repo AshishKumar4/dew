@@ -15,7 +15,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.precision import at_least_fp32, correctly_rounded_divide, divided
+from dew.nn.precision import at_least_fp32, correctly_rounded_divide, divided, exact_power2
 
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
 """Each E2M1 code's value in code order (ml_dtypes' float4_e2m1fn): 0 to 6
@@ -45,14 +45,14 @@ E2M1_MAX = float(jnp.finfo(jnp.float4_e2m1fn).max)
 
 
 def _power_of_two_ceil(value):
-    """2 ** ceil(log2(value)) off the fp32 bits, as the kernels' fast_round_scale
-    computes it (kernel.py:22-37). Unclamped, unlike the host codecs'
+    """2 ** ceil(log2(value)) off the fp32 bits (`exact_power2` of its exponent), as the kernels'
+    fast_round_scale computes it (kernel.py:22-37). Unclamped, unlike the host codecs'
     `ceil_to_ue8m0` rule (exponents 1 to 254): only past the normal range do
     they part, a zero giving 0.0 here and 2 ** -126 there, a value above
     2 ** 127 inf here and 2 ** 127 there."""
     bits = jax.lax.bitcast_convert_type(value.astype(jnp.float32), jnp.int32)
     exponent = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).astype(jnp.int32)
-    return jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
+    return exact_power2(exponent)
 
 
 def _round(values, mantissa: int, lowest: int):
@@ -63,7 +63,7 @@ def _round(values, mantissa: int, lowest: int):
     the even multiple, the one whose last mantissa bit is 0."""
     bits = jax.lax.bitcast_convert_type(values.astype(jnp.float32), jnp.int32)
     exponent = jnp.maximum(((bits >> 23) & 0xFF) - 127, lowest) - mantissa
-    quantum = jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
+    quantum = exact_power2(exponent)
     return jnp.round(values / quantum) * quantum
 
 

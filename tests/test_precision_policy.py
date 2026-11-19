@@ -1478,6 +1478,8 @@ def edge_values(dtype) -> np.ndarray:
     bits = np.concatenate([
         np.arange(0, 1 << width, ((1 << width) // 2047) | 1, dtype=word),
         np.arange(1 << width, infinite, ((infinite - (1 << width)) // 2047) | 1, dtype=word),
+        # A subnormal led by each bit's place, its lower bits mixed: every leading-bit position.
+        np.asarray([(1 << place) | ((1 << place) - 1) // 3 for place in range(width)], word),
         np.asarray([0, 1, 2, 3, (1 << width) - 1, 1 << width, infinite - 1, 3 << (width - 1),
                     5 << (width - 3), one, three + 1], word)])
     values = bits.view(dtype)
@@ -1527,19 +1529,21 @@ def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():
 @pytest.mark.parametrize(("dtype", "reach", "exponent"), [
     (jnp.float32, None, jnp.int32), (jnp.float32, TWO_FACTOR_REACH, jnp.int32),
     (jnp.float32, None, jnp.int8), (jnp.float32, TWO_FACTOR_REACH, jnp.int8), (jnp.float32, None, jnp.uint8),
-    (jnp.float32, None, jnp.float32), (jnp.float64, None, jnp.int32), (jnp.bfloat16, None, jnp.int32)])
+    (jnp.float32, None, jnp.float32), (jnp.float64, None, jnp.int32), (jnp.bfloat16, None, jnp.int32),
+    (jnp.float8_e4m3fn, None, jnp.int32), (jnp.float8_e5m2, TWO_FACTOR_REACH, jnp.int32)])
 def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach, exponent):
     """`dew.nn.precision.power2` (the one owner of scaling by a power of two: a kernel template's, a scaled
     value's, an aligned sum's) scales by powers of two exactly wherever the operand and the result are
     normal values of its format (`x`'s, at least float32), compiled (where XLA computes `exp2` as an inexact
     `exp` and fuses a product of them into one `exp`, past the format), at every integral exponent its type
     holds past the format's range both ways against exact rational scaling, greedy factors by default and a
-    stated reach's two halves within it, operands at both ends of the normal range among them; zero stays
-    zero, and a result past the format is infinite."""
-    from dew.nn.precision import power2
+    stated reach's two halves within it, operands at both ends of the normal range among them, an 8-bit
+    float's in float32 (`at_least_fp32`, which no implicit promotion reaches; base review a7c5428ef F1); zero
+    stays zero, and a result past the format is infinite."""
+    from dew.nn.precision import at_least_fp32, power2
 
     with jax.enable_x64(new_val=dtype == jnp.float64):
-        wide = jnp.result_type(dtype, jnp.float32)
+        wide = at_least_fp32(dtype)
         limits = np.finfo(wide)
         span = int(limits.maxexp - limits.minexp + limits.nmant) + 8 if reach is None else reach
         held = np.iinfo(exponent) if jnp.issubdtype(exponent, jnp.integer) else np.finfo(exponent)

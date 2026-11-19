@@ -504,10 +504,10 @@ TWO_FACTOR_REACH = _two_factor_reach(jnp.float32)
 
 def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None) -> jax.Array:
     """`x * 2^k` for an integral `k` (an integer, or a float holding one) of any size, exactly wherever `x`
-    and the result are normal values of its format (`x`'s, at least float32's, as a float32 factor widens a
-    narrower one): products by exact powers of two of `k`'s sign (`exact_power2`), so each partial product
-    lies between `x` and the result, `k` held within `reach` (by default its format's saturating bound, past
-    which every finite `x` lands zero or infinite: 279 in float32). The one owner of scaling by a power of two
+    and the result are normal values of its format (`x`'s, at least float32's, `at_least_fp32`): products
+    by exact powers of two of `k`'s sign (`exact_power2`), so each partial product lies between `x` and the
+    result, `k` held within `reach` (by default its format's saturating bound, past which every finite `x`
+    lands zero or infinite: 279 in float32). The one owner of scaling by a power of two
     (a scaled value's, an aligned sum's, a kernel template's; `scalar_power2` a Mosaic kernel's scalar `k`).
     A backend that flushes subnormals (XLA:CPU) flushes a subnormal `x` before any factor raises it:
     `raised_exactly` raises one from its bits.
@@ -521,8 +521,10 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     factors, `k`'s halves, each built as its product takes it: one integer tile live, not two (et-livehook1:
     the factor tiles 66 of an attention template's natural forward's 281 registers at its peak), a subnormal
     result rounded at each half past the normal range."""
-    x = jnp.asarray(x)
-    dtype = jnp.result_type(x, jnp.float32)
+    # Held at least in float32 (`at_least_fp32`), as a float32 factor widens a narrower float; an 8-bit float
+    # promotes implicitly to nothing.
+    dtype = at_least_fp32(jnp.asarray(x).dtype)
+    x = jnp.asarray(x, dtype)
     limits = jnp.finfo(dtype)
     least, largest = limits.minexp, limits.maxexp - 1
     saturating = (largest + 1) - (least - limits.nmant) + 2
