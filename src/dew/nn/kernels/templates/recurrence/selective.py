@@ -610,9 +610,10 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
             documents, firsts = ((None, None) if walked is None else
                                  (walked(channel), load(resets_ref.at[row, span])))
 
+            skip = parameters_ref[states, channel]
+            dx_init, dx_step, dx_inv = algebra.selective_dx_scale(skip, dys, dts)
             def state(n, sums):
-                # A state a turn, rolled: unrolled, the states' operands lived together and spilled 12 KB
-                # a thread (255 registers, an H100's compile, scanbwd-ptxas-sm90 at 5de7abaa0).
+                # Rolled: unrolled, the states spilled 12 KB/thread (scanbwd-ptxas-sm90 at 5de7abaa0).
                 dx, ddt = sums
                 rate = parameters_ref[n, channel]
                 bs, cs = load(b_ref.at[row, n, span]), load(c_ref.at[row, n, span])
@@ -625,7 +626,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
                     if documents is None else
                     documents.scans(k, n, firsts, a, written, read, entering, carried[0, n]))
                 d_value, d_step, d_b, d_c, d_rate = algebra.selective_adjoint(
-                    read + after, before, a, written, dts, xs, bs, dys, rate)
+                    read + after, before, a, written, dts, xs, bs, dys, rate, dx_step=dx_step)
                 # The rate's gradient so far read before the sum's barriers, so no thread reads another's
                 # write of it: read after, an A100's threads added the block's sum twice over (1.6e-2 of
                 # dA from float64 against the rest's 4e-7, mamba1-scan-a100-7d3152837).
@@ -636,9 +637,8 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
                 added(dbc_ref.at[0, partial, row, n, span], d_b)
                 added(dbc_ref.at[1, partial, row, n, span], d_c)
                 return dx + d_value, ddt + d_step
-
-            zeros = jnp.zeros((positions,), jnp.float32)
-            dx, ddt = lax.fori_loop(0, states, state, (parameters_ref[states, channel] * dys, zeros))
+            dx, ddt = lax.fori_loop(0, states, state, (dx_init, jnp.zeros((positions,), jnp.float32)))
+            dx = dx * dx_inv
             plgpu.store(dx_ref.at[row, channel, span], dx, optimized=False)
             plgpu.store(ddt_ref.at[row, channel, span], ddt, optimized=False)
             return d_skip + block_scan.summed(dys * xs, exchanged, interpret=interpret)

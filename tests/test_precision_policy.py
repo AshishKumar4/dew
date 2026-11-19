@@ -1433,17 +1433,18 @@ def test_an_aligned_sums_second_order_keeps_a_lone_parts_sign():
 
 
 def test_an_aligned_sums_tangents_value_and_gradient_keeps_its_joint_tangent():
-    """The tangent along `(0, -2^70, 2^70 (1 + k 2^-23), 0)` at `(2^70, 2^70, 2^70, 0)`, `k` drawn from 0
-    to 8, of the value of `aligned_sum([(a, b)])`'s tangent's value-and-gradient, `da vb + vda b`: `k 2^117`,
-    its two products each 2^140 past float32's largest, cancelling exactly at `k` zero, held by check 1
-    against the formula in float64 rounded once (exact, so Dew must be) where an untraced map's parts, rounded
-    apart, added to inf - inf, NaN (rows 8757, 8975)."""
+    """The tangent along `(0, -2^70, 2^70 (1 + k 2^-23), 0)` at `(2^70, 2^70, 2^70, 0)`, `k` each of 0 to 8
+    in check 1's first stage (the seed's, modulo nine; row 9087), of the value of `aligned_sum([(a, b)])`'s
+    tangent's value-and-gradient, `da vb + vda b`: `k 2^117`, its two products each 2^140 past float32's
+    largest, cancelling exactly at `k` zero, held by check 1 against the formula in float64 rounded once
+    (exact, so Dew must be) where an untraced map's parts, rounded apart, added to inf - inf, NaN (rows 8757,
+    8975)."""
     from arm_forms import as_given
 
     big = 2.0 ** 70
 
     def draw(seed):
-        k = np.random.default_rng([8975, seed]).integers(0, 9)
+        k = seed % 9
         point, direction = (big, big, big, 0.0), (0.0, -big, big * (1 + k * 2.0 ** -23), 0.0)
         return tuple(np.float32(x) for x in (*point, *direction))
 
@@ -1460,7 +1461,7 @@ def test_an_aligned_sums_tangents_value_and_gradient_keeps_its_joint_tangent():
         return vda * b + da * vb + va * db + a * vdb
 
     rounded = as_given(lambda *inputs: np.float32(formula(*(np.float64(x) for x in inputs))))
-    assert_as_exact(jax.jit(ours), rounded, draw, "an aligned sum's tangent's value and gradient", seeds=8,
+    assert_as_exact(jax.jit(ours), rounded, draw, "an aligned sum's tangent's value and gradient", seeds=9,
                     truth_fn=jax.jit(formula))
 
 
@@ -1518,11 +1519,13 @@ def test_an_aligned_sums_tangent_leaks_no_tracer():
         jax.grad(lambda a: aligned_sum([(a, one)]))(one)
 
 
-@pytest.mark.parametrize("axis", [2, -3, (0, 0), (1, -1)], ids=["past the rank", "before it", "repeated",
-                                                               "repeated by its sign"])
+@pytest.mark.parametrize("axis", [2, -3, (0, 0), (1, -1), 2 ** 31, (0, 2 ** 31)],
+                         ids=["past the rank", "before it", "repeated", "repeated by its sign",
+                              "past a C int", "one of them past a C int"])
 def test_an_aligned_sum_refuses_an_axis_its_term_has_not(axis):
     """`aligned_sum([(x,)], axis)` of a `[2, 3]` term over an axis past its rank or repeated: a ValueError, as
-    `jnp.sum`'s, where the axis wrapped by the rank reduced another (row 8837)."""
+    `jnp.sum`'s, where the axis wrapped by the rank reduced another (row 8837), and one past a C int's range,
+    where numpy's conversion of it raised an OverflowError (row 9086)."""
     with pytest.raises(ValueError):
         aligned_sum([(jnp.ones((2, 3), jnp.float32),)], axis=axis)
 
