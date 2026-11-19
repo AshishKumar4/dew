@@ -1462,9 +1462,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise ValueError(f"{label}: a weighed site reads its reference's own rounding at its truth's inputs, "
                          "which no program compiled ahead holds")
     if store is not None and store.prepare:
-        _compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms,
-                      also=also, orders=orders, plain=plain, library_fn=library_fn)
-        store.finished(label, armed(label))
+        with store.preparing(label, armed(label)):
+            _compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn,
+                          terms=terms, also=also, orders=orders, plain=plain, library_fn=library_fn)
         return
     if os.environ.get(QUALIFY) and not (drawing() or judging()):
         _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
@@ -1945,12 +1945,12 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False) -> Callable:
             programs: dict = {}
             held: dict = {}
             # A host-placed arm traced, and retraced where its compile lowers it, on the host's CPU.
-            with jax.default_device(jax.devices("cpu")[0]) if host else contextlib.nullcontext():
+            with (store.preparing(armed(label)),
+                  jax.default_device(jax.devices("cpu")[0]) if host else contextlib.nullcontext()):
                 with contextlib.nullcontext() if host else store.tracing():
                     shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
                 store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True),
                                    arms=True, host=host)
-            store.finished(armed(label))
             # Zeros of the shapes its own trace gave, in the store's tracing: a jit of its own compiler
             # options traced again inside another, `eval_shape`'s, was refused.
             return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)

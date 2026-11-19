@@ -237,8 +237,9 @@ def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unreco
     """In a GPU tier part's prepare, a cell that compiled a site and then raised, checking what its prepare
     gives in its programs' place (`ahead_arm`'s zeros), passes its prepare with nothing recorded, its run
     judging it (row 8555: every such cell was recorded deferred and its test named unprepared, falsely);
-    a cell whose site's prepare did not finish, its compile raised or its arm's trace raised after its
-    truths were written, is deferred, its failure recorded where it raised (the review)."""
+    a cell whose site's prepare did not finish, its compile raised, its arm's trace raised after its
+    truths were written, or a second check's truth trace raised after a first was prepared whole, is
+    deferred, its failure recorded where it raised (the review)."""
     import jax
     import numpy as np
     import reference_error
@@ -273,7 +274,23 @@ def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unreco
         assert_as_exact(jax.jit(lambda x: x * 2.0), jax.jit(lambda x: x * 2.0),
                         lambda seed: (np.full(3, seed, np.float32),), "a product whose arm failed", seeds=8)
 
-    monkeypatch.setattr(reference_error, "_arm_program", traced_badly)
-    with compiled_truths(tmp_path / "arms", prepare=True, stamp="a"):
-        run_cells([Cell("traces its arm badly", site)])
+    with monkeypatch.context() as failing:
+        failing.setattr(reference_error, "_arm_program", traced_badly)
+        with compiled_truths(tmp_path / "arms", prepare=True, stamp="a"):
+            run_cells([Cell("traces its arm badly", site)])
     assert (tmp_path / "arms" / DEFERRED).is_file()
+
+    # A check prepared whole, then a second check whose truth's trace raises before it compiles any site.
+    def two_checks():
+        ahead_arm(jax.jit(lambda x: x + 1.0), "a first product")(np.zeros(3, np.float32))
+
+        def truth(x):
+            raise RuntimeError("its truth's trace failed")
+
+        assert_as_exact(jax.jit(lambda x: x * 3.0), jax.jit(lambda x: x * 3.0),
+                        lambda seed: (np.full(3, seed, np.float32),), "a product whose truth failed", seeds=8,
+                        truth_fn=truth)
+
+    with compiled_truths(tmp_path / "second", prepare=True, stamp="a"):
+        run_cells([Cell("prepares one check and fails the next", two_checks)])
+    assert (tmp_path / "second" / DEFERRED).is_file()

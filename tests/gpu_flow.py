@@ -122,20 +122,20 @@ def _device() -> str:
 
 
 def _begun() -> frozenset[str] | None:
-    """The sites the store of a GPU tier part's prepare has begun (`truths_ahead.CompiledTruths.begun`),
-    read before a cell runs (`_deferred`); none outside one."""
+    """The sites the store of a GPU tier part's prepare has tried to prepare
+    (`truths_ahead.CompiledTruths.preparing`), read before a cell runs (`_deferred`); none outside one."""
     import tier_wire
     import truths_ahead
 
     store = truths_ahead.COMPILED.get()
-    return frozenset(store.begun) if tier_wire.preparing() and store is not None and store.prepare else None
+    return frozenset(store.tried) if tier_wire.preparing() and store is not None and store.prepare else None
 
 
 def _deferred(label: str, text: str, frames: list[tuple[str, int]], begun: frozenset[str] | None) -> bool:
     """Whether a cell that raised is deferred to its run (`run_cells`): in a GPU tier part's prepare
-    (`begun`, its store's sites begun before the cell, `_begun`), where nothing computes. A cell that began
-    no site before it raised, or one its check's prepare did not finish whole (a compile that raised, an arm
-    whose trace raised after its site's truths were written: `truths_ahead.CompiledTruths.finished`),
+    (`begun`, its store's sites tried before the cell, `_begun`), where nothing computes. A cell that tried
+    no site before it raised, or one its check's prepare did not finish whole (a trace or a compile that
+    raised, an arm's after its site's truths were written: `truths_ahead.CompiledTruths.preparing`),
     computed past or failed within the programs its prepare holds, and is recorded deferred
     (`truths_ahead.DEFERRED`, where it raised and why), its run computing and judging it with the flow's
     other cells served by the store and naming the test unprepared (tests/conftest.py); one whose every site
@@ -149,7 +149,7 @@ def _deferred(label: str, text: str, frames: list[tuple[str, int]], begun: froze
     if begun is None:
         return False
     store = truths_ahead.COMPILED.get()
-    new = store.begun - begun
+    new = store.tried - begun
     if not new or not new <= store.done:
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         truths_ahead.unprepared(store.directory, test, frames[::-1],
