@@ -526,6 +526,27 @@ def cancelling_entries_draw(seed: int):
                                entry_value=jnp.concatenate([u, -u, value[:, :, :1]], axis=2)), seeded
 
 
+@pytest.mark.parametrize("values_first", [False, True], ids=["keys first", "values first"])
+def test_an_entry_write_of_cancelling_terms_keeps_each_bands_rounding(values_first):
+    """A document's entry write (`chunked_launch.entry_write`) of six terms of unit keys and weight, their
+    values 2^127, -2^127, 2^25, -2^24, -2^24 and -2: its write, its tangent along the weight and the weight's
+    gradient each -2, exactly, where each band of the aligned sum rounded its own sum, -2^25 - 2 tied to
+    -2^25 beside 2^25, zero (base review 644ef5535 F1); laid as the TPU forked scan lays it too."""
+    from dew.nn.kernels.chunked_launch import entry_write
+
+    terms = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24), -2.0], jnp.float32)
+    key = jnp.ones((6, 1), jnp.float32)
+    value = terms[None, :] if values_first else terms[:, None]
+
+    def written(weight):
+        return entry_write(key, value, weight, values_first=values_first)[0, 0]
+
+    weight = jnp.float32(1.0)
+    assert float(written(weight)) == -2.0
+    assert float(jax.jvp(written, (weight,), (jnp.float32(1.0),))[1]) == -2.0
+    assert float(jax.grad(written)(weight)) == -2.0
+
+
 def test_a_turned_forked_calls_cancelling_entry_write_is_as_exact_as_each_document_alone():
     """A turned forked call whose documents' entry writes take two terms of 2^127 that cancel beside a third
     more than float32's exponent range below them (`cancelling_entries_draw`): its output, the row's last
