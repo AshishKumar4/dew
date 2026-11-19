@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -59,6 +60,8 @@ from dew.nn.sharding import manual_map, sequence_shards
 
 if TYPE_CHECKING:
     from dew.nn.inputs import Admitted
+
+_log = logging.getLogger(__name__)
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
 """The storage formats a quantized cache takes."""
@@ -1604,9 +1607,83 @@ class Append:
 def unpaged(layout: KVCache) -> KVCache:
     """`layout` unpaged, each row's cache whole in its own slots (`page_size`, `pages` and `groups` dropped),
     its format kept: a server's 'whole' rows (`dew.inference.serving`), and the cache a strategy that
-    regroups its rows decodes over (`dew.sampling.strategies.Regrouping`), which a paged pool's shared pages
-    cannot hold."""
+    regroups its rows decodes over where its pool is split among groups (`regrouped_layout`)."""
     return dataclasses.replace(layout, page_size=None, pages=None, groups=1)
+
+
+def regrouped_layout(layout: KVCache, prompts: int, width: int, prompt: int, new_tokens: int,
+                     capacity: int, *, rebuilds: bool = False) -> KVCache:
+    """The layout a search that regroups its rows (`dew.sampling.strategies.Regrouping`) decodes over:
+    `prompts` rows of `prompt` slots prefilled, then `width` rows each, `new_tokens` more tokens apiece (the
+    steps its loop advances them, past its budget too).
+
+    A pool split among groups (`KVCache.groups`) decodes unpaged (`unpaged`), said in the log: a regrouped
+    row's parent may lie in another group's part (row 8493); so does a model that rebuilds its cache past a
+    position (`rebuilds`, LongRoPE's), whose rebuild opens every row its own block and picks its leaves by
+    row (row 8494). An undivided pool keeps its pages, a regrouped row sharing its parent's
+    written ones (`gather_cache_rows`), sized for both phases: the prefill's tables give each prompt row
+    its whole block (`default_page_table`, `refuse_unassigned`), `prompts * per_row` pages; past the branch,
+    a prompt of `f` whole pages, which its rows share, holds at most `f + width * min(own, per_row - f)`,
+    each row's own pages past them at most `own = ceil(new_tokens / page_size) + 1` (the prompt's last part
+    page and its decoded tokens' pages, the page its next token lands in among them) and no more than its
+    table's columns past the shared ones. That count grows with `f` while `own` binds and falls after, so a
+    prompt of at most `prompt // page_size` whole pages holds the most at the least of that and
+    `per_row - own`; never more than its rows' whole blocks, the dense cache's slots. A layout naming a
+    smaller pool is refused, with the least it can be. A dense layout is the layout."""
+    if layout.page_size is None:
+        return layout
+    if layout.groups > 1 or rebuilds:
+        row = 8494 if rebuilds else 8493
+        _log.info("a search that regroups its rows decodes its paged cache unpaged, each row's cache "
+                  "whole: %s (row %d)", "its model rebuilds its cache past a position" if rebuilds
+                  else f"its pool is split among {layout.groups} groups", row, extra={"row": row})
+        return unpaged(layout)
+    size = layout.page_size
+    per_row, own = capacity // size, -(-new_tokens // size) + 1
+    whole = min(prompt // size, max(0, per_row - own))
+    least = max(prompts * per_row, prompts * (whole + width * min(own, per_row - whole)))
+    if layout.pages is None:
+        return dataclasses.replace(layout, pages=least)
+    if layout.pages < least:
+        raise ValueError(f"a search of {width} rows a prompt over {prompts} prompts of {prompt} slots, "
+                         f"{new_tokens} new tokens each, needs a pool of at least {least} pages of {size} "
+                         f"slots; the layout names {layout.pages}")
+    return layout
+
+
+def _banked_page_copies(bank: jax.Array, own: jax.Array, parents: jax.Array) -> jax.Array:
+    """An offloaded bank's pool `[layers, heads, pages, ...]` with each layer's pages `parents` `[layers,
+    rows]` copied to its pages `own`, a layer at a time and a page at a time where the bank lies: each
+    layer's pages read to the device before any of them is written (a row's own page may be another's
+    parent's; one layer's pages never another's), a page past the pool read and written as none."""
+    layers, count = own.shape
+    last = bank.shape[2] - 1
+    extent = (1, bank.shape[1], 1, *bank.shape[3:])
+
+    def start(layer, page) -> tuple[jax.Array, ...]:
+        # Every index int32, as a slice's starts must share one dtype (`fetched_at`'s).
+        zero = jnp.zeros((), jnp.int32)
+        return (jnp.asarray(layer, jnp.int32), zero, jnp.minimum(jnp.asarray(page, jnp.int32), last),
+                *(zero,) * (bank.ndim - 3))
+
+    def layer_copies(layer, pool: jax.Array) -> jax.Array:
+        def read(row, pages: jax.Array) -> jax.Array:
+            page = fetched(jax.lax.dynamic_slice(pool, start(layer, parents[layer, row]), extent))
+            return pages.at[row].set(page[0, :, 0])
+
+        held = jax.lax.fori_loop(0, count, read, jnp.zeros((count, bank.shape[1], *bank.shape[3:]),
+                                                           bank.dtype))
+
+        def write(row, pool: jax.Array) -> jax.Array:
+            target = own[layer, row]
+            page = placed_like(pool, held[row][None, :, None])
+            return jax.lax.cond(target <= last,
+                                lambda pool: jax.lax.dynamic_update_slice(pool, page, start(layer, target)),
+                                lambda pool: pool, pool)
+
+        return jax.lax.fori_loop(0, count, write, pool)
+
+    return jax.lax.fori_loop(0, layers, layer_copies, bank)
 
 
 def gather_cache_rows(cache, rows):
@@ -1618,16 +1695,98 @@ def gather_cache_rows(cache, rows):
     delta net's states, latent attention's cache, image groups, a multimodal
     model's next position. `rows` is any index array: repeats duplicate a row's
     state, a permutation reparents rows, a different length changes the row
-    count; beam branching and speculative rollback are both this. A paged cache
-    is refused, since gathered rows would write into each other's pages.
+    count; beam branching and speculative rollback are both this. A paged
+    store's rows share their parents' pages instead (`_regrouped_pages`), its
+    pool (`POOLED`) never gathered by row.
     """
-    if is_paged(cache):
-        raise ValueError("a strategy regrouped cache rows, which a paged cache's shared pool cannot do; a "
-                         "strategy that regroups states it (dew.sampling.strategies.Regrouping), and "
-                         "generate decodes it over a dense cache")
-    return jax.tree_util.tree_map_with_path(
-        lambda path, leaf: on_device(lambda held: jnp.take(held, rows, axis=0), leaf,
-                                     banked=bool(row_axis(path))), cache)
+    leaves, structure = jax.tree_util.tree_flatten_with_path(cache)
+    # Each paged store, by its path, its leaves by their names and their places among the cache's.
+    stores: dict[tuple, dict[str, tuple[int, jax.Array]]] = {
+        path[:-1]: {} for path, _ in leaves if leaf_name(path) == TABLE}
+    regrouped = []
+    for index, (path, leaf) in enumerate(leaves):
+        name = leaf_name(path)
+        if path[:-1] in stores and name is not None:
+            stores[path[:-1]][name] = index, leaf
+        regrouped.append(None if path[:-1] in stores else on_device(
+            lambda held: jnp.take(held, rows, axis=0), leaf, banked=bool(row_axis(path))))
+    for path, named in stores.items():
+        written = _regrouped_pages({name: leaf for name, (_, leaf) in named.items()}, rows,
+                                   bool(row_axis((*path, jax.tree_util.DictKey(TABLE)))))
+        for name, (index, _) in named.items():
+            regrouped[index] = written[name]
+    return jax.tree_util.tree_unflatten(structure, regrouped)
+
+
+def _regrouped_pages(store: Mapping[str, jax.Array], rows: jax.Array, banked: bool) -> dict[str, jax.Array]:
+    """One paged store's leaves (`TABLE`'s and its siblings', by name) reindexed on its rows by `rows`,
+    as `gather_cache_rows` reindexes a dense one, each new row reading as its parent read: its per-row
+    leaves (its table, its cursor) gathered, and the pages its parent wrote whole (before the parent's
+    cursor's page) shared, read only; the page its next token lands in its own: its parent's, for the
+    first new row of each parent whose page no row reads as written, else a free page of the pool (one no
+    new row's table holds below its cursor's page, nor a kept one) with the parent's tokens in it copied.
+    A table's columns past a row's cursor's page hold that page again, which a decode's kernels read
+    whole tiles of past a row's length and every reader masks: a regrouped row writes into its cursor's
+    page alone before it is regrouped again, as a beam's step does. A pool too small for every new row's
+    page drops the writes of those past it, as a write past any paged pool does; `generate` sizes the pool
+    for its search. Under a bank (`banked`) each layer's store alike; an offloaded pool
+    (`KVCache.offloaded`) unbanked moves the pages copied alone, a banked one a layer at a time."""
+    cursor_name = next(name for name in store if name in ROW_CURSORS)
+    payload = store["cached_key"]
+    axis = 2 if banked else 1
+    pages, size = payload.shape[axis], payload.shape[axis + 1]
+    columns = store[TABLE].shape[-1]
+
+    parents_of = jnp.where(rows < 0, rows + store[TABLE].shape[-2], rows)
+    # Each new row is its parent's first where it is the least new row of that parent.
+    least = jnp.full(store[TABLE].shape[-2], rows.shape[0]).at[parents_of].min(jnp.arange(rows.shape[0]))
+    first = least[parents_of] == jnp.arange(rows.shape[0])
+
+    def placed(table: jax.Array, cursor: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """A layer's new table, and the pages its copies read (`parents`) and write (`own`), the pool's size
+        where a row copies nothing."""
+        table, cursor = table[parents_of], cursor[parents_of]
+        tail = cursor // size
+        written = jnp.arange(columns)[None, :] < tail[:, None]
+        read = jnp.zeros(pages, bool).at[jnp.where(written, table, pages)].set(True, mode="drop")
+        writes = tail < columns
+        parent = jnp.where(writes, jnp.take_along_axis(table, jnp.minimum(tail, columns - 1)[:, None],
+                                                        axis=1)[:, 0], pages)
+        keep = first & (parent < pages) & ~read[jnp.minimum(parent, pages - 1)]
+        held = read.at[jnp.where(keep, parent, pages)].set(True, mode="drop")
+        fresh = writes & ~keep
+        free = jnp.nonzero(~held, size=rows.shape[0], fill_value=pages)[0]
+        own = jnp.where(fresh, free[jnp.cumsum(fresh) - 1], pages)
+        tail_page = jnp.where(keep, parent, own)
+        table = jnp.where(written, table, tail_page[:, None])
+        # A parent whose cursor's page holds no token yet (at a page's start, its column the page before
+        # again or none) leaves its child's empty.
+        copies = fresh & (parent < pages) & (cursor % size > 0)
+        return table, jnp.where(copies, parent, pages), jnp.where(copies, own, pages)
+
+    allot = jax.vmap(placed) if banked else placed
+    table, parents, own = allot(store[TABLE], store[cursor_name])
+
+    def copied(pool: jax.Array, own: jax.Array, parents: jax.Array) -> jax.Array:
+        # Every parent's page read before any is written: a row's own page may be another's parent's.
+        return pages_written(pool, own, pages_read(pool, parents, 1), 1)
+
+    regrouped = {}
+    for name, leaf in store.items():
+        if name == TABLE:
+            regrouped[name] = table
+        elif name in POOLED:
+            # An offloaded pool's pages move a page at a time (`pages_read`, `pages_written`; a bank's,
+            # `_banked_page_copies`), a resident bank's layers mapped.
+            if not banked:
+                regrouped[name] = copied(leaf, own, parents)
+            elif on_host(leaf):
+                regrouped[name] = _banked_page_copies(leaf, own, parents)
+            else:
+                regrouped[name] = jax.vmap(copied)(leaf, own, parents)
+        else:
+            regrouped[name] = on_device(lambda held: jnp.take(held, rows, axis=0), leaf, banked=banked)
+    return regrouped
 
 
 def cache_positions(module: nn.Module, batch: int, length: int, valid) -> jax.Array:

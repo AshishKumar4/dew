@@ -21,16 +21,25 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation
 from dew.nn.kv_cache import (
     BOUND,
+    CURSOR,
+    DOCUMENTS,
+    TABLE,
     TPU_PAGED_SUPPORTS,
     KVCache,
     KVSpec,
     KVStore,
+    _banked_page_copies,
     _gather_pages,
     _gathered_attention,
+    default_page_table,
+    gather_cache_rows,
     gpu_paged,
     hadamard,
     overflowed,
+    pages_read,
+    pages_written,
     quantize,
+    regrouped_layout,
     rotated,
     write_cache,
     write_tokens,
@@ -724,3 +733,108 @@ def test_a_vector_below_the_formats_scale_quantizes_finitely(quantized):
     np.testing.assert_array_equal(np.asarray(scale)[:2], [1.0, 1.0])
     np.testing.assert_array_equal(restored[:2], 0.0)
     assert np.asarray(scale)[2] != 1.0
+
+
+def test_a_paged_stores_regrouped_rows_share_their_parents_written_pages_and_write_their_own():
+    """A paged store regrouped by `rows` (`gather_cache_rows`: a beam's branches, a parent's rows repeated,
+    one dropped) reads, for each new row, its parent's tokens below its cursor; the pages its parent
+    wrote whole are shared, the same pages in every child's table; the page its next token lands in is its
+    own, its parent's for the first child (no copy) and a free page holding the parent's tokens for the
+    rest, so a token each row then writes at its cursor reaches that row alone (row 8034)."""
+    size, columns, pages = 2, 4, 10
+    # A parent's cursor inside its page and one at a page's end, whose next page holds nothing yet.
+    cursor = jnp.asarray([5, 4], jnp.int32)
+    held = jnp.arange(pages * size, dtype=jnp.float32).reshape(1, pages, size, 1) + 100
+    store = {TABLE: default_page_table(2, columns, pages, 1), CURSOR: cursor, "cached_key": held,
+             "cached_value": -held, BOUND: jnp.ones((1, pages, size)), DOCUMENTS: jnp.ones((1, pages, size),
+                                                                                         jnp.int32)}
+    rows = jnp.asarray([0, 0, 1, 0], jnp.int32)
+    regrouped = gather_cache_rows({"layer": store}, rows)["layer"]
+    table, keys = np.asarray(regrouped[TABLE]), np.array(regrouped["cached_key"])
+
+    def slots(table, pool, row, count):
+        return [float(pool[0, table[row, slot // size], slot % size, 0]) for slot in range(count)]
+
+    old = np.asarray(store[TABLE])
+    for row, parent in enumerate(np.asarray(rows)):
+        count = int(cursor[parent])
+        assert slots(table, keys, row, count) == slots(old, np.asarray(held), parent, count), row
+        np.testing.assert_array_equal(table[row, :count // size], old[parent, :count // size])
+    np.testing.assert_array_equal(np.asarray(regrouped[CURSOR]), np.asarray(cursor)[np.asarray(rows)])
+    tails = [table[row, int(cursor[parent]) // size] for row, parent in enumerate(np.asarray(rows))]
+    assert tails[0] == old[0, 2] and tails[2] == old[1, 2], "a first child keeps its parent's page"
+    written = {int(page) for row, parent in enumerate(np.asarray(rows))
+               for page in table[row, :int(cursor[parent]) // size]}
+    assert len(set(tails)) == len(tails) and not written & set(tails)
+    np.testing.assert_array_equal(np.asarray(regrouped["cached_value"]), -keys)
+
+    for row, parent in enumerate(np.asarray(rows)):
+        slot = int(cursor[parent])
+        keys[0, table[row, slot // size], slot % size, 0] = -row - 1
+    for row, parent in enumerate(np.asarray(rows)):
+        count = int(cursor[parent])
+        assert slots(table, keys, row, count + 1) == [*slots(old, np.asarray(held), parent, count), -row - 1]
+
+    # Regrouped again past those tokens: a cursor at a page's end, whose next page no table holds yet,
+    # leaves its children's new pages empty and every child reading its parent's tokens.
+    later = {**regrouped, "cached_key": jnp.asarray(keys), CURSOR: regrouped[CURSOR] + 1}
+    again = gather_cache_rows({"layer": later}, jnp.asarray([1, 1, 0, 3], jnp.int32))["layer"]
+    for row, parent in enumerate([1, 1, 0, 3]):
+        count = int(later[CURSOR][parent])
+        assert slots(np.asarray(again[TABLE]), np.asarray(again["cached_key"]), row, count) == slots(
+            table, keys, parent, count), row
+    assert not np.isnan(np.asarray(again["cached_key"])).any()
+    # Past its cursor's page a row's table holds that page again, which a kernel's whole tile reads.
+    for row, parent in enumerate([1, 1, 0, 3]):
+        tail = int(later[CURSOR][parent]) // size
+        assert set(np.asarray(again[TABLE])[row, tail:]) == {np.asarray(again[TABLE])[row, tail]}, row
+
+    # Negative rows are their rows from the end: two children of the last parent keep one page between them.
+    negative = np.asarray(
+        gather_cache_rows({"layer": store}, jnp.asarray([-1, 1], jnp.int32))["layer"][TABLE])
+    tail = int(cursor[1]) // size
+    assert negative[0, tail] != negative[1, tail]
+
+
+@pytest.mark.parametrize("wide", [False, True], ids=["int32", "x64"])
+def test_an_offloaded_banks_regrouped_pages_copy_as_a_resident_banks_do(wide):
+    """The page-at-a-time copies an offloaded bank's regrouped pages take (`_banked_page_copies`) give a
+    resident bank's (`pages_read` then `pages_written`, each layer's), a layer's two pages swapped among
+    them, so each layer's pages are read before any is written, and a page past the pool written as none;
+    under 64-bit indices too, whose loop counts its slices' starts must share a dtype with."""
+    bank = jnp.arange(2 * 6 * 2, dtype=jnp.float32).reshape(2, 1, 6, 2, 1)
+    own = jnp.asarray([[1, 0, 6], [2, 5, 6]], jnp.int32)
+    parents = jnp.asarray([[0, 1, 6], [3, 2, 6]], jnp.int32)
+    resident = jax.vmap(lambda leaf, own, parents: pages_written(leaf, own, pages_read(leaf, parents, 1), 1))
+    with jax.enable_x64(new_val=wide):
+        copied = _banked_page_copies(bank, own, parents)
+    np.testing.assert_array_equal(np.asarray(copied), np.asarray(resident(bank, own, parents)))
+
+
+def test_an_offloaded_banks_regrouped_page_copies_lower_with_the_bank_in_host_memory():
+    """`_banked_page_copies` over a bank in host memory (`KVCache.offloaded`'s, as a held-banks server keeps
+    it) compiles for an A100 (`compile_programs`), its pages read to the device and written where the bank
+    lies (`dew.nn.host_memory`), its result in host memory."""
+    from dew.training.ahead import compile_programs
+
+    def regrouped(bank, own, parents):
+        copied = _banked_page_copies(jax.device_put(bank, jax.memory.Space.Host), own, parents)
+        assert jax.typeof(copied).memory_space is jax.memory.Space.Host
+        return copied
+
+    shapes = [jax.ShapeDtypeStruct((2, 1, 6, 2, 1), jnp.float32), jax.ShapeDtypeStruct((2, 3), jnp.int32),
+              jax.ShapeDtypeStruct((2, 3), jnp.int32)]
+    compile_programs({"regrouped": (regrouped, shapes)}, "sm80")
+
+
+@pytest.mark.parametrize(("layout", "rebuilds", "row"), [(KVCache(page_size=2, groups=2), False, 8493),
+                                                          (KVCache(page_size=2), True, 8494)],
+                         ids=["groups", "rebuilds"])
+def test_a_search_regrouping_rows_unpaged_says_so(layout, rebuilds, row, caplog):
+    """A search that regroups its rows decodes a pool split among groups, or a model that rebuilds its cache,
+    unpaged (`regrouped_layout`), each row's cache whole (no page size, no pool, its format kept), and says
+    so in the log with the gap's row, never silently."""
+    with caplog.at_level("INFO", logger="dew.nn.kv_cache"):
+        chosen = regrouped_layout(layout, 2, 3, 5, 6, 24, rebuilds=rebuilds)
+    assert (chosen.page_size, chosen.pages, chosen.quantized) == (None, None, layout.quantized)
+    assert [getattr(record, "row", None) for record in caplog.records] == [row]

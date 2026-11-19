@@ -55,8 +55,8 @@ from dew.nn.kv_cache import (
     offloaded,
     on_device,
     refuse_unassigned,
+    regrouped_layout,
     row_axis,
-    unpaged,
     with_rounding_keys,
     with_rounding_keys_of,
     write_cache,
@@ -1082,9 +1082,12 @@ def generate(model: nn.Module, params: Variables,
     ``stopping`` adds criteria beside the policy's EOS criterion and never
     replaces it. ``strategy`` replaces the per-row draw loop; ``None`` uses
     ``Sample``. A strategy that reparents its rows (``Regrouping``: ``Beam``)
-    decodes over the model's cache unpaged, each row's whole, since a paged
-    pool's shared pages cannot hold a regrouped row; its memory is the dense
-    model's, not the pages'. A policy with ``stop`` strings
+    decodes over the model's cache as ``regrouped_layout`` lays it: an
+    undivided paged pool keeps its pages, sized for the search, each
+    regrouped row sharing its parent's written pages, so a prompt is held
+    once across its beams; a pool split among groups decodes unpaged, each
+    row's cache whole. A pool named smaller than the search needs is
+    refused, with the least it can be. A policy with ``stop`` strings
     raises ``ValueError``, because ``generate`` has no tokenizer to compile
     them against.
 
@@ -1110,9 +1113,6 @@ def generate(model: nn.Module, params: Variables,
         raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
                          "have; generate through a TextGeneration with a processor, or pass "
                          "stopping=(decoding.stop_strings(tokenizer, strings, vocab_size),)")
-    if isinstance(strategy, Regrouping) and isinstance(model, Layered):
-        # A search reparenting its rows holds them whole, which a paged pool's shared pages cannot.
-        model = model.with_kv_cache(unpaged(model.kv_cache))
     scanned = max_new_tokens if trips is None else trips
     request, components = Request.prepare(
         inputs, key, mesh_of(params),
@@ -1121,6 +1121,12 @@ def generate(model: nn.Module, params: Variables,
         phase="generation")
     plan = request.plan
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
+    if isinstance(strategy, Regrouping) and isinstance(model, Layered) and capacity is not None:
+        # A search reparenting its rows, its pool sized for them, or unpaged where groups split it.
+        prompt = request.inputs.tokens.shape[1]
+        model = model.with_kv_cache(regrouped_layout(model.kv_cache, plan.count, strategy.width, prompt,
+                                                     scanned, capacity,
+                                                     rebuilds=rebuild_position(model) is not None))
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
     from dew.nn.projections import pending
