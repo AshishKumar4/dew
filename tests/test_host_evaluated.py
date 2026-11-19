@@ -136,3 +136,20 @@ def test_a_scalar_of_a_numpy_subclass_folds_as_jax_canonicalizes_it():
     x = np.array(3, dtype=np.int32).view(_Dispatchless)
     (made,) = programs.host_evaluated(lax.add_p, (x, x), {})
     assert np.asarray(made).dtype == np.int32 and int(np.asarray(made)) == 6
+
+
+def test_a_trees_holes_take_a_mask_as_they_take_a_predicate():
+    """`programs.holes` keeps the leaves a mask marks (one bool per leaf in JAX's flatten order, a dict's by
+    its sorted keys) as it keeps those a predicate selects, equal leaves apart by their places, its `fill`
+    putting values back in those places and every other leaf as it was; a mask shorter or longer than the
+    leaves refused (row 8839)."""
+    tree = ({"b": 7, "a": 7}, [7, 4.0])
+    # Flatten order: a's 7, b's 7, the list's 7, 4.0.
+    kept, fill = programs.holes(tree, [False, True, False, True])
+    assert kept == [7, 4.0]
+    assert fill([20, 30]) == ({"b": 20, "a": 7}, [7, 30])
+    by_predicate, _ = programs.holes(tree, lambda leaf: leaf == 4.0)
+    assert by_predicate == [4.0]
+    for mask in ([True, False], [True, False, False, False, True]):
+        with pytest.raises(ValueError):
+            programs.holes(tree, mask)
