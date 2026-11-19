@@ -559,6 +559,37 @@ def test_the_mosaic_walk_drops_a_slice_at_its_global_places(training, sliced):
         np.testing.assert_array_equal(value_grads.transpose(0, 2, 3, 1), expected)
 
 
+def test_a_mosaic_dropping_backwards_tiny_split_mean_keeps_its_query_gradient():
+    """A bf16 Mosaic call interpreted for an H100, one query of first coordinate 1 over keys of second
+    coordinate 1 and of first -22, values 0 and of first 2^-126, dO of first 2^73, scale 1, at a rate of
+    1 - 2^-53 drawing words (3181759654, 0): the split mean
+    of the second key's value, weighed e^-22, is below fp32's least subnormal once its power of 2^53 comes
+    out, so D contracts it with dO in the power its sums hold (`attention_gradient.split_delta`): dQ about
+    -2.79e-10, on par with the reference's (check 1), where it was 0 (the base review of eb3ab2670, F1)."""
+    rate = 1.0 - 2.0 ** -53
+    words = jnp.asarray([3181759654, 0], jnp.uint32)
+    hooks, spans = hooked(words, 1, 1, rate), template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(1)
+    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 1].set(1).at[0, 1, 0, 0].set(-22)
+    value = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 1, 0, 0].set(2.0 ** -126)
+    dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(2.0 ** 73)
+
+    def ours(query, key, value, dout):
+        with generation.assumed("sm90", interpreted=True):
+            _, *residuals = attention_mosaic.forward(query, key, value, spans, hooks, scale=1.0,
+                                                     residuals=template.Kept.SPLIT, interpret=True)
+            grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                              scale=1.0, interpret=True)
+        return grads.query, grads.key, grads.value
+
+    def reference(query, key, value, dout):
+        _, pull = jax.vjp(lambda *qkv: template.reference(*qkv, spans, hooks, scale=1.0), query, key, value)
+        return pull(dout)
+
+    assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
+                    "a dropping split mean below fp32's least subnormal", seeds=FEWEST_SEEDS)
+
+
 def three_identical_keys():
     """One zero query of width 16 over three identical keys (first coordinate 1), values (0.75, 3u, 0, ...)
     with u = 2^-23, and dO = (1, 1, 0, ...), in bf16: at a rate of 1/2 each kept product is 2 (0.75 + 3u)."""

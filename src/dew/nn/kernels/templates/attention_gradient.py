@@ -260,36 +260,42 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     (`read`)."""
     multiplier = np.float32(dropped)
     over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
-    # A normalized row's sums are its output, which took the multiplier (`algebra.dropped_total`); another
-    # row's hold its power of two, taken out exactly after the total (before it, over 2^-126 times 2^-24
-    # flushed to 0).
-    taken = (None if dropped == 1.0 else
-             jnp.where(normalized_rows(shift), np.float32(1 / dropped), np.float32(1 / power)))
     # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
     # and the state's share of D about the anchor with it (row 2466).
     state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = rows(anchor_value, cotangent)
-    if taken is None:
-        others = others * expand(over, others)
-    else:
-        # The sums' power taken out after the total where their mean is finite (before it, over 2^-126 times
-        # 2^-24 flushed to 0); where it passes fp32's largest before the power comes out (sums of 18 2^126
-        # over a total of 4, the base review of e2b671ce9, F2), both in one division.
-        mean = others * expand(over, others)
-        divisor = jnp.where(normalized_rows(shift), np.float32(dropped),
-                            power2(total, -shift) * np.float32(power))
-        divided = others / expand(jnp.where(finite(divisor) & (divisor > 0), divisor, 1.0), others)
-        others = jnp.where(finite(mean), mean * expand(taken, others), divided)
-    own, others_total = own * over, others_total * over
-    about_zero = rows(read(split_output(others, own, anchor_value), cotangent), cotangent)
-    off_anchor = others - expand(others_total, anchor_value) * anchor_value
-    about_anchor = rows(read(off_anchor, cotangent), cotangent) - state_weight * anchor
-    anchor, delta, chosen = nearer_centre(anchor, about_anchor, about_zero, key_index)
+    mean = others * expand(over, others)
+
+    def centred(others: jax.Array, unit) -> tuple[jax.Array, jax.Array, jax.Array]:
+        # D's centre and numerators about it and about 0, each term in the units `unit` of `others`.
+        own_held, others_held = own * over * unit, others_total * over * unit
+        about_zero = rows(read(split_output(others, own_held, anchor_value), cotangent), cotangent)
+        off_anchor = others - expand(others_held, anchor_value) * anchor_value
+        return (anchor * unit, rows(read(off_anchor, cotangent), cotangent) - state_weight * unit * anchor,
+                about_zero)
+
     if dropped == 1.0:
-        return anchor, delta, chosen
-    return anchor * multiplier, delta * multiplier, chosen
+        return nearer_centre(*centred(mean, 1.0), key_index)
+    # A dropping call's: in the power its sums hold (`algebra.Forward.units`), contracted with dO before it
+    # comes out, so a mean the power takes below fp32's least subnormal keeps its bits (2^-126 at a weight of
+    # e^-22 and a power of 2^53, dQ 0 where it is -2.79e-10, the base review of eb3ab2670, F1); where those
+    # pass fp32's largest, and on a normalized row (an output's sums, which took the multiplier), the power
+    # taken out first, after the total where the mean is finite, else in one division with it (sums of
+    # 18 2^126 over a total of 4, the base review of e2b671ce9, F2).
+    held = jnp.where(normalized_rows(shift), np.float32(1), np.float32(power))
+    divisor = jnp.where(normalized_rows(shift), multiplier, power2(total, -shift) * np.float32(power))
+    divided = others / expand(jnp.where(finite(divisor) & (divisor > 0), divisor, 1.0), others)
+    in_units = centred(mean, held)
+    taken = jnp.where(normalized_rows(shift), np.float32(1 / dropped), np.float32(1 / power))
+    plain = centred(jnp.where(finite(mean), mean * expand(taken, mean), divided), 1.0)
+    kept = ~normalized_rows(shift) & finite(in_units[0]) & finite(in_units[1]) & finite(in_units[2])
+    centre, about_anchor, about_zero = (jnp.where(kept, held_term, plain_term)
+                                        for held_term, plain_term in zip(in_units, plain, strict=True))
+    anchor, delta, chosen = nearer_centre(centre, about_anchor, about_zero, key_index)
+    factor = jnp.where(kept, multiplier / held, multiplier)
+    return anchor * factor, delta * factor, chosen
 
 
 def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift: jax.Array) -> jax.Array:
