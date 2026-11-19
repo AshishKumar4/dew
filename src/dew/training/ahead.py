@@ -382,6 +382,11 @@ class AheadOfTime:
     (`dew.training.phase_passes.SampledPasses`): every count's step but its cap's, the step's own, at its
     plan (`StepCompiler.admitted_at`), with its sampled step where the run inspects, by count, which a run
     handed the step takes in place of compiling them (`at_count`); none for any other run."""
+    at_run: bool = False
+    """Whether any executable it holds, its step's, its sampled step's, its counts' or its starts', leaves a
+    choice to run time its device's own compile makes (`report.left_at_run`: a convolution compiled for
+    compile-only GPUs): a run handed it compiles its step and starts on its devices in their place
+    (`runnable`), whatever it tunes."""
     starts: dict[str, Executable] = dataclasses.field(default_factory=dict)
     """The programs a run builds its fresh state with before its first step and that step's own copies of
     its weights (`dew.training.distributed.start_compiled`, the narrowed copies), compiled for the target
@@ -431,13 +436,6 @@ class AheadOfTime:
         step on its devices in its place (`runnable`); a TPU's is the device's own."""
         return boolean(record(self.plan, "plan")["autotuned"], "autotuned")
 
-    @property
-    def at_run(self) -> bool:
-        """Whether it leaves a choice to run time its device's own compile makes, as its plan records it
-        (`at_run_time`, `report.at_run_time`: a convolution compiled for compile-only GPUs): a run handed it
-        compiles its step on its devices in its place (`runnable`), whatever it tunes."""
-        return boolean(record(self.plan, "plan")["at_run_time"], "at_run_time")
-
     def runnable(self, devices: Sequence) -> AheadOfTime | None:
         """The step a run on `devices` handed it runs: this one where it is tuned, or where the run's own
         compile would take no tuned choice either (`report.autotuned`: XLA_FLAGS setting the autotuner's
@@ -461,12 +459,12 @@ class AheadOfTime:
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
-        if ("starts" not in vars(step) or "counts" not in vars(step)
-                or not {"autotuned", "at_run_time"} <= record(step.plan, "plan").keys()):
+        if ("starts" not in vars(step) or "counts" not in vars(step) or "at_run" not in vars(step)
+                or "autotuned" not in record(step.plan, "plan")):
             raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
                              "programs (`starts`), a sampled pass count's other counts' steps (`counts`) and "
                              "said whether XLA tuned them and left a choice to run time (`autotuned`, "
-                             "`at_run_time`); compile it ahead again")
+                             "`at_run`); compile it ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         counted = [program.executable for held in step.counts.values() for program in held
                    if program is not None]
@@ -938,7 +936,8 @@ def lowering_for(generation: str, multiprocessors: int | None = None) -> Iterato
 
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
                      generation: str, multiprocessors: int | None = None, *,
-                     compiled: Compile = owned_program, topology: str | Path | None = None) -> AheadPrograms:
+                     compiled: Compile = owned_program, topology: str | Path | None = None,
+                     memory_only: bool = False) -> AheadPrograms:
     """`programs`, each a function and its arguments' shapes, dtypes and weak types (each a
     `ShapeDtypeStruct` or an abstract value), by its name, compiled ahead for
     one GPU of the CUDA `generation`, of the `multiprocessors` it states (`built_target`), on any host holding
@@ -956,7 +955,10 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     (`report.for_devices`), a choice none has tuned refused, named; over the generation's canonical GPUs
     it is XLA's untuned program, which its file says (`AheadPrograms.tuned`) and a tuning process refuses
     to load (row 8422). A program holding a choice only its GPU makes (`report.at_run_time`: a convolution)
-    is refused before any compiles (`report.CompiledOnDevice`, naming each): no GPU's load would take it."""
+    is refused before any compiles (`report.CompiledOnDevice`, naming each): no GPU's load would take it.
+    With `memory_only` every program compiles read offline (`report.read_offline`), refused for none, for
+    its memory alone (`Executable.memory`, a convolution's workspace XLA's default where its device's
+    compile may pick another): programs no process loads, which a prepare sizes a run by."""
     target = built_target(generation, multiprocessors)
     gpus = (compile_only_gpus(generation, multiprocessors=multiprocessors) if topology is None
             else host_gpus(generation, topology, 1))
@@ -980,10 +982,11 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     # whose kernel spills there is derived again at its next config; for a node, tuned or refused.
     at_run = tuple(name for name, (lowered, _, _) in zip(programs, lowerings, strict=True)
                    if report.at_run_time(lowered))
-    if at_run:
+    if at_run and not memory_only:
         # Their run compiles them on its GPU, whose choices they would leave to run time here.
         raise report.CompiledOnDevice(lowerings[0][0], at_run)
-    with report.for_devices() if topology is not None else contextlib.nullcontext():
+    with (report.read_offline() if memory_only else report.for_devices() if topology is not None
+          else contextlib.nullcontext()):
         tuned = report.autotuned(gpus[:1])
         try:
             executables = report.compiled_at_once(lowerings)
@@ -1549,6 +1552,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         sampled = AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
+    held = [compiled, *starts.values(), *(each.executable for each in admitted.values()),
+            *(each.sampled.executable for each in (planned, *admitted.values()) if each.sampled is not None)]
     memory = compiled_memory(compiled)
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
@@ -1562,10 +1567,12 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), need, topology=topology),
-        refusals=report.refused_launches(), sampled=sampled, starts=starts, counts=counts)
+        refusals=report.refused_launches(), sampled=sampled, counts=counts,
+        at_run=any(report.left_at_run(each) for each in held),
+        starts={digest: Executable.of(executable) for digest, executable in starts.items()})
 
 
-def _step_need(planned: Planned, counts: Iterable[Planned], starts: Mapping[str, Executable],
+def _step_need(planned: Planned, counts: Iterable[Planned], starts: Mapping[str, jax.stages.Compiled],
                device) -> int | None:
     """What a device must hold to run a step compiled ahead (`programs_need`): its step and every pass
     count's, each with its sampled step, beside the bytes their loop keeps (`Candidate.held`), and the
@@ -1575,7 +1582,7 @@ def _step_need(planned: Planned, counts: Iterable[Planned], starts: Mapping[str,
                 for each in steps]
     programs += [(compiled_memory(each.sampled.executable), each.candidate.held, each.candidate.built)
                  for each in steps if each.sampled is not None]
-    programs += [(executable.memory, 0, 0) for executable in starts.values()]
+    programs += [(compiled_memory(executable), 0, 0) for executable in starts.values()]
     return programs_need(device, programs)
 
 
@@ -1617,7 +1624,7 @@ def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch:
 
 
 def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
-                             plan: FitPlan | None = None) -> dict[str, Executable]:
+                             plan: FitPlan | None = None) -> dict[str, jax.stages.Compiled]:
     """The programs a run of `trainer` compiles besides its step, compiled for the target over their
     arguments' shapes (`AheadOfTime.starts`): its fresh state's build and placement (`start_compiled`), for
     a run that starts afresh, the first step's narrowed copies of its weights where the plan reads some
@@ -1645,7 +1652,7 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
             narrowing(candidate.copies, candidate.shardings.compute).compiled(
                 variables)
     collected.update(_results_programs(trainer, start, planned, plan))
-    return {digest: Executable.of(executable) for digest, executable in collected.items()}
+    return collected
 
 
 def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,

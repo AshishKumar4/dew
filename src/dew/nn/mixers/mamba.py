@@ -106,9 +106,9 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
 
     def scanned(h, step):
         x_c, dt_c, B_c, C_c, reset_c = step   # [B, C, D] twice, [B, C, N] twice, [B, C]
-        # The kernels' decay (`recurrence_algebra.selective_decay`), its rate in base 2, zero at a reset.
-        decay = recurrence_algebra.selective_decay(dt_c[..., None], A * recurrence_algebra.LOG2_E,
-                                                   1.0 - reset_c[..., None, None].astype(work))
+        # The kernels' decay (`recurrence_algebra.selective_decay`), zero at a reset.
+        kept = 1.0 - reset_c[..., None, None].astype(work)
+        decay = recurrence_algebra.selective_decay(dt_c[..., None], A, kept)
         write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
         # The reference's `combine_fn` (modeling_mamba.py:231-234), from the state entering the chunk.
         states = affine_states(decay, write, h, axis=1)

@@ -95,6 +95,13 @@ class Flow:
     rows: int = 2
     length: int = 256
     prefill: int = 248
+    packed: bool = False
+    """Whether its routed experts are packed NVFP4 banks (`dew.nn.kernels.formats.NvFp4`, row 8492), frozen
+    beside its parameters as a packed load holds them (`packed_variables`): its training step trains its
+    parameters alone, and its truths read each bank's exact matrix (`exact_banks`)."""
+    chosen: Mapping[str, Mapping[str, str]] = dataclasses.field(default_factory=dict)
+    """Each program's kernels its Dew arm names (`generation.chosen`), by its kind: a kernel a user names
+    where its selector takes another at the flow's shapes."""
     seeds: Mapping[str, int] = dataclasses.field(default_factory=lambda: {"train": 8, "decode": 8})
     """Each kind's declared count (`KINDS`), as a qualification run sizes it on the GPUs
     (`reference_error._qualified`, row 6198): the larger of an A100's and a GH200's (DC-SIZE2-A100 and
@@ -141,10 +148,22 @@ class Flow:
         """What the model's `init` reads beside its key: token ids of a draw's shape, zeros."""
         return (jnp.zeros((self.rows, self.length), jnp.int32),)
 
-    @staticmethod
-    def taken(variables):
-        """What a flow's programs take of its model's variables (`params`): its parameters."""
-        return variables["params"]
+    def taken(self, variables):
+        """What a flow's programs take of its model's variables: its parameters, and where `packed` its
+        experts' banks beside them (`packed_variables`)."""
+        return packed_variables(variables) if self.packed else variables["params"]
+
+    def variables(self, taken) -> dict:
+        """The model's variables of what its programs take (`taken`)."""
+        return dict(taken) if self.packed else {"params": taken}
+
+    def trained(self, taken):
+        """What its training step differentiates of what its programs take: its parameters."""
+        return taken["params"] if self.packed else taken
+
+    def with_trained(self, taken, params) -> dict:
+        """The model's variables of what its programs take, `params` its parameters."""
+        return {**taken, "params": params} if self.packed else {"params": params}
 
     @property
     def vocab(self) -> int:
@@ -161,20 +180,20 @@ class Flow:
         gradient of their mean: the losses its loss sums, each an element of a row, where their mean alone is
         one value a draw, which no count of draws check 1 takes resolves (a GH200's flows were Inconclusive on
         it at 40 draws, every gradient on par)."""
-        def step(params, ids):
+        def step(taken, ids):
             def loss(params):
-                logits = model.apply({"params": params}, ids)
+                logits = model.apply(self.with_trained(taken, params), ids)
                 losses = -token_log_probs(logits[:, :-1], ids[:, 1:])
                 return jnp.mean(losses), losses
-            (_, losses), gradients = jax.value_and_grad(loss, has_aux=True)(params)
+            (_, losses), gradients = jax.value_and_grad(loss, has_aux=True)(self.trained(taken))
             return losses, gradients
         return step
 
     def decode(self, model) -> Callable:
         """`model`'s decode loop: its first `prefill` tokens at once, then one token a step, each step's last
         logits, `[rows, 1 + length - 1 - prefill, vocab]`."""
-        def decoded(params, ids):
-            variables = {"params": params}
+        def decoded(taken, ids):
+            variables = self.variables(taken)
             _, made = model.apply(variables, self.rows, method=CausalTransformer.init_cache,
                                   mutable=["cache"])
             logits, mutated = model.apply({**variables, "cache": made["cache"]}, ids[:, :self.prefill],
@@ -189,8 +208,8 @@ class Flow:
 
     def decode_truth(self, model) -> Callable:
         """The decode loop's float64 truth: one forward over the sequence, read at the steps' positions."""
-        def truth(params, ids):
-            logits = model.apply({"params": params}, ids[:, :self.length - 1])
+        def truth(taken, ids):
+            logits = model.apply(self.variables(taken), ids[:, :self.length - 1])
             return logits[:, self.prefill - 1:]
         return truth
 
@@ -207,8 +226,10 @@ class Flow:
         return self.train(model) if kind == "train" else self.decode(model)
 
     def truth(self, kind: str, model) -> Callable:
-        """The float64 truth of the program `kind` over `model`, its float64 twin."""
-        return self.train(model) if kind == "train" else self.decode_truth(model)
+        """The float64 truth of the program `kind` over `model`, its float64 twin: where `packed`, over each
+        bank's exact matrix (`exact_banks`), frozen as the bank is."""
+        program = self.train(model) if kind == "train" else self.decode_truth(model)
+        return (lambda taken, ids: program(exact_banks(taken), ids)) if self.packed else program
 
 
 @dataclasses.dataclass(frozen=True)
@@ -226,6 +247,8 @@ class ImageFlow:
     channels: int = 4
     rows: int = 2
     size: int = 16
+    chosen: Mapping[str, Mapping[str, str]] = dataclasses.field(default_factory=dict)
+    """Each program's kernels its Dew arm names (`Flow.chosen`)."""
     seeds: Mapping[str, int] = dataclasses.field(default_factory=lambda: {"train": 8, "forward": 8})
     """Each kind's declared count (`kinds`)."""
 
@@ -314,6 +337,70 @@ type ModelFlow = Flow | ImageFlow
 """A flow of any family (`FLOWS`): a decoder's, or a denoiser's."""
 
 
+EXPERT_BANKS = ("gate_up_proj", "down_proj")
+"""GPT-OSS's routed experts' matrices, each `[experts, in, out]`, which a packed load holds as NVFP4 banks
+(`dew.interop.quantized_loads.with_banks`)."""
+
+
+def packed_variables(variables) -> dict:
+    """`variables`' parameters with each routed expert matrix (`EXPERT_BANKS`) packed into an NVFP4 bank
+    (`NvFp4.quantized`) in `QUANTIZATION` at its path, taken out of the parameters, as a packed load holds
+    it (`quantized_loads.with_banks`), which the expert layers read (`dew.quantization.expert_matrix`)."""
+    from flax import linen as nn
+    from flax.traverse_util import flatten_dict, unflatten_dict
+
+    from dew.nn.kernels.formats import NvFp4
+    from dew.quantization import QUANTIZATION
+
+    # Its parameters' values, each partitioning's box taken off, as a load holds them.
+    params = flatten_dict(dict(nn.unbox(variables["params"])))
+    banks = {path: NvFp4.quantized(jnp.asarray(params.pop(path))) for path in list(params)
+             if path[-1] in EXPERT_BANKS}
+    return {"params": unflatten_dict(params), QUANTIZATION: unflatten_dict(banks)}
+
+
+def exact_banks(taken) -> dict:
+    """What a packed flow's programs take (`packed_variables`) with each NVFP4 bank its exact matrix, in its
+    tensor scale's dtype (float64 where check 1 widens it), computed in that dtype from the bank's bits: each
+    code's E2M1 value read from its stored word by integer arithmetic and casts alone (`exact_codes`), times
+    its block's scale and its expert's, which float64 holds exactly (2 + 3 + 24 significant bits); still
+    frozen where the bank lay, so a truth differentiates the parameters alone."""
+    from dew.nn.kernels.formats import NvFp4
+    from dew.quantization import QUANTIZATION
+
+    def exact(bank: NvFp4) -> jax.Array:
+        dtype = jnp.result_type(bank.scale)
+        codes = exact_codes(jnp.swapaxes(jnp.asarray(bank.words), -1, -2), dtype)
+        blocks = jnp.repeat(jnp.swapaxes(jnp.asarray(bank.scales), -1, -2).astype(dtype), 16, axis=-2)
+        return codes * blocks * jnp.asarray(bank.scale, dtype)[..., None, None]
+
+    return {**taken, QUANTIZATION: jax.tree.map(exact, taken[QUANTIZATION],
+                                                is_leaf=lambda leaf: isinstance(leaf, NvFp4))}
+
+
+def exact_codes(words: jax.Array, dtype) -> jax.Array:
+    """The E2M1 values of an NVFP4 matrix's stored words (`[..., depth / 8, width]`, `NvFp4`'s staged order)
+    in `dtype`, in the depths' own order: the stored form's decode (`bits.NVFP4_BFLOAT16_FORM`, each code
+    times 2^-126 as a bfloat16's bits) restored to the code as `bits.restored` restores it, by integer
+    arithmetic and casts, its one product (a subnormal's mantissa times 2^-7) in `dtype`."""
+    from dew.algebra import bits
+    from dew.nn.kernels.formats import staged_rows
+
+    def one(words: jax.Array) -> jax.Array:
+        decoded = bits.NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T
+        pattern = jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32)
+        normal = jax.lax.bitcast_convert_type((pattern << jnp.uint32(16)) + jnp.uint32(126 << 23),
+                                              jnp.float32).astype(dtype)
+        mantissa = (pattern & jnp.uint32(0x7F)).astype(dtype) * jnp.asarray(2.0 ** -7, dtype)
+        subnormal = jnp.where(pattern & jnp.uint32(0x8000) != 0, -mantissa, mantissa)
+        codes = jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
+        return codes[np.argsort(staged_rows(codes.shape[0]))]
+
+    for _ in range(words.ndim - 2):
+        one = jax.vmap(one)
+    return one(words)
+
+
 def drawn(flow: ModelFlow):
     """What the flow's programs take of its model's variables (`ModelFlow.taken`), float32, drawn once on the
     host's CPU by its compiled initializer where the flow prepares, or where no tier's store holds them; a
@@ -358,6 +445,10 @@ GPT_OSS = {**DENSE, "sliding_window": 64, "num_local_experts": 16, "num_experts_
 no routing decision two arms could take apart. Sixteen experts 128 wide hold the parameters two 1024 wide
 would, and give the router's bias sixteen values a draw where two left check 1 Inconclusive on it at 40 draws
 on an A100 (pooled ratio 1.25 in [0.74, 2.01])."""
+
+GPT_OSS_PACKED = {**GPT_OSS, "intermediate_size": 256}
+"""`GPT_OSS` with its experts 256 wide, so each bank's depth is whole 256s and its width whole 64s, which the
+packed GEMM's NVFP4 mainloop takes (`dew.nn.kernels.gemm.NVFP4`'s `packed`)."""
 
 MLA = {**DENSE, "head_dim": 64, "kv_lora_rank": 128, "qk_nope_head_dim": 64, "qk_rope_head_dim": 64,
        "qk_head_dim": 128, "v_head_dim": 64, "first_k_dense_replace": 2}
@@ -407,6 +498,10 @@ FLOWS = (
     Flow("sinks, a user's", "gpt-oss-tiny", GPT_OSS, "bfloat16",
          {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}, lane=False,
          seeds={"train": 128, "decode": 8}),
+    # Its training named onto the packed GEMM, which its selector takes at a decode step's rows alone.
+    Flow("experts packed NVFP4", "gpt-oss-tiny", GPT_OSS_PACKED, "bfloat16",
+         {"train": {"nvfp4": EVERY}, "decode": {"nvfp4": NATIVE}}, packed=True,
+         chosen={"train": {"nvfp4": "packed"}}),
     Flow("latent attention, the lane's", "deepseek-v2-tiny", MLA, "bfloat16",
          {"train": TEMPLATE, "decode": {}}),
     Flow("latent attention, a user's", "deepseek-v2-tiny", MLA, "bfloat16",
@@ -554,7 +649,16 @@ def programs_of(flow: ModelFlow) -> dict[str, tuple[Callable, list]]:
     """The flow's programs by name, each of the parameters' leaves and the draw's inputs: each of its kinds
     (`ModelFlow.kinds`), Dew's (`dew`) and the reference path's (`reference`)."""
     model = flow.model
-    return {f"{kind} {arm}": _flat(flow, flow.program(kind, model))
+
+    def named(kind: str, program: Callable) -> Callable:
+        # Dew's arm traced under the kernels the flow names for it (`chosen`), its reference's as given.
+        def dew(*arguments):
+            with generation.chosen(**flow.chosen.get(kind, {})):
+                return program(*arguments)
+        return dew
+
+    return {f"{kind} {arm}": _flat(flow, named(kind, flow.program(kind, model)) if arm == "dew"
+                                   else flow.program(kind, model))
             for kind in flow.kinds for arm in ("dew", "reference")}
 
 

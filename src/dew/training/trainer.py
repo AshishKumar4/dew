@@ -1754,7 +1754,7 @@ class Trainer(Generic[Loss, Effects]):
             # As the loop hands its step the batch (`read_batch`): on the examples clock, marked whether
             # it closes its window; planned once, where the layout's choice planned it already.
             batch = closes_window(split_fields(placed)[0], self._shape.examples)
-            if not self._compiler.holds_unplaced(batch):
+            if not self._compiler.holds_unplaced(batch, self._shape):
                 self._planned_unplaced(fresh, batch)
         return begun
 

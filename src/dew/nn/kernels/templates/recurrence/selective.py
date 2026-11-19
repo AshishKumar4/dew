@@ -199,7 +199,7 @@ class Documents:
 @tuning.lowered_once(("scan",))
 def forward(x, dt, b, c, parameters, state, resets, scan: Scan, table: tuple = ()):
     """The scan's outputs from padded operands: `x`, `dt` `[R, T, D]`, `b`, `c` `[R, T, N]`, `parameters`
-    `[N + PARAMETER_ROWS, D]` fp32 (the rates `A log2(e)` transposed, then the skip `D`), `state` `[R, N, D]`
+    `[N + PARAMETER_ROWS, D]` fp32 (the rates `A` transposed, then the skip `D`), `state` `[R, N, D]`
     fp32 and `resets` `[R, T, RESET_WIDTH]` int8 (a token's flag in every column; ignored unless
     `scan.packed`). Returns `y` `[R, T, D]` in `x`'s dtype, the final state `[R, N, D]` fp32, with
     `scan.entered` the entering state of each chunk opening a backward block `[R, chunks / opening, N, D]`
@@ -767,10 +767,10 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
 
 
 def _parameters(A, D, channels: int):
-    """`forward`'s parameter tile: the rates `A log2(e)` transposed, then the skip, padded to the stream's
-    rows."""
+    """`forward`'s parameter tile: the rates `A` transposed (`algebra.selective_decay` takes them to base 2
+    after the step multiplies them), then the skip, padded to the stream's rows."""
     padding = jnp.zeros((PARAMETER_ROWS - 1, channels), jnp.float32)
-    return jnp.concatenate([(A * algebra.LOG2_E).T, D[None], padding])
+    return jnp.concatenate([A.T, D[None], padding])
 
 
 def _scan_primal(x, dt, A, B, C, D, entering, resets, scan: Scan, *table):

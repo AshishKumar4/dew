@@ -100,10 +100,24 @@ class CompiledTruths:
     stamp: str
     target: object | None = None
     begun: set[str] = dataclasses.field(default_factory=set)
+    # Each site a check's prepare began to prepare, from before its first trace, and each it finished whole,
+    # its truths and its arms (`preparing`).
+    tried: set[str] = dataclasses.field(default_factory=set)
+    done: set[str] = dataclasses.field(default_factory=set)
     read: dict[str, tuple[dict, dict]] = dataclasses.field(default_factory=dict)
 
     def path(self, label: str) -> Path:
         return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]
+
+    @contextlib.contextmanager
+    def preparing(self, *labels: str) -> Iterator[None]:
+        """Within the block, a check's prepare of its sites `labels` (a site's truths and its arms, `armed`):
+        recorded tried before its first trace, and finished where it ran to its end, every program it
+        compiles written; a cell's later failure, its every tried site finished, checks what its prepare
+        gives in their place (`gpu_flow.run_cells`)."""
+        self.tried.update(labels)
+        yield
+        self.done.update(labels)
 
     def holds(self, label: str) -> bool:
         """Whether the store's prepare reached site `label` (its programs written, at any stamp)."""
@@ -159,9 +173,11 @@ class CompiledTruths:
         compile point where None, a truth's, whose program is its run's); `arms` whether they are a site's
         arms (`compiled_memory`), whose state its run holds while its truths compute; `host` whether they
         are compiled for the host's CPU, whatever the store's target (an arm placed there, `ahead_arm`'s);
-        `at_run` why none is compiled, their run compiling each on its GPU (`at_run`), the site written with
-        no programs. A site its target's compile refuses (`report.CompiledOnDevice`: a choice its GPU makes at
-        run time) is left unbegun, its refusal raised for its caller to place it otherwise."""
+        `at_run` why none is compiled ahead, their run compiling each on its GPU (`at_run`), the site written
+        with no programs and each one's memory read offline (`compile_programs`' `memory_only`), by which
+        the lane sizes its worker (`compiled_memory`). A site its target's compile refuses
+        (`report.CompiledOnDevice`: a choice its GPU makes at run time) is left unbegun, its refusal raised
+        for its caller to place it otherwise."""
         from dew._cache import uncached
         from dew.nn.kernels.templates import report
 
@@ -174,7 +190,11 @@ class CompiledTruths:
             shutil.rmtree(site)
         site.mkdir(parents=True)
         if at_run is not None:
-            (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": {},
+            with uncached():
+                read = self._compiled(programs, compiled, host, memory_only=True)
+            memory = {name: executable.memory._asdict() for name, executable in read.programs.items()
+                      if executable.memory is not None}
+            (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
                                                  "arms": arms, "host": host, "at_run": at_run}))
             return
         # Compiled here, never loaded from JAX's persistent cache, whose executables serialize without their
@@ -194,14 +214,16 @@ class CompiledTruths:
                                              "arms": arms, "host": host}))
 
     def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None,
-                  host: bool = False):
+                  host: bool = False, *, memory_only: bool = False):
         """`programs` compiled for the store's target (`compile_programs`), or for this process's first device
         where it names none, or for the host's first CPU (`host`), each made by `compiled` where it is given
-        (`compile_site`), else by Dew's compile point on a target and `jax.jit` here."""
+        (`compile_site`), else by Dew's compile point on a target and `jax.jit` here; for a target, read for
+        their memory alone where `memory_only` (`compile_programs`')."""
         from dew.training.ahead import AheadPrograms, BuildTarget, Executable, compile_programs
 
         if self.target is not None and not host:
             return compile_programs(programs, self.target.generation, self.target.multiprocessors,
+                                    memory_only=memory_only,
                                     **({} if compiled is None else {"compiled": compiled}))
         devices = jax.devices("cpu" if host else None)[:1]
         placed = jax.sharding.SingleDeviceSharding(devices[0])

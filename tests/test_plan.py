@@ -5,6 +5,7 @@ the update pools the same rows, the clocks count the same steps, and a
 resumed run reads its batches as the run it continues did.
 """
 
+import collections
 import contextlib
 import dataclasses
 import functools
@@ -13,6 +14,7 @@ import itertools
 import json
 import logging
 import struct
+import types
 import weakref
 from collections.abc import Callable, Iterator
 
@@ -475,11 +477,11 @@ def autopgle(runs: int) -> Iterator[None]:
 @dataclasses.dataclass
 class Handed(Trials):
     """Trials that profile the plan admitted, keep a weak reference to the executable it was admitted with
-    (`unguided`) and count the executables the backend holds then, it among them (`live`), and hand back
-    `profile` where given in place of the profile they measured."""
+    (`unguided`) and the executables the backend holds then, it among them (`live`, by module), and hand
+    back `profile` where given in place of the profile they measured."""
     profile: bytes | None = None
     unguided: weakref.ref | None = None
-    live: int = 0
+    live: collections.Counter | None = None
 
     def profiled(self, step, planned, mesh, runs):
         measured = super().profiled(step, planned, mesh, runs)
@@ -488,10 +490,45 @@ class Handed(Trials):
         return measured if self.profile is None else self.profile
 
 
-def live_executables() -> int:
-    """The executables the backend holds once the garbage they are part of is collected."""
+def live_executables() -> collections.Counter:
+    """The executables the backend holds once the garbage they are part of is collected, by their module's
+    name: two counts' difference names what one holds the other does not."""
     gc.collect()
-    return len(get_backend().live_executables())
+    return collections.Counter(executable.hlo_modules()[0].name
+                               for executable in get_backend().live_executables())
+
+
+def holding(modules: collections.Counter, depth: int = 8) -> dict[str, list[list[str]]]:
+    """For each live executable of `modules`' names, the chains of objects that keep it, from the executable
+    out to a module's namespace or a class, each named by its type (a namespace by its module's name), the
+    first four found: what a test of an executable's release reads where one outlives its step."""
+    gc.collect()
+    found: dict[str, list[list[str]]] = {}
+    for executable in get_backend().live_executables():
+        name = executable.hlo_modules()[0].name
+        if name not in modules:
+            continue
+        chains: list[list[str]] = []
+        frontier, seen = [(executable, [type(executable).__name__])], {id(executable)}
+        for _ in range(depth):
+            reached = []
+            for held, chain in frontier:
+                for referrer in gc.get_referrers(held):
+                    # The walk's own lists and frames hold what it walks, and keep nothing past it.
+                    if (id(referrer) in seen or isinstance(referrer, types.FrameType)
+                            or referrer is frontier or referrer is reached):
+                        continue
+                    seen.add(id(referrer))
+                    namespace = isinstance(referrer, dict) and "__name__" in referrer
+                    named = f"({referrer['__name__']})" if namespace else ""
+                    step = [*chain, type(referrer).__name__ + named]
+                    if namespace or isinstance(referrer, type):
+                        chains.append(step)
+                    else:
+                        reached.append((referrer, step))
+            frontier = reached
+        found.setdefault(name, []).extend(chains[:4])
+    return found
 
 
 def test_a_plan_search_keeps_the_freeze_a_process_made_before_it():
@@ -587,7 +624,9 @@ def test_the_executable_a_profile_replaces_goes_with_its_program():
         state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
     assert trainer.plan["pgle"] == {"runs": 2, "bytes": len(COST)}
     assert trials.unguided is not None and trials.unguided() is None
-    assert live_executables() == trials.live and int(state.step) == 3
+    live = live_executables()
+    assert live == trials.live and int(state.step) == 3, (live - trials.live, trials.live - live,
+                                                            holding(live - trials.live))
 
 
 def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path,
@@ -989,7 +1028,9 @@ def a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly
         trainer = lm()
         _, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH))
     assert trainer.plan["pgle"]["runs"] == 2 and trainer.plan["pgle"]["bytes"] > 0
-    assert trials.unguided is not None and trials.unguided() is None and live_executables() == trials.live
+    assert trials.unguided is not None and trials.unguided() is None
+    live = live_executables()
+    assert live == trials.live, (live - trials.live, trials.live - live, holding(live - trials.live))
     guided = as_given(functools.partial(regression_steps, pgle=True))
     unguided = as_given(functools.partial(regression_steps, pgle=False))
     label, truth = "a step guided by its profile", regression_truth()
@@ -1348,7 +1389,7 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
     pytest.param("decoder", "cpu", id="decoder-cpu"),
     pytest.param("decoder", "h100", id="decoder-h100"),
     pytest.param("delta-scanned", "h100", id="delta-scanned-h100",
-                 marks=pytest.mark.shards(units=18, per_task=2)),
+                 marks=pytest.mark.shards(units=18, per_task=3)),
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request):
@@ -1362,8 +1403,8 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
     What a rung keeps orders its residuals, not XLA's peak (the scanned delta decoder needed more recomputing
     its scans and convolutions too than not), so a search that passed over a rung for one seen to miss
     settled a heavier plan than one that fits. The scanned delta decoder's walk of its 18 places runs over
-    CI's map tasks, 2 a task: compiled in one it took 262 to 350 s of a train's task (row 8438), 6 a task
-    469 s, its judge 168 s after (row 8524), 3 a task 299 s for its first, the heaviest (row 8557)."""
+    CI's map tasks, 3 a task: compiled in one it took 262 to 350 s of a train's task (row 8438), 6 a task
+    469 s, its judge 168 s after (row 8524)."""
     fields, batch, room_of = CENSUS[shape]
     with row_names_port("gated_delta_rule", "fla"):
         climb = climbed(monkeypatch, target, fields, batch, room_of, request)
@@ -1733,8 +1774,8 @@ def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_rec
     """A Muon step whose joined Newton-Schulz stacks' copies leave it short of the devices' room, and which
     fits with them parted, its split fixed: its plan parts them, joining one at a time (`ns_group` 1, the
     climb's release after the narrow copies, `FitSearch.searched`), and recomputes nothing more, where it
-    climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a step).
-    A run that states its group keeps it, the release asked of no step of it."""
+    climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a
+    step)."""
     joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
     parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
     assert parted < joined, (parted, joined)
@@ -1743,6 +1784,12 @@ def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_rec
     fitted_once(planned)
     assert planned.plan["ns_group"] == 1, planned.plan
     assert planned.plan["remat"] == trainer.plan["remat"], planned.plan
+
+
+def test_a_muon_run_that_states_its_stacks_group_keeps_it(monkeypatch):
+    """A Muon run that states its Newton-Schulz group keeps it: the release of its joined stacks asked of no
+    step of it (`FitSearch.searched`), the plan recording none (apart from the parting cell above, which
+    took 148 s with it, row 8546)."""
     stated = muon_lm(ns_group=2)
     free(monkeypatch, LIMIT)
     fitted_once(stated)

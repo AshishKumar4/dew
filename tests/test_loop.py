@@ -433,8 +433,13 @@ def test_an_implicit_loop_at_zero_theta_computes_the_decoder_it_loops(steps):
                     seeds=IMPLICIT_SEEDS[steps], truth_fn=decoder(jnp.float64))
     variables, ids, cotangent = draw(0)
     assert not np.any(np.asarray(variables["params"]["loop_theta"]))
-    _, pull = jax.vjp(lambda params: looped.apply({"params": params}, ids), variables["params"])
-    assert np.any(np.asarray(pull(cotangent)[0]["loop_theta"]) != 0)
+
+    # One program: run eagerly, the loop's pullback compiled 650 programs, 18 s of a cold run (row 7666).
+    @jax.jit
+    def pulled(params, ids, cotangent):
+        return jax.vjp(lambda params: looped.apply({"params": params}, ids), params)[1](cotangent)[0]
+
+    assert np.any(np.asarray(pulled(variables["params"], ids, cotangent)["loop_theta"]) != 0)
 
 
 def _theta_method(module, ids):

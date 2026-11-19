@@ -186,6 +186,19 @@ def test_an_nvfp4_products_packed_kernel_is_its_decoded_product(generation_name)
     np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
 
 
+def test_an_nvfp4_products_packed_kernel_on_a_cpu_uninterpreted_is_its_decoded_product():
+    """`gemm.nvfp4_product` with its packed kernel named for an assumed H100 and not interpreted, in a CPU
+    process: its launch's branch is CUDA's alone (`gemm._dispatched`), the CPU's the decoded product, exact
+    here (small integer rows), where the launch lowered for the CPU raised "Only interpret mode is supported
+    on CPU backend" (row 8492: a packed product's per-shard cell)."""
+    matrix, values = nvfp4(8, 512, 128, scale=0.25)
+    rows = jnp.asarray(np.random.default_rng(11).integers(-3, 4, size=(96, 512)), jnp.float32)
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"), generation.routes() as routes:
+        got = jax.jit(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32))(rows)
+    assert {route.kernel for route in routes if route.choice == "nvfp4"} == {"packed"}, routes
+    np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
+
+
 @INTERPRETS
 def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
     """`gemm.nvfp4_product` at a decode step's 13 rows on an H100, its packed kernel named, derives a tile
@@ -347,3 +360,34 @@ def test_an_nvfp4_products_input_gradient_keeps_its_cotangents_precision():
         (d_rows,) = pullback(cotangent)
     assert {route.kernel for route in routes if route.choice == "nvfp4"} == {"packed"}, routes
     np.testing.assert_array_equal(np.asarray(d_rows), np.full((8, 512), 1 / 512, np.float32))
+
+
+def test_a_bank_carries_its_forms_version_and_a_load_refuses_another(tmp_path):
+    """`formats.NvFp4` stores the version of the form its words are packed by (`formats.FORM`, the encoder's
+    digest, `bits.BitForm.version`; algebra.md 7.4, row 6101), a stacked bank's each layer, and a checkpoint
+    restore of words another encoder packed is refused (`NvFp4.checked`): written and read back with its
+    version, a bank restores; the same bank stored under another version is refused by name."""
+    from dew.checkpoints import Checkpoints
+
+    bank, _ = nvfp4_bank(3, 2, 256, 128)
+    assert bytes(np.asarray(bank.form)).hex() == bits.NVFP4_BFLOAT16_FORM.version
+    stacked = jax.tree.map(lambda *layers: jnp.stack(layers), bank, bank)
+    assert bytes(np.asarray(stacked.layer(jnp.int32(1)).form)).hex() == bits.NVFP4_BFLOAT16_FORM.version
+    other = dataclasses.replace(bank, form=np.frombuffer(bytes.fromhex("0" * 16), np.uint8).copy())
+    with pytest.raises(ValueError):
+        other.checked()
+
+    def template(of):
+        where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), of)
+
+    for name, written, refused in (("same", bank, False), ("other", other, True)):
+        checkpoints = Checkpoints(str(tmp_path / name))
+        checkpoints.save(1, {"bank": written})
+        checkpoints.wait()
+        if refused:
+            with pytest.raises(ValueError):
+                Checkpoints(str(tmp_path / name)).restore(template({"bank": written}))
+        else:
+            restored = Checkpoints(str(tmp_path / name)).restore(template({"bank": written}))[0]["bank"]
+            np.testing.assert_array_equal(np.asarray(restored.words), np.asarray(written.words))
