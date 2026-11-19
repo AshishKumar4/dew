@@ -49,12 +49,14 @@ def _assembled_record(kernel: str, read) -> dict:
     (None, ["cuda12"], "sm100", ("cuda13",)),
     (("580.65", (8, 0)), ["cuda12"], "sm80", ("cuda12",)),
     (("580.65", (8, 0)), ["cuda13"], "sm90", ("cuda13",)),
+    (("580.65", (8, 0)), [], "sm90", ("cuda13", "cuda12")),
 ])
 def test_the_gate_judges_every_build_on_a_host_with_no_gpu_and_a_gpu_environments_own_on_one(
         monkeypatch, gpus, installed, generation, judged):
     """The kernel-compile environment, on a host with no GPU, judges a generation's kernels under every CUDA
-    build its GPUs run, whatever plugin it holds; a GPU node's environment under the build its CUDA plugin is
-    alone, as it holds no other build's ptxas (row 8769: an A100's cuda12 environment asked CUDA 13's)."""
+    build its GPUs run, whatever plugin it holds, as does an environment with none on any host; a GPU node's
+    environment under the build its CUDA plugin is alone, as it holds no other build's ptxas (row 8769: an
+    A100's cuda12 environment asked CUDA 13's)."""
     monkeypatch.setattr(kc, "nvidia_gpus", lambda: gpus)
     monkeypatch.setattr(kc, "cuda_builds", lambda: installed)
     kc.judged_builds.cache_clear()

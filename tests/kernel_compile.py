@@ -727,14 +727,15 @@ def assemblers(generation: str) -> tuple[Path, ...]:
 @functools.cache
 def judged_builds(generation: str) -> tuple[str, ...]:
     """The CUDA builds this environment judges a GPU of `generation` under: on a host with no GPU (the
-    kernel-compile environment, holding each build's nvcc: locks/cpu.txt), every build the generation runs
+    kernel-compile environment, holding each build's nvcc beside the cuda12 plugin it compiles with:
+    locks/cpu.txt), or an environment with no CUDA plugin, every build the generation runs
     (`generation_builds`); on a host with one, the builds of the CUDA plugin its environment installs among
     them, as a GPU node's environment holds its own build's toolchain alone (its cuda12 lock has no CUDA 13
     ptxas, which would become its CUDA root: rows 4162, 8769). A generation none of whose builds this GPU
-    environment holds is refused, never judged under none. Asked once a generation, as nvidia-smi answers in
-    seconds."""
+    environment's plugin is is refused, never judged under none. Asked once a generation, as nvidia-smi
+    answers in seconds."""
     builds = generation_builds(generation)
-    if nvidia_gpus() is None:
+    if not cuda_builds() or nvidia_gpus() is None:
         return builds
     own = tuple(build for build in builds if build in cuda_builds())
     if not own:
