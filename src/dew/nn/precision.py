@@ -1726,14 +1726,16 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
     a sum's. Summed band by band (`_banded`), each band's products within float32's exponent range of its
     largest and the next band's those below it, so terms that cancel leave the ones far below them: aligned
     to the largest alone, a unit below two cancelling terms of 2^127 was dropped before they cancelled, zero
-    (base review 224fcf53a F1). Its error bound: the result is the plain float32 sum's rounding of each
-    band's exactly scaled terms (each product's significands rounded twice), then of the bands' totals,
-    `(n + 2) 2^-24` of the terms' absolute sum over `n` terms, a product dropped only below the dtype's least
-    subnormal. Its tangent is its terms' own, each factor's direction times its term's other factors, and
-    each factor's gradient the cotangent times its terms' other factors, each summed aligned as its value is
+    (base review 224fcf53a F1). Its error bound is Sum2's (Ogita, Rump and Oishi) over the products as
+    formed (each product's significands rounded twice): their twice-precise sum rounded once, `u |s| + g^2
+    sum |t|` for `u` 2^-24 and `g = n u / (1 - n u)` over `n` terms, a product dropped only below the dtype's
+    least subnormal; so terms cancelling past twice float32's precision (a condition number past 2^48) are
+    not summed exactly (Main's ruling on base review f5e6e678d F1, 2^80 + 2^50 + 1 - 2^50 - 1 - 2^80). Its
+    tangent is its terms' own, each factor's direction times its term's other factors, and each factor's
+    gradient the cotangent times its terms' other factors, each summed aligned as its value is
     (`_aligned_directions`): its bits carry none, so differentiated as formed every factor's was zero, and
-    summed plainly a cancelling entry write's terms of 2^160 were inf - inf (row 8501). A factor several
-    terms share (one array: an entry write's weight) is one factor, its gradient one aligned sum over them.
+    summed plainly a cancelling entry write's terms of 2^160 were inf - inf (row 8501). A factor several terms
+    share (one array: an entry write's weight) is one factor, its gradient one aligned sum over them.
     Elementwise and over a 2-D array's axes, so a Pallas TPU kernel forms it in place."""
     dtype = jnp.result_type(jnp.float32, *(factor for term in terms for factor in term))
     # Each factor once, by identity: a shared factor's gradient sums its terms' together, aligned.
@@ -1757,7 +1759,7 @@ def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) ->
 def _aligned_value(shape: tuple[tuple[int, ...], ...], axis, *flat: jax.Array) -> jax.Array:
     """`aligned_sum` of its terms' factors in a row (`_regrouped`): its products summed band by band
     (`_banded`), each band's sum a pair keeping its roundings (`_kept_sum`), then the bands' pairs, each at
-    its own binade, summed so as one band, the pair rounded once and scaled back."""
+    its own binade, summed so band by band (`_merged`), rounded once and scaled back."""
     products = []
     for term in _regrouped(shape, flat):
         significand, exponent = _binades(term[0])
@@ -1771,8 +1773,22 @@ def _aligned_value(shape: tuple[tuple[int, ...], ...], axis, *flat: jax.Array) -
         for part in pair:
             significand, exponent = _binades(part)
             totals.append((significand, exponent + top))
-    (high, low), top, _ = _band(totals, [significand != 0 for significand, _ in totals], None, dtype)
-    return _raised(high + low, top, dtype, factors)
+    return _raised(*_merged(totals, dtype), dtype, factors)
+
+
+def _merged(totals, dtype) -> tuple[jax.Array, jax.Array]:
+    """`aligned_sum`'s bands' pairs (`totals`, each part a significand and binary exponent) summed: the
+    largest band of them (`_band`) summed as a pair, which joins those it left in the next, so a lower
+    band's total stays until the higher ones cancel (aligned at once, 2^-100 was dropped before 2^25 and
+    -2^25 cancelled, base review f5e6e678d F1); the sum rounded once and its binade."""
+    held = [significand != 0 for significand, _ in totals]
+    pair, top, taken = _band(totals, held, None, dtype)
+    for _ in totals[1:]:
+        held = [kept & ~took for kept, took in zip(held, taken[-len(totals):], strict=True)]
+        carried = [(significand, exponent + top) for significand, exponent in map(_binades, pair)]
+        pair, top, taken = _band(carried + totals, [significand != 0 for significand, _ in carried] + held,
+                                 None, dtype)
+    return pair[0] + pair[1], top
 
 
 def _band_width(dtype) -> int:
@@ -1863,6 +1879,30 @@ def _aligned_tangent(shape: tuple[tuple[int, ...], ...], axis, primals, tangents
     return _aligned_value(shape, axis, *primals), _aligned_directions(shape, axis, primals, tangents)
 
 
+def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.Array) -> tuple:
+    """`aligned_sum`'s cotangent of one term's factor at `spot` as products and that factor's shape in their
+    space: summed over the axes the shape is one along, then broadcast to it. The term's product reduced
+    over `axis` (its own axes) and broadcast into the value, transposed in reverse: the value's broadcast
+    summed, each of the reduction's elements taking the cotangent, the factor's broadcast summed, as one sum
+    of the cotangent times the term's other factors in a space holding the value's axes and, beside each
+    reduced one, the product's own (row 8501; mixed ranks reduced against another term's axis, base review
+    f5e6e678d F2)."""
+    rank = max(np.ndim(factor) for factor in term)
+    reduced = set() if axis is None else {int(a) % rank for a in np.atleast_1d(axis)}
+    lead = cotangent.ndim - rank
+
+    def laid(x):
+        # A factor in the space: its reduced axes beside the value's, which it is broadcast along.
+        x = jnp.reshape(x, (1,) * (rank - np.ndim(x)) + np.shape(x))
+        return x.reshape((1,) * lead + tuple(d for k, size in enumerate(x.shape)
+                                             for d in ((1, size) if k in reduced else (size,))))
+
+    spread = cotangent.reshape(cotangent.shape[:lead] + tuple(
+        d for k, size in enumerate(cotangent.shape[lead:]) for d in ((size, 1) if k in reduced else (size,))))
+    products = (spread, *(laid(factor) for other, factor in enumerate(term) if other != spot))
+    return products, laid(term[spot]).shape
+
+
 def _aligned_directions(shape: tuple[tuple[int, ...], ...], axis, primals, tangents):
     """`aligned_sum`'s tangent, the linear map of its factors' `tangents` it is (`generation.linear_map`):
     each factor's direction in its place in each of its terms, every one summed aligned (over `axis` too
@@ -1880,24 +1920,27 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], axis, primals, tange
         return aligned_sum(moved, axis)
 
     def pulled(factors, cotangent):
-        rank = cotangent.ndim
-
-        def padded(x):
-            return x.reshape((1,) * (rank - x.ndim) + x.shape)
-
         gradients = []
         for place, factor in enumerate(factors):
-            # Each of the factor's places: the cotangent times the term's other factors, summed aligned over
-            # the axes the factor is broadcast across (its term's, the cotangent's across a term broadcast
-            # into the value, and `axis`'s), the cotangent inside the products: summed first, 3 2^127 past
-            # float32's largest (base review d6c1b2c1a F1).
-            products = [(cotangent, *(padded(factors[at]) for other, at in enumerate(term) if other != spot))
-                        for term in shape for spot, at in enumerate(term) if at == place]
-            axes = tuple(d for d, size in enumerate(padded(factor).shape) if size == 1)
-            gradient = aligned_sum(products, axes or None)
-            # A factor's axes its terms' others hold once take one gradient along them, broadcast.
-            gradient = jnp.broadcast_to(gradient, padded(factor).shape)
-            gradients.append(gradient.reshape(factor.shape).astype(factor.dtype))
+            # Each of the factor's places, grouped by the space its products lie in (`_transposed_term`), the
+            # cotangent inside the products: summed first, 3 2^127 past float32's largest (base review
+            # d6c1b2c1a F1).
+            groups = {}
+            for term in shape:
+                for spot, at in enumerate(term):
+                    if at == place:
+                        products, held = _transposed_term([factors[other] for other in term], spot, axis,
+                                                          cotangent)
+                        groups.setdefault(held, []).append(products)
+            # Summed over the axes the factor is broadcast along, then broadcast along those it is not
+            # found in (a reduced axis its term's other factors are broadcast along too).
+            summed = []
+            for held, group in groups.items():
+                along = [d for d, size in enumerate(held) if size == 1]
+                summed.append(jnp.broadcast_to(aligned_sum(group, tuple(along) if along else None), held)
+                              .reshape(factor.shape))
+            gradient = summed[0] if len(summed) == 1 else aligned_sum([(part,) for part in summed])
+            gradients.append(gradient.astype(factor.dtype))
         return gradients
 
     return generation.linear_map(applied, pulled, list(primals), list(tangents))
