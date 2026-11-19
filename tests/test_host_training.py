@@ -1297,6 +1297,27 @@ def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_stat
     equal(trained.variables, expected.variables)
 
 
+
+def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout():
+    """A fresh LoRA fit whose frozen base is a decoder of a plain loop (scan_layers=False) on GPUs that
+    price the streamed step (the host's CPUs standing in for H100s): no host layout holds a plain loop's
+    stack in bank memory (`execution.unscanned`), so the streamed step is no candidate, said by name, and
+    the run trains in its device layout. Before, the chooser laid the streamed start out and its frozen
+    base's placement raised (rows 8336, 8358: test_dory's LoRA cell on every GPU tier)."""
+    from dew.lora import LoRA
+    from dew.training.ahead import stand_in_gpus
+
+    model = CausalTransformer(vocab_size=256, emb_features=64, num_layers=2, num_heads=2, mlp_features=128,
+                              max_seq_len=8, scan_layers=False)
+    variables = nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+    adapted = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables, key=2)
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+        trainer = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
+                                      variables=adapted.variables), STREAMING_ADAM, key=jax.random.key(6))
+        trainer.fit(streaming_data(), steps=1, log_every=100)
+    choice = trainer.layout_choice
+    assert not trainer.host_master and not choice.streams and choice.refused is not None, choice
+
 @pytest.mark.tpu(reason="a TPU v6e prices the streamed step by its stated host link (row 7908)")
 def test_a_tpu_that_holds_only_the_streamed_step_streams_on_par_with_its_device_plan():
     """A fresh bf16 fit on a v6e stated to hold the decoder's streamed step and not its device plan (its

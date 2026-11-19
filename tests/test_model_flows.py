@@ -56,8 +56,8 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed(target), jax.default_matmul_precision(flow.precision):
-        dew = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
-        reference = [route for kind in model_flows.KINDS
+        dew = {kind: _routes(programs[f"{kind} dew"]) for kind in flow.kinds}
+        reference = [route for kind in flow.kinds
                      for route in _routes(programs[f"{kind} reference"], reference=True)]
         model_flows.held_routes(flow, dew, target)
         model_flows.held_reference(flow, reference)
@@ -73,7 +73,7 @@ def test_a_training_step_on_the_templates_plain_jax_mainloop_does_not_reach_its_
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed("sm90"), jax.default_matmul_precision(flow.precision):
-        native = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
+        native = {kind: _routes(programs[f"{kind} dew"]) for kind in flow.kinds}
         with generation.chosen(attention_mainloop="portable"):
             forced = _routes(programs["train dew"])
     model_flows.held_routes(flow, native, "sm90")
@@ -112,11 +112,11 @@ def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
     this CPU, a node's for its GPU): each program's first draw's truth held to float64 (check 1's
     `_of_float64`, a narrow one refused) and every program its sites' truths and terms take compiled into the
     store, at the fewest seeds check 1 takes (`parity.FEWEST_SEEDS`)."""
-    fewest = dict.fromkeys(model_flows.KINDS, FEWEST_SEEDS)
-    flow = dataclasses.replace(model_flows.flow_named(name), seeds=fewest)
+    named = model_flows.flow_named(name)
+    flow = dataclasses.replace(named, seeds=dict.fromkeys(named.kinds, FEWEST_SEEDS))
     monkeypatch.setenv(tier_wire.TRUTHS, str(store))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
-    for kind in model_flows.KINDS:
+    for kind in flow.kinds:
         model_flows.judge(flow, {}, kind)
 
 
@@ -167,6 +167,30 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     filed = json.loads(needs.read_text())
     stated = json.loads((store / model_flows.NEED).read_text())["programs"]
     assert (filed["unit"], filed["programs"]) == ("a selective scan's unit", stated)
+
+
+def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monkeypatch):
+    """A flow whose programs hold convolutions (the UNet denoiser's), prepared over a compile-only A100's
+    topology, prepares none of them: a convolution compiled without its GPU leaves its algorithm to run
+    time (`report.CompiledOnDevice`), so its store names each program its run compiles on its GPU
+    (`model_flows.ON_DEVICE`) and holds none of them, its truths compiled all the same."""
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = store / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.TRUTHS, str(store / "tier"))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    monkeypatch.setenv(tier_wire.UNIT, "a UNet's unit")
+    flow = model_flows.flow_named("UNet denoiser fp32")
+    assert model_flows.prepared_apart(flow) is not None
+    held = model_flows.store_of(flow)
+    on_device = json.loads((held / model_flows.ON_DEVICE).read_text())["programs"]
+    assert sorted(on_device) == sorted(f"{kind} {arm}" for kind in flow.kinds for arm in ("dew", "reference"))
+    assert not (held / "dew.programs").exists() and not (held / "reference.programs").exists()
+    assert len(list((held / "truths").iterdir())) == len(flow.kinds)
 
 
 def _site(salt: int = 5461):
@@ -355,14 +379,14 @@ def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):
     assert all(program["beside"] >= state for program in filed[len(arms):])
 
 
-def test_a_convolution_sites_truths_compute_on_the_host_and_its_arms_compile_on_its_gpu(tmp_path,
-                                                                                         monkeypatch):
+def test_a_convolution_sites_truths_and_arms_compile_on_its_gpu_in_its_run(tmp_path, monkeypatch):
     """A site holding a convolution, prepared for a node's GPU (`truths_ahead.prepared`): no compile without
     that GPU holds the convolution's algorithm, which cuDNN then picks at run time, on an A100 not the same
-    each run (`report.DEVICELESS_CONVOLUTION_PICKS`, row 7941). Its float64 truths compile for the host's CPU
-    and its arms for none, their run compiling them on its GPU as its prepare states, which the run names
-    (`truths_ahead.AT_RUN`) and records nothing unprepared; before, the prepare compiled both for the GPU and
-    its run refused their load."""
+    each run (`report.DEVICELESS_CONVOLUTION_PICKS`, row 7941). Its prepare writes its truths and its arms
+    at run, compiling none, their run compiling both on its GPU, its float64 truths on its FP64 units, as its
+    prepare declared, which the run names (`truths_ahead.AT_RUN`: its truths and each arm), nothing
+    unprepared; before, the prepare compiled both for the GPU and its run refused their load, and then its
+    truths for the host's CPU, dense float64 on the node's CPU in the run (row 8576)."""
     import tier_wire
     from jax.experimental import topologies
     from truths_ahead import AT_RUN, prepared
@@ -388,12 +412,14 @@ def test_a_convolution_sites_truths_compute_on_the_host_and_its_arms_compile_on_
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
     sites = [json.loads(site.read_text()) for site in store.glob("*/site.json")]
     assert sorted((site["arms"], site["host"], "at_run" in site) for site in sites) == [
-        (False, True, False), (True, False, True)], sites
-    # Its arms' memory read offline, by which the lane sizes the run's worker (`compiled_memory`).
-    assert all(site["memory"] for site in sites if site["arms"]), sites
+        (False, False, True), (True, False, True)], sites
+    # Their memory read offline, by which the lane sizes the run's worker (`compiled_memory`).
+    assert all(site["memory"] for site in sites), sites
     with compiled_truths(store, prepare=False, stamp="a"):
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
-    assert (store / AT_RUN).exists() and not (store / UNPREPARED).exists()
+    # Its truths and its two arms, each named once.
+    assert len(json.loads((store / AT_RUN).read_text())["reasons"]) == 3
+    assert not (store / UNPREPARED).exists()
 
 
 def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
@@ -837,14 +863,15 @@ def test_a_tests_unprepared_record_names_every_reason(tmp_path):
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_walk_its_values_steer_runs_on_the_host_in_a_prepared_run(tmp_path, monkeypatch):
+def test_a_walk_its_values_steer_runs_on_the_runs_device_named_at_run(tmp_path, monkeypatch):
     """A site sized by its truth's terms (`terms=True`) whose float64 truth takes a branch its values pick
     (`lax.cond` on its operands), its terms' walk held by its prepare as one its run walks
-    (`reference_error._held_walk`), walks it in its run on the host's CPU, wherever the run's default device
-    is: a part's run compiles nothing on its GPU, whose lane requires every program's tuning recorded (the
-    deterministic picks theme), where the walk compiled its spans on the run's own device; each output's
-    terms completed there too (`float64_terms._or_size`, a literal's sized apart: the review)."""
+    (`reference_error._held_walk`), walks it in its run on the run's own device, a GPU's FP64 units, each
+    output's terms completed there (`float64_terms._or_size`), and the run names the walk as compiled at run
+    (`truths_ahead.AT_RUN`), nothing unprepared: a float64 truth's terms walked on the host's CPU in the run
+    was dense float64 on the node's CPU (testing.md, bible section 8; row 8576)."""
     import float64_terms
+    from truths_ahead import AT_RUN
 
     dew, reference, draw = _site()
 
@@ -869,4 +896,33 @@ def test_a_walk_its_values_steer_runs_on_the_host_in_a_prepared_run(tmp_path, mo
     assert not walked
     with compiled_truths(tmp_path, prepare=False, stamp="a"), jax.default_device(jax.devices()[1]):
         assert_as_exact(dew, reference, draw, "a steered product", seeds=8, truth_fn=steered, terms=True)
-    assert walked and sized and set(walked) == set(sized) == {jax.devices("cpu")[0]}
+    assert walked and sized and set(walked) == set(sized) == {jax.devices()[1]}
+    assert (tmp_path / AT_RUN).is_file() and not (tmp_path / UNPREPARED).exists()
+
+
+def test_a_site_whose_truths_alone_are_at_run_computes_its_reference_as_its_truth(tmp_path, monkeypatch):
+    """A site naming no truth whose prepare writes its truths at run (`compile_site`'s `at_run`: their
+    programs hold a choice its GPU makes) and compiles its arms: its run computes its truth from its
+    reference as compiled there (`_site_judged`), its arms from the store, the truths named at run alone,
+    nothing unprepared; the truth fell back to the reference arm read from the store, called at float64
+    inputs it holds no program for (`MissingTruth`, the review of rows 8576 and 8579)."""
+    from truths_ahead import AT_RUN, CompiledTruths
+
+    from dew.nn.kernels.templates import report
+
+    dew, reference, draw = _site()
+    real = CompiledTruths.compile_site
+
+    def refusing_truths(store, label, programs, held, **options):
+        # A choice its GPU makes, which no compile without that GPU holds, in its truths' programs alone.
+        if programs and not options.get("arms", False):
+            raise report.CompiledOnDevice(jax.jit(lambda x: x).lower(np.zeros(1, np.float32)), ["truth"])
+        return real(store, label, programs, held, **options)
+
+    with compiled_truths(tmp_path, prepare=True, stamp="a"), monkeypatch.context() as at_run:
+        at_run.setattr(CompiledTruths, "compile_site", refusing_truths)
+        assert_as_exact(dew, reference, draw, "a product whose truths are at run", seeds=8)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product whose truths are at run", seeds=8)
+    assert len(json.loads((tmp_path / AT_RUN).read_text())["reasons"]) == 1
+    assert not (tmp_path / UNPREPARED).exists()

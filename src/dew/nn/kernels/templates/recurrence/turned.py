@@ -362,9 +362,12 @@ def _halves(query, key, value, d_out, log, beta, ids, teams, *, scale: float, gr
         kept = ((team[..., 1, :, None] > team[..., 0, None, :])
                 & (doc[..., 1, :, None] == doc[..., 0, None, :]))
         lag = _between(tuple(part[..., 1, :, None] for part in G), tuple(part[..., 0, None, :] for part in G))
-        pairs = (jnp.einsum('...iv,...jv->...ij', do[..., 1, :, :], v[..., 0, :, :])
-                 * jnp.exp(jnp.where(kept, lag, -jnp.inf)))
-        pairs = pairs * (scale * b[..., 0, None, :])
+        # A pair of another document or group selected out before any product meets it, its score, decay
+        # and gate weight each zero there: weighed by exp(-inf) after them, two documents' cotangent of
+        # 2^127 and value of two were inf times zero, and a gate weight past the largest likewise (row 8566).
+        scores = jnp.where(kept, jnp.einsum('...iv,...jv->...ij', do[..., 1, :, :], v[..., 0, :, :]), 0.0)
+        weights = jnp.where(kept, scale * b[..., 0, None, :], 0.0)
+        pairs = scores * jnp.exp(jnp.where(kept, lag, -jnp.inf)) * weights
         later = _suffix(_crossed(q[..., 1, :, :], jnp.einsum('...ij,...jk->...ik', pairs, k[..., 0, :, :])),
                         axis=-2)
         terms = _crossed(jnp.einsum('...ij,...ik->...jk', pairs, q[..., 1, :, :]), k[..., 0, :, :])
