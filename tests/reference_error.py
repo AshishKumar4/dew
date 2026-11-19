@@ -598,7 +598,9 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     it, for the store's devices (`CompiledTruths.tracing`, in the arithmetic arms run in, `summed_as_run`),
     and compiled as the gate compiles it (`_arm_compile`): its run calls each draw's executable
     (`_ahead_arm`), tracing, lowering and compiling none, its sizing too. An arm the gate runs as given, or
-    one running Dew's own programs (`dew_programs`, a host loop), holds no program."""
+    one running Dew's own programs (`dew_programs`, a host loop), holds no program. A site its target's
+    compile refuses (`report.CompiledOnDevice`: a convolution's algorithm, which its GPU picks) is written
+    at run (`compile_site`'s `at_run`): its run compiles every arm on its GPU, as given (`_stored_arm`)."""
     # Each arm named as each process first finds it, before any call of it here (`arm_role`); one no
     # statement holds runs unprepared in its run.
     named_arms = {role: (named_role, fn, reference) for role, (fn, reference) in arms.items()
@@ -729,7 +731,8 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str):
     draw's program its prepare compiled into `store` (`_ahead_arm`), named as its prepare named it; one no
     statement holds, or whose site's arms its prepare did not finish (its truths written, a failure before
     its arms': a flow's cell its prepare deferred, `gpu_flow.run_cells`), runs unprepared, named, and one
-    that holds no program as it is (`_stored_arms`)."""
+    that holds no program as it is (`_stored_arms`). One of a site its prepare wrote at run (`at_run`, before
+    `holds`) runs as given, compiled on its GPU, named (`compiled_at_run`), nothing unprepared."""
     if not _holds_program(given_fn):
         return arm
     named_role = arm_role(role, given_fn, label)
@@ -1176,8 +1179,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         with summed_as_run():
             _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms, ran = _draw_truth(truth_and_terms, prepared_followed, followed, dew_fn, inputs)
-        # Compiled ahead, its prepare held it (`_compile_site`); a truth run as given, its run holds it here.
-        if not at and (running() is None or _given(truth_fn or reference_fn)):
+        if not at and (running() is None or _given(truth_fn or reference_fn)):  # else held (`_compile_site`)
             _of_float64(label, _truth_read(truth_fn or reference_fn, followed, ran), inputs, truth)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
