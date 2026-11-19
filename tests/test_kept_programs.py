@@ -464,3 +464,29 @@ def test_a_program_over_numpys_pointers_runs_what_they_point_to_when_its_handed(
         assert fresh()(Scales(table), values).tolist() == [3.0] * 3
 
 
+
+
+def test_a_keeping_block_within_another_is_heard_by_both_and_the_outer_alone_after_it():
+    """Each executable Dew's compile point compiles within a `keeping` block nested in another is heard by
+    both, the outer first: a save of a run's programs inside a save of its process's keeps it in each (row
+    8450: the inner block hid the outer, whose save then lacked it); past the inner block, the outer
+    alone hears."""
+    from dew.nn.kernels.options import keeping, owned_program
+
+    heard: list[tuple[str, str]] = []
+
+    def listener(name):
+        return lambda program, lowered, executable: heard.append((name, program.called))
+
+    def doubled(values):
+        return values * 2
+
+    def halved(values):
+        return values / 2
+
+    with keeping(listener("outer")):
+        with keeping(listener("inner")):
+            owned_program(doubled)(jnp.arange(3.))
+        owned_program(halved)(jnp.arange(3.))
+    assert [name for name, _ in heard] == ["outer", "inner", "outer"], heard
+    assert heard[0][1] == heard[1][1] != heard[2][1], heard

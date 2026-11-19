@@ -145,7 +145,10 @@ def float64_held(tree):
 
 def summed_as_run():
     """The scope a check runs each arm in (`_drawn`), the truth and its terms outside it: on the CPU lane,
-    the process's default backend (`jax.default_backend()`), fp32 products summed in fp32
+    where the context places a call (`generation.placed_platform`: a GPU tier part's prepare, a CPU process,
+    places its arms on its compile-only GPU and takes the GPU's own arithmetic, as its run does; row 8580's
+    cuBLASLt FP8 arm, traced under the CPU's preset in that prepare, compiled without its fast
+    accumulation), fp32 products summed in fp32
     (`dew.nn.precision.FP32_SUMS`), as an accelerator sums them and as a CPU does in any process but
     the suite's, whose wide arithmetic (`WIDE_CPU_ARITHMETIC`) sums Dew's products in float64, so the
     gate measures each arm as its users run it; elsewhere the process's own precision. A Dew arm that
@@ -155,7 +158,9 @@ def summed_as_run():
     and sums them in float32, as a GPU's fp32-accumulated product does, and a loop's running sum of
     them is the plain one (`compensates_loops`); the setting's widened reductions, which are not
     product sums, stay."""
-    if jax.default_backend() == "cpu":
+    from dew.nn.kernels.generation import placed_platform
+
+    if placed_platform() == "cpu":
         return jax.default_matmul_precision(FP32_SUMS)
     return contextlib.nullcontext()
 

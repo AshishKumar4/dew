@@ -74,10 +74,13 @@ def test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_
     plain, headed, wide = built(None), built(None, head_chunks=2, head_tile="whole"), built(jnp.float64)
     initialize = jax.jit(plain.init)
 
+    # A draw's every leaf a JAX array, made by programs of its own: a draw holding NumPy arrays runs each arm
+    # once eagerly (`arm_forms._refuse_numpy_arms`), 974 programs and 16 s of a cold run (row 8433).
+    lowered = jax.jit(lambda variables: jax.tree.map(lambda leaf: leaf * 0.9, variables))
+
     def draw(seed):
         variables = initialize(jax.random.key(seed))
-        reference = jax.tree.map(lambda leaf: leaf * 0.9, variables)
-        return variables, reference, scored_batch(objective, int(seed))[0]
+        return variables, lowered(variables), jax.tree.map(jnp.asarray, scored_batch(objective, int(seed))[0])
 
     def trained(scored, *, qk_stats=False):
         def run(variables, reference, batch):

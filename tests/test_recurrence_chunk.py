@@ -15,6 +15,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tiny_models
+from arm_arithmetic import on_float64_device
+from contract_support import normal_float32
 from delta_rule_support import stacked_documents
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec as P
@@ -494,6 +496,89 @@ def test_a_turned_forked_calls_turn_curvature_is_as_exact_as_each_document_alone
 
     assert_as_exact(jax.jit(turn_curvature(ours)), jax.jit(turn_curvature(alone)), turned_entered_draw,
                     f"xla {TURNED} a forked call's turn curvature", seeds=32, truth_fn=truth)
+
+
+
+def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recurrence():
+    """A turned call's turns' gradient differentiated along its queries (`jvp` of `grad`), a third of its
+    queries zero, packed: on par from float64 with the recurrence a token at a time's (check 1), where the
+    turns' gradient taking out the tokens whose readers were zero by their values lost a zero query's
+    derivative (row 8519's head review: [1, 0] read [0, 0])."""
+    def drawn(seed):
+        (operands,) = draw(TURNED, packed=True, seed=seed)
+        rng = np.random.default_rng([8519, seed])
+        query = operands.query.at[:, ::3].set(0.0)
+        direction, cotangent = (hosted(rng.standard_normal(x.shape)) for x in (query, operands.value))
+        return dataclasses.replace(operands, query=query), direction, cotangent
+
+    def mixed(run):
+        def second(operands, direction, cotangent):
+            def turns_gradient(query):
+                given = dataclasses.replace(operands, query=query)
+
+                def loss(turn):
+                    return jnp.sum(run(dataclasses.replace(given, turn=turn))[0] * cotangent)
+
+                return jax.grad(loss)(given.turn)
+
+            return jax.jvp(turns_gradient, (operands.query,), (direction,))[1]
+
+        return jax.jit(second)
+
+    exact = mixed(functools.partial(token_by_token, TURNED))
+    assert_as_exact(mixed(lambda given: chunk_on('xla', TURNED, given, chunk_size=CHUNK)), exact, drawn,
+                    "a turned call's mixed derivative at zero queries", seeds=32, truth_fn=exact)
+
+
+def assert_finite_where_float64_is(operands, seeded) -> None:
+    """`TURNED`'s chunked op over `operands` on the portable math, its output and every gradient under the
+    cotangents `seeded`: finite wherever the recurrence a token at a time's in float64 is a normal float32,
+    the leaf named where one is not (a mark's gradient, float0, skipped)."""
+    ours = jax.jit(with_gradients(lambda given: chunk_on('xla', TURNED, given, chunk_size=CHUNK)))(operands,
+                                                                                                    seeded)
+    with jax.enable_x64(new_val=True), on_float64_device():
+        exact = jax.jit(with_gradients(lambda given: token_by_token(TURNED, given)))(*widened((operands,
+                                                                                               seeded)))
+    leaves = jax.tree_util.tree_leaves_with_path(ours)
+    for (path, made), truth in zip(leaves, jax.tree.leaves(exact), strict=True):
+        if not jnp.issubdtype(made.dtype, jnp.floating):
+            continue
+        held = normal_float32(np.asarray(truth))
+        wrong = held & ~np.isfinite(np.asarray(made, np.float64))
+        assert not wrong.any(), (jax.tree_util.keystr(path), int(wrong.sum()))
+
+
+def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
+    """A one-token turned call whose token begins a document (its memory entering, every entry 2^127,
+    discarded), a query of its first key, zero keys, values, turns and log decays, an output cotangent of 2
+    on each of its first two value columns: its output and every gradient finite wherever float64's is a
+    normal float32, the turns' zero, where the turns' gradient contracted the discarded memory with the
+    output's cotangent before its zero readers took it out, 2^128 then 0 times inf (row 8519, base review
+    d6c1b2c1a F2)."""
+    (operands,) = draw(TURNED, packed=False, seed=0, length=1)
+    zero = {name: jnp.zeros_like(getattr(operands, name)) for name in ('key', 'value', 'log_decay', 'turn')}
+    first = jnp.zeros_like(operands.query).at[..., 0].set(1.0)
+    operands = dataclasses.replace(operands, query=first,
+                                   beta=jnp.ones_like(operands.beta),
+                                   state=jnp.full_like(operands.state, 2.0 ** 127),
+                                   starts=jnp.ones(operands.value.shape[:2], bool), **zero)
+    d_out = jnp.zeros_like(operands.value).at[..., :2].set(2.0)
+    seeded = (d_out, jnp.zeros_like(operands.state))
+    assert_finite_where_float64_is(operands, seeded)
+
+
+def test_a_turned_calls_cotangent_near_the_largest_across_documents_keeps_every_gradient_finite():
+    """Two one-token turned documents, zero queries, keys, turns and log decays, unit write gates, values of
+    two and output cotangents of 2^127: its output and every gradient finite wherever float64's is a normal
+    float32, the turns' zero, where the turns' gradient's own pairs contracted the later document's cotangent
+    with the earlier one's value, 2^128, before their zero cross-document weight, NaN (row 8566)."""
+    (operands,) = draw(TURNED, packed=False, seed=0, length=2)
+    zero = {name: jnp.zeros_like(getattr(operands, name)) for name in ('query', 'key', 'log_decay', 'turn')}
+    operands = dataclasses.replace(operands, value=jnp.full_like(operands.value, 2.0),
+                                   beta=jnp.ones_like(operands.beta), state=jnp.zeros_like(operands.state),
+                                   starts=jnp.ones(operands.value.shape[:2], bool), **zero)
+    seeded = (jnp.full_like(operands.value, 2.0 ** 127), jnp.zeros_like(operands.state))
+    assert_finite_where_float64_is(operands, seeded)
 
 
 @pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],
