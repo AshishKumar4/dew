@@ -978,11 +978,13 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
 
 
 def _underflowed_out(products, between):
-    """`products` `[C, C]` zero where every decay of their pair (`between` `[C, C, K]`) is zero but a NaN:
-    the recurrence decays a term as it enters, so a live pair's decay that underflows (`_crossed`'s positive
-    zero) weighs its product to zero, which formed before that decay may overflow, infinity times zero (a
+    """A scalar decay's pair `products` `[C, C]` zero where their decay (`between` `[C, C, 1]`) is zero but a
+    NaN, which that decay multiplies after them: a live pair's decay that underflows (`_crossed`'s positive
+    zero) weighs its product to zero, which, formed before that decay, may overflow, infinity times zero (a
     query's and a key's 2^70 under decays of exp(-160), head review of 512810acf F7); a NaN in a factor reads
-    NaN as the recurrence's (train 1079's review F1)."""
+    NaN as the recurrence's (train 1079's review F1). A per-key decay's pairs apply their factors apart
+    (`_factored`, `spread`'s sub-chunks), each at most 1, whose product keeps a result its whole decay
+    loses."""
     return jnp.where(jnp.all(between == 0, axis=-1) & ~jnp.isnan(products), 0.0, products)
 
 
@@ -1033,11 +1035,11 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
 
     issue = issue or _issued
     active = jnp.any(~_crossed(between), axis=-1)
-    reads = _underflowed_out(jnp.where(active, issue("scores", readers, values.T), 0.0), between)
+    reads = jnp.where(active, issue("scores", readers, values.T), 0.0)
     if weights is not None:
         reads = reads * weights
     if between.shape[-1] == 1:
-        return issue("apply", reads * between[..., 0], keys)
+        return issue("apply", _underflowed_out(reads, between) * between[..., 0], keys)
     count = keys.shape[0]
     sub = recurrence_algebra.SUB
     rows = []
