@@ -237,7 +237,11 @@ and a product's, each a fusion's root, as `cost.fused` restates XLA's fusion, wh
 compile: §6.5, whose table measures where the restatement over-counts) at the part's measured fixed latency (its launch and first byte; a part no measurement holds pays none, and
 its kernels are counted as work no rate prices, §6.5), so a
 chain of dependent reductions pays a kernel's latency a link, and the span of a loop XLA lowers at its
-iteration's latency (§6.5), combined as `templates.cost` combines a launch's. Row
+iteration's latency (§6.5), combined as `templates.cost` combines a launch's. On a TPU, what XLA's fusion keeps on
+chip between its kernels moves through VMEM (`Work.kept_bytes`: a leaf read once into the vector registers, a
+reduction's and a product's result written once and read once, elementwise work fused into a kernel none), priced at
+the TPU's measured VMEM rate (`GpuTarget.vmem_rate`; a TPU no one measured leaves it work no rate prices); a GPU's
+XLA keeps it on chip at no price (row 7283). Row
 4072's validation priced 1,580 profiled kernels: without a kernel's fixed latency an H100's XLA fusions came
 to 0.02 of their measured time, with it 0.51 (p10 0.40). Prices are checked against measured profiles, not
 fitted to them, and a rule set ships only with measured receipts.
