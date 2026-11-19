@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from attention_oracle import attention_terms
+from attention_oracle import traced_attention_terms
 from decision_support import decision_rows
 from float64_terms import float64_terms
 from optim_support import in_float64
@@ -246,7 +246,7 @@ READ = ("_heads", "__call__")
 
 class AttentionTerms:
     """Each attention's projections' gradients' float64 terms in `objective`'s float64 model at `batch`
-    (`NormalAttention`): its queries', keys' and values' terms (`attention_terms`, a logit's gradient
+    (`NormalAttention`): its queries', keys' and values' terms (`traced_attention_terms`, a logit's gradient
     P (dP - delta) sized by its terms' rounding), carried through the projection that made them to its
     bias, their root sum of squares over the batch's tokens, and to its kernel, the tokens' input times
     them. A key's bias moves every logit of its query alike, so its gradient cancels to zero in float64
@@ -313,7 +313,7 @@ class AttentionTerms:
             kernel = node(variables["params"], place)[out_name]["kernel"]
             heads, width = queries.shape[2:]
             dout = jnp.einsum("bsf,hdf->bshd", cotangents[path], kernel.reshape(heads, width, -1))
-            _, query_terms, key_terms, value_terms = attention_terms(queries, keys, values, dout, keep)
+            _, query_terms, key_terms, value_terms = traced_attention_terms(queries, keys, values, dout, keep)
             # `into` stays on the device: `with_attention_terms` widens it there, at float64 under x64.
             carried[place] = {name: (into, terms) for name, into, terms in (
                 (query_name, into_queries, query_terms), (key_name, into_keys, key_terms),
