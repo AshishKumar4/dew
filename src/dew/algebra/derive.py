@@ -830,15 +830,26 @@ ZERO = "zero"
 
 
 def _factor_axes(made: _Forms, index: int, kept) -> tuple[int, ...]:
-    """The axes of `made`'s state `index` its anchor's factor runs along (the step's `lifts` of the
-    correction reading the maximum `kept`), or every axis where its step broadcasts it none (a sum of the
-    anchor's own shape)."""
+    """The axes of `made`'s state `index` its anchor's factor runs along: the lift (`lifts`) of the
+    correction reading the maximum `kept` that multiplies the carried state, every axis where it is no
+    broadcast (a sum of the anchor's own shape); refused where its step lifts it two ways (the review of
+    646d52c15's `_anchored`, F3)."""
+    state, found = terms.key(Term.state(i64(index), i64(0))), set()
     for term in terms.subterms(made.steps[index]):
-        args = get_callable_args(term, Term.shaped)
-        if (args is not None and terms.text(args[1]) == "broadcast_in_dim"
-                and any(terms.key(read) == kept for read in terms.subterms(args[0]))):
-            return tuple(made.region.params[terms.integer(args[2])][1]["broadcast_dimensions"])
-    return tuple(range(len(made.region.shape(made.reductions[index]))))
+        args = get_callable_args(term, Term.binary)
+        if (args is None or terms.text(args[1]) != "mul"
+                or state not in {terms.key(args[0]), terms.key(args[2])}):
+            continue
+        factor = args[2] if terms.key(args[0]) == state else args[0]
+        if not any(terms.key(read) == kept for read in terms.subterms(factor)):
+            continue
+        lifted = get_callable_args(factor, Term.shaped)
+        found.add(tuple(made.region.params[terms.integer(lifted[2])][1]["broadcast_dimensions"])
+                  if lifted is not None and terms.text(lifted[1]) == "broadcast_in_dim"
+                  else tuple(range(len(made.region.shape(made.reductions[index])))))
+    if len(found) != 1:
+        raise Refused(f"{made.reductions[index]}: its step lifts the anchor's correction {len(found)} ways")
+    return found.pop()
 
 
 def _invariant_finishes(made: _Forms, index: int, carried: dict) -> None:
@@ -853,6 +864,12 @@ def _invariant_finishes(made: _Forms, index: int, carried: dict) -> None:
         if form is not None and _anchor_degree(form, made, index, carried, memo) not in (0, ZERO):
             raise Refused(f"an output whose finish {form} is no ratio of the sums an anchor carries, which a "
                           "moved anchor would change")
+    # A step past the carried sums' and the maximum's own reading a carried sum moves with the anchor too
+    # (the review of 646d52c15's `_anchored`, F2).
+    for place, form in enumerate(made.steps):
+        if place != index and place not in carried and _anchor_degree(form, made, index, carried,
+                                                                       memo) not in (0, ZERO):
+            raise Refused(f"{made.reductions[place]}: its step reads a sum the anchor carries")
 
 
 def _anchor_degree(term: Term, made: _Forms, index: int, carried: dict, memo: dict):
@@ -899,11 +916,14 @@ def _anchor_degree(term: Term, made: _Forms, index: int, carried: dict, memo: di
         found = _guarded(made, args, degree)
     elif (args := get_callable_args(term, Term.unary)) is not None:
         inner = degree(args[0])
-        found = inner if given(2)[0] in (jax.lax.neg_p, jax.lax.abs_p) or inner in (0, ZERO) else None
+        found = inner if given(2)[0] in (jax.lax.neg_p, jax.lax.abs_p) else 0 if inner in (0, ZERO) else None
     elif (args := get_callable_args(term, Term.convert)) is not None:
         inner, target = degree(args[0]), given(1)[1].get("new_dtype")
-        widest = target is not None and np.dtype(target) in (np.dtype(np.float32), np.dtype(np.float64))
-        found = inner if widest or inner in (0, ZERO) else None
+        source = region.dtypes.get(terms.key(args[0]))
+        widening = (target is not None and source is not None and jnp.issubdtype(target, jnp.floating)
+                    and jnp.issubdtype(source, jnp.floating)
+                    and np.dtype(target).itemsize >= np.dtype(source).itemsize)
+        found = inner if widening or inner in (0, ZERO, None) else None
     elif (args := get_callable_args(term, Term.shaped)) is not None:
         found = _reshaped(degree(args[0]), *given(2))
     elif (args := get_callable_args(term, Term.reduce)) is not None:

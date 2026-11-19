@@ -328,16 +328,24 @@ def across_rows(q, k, v, rows, keys):
     return total[:, None] / total[None, :]
 
 
+def times_one(q, k, v, rows, keys):
+    """The weights' sum times `exp(0)`: a sum the anchor scales, the function of a zero literal 1, not 0."""
+    del v, rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    return jnp.sum(jnp.exp(s - jnp.max(s, axis=-1)[:, None]), axis=-1) * jnp.exp(jnp.float32(0))
+
+
 @pytest.mark.parametrize("function", [unnormalized, guarded_backwards, guarded_signed, over_unanchored,
-                                      narrowed, across_rows],
+                                      narrowed, across_rows, times_one],
                          ids=["a sum", "a guard backwards", "a signed guard", "over an unanchored sum",
-                              "a narrowing cast", "across rows"])
+                              "a narrowing cast", "across rows", "times a function of zero"])
 def test_an_anchor_of_an_output_its_sums_scale_is_refused(function):
     """A declaration whose output its sums' anchor scales is refused a moved anchor at its step
     (`derive.Refused`): a sum its maximum weighs (an anchor 1 below the maximum finished `1 + e` where it is
     `1 + e^-1`, the base review of 9745e74f0, F2), a guard taken the wrong way round, a guard of a signed sum
     (the review of de9fbec82's `_anchored`, F1, F2), a ratio over an unanchored sum, a narrowing cast (the
-    base review of 25ceaae2f, F1, F2) and a ratio of one row's sum over another's."""
+    base review of 25ceaae2f, F1, F2), a ratio of one row's sum over another's and a sum times `exp(0)`
+    (the review of 646d52c15's `_anchored`, F1)."""
     forms = derive.derive(declared(function), accurate=False, saturation=SATURATION)
     values = operands(*draw(0))
     tile = tile_of(values, 0)
