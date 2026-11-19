@@ -665,7 +665,9 @@ def test_a_truth_run_as_given_computes_on_the_host_in_a_prepare(tmp_path, monkey
     placed = []
 
     def truth(a, b):
-        placed.append((jax.config.jax_default_device, {device for x in (a, b) for device in x.devices()}))
+        # Where its eager operations run, and where its inputs are (NumPy's, unplaced, none).
+        placed.append((jax.config.jax_default_device,
+                       {device for x in (a, b) for device in getattr(x, "devices", set)()}))
         return reference(a, b)
 
     # The store's device another than the host's first, as a GPU part's compile-only GPU is.
