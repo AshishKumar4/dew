@@ -235,8 +235,10 @@ class CompiledTruths:
                              for shape in shapes)
             return Executable.of(compile_one(function, out_shardings=placed).lower(*placed_shapes).compile())
 
+        # Compiled on this process's devices, which made every choice themselves.
         return AheadPrograms(BuildTarget.of(devices), {
-            name: built(function, shapes) for name, (function, shapes) in programs.items()})
+            name: built(function, shapes) for name, (function, shapes) in programs.items()},
+            tuned=True, at_run=())
 
     def called(self, label: str, role: str, inputs):
         """The site's program `role` run on `inputs` (its draw's: a truth's widened, an arm's as drawn) and
