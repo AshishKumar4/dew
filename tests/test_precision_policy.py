@@ -1236,6 +1236,35 @@ def test_an_aligned_sums_non_finite_product_is_ieees(term, total):
     np.testing.assert_array_equal(np.asarray(found), np.float32(total))
 
 
+@pytest.mark.parametrize("x64", [False, True], ids=["x32", "x64"])
+def test_an_aligned_sum_in_a_tpu_kernel_lowers_for_a_tpu(x64):
+    """A Pallas launch summing a `[16, 16]` tile's rows aligned (as the forked SSD's entry-write gradient
+    does), traced for an assumed v5p, with x64 off and on: it lowers on any host to a Mosaic kernel, where
+    under x64 its digit loop's index was 64-bit and Mosaic's 32 (base review d710d7ee9 F2, row 8757)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import AbstractDevice, AbstractMesh, AxisType
+
+    from dew.nn.kernels import launches
+    from dew.nn.kernels.generation import TARGETS, assumed
+    from dew.nn.kernels.lowered import custom_calls
+
+    def body(x_ref, y_ref, out_ref):
+        out_ref[...] = aligned_sum([(x_ref[...], y_ref[...])], axis=0)
+
+    spec = pl.BlockSpec((16, 16), lambda: (0, 0), memory_space=pltpu.VMEM)
+    call = launches.pallas_call(body, grid=(), in_specs=[spec, spec],
+                                out_specs=pl.BlockSpec((1, 16), lambda: (0, 0), memory_space=pltpu.VMEM),
+                                out_shape=jax.ShapeDtypeStruct((1, 16), jnp.float32), interpret=False,
+                                name="aligned_sum_lowered")
+    tile = jax.ShapeDtypeStruct((16, 16), jnp.float32)
+    device = AbstractDevice(device_kind=TARGETS["v5p"].device_kind, num_cores=None, platform="tpu")
+    mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with jax.enable_x64(new_val=x64), assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(call).trace(tile, tile).lower(lowering_platforms=("tpu",))
+    assert any(found.target == "tpu_custom_call" for found in custom_calls(lowered))
+
+
 def test_an_aligned_sum_over_an_empty_axis_is_positive_zero():
     """`aligned_sum` over an empty fp32 axis: positive zero, IEEE's sum of no terms, where a sum of none
     counted as of negative zeros alone, negative zero (base review 6c68b90ad F4)."""
