@@ -167,9 +167,8 @@ def streamed(trainer, start: Start, batch, dtype, device_steps: tuple
     as built, and the batches the run prefetches beside them, `prefetched_bytes`), and its price
     (`streamed_price`), None where its part rates no step computing in `dtype`, with the bytes its fit check
     found the tightest device had to spare (`step_fits`'s headroom, None where it read none). Its bytes are
-    each device's:
-    the shards its link moves, and the shards its process's update reads and writes on its host, every local
-    device's."""
+    each device's: the shards its link moves, and the shards its process's update reads and writes on its
+    host, every local device's."""
     mesh, abstract = trainer.device_mesh, start.abstract
     # The batch read in the split the run states, each microbatch an attempt of its own that fetches the
     # parameters again (`StepCompiler._compile_host`).
