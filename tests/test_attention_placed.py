@@ -119,6 +119,9 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
             return attention_mosaic.forward(query, key, key, spans, interpret=False)
 
     threads, arrivals = programs(forward, query, key, threads=ROWS_TILES.consumers + 1, rare=False)
+    first_mma = next(i for i, event in enumerate(threads[-1]) if event.kind == "product")
+    assert ({event.at for event in threads[-1][:first_mma] if event.kind == "wait"}
+            & {event.at for event in threads[0] if event.kind == "arrive"})
     assert explore(threads, arrivals) > 0
 
 @INTERPRETS
