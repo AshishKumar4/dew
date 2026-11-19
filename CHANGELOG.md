@@ -12,8 +12,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   the companion's for this host, none compiled. `Lowered.lowered` is a device step's one program.
 - A run that keeps its variables on the host samples its rollout from a copy of its weights on its
   devices, made once a call; the copy and each program the rollout compiles beside it (a generation's KV
-  cache and activations) are refused by name where the devices cannot hold them. The streamed layout's
-  choice considers a run with a rollout, its plan's price counting the copy (`StepPrice.rollout`).
+  cache and activations) are refused by name where the devices cannot hold them, and the copy's bytes are
+  logged (`train/rollout_copied_gib`). The streamed layout's choice keeps a run with a rollout on its
+  devices: its stream's first batch is the rollout's input, no step's, so no step is priced before a
+  rollout runs.
+- A fresh fit plans its step once over the batch its loop hands the step, where the layout's choice
+  planned over the batch as read and the first compile planned and compiled it again, and compiles no
+  streamed step where the device plan is priced no dearer than the streamed step's update on the host
+  alone.
 - Under AutoPGLE (`jax_enable_pgle`) a step that keeps its variables on the host is profiled on a trial
   after its startup and runs its accelerator programs guided by the profile, as a device plan does
   (`HostStartup.pgle` records it); the streamed layout's choice considers such a run.

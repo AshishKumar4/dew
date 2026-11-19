@@ -214,7 +214,9 @@ class Interval:
     their FLOPs. `model_counted` and `tokens_counted` say whether a step
     since the last log reported its analytical work and real tokens.
     `rollout_seconds` is the time spent sampling, logged under
-    train/rollout_seconds when a rollout is set. `waited` is the time the
+    train/rollout_seconds when a rollout is set, and `rollout_copied` the bytes its
+    rollouts copied of the run's host-held weights onto a device (`rollout.on_devices`), logged
+    under train/rollout_copied_gib. `waited` is the time the
     loop spent waiting on its next batch and `compiling` the time it spent
     compiling the step for a shape it had not met, both in seconds, since
     the last log. `compiles` counts StepCompiled records over the whole fit,
@@ -239,6 +241,7 @@ class Interval:
     model_counted: bool = False
     tokens_counted: bool = False
     rollout_seconds: float = 0.0
+    rollout_copied: int = 0
     kept_paths: tuple[str, ...] = ()
     """The leaves of the run's kept state (`dew.training.transaction.checked`) by their paths, in their
     order, by which a stop names one not finite (`checked_finite`)."""
@@ -424,6 +427,7 @@ class Interval:
                 self.logged_tokens, book.tokens)
         self.since_log, self.samples, self.computed = 0, 0, 0
         self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
+        self.rollout_copied = 0
         self.model_counted = self.tokens_counted = False
         self.inspected = None
         if book is not None and self.fresh is not None:
@@ -655,6 +659,7 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
         scalars["train/loss_scale"] = float(read.scale)
     if rollout:
         scalars["train/rollout_seconds"] = counts.rollout_seconds
+        scalars["train/rollout_copied_gib"] = counts.rollout_copied / 2 ** 30
         scalars.update({f"rollout/{name}": float(value) for name, value in read.rollout.items()})
     if read.inspected is not None and int(read.inspected[0]):
         scalars.update(logged(read.inspected[1]))

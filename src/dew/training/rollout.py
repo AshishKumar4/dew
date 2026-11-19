@@ -124,6 +124,9 @@ def rolled_out[LossT, EffectsT](rollout: Rollout | None, state: TrainState, batc
     further = {"further": consumed.reading(run.further(interval))} if _draws_further(rollout) else {}
     with run.held():
         policy, key, held = on_devices(state, key, mesh)
+        # The copy's bytes on a device, each call's (`Interval.rollout_copied`): what a run that keeps its
+        # variables on the host moves to sample, the step aside.
+        interval.rollout_copied += max((copy for copy, _ in held.values()), default=0)
         with admitted(mesh, held):
             made = carried(rollout(policy, _unread(batch), key, **further, objective=objective), batch,
                            consumed)
@@ -171,8 +174,8 @@ def on_devices(state: TrainState, key: jax.Array, mesh: Mesh
 def policy_bytes(weights, shardings, mesh: Mesh) -> Held:
     """Each of `mesh`'s devices' bytes, in its own memory, of `weights` (arrays or shapes, each placed by
     `shardings`' leaf) as a rollout's policy reads them there (`on_devices`): of the leaves held on other
-    devices, copied onto it by their partition spec (`execution.spec_on`), and of the rest, as they sit. The
-    one count the copy is admitted by and its step's price reads (`streaming.streamed`)."""
+    devices, copied onto it by their partition spec (`execution.spec_on`), and of the rest, as they sit: the
+    one count the copy is admitted by and its run logs (`Interval.rollout_copied`)."""
     from dew.training.execution import spec_on
 
     devices = set(mesh.devices.flat)
