@@ -834,6 +834,14 @@ class OuterProgram:
             if key in self._executables:
                 self._ready[key] = executable
 
+    def keeps(self) -> bool:
+        """Whether it keeps an executable a call over arrays runs (one compiled at a call, or taken from a
+        compile over shapes at one): none before its first call and once released (`released`). It says that
+        one is kept, not that it is the one a call over given arguments runs: a caller reads it of a program
+        called over one shape alone (a kept start's, `dew.training.distributed.start_compiling`)."""
+        with self._compiling:
+            return bool(self._ready)
+
     def guided(self, executable: jax.stages.Compiled, replacement: jax.stages.Compiled) -> None:
         """`executable`, one this program holds, replaced by `replacement`, its compile again guided by a
         profile of its runs (AutoPGLE's, `dew.training.planning.guided_compile`), wherever the program holds
