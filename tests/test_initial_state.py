@@ -136,3 +136,22 @@ def test_a_kept_draw_over_trees_alike_under_other_keys_draws_each_tree_its_own()
     drawn = drawn_once(doubled, second, key, WHOLE, kept="doubled")
     assert sorted(drawn) == ["c", "d"], drawn
     assert float(drawn["c"][0]) == 10.0 and float(drawn["d"][0]) == 14.0, drawn
+
+
+def test_an_initial_state_from_another_initializer_draws_that_initializer():
+    """A state built from an initializer other than the objective's own, of the same leaves (none), draws
+    that initializer, where the eager draw kept by the class replayed the objective's own, which its key
+    states and the other's function is not part of (row 9092)."""
+    from jax.tree_util import Partial
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=8)
+    objective = LMObjective(model, seq_len=8)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
+
+    def shifted(key):
+        return jax.tree.map(lambda leaf: leaf + 1, objective.init(key))
+
+    own = jax.tree.leaves(trainer.initial_state().variables["params"])
+    other = jax.tree.leaves(trainer.initial_state(Partial(shifted)).variables["params"])
+    assert all(jnp.allclose(b, a + 1) for a, b in zip(own, other, strict=True))
