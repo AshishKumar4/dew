@@ -2296,16 +2296,12 @@ KEY_BINADES = 31
 
 def lazy_binades(natural: bool, *, compensated: bool, weights, bound: float = 1.0) -> int | None:
     """The binades by which a tile's maximum may pass a row's kept one before the walk moves its anchor
-    (`lazy_anchor`), or None where it moves on every larger maximum: the accurate form's (`natural`), whose
-    held weights assume their anchor at least every logit (`derive`'s select of `exp(x - b)` under
-    `b >= x`), and a compensated walk's. A kept anchor leaves each weight at most `2^binades`, a dropping
-    call's times its largest multiplier `bound`, so the binades are the least of those above 1 its
-    product's narrowed weights hold (`weights`' largest exponent: fp16's 15) and those the scaled walk's
-    bound leaves for its keys (`BOUND_UNIT` less `KEY_BINADES`: each term of `weighed_reach` a weight times
-    a value below 2^128, held at `2^-BOUND_UNIT`, summed over fewer than `2^KEY_BINADES` keys), each less
-    the multiplier's binades (a weight of 4 e^10 at a rate of 0.75 narrowed to fp16's infinity), none below
-    0, the exact anchor. An unscaled walk's sums reach `walk_reach` times a weight of 1's
-    (`may_scale`'s `amplified`)."""
+    (`lazy_anchor`); None where it moves on every larger maximum: the accurate form's (`natural`, its held
+    weights' select of `exp(x - b)` under `b >= x`) and a compensated walk's. A kept anchor leaves each
+    weight at most `2^binades` (a dropping call's times its multiplier `bound`): the least of the binades
+    above 1 its narrowed weights hold (`weights`' largest exponent, fp16's 15) and those the scaled walk's
+    bound leaves its keys (`BOUND_UNIT` less `KEY_BINADES`), each less the multiplier's (4 e^10 at a rate of
+    0.75 narrowed to fp16's infinity), none below 0. An unscaled walk's sums reach `walk_reach`."""
     if natural or compensated:
         return None
     multiplied = math.ceil(math.log2(bound)) if bound > 1 else 0
@@ -2341,21 +2337,29 @@ def lazy_margin(spec: Forward, weights, bound: float = 1.0) -> float | None:
 def lazy_anchor(margin: float | None, binade: float = 1.0) -> Callable | None:
     """The walk's anchor (`forms.step`'s `anchor`): a row's maximum kept unless the tile's passes it by more
     than `margin` (`lazy_margin`), then the tile's, or past `FAR_BINADES` (a `binade` each in the walk's
-    units) the tile's less the margin, its factor never below an every-maximum walk's (tiles at 0, 22 and
-    105 nats took e^-105 at once, flushing what an anchor at 22 keeps, the base review of 13eba49bd, F1)."""
+    units) the tile's less the margin, rounded up toward it, so its factor is never below an every-maximum
+    walk's (moved to the tile's, tiles at 0, 22 and 105 nats and at 300, 322 and 406 flushed what an anchor
+    at 22 or 322 keeps, the base reviews of 13eba49bd and 9745e74f0, F1). Each distance is exact where close
+    (Sterbenz): the kept one plus the margin rounded at 2^29 kept an anchor that weighed fp16's infinity (the
+    base review of a71e85d7a, F2)."""
     if margin is None:
         return None
     gap, far = np.float32(margin), np.float32(FAR_BINADES * binade)
 
-    # Each distance exact where they are close (Sterbenz): the kept one plus the margin rounded at 2^29 (an
-    # fp16 raw fold's, scale 0.24) up to a maximum 64 past it, past a margin of 43.3, so the anchor stayed
-    # and weighed e^15.4, fp16's infinity (the base review of a71e85d7a, F2); where it rounds, the maximum.
     def anchor(kept, exact):
         below = exact - gap
+        below = jnp.where(exact - below > gap, toward(below, exact), below)
         moved = jnp.where((exact - kept > far) & (exact - below <= gap), below, exact)
         return jnp.where(exact - kept > gap, moved, kept)
 
     return anchor
+
+
+def toward(x: jax.Array, y: jax.Array) -> jax.Array:
+    """fp32 `x` one place toward `y` (`nextafter` in bits, a kernel's own integers), `x` where they agree."""
+    bits = jax.lax.bitcast_convert_type(x, jnp.int32)
+    step = jnp.where((y > x) == (bits >= 0), 1, -1)
+    return jnp.where(x == y, x, jax.lax.bitcast_convert_type(bits + step, jnp.float32))
 
 
 FAR_BINADES = 64
@@ -2363,18 +2367,13 @@ FAR_BINADES = 64
 
 
 def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
-    """The state after a tile `keys` by the derived forms: the tile's logits (-inf where a query does not see
-    a key, as `modify` writes them) and values, its maximum, rescale and weights the forms'; the weighted
-    values' sums the mainloop's own where it holds them (`Keys.accumulate`, the state's `acc` in its form),
-    every product the mainloop's (`Keys.dot`). A tile held keys first (`Coords.keys_first`, a decode
-    program's `K Qᵀ`) takes its sums so: the mainloop's, `[Dv, bq]`, its queries their columns. A compensated
-    walk's (the state's `Low`) takes its sums as the template's step takes them (`stepped`): the tile's
-    products a chunk of keys each, each addition's rounding kept; a scaled walk's (`SCALED_WALK`) its rows'
-    scale from the forms' weights and the tile's values (`rescaled`), each tile at it where some row is
-    scaled (`scaled_step`). A dropping call's draw (`drawn`) multiplies the weights of the tile's product
-    alone, never its denominator's, so the template's product takes them (`tile_parts`): narrowed in place,
-    or past fp16's range (a multiplier of 2^16) at the power-of-two scale `dropped_parts` keeps them at,
-    where the forms' product would narrow them unnormalized."""
+    """The state after a tile `keys` by the derived forms: its logits (-inf where a query does not see a key,
+    `modify`'s) and values, its maximum (`lazy_anchor`), rescale and weights the forms'; the weighted values'
+    sums the mainloop's where it holds them (`Keys.accumulate`), every product the mainloop's (`Keys.dot`), a
+    keys-first tile's (`Coords.keys_first`) `[Dv, bq]`. A compensated walk's (`Low`) takes its sums as the
+    template's step does (`stepped`), a chunk of keys a product; a scaled walk's (`SCALED_WALK`) its rows'
+    scale (`rescaled`, `scaled_step`). A dropping call's draw (`drawn`) takes the product's weights alone,
+    never the denominator's (`tile_parts`)."""
     forms, tiles, fields = _step_forms(spec, keys)
     held_by, plain = keys.accumulate, state.low is None
     drop = keys.coords.drop

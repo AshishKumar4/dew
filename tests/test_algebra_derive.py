@@ -263,6 +263,25 @@ def test_an_anchor_of_an_accurate_forms_held_weights_is_refused():
         forms.step(forms.init(shaped(tile)), tile, anchor=lazily)
 
 
+def unnormalized(q, k, v, rows, keys):
+    """The softmax's denominator alone, `sum(exp(s - max s))` over the keys: a sum of weights at the row's
+    maximum, which an anchor below it would scale."""
+    del v, rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    return jnp.sum(jnp.exp(s - jnp.max(s, axis=-1)[:, None]), axis=-1)
+
+
+def test_an_anchor_of_an_output_its_sums_scale_is_refused():
+    """A declaration whose output is a sum its maximum weighs (`unnormalized`) is refused a moved anchor at
+    its step (`derive.Refused`): an anchor 1 below the maximum finished `1 + e` where it is `1 + e^-1` (the
+    base review of 9745e74f0, F2); attention's ratio of two such sums takes one (above)."""
+    forms = derive.derive(declared(unnormalized), accurate=False, saturation=SATURATION)
+    values = operands(*draw(0))
+    tile = tile_of(values, 0)
+    with pytest.raises(derive.Refused):
+        forms.step(forms.init(shaped(tile)), tile, anchor=lambda old, exact: exact - 1)
+
+
 def test_a_declaration_closing_over_a_typed_key_derives():
     """A declared attention whose logits are scaled by a temperature drawn from a typed PRNG key it closes
     over (`jax.random.key`): its derivation reads each constant's magnitude, sign and dtype (`terms`), a

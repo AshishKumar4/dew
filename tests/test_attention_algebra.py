@@ -611,18 +611,20 @@ def test_a_lazy_walks_kept_anchor_is_on_par_with_the_exact_maximum(family, base)
                         f"a lazy walk {family} ({base}), {run}", seeds=LAZY_SEEDS)
 
 
+@pytest.mark.parametrize("offset", [0.0, 300.0], ids=["at 0", "at 300"])
 @pytest.mark.parametrize("base", sorted(LAZY_SCALES))
-def test_a_lazy_walks_far_move_keeps_the_sums_before_it(base):
+def test_a_lazy_walks_far_move_keeps_the_sums_before_it(base, offset):
     """Three tiles whose maxima rise by the margin and then by 105 nats past their first (`FAR_BINADES` past
     the kept anchor), the first and last tiles' values 0 and the middle's 2^50 times a draw: the anchor kept
     through the middle tile moves to the last tile's maximum less the margin, its factor a normal number,
     so the middle tile's sums, about 1e-21 of the last's weight, survive: on par with the softmax at each
     row's exact maximum (check 1), where a move to the last tile's maximum took e^-105 at once and flushed
-    them (the base review of 13eba49bd, F1)."""
+    them (the base review of 13eba49bd, F1). Translated by `offset` nats, the anchor less the margin rounds,
+    which moved it to the last tile's maximum (the base review of 9745e74f0, F1)."""
     spec = _lazy_spec(LAZY_SCALES[base])
     margin = algebra.lazy_margin(spec, jnp.bfloat16)
     nats = spec.unit
-    rises = (0.0, margin * 0.99, 105.0 / nats)
+    rises = tuple(rise + offset / nats for rise in (0.0, margin * 0.99, 105.0 / nats))
     draw = _lazy_draw(rises.__getitem__)
 
     def drawn(seed):
@@ -631,8 +633,8 @@ def test_a_lazy_walks_far_move_keeps_the_sums_before_it(base):
         return logits, (values.astype(jnp.float32) * scale).astype(jnp.bfloat16)
 
     walk = _lazy_walk(spec)
-    assert_as_exact(jax.jit(walk), as_given(_exact_softmax(spec)), drawn, f"a lazy walk's far move ({base})",
-                    seeds=LAZY_SEEDS)
+    assert_as_exact(jax.jit(walk), as_given(_exact_softmax(spec)), drawn,
+                    f"a lazy walk's far move ({base}, at {offset})", seeds=LAZY_SEEDS)
 
 
 def _raw_softmax(spec):

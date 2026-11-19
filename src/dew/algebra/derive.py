@@ -819,7 +819,110 @@ def _anchored(made: _Forms, state, anchor: Callable) -> dict:
                               "weights' select), which a lower anchor makes false: an anchor of an accurate "
                               "form's walk")
         adjusted[kept] = functools.partial(anchor, state[index])
+    if adjusted:
+        _invariant_finishes(made)
     return adjusted
+
+
+ZERO = "zero"
+"""`_anchor_degree` of a zero literal: of every degree."""
+
+
+def _invariant_finishes(made: _Forms) -> None:
+    """Refuses an anchor (`_anchored`) unless every output's finish reads its sums homogeneously of degree 0
+    (`_anchor_degree`): a moved anchor takes every sum that reads it by one factor, which such an output
+    leaves, where an output of a sum itself took it (`sum(exp(x - max x))` at an anchor 1 below the
+    maximum finished at 1 + e where it is 1 + e^-1, the base review of 9745e74f0, F2)."""
+    maxima = {index for index, reduction in enumerate(made.reductions) if _role(reduction) == "max"}
+    memo: dict = {}
+    for form in made.finishes:
+        if form is not None and _anchor_degree(form, made, maxima, memo) not in (0, ZERO):
+            raise Refused(f"an output whose finish {form} is no ratio of the sums an anchor carries, which a "
+                          "moved anchor would change")
+
+
+def _anchor_degree(term: Term, made: _Forms, maxima: set, memo: dict):
+    """`term`'s degree in the sums a walk's anchor carries (each a state of `made`'s that no maximum is,
+    degree 1; a maximum's state None, its value moving with the anchor), None where it has none: a product
+    adds degrees, a quotient subtracts them, a sum, a difference, an extreme, a comparison and a selection
+    take operands of one degree (a zero literal's every one, `ZERO`); an elementwise function other than a
+    negation or an absolute value takes degree 0 alone. A selection by whether a sum is zero takes that sum's
+    degree where its other branch is a literal (a guarded denominator: the literal's branch is taken alike
+    before and after the anchor moves)."""
+    key = terms.key(term)
+    if key not in memo:
+        def degree(of: Term):
+            return _anchor_degree(of, made, maxima, memo)
+
+        region = made.region
+        if (args := get_callable_args(term, Term.state)) is not None:
+            found = None if terms.integer(args[0]) in maxima else 1
+        elif get_callable_args(term, Term.leaf) is not None:
+            found = 0
+        elif (args := get_callable_args(term, Term.literal)) is not None:
+            found = ZERO if not np.any(np.asarray(region.literals[terms.integer(args[0])])) else 0
+        elif (args := get_callable_args(term, Term.binary)) is not None:
+            found = _binary_degree(region.params[terms.integer(args[3])][0], degree(args[0]), degree(args[2]))
+        elif (args := get_callable_args(term, Term.compare)) is not None:
+            found = None if _one_degree(degree(args[0]), degree(args[2])) is None else 0
+        elif (args := get_callable_args(term, Term.dot)) is not None:
+            found = _binary_degree(jax.lax.mul_p, degree(args[0]), degree(args[1]))
+        elif (args := get_callable_args(term, Term.select)) is not None:
+            found = _selected_degree(args, degree)
+        elif (args := get_callable_args(term, Term.unary)) is not None:
+            inner = degree(args[0])
+            kept = region.params[terms.integer(args[2])][0] in (jax.lax.neg_p, jax.lax.abs_p)
+            found = inner if kept else 0 if inner in (0, ZERO) else None
+        elif (args := get_callable_args(term, Term.convert) or get_callable_args(term, Term.shaped)):
+            found = degree(args[0])
+        elif (args := get_callable_args(term, Term.reduce)) is not None:
+            inner = degree(args[0])
+            kept = terms.text(args[1]) in ("sum", "max", "min")
+            found = inner if kept else 0 if inner in (0, ZERO) else None
+        else:
+            found = None
+        memo[key] = found
+    return memo[key]
+
+
+def _one_degree(*degrees):
+    """The one degree of `degrees` (`_anchor_degree`'s, a zero literal's any), None where they differ."""
+    found = {d for d in degrees if d != ZERO}
+    return ZERO if not found else found.pop() if len(found) == 1 and None not in found else None
+
+
+def _binary_degree(primitive, a, b):
+    """`_anchor_degree` of `primitive` over operands of degrees `a` and `b`."""
+    if None in (a, b):
+        return None
+    if primitive is jax.lax.mul_p:
+        return ZERO if ZERO in (a, b) else a + b
+    if primitive is jax.lax.div_p:
+        return ZERO if a == ZERO else None if b == ZERO else a - b
+    if primitive in (jax.lax.add_p, jax.lax.sub_p, jax.lax.max_p, jax.lax.min_p):
+        return _one_degree(a, b)
+    return 0 if _one_degree(a, b) in (0, ZERO) else None
+
+
+def _selected_degree(args, degree: Callable):
+    """`_anchor_degree` of a selection `(predicate, false, true)`: one degree of its branches under a
+    predicate of degree 0, or a guarded sum's (a predicate comparing a sum with a zero literal, the other
+    branch a literal)."""
+    predicate, *branches = args
+    taken = [degree(branch) for branch in branches]
+    if degree(predicate) not in (0, ZERO) or None in taken:
+        return None
+    found = {d for d in taken if d != ZERO}
+    if len(found) <= 1:
+        return found.pop() if found else ZERO
+    compared = get_callable_args(predicate, Term.compare)
+    if compared is None or ZERO not in (degree(compared[0]), degree(compared[2])):
+        return None
+    guarded = {terms.key(side) for side in (compared[0], compared[2])}
+    for branch, other in zip(branches, reversed(branches), strict=True):
+        if terms.key(branch) in guarded and get_callable_args(other, Term.literal) is not None:
+            return degree(branch)
+    return None
 
 
 def _role(reduction: Term) -> str:
