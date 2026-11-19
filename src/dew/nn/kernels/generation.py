@@ -1417,6 +1417,7 @@ def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Cal
     from dew.nn.derivatives import contracted, declared_tangent
 
     def tangent(primals, tangents):
+        # The output's own tangent is zero: it is computed from operands held still.
         output, *operands = primals
         return output, jax.jvp(portable, tuple(operands), tuple(tangents[1:]))[1]
 
@@ -1491,7 +1492,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         return backward(*arguments)
 
     def pulled_jvp(live, primals, tangents):
-        _, operands, cotangent = primals
+        saved, operands, cotangent = primals
         _, doperands, dcotangent = tangents
 
         def pullback(operands, cotangent):
@@ -1500,7 +1501,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             # `live` indexes the operands' leaves, as the reverse pass's `backward` takes them.
             return whole if live is None else tuple(jax.tree.leaves(whole)[index] for index in live)
 
-        return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
+        return (pulled(saved, operands, cotangent, live),
+                jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1])
 
     pulled = pulled_by if traced else contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,)))
