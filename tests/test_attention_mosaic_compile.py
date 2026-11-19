@@ -790,11 +790,11 @@ def test_a_programs_launches_compile_beside_its_trace():
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.options import owned_program
 
-    compiled_on: list[str] = []
+    compiled_on: list[tuple[str, str]] = []
 
-    def heard(event: str, seconds: float, **_) -> None:
+    def heard(event: str, seconds: float, *, fun_name: str = "", **_) -> None:
         if event == "/jax/core/compile/backend_compile_duration":
-            compiled_on.append(threading.current_thread().name)
+            compiled_on.append((threading.current_thread().name, fun_name))
 
     tokens, heads, kv_heads, width = 1600, 4, 2, 128
     device = compile_only_gpus("sm90")[0]
@@ -815,10 +815,12 @@ def test_a_programs_launches_compile_beside_its_trace():
         jax.monitoring.unregister_event_duration_listener(heard)
     certified = report.certifications()[before:]
     assert certified and not any(certification.refused for certification in certified), certified
-    aside = [name for name in compiled_on if name.startswith("dew-certify")]
+    aside = [thread for thread, _ in compiled_on if thread.startswith("dew-certify")]
     compiled_here = [certification for certification in certified if not certification.stored]
     assert len(aside) == len(compiled_here) > 0, compiled_on
-    assert compiled_on.count(threading.current_thread().name) == 1, compiled_on
+    # The step's own program on the caller's thread, once; beside it the caller compiles only the host's own
+    # folds of a kernel's index arithmetic (`programs.host_evaluated`, one primitive each).
+    assert compiled_on.count((threading.current_thread().name, "jit(loss)")) == 1, compiled_on
 
 
 @COMPILES_ON_CPU
