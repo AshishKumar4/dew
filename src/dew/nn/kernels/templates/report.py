@@ -966,7 +966,8 @@ class CompiledOnDevice(Untuned):
     the programs it names (`programs`; the compile's own where it names none) are not preparable at all, and
     their run compiles each on its GPU, which picks every choice itself. Refused before XLA compiles, so no
     executable leaving the choice to run time reaches the persistent cache under the key the run's own
-    compile reads."""
+    compile reads. An `Untuned` by intent: each says a choice the device's own compile makes, where a
+    handler of either compiles the program on its device; one naming how to tune it catches this first."""
 
     def __init__(self, lowered: jax.stages.Lowered, programs: Sequence[str] = ()):
         super().__init__("a cuDNN convolution compiled without its GPU leaves its algorithm to run time "
