@@ -875,6 +875,28 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     assert priced.price.value > unmeasured.price.value
 
 
+@pytest.mark.parametrize(("dtypes", "itemsize"), [(("bfloat16", "float16"), 2), (("float64", "float64"), 8)],
+                         ids=["bfloat16 by float16", "float64 traced under x64"])
+def test_a_product_is_priced_at_the_dtype_jax_gives_it(dtypes, itemsize):
+    """A `lax.dot_general`, no preferred type stated, priced at the dtype JAX makes it
+    (`terms.product_dtype`), its result kept on chip at that dtype's bytes beside its leaves'
+    (`Work.kept_bytes`): a bfloat16 by a float16 product bfloat16, whose NumPy promotion, refused, raised
+    there (base review 0b8b7ed98 F1, a crash pricing any program holding one); a float64 product traced
+    under x64 and priced outside it float64, not the float32 a dtype read outside x64 canonicalizes it to
+    (its head review)."""
+    def product(a, b):
+        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
+
+    with jax.enable_x64(new_val=True):
+        a, b = jnp.ones((2, 3), dtypes[0]), jnp.ones((3, 4), dtypes[1])
+        region = terms.region(jax.make_jaxpr(product)(a, b))
+    graph, bundle, _ = program.graphed(region)
+    work = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                         cost_model=cost.model(region, cost.fused(generation.TARGETS["v5e"])))[1].work
+    leaves = a.dtype.itemsize * 2 * 3 + b.dtype.itemsize * 3 * 4
+    assert work.kept_bytes == leaves + 2 * itemsize * (2 * 4)
+
+
 @pytest.mark.parametrize("apart", [0, 1, 4], ids=["as written", "a group of one", "apart from its group"])
 def test_a_token_loops_states_are_kept_each_token(apart):
     """A scan's token loop keeps its state on chip each token, written and read (`Work.kept_bytes`, row
@@ -885,7 +907,7 @@ def test_a_token_loops_states_are_kept_each_token(apart):
     c, k, v = 16, 32, 64
     work = linear_scan._work(linear_scan.Chunk.plain(linear_scan.Chunk.token("U")),
                              linear_scan.Extents(c, k, v, 1, apart=apart), lambda value: (0, 0), None)
-    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * cost.LANE_BYTES * k * v
+    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * 4 * k * v
 
 
 def test_device_memory_is_priced_at_the_parts_measured_stream():

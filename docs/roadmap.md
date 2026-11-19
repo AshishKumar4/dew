@@ -39,6 +39,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests/test_gemm_gather.py:200-242 (the strided-table gathers kernel) duplicates tests/test_ring_protocol.py:382-424's gathered walk fixture. [8679]
 - Tests/test_gemm_paired.py:649-669 passes a two-launch chained gradient to ring_protocol.programs, which explores only the first mpmd_map. [8680]
 - A launch's certification traces it a second time. [8720]
+- Jax fork, Pallas Mosaic GPU lowering cache. [8793]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -87,6 +88,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Training and parallelism
 
+- Time to first step: the compile path's re-derivations. [5556]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - XLA:CPU edges. [1591]
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
@@ -102,6 +104,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [5292]
 - A device-plan search whose devices hold no plan walks the whole remat/head ladder before refusing. [8541]
 - The diffusion kinds' starts keep no record and their refits trace again. [6297]
+- The BFC bound places a step's non-aliased outputs beside its temporaries at XLA's raw sizes (memory.placed_beside: stats.output - stats.alias), where each…. [8792]
 
 ## RL and serving
 
