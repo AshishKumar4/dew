@@ -43,16 +43,32 @@ def _fit_events(trainer, tracker: Reported, steps: int) -> list[tuple[str, int]]
     return events
 
 
+def pending() -> list[list[int]]:
+    """Objects made pending, more than a quarter of the heap the last full collection left, which the
+    collector is kept from collecting while they are made: a fit after them meets what a start's compiles
+    make, whatever this process held before (row 8771: a fit whose step the shared XLA cache served made
+    too few for its start to collect in a task beside other tests' heaps)."""
+    gc.collect()
+    gc.disable()
+    try:
+        return [[index] for index in range(sys.getallocatedblocks() // 2)]
+    finally:
+        gc.enable()
+
+
 def test_no_full_collection_runs_among_a_fits_steps_and_a_held_steps_fit_forces_none():
     """No full collection runs among a fit's steps (row 6739: one walking what the start made ran inside a 4B
-    fit's loop, 0.75 to 0.9 s): a fresh trainer's first fit, whose compiles grew the heap by more than a
-    quarter since the last full collection, collects before its step is reported compiled. A second fit of
-    the same trainer, whose step the process holds and whose heap grew little, forces none, and none of the
-    collector's own runs among its steps either, the collector enabled throughout (rows 8511, 8545: the
-    growth read against the last full collection, a plan's compile and an earlier fit's counted)."""
+    fit's loop, 0.75 to 0.9 s): a fresh trainer's first fit, its heap grown by more than a quarter since the
+    last full collection (`pending`, as a start's compiles grow it), collects before its step is reported
+    compiled. A second fit of the same trainer, whose step the process holds and whose heap grew little,
+    forces none, and none of the collector's own runs among its steps either; one after objects made between
+    fits collects them before its steps, not among them, the collector enabled throughout (rows 8511, 8545:
+    the growth read against the last full collection, a plan's compile and an earlier fit's counted)."""
     tracker = Reported()
     trainer = make_trainer(tracker=tracker)
+    made = pending()
     first = _fit_events(trainer, tracker, 12)
+    del made
     compiled = first.index(("compiled", 0))
     steps = [index for index, event in enumerate(first) if event[0] == "step"]
     assert len(steps) == 12 and steps[0] > compiled
@@ -60,13 +76,7 @@ def test_no_full_collection_runs_among_a_fits_steps_and_a_held_steps_fit_forces_
     assert ("collection", 2) not in first[compiled:], first[compiled:]
     again = _fit_events(trainer, tracker, 3)
     assert ("collection", 2) not in again, again
-    # Objects made between fits, more than a quarter of the heap the last full collection left, are pending:
-    # a fit whose step the process holds collects them before its steps, not among them (row 8511).
-    gc.disable()  # Made pending, none collected while made.
-    try:
-        made = [[index] for index in range(sys.getallocatedblocks() // 2)]
-    finally:
-        gc.enable()
+    made = pending()
     grown = _fit_events(trainer, tracker, 3)
     first_step = grown.index(("step", 0))
     assert ("collection", 2) in grown[:first_step], grown
