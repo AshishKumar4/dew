@@ -355,6 +355,45 @@ def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):
     assert all(program["beside"] >= state for program in filed[len(arms):])
 
 
+def test_a_convolution_sites_truths_compute_on_the_host_and_its_arms_compile_on_its_gpu(tmp_path,
+                                                                                         monkeypatch):
+    """A site holding a convolution, prepared for a node's GPU (`truths_ahead.prepared`): no compile without
+    that GPU holds the convolution's algorithm, which cuDNN then picks at run time, on an A100 not the same
+    each run (`report.DEVICELESS_CONVOLUTION_PICKS`, row 7941). Its float64 truths compile for the host's CPU
+    and its arms for none, their run compiling them on its GPU as its prepare states, which the run names
+    (`truths_ahead.AT_RUN`) and records nothing unprepared; before, the prepare compiled both for the GPU and
+    its run refused their load."""
+    import tier_wire
+    from jax.experimental import topologies
+    from truths_ahead import AT_RUN, prepared
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = tmp_path / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.UNIT, "a unit")
+    monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path))
+
+    def draw(seed):
+        rng = np.random.default_rng([7941, seed])
+        return (rng.standard_normal((1, 8, 8, 4)).astype(np.float32),
+                rng.standard_normal((3, 3, 4, 4)).astype(np.float32))
+
+    def convolved(x, w):
+        return jax.lax.conv_general_dilated(x, w, (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"))
+
+    store = tmp_path / "sites"
+    with prepared(store, stamp="a", target=model_flows.node_target()):
+        assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
+    sites = [json.loads(site.read_text()) for site in store.glob("*/site.json")]
+    assert sorted((site["arms"], site["host"], "at_run" in site) for site in sites) == [
+        (False, True, False), (True, False, True)], sites
+    with compiled_truths(store, prepare=False, stamp="a"):
+        assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
+    assert (store / AT_RUN).exists() and not (store / UNPREPARED).exists()
+
+
 def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     """Judged from programs compiled ahead (`compiled_truths(prepare=False)`), a site's run computes every
     draw's arms with them and runs none of its arms' code, which its prepare alone traced (a GPU run then
