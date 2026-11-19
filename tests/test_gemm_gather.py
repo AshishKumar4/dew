@@ -11,10 +11,11 @@ import mx_matrix
 import numpy as np
 import pytest
 from generation_support import cublas_compiled
+from jax.sharding import Mesh
 from reference_error import assert_as_exact, equations
 
 from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
-from dew.nn.kernels.templates import product
+from dew.nn.kernels.templates import product, rings
 from dew.nn.kernels.templates.gemm import mosaic_gpu, row_tiles
 
 SEEDS = 8
@@ -177,6 +178,138 @@ def test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_say
         mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
                         tiles=mosaic_gpu.Tiles(128, 128, 32, 3, 1, family="mma.sync"), out_dtype=jnp.float32,
                         multiprocessors=4, interpret=grouped_launch.INTERPRETED, gather=(table, None))
+
+
+def test_a_gathered_kernel_gradients_last_step_addresses_no_step_past_it():
+    """A Blackwell's gathered kernel gradient of one step (64 rows, one group, a 64-entry identity table, the
+    128 x 128 x 64 tcgen05 tile), interpreted with every out-of-bounds read raised: its loads address no step
+    past the walk's last (`rings.Ahead.view` resolved by the load that reads a step ahead alone), and it is
+    on par with the gradient of its rows gathered first (check 1); resolved eagerly, the last step's next
+    view read `table[64]` (base review 103007773 F1)."""
+    strict = dataclasses.replace(grouped_launch.INTERPRETED, out_of_bounds_reads="raise")
+    table, sizes = jnp.arange(64, dtype=jnp.int32), jnp.asarray([64], jnp.int32)
+
+    def gathered(tokens):
+        return mosaic_gpu.tgmm(tokens, tokens, sizes, tiles=KERNEL_GRADIENT_TILES["sm100"],
+                               out_dtype=jnp.float32, multiprocessors=4, interpret=strict,
+                               gather=(table, None))
+
+    def first(tokens):
+        rows = tokens[table]
+        return jnp.dot(rows.T, rows, preferred_element_type=jnp.float32)[None]
+
+    def draw(seed):
+        return (np.random.default_rng([seed, 5]).normal(size=(64, 128)).astype(jnp.bfloat16),)
+
+    with generation.assumed("sm100"):
+        assert_as_exact(gathered, jax.jit(first), draw, "a one-step gathered kernel gradient, strictly read",
+                        seeds=SEEDS, truth_fn=lambda tokens: (tokens[table].T @ tokens[table])[None])
+
+
+def _strided_gathers(tokens, table, plain, at: int | None = None):
+    """`plain @ tokens[table[:, 0]]` a step of `STRIDED_BLOCK`'s rows at a time through a Blackwell's
+    gathered ring, its table's column zero the ring's (`rings.Rows` over a view of stride two): one tile;
+    or, `at` given, every step's rows those of a flat `table` from entry `at` (a Python int, past int32's
+    reach where the table is: `test_a_gathered_rings_steps_past_int32s_reach_lower_for_cuda`)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    family = mosaic_sm100.RINGS
+    (height, width), rows = STRIDED_BLOCK, plain.shape[0]
+    steps = plain.shape[1] // height
+
+    def body(x_gmem, table_gmem, w_gmem, o_gmem):
+        def entries(step):
+            return (rings.Rows(table_gmem.at[:, 0], step * height, (0,), 1) if at is None
+                    else rings.Rows(table_gmem, at, (0,), 1))
+
+        def scope(*, streams):
+            def schedule(index):
+                views = {"x": (x_gmem, entries),
+                         "w": (w_gmem, lambda step: (0, step))}
+                return True, steps, views, index[0]
+
+            def issue(wg, tile, walk, *, active):
+                del wg, tile, active
+
+                def step(index, slots, carry, accumulators):
+                    del index
+                    (acc,) = accumulators
+                    return carry, (family.products(acc, slots["w"], slots["x"]),)
+
+                return walk(step, None, ((rows, width),))[1]
+
+            def finish(wg, tile, accs, store, *, active):
+                del wg, tile, active
+                for first, (value,) in family.chunks(accs):
+                    store(0, value, o_gmem, (0, 0, rows, first, rows))
+
+            family.persist(streams, (1,), schedule, issue, finish, consumers=1, axis="programs",
+                           outputs=(((rows, width), jnp.float32),), interpret=False,
+                           accumulators=((rows, width),))
+
+        blocks = {"x": ((height, width), jnp.bfloat16), "w": ((rows, height), jnp.bfloat16)}
+        family.scoped(scope, streams=family.streams(blocks, 2, 1, gathered=("x",)))
+
+    return family.kernel(body, out_type=jax.ShapeDtypeStruct((rows, width), jnp.float32), grid=(1,),
+                         grid_names=("programs",), consumers=1, interpret=False,
+                         name="strided_gathers")(tokens, table, plain)
+
+
+STRIDED_BLOCK = (64, 64)
+"""`_strided_gathers`' gathered step: 64 rows, a tcgen05 product's least depth (eight 8-row tiles over the
+issuing warpgroup's load warps)."""
+
+
+def a_gathered_ring_reads_a_strided_tables_entries() -> None:
+    """A Blackwell's gathered ring (`gathered.Committed`: its load warps' gathers, each step's table entries
+    read a step ahead) whose table is column zero of a row-major int32 `[128, 2]` table, every row `[0, 1]`
+    (a view of stride two, `_strided_gathers`): every gathered row is token 0's. Two steps of 64 gathered
+    rows times a plain block, on par with the product of its rows gathered first (check 1); entries read at
+    stride one gather token 1's for half the rows (base review ae8a242ed F1). On this GPU (test_gpu_gemm's
+    Blackwell cell): its load warps' code runs on none other."""
+    (height, width), steps, rows = STRIDED_BLOCK, 2, 128
+    table = jnp.asarray(np.tile([0, 1], (steps * height, 1)), jnp.int32)
+
+    def gathered(tokens, plain):
+        return _strided_gathers(tokens, table, plain)
+
+    def first(tokens, plain):
+        return jnp.dot(plain, tokens[table[:, 0]], preferred_element_type=jnp.float32)
+
+    def draw(seed):
+        rng = np.random.default_rng([seed, 9])
+        return (rng.normal(size=(2, width)).astype(jnp.bfloat16),
+                rng.normal(size=(rows, steps * height)).astype(jnp.bfloat16))
+
+    with generation.assumed("sm100"):
+        assert_as_exact(gathered, jax.jit(first), draw, "a gathered ring over a strided table", seeds=SEEDS,
+                        truth_fn=lambda tokens, plain: plain @ tokens[table[:, 0]])
+
+
+def test_a_gathered_ring_over_a_strided_table_lowers_for_cuda():
+    """`a_gathered_ring_reads_a_strided_tables_entries`' kernel lowered for a B200 on this CPU, its table a
+    stride-two column, the load warps' entries addressed by it (`gathered.Held.filled`)."""
+    (height, width), steps, rows = STRIDED_BLOCK, 2, 128
+    shaped = jax.ShapeDtypeStruct
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(_strided_gathers).trace(
+            shaped((2, width), jnp.bfloat16), shaped((steps * height, 2), jnp.int32),
+            shaped((rows, steps * height), jnp.bfloat16)).lower(lowering_platforms=("cuda",))
+
+
+def test_a_gathered_rings_steps_past_int32s_reach_lower_for_cuda():
+    """`_strided_gathers` over a flat int32 table of 2^31 + 64 entries, both steps' rows from entry 2^31 (a
+    Python int), lowered for a B200 on this CPU: the next step's slice formed as the load's own (`pl.ds`,
+    the table's index type) where the walk has that step, no narrowing to int32 (base review ac90e3e16 F1:
+    `OverflowError` in tracing)."""
+    (height, width), rows = STRIDED_BLOCK, 128
+    shaped = jax.ShapeDtypeStruct
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_strided_gathers, at=2 ** 31)).trace(
+            shaped((2, width), jnp.bfloat16), shaped((2 ** 31 + height,), jnp.int32),
+            shaped((rows, 2 * height), jnp.bfloat16)).lower(lowering_platforms=("cuda",))
 
 
 KERNEL_GRADIENT_TILES = {"sm90": mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma'),

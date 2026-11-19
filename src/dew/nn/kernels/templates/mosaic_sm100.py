@@ -311,7 +311,8 @@ class PairedRing(CommittedRing):
 
     topology: Topology = PAIRED
 
-    def load(self, turn: rings.Turn, view) -> None:
+    def load(self, turn: rings.Turn, view, ahead: rings.Ahead | None = None) -> None:
+        del ahead  # A pair's rows are a tile's own, read by no table (`rings.reads_ahead`).
         if not isinstance(view, rings.Split):
             raise ValueError(f"a pair's step is the pair's block (`rings.Paired` indices), not {view}")
         slot = rings.opaque(turn.slot)

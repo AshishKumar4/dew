@@ -14,7 +14,9 @@ warpgroup product (`wgmma`, reading shared memory until `wgmma_wait` retires it)
 (`tcgen05_mma`, until its thread's next commit completes), a shared-memory read or write (`get`, `swap`),
 and an inlined body's (`inline_mgpu`, lane-level code the jaxpr does not show) as its body's own fields
 state them (`INLINED`: a gathered ring's barriers' arrivals, its parity waits, and each load warp's gathers
-and the first's expecting arrival). Index arithmetic, loops and branches are evaluated concretely per
+and the first's expecting arrival, its step's entries read where the step before filled them, and the next
+step's filled: `fill`, an asynchronous write landing later, `fill_wait` its thread's wait for its fills,
+cp.async's). Index arithmetic, loops and branches are evaluated concretely per
 warpgroup and warp (`axis_index`), so each program is its own fixed sequence of events: no control flow
 reads shared memory a peer writes.
 
@@ -404,19 +406,42 @@ def _waited(self: _Interpreter, body: gathered.Waited, values, located) -> None:
 def _gathers(self: _Interpreter, body: gathered.Gathers, values, located) -> None:
     """A load warp's gathers of a step (`gathered.Gathers`): the first warp's arrival expecting every tile's
     copy, and a copy of each tile the warp issues into its part of the slot, each completing its bytes at
-    the slot's barrier."""
-    _, _, slot, barrier, _ = located
+    the slot's barrier; read a step ahead (`body.ahead`), its tiles' entries read from the entries' parity
+    the step before filled, once its fills are awaited (`gathered.Held.awaited`), a warp's fills an
+    asynchronous write of its own; a tile's first step fills its own entries first (`gathered.Held.awaited`);
+    the next step's fill is the load's next body (`_filled`).
+    The warp's lanes are its one program: the body's warp syncs, which make a lane's fill seen by the
+    others, are its own statement, not an event."""
+    _, _, slot, barrier, _, *ahead = located
     # The slot's tiles: its leading axis as its allocation stages it (`swizzling.swizzle_transforms`'
     # `TILE_ROWS`-row tiles), the memref's the body reads.
     tiles = values[2].shape[1]
     if body.expects:
         self.emit("expect", barrier, tiles)
+    if body.ahead:
+        entries = ahead[0]
+        parity, held = (int(np.asarray(_governing(value, "an entry's parity"))) for value in ahead[1:])
+        # A warp's fills of a step are one cp.async group, awaited together: one write of its parity's
+        # entries, its tiles' all (each warp's its own rows: `gathered.Gathers.tiles`).
+        warp = body.share[0]
+        if not held:
+            self.emit("fill", (entries[0], parity, warp))
+        self.emit("fill_wait")
+        # A read of entries a fill must have written: no fill ordered before it is a read of nothing.
+        self.emit("read", (entries[0], parity, warp), "filled")
     for tile in body.tiles(tiles):
         self.emit("copy", (*slot, tile), barrier)
 
 
+def _filled(self: _Interpreter, body: gathered.Filled, values, located) -> None:
+    """A load warp's fill of its next step's entries (`gathered.Filled`, where the walk has a next step):
+    one asynchronous write of the parity it fills, its tiles' all, a cp.async group the next step awaits."""
+    entries, _, parity = located
+    self.emit("fill", (entries[0], int(np.asarray(_governing(parity, "an entry's parity"))), body.share[0]))
+
+
 INLINED: dict[type, Callable] = {gathered.Initialized: _initialized, gathered.Waited: _waited,
-                                 gathered.Gathers: _gathers}
+                                 gathered.Gathers: _gathers, gathered.Filled: _filled}
 """Each inlined body a checked kernel takes (`plgpu.inline_mgpu`'s function, by its type), as the `Event`s
 its fields and its operands state: the arrivals a phase of the barriers a gathered ring initializes, its
 parity waits at a turn's rotation, and its load warps' gathers. A body of no synchronization (a fence, a
@@ -461,7 +486,8 @@ def _body(jaxpr: jcore.Jaxpr) -> jcore.ClosedJaxpr:
 @dataclasses.dataclass
 class Violation(AssertionError):
     """A property the exploration found broken: its class (`kind`: "deadlock", "unfinished" phase,
-    "unobserved" phase, "aliased" parity, "early" arrival, "unordered" access, "unfenced" store, "bounds"),
+    "unobserved" phase, "aliased" parity, "early" arrival, "unordered" access, "unfenced" store, "bounds",
+    an "unwritten" entries' read),
     what broke (`what`), and the
     interleaving reaching it (`trace`, each move a thread's index and its event's place, or a landing)."""
 
@@ -677,6 +703,12 @@ class _State:
             made.flight = self.flight | {(thread, self.positions[thread], event.argument)}
         elif event.kind == "committed":
             made.flight = self.flight | {(thread, self.positions[thread], event.at)}
+        elif event.kind == "fill":
+            # A thread's asynchronous write (cp.async's), no barrier's: it lands later, `fill_wait` its wait.
+            made.flight = self.flight | {(thread, self.positions[thread], None)}
+        elif event.kind == "fill_wait" and any(issuer == thread and barrier is None
+                                                for issuer, _, barrier in self.flight):
+            return None
         return made
 
     def check(self, awaited, trace) -> None:
@@ -733,6 +765,7 @@ class _Order:
         self.issued: dict = {}
         self.committed: list = [[] for _ in threads]
         self.committing: dict = {}
+        self.fills: dict = {}
 
     def arrived(self, at, clock, *, counted: bool, transaction: int) -> None:
         joined, count, flying = self.accumulating.get(at, ({}, 0, 0))
@@ -781,7 +814,9 @@ class _Order:
             return
         self.ordered(event.at, landing, event, write=True)
         self.writes.append((event.at, landing, event))
-        if event.argument:
+        if event.kind == "fill":
+            self.fills.setdefault(thread, []).append(landing)
+        elif event.argument:
             self.arrived(event.argument, landing, counted=False, transaction=-1)
 
     def moved(self, thread, position, event) -> None:
@@ -794,11 +829,20 @@ class _Order:
             self.arrived(event.at, clock, counted=True, transaction=0)
         elif kind == "expect":
             self.arrived(event.at, clock, counted=True, transaction=event.argument)
-        elif kind in ("load", "copy"):
+        elif kind == "fill_wait":
+            # Its fills landed (`_State.step` holds it till then): each landing before it.
+            for landing in self.fills.pop(thread, ()):
+                clock = _joined(clock, landing)
+            self.clocks[thread] = clock
+        elif kind in ("load", "copy", "fill"):
             self.issued[(thread, position)] = dict(clock)
             if event.argument and kind == "load":
                 self.arrived(event.argument, clock, counted=True, transaction=1)
         elif kind in ("read", "write"):
+            if kind == "read" and event.argument == "filled" and not any(
+                    where == event.at and _before(prior, clock) for where, prior, _ in self.writes):
+                raise Violation("unwritten", f"read of {event.at}, which no fill ordered before it wrote",
+                                [(thread, event)])
             self.ordered(event.at, clock, event, write=kind == "write")
             (self.writes if kind == "write" else self.reads).append((event.at, dict(clock), event))
             if kind == "write":

@@ -129,20 +129,43 @@ def held_together(rings: dict) -> list[dict]:
     return groups
 
 
-def stepped_in(rings: dict, turn_of: Callable, view_of: Callable) -> None:
-    """A step's loads into `rings` (`turn_of(key, ring)` its turn, `view_of(key, ring)` its source), a barrier
+@dataclasses.dataclass(frozen=True)
+class Ahead:
+    """The next step's view of a ring whose views read memory to address a step (a `Rows` table's entries:
+    `reads_ahead`), handed to its load (`Ring.load`'s `ahead`) so it reads those of the next step under this
+    one's copies (`gathered.Committed`): `view` the next step's, resolved by the load that reads it ahead
+    (a call: an ordinary ring, which reads no step ahead, never resolves it, so no step past the walk's last
+    is addressed, base review 103007773 F1), `live` whether the walk has that step, and `held` whether this
+    step's own were read at the step before (not a walk's first step)."""
+
+    view: Callable[[], Any]
+    live: Any
+    held: Any
+
+
+def reads_ahead(indices) -> bool:
+    """Whether a stream's step `indices` (its view's index map's at the step) read memory to address it: a
+    table's (`Rows`), whose entries its load reads at the step before (`Ahead`)."""
+    return isinstance(indices, Rows)
+
+
+def stepped_in(rings: dict, turn_of: Callable, view_of: Callable, ahead_of: Callable | None = None) -> None:
+    """A step's loads into `rings` (`turn_of(key, ring)` its turn, `view_of(key, ring)` its source,
+    `ahead_of(key, ring)` the next step's where its views read memory: `Ahead`, None otherwise), a barrier
     pair at a time (`held_together`, `_loaded`): the one loader a producer's and a loading consumer's walks
     (`fed.Feed`) take."""
     for group in held_together(rings):
-        _loaded(group, turn_of, view_of)
+        _loaded(group, turn_of, view_of, ahead_of)
 
 
-def _loaded(group: dict, turn_of: Callable, view_of: Callable) -> None:
+def _loaded(group: dict, turn_of: Callable, view_of: Callable, ahead_of: Callable | None = None) -> None:
     """A group's step loaded (`held_together`): a ring holding its own pair by its own load (`Ring.load`, a
-    gathered ring's its own copies), a joined pair's slot freed once and each member copied into it."""
+    gathered ring's its own copies, with the next step's view where it reads ahead, `Ahead`), a joined
+    pair's slot freed once and each member copied into it."""
     if len(group) == 1:
         [(key, ring)] = group.items()
-        ring.load(turn_of(key, ring), view_of(key, ring))
+        ahead = None if ahead_of is None else ahead_of(key, ring)
+        ring.load(turn_of(key, ring), view_of(key, ring), ahead)
         return
     key, lead = next(iter(group.items()))
     # One slot for the pair (its rings hold one depth, `joined`), its index formed once (`Ring.load`).
@@ -165,13 +188,28 @@ def _lead(group: dict) -> "Ring":
 
 def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
     """A producer's loads of one persistent tile (`persistent.tiled`'s visit): each of its steps' blocks
-    into its stream's ring at the step the rings are at (`counter`), none where it streams nothing."""
+    into its stream's ring at the step the rings are at (`counter`), none where it streams nothing; a ring
+    whose views read memory to address a step (`reads_ahead`) given the next step's view (`Ahead`), so it
+    reads that step's addresses under this one's copies (an emulated B200's gathered kernel gradient waited
+    805 cycles of its load warps' 1,700-1,900 a step for its table entries, its slot's release 72: em7x-3)."""
     del tile, done
+    walked = jnp.where(active, steps, 0)
 
-    @pl.loop(0, jnp.where(active, steps, 0))
+    @pl.loop(0, walked)
     def _(step):
+        # Each view's index map evaluated once at the step (base review ae8a242ed F5), its view fixed there.
+        fixed = {name: view if not isinstance(view, tuple) else
+                 (view[0], functools.partial(lambda indices, _: indices, view[1](step)))
+                 for name, view in views.items()}
+
+        def ahead(name, ring):
+            view = fixed[name]
+            if not (isinstance(view, tuple) and reads_ahead(view[1](step))):
+                return None
+            return Ahead(functools.partial(ring.viewed, views[name], step + 1), step + 1 < walked, step > 0)
+
         stepped_in(rings, lambda name, ring: ring.turn(counter + step),
-                   lambda name, ring: ring.viewed(views[name], step))
+                   lambda name, ring: ring.viewed(fixed[name], step), ahead)
 
 
 def loaded_once(rings: dict, views: dict) -> None:
@@ -318,11 +356,15 @@ class Ring:
         """Step `step`'s source of the stream's view (`viewed`), as `load` takes it."""
         return viewed(view, self.block, step)
 
-    def load(self, turn: Turn, view) -> None:
+    def load(self, turn: Turn, view, ahead: Ahead | None = None) -> None:
         """The producer's load of `turn`'s step from `view`, once its slot is free (`free`, `copy`): the
         slot's index formed once (`opaque`) for its wait and its copies, as an index each formed apart repeats
         its arithmetic past the barrier (+16 mov, +8 each of four integer ops and a register at an H100's
-        fused dK/dV, 2.9% of its time, M-ET-87)."""
+        fused dK/dV, 2.9% of its time, M-ET-87). A view that reads its addresses (`Rows`, `ahead` the next
+        step's) reads them as it copies: an interpreted walk's pieces, each run's entry read where it is
+        copied; a ring reading a step's addresses under the step before's copies is its own
+        (`gathered.Committed`)."""
+        del ahead
         slot = opaque(turn.slot)
         self.free(turn, slot)
         self.copy(slot, view)

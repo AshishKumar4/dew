@@ -189,6 +189,9 @@ def test_the_gemm_kernels_run_on_this_gpu():
         Cell("a Blackwell's gathered product is its gathered rows' product",
              gemm_gather.a_blackwells_gathered_product_is_its_gathered_rows_product, "sm100",
              native={"launch": "gathered", "pass": "forward"}),
+        Cell("a Blackwell's gathered ring reads a strided table's entries",
+             gemm_gather.a_gathered_ring_reads_a_strided_tables_entries, "sm100",
+             native={"launch": "gathered", "pass": "strided table"}),
         *(Cell(f"CUTLASS runs a mapped projection as exactly as XLA where chosen: "
                f"{'shared' if shared else 'mapped'} matrices",
                functools.partial(grouped_gemm.cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen,
