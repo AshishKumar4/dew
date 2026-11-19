@@ -205,7 +205,8 @@ def _certified_two(call: tuple[tuple[str, str], ...]):
     """A call's two-launch pin (`_two_pin`), certified in its generation's own process only when legal."""
     if _route_two(call) is None:
         return None
-    return _in_generation_process(dict(call)["generation"], functools.partial(_two_pin, certified=True), call)
+    return _in_generation_process(
+        dict(call)["generation"], functools.partial(_two_pin, certified=True), call)
 
 
 def pin_of(case: dict[str, str], *, certified: bool = False) -> attention_mosaic.BackwardTiles | None:
