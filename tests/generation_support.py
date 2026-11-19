@@ -18,23 +18,6 @@ from flax.linen.dtypes import canonicalize_dtype
 
 from dew.nn.kernels import gemm, generation
 
-INTERPRETS = pytest.mark.skipif(jax.default_backend() != "cpu",
-                                reason="interprets the Mosaic GPU kernels, which a CPU process alone does")
-COMPILES_ON_CPU = pytest.mark.skipif(
-    jax.default_backend() != "cpu",
-    reason="compiles kernels ahead for compile-only GPUs, a CPU process's work (bible §8: no GPU is held "
-           "for host compiles), judging each by every CUDA build's ptxas, whose nvcc wheels the CPU "
-           "environment alone installs; a GPU process's Mosaic prints a module's PTX at its first compile "
-           "alone, so the gate's re-run of a module it compiled for its own device reads none (EM-GAC, rows "
-           "7355/7356, 29b3c8921)")
-"""A mark placing a resource gate (`kernel_compile.mosaic_failures`) of kernels compiled ahead for
-compile-only GPUs in a CPU process, where its every build's ptxas is installed and each module's PTX is
-printed for it."""
-SUMS_IN_IEEE = pytest.mark.skipif(
-    jax.default_backend() != "cpu",
-    reason="compares sums bit for bit as a CPU's IEEE fp32 dots give them, which a GPU's tensor cores, "
-           "truncating each add, do not")
-
 
 def interprets() -> bool:
     """Whether this process's kernels run interpreted as its run runs them: off a GPU, but not in a GPU tier
@@ -57,7 +40,23 @@ def here() -> str:
     return generation.device_generation()
 
 
-
+_ON_CPU = here() == "cpu"
+INTERPRETS = pytest.mark.skipif(not _ON_CPU,
+                                reason="interprets the Mosaic GPU kernels, which a CPU process alone does")
+COMPILES_ON_CPU = pytest.mark.skipif(
+    not _ON_CPU,
+    reason="compiles kernels ahead for compile-only GPUs, a CPU process's work (bible §8: no GPU is held "
+           "for host compiles), judging each by every CUDA build's ptxas, whose nvcc wheels the CPU "
+           "environment alone installs; a GPU process's Mosaic prints a module's PTX at its first compile "
+           "alone, so the gate's re-run of a module it compiled for its own device reads none (EM-GAC, rows "
+           "7355/7356, 29b3c8921)")
+"""A mark placing a resource gate (`kernel_compile.mosaic_failures`) of kernels compiled ahead for
+compile-only GPUs in a CPU process, where its every build's ptxas is installed and each module's PTX is
+printed for it."""
+SUMS_IN_IEEE = pytest.mark.skipif(
+    not _ON_CPU,
+    reason="compares sums bit for bit as a CPU's IEEE fp32 dots give them, which a GPU's tensor cores, "
+           "truncating each add, do not")
 
 
 def pinned(case_generation: str):
