@@ -27,7 +27,8 @@ from dew._accuracy import reduction_bound, within
 from dew.telemetry.benchmark import samples
 
 
-def reference(x, kernel, dilation, *, layout='NHWC', precision=jax.lax.Precision.HIGHEST):
+def reference(x, kernel, dilation, *, layout='NHWC',
+              precision: jax.lax.Precision | None = jax.lax.Precision.HIGHEST):
     if layout == 'NCHW':
         x, kernel = x.transpose(0, 3, 1, 2), kernel.transpose(3, 2, 0, 1)
     out = jax.lax.conv_general_dilated(
@@ -50,7 +51,8 @@ def dilated_form(form):
                 or module.conv_general_dilated is not conv._conv_general_dilated):
             return call(*args, **kwargs)
         # The same layer in its own scope, rewound so a layer called twice reads
-        # its parameters again, the form its convolution's argument.
+        # its parameters again, the form its convolution's argument: a bound layer's.
+        assert module.scope is not None, "an intercepted call is a bound layer's"
         return module.clone(parent=module.scope.rewound(), conv_general_dilated=convolve)(*args, **kwargs)
 
     with nn.intercept_methods(substituted):
@@ -160,9 +162,15 @@ def convolution_profile(directory):
 
 def checkpoint(args):
     import dew
+    from dew.inference.images import TextToImage
+    from dew.nn.autoencoders.kl import AutoencoderKL
     from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 
     pipeline = dew.pipeline('dewml/hybrid-dit-176m', revision='b282fd7d06d6bafca2739747423ef8049f6feada')
+    vae = pipeline.autoencoder if isinstance(pipeline, TextToImage) else None
+    if not isinstance(pipeline, TextToImage) or not isinstance(vae, StableDiffusionVAE) or not isinstance(
+            vae.model, AutoencoderKL):
+        raise ValueError("dewml/hybrid-dit-176m loads as a text-to-image task over a Stable Diffusion VAE")
     prompt = 'a watercolor painting of a mountain lake at sunrise'
 
     def sample(dilated=None):
@@ -174,7 +182,7 @@ def checkpoint(args):
         before = sample(partial(reference, precision=None))
         after = sample()
         rounded = sample(one_rounding)
-        vae, params = pipeline.autoencoder, pipeline.variables['autoencoder']
+        params = pipeline.variables['autoencoder']
         float_vae = StableDiffusionVAE(
             model=vae.model.clone(dtype=jnp.float32), params=params,
             dtype=jnp.float32, latent_shift=vae.latent_shift, latent_scale=vae.latent_scale)

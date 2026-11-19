@@ -39,13 +39,15 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import argparse
 import contextlib
+import functools
 import json
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, Literal
 
 import httpx
 
@@ -153,17 +155,29 @@ def capture_gateway(name: str, bin: Path, gateway_bin: Path, venvs: Path, out: P
         (out / f"{name}_overflow_trace.json").write_text(json.dumps(compact(traces["overflow"][0])))
 
 
+Engine = Literal["vllm", "sglang"]
+"""An engine the captures run, as `OpenAICompletion` names its provider."""
+
+
+class _Proxy(ThreadingHTTPServer):
+    """The proxy between the rollout server and the engine, the exchanges it forwarded (`_Recorded`)."""
+
+    exchanges: list[dict[str, Any]]
+
+
 class _Recorded(BaseHTTPRequestHandler):
     """Forwards each request to the engine and logs its path, body and the engine's answer in `exchanges`."""
 
     def _forward(self, method: str) -> None:
+        proxy = self.server
+        assert isinstance(proxy, _Proxy), "a request the capture's proxy serves"
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         answer = httpx.request(method, ENGINE + self.path, content=raw, timeout=900,
                                headers={"Content-Type": self.headers.get("Content-Type", "application/json")})
         kind = answer.headers.get("Content-Type", "application/json")
         # A streamed answer is kept as the server-sent events it was, a whole one as its JSON.
         streamed = kind.startswith("text/event-stream")
-        self.server.exchanges.append({"path": self.path, "request": json.loads(raw) if raw else None,
+        proxy.exchanges.append({"path": self.path, "request": json.loads(raw) if raw else None,
                                       "status": answer.status_code,
                                       **({"stream": answer.text} if streamed else {"response": answer.json()})})
         self.send_response(answer.status_code)
@@ -178,11 +192,36 @@ class _Recorded(BaseHTTPRequestHandler):
     def do_POST(self):
         self._forward("POST")
 
-    def log_message(self, *args):
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
 
-def capture_stops(name: str, bin: Path, out: Path) -> None:
+def _chat_prompt(tokenizer) -> list[int]:
+    """The chat template's ids of the capture's one message, as a list: Transformers 5 answers a
+    BatchEncoding unless told not to."""
+    ids = tokenizer.apply_chat_template([{"role": "user", "content": "Say hello."}],
+                                        add_generation_prompt=True, tokenize=True, return_dict=False)
+    prompt = [token for token in ids if isinstance(token, int)]
+    assert len(prompt) == len(ids), "a chat template's tokenized prompt is its ids"
+    return prompt
+
+
+def _native_eos(tokenizer, listed) -> list[int]:
+    """The model's end-of-sequence ids: its generation config's (`listed`, one or a list) and its
+    tokenizer's."""
+    eos = tokenizer.eos_token_id
+    assert isinstance(eos, int), "the tokenizer names one end-of-sequence token"
+    return sorted({*(int(token) for token in (listed if isinstance(listed, list) else [listed])), eos})
+
+
+def _decoded(tokenizer, ids: Sequence[int]) -> str:
+    """One sequence's text: a list of ids decodes to one string."""
+    text = tokenizer.decode(list(ids))
+    assert isinstance(text, str)
+    return text
+
+
+def capture_stops(name: Engine, bin: Path, out: Path) -> None:
     import openai
     from huggingface_hub import hf_hub_download
 
@@ -191,17 +230,15 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
     from dew.sampling import Sampling
 
     tokenizer = load_tokenizer(MODEL)
-    # The chat template's ids as a list: Transformers 5 answers a BatchEncoding unless told not to.
-    prompt = list(tokenizer.apply_chat_template([{"role": "user", "content": "Say hello."}],
-                                                add_generation_prompt=True, tokenize=True, return_dict=False))
+    prompt = _chat_prompt(tokenizer)
     generation = json.loads(Path(hf_hub_download(MODEL, "generation_config.json")).read_text())
-    listed = generation["eos_token_id"]
-    native = sorted({*(listed if isinstance(listed, list) else [listed]), tokenizer.eos_token_id})
+    native = _native_eos(tokenizer, generation["eos_token_id"])
+    decoded = functools.partial(_decoded, tokenizer)
 
     def published(variables, version):
         raise AssertionError("no weights are pushed while capturing")
 
-    proxy = ThreadingHTTPServer(PROXY, _Recorded)
+    proxy = _Proxy(PROXY, _Recorded)
     proxy.exchanges = []
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
     client = openai.OpenAI(base_url=f"http://{PROXY[0]}:{PROXY[1]}/v1", api_key="capture", max_retries=0)
@@ -210,7 +247,7 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
     def draw(eos: int | None, seed: int, stop: str | None = None) -> dict:
         proxy.exchanges.clear()
         sampling = Sampling(temperature=1.0, eos_token_ids=eos, stop=() if stop is None else (stop,))
-        server = OpenAIRolloutServer(completion, sampling, published, decode=tokenizer.decode)
+        server = OpenAIRolloutServer(completion, sampling, published, decode=decoded)
         try:
             drawn = server.submit(prompt, STOPS_BUDGET, key=seed).result()
             outcome = {"tokens": list(drawn.tokens), "terminated": drawn.terminated}
@@ -275,7 +312,7 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
                 raise RuntimeError(f"{name} drew no token past its EOS in 16 seeds")
             draws = [unstopped, draw(native[0], seed), draw(later[0], seed)]
             # A stop string the same seed's answer reaches a few tokens in.
-            pieces = [tokenizer.decode([token]).strip() for token in unstopped["tokens"][2:after]]
+            pieces = [decoded([token]).strip() for token in unstopped["tokens"][2:after]]
             stop = next((piece for piece in pieces if piece), None)
             if stop is not None:
                 stopped.append(raw(seed, stop))
@@ -323,7 +360,8 @@ def main() -> None:
     if not set(given) <= {"vllm", "sglang"}:
         parser.error("--python names vllm or sglang")
     captures = args.only or ["gateway", "stops"]
-    for name in ("sglang", "vllm"):
+    engines: tuple[Engine, ...] = ("sglang", "vllm")
+    for name in engines:
         bin = Path(given[name]).parent if name in given else venv(args.venvs, name)
         if "gateway" in captures:
             capture_gateway(name, bin, venv(args.venvs, "gateway"), args.venvs, args.out)
