@@ -1768,22 +1768,29 @@ def edge_values(dtype) -> np.ndarray:
 def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
     """`dew.nn.float_bits.exact_power2` is `2^n` in its format, bit for bit, at every normal exponent from the
     least to the largest, and +0 one below them (a zero a caller encodes so), compiled, a sub-byte format's
-    too (FP6, FP4: base review d47c0d69c F1)."""
+    too (FP6, FP4: base review d47c0d69c F1); an exponent of a narrow integer type is its value, where an
+    unsigned 2-bit 1 read as the E3M2 sentinel -3's wrap and gave +0 (base review 1e030145c F1)."""
     from dew.nn.float_bits import exact_power2
 
+    # Each exponent type's values: int32's every one here, int4's and an unsigned 2-bit's narrow.
+    held = {jnp.int32: (-(2 ** 31), 2 ** 31 - 1), jnp.int4: (-8, 7), jnp.uint2: (0, 3)}
     with jax.enable_x64(new_val=dtype == jnp.float64):
         limits = jnp.finfo(dtype)
         exponents = np.arange(limits.minexp - 1, limits.maxexp)
-        found = np.asarray(jax.jit(lambda n: exact_power2(n, dtype))(jnp.asarray(exponents, jnp.int32)))
-    assert found.dtype == dtype
+        taken = {exponent: (low <= exponents) & (exponents <= high) for exponent, (low, high) in held.items()}
+        found = {exponent: np.asarray(jax.jit(lambda n: exact_power2(n, dtype))(
+            jnp.asarray(exponents[within], exponent))) for exponent, within in taken.items()}
     expected = np.asarray([0.0, *(2.0 ** int(n) for n in exponents[1:])], np.float64).astype(dtype)
     # A sub-byte format's value is held in a byte (ml_dtypes'): its storage's bits.
     stored = f"uint{8 * np.dtype(dtype).itemsize}"
-    np.testing.assert_array_equal(found.view(stored), expected.view(stored))
+    for exponent, within in taken.items():
+        assert found[exponent].dtype == dtype, exponent
+        np.testing.assert_array_equal(found[exponent].view(stored), expected[within].view(stored),
+                                      err_msg=str(exponent))
 
 
 def power2_rounds_a_subnormal_result_once():
-    """`dew.nn.precision.power2` by equal parts rounds a result below the least normal once, at its last
+    """`dew.nn.precision.power2` by `2^o 2^(k-2o) 2^o` rounds a result below the least normal once, at its last
     factor, on a device that keeps subnormals (a GPU's XLA, whose fp32 arithmetic keeps them where XLA:CPU's
     flushes them): `(0.5 + 2^-24) 2^-149` is `2^-149`, where a whole factor first rounded the partial product
     to `2^-127` and the remainder's then rounded its tie to zero (base review 54bb1f61a F2). Its pullback

@@ -21,13 +21,14 @@ def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax
     exactly. `dtype` is the one JAX makes of it (a Python `float` float32 where x64 is off)."""
     dtype = jax.dtypes.canonicalize_dtype(dtype)
     limits = jnp.finfo(dtype)
+    # Its value, not a narrow type's wrap of a sentinel (an unsigned 2-bit -3 is 1).
+    n = jnp.asarray(n).astype(jnp.int32)
     if not hasattr(jnp, f"int{limits.bits}"):
-        n = jnp.asarray(n)
         power = jnp.where(n == limits.minexp - 1, np.float32(0), exact_power2(n, jnp.float32))
         return power.astype(dtype)
     word = jnp.dtype(f"int{limits.bits}")
     bias = int(np.asarray(1.0, dtype).view(f"uint{limits.bits}")) >> limits.nmant
-    biased = jnp.asarray(n).astype(word) + word.type(bias)
+    biased = n.astype(word) + word.type(bias)
     bits = jax.lax.shift_left(biased, jnp.full_like(biased, limits.nmant))
     return jax.lax.bitcast_convert_type(bits, dtype)
 
