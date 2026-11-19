@@ -1258,6 +1258,28 @@ def test_an_algebra_span_no_rewrite_crosses_keeps_its_marker():
                     "a span no rewrite crosses beside joined sums", seeds=8)
 
 
+def test_an_algebra_span_returning_one_value_twice_stays_open_beside_a_splice():
+    """An Algebra span returning one value as two outputs, both read, beside sums the pass joins elsewhere:
+    the program the pass writes is a valid program (JAX's own check), the span left opened, where calling
+    it again bound that one value's name twice (head review); it computes what it computes (check 1)."""
+    from jax._src import core as jax_core
+
+    from dew.nn.derivatives import Algebra, marked
+
+    def both(x, y, a):
+        def twice(x):
+            made = jnp.cumsum(jnp.sin(x), axis=-1)
+            return made, made
+
+        first, second = marked(Algebra(), twice)(x)
+        return first * second, two_sums(x, y, a)
+
+    closed = jax.make_jaxpr(both)(*rows(15, *SHAPES_MARKED))
+    jax_core.check_jaxpr(algebra.rewritten_program(closed).jaxpr)
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a span returning one value twice beside joined sums", seeds=8)
+
+
 def test_an_algebra_span_with_effects_is_rewritten_within_its_call():
     """An Algebra span whose body has effects (a callback's) is not opened into the region around it, whose
     renaming would leave its effects naming the body's own variables: it is rewritten within its call, as a

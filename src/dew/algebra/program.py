@@ -796,23 +796,33 @@ def _reclosed(jaxpr: jcore.Jaxpr, spans: Sequence[_Span], spliced: Mapping[int, 
     """`jaxpr`, the windowed program (`_windowed`, `spliced` its splices by the id of the equation each
     replaced), with each opened span (`spans`) no splice crosses called again as it was: none of its body's
     equations replaced, none of their values read by a spliced form but its outputs, its outputs each a value
-    its body made, so an Algebra marker stands wherever no rewrite lands across its boundary (spec alignment,
-    8998: one splice anywhere kept every span of the program opened)."""
+    its body made and no two of them one value (one value twice would bind one name twice), so an Algebra
+    marker stands wherever no rewrite lands across its boundary (spec alignment, 8998: one splice anywhere
+    kept every span of the program opened). The program is indexed once and written once."""
     read = {atom for made in spliced.values() for equation in made for atom in equation.invars
             if not isinstance(atom, jcore.Literal)}
-    equations = list(jaxpr.eqns)
+    position = {id(equation): place for place, equation in enumerate(jaxpr.eqns)}
+    calls: dict[int, jcore.JaxprEqn] = {}
+    removed: set[int] = set()
     for span in spans:
-        inside = {var for equation in jaxpr.eqns if id(equation) in span.inlined for var in equation.outvars}
-        outputs = set(span.returned)
-        if (span.inlined & spliced.keys() or (read & inside) - outputs
-                or not all(isinstance(atom, jcore.Var) and atom in inside for atom in span.returned)):
+        inlined = {made for made in span.inlined if made in position}
+        if not inlined or inlined & spliced.keys() or inlined & removed:
             continue
-        places = [place for place, equation in enumerate(equations) if id(equation) in span.inlined]
-        if not places:
+        inside = {var for made in inlined for var in jaxpr.eqns[position[made]].outvars}
+        returned = span.returned
+        if ((read & inside) - set(returned) or len(set(map(id, returned))) != len(returned)
+                or not all(isinstance(atom, jcore.Var) and atom in inside for atom in returned)):
             continue
-        called_again = span.call.replace(outvars=list(span.returned))
-        equations = [*equations[:places[0]], called_again,
-                     *(equation for equation in equations[places[0]:] if id(equation) not in span.inlined)]
+        calls[min(position[made] for made in inlined)] = span.call.replace(outvars=list(returned))
+        removed |= inlined
+    if not calls:
+        return jaxpr
+    equations = []
+    for place, equation in enumerate(jaxpr.eqns):
+        if place in calls:
+            equations.append(calls[place])
+        if id(equation) not in removed:
+            equations.append(equation)
     return jaxpr.replace(eqns=equations)
 
 
