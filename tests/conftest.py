@@ -279,9 +279,11 @@ order they ran."""
 def pytest_terminal_summary(terminalreporter):
     if _remote is not None:
         terminalreporter.write_line(_remote.summary())
+    # Each test run unprepared, with every reason it gave, where and why (`truths_ahead.reasoned`).
     for record in terminalreporter.config.stash.get(UNPREPARED_RUN, []):
-        terminalreporter.write_line(f"unprepared, its sites compiled on its GPU: {record['test']} computes "
-                                    f"before its first check-1 site at {record['where']}")
+        terminalreporter.write_line(f"unprepared, its sites compiled on its GPU: {record['test']}")
+        for reason in record["reasons"]:
+            terminalreporter.write_line(f"  at {reason['where']}: {reason['error']}")
 
 
 def pytest_runtest_setup(item):

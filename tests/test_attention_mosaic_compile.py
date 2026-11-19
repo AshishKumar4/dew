@@ -914,11 +914,15 @@ def test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks():
 
 
 @COMPILES_ON_CPU
-def test_a_start_runs_the_kernels_its_launches_certified():
+@pytest.mark.parametrize("hooks", ["none", "temperature"])
+def test_a_start_runs_the_kernels_its_launches_certified(hooks):
     """A launch's derived config certified as it traces (`report.certified`: its kernels compiled alone as
-    the GPU's compiler assembles them) on a compile-only B200, and then compiled within its program: every
-    Mosaic GPU kernel the program runs is one certification compiled, module for module (its kernel hash),
-    which Mosaic compiles once a process, so certification adds a start no second assembly."""
+    the GPU's compiler assembles them, in certification's own placement) on a compile-only B200, and then
+    compiled within its program: every Mosaic GPU kernel the program runs is one certification compiled,
+    module for module (its kernel hash), which Mosaic compiles once a process, so certification adds a start
+    no second assembly and its verdict is the program's kernel's. Under a score hook too, whose traced digest
+    names the kernels (row 8532: certification's placement named them apart, and ptxas assembled the two
+    otherwise identical modules differently, 8 bytes spilled in the program against none certified)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -926,9 +930,10 @@ def test_a_start_runs_the_kernels_its_launches_certified():
     spans = template.spans(tokens, tokens, 1, causal=True)
     query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16)
+    hooked = _gated_hooks(hooks, tokens, width)
 
     def forward(query, key, value):
-        return attention_mosaic.forward(query, key, value, spans, None)
+        return attention_mosaic.forward(query, key, value, spans, hooked)
 
     found = compile_mosaic_kernels([KernelCase("a start's forward", lambda: (forward, (query, key, key)))],
                                    "sm100")

@@ -25,14 +25,29 @@ import json
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 RECORDINGS = "tests/fixtures/hf/gemma4-unified-native-tiny"
 """Where the Unified fixture and its sites' recordings are, from the checkout."""
 
+type Arrays = dict[str, np.ndarray]
+"""A site's arrays by name: a draw's inputs, a reference's or a truth's outputs."""
 
-def workload(site, directory, device):
+type Arguments = tuple[Arrays] | tuple[Arrays, np.ndarray]
+"""A draw's arguments: its inputs, and the cached site's continuation after them."""
+
+
+def workload(site, directory, device) -> tuple[Callable[..., Arrays], Callable[..., Arrays],
+                                                Callable[[int], Arguments], Path]:
+    """`site`'s reference and float64 truth, each called with a draw's arguments, its draw of a seed's
+    arguments (the cached site's inputs and continuation, every other one input), and its source's
+    directory."""
     from test_gemma4_unified import (
         FIXTURE,
         cached_functions,
@@ -55,9 +70,17 @@ def workload(site, directory, device):
     source[2].to(device)
     if site in ("backward", "cached"):
         functions = (gradient_functions if site == "backward" else cached_functions)(source)
-        return (*functions[1:], source[0].source)
+        reference, truth, drawn = functions[1:]
+        return reference, truth, drawn, _directory(source[0].source)
     _, reference, truth = forward_functions(source)
-    return reference, truth, lambda seed: (draw(seed),), source[0].source
+    return reference, truth, lambda seed: (draw(seed),), _directory(source[0].source)
+
+
+def _directory(source: Path | None) -> Path:
+    """A loaded source's directory, which every site's source has."""
+    if source is None:
+        raise ValueError("the Unified fixture loads from no directory")
+    return source
 
 
 def backward_recording(device, seeds=None):
@@ -134,6 +157,12 @@ def environment(device) -> dict:
                          for name in ("jax", "torch", "transformers", "numpy")}}
 
 
+def recorded_command(site, device) -> str:
+    """The command that records `site` whole on `device`, as its provenance names it."""
+    return (f"PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py {site} --device {device} "
+            f"--record --output {RECORDINGS}/{site}.npz")
+
+
 def record_site(site, output, device, *, shards=()):
     """`site`'s recording at `output`, with its provenance: the backward site's joined from `shards`
     (`merge_shards`) where they are given, its provenance the environment every shard was recorded in,
@@ -145,7 +174,7 @@ def record_site(site, output, device, *, shards=()):
 
     with tempfile.TemporaryDirectory() as directory:
         if site == "backward" and shards:
-            held, environments = [], set()
+            held, environments = [], set[str]()
             for path in shards:
                 with np.load(path, allow_pickle=False) as shard:
                     held.append({key: value for key, value in shard.items() if key != ENVIRONMENT})
@@ -165,13 +194,16 @@ def record_site(site, output, device, *, shards=()):
                        + f"in shards, then --merge SHARD.npz... --output {RECORDINGS}/backward.npz")
         elif site == "backward":
             stored, source = backward_recording(device)
+            made, command = environment(device), recorded_command(site, device)
         else:
             reference, truth, draw, source = workload(site, Path(directory), device)
 
             def drawn(seed):
-                arguments = draw(seed)
-                return ({**arguments[0], "continuation": arguments[1]} if site == "cached"
-                        else arguments[0])
+                match draw(seed):
+                    case (inputs, continuation):
+                        return {**inputs, "continuation": continuation}
+                    case (inputs,):
+                        return inputs
 
             def evaluate(inputs):
                 arguments = (({name: value for name, value in inputs.items() if name != "continuation"},
@@ -186,11 +218,8 @@ def record_site(site, output, device, *, shards=()):
             # outputs took 94 MB of the fetched store over seven sites. The bfloat16 source's outputs stay
             # whole: Dew's float64 forward of its bfloat16 load is not the reference's float64 run.
             stored = record_case(site, drawn, evaluate, store_inputs=False, summary=site != "bfloat16")
-        if not (site == "backward" and shards):
-            made = environment(device)
-            command = (f"PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py {site} --device "
-                       f"{device} --record --output {RECORDINGS}/{site}.npz")
-        stored["precision"] = "ieee"
+            made, command = environment(device), recorded_command(site, device)
+        stored["precision"] = np.asarray("ieee")
         stored["provenance"] = provenance(
             "transformers Gemma4UnifiedForConditionalGeneration", made["packages"]["transformers"],
             made["device"], command,
@@ -230,7 +259,8 @@ def main():
         start, stop = (int(bound) for bound in args.shard.split(":"))
         shard, _ = backward_recording(args.device, range(start, stop))
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(args.output, **shard, **{ENVIRONMENT: np.asarray(json.dumps(environment(args.device)))})
+        np.savez(args.output, allow_pickle=False, **shard,
+                 **{ENVIRONMENT: np.asarray(json.dumps(environment(args.device)))})
         return
     if args.record or args.merge:
         record_site(args.site, args.output, args.device, shards=args.merge)

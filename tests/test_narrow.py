@@ -566,11 +566,15 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     state = held(copies=False)
     assert copies > 0 and held(copies=True) == state
     run, _ = built()
-    # Devices whose allocator holds the state and half its copies, its step's free bytes between its needs
-    # beside the state: the plan made before the state is placed (`Trainer._planned_unplaced`), which reads
-    # those bytes as holding the state too, holds none, and the step is planned once the state is placed.
-    free, limit = (with_copies + without) // 2, state + copies // 2
-    assert limit > free, (limit, free)
+    # Devices whose allocator holds the state and, beside it, free bytes between the step's needs with and
+    # without its copies, as each plan measured them: the state fits (`validate` checks it alone against
+    # the limit), the step fits only without its copies. Both stated from the needs the cell measured, not
+    # the state's bytes, which a GPU step's temporaries dwarf (M-MC-22: a 349,744 B state, a 68 MB step).
+    # The plan made before the state is placed (`Trainer._planned_unplaced`), which reads those bytes as
+    # holding the state too, holds none, and the step is planned once the state is placed.
+    free = (with_copies + without) // 2
+    limit = state + free
+    assert without < free < with_copies, (without, free, with_copies)
     stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
     with chosen(narrow_copies='on'):
         run.fit(stream, steps=2)

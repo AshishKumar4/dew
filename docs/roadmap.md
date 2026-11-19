@@ -10,6 +10,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
 - finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
+- Jax fork, sm80: lax_test RaggedTest.test_ragged_dot_prefix_rounds_once's F16_F16_F32 cells (8, 9) fail on an A100 with INVALID_ARGUMENT 'Unsupported dot…. [8554]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
