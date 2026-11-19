@@ -1156,12 +1156,21 @@ ALIGNED_CASES = {
     "a band below two that cancel": ([(2.0 ** 100, 2.0 ** 27, 1.0), (2.0 ** 100, -(2.0 ** 27), 1.0),
                                       (2.0 ** 25, 1.0, 1.0), (-(2.0 ** 24), 1.0, 1.0),
                                       (-(2.0 ** 24), 1.0, 1.0), (2.0 ** -50, 2.0 ** -50, 1.0)], 2.0 ** -100),
+    "three levels cancelling beside the largest": (
+        [(2.0 ** 100, 2.0 ** 53, 1.0), (2.0 ** 100, 2.0 ** 28, 1.0), (-(2.0 ** 100), 2.0 ** 3, 1.0),
+         (-(2.0 ** 100), 2.0 ** 28, 1.0), (2.0 ** 100, 2.0 ** 3, 1.0), (-(2.0 ** 100), 2.0 ** 53, 1.0),
+         (float(np.finfo(np.float32).max), 1.0, 1.0)], float(np.finfo(np.float32).max)),
+    "cancelling past twice the precision": ([(2.0 ** 80, 1.0, 1.0), (2.0 ** 50, 1.0, 1.0), (1.0, 1.0, 1.0),
+                                             (-(2.0 ** 50), 1.0, 1.0), (-1.0, 1.0, 1.0),
+                                             (-(2.0 ** 80), 1.0, 1.0)], 0.0),
 }
 """`aligned_sum`'s cases: three-factor terms whose products leave fp32's range, and their sum, exact in any
 order of summing (their sum a float32): a term more than float32's exponent range below the largest kept,
 where the largest cancel (base review 224fcf53a F1), and a lower band's rounding, -2^25 - 2 a tie, kept
-where its rounded sum cancels a higher band's (base review 644ef5535 F1), and a third band's 2^-100 kept
-where the two above it cancel (base review f5e6e678d F1)."""
+where its rounded sum cancels a higher band's (base review 644ef5535 F1), a third band's 2^-100 kept
+where the two above it cancel (base review f5e6e678d F1), and three levels of cancelling terms beside the
+largest, `[2^153, 2^128, -2^103, -2^128, 2^103, -2^153, fp32's largest]` the largest, not inf, and
+`2^80 + 2^50 + 1 - 2^50 - 1 - 2^80` zero, which floats summed in some order lose (row 8757)."""
 
 
 @pytest.mark.parametrize("case", list(ALIGNED_CASES))
@@ -1172,6 +1181,55 @@ def test_an_aligned_sum_is_exact_where_its_terms_leave_fp32s_range(case):
     terms, total = ALIGNED_CASES[case]
     found = aligned_sum([tuple(jnp.float32(factor) for factor in term) for term in terms])
     assert float(found) == total
+
+
+ROUNDED_CASES = {
+    "a tie to even": ([1.0, 2.0 ** -24], 1.0),
+    "past a tie by a sticky bit": ([1.0, 2.0 ** -24, 2.0 ** -60], 1 + 2.0 ** -23),
+    "below a tie by a sticky bit": ([1.0, 2.0 ** -24, -(2.0 ** -60)], 1.0),
+    "the largest past by half its unit": ([float(np.finfo(np.float32).max), 2.0 ** 103], float("inf")),
+    "a cancelled zero": ([1.0, -1.0], 0.0),
+    "negative zeros": ([-0.0, -0.0], -0.0),
+    "infinities of both signs": ([float("inf"), float("-inf")], float("nan")),
+    "an infinity beside a finite term": ([float("inf"), 1.0], float("inf")),
+    "a NaN": ([float("nan"), 1.0], float("nan")),
+}
+"""`aligned_sum`'s rounding cases: terms of one factor and the float their sum rounds to, nearest and ties
+to even, every bit below the rounding place sticky, its zeros' and non-finite terms' as IEEE's."""
+
+
+@pytest.mark.parametrize("case", list(ROUNDED_CASES))
+def test_an_aligned_sum_rounds_its_exact_sum_once_to_nearest_ties_to_even(case):
+    """`aligned_sum` of one-factor fp32 terms (`ROUNDED_CASES`): the float their exact sum rounds to, to
+    nearest, ties to even, a bit far below the tie deciding it, past the largest infinite, a cancelled sum
+    positive zero and negative zeros' negative, infinities' and NaNs' as IEEE sums them (row 8757)."""
+    terms, total = ROUNDED_CASES[case]
+    found = np.asarray(aligned_sum([(jnp.float32(term),) for term in terms]))
+    np.testing.assert_array_equal(found, np.float32(total))
+    assert np.signbit(found) == np.signbit(np.float32(total))
+
+
+@pytest.mark.parametrize(("terms", "total"), [
+    ([(2.0 ** -75, 2.0 ** -75)] * 2, 2.0 ** -149),
+    ([(2.0 ** -75, 2.0 ** -75)], 0.0),
+    ([(2.0 ** -75, 2.0 ** -75)] * 3, 2.0 ** -148),
+    ([(1 + 2.0 ** -12, 1 + 2.0 ** -12), (-(1 + 2.0 ** -11), 1.0)], 2.0 ** -24),
+], ids=["two products a subnormal", "a product half the least subnormal", "three such halves",
+        "a product's bit below its rounding"])
+def test_an_aligned_sum_sums_its_products_every_bit(terms, total):
+    """`aligned_sum` of two-factor fp32 terms whose products round in fp32 or are subnormal: their exact sum
+    rounded once, `2^-150` twice the least subnormal, once a tie to zero, three times `2^-148`, and `(1 +
+    2^-12)^2 - (1 + 2^-11)` its `2^-24`, where its products were rounded first and subnormals flushed (row
+    8757)."""
+    found = aligned_sum([tuple(jnp.float32(factor) for factor in term) for term in terms])
+    np.testing.assert_array_equal(np.asarray(found), np.float32(total))
+
+
+def test_an_aligned_sum_over_a_long_axis_is_its_exact_sum():
+    """`aligned_sum([(x,)], axis=0)` of 65,536 ones but `2^100` and `-2^100` first: 65,534, its digits'
+    sums within their integers however many terms an axis holds (row 8757)."""
+    x = jnp.ones((65536, 2), jnp.float32).at[0].set(2.0 ** 100).at[1].set(-(2.0 ** 100))
+    np.testing.assert_array_equal(np.asarray(aligned_sum([(x,)], axis=0)), [[65534.0, 65534.0]])
 
 
 @pytest.mark.parametrize("terms", [[(0.0, 0.5, 0.5)], [(0.0, 0.0, 0.0), (0.0, 2.0 ** 100, 2.0 ** 100)]],
