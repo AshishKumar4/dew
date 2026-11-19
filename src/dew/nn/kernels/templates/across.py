@@ -118,7 +118,7 @@ class ScaleSmem:
         mgpu_utils.warpgroup_barrier()
 
 
-def scale_smem(ref, power: float, *, swizzle: int | None = None, interpret: bool = False) -> None:
+def scale_smem(ref, power: float, *, swizzle: int, interpret: bool = False) -> None:
     """Scales every 16-bit element of shared-memory tile `ref` in place by `power` (a power of two),
     swizzle-agnostically (`ScaleSmem`): avoids a separate XLA pass over the query before the launch
     (row 5274, ~1.5 us at batch 1)."""
@@ -130,9 +130,9 @@ def scale_smem(ref, power: float, *, swizzle: int | None = None, interpret: bool
     dtype = jnp.dtype(ref.dtype)
     elements = int(np.prod(ref.shape))
     words = elements // 2
-    if dtype.itemsize != 2 or words % resources.THREADS != 0:
-        raise ValueError(f"scale_smem takes a 16-bit tile of whole warpgroup word stripes, not "
-                         f"{ref.shape} {dtype}")
+    if swizzle is None or dtype.itemsize != 2 or words % resources.THREADS != 0:
+        raise ValueError(f"scale_smem takes an explicitly swizzled 16-bit tile of whole warpgroup word "
+                         f"stripes, not {ref.shape} {dtype} swizzle={swizzle}")
     bf16 = dtype == jnp.dtype(jnp.bfloat16)
     bits = (int(np.float32(power).view(np.uint32) >> 16) if bf16
             else int(np.float16(power).view(np.uint16)))

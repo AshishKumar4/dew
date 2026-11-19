@@ -722,13 +722,14 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 def _powered_in_kernel(family: mosaic.Family, dtype, hooks: Hooks, *, parts: int = 1) -> bool:
     """Whether a launch's consumers take its query's power of two in their stage (`_query_of`, its form's
     `prescale`): under a query prologue, or for a single-part 16-bit query on an NVIDIA GPU family whose
-    consumers own their query stage (`across.scale_smem`, row 5274, ~1.5 us at B1; not fp32 multipart,
-    not `places_on_role`, whose issuer waits on `q_loaded`, and not TPU `mxu`)."""
+    query stage carries an explicit swizzle (`query_swizzle`, `across.scale_smem`, row 5274, ~1.5 us at B1;
+    not fp32 multipart, not inferred-layout WGMMA/tcgen05.chunks, not `places_on_role`, not TPU `mxu`)."""
     if parts != 1:
         return False
     if hooks.query_mod is not None:
         return True
-    return jnp.dtype(dtype).itemsize == 2 and family.fixes_up and not family.places_on_role
+    return (jnp.dtype(dtype).itemsize == 2 and family.fixes_up
+            and not family.places_on_role and query_swizzle(family) is not None)
 
 
 def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, taken: float, hooks: Hooks,
