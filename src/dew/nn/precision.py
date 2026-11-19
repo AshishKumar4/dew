@@ -55,7 +55,7 @@ from dew.nn.derivatives import (
     with_gradients_formed_at,
     with_tangents_formed,
 )
-from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, two_factor_reach
+from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, raw_fields, two_factor_reach
 from dew.nn.nested import nested
 from dew.nn.programs import UNROUNDED, equations
 from dew.nn.sharding import explicit_spec
@@ -1523,15 +1523,15 @@ def _divided(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
     plain = numerator / denominator
     if not (isinstance(lowered, int) and lowered == 0):
         plain = lowered_rounded(plain, jnp.broadcast_to(jnp.asarray(lowered, jnp.int32), plain.shape))
-    top_bits, bottom_bits = (jax.lax.bitcast_convert_type(value, jnp.uint32)
-                             for value in (numerator, denominator))
-    top_field, bottom_field = (((bits >> 23) & 0xFF).astype(jnp.int32) for bits in (top_bits, bottom_bits))
+    (_, top_sign, top_field, top_fraction), (_, bottom_sign, bottom_field, bottom_fraction) = (
+        raw_fields(value) for value in (numerator, denominator))
+    top_field, bottom_field = top_field.astype(jnp.int32), bottom_field.astype(jnp.int32)
     special = (top_field == 0) | (top_field == 255) | (bottom_field == 0) | (bottom_field == 255)
-    negative = ((top_bits ^ bottom_bits) >> 31) != 0
+    negative = top_sign != bottom_sign
     # A normal operand's significand, exact in [1, 2); any bits give one in that range, so a special
     # lane's steps stay normal too, and its result is the division's.
-    top, bottom = (jax.lax.bitcast_convert_type((bits & 0x007FFFFF) | 0x3F800000, jnp.float32)
-                   for bits in (top_bits, bottom_bits))
+    top, bottom = (jax.lax.bitcast_convert_type(fraction | np.uint32(0x3F800000), jnp.float32)
+                   for fraction in (top_fraction, bottom_fraction))
     significand, residual = _rounded_significand(top, bottom)
     exponent = top_field - bottom_field - lowered
     bits = jax.lax.bitcast_convert_type(significand, jnp.int32)
@@ -1541,7 +1541,7 @@ def _divided(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
     # Below the normal range: the significand on the grid of 2^-149, a value under 2^23 whose
     # integer part and half are exact in fp32; within the float32 range scaled by 2^shift.
     shift = jnp.clip(exponent + 149, -126, 127)
-    scaled = significand * jax.lax.bitcast_convert_type((shift + 127) << 23, jnp.float32)
+    scaled = significand * exact_power2(shift, jnp.float32)
     whole = jnp.floor(scaled)
     fraction = scaled - whole
     odd = (whole.astype(jnp.int32) & 1) == 1

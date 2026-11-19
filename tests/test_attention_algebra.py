@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from low_precision_support import edge_values
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
 from test_attention_triton import (
@@ -926,20 +927,13 @@ def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at
     _accurate_dq(query, key, value, spans, hooks, dout, 2.0 ** -40, "a tiny weight over a large state")
 
 
-def _edge_floats() -> np.ndarray:
-    """fp32's values across every binade (`test_precision_policy.edge_values`): a quotient's operands."""
-    from test_precision_policy import edge_values
-
-    return edge_values(np.float32)
-
-
 def test_a_quotient_below_the_least_normal_is_correctly_rounded_on_a_flushing_cpu():
     """`algebra.quotient` on XLA's CPU, which flushes a subnormal result (row 6302's finish): weighted values
     across fp32's subnormals and least normals over totals from 1 to 3 * 2^121, each quotient it raises (its
     weighted value over 124 binades under its total) bitwise the correctly rounded fp32 of its exact ratio,
     the constructed tie `0x00c00002 / 3` among them (a second rounding's one-ulp miss), and every other one
     bitwise XLA's own division."""
-    values = _edge_floats()
+    values = edge_values(np.float32)
     totals = np.asarray([1.0, 3.0, 7.0, 2.0 ** 20 + 1, 2.0 ** 60, 3.0 * 2.0 ** 121], np.float32)
     acc = np.concatenate([values, np.asarray([0x00C00002], np.uint32).view(np.float32)])
     rows = np.broadcast_to(acc, (len(totals), len(acc)))
