@@ -457,6 +457,30 @@ def test_older_kept_steps_hold_their_model_alone_and_the_latest_resumes(tmp_path
         np.testing.assert_array_equal(np.asarray(held), np.asarray(expected))
 
 
+
+def test_a_directory_holding_only_a_model_alone_is_no_fresh_runs(tmp_path):
+    """A directory whose committed steps hold their model alone (`Keep(weights_only=True)`), none of them a
+    step a resume reads, is occupied: a fresh run there, asked (`resume="never"`) or chosen (`"auto"`), is
+    refused, as one beside a run's steps is, never started beside them (row 9019: read as empty, a fresh
+    run wrote its steps among them); one that must continue (`"require"`) finds none to continue."""
+    import shutil
+
+    directory = tmp_path / 'run'
+    run = trainer(directory, keep=Keep(latest=1, every=2, weights_only=True))
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    run.checkpoints.save(2, state.replace(step=jnp.int32(2)), None)
+    run.checkpoints.wait()
+    run.checkpoints.save(3, state.replace(step=jnp.int32(3)), None)
+    run.checkpoints.wait()
+    held = tmp_path / 'held'
+    shutil.copytree(directory / '2', held / '2')
+    assert _items(held, 2) == ['model']
+    alone = Checkpoints(str(held))
+    assert alone.latest is None and alone.occupied == 2
+    for resume in ("auto", "never", "require"):
+        with pytest.raises(ValueError):
+            alone.resumed(resume)
+
 def saved_twice(directory, keep: Keep):
     """A run under `keep` with its fit's step 1 and a save of step 2 landed, and the state it saved."""
     run = trainer(directory, keep=keep)

@@ -320,9 +320,9 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     compile takes), priced, against the step that streams its parameters from the host, priced where its
     devices hold it, over the run's first batch (`Trainer._primed_first`, which the run then reads as its
     first), the choice every process's first's (`broadcast_from_process_zero`), said and kept
-    (`Trainer.layout_choice`). A run that states a layout (any but the default `Layout()`), or one the
-    streamed step cannot run, keeps its layout, said by name."""
-    stated = trainer._given_layout != Layout()
+    (`Trainer.layout_choice`). A run that states a layout (`Layout()` among them: `Trainer`'s argument
+    given, row 9016), or one the streamed step cannot run, keeps its layout, said by name."""
+    stated = trainer._layout_stated
     resumed = None if stated else resumed_layout(trainer, resume)
     if resumed is not None:
         trainer._laid_out(resumed)

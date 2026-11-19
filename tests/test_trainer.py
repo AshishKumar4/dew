@@ -64,7 +64,6 @@ from dew.state import CHECKPOINTED, TokenCount, TrainState
 from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.runtime import Preempted
-from dew.training.trainer import refuse_non_finite
 
 
 def endless():
@@ -2427,7 +2426,17 @@ def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path
     assert resumed.checkpoints.latest == 2
     restored, *_ = resumed.checkpoints.restore(resumed.initial_state())
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(restored.variables))
-    refuse_non_finite(restored, 3, lambda: 2)
+    # A direct save of a non-finite state, on either tier, is refused at the writer before anything is
+    # written or rotated: the latest step stays the finite one (row 9021: it wrote, and a local save
+    # deleted the finite step it replaced).
+    poisoned = jax.tree.map(lambda leaf: jnp.full_like(leaf, jnp.nan), restored.variables)
+    with pytest.raises(RuntimeError):
+        resumed.checkpoints.save(3, restored.replace(variables=poisoned), None)
+    if tier == "local":
+        with pytest.raises(RuntimeError):
+            resumed.checkpoints.save_local(3, restored.replace(variables=poisoned), None)
+    resumed.checkpoints.wait()
+    assert resumed.checkpoints.latest == 2
 
 
 def test_a_trainers_refit_traces_its_step_and_start_once_and_another_trainers_its_own():

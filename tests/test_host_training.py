@@ -1318,6 +1318,7 @@ def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_stat
     for bit as a run given that layout does."""
     from model_support import memory_limited_to
 
+    from dew.mesh import LayoutRefused
     from dew.training.ahead import stand_in_gpus
 
     with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to(streamed_only())):
@@ -1325,8 +1326,15 @@ def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_stat
         trained = chosen.fit(streaming_data(), steps=2, log_every=100)
         given = streaming_decoder(Layout(host=("variables",)))
         expected = given.fit(streaming_data(), steps=2, log_every=100)
+        # A run that states the device layout, `Layout()` written out, keeps it, refused where its devices
+        # do not hold it, never streamed in its place (row 9016: equal to the default, it was read as none
+        # stated and streamed).
+        stated = streaming_decoder(Layout())
+        with pytest.raises(LayoutRefused):
+            stated.fit(streaming_data(), steps=1, log_every=100)
     # The one plan its devices hold: laid out as the streamed layout states, through its construction.
     assert chosen.host_master and chosen.layout == given.layout, chosen.layout_choice
+    assert not stated.host_master
     equal(trained.variables, expected.variables)
 
 

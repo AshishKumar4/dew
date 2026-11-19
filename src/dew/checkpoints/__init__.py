@@ -1332,9 +1332,9 @@ class Checkpoints:
         """Return the newest committed step a resume can read, local or persistent (`_newest`)."""
         return self._newest(RESUME)
 
-    def _newest(self, reads: str) -> int | None:
-        """The newest committed step that holds what a reader of `reads` reads (`ROLES`), local or
-        persistent: a local step holds a whole state.
+    def _newest(self, reads: str | None) -> int | None:
+        """The newest committed step that holds what a reader of `reads` reads (`ROLES`), or any where None
+        (`occupied`), local or persistent: a local step holds a whole state.
 
         Asking opens and writes nothing: until this process writes, Orbax's
         step format lists the committed steps read-only, and once it has, its
@@ -1342,25 +1342,35 @@ class Checkpoints:
         steps = (self._manager.all_steps() if self._manager is not None
                  else [found.step for found in ocp.step.standard_name_format().find_all(self.directory)])
         found = (step for step in sorted(steps, reverse=True)
-                 if self._complete(step) and reads in self._roles_held(step))
+                 if self._complete(step) and (reads is None or reads in self._roles_held(step)))
         persistent = next(found, None)
         local = self._local_latest()
         if persistent is None or local is None:
             return local if persistent is None else persistent
         return max(persistent, local)
 
+    @property
+    def occupied(self) -> int | None:
+        """The newest committed step of any kind the directory holds, a run's or a model's alone (a
+        weights-only save, which no resume reads): what a run started afresh would write beside."""
+        return self._newest(None)
+
     def resumed(self, resume: Resume = "auto") -> int | None:
         """The step a run continues under `resume`, the `latest`, or None where it starts afresh:
         "auto" continues one where the directory holds it; "require" refuses a directory with none,
-        so a job that must continue never trains from scratch; "never" refuses one that holds a run,
-        which a run started afresh would write beside."""
+        so a job that must continue never trains from scratch; "never" refuses one that holds any step,
+        which a run started afresh would write beside. A directory holding steps of which none resumes
+        (`occupied`, a weights-only save) is refused a fresh run under "auto" too: the run would write
+        beside them (row 9019: such a directory read as empty)."""
         latest = self.latest
         if resume == "require" and latest is None:
             raise ValueError(f"resume='require' continues a run, and {self.directory} holds no checkpoint "
                              "to continue")
-        if resume == "never" and latest is not None:
-            raise ValueError(f"resume='never' starts a run afresh, and {self.directory} holds one at step "
-                             f"{latest}; give the new run a directory of its own")
+        held = latest if latest is not None else self.occupied
+        if held is not None and (resume == "never" or latest is None):
+            raise ValueError(f"resume={resume!r} starts a run afresh here, and {self.directory} holds a step "
+                             f"at {held}{'' if latest is not None else ' that no run resumes'}; give the new "
+                             "run a directory of its own")
         return latest
 
     @property
@@ -1446,9 +1456,13 @@ class Checkpoints:
         parameter for fp32 Adam moments and EMA, 84 GB at 7B parameters, on
         hosts that keep the state there because device memory is short.
         """
+        mapping = isinstance(state, Mapping)
+        if not mapping:
+            # No tier writes a non-finite state, before any write or retention (`refuse_non_finite`).
+            from dew.training.transaction import refuse_non_finite
+            refuse_non_finite(state, step, lambda: self.latest)
         persistent = self._open()
         self._project()
-        mapping = isinstance(state, Mapping)
         if not mapping:
             self._identify_run()
             # A run's trainer hands its objective's tokenizer (`Trainer`); a direct save holds none.
@@ -1813,7 +1827,10 @@ class Checkpoints:
         The new step replaces the previous local step. As with `save`, a state
         with arrays in pinned host memory is written before this returns. The
         placement is saved with the state, which a pool's resume is held to
-        (`_check_placement`)."""
+        (`_check_placement`). A non-finite state is refused before the previous local step is touched
+        (`refuse_non_finite`): a local copy is the one a restarted node reads first."""
+        from dew.training.transaction import refuse_non_finite
+        refuse_non_finite(state, step, lambda: self.latest)
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
         grid = Grid.of({name: leaf for name, leaf in state_tree.items() if name != 'position'})
