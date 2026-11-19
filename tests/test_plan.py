@@ -1774,7 +1774,8 @@ def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_rec
     """A Muon step whose joined Newton-Schulz stacks' copies leave it short of the devices' room, and which
     fits with them parted, its split fixed: its plan parts them, joining one at a time (`ns_group` 1, the
     climb's release after the narrow copies, `FitSearch.searched`), and recomputes nothing more, where it
-    climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a step)."""
+    climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a
+    step)."""
     joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
     parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
     assert parted < joined, (parted, joined)
