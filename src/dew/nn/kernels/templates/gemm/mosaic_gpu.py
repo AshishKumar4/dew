@@ -952,7 +952,8 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     `place`, its column the chunk's (`mosaic.Family.persist`'s `store`), in its output's dtype; with
     `nonfinite` (a one-entry int32 ref, `flags_declared`), whether any value the share stores is non-finite
     written there: the stored value's, converted once, as a finite fp32 sum can overflow its output's dtype
-    (base review b1ab251ac F1: 65536, the joined sum where the products' was 65504, an fp16 infinity)."""
+    (base review b1ab251ac F1: 65536, the joined sum where the products' was 65504, an fp16 infinity), of its
+    stored rows alone: another group's, by this entry's matrix, may overflow (base review d0bc7dee6 F3)."""
     family.loaded([(gmem.at[axes.named(side_axes, origins | axes.at_group(side_axes, gmem.shape, group))],
                     smem.at[wg], barrier.at[wg])
                    for gmem, side_axes, smem, barrier in sides],
@@ -970,9 +971,11 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
         for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
             value = value.astype(_stored_dtype(o_gmem))
             if nonfinite is not None:
-                # An entry times zero is NaN where it is infinite or NaN, zero elsewhere: a predicate reduced
-                # over the warpgroup by a barrier, no scratch.
-                seen = seen | jnp.any(jnp.isnan(value * 0))
+                # An entry times zero is NaN where it is infinite or NaN, zero elsewhere, of the rows the
+                # share stores: a predicate reduced over the warpgroup by a barrier, no scratch.
+                kept = family.iota(value.shape, 0) - first
+                stored_rows = (kept >= 0) & (kept < stored)
+                seen = seen | jnp.any(stored_rows & jnp.isnan(value * 0))
             store(output, value, o_gmem, (row_start, first, stored, column + start, *ladder))
     if nonfinite is not None:
         nonfinite[...] = jnp.broadcast_to(seen.astype(jnp.int32), (1,))

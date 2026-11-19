@@ -1129,28 +1129,17 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
                if d is not None]
     entrywise = _entrywise(lhs, prologue, prologue_arrays, prologue_axes, plain)
     wide, d_operand = at_least_fp32(lhs.dtype), None
-    if len(reached) == 2 and not entrywise and _joins(reached, group_sizes, lhs.dtype, prologue, options):
-        # A paired product's two cotangents through their matrices, one product over their joined depths
-        # (`_gemm`'s `joined`): one launch, one accumulator, rounded once (row 6783: lm-moe's start certified
-        # and built the two at two tiles, 6.2 s).
-        (d, matrix), (d_paired, paired) = reached
+    taken = None if entrywise else _one_launch(reached, group_sizes, lhs.dtype, prologue, options)
+    if taken is not None:
+        # The cotangents through their matrices, one product over their joined depths (`_one_launch`'s
+        # form): one launch, one accumulator, rounded once (row 6783: lm-moe's start certified and built a
+        # paired product's two at two tiles, 6.2 s; row 8282: q, k and v's three launches each read and
+        # wrote the fp32 sum, 1.145 ms on a GH200's 8b input gradient), a chain's overflowing tiles summed
+        # again bounded (`mosaic_gpu.guarded_walk`).
+        d, matrix, form = taken
         out = wide if prologue is not None else jnp.dtype(lhs.dtype)
         d_operand = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), None, (), (), (out,),
-                                      several=False, summed_as=(lhs.dtype,), paired=paired, joined=d_paired,
-                                      **options))
-        reached = []
-    # A product of no depth adds nothing, and its operand has no extent a TMA descriptor takes (c3b97e20f F4):
-    # chained products are the others alone.
-    nonempty = [(d, matrix) for d, matrix in reached if d.shape[1]]
-    if len(nonempty) > 1 and not entrywise and _chains(nonempty, group_sizes, lhs.dtype, prologue, options):
-        # Every cotangent through its matrix, one product over their joined depths in the portable
-        # program's transpose order (`_gemm`'s `chained`): one launch, one accumulator, rounded once, its
-        # overflowing tiles summed again bounded (`mosaic_gpu.guarded_walk`; row 8282: q, k and v's three
-        # launches each read and wrote the fp32 sum, 1.145 ms on a GH200's 8b input gradient).
-        (d, matrix), *rest = nonempty[::-1]
-        out = wide if prologue is not None else jnp.dtype(lhs.dtype)
-        d_operand = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), None, (), (), (out,),
-                                      several=False, summed_as=(lhs.dtype,), chained=tuple(rest), **options))
+                                      several=False, summed_as=(lhs.dtype,), **form, **options))
         reached = []
     # Where its rows are gathered, or the last product's epilogue pulls an entrywise prologue back, a paired
     # product's first product, wide, is added in the second's epilogue (`_added`): the same sum, rounded
@@ -1232,59 +1221,52 @@ def _added(acc, prior):
     return acc + prior
 
 
-def _joins(reached: list, group_sizes, dtype, prologue, options: dict) -> bool:
-    """Whether a launch takes a paired product's two input-gradient products (`reached`'s `(cotangent,
-    matrix)` pairs) whole as one over their joined depths (`_gemm`'s `joined`), as `_input_cotangents` calls
-    it: Mosaic GPU's, of 16-bit cotangents and no gathered rows (`grouped_matmul.GROUPED`'s choice, read
-    without reporting it), its two matrices and two cotangents each of one shape (a joined product's
-    contract, `mosaic_gpu.gmm`'s `joined`: projections side by side of their own widths, `beside`, are
-    not one). Elsewhere the two run as before, the second adding the first in its epilogue."""
-    (d, matrix), (d_paired, paired) = reached
-    if (options['gather'] is not None or d.dtype != d_paired.dtype or matrix.shape != paired.shape
-            or d.shape != d_paired.shape):
-        return False
+def _one_launch(reached: list, group_sizes, dtype, prologue, options: dict) -> tuple | None:
+    """The one launch an input gradient's products (`reached`'s `(cotangent, matrix)` pairs) take whole over
+    their joined depths, as `_input_cotangents` calls it: `(cotangent, matrix, form)`, `_gemm`'s first
+    product and its `form`, where Mosaic GPU's launch takes it (`grouped_matmul.GROUPED`'s choice, read
+    without reporting it, which `_gemm`'s dispatch reports), else None. Its forms, in turn: a paired
+    product's two, each matrix and each cotangent of one shape (`joined`, the matrix `paired`: a joined
+    product's contract, `mosaic_gpu.gmm`'s; row 6783); every product of some depth (a product of none adds
+    nothing, and its operand has no extent a TMA descriptor takes, c3b97e20f F4), in the portable program's
+    transpose order (`chained`: projections side by side of their own widths, `beside`, row 8282), its
+    derivation refusing depths of no whole steps (`mosaic_gpu.chained_refusal`). Cotangents of one dtype and
+    no gathered rows; elsewhere each product runs as before, the next adding it in its epilogue."""
+    if options['gather'] is not None or len({d.dtype for d, _ in reached}) > 1:
+        return None
+    forms = []
+    if len(reached) == 2 and len({d.shape for d, _ in reached}) == len({w.shape for _, w in reached}) == 1:
+        (d, matrix), (d_paired, paired) = reached
+        forms.append((d, matrix, {'paired': paired, 'joined': d_paired}))
+    nonempty = [(d, matrix) for d, matrix in reached if d.shape[1]]
+    if len(nonempty) > 1:
+        (d, matrix), *rest = nonempty[::-1]
+        forms.append((d, matrix, {'chained': tuple(rest)}))
+    return next(((d, matrix, form) for d, matrix, form in forms
+                 if _launch_takes(d, matrix, form, group_sizes, dtype, prologue, options)), None)
+
+
+def _launch_takes(d, matrix, form: dict, group_sizes, dtype, prologue, options: dict) -> bool:
+    """Whether Mosaic GPU's launch takes `d @ matrix` in `form` (`_one_launch`'s) as `_gemm` binds it; a
+    chain not at a pinned tile it does not hold (its replay narrower than a column unit: base review
+    2e4651b2e F1, the chain narrowed a 64-column pin to 16)."""
     interpret = xla_products.interpreted(options['interpret_on_cpu'])
     sizes = jnp.full((1,), d.shape[0], jnp.int32) if group_sizes is None else group_sizes
     out = at_least_fp32(dtype) if prologue is not None else jnp.dtype(dtype)
     call, product = _gemm_call(d, matrix, sizes, None, (), (), None, (), (), (out,), several=False,
                                transpose_rhs=options['transpose_rhs'], interpret=interpret,
-                               precision=options['precision'], dense=options['dense'], paired=paired,
-                               first=options['first'], gather=None, scatter=None, summed_as=(dtype,),
-                               joined=d_paired)
-    case = grouped_matmul.grouped_case(*call, product=product, whole=seen_whole(d) and seen_whole(matrix))
-    try:
-        return selection.selected(grouped_matmul.GROUPED, case).name == grouped_matmul.MosaicGmm.name
-    except selection.KernelRefused:
-        return False
-
-
-def _chains(reached: list, group_sizes, dtype, prologue, options: dict) -> bool:
-    """Whether a launch takes a multi-matrix input gradient's products (`reached`'s `(cotangent, matrix)`
-    pairs) whole as one over their joined depths (`_gemm`'s `chained`), as `_input_cotangents` calls it:
-    Mosaic GPU's, of cotangents of one dtype and no gathered rows (`grouped_matmul.GROUPED`'s choice, read
-    without reporting it, its derivation refusing depths of no whole steps, `mosaic_gpu.chained_refusal`).
-    Elsewhere each runs as before, the next adding it in its epilogue."""
-    if options['gather'] is not None or len({d.dtype for d, _ in reached}) > 1:
-        return False
-    (d, matrix), *rest = reached[::-1]
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
-    sizes = jnp.full((1,), d.shape[0], jnp.int32) if group_sizes is None else group_sizes
-    out = at_least_fp32(dtype) if prologue is not None else jnp.dtype(dtype)
-    call, product = _gemm_call(d, matrix, sizes, None, (), (), None, (), (), (out,), several=False,
-                               transpose_rhs=options['transpose_rhs'], interpret=interpret,
-                               precision=options['precision'], dense=options['dense'], paired=None,
-                               first=options['first'], gather=None, scatter=None, summed_as=(dtype,),
-                               chained=tuple(rest))
-    whole = all(seen_whole(each) for pair in reached for each in pair)
+                               precision=options['precision'], dense=options['dense'],
+                               paired=form.get('paired'), first=options['first'], gather=None, scatter=None,
+                               summed_as=(dtype,), joined=form.get('joined'), chained=form.get('chained', ()))
+    operands = (d, matrix, *(() if 'joined' not in form else (form['joined'], form['paired'])),
+                *(each for pair in form.get('chained', ()) for each in pair))
     pin = dict(_cache.KERNEL_PINS.value).get(grouped_matmul.MosaicGmm)
-    if pin is not None:
-        # A launch pinned at a tile no chain holds (its replay narrower than a column unit) keeps the
-        # pinned products apart (base review 2e4651b2e F1: the chain narrowed a 64-column pin to 16).
+    if pin is not None and 'chained' in form:
         launch = grouped_matmul.MosaicGmm()
         bound = launch.bind(*call[1], **call[2])
         if not launch.pinnable(bound, launch.completed(bound, pin)):
             return False
-    case = grouped_matmul.grouped_case(*call, product=product, whole=whole)
+    case = grouped_matmul.grouped_case(*call, product=product, whole=all(map(seen_whole, operands)))
     try:
         return selection.selected(grouped_matmul.GROUPED, case).name == grouped_matmul.MosaicGmm.name
     except selection.KernelRefused:

@@ -2187,6 +2187,51 @@ def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loo
         reset_gpu_interpret_mode_state()
 
 
+@pytest.mark.parametrize("staged", [False, True], ids=["skipped", "staged"])
+def test_a_share_storing_no_rows_stages_no_chunk_between_stored_tiles(staged):
+    """Three tiles of an output staged two chunks a tile through two chunk buffers at the derived waits
+    (`stores.buffer_waits`: one group left in flight before each), the second tile's share storing no rows,
+    under the GPU interpreter's race detection: `stores.staged_chunks` stages nothing for it (no buffer
+    written, no group issued), so each buffer is rewritten once its last store has read it and the output is
+    the first and third tiles' values. Staged anyway, its chunks writing their buffers but issuing no
+    copy, its second chunk's wait counts a group it never issued and rewrites the buffer the first tile's
+    last store still reads, which the detector names (base review 5b513e9af F1)."""
+    from jax._src.pallas.mosaic_gpu.interpret.interpret_pallas_call import reset_gpu_interpret_mode_state
+
+    rows, width, chunks = 8, 32, 2
+    waits = stores.buffer_waits(chunks, 2)
+    assert waits == (1, 1)
+
+    def body(out_gmem):
+        def scoped(smem):
+            for tile, stored in enumerate((rows, 0, rows)):
+                value = jax.lax.broadcasted_iota(jnp.float32, (rows, chunks * width), 1) + 1000.0 * tile
+                place = (min(tile, 1) * rows, 0, jnp.int32(stored), 0, rows, rows)
+                if staged and stored == 0:
+                    for chunk in range(chunks):
+                        plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
+                        stores.staged_rows(smem.at[chunk], value[:, chunk * width:(chunk + 1) * width],
+                                           out_gmem, place[0], 0, place[2], chunk * width, rows, rows)
+                    continue
+                stores.staged_chunks(smem, value, out_gmem, place, waits=waits)
+            plgpu.wait_smem_to_gmem(0)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, rows, width), jnp.float32))
+
+    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((2 * rows, chunks * width), jnp.float32),
+                          interpret=plgpu.InterpretGPUParams(detect_races=True))
+    if not staged:
+        tiles = 1000.0 * np.repeat([0, 2], rows)[:, None]
+        columns = np.arange(chunks * width, dtype=np.float32)
+        np.testing.assert_array_equal(np.asarray(kernel()), columns + tiles)
+        return
+    try:
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            kernel()
+    finally:
+        reset_gpu_interpret_mode_state()
+
+
 def test_a_staged_outputs_launch_states_its_cost():
     """The staged output's launch (`_staged_launch`, each of its chunks' copies its own store group) costed as
     the toolkit's launches are (`emission.costed`, the estimate XLA and Dew's FLOP count read): it states the
