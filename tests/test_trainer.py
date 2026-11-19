@@ -199,6 +199,7 @@ def test_a_state_built_outside_a_trace_is_one_program_its_frozen_tree_the_held_a
     program, its traced start's (`distributed.built_start`), where run eagerly each operation of the
     model's draw compiled alone (row 8682); its frozen tree is the held arrays themselves and its moving
     tree buffers of its own, which the step's donation may free."""
+    from dew._cache import uncached
     from dew.batch import FROZEN
     from dew.lora import LoRA
 
@@ -213,11 +214,14 @@ def test_a_state_built_outside_a_trace_is_one_program_its_frozen_tree_the_held_a
         if event == "/jax/core/compile/backend_compile_duration":
             compiles.append(seconds)
 
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
     jax.monitoring.register_event_duration_secs_listener(heard)
-    try:
-        state = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0)).initial_state()
-    finally:
-        jax.monitoring.unregister_event_duration_listener(heard)
+    # Compiled here, each program counted, none loaded from the persistent cache.
+    with uncached():
+        try:
+            state = trainer.initial_state()
+        finally:
+            jax.monitoring.unregister_event_duration_listener(heard)
     assert len(compiles) <= 2, len(compiles)
     held = {id(leaf) for leaf in jax.tree.leaves(objective.held_variables())}
     frozen = jax.tree.leaves(state.variables[FROZEN])
