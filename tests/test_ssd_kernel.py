@@ -474,6 +474,14 @@ ENTRY_LEAVES = ("output", "final", "entry keys", "entry values", "entry weights"
 """The leaves a forked call's entry writes of cancelling levels are held on (`_documents_arm`'s)."""
 
 
+def _entry_arm(scan):
+    """A forked call's arm (`_documents_arm`) on the leaves its entry writes are held on (`ENTRY_LEAVES`)."""
+    def run(operands, seeded):
+        leaves = _documents_arm(scan)(operands, seeded)
+        return {name: leaves[name] for name in ENTRY_LEAVES}
+    return run
+
+
 def test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel():
     """The TPU kernel over a forked call whose documents' entry writes are three levels cancelling beside
     float32's largest (`levels_documents_draw`), interpreted: its output, the row's last state and its entry
@@ -482,14 +490,8 @@ def test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel():
     at its tie as its negative survived, an ulp here and inf at float32's largest, row 8757; rows 8840,
     9463). The rated scan's selector routes the same call to it on a TPU (test_recurrence_chunk's
     `LEVELS_ROUTES`)."""
-    def held(scan):
-        def run(operands, seeded):
-            leaves = _documents_arm(scan)(operands, seeded)
-            return {name: leaves[name] for name in ENTRY_LEAVES}
-        return run
-
-    truth = jax.jit(held(documents_one_by_one))
-    assert_as_exact(held(documents_on_the_kernel), exactly_rounded(truth), levels_documents_draw,
+    truth = jax.jit(_entry_arm(documents_one_by_one))
+    assert_as_exact(_entry_arm(documents_on_the_kernel), exactly_rounded(truth), levels_documents_draw,
                     "the TPU kernel's forked call's entry writes of cancelling levels", seeds=8,
                     truth_fn=truth)
 
@@ -521,15 +523,9 @@ def test_documents_entry_writes_of_cancelling_levels_take_the_selected_tpu_scan(
     """`test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel`'s call as a TPU runs it
     through the rated scan's selector (`documents_as_selected`): its forked documents and entry writes
     forwarded to the Pallas scan it takes, each leaf held as on the kernel (rows 9463, 9464)."""
-    def held(scan):
-        def run(operands, seeded):
-            leaves = _documents_arm(scan)(operands, seeded)
-            return {name: leaves[name] for name in ENTRY_LEAVES}
-        return run
-
-    truth = jax.jit(held(documents_one_by_one))
+    truth = jax.jit(_entry_arm(documents_one_by_one))
     with generation.routes() as found:
-        assert_as_exact(held(documents_as_selected), exactly_rounded(truth), levels_documents_draw,
+        assert_as_exact(_entry_arm(documents_as_selected), exactly_rounded(truth), levels_documents_draw,
                         "the selected TPU scan's forked call's entry writes of cancelling levels", seeds=8,
                         truth_fn=truth)
     assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
