@@ -650,10 +650,16 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         matrices = _undeferred(words, scales).decoded()
         return matrices[0] if dense else matrices
 
+    def kernel(rows, words, scales, sizes, gather, first, *, interpret):
+        return launch(rows, _undeferred(words, scales), sizes, (), (), None, first, gather,
+                      out_dtype='float32', trans_rhs=False, interpret=interpret, dense=dense, exact_sums=True)
+
     def forward(rows, words, scales, sizes, gather, first):
-        out = launch(rows, _undeferred(words, scales), sizes, (), (), None, first, gather,
-                     out_dtype='float32', trans_rhs=False, interpret=interpret, dense=dense, exact_sums=True)
-        return out, ()
+        # The launch where the call lowers for CUDA, interpreted on a CPU where asked, the decoded values'
+        # product elsewhere (`_dispatched`; `portable`, the tangent's too), as every launch of gemm's: a CPU
+        # process's call lowered the launch for its CPU uninterpreted (row 8492: "Only interpret mode is
+        # supported on CPU backend").
+        return _dispatched(kernel, portable, interpret, rows, words, scales, sizes, gather, first), ()
 
     def backward(saved, operands, cotangent, live):
         # The cotangent at its own precision times the decoded values' transpose, rounded once to the rows',
