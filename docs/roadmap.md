@@ -39,6 +39,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests/ring_protocol.py:838-839 accepts a read of an entries parity whose contents are a stale step's. [8678]
 - Tests/test_gemm_gather.py:200-242 (the strided-table gathers kernel) duplicates tests/test_ring_protocol.py:382-424's gathered walk fixture. [8679]
 - Tests/test_gemm_paired.py:649-669 passes a two-launch chained gradient to ring_protocol.programs, which explores only the first mpmd_map. [8680]
+- A launch's certification traces it a second time. [8720]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -59,6 +60,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - An FP8 key-value cache's codes decoded in the attention kernel on sm80, algebra.md §7.3's FP8 decodes. [8549]
 - Src/dew/nn/kernels/templates/gathered.py:325-326 and 403. [8658]
 - Src/dew/nn/kernels/templates/gathered.py:325-326 and 413-421. [8667]
+- Jax fork, Pallas Mosaic GPU lowering cache. [8721]
+- The wgmma consumer's register model misses the GEMM epilogue's live set by ~16 registers. [8723]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
@@ -92,7 +95,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
-- Objective.init and Trainer.initial_state, called outside a trace, run the model's draw eagerly, so every operation compiles alone. [8682]
 
 ## Data
 
@@ -115,6 +117,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
 - The merge law's placed sum keeps two bands of a term's span, not three. [8061]
+- TPU attention precision, sinks and VMEM. [8729]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]

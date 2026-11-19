@@ -30,13 +30,14 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.training import dynamic_scale as dynamic_scale_lib
+from jax.core import Tracer
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON
-from dew.batch import FROZEN, Batch, at_path, owned_dicts, placed_at, select, unboxed
+from dew.batch import Batch, at_path, owned_dicts, placed_at, select, unboxed
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume
 from dew.data.compile import Handed
 from dew.data.dataset import (
@@ -160,6 +161,7 @@ from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, wind
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     Produced,
+    built_start,
     check_batch,
     check_stream,
     marked,
@@ -442,25 +444,16 @@ class Trainer(Generic[Loss, Effects]):
         from dew.nn.inputs import request_key
         ready_process()  # A key given here opens the backend as the run's does (`key`).
         key = self.key if key is None else request_key(key)
+        if not self.host_master and not isinstance(key, Tracer):
+            # One program, not each operation's (`built_start`): the moving state its buffers, the frozen tree
+            # the held arrays as they are. A state held on the host takes the arrays over as it is placed.
+            return built_start(self.initial_state, initializer, key)
         init_key, run_key = jax.random.split(key)
         initialized = initializer(init_key)
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
         # mapping or a list) the objective's tree came in, so its placement, its updates, the
         # collections a step writes back (`write_back`) and its restores share one structure.
         params = drawn_in(owned_dicts(unboxed(initialized)), self.param_dtype, self.objective)
-        # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
-        # which the step's donation would free: the moving state takes buffers of its own, copied by the
-        # transfer as a placed one's are (`distributed.transferred_copy`), compiling no program. The frozen
-        # tree no step donates (`apart`), so it shares the held arrays as they are, one copy for the run.
-        # Traced, no leaf is a held array, so nothing is copied; a state held on the host is never donated,
-        # and takes the arrays over leaf by leaf as it is placed (`execution.placed_host`), so it takes them
-        # as they are.
-        if not self.host_master:
-            held = {id(leaf) for leaf in jax.tree.leaves(self.objective.held_variables())
-                    if isinstance(leaf, jax.Array)}
-            params = {collection: tree if collection == FROZEN else jax.tree.map(
-                lambda leaf: transferred_copy(leaf) if id(leaf) in held else leaf, tree)
-                for collection, tree in params.items()}
         if "params" not in params:
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
