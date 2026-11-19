@@ -348,9 +348,9 @@ _FULL: list[int] = []
 """The process's allocated blocks after its last full collection (`_full`), none before its first."""
 
 
-def _full(phase: str, info: Mapping[str, int]) -> None:
+def _full(phase: str, collection: Mapping[str, int]) -> None:
     """Note the heap a full collection leaves (`_FULL`), the collector's own or one asked for."""
-    if phase == "stop" and info["generation"] == 2:
+    if phase == "stop" and collection["generation"] == 2:
         _FULL[:] = [sys.getallocatedblocks()]
 
 
