@@ -18,7 +18,8 @@ def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax
     holds its zero (IEEE's binary formats, bfloat16, the float8s): the one owner of an exact power of two. No
     `exp2`, which XLA computes as `exp(n ln 2)` and whose products it fuses into one `exp` of their sum. A
     format whose width no integer holds (FP6) takes float32's power, its sentinel its own zero, cast to it,
-    exactly."""
+    exactly. `dtype` is the one JAX makes of it (a Python `float` float32 where x64 is off)."""
+    dtype = jax.dtypes.canonicalize_dtype(dtype)
     limits = jnp.finfo(dtype)
     if not hasattr(jnp, f"int{limits.bits}"):
         n = jnp.asarray(n)

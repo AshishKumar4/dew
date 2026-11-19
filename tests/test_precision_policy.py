@@ -1786,6 +1786,17 @@ def power2_rounds_a_subnormal_result_once():
     assert found.dtype == np.float32 and found.view(np.uint32) == 1, found.view(np.uint32)
 
 
+def test_an_exact_power_of_two_in_a_python_float_is_jaxs_float():
+    """`exact_power2` of a Python `float` destination is JAX's float (float32 where x64 is off), its layout
+    that dtype's: `2^0` is float32's 1.0, the sentinel below the normals (`2^-127`) its zero (base review
+    43f53b12f F1)."""
+    from dew.nn.float_bits import exact_power2
+
+    found = np.asarray(jax.jit(lambda n: exact_power2(n, float))(jnp.asarray([0, 3, -126, -127], jnp.int32)))
+    assert found.dtype == np.float32
+    np.testing.assert_array_equal(found, np.asarray([1.0, 8.0, 2.0 ** -126, 0.0], np.float32))
+
+
 def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():
     """`dew.nn.precision.power2` at a reach past `TWO_FACTOR_REACH` (254, float32's twice its largest
     exponent) takes `2^127` and `1.5 2^127` by `2^-253` to the normal `2^-126` and `1.5 2^-126` exactly,
