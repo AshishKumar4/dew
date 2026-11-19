@@ -82,13 +82,26 @@ def covering(cells: Iterable[Cell]) -> list[Cell]:
 
 
 class CellsFailed(AssertionError):
-    """Every failed cell of a flow, each by its label beside its error's own report; `labels` the failed
-    cells' in order. No error is kept: its traceback would hold every frame's device arrays beside the cells
-    that run after it."""
+    """Every failed cell of a flow, each by its label beside its error's own report, its Dew frames first
+    (`_reported`); `labels` the failed cells' in order, `where` each one's Dew frames, each its file and
+    line. No error is kept: its traceback would hold every frame's device arrays beside the cells that run
+    after it."""
 
-    def __init__(self, failed: list[tuple[str, str]]):
-        super().__init__("\n\n".join(f"{label}:\n{report}" for label, report in failed))
-        self.labels = [label for label, _ in failed]
+    def __init__(self, failed: list[tuple[str, str, list[tuple[str, int]]]]):
+        super().__init__("\n\n".join(f"{label}:\n{report}" for label, report, _ in failed))
+        self.labels = [label for label, _, _ in failed]
+        self.where = {label: frames for label, _, frames in failed}
+
+
+def _reported(error: BaseException) -> tuple[str, list[tuple[str, int]]]:
+    """A cell's failure as text and its frames of Dew and its tests (each file and line, those its traceback
+    passed through outside Python's and its packages' own: `traceback.extract_tb`'s, which keeps no frame's
+    locals), the text those frames and its own report, so a flow's report names where each cell failed (a
+    GPU tier part's prepare log showed a cell's `AttributeError` with no frame to find it by)."""
+    frames = [frame for frame in traceback.extract_tb(error.__traceback__)
+              if "/site-packages/" not in frame.filename and "/lib/python" not in frame.filename]
+    text = "".join(traceback.format_list(frames)) + "".join(traceback.format_exception_only(error)).strip()
+    return text, [(frame.filename, frame.lineno or 0) for frame in frames]
 
 
 REPORTED: list[dict] = []
@@ -114,7 +127,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     labels returned; an outermost flow's counts reported (`REPORTED`)."""
     global _depth
     _depth += 1
-    failed: list[tuple[str, str]] = []
+    failed: list[tuple[str, str, list[tuple[str, int]]]] = []
     skipped: list[str] = []
     passed = 0
     try:
@@ -132,7 +145,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 # A cell's failure is any exception, pytest's own among them (`pytest.fail`, and a
                 # `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end
                 # the flow: kept with its label, and raised with every other cell's after the last.
-                failed.append((cell.label, "".join(traceback.format_exception_only(error)).strip()))
+                failed.append((cell.label, *_reported(error)))
             else:
                 passed += 1
     finally:

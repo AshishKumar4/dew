@@ -20,8 +20,9 @@ import model_flows
 import numpy as np
 import pytest
 import tier_wire
+from arm_forms import WITHOUT_YNN, without_ynn
 from process_support import relayed
-from reference_error import assert_as_exact, over_windows, run_to_run, windows
+from reference_error import ahead_arm, assert_as_exact, over_windows, run_to_run, windows
 from truths_ahead import UNPREPARED, MissingTruth, compiled_truths
 
 from dew.nn.kernels import generation
@@ -299,7 +300,7 @@ def test_a_record_a_trace_fills_is_named_as_first_found_inside_another_container
     later arm's run, a process of its own whose earlier site's executable fills none of it, finds its program
     (the reviews of row 7674's fix: the dict stated the list as the prepare's trace had filled it, and then
     its alias inside another dict did)."""
-    import reference_error
+    import truths_ahead
 
     dew, reference, draw = _site()
     calls: list = []
@@ -319,7 +320,7 @@ def test_a_record_a_trace_fills_is_named_as_first_found_inside_another_container
         assert_as_exact(holding, reference, draw, "a held product", seeds=8)
     # The run's own process: its record empty and every container first named in it.
     calls.clear()
-    monkeypatch.setattr(reference_error, "_FIRST_NAMED", {})
+    monkeypatch.setattr(truths_ahead, "_FIRST_NAMED", {})
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(recording, reference, draw, "a recorded product", seeds=8)
         assert_as_exact(holding, reference, draw, "a held product", seeds=8)
@@ -379,6 +380,97 @@ def test_a_compiled_sites_run_traces_none_of_its_arms(tmp_path):
     assert not dew_traced and not reference_traced
     assert_as_exact(dew_arm, reference_arm, draw, "a product's arms", seeds=8)
     assert dew_traced and reference_traced
+
+
+def _rewriting() -> bool:
+    """Whether the algebra pass is on where this is called (`dew.algebra.passes`): a function of this module,
+    which an arm's statement names (`dew._stated.stated`), where the switch itself has no statable form."""
+    from dew._cache import ALGEBRA
+
+    return ALGEBRA.value.on
+
+
+def test_an_arm_of_its_own_compiler_options_is_prepared_whole(tmp_path):
+    """A site whose reference arm is a jit of its own compiler options (`without_ynn`, which on the CPU lane
+    turns YNNPACK's fusions off by them: a library arm's cuBLAS on a GPU,
+    `generation_support.cublas_compiled`) prepares it whole, lowered as itself, and its run computes it from
+    that program, tracing none, with no test of it recorded unprepared (row 8469: traced inside the arms'
+    program, the prepare refused it, 'compiler_options can only be passed to top-level jax.jit', and its test
+    ran unprepared). Its truth its own float64 function, as such a site's is (`blockwise_matrix`'s cuBLASLt
+    reference beside its truth): a truth is walked by its trace, which no jit of compiler options lives in.
+    A reference, it is traced and lowered with the algebra pass off, as its call runs (`unrewritten`): held
+    whole, it was traced with the pass on, the program it stored a rewrite of the reference (the review).
+    Its draw's arrays JAX's, so no NumPy refusal runs it beside the gate's arm (`_refuse_numpy_arms`)."""
+    dew, reference, numpy_draw = _site()
+    traced: list[bool] = []
+
+    def counted(a, b):
+        traced.append(_rewriting())
+        return reference(a, b)
+
+    def draw(seed):
+        return tuple(map(jnp.asarray, numpy_draw(seed)))
+
+    # Its own compiler options, YNNPACK's off, whatever the census (`arm_forms.switched_off`).
+    whole = without_ynn(counted, compiler_options=dict(WITHOUT_YNN))
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8, truth_fn=reference)
+    assert traced and not any(traced)
+    traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew, whole, draw, "a product of a compiled reference", seeds=8, truth_fn=reference)
+    assert not traced and not (tmp_path / UNPREPARED).exists()
+
+
+def test_a_library_sites_arms_are_prepared_and_run_from_their_programs(tmp_path):
+    """A site with a library arm (`library_fn`, the owner's exception under BIBLE section 7, run on Dew's own
+    inputs beside the reference) prepares it as one of its arms, and its run computes it from that program,
+    tracing none, with no test of it recorded unprepared (row 8468: a store refused every library site,
+    which then compiled on its GPU, test_gemm_gather's cuBLAS product among them)."""
+    dew, reference, draw = _site()
+    traced: list[None] = []
+
+    def library(a, b):
+        traced.append(None)
+        return jnp.dot(a, b)
+
+    options = {"library_fn": library, "library_row": 8468, "library_leaves": [""]}
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product beside its library", seeds=8, **options)
+    assert traced
+    traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product beside its library", seeds=8, **options)
+    assert not traced and not (tmp_path / UNPREPARED).exists()
+
+
+@pytest.mark.parametrize("jitted", [jax.jit, lambda fn: without_ynn(fn, compiler_options=dict(WITHOUT_YNN))],
+                         ids=["a plain jit", "a jit of its own compiler options"])
+def test_a_site_free_arm_runs_its_prepared_program(tmp_path, jitted):
+    """A computation with no check-1 site (a bitwise check's kernel, `reference_error.ahead_arm`) is
+    prepared as an arm is: its prepare traces it and gives zeros of its outputs' shapes, its run computes it
+    with the program its prepare compiled, tracing none, the same values bit for bit as computing it; one its
+    prepare did not reach runs unprepared, recorded and named (bible section 8: compiling in the prepare,
+    none on a held GPU; the GPU tier's site-free tests computed before any site there and compiled on it)."""
+    traced: list[None] = []
+
+    def scaled(a, b):
+        traced.append(None)
+        return a * b + 1.0
+
+    a, b = (np.arange(6, dtype=np.float32).reshape(2, 3) + offset for offset in (1.0, 0.5))
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        prepared = ahead_arm(jitted(scaled), "a scaled product")(a, b)
+    assert traced and np.asarray(prepared).tolist() == np.zeros((2, 3), np.float32).tolist()
+    traced.clear()
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        stored = ahead_arm(jitted(scaled), "a scaled product")(a, b)
+    assert not traced and np.asarray(stored).tolist() == (a * b + 1.0).tolist()
+    # Another function's jit, which JAX's own cache of traces (of `scaled`, the prepare's) does not hold.
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        unreached = ahead_arm(jitted(lambda a, b: scaled(a, b)), "a product no prepare reached")(a, b)
+    assert traced and np.asarray(unreached).tolist() == (a * b + 1.0).tolist()
+    assert (tmp_path / UNPREPARED).is_file()
 
 
 @pytest.mark.parametrize("jitted", [False, True], ids=["a plain reference", "a jitted reference"])
