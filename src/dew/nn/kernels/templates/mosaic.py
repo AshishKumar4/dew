@@ -1127,7 +1127,7 @@ class Issuer[Accumulator](abc.ABC):
                 loop.then()
         return both
 
-    def held(self, ref):
+    def held(self, ref: Ref) -> Operand:
         """An operand every step reads (`ref`, in shared memory) where the family keeps it: in shared memory,
         which its products read, not beside every loop carry."""
         return ref

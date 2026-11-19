@@ -157,7 +157,6 @@ class Tcgen05Placed(Tcgen05Rings):
                    SUMS: tuple(self.tensor_memory((rows, kept)) for _ in range(consumers))}
         if query_left:
             ((q_width, q_dtype),) = query_left
-            scratch["q_ready"] = tuple(self.signals(1).scratch() for _ in range(consumers))
             scratch[QUERY] = tuple(self.tensor_memory((rows, q_width), q_dtype) for _ in range(consumers))
         return scratch
 
@@ -170,27 +169,8 @@ class Tcgen05Placed(Tcgen05Rings):
 
     def product_shared(self, scratch) -> tuple:
         # Its accumulators and tiles are tensor memory; its hand-offs' barriers shared memory.
-        return tuple(barrier for name in ("scored", "weighed", "summed", "q_ready")
+        return tuple(barrier for name in ("scored", "weighed", "summed")
                      if name in scratch for barrier in scratch[name])
-
-    def held(self, ref):
-        # The query block moved into tensor memory once before the walk where tensor memory holds it beside
-        # the logits and sums (`product_scratch`'s `QUERY`), so every key tile's logits product reads Q from
-        # tensor memory (tcgen05's TS form) instead of re-reading shared memory (`issuing`, row 5368).
-        found = self._scoped()
-        if QUERY not in found:
-            return ref
-        role = mosaic.ROLE.get()
-        q_ref = found[QUERY][role]
-        q_tmem = Accumulator(q_ref, tuple(q_ref.shape), dtype=q_ref.dtype)
-        dtype, width = ref.dtype, int(ref.shape[1])
-        chunk = min(width, swizzling.swizzle_columns(dtype, swizzling.swizzle_for(dtype, width)))
-        for column in range(0, width, chunk):
-            src = ref if chunk == width else ref.at[:, pl.ds(column, chunk)]
-            tile = plgpu.load(src, layout=STORED, optimized=False)
-            self.write(q_tmem, tile, first=column)
-        self.signals(1).opened(found["q_ready"][role]).published(rings.Turn.of(0, 1))
-        return q_tmem
 
     def product_addresses(self, products: tuple | None) -> int:
         return 0 if products is None else resources.TMEM_ADDRESS_BYTES
@@ -317,10 +297,8 @@ class Tcgen05Placed(Tcgen05Rings):
         if QUERY in found:
             lhs = tuple(Accumulator(found[QUERY][c], tuple(found[QUERY][c].shape),
                                     dtype=found[QUERY][c].dtype) for c in served)
-            waited = tuple(self.signals(1).opened(found["q_ready"][c]) for c in served)
         else:
             lhs = tuple(left[scores.left] for left in lefts)
-            waited = None
 
         def each(index, turn: int, consumer: int, issue: Callable[[jax.Array, int], None]) -> None:
             # A consumer's product of step `index`: at the program's own turn where it walks every step (one
@@ -363,11 +341,11 @@ class Tcgen05Placed(Tcgen05Rings):
                 each(index, turn, consumer, weighted_values)
             values.release(ring)
 
-        if waited is not None:
-            tuple(signal.wait(rings.Turn.of(0, 1)) for signal in waited)
-        else:
-            for barrier in ready:
-                plgpu.barrier_wait(barrier)
+        for barrier in ready:
+            plgpu.barrier_wait(barrier)
+        if QUERY in found:
+            for c in served:
+                plgpu.async_copy_smem_to_tmem(lefts[c][scores.left], found[QUERY][c])
         mosaic.looped(issued(score, weigh, lo, hi), None, ())
 
     def stored_row(self, vector: jax.Array, smem) -> jax.Array:

@@ -121,9 +121,15 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
     threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key,
                                  threads=ROWS_TILES.consumers + 1, rare=False)
     (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
-    first_mma = next(i for i, event in enumerate(issuer) if event.kind == "product")
-    assert ({event.at for event in issuer[:first_mma] if event.kind == "wait"}
-            & {event.at for event in threads[0] if event.kind == "arrive"})
+    # The issuer writes Q into TMEM (`async_copy_smem_to_tmem`) before the first score MMA reads that TMEM
+    # ref (deleting the copy fails this assertion, row 9081).
+    written_tmem = {event.at for event in issuer if event.kind == "write"}
+    score_mmas = [i for i, event in enumerate(issuer)
+                  if event.kind == "product" and any(src in written_tmem for src in event.argument)]
+    assert score_mmas, "expected score MMAs to read the TMEM query ref written by async_copy_smem_to_tmem"
+    first_write = next(i for i, event in enumerate(issuer)
+                       if event.kind == "write" and event.at in issuer[score_mmas[0]].argument)
+    assert first_write < score_mmas[0]
     assert explore(threads, arrivals) > 0
 
 

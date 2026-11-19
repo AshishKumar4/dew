@@ -624,12 +624,9 @@ class MosaicForward(_Mainloop[Tiles]):
             return False
         if not super().legal(ba, config, target):
             return False
-        if decides:
-            priced = self.registers(ba, config, decides=True)
-            if priced is not None and priced > self.register_budget(config):
-                return False
-            if self.staged_bytes(ba, config, target, decides=True) > self.program_shared(config, target):
-                return False
+        if decides and self.staged_bytes(ba, config, target, decides=True) > self.program_shared(config,
+                                                                                                 target):
+            return False
         query = ba.arguments["query"]
         codes = _codes_of(ba.arguments["key"], ba.arguments.get("scales"))
         if codes is not None and not mosaic.converts(codes):
@@ -650,9 +647,10 @@ class MosaicForward(_Mainloop[Tiles]):
         # ones its family's products take (`Issuer.takes_right`: tcgen05's 64-row products pad a narrow one
         # only at their own depth). Its natural rewalk's are judged as its launch's (`legal`).
         width = _width(query.shape[-1], family, query.dtype)
-        value_columns = config.columns or _width(ba.arguments["value"].shape[-1], family, query.dtype)
+        val_columns = value_columns(_width(ba.arguments["value"].shape[-1], family, query.dtype),
+                                    config.columns)
         if not (family.takes_right(width, config.block_k)
-                and family.takes_right(config.block_k, value_columns)):
+                and family.takes_right(config.block_k, val_columns)):
             return False
         # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
         # in them (`_pages_hold`).
@@ -839,9 +837,15 @@ class MosaicForward(_Mainloop[Tiles]):
                       for consumers in range(config.consumers, 0, -1)
                       for block in walked_extents(family, query.dtype, config.block_k)
                       if config.block_k % block == 0)
-        relaunch = next((tiles for tiles in relaunches
-                         if self._launch_legal(ba, tiles, target, decides=decides)
-                         and self.proposes(ba, tiles, target)), None)
+        def fits_rewalk(tiles: Tiles) -> bool:
+            if not self._launch_legal(ba, tiles, target, decides=decides):
+                return False
+            if self.ranks_alone(ba, target):
+                return True
+            priced = self.registers(ba, tiles, decides=decides)
+            return priced is None or priced <= self.register_budget(tiles)
+
+        relaunch = next((tiles for tiles in relaunches if fits_rewalk(tiles)), None)
         if relaunch is None:
             return None
         return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers,
@@ -910,7 +914,7 @@ class MosaicForward(_Mainloop[Tiles]):
         query, value = ba.arguments["query"], ba.arguments["value"]
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         # A launch of a block of the value columns (`Tiles.columns`) stages that block.
-        value_width = config.columns or value_width
+        value_width = value_columns(value_width, config.columns)
         steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
         # A paged call's key tile of several pages loaded as its launch loads it (`paged_reads`).
@@ -943,8 +947,7 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         query_width = _width(query.shape[-1], family, query.dtype)
-        padded_value = _width(value.shape[-1], family, query.dtype)
-        value_width = min(config.columns, padded_value) if config.columns else padded_value
+        value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
         return forward_products(family, config, value_width, query.dtype, parts=self.parts,
                                 scaled=self.scales_in_kernel(ba), ahead=self._ahead(ba, config),
                                 training=ba.arguments.get("residuals") is Kept.SPLIT,
@@ -957,18 +960,11 @@ class MosaicForward(_Mainloop[Tiles]):
         query, value = ba.arguments["query"], ba.arguments["value"]
         steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
         coded = _codes_of(ba.arguments["key"], ba.arguments.get("scales")) is not None
-        padded_value = _width(value.shape[-1], family, query.dtype)
-        value_width = min(config.columns, padded_value) if config.columns else padded_value
+        value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
         return logits_ahead(family, config, value_width,
                             query.dtype, stages=min(config.stages, steps), parts=self.parts, coded=coded,
                             scaled=self.scales_in_kernel(ba),
                             training=ba.arguments.get("residuals") is Kept.SPLIT)
-
-    @staticmethod
-    def _value_columns(value: jax.Array, family: mosaic.Family, dtype, config: Tiles) -> int:
-        """The value columns a launch at `config` actually emits (`attention_mosaic_forward._column_blocks`):
-        `config.columns` capped at the padded value width so oversized pins price as launched."""
-        return value_columns(_width(value.shape[-1], family, dtype), config.columns)
 
     def cached(self, table, sources, scales) -> bool:
         """Whether a call walks a cache's keys (masked, split, paged, by rows or over codes: a decode step's
