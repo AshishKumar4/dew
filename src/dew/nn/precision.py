@@ -1854,9 +1854,11 @@ def _halved_over(pair, axis) -> tuple[jax.Array, jax.Array]:
                              for start in (0, half))
             summed, dropped = two_sum(first[0], second[0])
             halves = (summed, first[1] + second[1] + dropped)
-            # An odd size's last element waits for the next halving.
-            high, low = (jnp.concatenate([part, jax.lax.slice_in_dim(x, 2 * half, size, axis=along)],
-                                         axis=along) for part, x in zip(halves, (high, low), strict=True))
+            # An odd size's last element waits for the next halving; an even size leaves no tail, whose empty
+            # slice Mosaic refuses (a vector of no rows, base review 68c63603f F1).
+            high, low = halves if size % 2 == 0 else (
+                jnp.concatenate([part, jax.lax.slice_in_dim(x, 2 * half, size, axis=along)], axis=along)
+                for part, x in zip(halves, (high, low), strict=True))
     return high, low
 
 
@@ -1915,7 +1917,8 @@ def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, t
     """`_aligned_terms`' value and tangent (`_aligned_directions`), the value the declared sum's (`_aligned`)
     so an outer order takes its tangent: formed from bits, which carry none, a second order lost its loss's
     curvature, zero for `sum((a c)^2)` along `a` where `2 c^2` (base review d2d45bd6f F2)."""
-    return _aligned(shape, spec, *primals), _aligned_directions(shape, spec, primals, tangents)
+    value = _aligned(shape, spec, *primals)
+    return value, _aligned_directions(shape, spec, primals, tangents, value)
 
 
 def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.Array) -> tuple:
@@ -1942,7 +1945,7 @@ def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.
     return products, laid(term[spot]).shape
 
 
-def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents):
+def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents, value):
     """`aligned_sum`'s tangent, the linear map of its factors' `tangents` it is (`generation.linear_map`):
     each factor's direction in its place in each of its terms, every one summed aligned (over `axis` too
     where given), and its transpose each factor's cotangent the aligned sum, over the terms it is in and the
@@ -1985,7 +1988,9 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
             gradients.append(jax.sharding.reshard(gradient, placed) if typed else gradient)
         return gradients
 
-    return generation.linear_map(applied, pulled, list(primals), list(tangents))
+    # Typed as the value it perturbs, so a reverse pass traces no forward mode for its type alone.
+    return generation.linear_map(applied, pulled, list(primals), list(tangents),
+                                 out_aval=jax.typeof(value).to_tangent_aval())
 
 
 _aligned = contracted("test_an_aligned_sum_holds_every_order")(
