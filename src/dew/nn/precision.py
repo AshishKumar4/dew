@@ -462,16 +462,61 @@ def _exp_value(base2: bool, x) -> jax.Array:
         n = jnp.round(x * (1.0 / math.log(2.0)))
         r = (x - n * _LN2_HI) - n * _LN2_LO
     summed = functools.reduce(lambda p, term: p * r + term, _EXP_TERMS[1:], jnp.full_like(r, _EXP_TERMS[0]))
-    half = jnp.floor(n * 0.5)
-    return summed * _power_of_two(half) * _power_of_two(n - half)
+    return power2(summed, n, reach=150)
 
 
-def _power_of_two(n, dtype=jnp.float32) -> jax.Array:
-    """`2^n` in `dtype` (fp32 or float64), of an integral `n` within its normal exponents, set in its
-    exponent bits."""
+def exact_power2(n, dtype=jnp.float32) -> jax.Array:
+    """`2^n` in `dtype`, exactly, for an integral `n` (an integer, or a float holding one) within its normal
+    exponents ([-126, 127] in float32), set in its exponent bits: the one owner of an exact power of two
+    (`power2`'s factors, a kernel template's). No `exp2`, which XLA computes as `exp(n ln 2)`, inexactly, and
+    whose products its algebraic simplifier fuses into one `exp` of their sum (`exp(a) exp(b) -> exp(a +
+    b)`), past the format where each factor is in it."""
     limits = jnp.finfo(dtype)
-    signed = jnp.dtype(f"int{limits.bits}")
-    return jax.lax.bitcast_convert_type((n.astype(signed) + (limits.maxexp - 1)) << limits.nmant, dtype)
+    word = jnp.dtype(f"int{limits.bits}")
+    biased = jnp.asarray(n).astype(word) + word.type(limits.maxexp - 1)
+    bits = jax.lax.shift_left(biased, jnp.full_like(biased, limits.nmant))
+    return jax.lax.bitcast_convert_type(bits, dtype)
+
+
+def power2(x, k, reach: float | None = None) -> jax.Array:
+    """`x * 2^k` for an integral `k` (an integer, or a float holding one) of any size, exactly wherever the
+    result is a normal value of its format (`x`'s, at least float32's, as a float32 factor widens a narrower
+    one): products by exact powers of two of `k`'s sign (`exact_power2`), so each partial product lies
+    between `x` and the result, `k` held within `reach` (by default its format's saturating bound, past
+    which every finite `x` lands zero or infinite: 279 in float32). The one owner of scaling by a power of
+    two (a scaled value's, an aligned sum's, a kernel template's).
+
+    Each factor takes as much of what is left of `k` as the normal exponents hold, as many factors as `reach`
+    needs, so a result below the least normal rounds once wherever `|k|` fits one factor, where a split into
+    equal parts rounded it again at each part past the normal range. A caller whose `k` stays within twice
+    the largest exponent states its `reach` and takes two factors, `k`'s halves, each built as its product
+    takes it: one integer tile live, not two (et-livehook1: the factor tiles 66 of an attention template's
+    natural forward's 281 registers at its peak). Two halves hold `k` down to twice the least normal exponent
+    (-252 in float32), below which a half is no normal power and the product zero, a value of at most
+    `2^-125` in float32 lost."""
+    x = jnp.asarray(x)
+    dtype = jnp.result_type(x, jnp.float32)
+    limits = jnp.finfo(dtype)
+    least, largest = limits.minexp, limits.maxexp - 1
+    saturating = (largest + 1) - (least - limits.nmant) + 2
+    held = saturating if reach is None else min(reach, saturating)
+    if held <= 2 * largest:
+        # The half truncated from an exact multiply by its conversion, `k` an integer only at each factor's
+        # bias: an int32 `k` halved (a shift or a floored division alike) spilled an A100's recurrence
+        # query_key launch 32 bytes at the 27B gated delta net's training tiles, the float half none
+        # (gate_one, ledger 2519); a float `trunc` compares each entry's sign, whose predicates over a
+        # 32-entry fragment pass a thread's seven and ptxas parks them in general registers, holding the
+        # exponent's parts live to their selects (an A100's hooked training forwards at width 128 spilled
+        # 496 to 588 bytes; the conversion's own truncation none).
+        k = jnp.clip(jnp.asarray(k, jnp.float32), -held, held)
+        half = (k * np.float32(0.5)).astype(jnp.int32)
+        return (x * exact_power2(half, dtype)
+                * exact_power2((k - half.astype(jnp.float32)).astype(jnp.int32), dtype))
+    k = jnp.clip(jnp.asarray(k), -held, held).astype(jnp.int32)
+    for _ in range(math.ceil(held / -least)):
+        part = jnp.clip(k, least, largest)
+        x, k = x * exact_power2(part, dtype), k - part
+    return x
 
 
 def _exp_jvp(base2: bool, primals, tangents) -> tuple[jax.Array, jax.Array]:
@@ -1688,13 +1733,13 @@ def _aligned_value(shape: tuple[int, ...], axis, *flat: jax.Array) -> jax.Array:
     # Each term's shift to the largest's binade, at most none; one past the normal exponents dropped.
     total = sum(reduced(jnp.where(
         (significand != 0) & (exponent - top >= least),
-        significand * _power_of_two(jnp.clip(exponent - top, least, 0.0), dtype), 0.0), jnp.sum)
+        significand * exact_power2(jnp.clip(exponent - top, least, 0.0), dtype), 0.0), jnp.sum)
         for significand, exponent in products)
     first = jnp.clip(top, least, most)
     second = jnp.clip(top - first, least, most)
     third = jnp.clip(top - first - second, least, most)
-    return (total * _power_of_two(first, dtype) * _power_of_two(second, dtype)
-            * _power_of_two(third, dtype))
+    return (total * exact_power2(first, dtype) * exact_power2(second, dtype)
+            * exact_power2(third, dtype))
 
 
 def _aligned_tangent(shape: tuple[int, ...], axis, primals, tangents):

@@ -47,7 +47,15 @@ from dew.nn.kernels.templates.attention import (
     coded,
     within,
 )
-from dew.nn.precision import binade_of, float32_einsum, lowered_divide, raised_exactly, two_product, two_sum
+from dew.nn.precision import (
+    binade_of,
+    float32_einsum,
+    lowered_divide,
+    power2,
+    raised_exactly,
+    two_product,
+    two_sum,
+)
 
 
 def folds(scale: float, prescale: float, *, natural: bool, score_mod) -> bool:
@@ -761,47 +769,6 @@ def once[C](taken: jax.Array, body: Callable[[C], C], carried: C) -> C:
 NATURAL_EXPONENT_REACH = 150.0
 """The largest `|k|` `natural_exp` hands `power2`: its reduced exponent's integral part, its argument held to
 [-150, 128] (every fp32 exponential outside is zero or infinite), rounded up by at most one."""
-
-POWER2_REACH = 381.0
-"""The largest `|k|` `power2` takes apart: past it every fp32 `x * 2^k` is zero or infinite (`2^-381` of
-fp32's largest flushes, `2^381` of its least overflows), so `k` is held there."""
-
-
-def exact_power2(k: jax.Array) -> jax.Array:
-    """`2^k` exactly for an integral `k` in [-126, 127], built from its fp32 exponent bits: no `exp2`,
-    which XLA computes as `exp(k ln 2)`, inexactly, and whose products it fuses into one `exp` of their
-    sum (its algebraic simplifier's `exp(a) exp(b) -> exp(a + b)`), past fp32's range where each factor
-    is in it."""
-    biased = jnp.asarray(k).astype(jnp.int32) + jnp.int32(127)
-    bits = jax.lax.shift_left(biased, jnp.full_like(biased, 23))
-    return jax.lax.bitcast_convert_type(bits, jnp.float32)
-
-
-def power2(x: jax.Array, k: jax.Array, reach: float = POWER2_REACH) -> jax.Array:
-    """`x * 2^k` for an integral `k` of any size, exactly wherever the result is a normal fp32: three exact
-    factors each within 2^±127 (`exact_power2`), of `k`'s sign, so each partial product lies between `x`
-    and the result; `k` held within `reach` (`POWER2_REACH`, past which the result is zero or infinite, by
-    default). `k` is carried as the integer its contract makes it, so its thirds and halves are integer
-    divisions, exact, floored, which keeps each part of `k`'s sign, and no factor converts it again. A caller
-    whose `k` stays within twice 127 states its `reach` and takes two factors, each built as its product
-    takes it: one integer tile live, not two (et-livehook1: power2's factor tiles 66 of the natural forward's
-    281 registers at its peak)."""
-    k = jnp.clip(jnp.asarray(k, jnp.float32), -reach, reach)
-    if reach <= 2 * 127:
-        # The half truncated from an exact multiply by its conversion, `k` an integer only at each factor's
-        # bias: an int32 `k` halved (a shift or a floored division alike) spilled an A100's recurrence
-        # query_key launch 32 bytes at the 27B gated delta net's training tiles, the float half none
-        # (gate_one, ledger 2519); a float `trunc` compares each entry's sign, whose predicates over a
-        # 32-entry fragment pass a thread's seven and ptxas parks them in general registers, holding the
-        # exponent's parts live to their selects (an A100's hooked training forwards at width 128 spilled
-        # 496 to 588 bytes; the conversion's own truncation none).
-        half = (k * np.float32(0.5)).astype(jnp.int32)
-        return x * exact_power2(half) * exact_power2((k - half.astype(jnp.float32)).astype(jnp.int32))
-    k = k.astype(jnp.int32)
-    first = k // 3
-    second = (k - first) // 2
-    return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
-
 
 def natural_exp(x: jax.Array, scale: float = 1.0, offset: jax.Array | None = None) -> jax.Array:
     """The natural form's forward exponential (`Forward.power`): `exp(x * scale)` as the hardware's
