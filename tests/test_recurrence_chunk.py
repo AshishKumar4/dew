@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 import tiny_models
 from arm_arithmetic import on_float64_device
-from contract_support import normal_float32
+from contract_support import CANCELLING_LEVELS, MOST, normal_float32
 from delta_rule_support import stacked_documents
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec as P
@@ -638,10 +638,8 @@ ENTRY_CASES = {
     "a tie": ([1.0] * 6, [2.0 ** 127, -(2.0 ** 127), 2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24), -2.0], -2.0),
     "a band below": ([1.0] * 6, [2.0 ** 127, -(2.0 ** 127), 2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24),
                                  2.0 ** -100], 2.0 ** -100),
-    "three levels beside the largest": (
-        [2.0 ** 26, 2.0, 1.0, 2.0, 1.0, 2.0 ** 26, 1.0],
-        [2.0 ** 127, 2.0 ** 127, -(2.0 ** 103), -(2.0 ** 127), 2.0 ** 103, -(2.0 ** 127),
-         float(np.finfo(np.float32).max)], float(np.finfo(np.float32).max)),
+    "three levels beside the largest": ([key for key, _ in CANCELLING_LEVELS],
+                                        [value for _, value in CANCELLING_LEVELS], MOST),
 }
 """Entry writes' terms whose sum floats summed in some order lose: each term's key and value, and the
 write."""
