@@ -32,8 +32,9 @@ def test_an_mxfp8_operand_holds_each_blocks_largest_code_in_its_scales_binade():
 
 def test_an_mxfp8_block_of_a_subnormal_encodes_it_at_the_least_scale():
     """A block whose largest magnitude is float32's subnormal `2^-130` takes the least scale, `2^-127`, its
-    code E4M3's `0.125`, read from its bits on a process that flushes a subnormal operand (XLA's CPU), where
-    a scaling by multiplies (`precision.power2`) read it as zero (base review ed11c8e4e F5)."""
+    code E4M3's `0.125`, raised from its bits on a process that flushes a subnormal operand (XLA's CPU, op by
+    op here), where a scaling by multiplies (`jnp.ldexp`'s, `precision.power2`'s) read it as zero (base
+    review ed11c8e4e F5)."""
     block = jnp.zeros((1, product.MXFP8.depth), jnp.float32).at[0, 0].set(2.0 ** -130)
     operand = formats.MxFp8.quantized(block)
     assert np.asarray(operand.scales[0, 0]).view(np.uint8) == 0

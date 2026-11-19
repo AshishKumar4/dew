@@ -12,10 +12,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import bits
-from dew.nn.float_bits import exact_power2
+from dew.nn.float_bits import exact_power2, raised_exactly
 from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, power2
 
 FORM = np.frombuffer(bytes.fromhex(bits.NVFP4_BFLOAT16_FORM.version), np.uint8)
 """The version of the form an `NvFp4`'s words are packed by (`bits.BitForm.version`, its encoder's digest),
@@ -210,23 +210,27 @@ class MxFp8:
         exponent = jnp.clip(jnp.where(largest > 0, binade - 1 - top, -bias), -bias, bias)
         # E8M0's every biased exponent a power, none a zero (`exact_power2`, row 8832).
         scales = exact_power2(exponent, scale)
-        # Each value over its scale as its exponent (`jnp.ldexp`), as `decoded` applies it: the least scale,
-        # a block of zeros' or of magnitudes under 2^-118, is float32's subnormal 2^-127, which a program
-        # that flushes subnormals (XLA's CPU, op by op or with its simplifier off) reads as zero, its zeros
-        # over it NaN (row 6931); and a block's subnormal value (2^-130) is raised from its bits, where
-        # `precision.power2`'s multiplies read it as zero on such a process (base review ed11c8e4e F5).
-        codes = fake_quant.fp8_codes(jnp.ldexp(blocks, -exponent)).reshape(x.shape)
+        # Each value over its scale as its exponent, as `decoded` applies it: the least scale, a block of
+        # zeros' or of magnitudes under 2^-118, is float32's subnormal 2^-127, which a program that flushes
+        # subnormals (XLA's CPU, op by op or with its simplifier off) reads as zero, its zeros over it NaN
+        # (row 6931). A float32 block raised from its bits (`raised_exactly`), so its subnormal value (2^-130)
+        # reaches its code (0.125) where a multiply, `jnp.ldexp`'s or `power2`'s, read it as zero on such a
+        # process (base review ed11c8e4e F5); lowered by `power2`, whose results below the normals no E4M3
+        # code holds.
+        lowered = power2(blocks, -exponent)
+        scaled = (jnp.where(exponent <= 0, raised_exactly(blocks, jnp.maximum(-exponent, 0)), lowered)
+                  if blocks.dtype == jnp.float32 else lowered)
+        codes = fake_quant.fp8_codes(scaled).reshape(x.shape)
         return cls(codes.astype(jnp.float8_e4m3fn), scales[..., 0])
 
     def decoded(self, dtype=jnp.float32) -> jax.Array:
         """Its values, exactly, in `dtype` (`[..., depth]`, float32 or a float64 truth's): each code times
         its block's scale."""
         exponents = jax.lax.bitcast_convert_type(self.scales, jnp.uint8).astype(jnp.int32) - 127
-        # Each E8M0 scale applied as its exponent (`jnp.ldexp`, in two normal steps): a scale below
-        # float32's least normal (2**-128 for inputs near 2**-120) would read as zero where a device
-        # flushes subnormals, though the value it scales to is normal.
-        return jnp.ldexp(self.codes.astype(dtype),
-                         jnp.repeat(exponents, formats_of.MXFP8.depth, axis=-1))
+        # Each E8M0 scale applied as its exponent (`power2`, in normal steps): a scale below float32's least
+        # normal (2**-128 for inputs near 2**-120) would read as zero where a device flushes subnormals,
+        # though the value it scales to is normal.
+        return power2(self.codes.astype(dtype), jnp.repeat(exponents, formats_of.MXFP8.depth, axis=-1))
 
 
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:

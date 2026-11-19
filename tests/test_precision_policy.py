@@ -1994,13 +1994,17 @@ def test_a_float_widens_exactly_from_its_bits(source, target):
     np.testing.assert_array_equal(found[held].view(word), expected[held].view(word))
 
 
-@pytest.mark.parametrize("source", [jnp.float6_e2m3fn, jnp.float6_e3m2fn, jnp.float4_e2m1fn])
-def test_a_sub_byte_float_widens_as_it_converts(source):
-    """`widened_exactly` of every code of a sub-byte float (FP6, FP4) into float32: its conversion, exact,
-    where reading its bits asked for an unsigned integer of its width (base review ed11c8e4e F3)."""
+@pytest.mark.parametrize("source", [jnp.float4_e2m1fn, jnp.float8_e4m3fnuz, jnp.float8_e5m2fnuz])
+def test_a_narrow_float_widens_as_it_converts(source):
+    """`widened_exactly` of every code of a narrow float into float32, compiled: its conversion, exact, where
+    its bits were read as an IEEE format's: a sub-byte float's (FP4) asked for an unsigned integer of its
+    width (base review ed11c8e4e F3), and E4M3FNUZ's and E5M2FNUZ's 0x80 widened to -0, not their NaN (F4).
+    FP6's conversion XLA:CPU compiles none of (an invalid i6 bitcast), so its codes are no cell here."""
     values = np.arange(1 << jnp.finfo(source).bits, dtype=np.uint8).view(source)
     found = np.asarray(jax.jit(lambda x: widened_exactly(x, np.float32))(jnp.asarray(values)))
-    np.testing.assert_array_equal(found, values.astype(np.float32))
+    expected = values.astype(np.float32)
+    np.testing.assert_array_equal(np.isnan(found), np.isnan(expected))
+    np.testing.assert_array_equal(found[~np.isnan(expected)], expected[~np.isnan(expected)])
 
 
 def test_e8m0s_raw_fields_hold_no_sign():
