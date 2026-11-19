@@ -69,7 +69,6 @@ import json
 import logging
 import os
 import time
-import types
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, NamedTuple
 
@@ -107,11 +106,9 @@ from check1_wire import QUALIFY
 from float64_terms import POWER, evaluated, evaluated_on, float64_terms, lowered, scan_groups, static, traced
 from map_judge import drawing, judging, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
-from truths_ahead import COMPILED, CompiledTruths, judged, named, running
+from truths_ahead import COMPILED, CompiledTruths, arm_role, judged, named, running
 
 from dew._accuracy import distance, reduction_bound, within
-from dew._sources import function_reads
-from dew._stated import Unestablished, stated
 from dew.algebra import passes
 from dew.nn import programs
 from dew.nn.kernels import generation
@@ -584,11 +581,11 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     and compiled as the gate compiles it (`_arm_compile`): its run calls each draw's executable
     (`_ahead_arm`), tracing, lowering and compiling none, its sizing too. An arm the gate runs as given, or
     one running Dew's own programs (`dew_programs`, a host loop), holds no program."""
-    # Each arm named as each process first finds it, before any call of it here (`_arm_role`); one no
+    # Each arm named as each process first finds it, before any call of it here (`arm_role`); one no
     # statement holds runs unprepared in its run.
     named_arms = {role: (named_role, fn, reference) for role, (fn, reference) in arms.items()
                   if fn is not None and _holds_program(fn)
-                  and (named_role := _arm_role(role, fn, label)) is not None}
+                  and (named_role := arm_role(role, fn, label)) is not None}
     if store.target is None:
         # An arm computing in NumPy refused as a run refuses it, by a call on a draw; for a GPU's store the
         # prepare computes nothing on its host (bible §8), and its trace refuses an arm that cannot trace.
@@ -619,7 +616,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     unrewritten but one of Dew's own paths (an arm that holds a program, `_holds_program`). Traced as its run
     traces it, and again where its compile lowers it (a launch a spill refused
     derived at its next config), its constants the first trace's, by place (`_hold`), and the routes that
-    trace reported; held under `role`, its name with its fingerprint (`_arm_role`). Its outputs' shapes and
+    trace reported; held under `role`, its name with its fingerprint (`arm_role`). Its outputs' shapes and
     dtypes at `inputs`, its trace's (a window loop's at one window's)."""
     if isinstance(fn, _RunToRun):
         return _arm_program(programs, held, role, fn.fn, inputs, reference=reference)
@@ -676,69 +673,6 @@ class _Whole:
         return self.fn(*leaves)
 
 
-def _arm_role(role: str, fn, label: str) -> str | None:
-    """An arm's role in its site's store (`_compile_arms`) with what it computes as Dew states an identity
-    (`dew._stated.stated`, one form in every process that holds an equal value): a run that passes the site
-    another computation under that role finds none (`truths_ahead.MissingTruth`), never the prepare's run in
-    its place. None for an arm no statement holds (`Unestablished`), which runs unprepared, named
-    (`truths_ahead.CompiledTruths.unprepared`)."""
-    at = f"{label}: its {role} arm"
-    try:
-        known: dict[int, Any] = {}
-        _mutable_known(fn, known, set(), at)
-        statement = stated(fn, at, known)
-    except Unestablished as unstated:
-        _log.info("an arm no statement holds runs unprepared: %s", unstated)
-        return None
-    return f"{role} {hashlib.sha256(json.dumps(statement, sort_keys=True).encode()).hexdigest()[:16]}"
-
-
-def _mutable_known(value, known: dict[int, Any], walking: set[int], at: str) -> None:
-    """Into `known` (`dew._stated.stated`'s values its caller states), each list, dict or set `value`
-    reaches through partials, records, tuples, jits, containers and what each function reads, stated by its
-    contents as this process first named an arm reading it (`_FIRST_NAMED`): such a container may be state an
-    arm keeps as it runs (a test's record of its calls, a cache a trace fills), which a prepare's trace of the
-    arm fills after its first naming and its run, calling the arm's executable, never does; and it may hold
-    what the arm computes by (a test's options read off its backend, another in a GPU's run than in its CPU's
-    prepare), which names another arm (row 7674: stated by its type alone, the run computed the prepare's
-    program). Each container's parts are walked before it is stated, through the one `known` every reached
-    container's statement is in, so one a trace filled since its first naming is stated as it was then
-    wherever it lies, inside another or beside an alias of itself (the review's: a dict read its record
-    trace-filled in a prepare, empty in its run)."""
-    if id(value) in walking:
-        return
-    walking.add(id(value))
-    container = isinstance(value, (list, dict, set))
-    if container:
-        parts = tuple(value.values()) if isinstance(value, dict) else tuple(value)
-    elif isinstance(value, functools.partial):
-        parts = (value.func, *value.args, *value.keywords.values())
-    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
-        parts = tuple(getattr(value, field.name) for field in dataclasses.fields(value))
-    elif isinstance(value, tuple):
-        parts = value
-    elif isinstance(value, types.FunctionType):
-        cells, read = function_reads(value)
-        parts = (*cells.values(), *read.values(), *(value.__defaults__ or ()),
-                 *(value.__kwdefaults__ or {}).values())
-    elif (wrapped := getattr(value, "__wrapped__", None)) is not None:
-        parts = (wrapped,)
-    else:
-        return
-    for part in parts:
-        _mutable_known(part, known, walking, at)
-    if container:
-        named = _FIRST_NAMED.get(id(value))
-        if named is None:
-            named = _FIRST_NAMED[id(value)] = (value, ["mutable", stated(value, at, known)])
-        known[id(value)] = named[1]
-
-_FIRST_NAMED: dict[int, tuple[Any, Any]] = {}
-"""Each list, dict or set an arm reads (`_mutable_known`), by its `id`, with its statement as this process
-first named an arm reading it, before any trace of that arm wrote to it, as a prepare names it and a run, a
-process whose executables write to none, alike; held, so no other container takes its `id`."""
-
-
 def _paired_most(reference_fn, most: int = MOST_SEEDS) -> int | None:
     """The most seeds a paired sizing of `reference_fn` takes (`seeds_for`'s, its draws from SIZING_FROM to
     twice it, `parity._sized_count`): `most`, a recording's pilots' half where it holds fewer; None for a
@@ -773,7 +707,7 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str):
     statement holds runs unprepared, named, and one that holds no program as it is (`_stored_arms`)."""
     if not _holds_program(given_fn):
         return arm
-    named_role = _arm_role(role, given_fn, label)
+    named_role = arm_role(role, given_fn, label)
     if named_role is None:
         store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
         return arm
@@ -1947,7 +1881,7 @@ def ahead_arm(fn: Callable, label: str) -> Callable:
     the GPU) as an arm with no site, through the arms' own path: within a GPU tier part's prepare (`COMPILED`,
     a store that prepares) its call is traced and compiled at its inputs' shapes as a site's arms are
     (`_arm_program` in the store's `tracing`, `_arm_compile`, held under `armed(label)` by Dew's statement of
-    it, `_arm_role`) and gives zeros of its outputs' shapes, nothing computing there (a test's later failure
+    it, `arm_role`) and gives zeros of its outputs' shapes, nothing computing there (a test's later failure
     in its prepare, past its stored program, judges nothing); in its run its call is that executable
     (`CompiledTruths.ran`), tracing, lowering and compiling none; outside a part, `fn` itself. One no
     statement holds, or one its prepare did not reach, runs unprepared, recorded and named (`unprepared`,
@@ -1958,7 +1892,7 @@ def ahead_arm(fn: Callable, label: str) -> Callable:
         store = COMPILED.get()
         if store is None:
             return fn(*inputs)
-        role = _arm_role("dew", fn, label)
+        role = arm_role("dew", fn, label)
         if role is None:
             store.unprepared(f"{label}: its arm has no statement of what it computes")
             return fn(*inputs)

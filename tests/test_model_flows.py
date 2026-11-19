@@ -300,7 +300,7 @@ def test_a_record_a_trace_fills_is_named_as_first_found_inside_another_container
     later arm's run, a process of its own whose earlier site's executable fills none of it, finds its program
     (the reviews of row 7674's fix: the dict stated the list as the prepare's trace had filled it, and then
     its alias inside another dict did)."""
-    import reference_error
+    import truths_ahead
 
     dew, reference, draw = _site()
     calls: list = []
@@ -320,7 +320,7 @@ def test_a_record_a_trace_fills_is_named_as_first_found_inside_another_container
         assert_as_exact(holding, reference, draw, "a held product", seeds=8)
     # The run's own process: its record empty and every container first named in it.
     calls.clear()
-    monkeypatch.setattr(reference_error, "_FIRST_NAMED", {})
+    monkeypatch.setattr(truths_ahead, "_FIRST_NAMED", {})
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(recording, reference, draw, "a recorded product", seeds=8)
         assert_as_exact(holding, reference, draw, "a held product", seeds=8)
