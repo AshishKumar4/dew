@@ -1095,21 +1095,21 @@ class Trainer(Generic[Loss, Effects]):
 
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep:
-        """Compile a transaction over the state and one already-produced global batch
-        (`StepCompiler.compile`).
+        """Compile a transaction over the state and one produced global batch (`StepCompiler.compile`).
 
         The step consumes its state: `new = step(old, batch)` donates the old buffers, keeping one
         copy of parameters and optimizer state. Keep no reference to the old state after stepping.
         Orbax copies a checkpoint to host before `save` returns, provided `Checkpoints` names neither
         prioritized keys nor a concurrent transfer limit. The loader's batch is not donated. The plan takes
-        the fewest microbatches at least recomputation, a compile-only GPU holding the memory stated for it.
-        Built at the pass count of the phase its batch was read in (`PhasePasses.scoped`).
-        """
+        the fewest microbatches at least recomputation, a compile-only GPU holding the memory stated for it,
+        at the pass count of the phase its batch was read in (`PhasePasses.scoped`)."""
         self._handed_ahead()
         with self.phase_passes.scoped(self, self._compiler):
             compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials))
         assert compiled.step is not None
-        return self._compiler.drawing(self, self._stepping, compiled, state, batch, self.key)
+        # The state the step runs on: `trials`', which its plan's search built its buffers on.
+        stepped = state if trials is None else trials.state
+        return self._compiler.drawing(self, self._stepping, compiled, stepped, batch, self.key)
 
     @ruled
     def _planned_unplaced(self, start: Start, batch: Batch) -> None:
