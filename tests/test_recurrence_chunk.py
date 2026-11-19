@@ -454,17 +454,19 @@ def vanishing_entered_draw(seed: int):
 
 def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
     """A one-token turned call whose token begins a document (its memory entering, every entry 2^127,
-    discarded), unit queries, zero keys, values, turns and log decays, an output cotangent of 2 on its first
-    value column: its output and every gradient finite wherever float64's is a normal float32, the turns'
-    zero, where the turns' gradient contracted the discarded memory with the output's cotangent before its
-    zero readers took it out, 2^128 then 0 times inf (base review d6c1b2c1a F2)."""
+    discarded), a query of its first key, zero keys, values, turns and log decays, an output cotangent of 2
+    on each of its first two value columns: its output and every gradient finite wherever float64's is a
+    normal float32, the turns' zero, where the turns' gradient contracted the discarded memory with the
+    output's cotangent before its zero readers took it out, 2^128 then 0 times inf (base review d6c1b2c1a
+    F2)."""
     (operands,) = draw(TURNED, packed=False, seed=0, length=1)
     zero = {name: jnp.zeros_like(getattr(operands, name)) for name in ('key', 'value', 'log_decay', 'turn')}
-    operands = dataclasses.replace(operands, query=jnp.ones_like(operands.query),
+    first = jnp.zeros_like(operands.query).at[..., 0].set(1.0)
+    operands = dataclasses.replace(operands, query=first,
                                    beta=jnp.ones_like(operands.beta),
                                    state=jnp.full_like(operands.state, 2.0 ** 127),
                                    starts=jnp.ones(operands.value.shape[:2], bool), **zero)
-    d_out = jnp.zeros_like(operands.value).at[..., 0].set(2.0)
+    d_out = jnp.zeros_like(operands.value).at[..., :2].set(2.0)
     seeded = (d_out, jnp.zeros_like(operands.state))
     ours = jax.jit(with_gradients(lambda given: chunk_on('xla', TURNED, given, chunk_size=CHUNK)))(operands,
                                                                                                    seeded)
