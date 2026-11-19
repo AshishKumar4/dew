@@ -249,18 +249,42 @@ def _slot(ref, treedef, leaves) -> tuple:
 
 
 def _located(ref, transforms) -> tuple:
-    """A ref's location through `transforms`: the ref and its leading index where it is one value (a ring's
-    slot, or a one-entry slice of its leading axis: a gathered ring's slot mbarrier, `gathered.Ring`), else
-    the ref whole."""
+    """A ref's location through `transforms`: the ref and each leading index that is one value, in order (a
+    ring's slot; a consumer's staging buffer and its chunk's buffer within it, `stores.staged_chunks`; a
+    one-entry slice of an axis, which keeps it, last: a gathered ring's slot mbarrier, `gathered.Ring`), else
+    the ref whole. Two locations share memory where one's indices are a prefix of the other's (`_overlaps`):
+    a consumer's two chunk buffers, keyed by its own index alone, read as one buffer, so its double-buffered
+    stores raced (base review f86cb5b03's witness at 128 x 256)."""
+    found = []
+
+    def whole(index, extent) -> bool:
+        return (hasattr(index, "start") and index.start is not None and int(np.asarray(index.start)) == 0
+                and index.size == extent)
+
     for transform in transforms or ():
-        indices = getattr(transform, "indices", None)
-        if indices:
-            first = indices[0]
-            if hasattr(first, "start") and first.size == 1 and first.start is not None:
-                return (ref.name, int(np.asarray(first.start)))
-            if not hasattr(first, "start") and first is not None:
-                return (ref.name, int(np.asarray(first)))
-    return (ref.name, None)
+        if getattr(transform, "indices", None) is None:
+            # A transform that moves axes (a transpose, a reshape): later indices are not the base's
+            # coordinates, so the location stops at the prefix known (base review 2e4651b2e F3). A tiling's,
+            # a swizzle's or a bitcast's changes the trailing axes alone, the leading ones indexed as before.
+            if hasattr(transform, "permutation") or "reshape" in type(transform).__name__.lower():
+                return (ref.name, *found) if found else (ref.name, None)
+            continue
+        indices, shape = transform.indices, getattr(transform, "shape", None)
+        for axis, index in enumerate(indices):
+            if index is None:
+                return (ref.name, *found) if found else (ref.name, None)
+            if not hasattr(index, "start"):
+                found.append(int(np.asarray(index)))
+                continue
+            # A slice: the axes from it on whole, the next transform indexes them; else its one entry, if it
+            # takes one, the location's last.
+            if shape is not None and all(whole(rest, shape[at])
+                                         for at, rest in enumerate(indices) if at >= axis):
+                break
+            if index.size == 1 and index.start is not None:
+                found.append(int(np.asarray(index.start)))
+            return (ref.name, *found) if found else (ref.name, None)
+    return (ref.name, *found) if found else (ref.name, None)
 
 
 def _governing(value, what: str):
@@ -423,13 +447,16 @@ parity waits at a turn's rotation, and its load warps' gathers. A body of no syn
 register form) takes a reader that emits nothing, its reason beside it; one of no type here is refused."""
 
 
-def programs(kernel: Callable, *operands, threads: int) -> tuple[list[list[Event]], dict[str, int]]:
-    """Each program of `kernel` (a Mosaic GPU launch the toolkit built, `mosaic.kernel`) over `operands`, of
-    its `threads` warpgroups: a warpgroup's events, or where it runs warp roles, each of its warps' in turn
-    (`_Interpreter.programs`), by warpgroup index; and each barrier's arrivals a phase, by name: a barrier
-    allocation's, or a shared `uint64`'s its inlined initialization states (`gathered.Initialized`)."""
+def programs(kernel: Callable, *operands, threads: int, launch: int = 0
+             ) -> tuple[list[list[Event]], dict[str, int]]:
+    """Each program of `kernel`'s `launch`-th Mosaic GPU launch (one the toolkit built, `mosaic.kernel`, in
+    the order its trace makes them: a chained input gradient's flagged walk, then its bounded one) over
+    `operands`, of its `threads` warpgroups: a warpgroup's events, or where it runs warp roles, each of its
+    warps' in turn (`_Interpreter.programs`), by warpgroup index; and each barrier's arrivals a phase, by
+    name: a barrier allocation's, or a shared `uint64`'s its inlined initialization states
+    (`gathered.Initialized`)."""
     closed = jax.make_jaxpr(kernel)(*operands)
-    body = _body(closed.jaxpr)
+    body = list(_bodies(closed.jaxpr))[launch]
     found, arrivals = [], {}
     for thread in range(threads):
         interpreter = _Interpreter(thread)
@@ -441,21 +468,19 @@ def programs(kernel: Callable, *operands, threads: int) -> tuple[list[list[Event
     return found, arrivals
 
 
-def _body(jaxpr: jcore.Jaxpr) -> jcore.ClosedJaxpr:
-    """The kernel body's jaxpr inside a traced launch: the per-program jaxpr of its `mpmd_map`."""
+def _bodies(jaxpr: jcore.Jaxpr) -> Iterator[jcore.ClosedJaxpr]:
+    """The kernel bodies' jaxprs inside a traced program, in its order: each `mpmd_map`'s per-program
+    jaxpr."""
     for equation in jaxpr.eqns:
         if equation.primitive.name == "mpmd_map":
             (inner,) = equation.params["jaxprs"]
-            return inner if isinstance(inner, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(inner, ())
+            yield inner if isinstance(inner, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(inner, ())
+            continue
         for value in equation.params.values():
             for inner in value if isinstance(value, (tuple, list)) else (value,):
                 nested = inner.jaxpr if isinstance(inner, jcore.ClosedJaxpr) else inner
                 if isinstance(nested, jcore.Jaxpr):
-                    try:
-                        return _body(nested)
-                    except LookupError:
-                        continue
-    raise LookupError("no Mosaic GPU kernel body in the traced launch")
+                    yield from _bodies(nested)
 
 
 @dataclasses.dataclass
