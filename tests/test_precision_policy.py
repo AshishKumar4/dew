@@ -1193,6 +1193,18 @@ def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
     np.testing.assert_array_equal(found.view(f"uint{limits.bits}"), expected.view(f"uint{limits.bits}"))
 
 
+def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():
+    """`dew.nn.precision.power2` at a reach past `TWO_FACTOR_REACH` (254, float32's twice its largest
+    exponent) takes `2^127` and `1.5 2^127` by `2^-253` to the normal `2^-126` and `1.5 2^-126` exactly,
+    compiled: two halves there hold a -127, no normal power, whose encoding is +0, and gave zero."""
+    from dew.nn.precision import TWO_FACTOR_REACH, power2
+
+    assert TWO_FACTOR_REACH == 252
+    found = np.asarray(jax.jit(lambda x, k: power2(x, k, reach=2 * 127))(
+        jnp.asarray([2.0 ** 127, 1.5 * 2.0 ** 127, 2.0 ** 127], jnp.float32), jnp.asarray([-253, -253, 254])))
+    np.testing.assert_array_equal(found, np.asarray([2.0 ** -126, 1.5 * 2.0 ** -126, np.inf], np.float32))
+
+
 @pytest.mark.parametrize(("dtype", "reach", "exponent"), [
     (jnp.float32, None, jnp.int32), (jnp.float32, 2 * 126, jnp.int32), (jnp.float32, None, jnp.int8),
     (jnp.float32, 2 * 126, jnp.int8), (jnp.float32, None, jnp.uint8), (jnp.float32, None, jnp.float32),

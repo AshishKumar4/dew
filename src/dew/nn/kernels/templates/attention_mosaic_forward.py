@@ -99,7 +99,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 )
 from dew.nn.kernels.templates.cost import estimate
 from dew.nn.kernels.templates.rings import Ref
-from dew.nn.precision import power2
+from dew.nn.precision import TWO_FACTOR_REACH, power2
 
 
 def _out_types(query, value, value_width: int | None, out_dtype, *, parts: int, splits: int, peaks: bool,
@@ -602,9 +602,9 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
             # Each block's rows scale by its own columns' values: its split sums and rows' weights taken to
             # the largest of the blocks' shifts, a power of two on each.
             shift = functools.reduce(jnp.maximum, [block[1][4] for block in launched])
-            others = jnp.concatenate([power2(block[3], (block[1][4] - shift)[..., None], reach=2 * 126)
-                                      for block in launched], axis=-1)
-            rows = rows.at[2:4].set(power2(rows[2:4], (rows[4] - shift)[None], reach=2 * 126))
+            others = jnp.concatenate([power2(block[3], (block[1][4] - shift)[..., None],
+                                             reach=TWO_FACTOR_REACH) for block in launched], axis=-1)
+            rows = rows.at[2:4].set(power2(rows[2:4], (rows[4] - shift)[None], reach=TWO_FACTOR_REACH))
             rows = rows.at[4].set(shift)
         else:
             others = jnp.concatenate([block[3] for block in launched], axis=-1)
@@ -619,7 +619,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                else split.own * algebra.anchor_multipliers(hooks.drop, anchors))
         acc = algebra.split_output(split.others, own, value_rows)
         # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`).
-        total = rows[1] if not form.headroom else power2(rows[1], -split.shift, reach=2 * 126)
+        total = rows[1] if not form.headroom else power2(rows[1], -split.shift, reach=TWO_FACTOR_REACH)
         out = algebra.output_of(acc, total, guarded=form.guarded or hooks.initial is not None)
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None

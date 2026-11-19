@@ -48,6 +48,7 @@ from dew.nn.kernels.templates.attention import (
     within,
 )
 from dew.nn.precision import (
+    TWO_FACTOR_REACH,
     binade_of,
     float32_einsum,
     lowered_divide,
@@ -192,7 +193,7 @@ class Forward:
             return jnp.exp2((x * np.float32(self.scale * LOG2E) if self.raw else x) + k)
         if not self.natural and not self.approximate:
             half = jnp.exp(x * np.float32(0.5))
-            return power2(half, k, reach=2 * 126) * half
+            return power2(half, k, reach=TWO_FACTOR_REACH) * half
         return natural_exp(x, self.scale if self.raw else 1.0, offset=k)
 
     def naturalized(self, m: jax.Array) -> jax.Array:
@@ -865,7 +866,7 @@ def denominator_after(total: jax.Array, factor: jax.Array, weighed: jax.Array, h
     (`held`)."""
     if held is None:
         return carry_factor(total, factor) + weighed
-    return carry_factor(total, factor, held.drop) + power2(weighed, -held.exponent, reach=2 * 126)
+    return carry_factor(total, factor, held.drop) + power2(weighed, -held.exponent, reach=TWO_FACTOR_REACH)
 
 
 def stepped(state: Partial, m: jax.Array, factor: jax.Array, weighed: jax.Array,
@@ -879,7 +880,7 @@ def stepped(state: Partial, m: jax.Array, factor: jax.Array, weighed: jax.Array,
     low = state.low
     drop = None if held is None else held.drop
     total, acc = carry_factor(state.total, factor, drop), carry_factor(state.acc, factor, drop)
-    weights = (weighed if held is None else power2(weighed, -held.exponent, reach=2 * 126),)
+    weights = (weighed if held is None else power2(weighed, -held.exponent, reach=TWO_FACTOR_REACH),)
     kept = None
     if low is None:
         total, acc = in_turn(total, weights), in_turn(acc, products)
@@ -964,8 +965,8 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Pa
         return Partial(acc, m, total)
     bound = scale_of(Partial(acc, m, total)).bound
     exponent = exponent_of(bound)
-    return Partial(power2(acc, expand(-exponent, acc), reach=2 * 126), m,
-                   power2(total, -exponent, reach=2 * 126), Scale(exponent, bound))
+    return Partial(power2(acc, expand(-exponent, acc), reach=TWO_FACTOR_REACH), m,
+                   power2(total, -exponent, reach=TWO_FACTOR_REACH), Scale(exponent, bound))
 
 
 def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
@@ -1375,7 +1376,7 @@ def at_scale(p: jax.Array, held: Scaled, *, axis: int = -1) -> tuple[jax.Array, 
         # or, held keys first, its first.
         return x if axis % p.ndim == 0 else expand(x, p)
 
-    shifted = power2(p, row(-held.exponent), reach=2 * 126)
+    shifted = power2(p, row(-held.exponent), reach=TWO_FACTOR_REACH)
     tiny = (shifted < LEAST_NORMAL) & row(held.exponent > 0)
     return jnp.where(tiny, 0.0, shifted), jnp.where(tiny, held.raised(SMALL_SHIFT - held.exponent), 0.0)
 
@@ -1590,7 +1591,7 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
         else:
             rescale = functools.partial(_queries_taken, keys.coords, None, held)
             acc = keys.accumulate(state.acc, rescale, parts, value)
-        total = power2(state.total, drop) + power2(p.sum(axis=-1), -held.exponent, reach=2 * 126)
+        total = power2(state.total, drop) + power2(p.sum(axis=-1), -held.exponent, reach=TWO_FACTOR_REACH)
         return (Partial(acc, state.m, total, scale), anchor, power2(own, drop) + own_tile,
                 power2(others_total, drop) + rest())
 
@@ -1830,7 +1831,7 @@ def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.
     m = jnp.where(no_keys(state.total), 0.0 if spec.guarded or initial else -jnp.inf, m)
     if state.scale is None:
         return m, state.total
-    return m, power2(state.total, state.scale.exponent, reach=2 * 126)
+    return m, power2(state.total, state.scale.exponent, reach=TWO_FACTOR_REACH)
 
 
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,

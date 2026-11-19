@@ -479,6 +479,12 @@ def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax
     return jax.lax.bitcast_convert_type(bits, dtype)
 
 
+TWO_FACTOR_REACH = 2 * min(-jnp.finfo(jnp.float32).minexp, jnp.finfo(jnp.float32).maxexp - 1)
+"""The largest `reach` `power2` takes as two factors in float32, 252: twice the least of its normal
+exponents' bounds, so both halves of any `k` within it are normal powers. A caller whose `k` stays within it
+states it and takes the measured two-factor form."""
+
+
 def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None) -> jax.Array:
     """`x * 2^k` for an integral `k` (an integer, or a float holding one) of any size, exactly wherever `x`
     and the result are normal values of its format (`x`'s, at least float32's, as a float32 factor widens a
@@ -489,13 +495,14 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     A backend that flushes subnormals (XLA:CPU) flushes a subnormal `x` before any factor raises it:
     `raised_exactly` raises one from its bits.
 
-    Each factor takes as much of what is left of `k` as the normal exponents hold, as many factors as `reach`
-    needs, so a result below the least normal rounds once wherever `|k|` fits one factor, where a split into
-    equal parts rounded it again at each part past the normal range. A caller whose `k` stays within twice
-    the least of the normal exponents' bounds (252 in float32: both halves normal powers) states its `reach`
-    and takes two factors, `k`'s halves, each built as its product takes it: one integer tile live, not two
-    (et-livehook1: the factor tiles 66 of an attention template's natural forward's 281 registers at its
-    peak)."""
+    Past twice the least of the normal exponents' bounds, each factor takes as much of what is left of `k` as
+    the normal exponents hold, as many factors as `reach` needs, so on a backend that keeps subnormals a
+    result below the least normal rounds once wherever `|k|` fits one factor, where a split into equal parts
+    rounded it again at each part past the normal range. Within it (`TWO_FACTOR_REACH` in float32, both halves
+    normal powers) a caller stating its `reach` takes two factors, `k`'s halves, each built as its product
+    takes it: one integer tile live, not two (et-livehook1: the factor tiles 66 of an attention template's
+    natural forward's 281 registers at its peak), a subnormal result rounded at each half past the normal
+    range."""
     x = jnp.asarray(x)
     dtype = jnp.result_type(x, jnp.float32)
     limits = jnp.finfo(dtype)
@@ -524,8 +531,9 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
 
 
 def scalar_power2(x: jax.Array, k: jax.Array) -> jax.Array:
-    """`x` times `2^k` for a scalar integral `k` within twice fp32's exponent range, as two scalar powers of
-    two, each within it (`exp2` of an integer, a GPU's exactly): `power2`'s form for a Mosaic GPU kernel's
+    """`x` times `2^k` for a scalar integral `k` from -252 to 254, as two scalar powers of two, `floor(k/2)`
+    and the rest, each a normal power there (`exp2` of an integer, a GPU's exactly; Mosaic's approximate
+    `exp2` flushes a subnormal power, -127's at `k = -253`): `power2`'s form for a Mosaic GPU kernel's
     scalar `k`, no tile of exponent bits, which held a 128-wide fp16 fused backward's dK and dV beside two
     int tiles a step, 286 registers live at its peak and 2240 bytes spilled (et-c7512), and no bitcast of a
     scalar, which Mosaic GPU takes none of."""
