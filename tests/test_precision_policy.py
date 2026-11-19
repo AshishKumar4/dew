@@ -1153,11 +1153,15 @@ ALIGNED_CASES = {
     "a tie below cancelling terms": ([(2.0 ** 100, 2.0 ** 27, 1.0), (2.0 ** 100, -(2.0 ** 27), 1.0),
                                       (2.0 ** 25, 1.0, 1.0), (-(2.0 ** 24), 1.0, 1.0),
                                       (-(2.0 ** 24), 1.0, 1.0), (-2.0, 1.0, 1.0)], -2.0),
+    "a band below two that cancel": ([(2.0 ** 100, 2.0 ** 27, 1.0), (2.0 ** 100, -(2.0 ** 27), 1.0),
+                                      (2.0 ** 25, 1.0, 1.0), (-(2.0 ** 24), 1.0, 1.0),
+                                      (-(2.0 ** 24), 1.0, 1.0), (2.0 ** -50, 2.0 ** -50, 1.0)], 2.0 ** -100),
 }
 """`aligned_sum`'s cases: three-factor terms whose products leave fp32's range, and their sum, exact in any
 order of summing (their sum a float32): a term more than float32's exponent range below the largest kept,
 where the largest cancel (base review 224fcf53a F1), and a lower band's rounding, -2^25 - 2 a tie, kept
-where its rounded sum cancels a higher band's (base review 644ef5535 F1)."""
+where its rounded sum cancels a higher band's (base review 644ef5535 F1), and a third band's 2^-100 kept
+where the two above it cancel (base review f5e6e678d F1)."""
 
 
 @pytest.mark.parametrize("case", list(ALIGNED_CASES))
@@ -1235,14 +1239,16 @@ def test_an_aligned_sums_derivatives_hold_a_cancelling_shared_factors_range():
         np.testing.assert_array_equal(np.asarray(found, np.float64), expected)
 
 
-@pytest.mark.parametrize("smaller", [[1.0], [2.0 ** -100], [2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24), -2.0]],
-                         ids=["a unit", "2^-100", "a tie"])
+@pytest.mark.parametrize("smaller", [[1.0], [2.0 ** -100], [2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24), -2.0],
+                                     [2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24), 2.0 ** -100]],
+                         ids=["a unit", "2^-100", "a tie", "a band below two that cancel"])
 def test_an_aligned_sums_derivatives_keep_smaller_terms_below_cancelling_ones(smaller):
     """`aligned_sum([(w, a), (w, -a), *((w, s) for s in smaller)])` of `a` 2^127 at `w` zero along one: its
     tangent and `w`'s gradient the sum of `smaller`, and at `w` one its value, float64's, where aligned to the
     largest term, a unit or 2^-100 more than float32's exponent range below it was dropped before the largest
-    cancelled, zero (base review 224fcf53a F1), and where each band rounded its sum alone, -2^25 - 2 tied to
-    -2^25 beside 2^25, zero (base review 644ef5535 F1)."""
+    cancelled, zero (base review 224fcf53a F1), where each band rounded its sum alone, -2^25 - 2 tied to
+    -2^25 beside 2^25, zero (base review 644ef5535 F1), and where the bands' totals were aligned at once,
+    2^-100 dropped before 2^25 and -2^25 cancelled (base review f5e6e678d F1)."""
     terms = [jnp.float32(2.0 ** 127), jnp.float32(-(2.0 ** 127)), *map(jnp.float32, smaller)]
     small = sum(smaller)
 
@@ -1253,6 +1259,18 @@ def test_an_aligned_sums_derivatives_keep_smaller_terms_below_cancelling_ones(sm
     assert float(tangent) == small
     assert float(jax.grad(summed)(jnp.float32(0.0))) == small
     assert float(summed(jnp.float32(1.0))) == small
+
+
+def test_an_aligned_sums_gradient_reduces_a_term_before_its_value_broadcasts_it():
+    """`aligned_sum([(x,), (y,)], axis=0)` of `x` `[2]` and `y` `[1, 2]`: `x` summed to one value broadcast
+    across the value's two, so under a cotangent of `[[1, 2]]` its gradient is 3 at each element and `y`'s
+    the cotangent, where the transpose laid `x` against the value's axis and gave it `[1, 2]` (base review
+    f5e6e678d F2)."""
+    x, y = jnp.zeros((2,), jnp.float32), jnp.zeros((1, 2), jnp.float32)
+    _, pulled = jax.vjp(lambda x, y: aligned_sum([(x,), (y,)], axis=0), x, y)
+    dx, dy = pulled(jnp.asarray([[1.0, 2.0]], jnp.float32))
+    np.testing.assert_array_equal(np.asarray(dx), [3.0, 3.0])
+    np.testing.assert_array_equal(np.asarray(dy), [[1.0, 2.0]])
 
 
 def test_an_aligned_sums_gradient_scales_a_cotangent_before_its_broadcast_sum():
