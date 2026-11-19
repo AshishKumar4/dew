@@ -1756,7 +1756,8 @@ def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) ->
 
 def _aligned_value(shape: tuple[tuple[int, ...], ...], axis, *flat: jax.Array) -> jax.Array:
     """`aligned_sum` of its terms' factors in a row (`_regrouped`): its products summed band by band
-    (`_banded`), then the bands' totals, each at its own binade, summed aligned as one band, scaled back."""
+    (`_banded`), each band's sum a pair keeping its roundings (`_kept_sum`), then the bands' pairs, each at
+    its own binade, summed so as one band, the pair rounded once and scaled back."""
     products = []
     for term in _regrouped(shape, flat):
         significand, exponent = _binades(term[0])
@@ -1764,17 +1765,14 @@ def _aligned_value(shape: tuple[tuple[int, ...], ...], axis, *flat: jax.Array) -
             more, power = _binades(factor)
             significand, exponent = significand * more, exponent + power
         products.append((significand, exponent))
-
-    def reduced(x, op):
-        return x if axis is None else op(x, axis=axis, keepdims=True)
-
     dtype, factors = flat[0].dtype, max(map(len, shape))
     totals = []
-    for total, top in _banded(products, reduced, dtype, factors):
-        significand, exponent = _binades(total)
-        totals.append((significand, exponent + top))
-    total, top, _ = _band(totals, [significand != 0 for significand, _ in totals], lambda x, _: x, dtype)
-    return _raised(total, top, dtype, factors)
+    for pair, top in _banded(products, axis, dtype, factors):
+        for part in pair:
+            significand, exponent = _binades(part)
+            totals.append((significand, exponent + top))
+    (high, low), top, _ = _band(totals, [significand != 0 for significand, _ in totals], None, dtype)
+    return _raised(high + low, top, dtype, factors)
 
 
 def _band_width(dtype) -> int:
@@ -1785,35 +1783,69 @@ def _band_width(dtype) -> int:
     return -limits.minexp - limits.nmant - 1
 
 
-def _band(products, held, reduced, dtype):
+def _kept_sum(pairs, axis) -> tuple[jax.Array, jax.Array]:
+    """The sum of `(high, low)` pairs, each over `axis` first where given (kept), as a pair: each addition's
+    rounding kept in the low part (`two_sum`), an axis summed in halves (`_halved_over`), so the pair rounded
+    once is the sum's twice-precise value rounded (Ogita, Rump and Oishi's Sum2): a band's sum rounded alone
+    lost what a lower band's cancelled, -2^25 - 2 tied to -2^25 beside 2^25 (base review 644ef5535 F1)."""
+    high, low = None, None
+    for pair in pairs:
+        part_high, part_low = _halved_over(pair, axis)
+        if high is None:
+            high, low = part_high, part_low
+            continue
+        high, dropped = two_sum(high, part_high)
+        low = low + part_low + dropped
+    return high, low
+
+
+def _halved_over(pair, axis) -> tuple[jax.Array, jax.Array]:
+    """A `(high, low)` pair summed over `axis` (kept; none where None) in halves, each addition's rounding
+    kept in the low part (`two_sum`): elementwise and slices alone, which a Pallas TPU kernel forms."""
+    high, low = pair
+    for along in () if axis is None else np.atleast_1d(axis) % high.ndim:
+        while high.shape[along] > 1:
+            size, half = high.shape[along], high.shape[along] // 2
+            first, second = ([jax.lax.slice_in_dim(x, start, start + half, axis=along) for x in (high, low)]
+                             for start in (0, half))
+            summed, dropped = two_sum(first[0], second[0])
+            halves = (summed, first[1] + second[1] + dropped)
+            # An odd size's last element waits for the next halving.
+            high, low = (jnp.concatenate([part, jax.lax.slice_in_dim(x, 2 * half, size, axis=along)],
+                                         axis=along) for part, x in zip(halves, (high, low), strict=True))
+    return high, low
+
+
+def _band(products, held, axis, dtype):
     """One band of `aligned_sum`'s `products` (each a significand and binary exponent): of those `held`, each
-    within `_band_width` binades of their largest's (`top`, per element of the reduced value, zero where none
-    is held) scaled to it and summed, over `reduced`'s axis too; returns the sum, `top` and which products it
-    took."""
+    within `_band_width` binades of their largest's (`top`, per element of the value reduced over `axis`,
+    zero where none is held) scaled to it and summed (`_kept_sum`, over `axis` too); returns the sum's pair,
+    `top` and which products it took."""
     width = _band_width(dtype)
-    top = functools.reduce(jnp.maximum, [reduced(jnp.where(kept, exponent, -jnp.inf), jnp.max)
-                                         for kept, (_, exponent) in zip(held, products, strict=True)])
+    top = functools.reduce(jnp.maximum, [
+        jnp.where(kept, exponent, -jnp.inf) if axis is None
+        else jnp.max(jnp.where(kept, exponent, -jnp.inf), axis=axis, keepdims=True)
+        for kept, (_, exponent) in zip(held, products, strict=True)])
     top = jnp.where(jnp.isfinite(top), top, 0.0)
     taken = [kept & (exponent - top >= -width) for kept, (_, exponent) in zip(held, products, strict=True)]
-    total = sum(reduced(jnp.where(took, significand * _power_of_two(jnp.clip(exponent - top, -width, 0.0),
-                                                                     dtype), 0.0), jnp.sum)
-                for took, (significand, exponent) in zip(taken, products, strict=True))
-    return total, top, taken
+    scaled = [jnp.where(took, significand * _power_of_two(jnp.clip(exponent - top, -width, 0.0), dtype), 0.0)
+              for took, (significand, exponent) in zip(taken, products, strict=True)]
+    return _kept_sum([(x, jnp.zeros_like(x)) for x in scaled], axis), top, taken
 
 
-def _banded(products, reduced, dtype, factors: int) -> list[tuple[jax.Array, jax.Array]]:
+def _banded(products, axis, dtype, factors: int) -> list[tuple[tuple[jax.Array, jax.Array], jax.Array]]:
     """`aligned_sum`'s products summed band by band (`_band`), each band over those the bands above it left:
     as many bands as span the largest binade a product of `factors` factors reaches down to below the dtype's
     least subnormal, so a band whose products cancel leaves the next band's sum, no term dropped beneath it;
-    each band's total and its top."""
+    each band's sum's pair and its top."""
     limits = jnp.finfo(dtype)
     span = factors * limits.maxexp - (limits.minexp - limits.nmant - 1)
     held = [significand != 0 for significand, _ in products]
     bands = []
     # Each band's top lies more than its width below the one before's.
     for _ in range(-(-span // (_band_width(dtype) + 1))):
-        total, top, taken = _band(products, held, reduced, dtype)
-        bands.append((total, top))
+        pair, top, taken = _band(products, held, axis, dtype)
+        bands.append((pair, top))
         held = [kept & ~took for kept, took in zip(held, taken, strict=True)]
     return bands
 
