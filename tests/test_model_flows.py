@@ -649,3 +649,28 @@ def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
     with jax.default_device(compile_only_gpus("sm80", 1)[0]):
         assert gpu_flow.run_cells(cells) == []
     assert ran == list(range(5))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_truth_run_as_given_computes_on_the_host_in_a_prepare(tmp_path, monkeypatch):
+    """A site whose float64 truth the gate runs as given (`as_given`: host work, NumPy, torch) has its value
+    read in its prepare (`_shaped_truth`) on the host's CPU, its inputs placed there, wherever the store's
+    device is: a GPU part's prepare computes nothing on its default device, a compile-only GPU, where the
+    truth's eager operations raised "'Executable' object has no attribute 'local_devices'" and the test ran
+    unprepared (row 4881's class: a compensated primitive's site, the audio encoders' cells)."""
+    from arm_forms import as_given
+    from truths_ahead import CompiledTruths
+
+    dew, reference, draw = _site()
+    placed = []
+
+    def truth(a, b):
+        placed.append((jax.config.jax_default_device, {device for x in (a, b) for device in x.devices()}))
+        return reference(a, b)
+
+    # The store's device another than the host's first, as a GPU part's compile-only GPU is.
+    monkeypatch.setattr(CompiledTruths, "device", lambda store: jax.devices()[1])
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product of a given truth", seeds=8, truth_fn=as_given(truth))
+    host = jax.devices("cpu")[0]
+    assert placed and all(device == host and on == {host} for device, on in placed)

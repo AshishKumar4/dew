@@ -799,10 +799,15 @@ def _held_walk(programs: dict, held: dict, fn, wide) -> None:
 
 def _shaped_truth(truth, wide):
     """`truth` on widened inputs `wide` as `_of_float64` reads it, its leaves' dtypes and sizes: its value
-    where the gate runs it as it is (`_given`), else its shapes alone (a window loop's on one window), no
-    float64 computed."""
+    where the gate runs it as it is (`_given`), computed on the host's CPU, else its shapes alone (a window
+    loop's on one window), no float64 computed."""
     if _given(truth):
-        return truth(*wide)
+        # On the host's CPU, its inputs placed there: a GPU part's prepare computes nothing on its default
+        # device, a compile-only GPU (an eager operation there raised "'Executable' object has no attribute
+        # 'local_devices'", and its test ran unprepared, row 4881's class).
+        host = jax.devices("cpu")[0]
+        with jax.default_device(host):
+            return truth(*jax.device_put(wide, host))
     if isinstance(truth, _Windowed):
         return jax.eval_shape(unrewritten(truth.fn), *jax.tree.map(lambda leaf: leaf[0], wide))
     return jax.eval_shape(unrewritten(truth), *wide)
