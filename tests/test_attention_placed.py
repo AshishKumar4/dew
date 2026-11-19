@@ -97,8 +97,19 @@ def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving
 def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_interleaving(call):
     """The forward on a B200's tcgen05 rows at width 256 (1 consumer: SUMS 256 + LOGITS 128 + QUERY 128 =
     512 TMEM columns, row 5368): every interleaving of its consumer, producer and issuer warps explored
-    (`ring_protocol.explore`), including the query-in-TMEM hand-off (`q_ready`)."""
+    (`ring_protocol.explore`), including the query-in-TMEM hand-off (`q_ready`), and Q placement derived
+    from `tmem_columns` (placed at d256/1-consumer and d64/2-consumers, kept in SMEM at d128/2-consumers)."""
     from ring_protocol import explore, programs
+
+    from dew.nn.kernels.templates import attention_mosaic_forward as forward_mod, placed
+
+    tmem = generation.gpu_target("sm100").tmem_columns
+    for tiles, width, expected in ((ROWS_TILES, 256, True), (ROWS_PAIR_TILES, 64, True),
+                                   (ROWS_PAIR_TILES, 128, False)):
+        products = forward_mod.forward_products(placed.ROWS, tiles, width, jnp.bfloat16, ahead=True,
+                                                query_width=width, tmem_columns=tmem)
+        assert (placed.QUERY in placed.ROWS.product_scratch(*products)) is expected
+        assert placed.ROWS.product_columns(products) <= tmem
 
     query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 256, 1, 256), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
@@ -109,7 +120,6 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
 
     threads, arrivals = programs(forward, query, key, threads=ROWS_TILES.consumers + 1, rare=False)
     assert explore(threads, arrivals) > 0
-
 
 @INTERPRETS
 @pytest.mark.parametrize("tokens", [64, 128, 256, 320])

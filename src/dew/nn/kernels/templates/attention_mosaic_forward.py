@@ -1249,7 +1249,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             out_stage(split_sums)
         _status_stored(family, spec, state, stored().status, row_smem, first)
         _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks,
-                     training=training, out=(out_view, out_stage), rows=(stored, row_smem), keep=keep)
+                     training=training, out=(out_view, out_stage), rows=(stored, row_smem), keep=keep,
+                     interpret=interpret)
 
     _walks_stored(walk, store, spec, consumer, turn, decided=decided, past=past_walks, streamed=streamed)
 
@@ -1419,7 +1420,7 @@ def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
 
 def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partial, trained: tuple | None,
                  hooked: _Hooked, place: tuple, *, hooks: Hooks, training: bool, out: tuple, rows: tuple,
-                 keep: jax.Array | None = None) -> None:
+                 keep: jax.Array | None = None, interpret: bool = False) -> None:
     """A consumer's walk's result stored (`_consumer`): its output under the output hook through `out` (its
     view and its stage's `out_stage`), its finished rows through `rows` (the views `stored()` forms where
     each is stored, `_written_views`', its finished rows None where the launch finishes none, and their

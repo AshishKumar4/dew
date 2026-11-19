@@ -913,7 +913,8 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         query_width = _width(query.shape[-1], family, query.dtype)
-        value_width = config.columns or _width(value.shape[-1], family, query.dtype)
+        padded_value = _width(value.shape[-1], family, query.dtype)
+        value_width = min(config.columns, padded_value) if config.columns else padded_value
         return forward_products(family, config, value_width, query.dtype, parts=self.parts,
                                 scaled=self.scales_in_kernel(ba), ahead=self._ahead(ba, config),
                                 training=ba.arguments.get("residuals") is Kept.SPLIT,
@@ -926,7 +927,9 @@ class MosaicForward(_Mainloop[Tiles]):
         query, value = ba.arguments["query"], ba.arguments["value"]
         steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
         coded = _codes_of(ba.arguments["key"], ba.arguments.get("scales")) is not None
-        return logits_ahead(family, config, config.columns or _width(value.shape[-1], family, query.dtype),
+        padded_value = _width(value.shape[-1], family, query.dtype)
+        value_width = min(config.columns, padded_value) if config.columns else padded_value
+        return logits_ahead(family, config, value_width,
                             query.dtype, stages=min(config.stages, steps), parts=self.parts, coded=coded,
                             scaled=self.scales_in_kernel(ba),
                             training=ba.arguments.get("residuals") is Kept.SPLIT)
