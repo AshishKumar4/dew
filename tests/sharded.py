@@ -54,9 +54,10 @@ def assert_sharded(tree, mesh: jax.sharding.Mesh) -> None:
     assert not missing, f"no parameter is split over {sorted(missing)}, so this mesh runs as data parallelism"
 
 
-def collectives(text: str) -> list[tuple[str, list[tuple[int, ...]]]]:
-    """`(op, result shapes)` of every collective in compiled HLO `text`, read by the profiler's own
-    parser (`hlo_instructions`): an async pair once, by its `-done`, which holds what moved."""
+def collectives(text: str | jax.stages.Compiled) -> list[tuple[str, list[tuple[int, ...]]]]:
+    """`(op, result shapes)` of every collective in compiled HLO `text` (or a compiled executable's module,
+    `collective_axes`), read by the profiler's own parser (`hlo_instructions`): an async pair once, by its
+    `-done`, which holds what moved."""
     return [(kind, list(instruction.shapes)) for instruction in hlo_instructions(text).values()
             if (kind := collective(instruction.op)) and not instruction.op.endswith("-start")]
 
