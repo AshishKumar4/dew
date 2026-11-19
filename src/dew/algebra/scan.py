@@ -1187,7 +1187,10 @@ def _decays_value(exponents, base2: bool) -> _Decays:
 def _crossed(decay: jax.Array) -> jax.Array:
     """Where a chunk's decay (`_decays_value`'s) spans a vanished token, a document's start: negative zero,
     which a live span's decay that underflows (positive zero) is not."""
-    return (decay == 0) & jnp.signbit(decay)
+    # The sign bit read as the integer of its width's: `jnp.signbit` shifts by a constant, which a checked
+    # `shard_map` refuses beside a varying decay.
+    bits = jax.lax.bitcast_convert_type(decay, jnp.dtype(f"int{jnp.finfo(decay.dtype).bits}"))
+    return (decay == 0) & (bits < 0)
 
 
 def _decays_of(exponents, base2: bool) -> _Decays:
