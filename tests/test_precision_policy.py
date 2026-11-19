@@ -1206,9 +1206,9 @@ def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():
 
 
 @pytest.mark.parametrize(("dtype", "reach", "exponent"), [
-    (jnp.float32, None, jnp.int32), (jnp.float32, TWO_FACTOR_REACH, jnp.int32), (jnp.float32, None, jnp.int8),
-    (jnp.float32, TWO_FACTOR_REACH, jnp.int8), (jnp.float32, None, jnp.uint8), (jnp.float32, None, jnp.float32),
-    (jnp.float64, None, jnp.int32), (jnp.bfloat16, None, jnp.int32)])
+    (jnp.float32, None, jnp.int32), (jnp.float32, TWO_FACTOR_REACH, jnp.int32),
+    (jnp.float32, None, jnp.int8), (jnp.float32, TWO_FACTOR_REACH, jnp.int8), (jnp.float32, None, jnp.uint8),
+    (jnp.float32, None, jnp.float32), (jnp.float64, None, jnp.int32), (jnp.bfloat16, None, jnp.int32)])
 def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach, exponent):
     """`dew.nn.precision.power2` (the one owner of scaling by a power of two: a kernel template's, a scaled
     value's, an aligned sum's) scales by powers of two exactly wherever the operand and the result are
