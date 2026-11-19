@@ -14,6 +14,7 @@ import pytest
 from arm_arithmetic import float64_held
 from attention_oracle import attention_on_par, exact_attention, float64_weights
 from contract_support import normal_drawn
+from generation_support import interprets
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
 from sharded import assert_runs_per_shard
@@ -81,9 +82,9 @@ def test_folded_attention_is_jax_nn_attention(dtype, heads):
                     truth_fn=lambda q, k, v: exact_attention(q, k, v, keep=reads))
 
 
-ON_GPU = jax.default_backend() == "gpu"
-"""Whether the kernels compile for this host's GPU; elsewhere they run interpreted, sized as on an
-A100 (`on_the_gpu`)."""
+ON_GPU = not interprets()
+"""Whether the kernels compile for this host's GPU (or a GPU tier prepare's target); elsewhere they run
+interpreted, sized as on an A100 (`on_the_gpu`)."""
 
 
 def on_the_gpu():

@@ -839,11 +839,12 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
 
 
 def _persisted_operands(rows: int):
-    """Small integers, so every tile's product is exact in fp32 whatever its order."""
-    keys = jax.random.split(jax.random.key(2))
+    """Small integers, so every tile's product is exact in fp32 whatever its order: NumPy's (a GPU tier's
+    prepare computes on no device, row 8932)."""
+    rng = np.random.default_rng(2)
     depth = PERSISTED_STEPS * PERSISTED_DEPTH
-    x = jax.random.randint(keys[0], (PERSISTED_TILES * rows, depth), -4, 4).astype(jnp.bfloat16)
-    w = jax.random.randint(keys[1], (depth, 128), -4, 4).astype(jnp.bfloat16)
+    x = rng.integers(-4, 4, (PERSISTED_TILES * rows, depth)).astype(jnp.bfloat16)
+    w = rng.integers(-4, 4, (depth, 128)).astype(jnp.bfloat16)
     return x, w
 
 

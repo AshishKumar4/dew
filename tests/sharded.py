@@ -270,7 +270,9 @@ def assert_kernel_runs_per_shard(choice: str, kernel: str, shard: Shard) -> None
     named = {name for spec in jax.tree.leaves(specs, is_leaf=lambda leaf: isinstance(leaf, PartitionSpec))
              for axes in spec if axes is not None for name in ((axes,) if isinstance(axes, str) else axes)}
     assert shard.split in named and mesh.shape[shard.split] > 1, (shard.split, sorted(named), mesh.shape)
-    target = (generation.assumed(shard.target, interpreted=True) if jax.default_backend() == "cpu"
+    from generation_support import here
+
+    target = (generation.assumed(shard.target, interpreted=True) if here() == "cpu"
               else contextlib.nullcontext())
     with target, generation.chosen(**{choice: kernel}), shard.context():
         with generation.routes() as routes:
