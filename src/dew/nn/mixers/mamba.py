@@ -20,9 +20,10 @@ the output gated by `silu(z)` before `out_proj`. The decode step is
 checkpoint's: in_proj, conv1d/{weight,bias}, x_proj, dt_proj/{kernel,bias},
 A_log, D, out_proj.
 
-The scan runs in chunks of `chunk_size` tokens: within a chunk an
-associative scan over `(exp(dt A), dt B x)` pairs, the reference's
-`combine_fn` (231-234), and across chunks the carried `[B, D, N]` state.
+The scan runs in chunks of `chunk_size` tokens: within a chunk the
+recurrence over `(exp(dt A), dt B x)` a token at a time, unrolled
+(`ssm.affine_states`; the reference's `combine_fn`, 231-234, scans the
+same pairs associatively), and across chunks the carried `[B, D, N]` state.
 Mamba's block has no feed-forward (`MambaBlock`, 505-529: norm, mixer,
 residual), which `CausalTransformer` spells as an `mlp_features` of 0.
 """
@@ -64,9 +65,9 @@ from dew.nn.sharding import rows_like
 from dew.nn.ssm import affine_states
 
 CHUNK_SIZE = 64
-"""Tokens per associative scan. Each chunk materialises its `[B, C, D, N]`
-decays and writes, so the chunk bounds the scan's memory; the output does
-not depend on it."""
+"""Tokens per recurrence chunk (`ssm.affine_states`). Each chunk materialises
+its `[B, C, D, N]` decays and writes, so the chunk bounds the scan's memory;
+the output does not depend on it."""
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE, *,
@@ -110,7 +111,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         kept = 1.0 - reset_c[..., None, None].astype(work)
         decay = recurrence_algebra.selective_decay(dt_c[..., None], A, kept)
         write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
-        # The reference's `combine_fn` (modeling_mamba.py:231-234), from the state entering the chunk.
+        # The chunk's states a token at a time from the state entering it (`ssm.affine_states`).
         states = affine_states(decay, write, h, axis=1)
         read = recurrence_algebra.portable_einsum('bcdn,bcn->bcd', states, C_c)
         return states[:, -1], read
