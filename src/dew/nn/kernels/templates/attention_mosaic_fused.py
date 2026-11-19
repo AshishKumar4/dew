@@ -11,7 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, launches, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, outputs, resources, stacked
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
@@ -248,14 +248,14 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     leaves, treedef = jax.tree.flatten((spans, drop))
     # Grouped dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
     shapes = [(batch, keys_padded, kv_heads, width)] * 2
-    groups = mosaic.stacked_groups(shapes)
+    groups = stacked.groups(shapes)
 
     def body(*refs, streams, after=None):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         (spans_of, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         if grouped:
             dq_ref, dkv_ref, *refs = refs
-            dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], groups)
+            dk_ref, dv_ref = stacked.views([dkv_ref], groups)
         else:
             dq_ref, dk_ref, dv_ref, *refs = refs
         # The output stage where the walks' adds read it; else the epilogue's own, scoped after the walks.
@@ -338,10 +338,10 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                          grouped=grouped)
 
 
-def _fused_called(launch: Callable, operands: tuple, stacked: tuple, *, copies: int, grouped: bool
+def _fused_called(launch: Callable, operands: tuple, grads: tuple, *, copies: int, grouped: bool
                   ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The fused launch called on its `operands` (`_fused_launch`'s): dQ added into zeros in place, and
-    grouped dK and dV in one ref of both (`mosaic.stacked_zeros`, `[2, B, Kp, KV, D]`, `stacked` their shapes
+    grouped dK and dV in one ref of both (`stacked.zeros`, `[2, B, Kp, KV, D]`, `grads` their shapes
     and grouping: where XLA wraps the launch in a dynamic-slice fusion, a step's stacked forward rows sliced
     for this launch's operands, two refs of equal zeros were one buffer, dK and dV each the sum of both, row
     3180, ET-3180-PLAIN-h100): one copy of dQ, or each consumer's own interpreted (`Family.added`,
@@ -351,8 +351,9 @@ def _fused_called(launch: Callable, operands: tuple, stacked: tuple, *, copies: 
     dq = jax.new_ref(launches.filled((copies, batch, queries, heads, width), jnp.float32, *operands[:4]))
     if not grouped:
         dk, dv = launch(*operands, dq)
-        return mosaic.added_copies(dq), dk, dv
-    dkv = mosaic.stacked_zeros(*stacked, *operands[:4])
+        return stacked.added(dq), dk, dv
+    shapes, groups = grads
+    dkv = stacked.zeros(shapes, groups, *operands[:4])
     launch(*operands, dq, *dkv)
-    dk, dv = mosaic.stacked_read(dkv, stacked[1])
-    return mosaic.added_copies(dq), dk, dv
+    dk, dv = stacked.read(dkv, groups)
+    return stacked.added(dq), dk, dv

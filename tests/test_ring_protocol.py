@@ -73,8 +73,9 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
             def schedule(index):
                 tile = index[0]
                 steps = _at(tile, tiles)
-                source = rings.Among(tile % 2, (x_gmem, x_gmem)) if among else x_gmem
-                views = {name: (source, lambda step: (_at(tile, starts) + step, 0)) for name in names}
+                view = (x_gmem, lambda step: (_at(tile, starts) + step, 0))
+                source = rings.Among(lambda step: tile % 2, (view, view)) if among else view
+                views = dict.fromkeys(names, source)
                 return (steps > 0) | empty_active, steps, views, tile
 
             def issue(wg, tile, walk, *, active):

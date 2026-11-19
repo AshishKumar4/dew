@@ -25,6 +25,7 @@ from dew.nn.kernels.templates import (
     outputs,
     product,
     rings,
+    stacked,
     stores,
     swizzling,
 )
@@ -749,13 +750,13 @@ def test_an_sm80_side_vector_loads_in_the_layout_of_the_axis_it_follows(axis):
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     """Two zeroed refs of one shape and dtype a launch adds into in place are one value to XLA, which a
     dynamic-slice fusion wrapping the launch passes once for both (row 3180): `mosaic.checked` refuses the
-    launch where it traces them, and takes them stacked into one ref (`stacked_zeros`), each member its own
-    place: a launch writing a value of its own into each view (`stacked_views`) reads each back apart
-    (`stacked_read`), in its shapes' order."""
+    launch where it traces them, and takes them stacked into one ref (`stacked.zeros`), each member its own
+    place: a launch writing a value of its own into each view (`stacked.views`) reads each back apart
+    (`stacked.read`), in its shapes' order."""
     shapes = [(2, 3), (4,), (2, 3)]
 
     def written(*refs):
-        for index, view in enumerate(mosaic.stacked_views(refs, groups)):
+        for index, view in enumerate(stacked.views(refs, groups)):
             view[...] = jnp.full(view.shape, index + 1.0)
 
     launched = mosaic.checked(written, "probe")
@@ -763,16 +764,16 @@ def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     def apart():
         launched(*(jax.new_ref(jnp.zeros(shape, jnp.float32)) for shape in shapes))
 
-    groups = mosaic.stacked_groups(shapes)
+    groups = stacked.groups(shapes)
     with pytest.raises(ValueError):
         jax.jit(apart).trace()
 
-    def stacked():
-        refs = mosaic.stacked_zeros(shapes, groups, jnp.zeros(()))
+    def together():
+        refs = stacked.zeros(shapes, groups, jnp.zeros(()))
         launched(*refs)
-        return mosaic.stacked_read(refs, groups)
+        return stacked.read(refs, groups)
 
-    for index, (shape, array) in enumerate(zip(shapes, jax.jit(stacked)(), strict=True)):
+    for index, (shape, array) in enumerate(zip(shapes, jax.jit(together)(), strict=True)):
         np.testing.assert_array_equal(array, np.full(shape, index + 1.0))
 
 
@@ -1948,7 +1949,8 @@ def test_a_uniform_read_gives_each_lane_its_warps_lane_zero_value(read):
         each = plgpu.ShapeDtypeStruct((128,), jnp.dtype(jnp.int32), layout=lanes)
         out_gmem[...] = plgpu.inline_mgpu(arg_types=(scalar,), return_type=each)(spread)(read_value)
 
-    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.int32), grid=(1,))()
+    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.int32), grid=(1,),
+                       grid_names=("programs",))()
     threads = np.arange(128, dtype=np.int32)
     expected = (threads // 32 * 32 if read == "uniform" else threads) + 7
     np.testing.assert_array_equal(np.asarray(out), expected)

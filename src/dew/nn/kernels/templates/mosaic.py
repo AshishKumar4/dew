@@ -137,7 +137,7 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
     residency (`bodies.RESIDENT`) and moving its roles' registers where it `moves` them (`bodies.MOVES`,
     `resources.RegisterModel.moves`) under the name `kernel`: a launch built once for every call of its facts
     checks each call's own; and refused at its trace where two of the refs it adds into in place share a shape
-    and a dtype, which `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's
+    and a dtype, which `stacked.zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's
     share of the work its cost states (the rest its own recomputation), where given, as its custom call's
     frontend attribute (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads; and, where its
     `out_type` states its outputs as its operands' axes (`outputs.Output`), the dimensions each descends from
@@ -157,7 +157,7 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
         if len(set(kinds)) < len(kinds):
             raise ValueError(f"{kernel} adds into two refs of one shape and dtype ({kinds}): XLA may take "
                              "their zeros for one value and pass one buffer for both (row 3180); stack them "
-                             "into one ref (`stacked_zeros`)")
+                             "into one ref (`stacked.zeros`)")
         token, moving = bodies.RESIDENT.set(resident), bodies.MOVES.set(moves)
         try:
             return built(*operands)
@@ -166,55 +166,6 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
             bodies.RESIDENT.reset(token)
 
     return launch
-
-
-def stacked_groups(shapes: Sequence[tuple[int, ...]]) -> tuple[tuple[int, ...], ...]:
-    """The refs a launch adds into in place, one for each of `shapes`, grouped by shape, each group's indices
-    in order: a group is one ref, a leading axis of them (`stacked_zeros`)."""
-    grouped: dict[tuple[int, ...], list[int]] = {}
-    for index, shape in enumerate(shapes):
-        grouped.setdefault(tuple(shape), []).append(index)
-    return tuple(tuple(group) for group in grouped.values())
-
-
-def stacked_zeros(shapes: Sequence[tuple[int, ...]], groups: tuple[tuple[int, ...], ...], anchor: jax.Array,
-                  *anchors: jax.Array) -> list:
-    """Zeroed fp32 refs a launch adds into in place, one for each of `shapes`, a ref a group of one shape
-    (`stacked_groups`), a leading axis of them: two refs of equal zeros are one value to XLA, which a
-    dynamic-slice fusion wrapping the launch passes once for both aliased operands, so both were one buffer
-    (row 3180; `checked` refuses two such refs); each bound to the launch's operands, `anchor` and `anchors`
-    (`launches.filled`), so no other launch's zeros are its."""
-    return [jax.new_ref(launches.filled((len(group), *shapes[group[0]]), jnp.float32, anchor, *anchors))
-            for group in groups]
-
-
-def stacked_views(refs, groups: tuple[tuple[int, ...], ...]) -> list:
-    """Each stacked ref's member (`stacked_zeros`) as the launch's program reads it, in its shapes' order:
-    its place along its group's ref's leading axis."""
-    views: list = [None] * sum(map(len, groups))
-    for ref, group in zip(refs, groups, strict=True):
-        for place, index in enumerate(group):
-            views[index] = ref.at[place]
-    return views
-
-
-def added_copies(ref) -> jax.Array:
-    """A ref every role adds into (`Family.added`) after the launch, from its leading axis of copies: one on a
-    device, every role's adds atomic into it, read as it is; each role's own interpreted, summed. A sum over
-    one copy is a second buffer of the ref's size, which XLA writes beside it (a Qwen3.5-4B training step's
-    fp32 dQ on an H100, 805 MB more at its peak)."""
-    added = jax.freeze(ref)
-    return added[0] if added.shape[0] == 1 else added.sum(axis=0)
-
-
-def stacked_read(refs, groups: tuple[tuple[int, ...], ...]) -> list[jax.Array]:
-    """Each stacked ref's member (`stacked_zeros`) after the launch, an array, in its shapes' order."""
-    found: list = [None] * sum(map(len, groups))
-    for ref, group in zip(refs, groups, strict=True):
-        stacked = jax.freeze(ref)
-        for place, index in enumerate(group):
-            found[index] = stacked[place]
-    return found
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1223,7 +1174,44 @@ class Issuer[Accumulator](abc.ABC):
         exact sum's (`summed_apart`, row 7139). A value accumulator's (mma.sync's, a running sum's, an
         interpreted walk's) by a branch on `idle`; an issuer whose accumulator is a place its instructions
         write states its own (`WgmmaIssuer`). The walk's ring waits and releases are its own, outside it."""
-        return lax.cond(idle, lambda: acc, issue)
+        return self.issued_when(~idle, acc, issue)
+
+    def issued_when(self, issuing: jax.Array, acc, issue: Callable):
+        """`issue()`'s accumulator, its products issued only where `issuing` (traced, one value across the
+        issuing threads, the same at every step of a walk) is true: `acc` as it was elsewhere;
+        `issued_unless`'s branch the other way, stated positively, as a warp's own code lowers a predicate
+        (no boolean `not` there): a value accumulator's by a branch, one its instructions write in place by
+        its issuer's own (`WgmmaIssuer`, `Tcgen05Issuer`). Its groups count as committed either way
+        (`commits`), which a walk's waits meet where no step issues them; a choice among products that
+        varies by step is `issued_one_of`'s."""
+        return lax.cond(issuing, issue, lambda: acc)
+
+    def issued_one_of(self, which: jax.Array, accumulators: Sequence, issue: Callable) -> tuple:
+        """Each of `accumulators` as `issue(case, acc)`'s products into it leave it where `which` (traced,
+        one value across the issuing threads, at every step one of their indices) names it, as it was
+        elsewhere: one case's products a step (a chained walk's, each step its one product's,
+        `gemm.chained`). Its groups count as one case's (`commits`), each case committing as many: counted
+        as every case traced, a walk's wait for a step's groups left a step of its ring in flight past its
+        slot's release (base review of f86cb5b03, F2)."""
+        before, issued, groups = commits(), [], set()
+        for case, acc in enumerate(accumulators):
+            began = commits()
+            issued.append(self.issued_when(which == case, acc, functools.partial(issue, case, acc)))
+            groups.add(commits() - began)
+        if len(groups) > 1:
+            raise ValueError(f"a choice among products commits one count of groups whichever it issues, not "
+                             f"{sorted(groups)}")
+        _COMMITTED.set(before + max(groups, default=0))
+        return tuple(issued)
+
+    def added_onto(self, acc, adds: jax.Array):
+        """`acc` as a step's products into it write it, where `adds` (traced) tells whether they add onto it
+        or begin its sum: an accumulator a walk zeroes before its first step (a warpgroup MMA's, a value's)
+        takes its products onto those zeros, as it is; one whose first product overwrites it states its own
+        (`Tcgen05Issuer`). Products of several sums in one walk, each its own accumulator from its own first
+        step on (`gemm.chained.guarded_walk`), tell each where its sum begins."""
+        del adds
+        return acc
 
     def looped_products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True) -> Accumulator:
         """`products`, its instruction steps issued in a loop of their own where the issuer reads its

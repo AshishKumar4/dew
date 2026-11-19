@@ -48,6 +48,7 @@ import pytest
 import test_contracts_gemm as contracts_gemm
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
+import test_gemm_paired as gemm_paired
 import test_gemm_tcgen05 as gemm_tcgen05
 import test_gemm_template as gemm_template
 import test_gemm_widths as gemm_widths
@@ -171,6 +172,10 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
                                  depth, width, dtype), "sm90", fault=BALANCED_TAIL)
           for rows, depth, width in gemm_template.BALANCED_TAILS for dtype in (jnp.bfloat16, jnp.float32)),
+        *(Cell(f"a chained input gradient holds check 1: {case}",
+               functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
+               native={"launch": "chained", "generation": name, "case": case})
+          for name in ("sm90", "sm100") for case in gemm_paired.CHAINED_CASES),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",
