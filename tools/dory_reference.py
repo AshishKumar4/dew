@@ -90,6 +90,12 @@ def rotate(x, positions, theta, factor=1.0):
     return torch.cat([(x1 * cos - x2 * sin).to(x.dtype), (x2 * cos + x1 * sin).to(x.dtype), rest], dim=-1)
 
 
+def grad_of(tensor: torch.Tensor) -> torch.Tensor:
+    """A tensor's gradient after the backward pass, which every tensor asked for here holds."""
+    assert tensor.grad is not None
+    return tensor.grad
+
+
 class DoryReference:
     """dory.py's forward over `tensors` (the checkpoint's names) at `dtype`."""
 
@@ -244,12 +250,12 @@ class DoryReference:
         """The gradient of `sum(logits * cotangent)` over the rows of `ids` in each tensor `names`
         holds, `cut` as `hidden` reads it."""
         for name in names:
-            self.w[name].requires_grad_(requires_grad=True)
-        total = sum((self.logits(self.hidden(row, torch.arange(len(row)), cut=cut))
-                     * torch.as_tensor(weights, device=self.device)).sum()
-                    for row, weights in zip(ids, cotangent, strict=True))
+            self.w[name].requires_grad_(True)
+        total = torch.stack([(self.logits(self.hidden(row, torch.arange(len(row)), cut=cut))
+                              * torch.as_tensor(weights, device=self.device)).sum()
+                             for row, weights in zip(ids, cotangent, strict=True)]).sum()
         total.backward()
-        return {name: self.w[name].grad.cpu().numpy() for name in names}
+        return {name: grad_of(self.w[name]).cpu().numpy() for name in names}
 
     def decode(self, prompt, steps: int):
         """Greedy decoding of one prompt, cached as `recurrent_kv_cache_mode` says: the tokens and
@@ -414,7 +420,7 @@ def write_tiny() -> None:
                                              for prompt in prompts])
 
     arrays['cotangent'] = rng.normal(size=(*ids.shape, CONFIG['vocab_size'])).astype(np.float32)
-    np.savez(FIXTURE / 'reference.npz', **arrays)
+    np.savez(FIXTURE / 'reference.npz', allow_pickle=False, **arrays)
     (FIXTURE / 'source.json').write_text(json.dumps({
         'reference': 'vllm-project/vllm#60149 vllm/model_executor/models/dory.py at '
                      '55076950b6c155f384d6766d63563c3bc20a0e3f, transcribed in tools/dory_reference.py',

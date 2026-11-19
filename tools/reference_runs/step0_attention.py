@@ -42,9 +42,11 @@ def torch_side(args) -> None:
     from torch.nn.attention import SDPBackend, sdpa_kernel
     from torch_lm import bf16_residual
     from transformers import AutoModelForCausalLM
+    from transformers.modeling_utils import PreTrainedModel
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32,
-                                                 attn_implementation="sdpa").cuda()
+    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32,
+                                                                  attn_implementation="sdpa")
+    model = model.cuda()
     bf16_residual(model)
     kept = {}
     model.model.norm.register_forward_hook(lambda module, inputs, output: kept.__setitem__("hidden", output))

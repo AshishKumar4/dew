@@ -24,6 +24,7 @@ import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -38,7 +39,10 @@ EVIDENCE = Path(os.environ.get(
 
 # Dew's host-only records and target table, read without its backend import policy.
 gpu_target = loaded("dew_gpu_targets", SOURCE / "nn/kernels/generation.py").gpu_target
-WorkloadWork = loaded("dew_workload", SOURCE / "telemetry/workload.py").WorkloadWork
+if TYPE_CHECKING:
+    from dew.telemetry.workload import WorkloadWork
+else:
+    WorkloadWork = loaded("dew_workload", SOURCE / "telemetry/workload.py").WorkloadWork
 trace = loaded("dew_trace", SOURCE / "telemetry/trace.py")
 
 

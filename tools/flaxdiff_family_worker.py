@@ -100,7 +100,8 @@ def flaxdiff(wide: bool) -> dict[str, types.ModuleType]:
         module = types.ModuleType(name)
         module.__package__, module.__file__ = "flaxdiff.models", str(local)
         sys.modules[name] = module
-        module.FOURIER_TABLE = fourier_table
+        # A module made here, its constant set before its code runs.
+        setattr(module, "FOURIER_TABLE", fourier_table)
         exec(compile(source, str(local), "exec"), module.__dict__)
         setattr(sys.modules["flaxdiff.models"], stem, module)
         modules[stem] = module

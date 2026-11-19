@@ -36,6 +36,9 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "diffusers-qwen-image"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
 ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE = ROOT / "tests" / "fixtures" / "qwen_image_source.tar.xz"
 GRID = (4, 6)
@@ -118,9 +121,10 @@ def run(models, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     from _dew_torch.precision import float64
 
     def arm(inputs, model, dtype):
-        given = [torch.from_numpy(inputs[key]).to(dtype) for key in ("packed", "context", "times")]
+        packed, context, times = (torch.from_numpy(inputs[key]).to(dtype)
+                                  for key in ("packed", "context", "times"))
         with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
-            return {"output": transformer_call(model, *given, GRID).numpy()}
+            return {"output": transformer_call(model, packed, context, times, GRID).numpy()}
 
     return drawn(cases, lambda inputs: (arm(inputs, models[0], torch.float32),
                                         arm(inputs, models[1], torch.float64)))

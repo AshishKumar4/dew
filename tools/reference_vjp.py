@@ -29,7 +29,7 @@ def recorded_vjp(side: str, outputs: dict[str, torch.Tensor], inputs: dict[str, 
     gradient as `{side}.grad_{input}`, a parameter's as `{side}.grad.{name}`.
     """
     probes = {name: torch.randn(output.shape, generator=generator) for name, output in outputs.items()}
-    loss = sum((output * probes[name]).sum() for name, output in outputs.items())
+    loss = torch.stack([(output * probes[name]).sum() for name, output in outputs.items()]).sum()
     every = [*inputs.values(), *(value for _, value in named)]
     found = torch.autograd.grad(loss, every, allow_unused=not reached)
     gradients = [torch.zeros_like(value) if gradient is None else gradient

@@ -37,11 +37,12 @@ class DewImages(GeneratorBasedBuilder):
 
     def _split_generators(self, dl_manager):
         del dl_manager
-        return {"train": self._generate_examples(0, 16),
-                "test": self._generate_examples(16, 20)}
+        return {"train": self._generate_examples(start=0, stop=16),
+                "test": self._generate_examples(start=16, stop=20)}
 
-    def _generate_examples(self, start, stop):
-        for index in range(start, stop):
+    def _generate_examples(self, **bounds: int):
+        """Examples `start` to `stop` (`bounds`, by keyword as tfds' signature takes them)."""
+        for index in range(bounds["start"], bounds["stop"]):
             yield index, {"image": np.full((8, 8, 3), index + 10, np.uint8),
                           "label": index % 2}
 
@@ -51,13 +52,13 @@ class DewPassages(GeneratorBasedBuilder):
 
     def _info(self):
         return DatasetInfo(builder=self, disable_shuffling=True,
-                                     features=tfds.features.FeaturesDict({"text": tfds.features.Text()}))
+                           features=tfds.features.FeaturesDict({"text": tfds.features.Text()}))
 
     def _split_generators(self, dl_manager):
         del dl_manager
         return {"train": self._generate_examples()}
 
-    def _generate_examples(self):
+    def _generate_examples(self, **_: object):
         for index, passage in enumerate(PASSAGES):
             yield index, {"text": passage}
 

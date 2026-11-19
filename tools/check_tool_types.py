@@ -244,7 +244,9 @@ def made(requirements: list[str]) -> Path:
         subprocess.run(["git", "-C", str(checkout), "fetch", "--quiet", "--depth=1", source["url"],
                         source["sha"]], check=True)
         subprocess.run(["git", "-C", str(checkout), "checkout", "--quiet", "FETCH_HEAD"], check=True)
-        Path(site, f"_tool_types_{source['name']}.pth").write_text(f"{checkout}\n")
+        # A src layout's packages are under its src/, as an editable install of it puts them on the path.
+        root = checkout / "src" if (checkout / "src").is_dir() else checkout
+        Path(site, f"_tool_types_{source['name']}.pth").write_text(f"{root}\n")
     (where / "made").write_text(json.dumps(requirements))
     return python
 

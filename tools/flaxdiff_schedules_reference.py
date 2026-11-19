@@ -73,7 +73,7 @@ def schedulers() -> dict[str, types.ModuleType]:
                                           for name, digest in FILES.items()})
     package("flaxdiff", root / "flaxdiff")
     utils = types.ModuleType("flaxdiff.utils")
-    utils.RandomMarkovState = type("RandomMarkovState", (), {})
+    setattr(utils, "RandomMarkovState", type("RandomMarkovState", (), {}))  # A stand-in module's one name.
     sys.modules["flaxdiff.utils"] = utils
     return {name: loaded(f"flaxdiff.schedulers.{name}", root / "flaxdiff" / "schedulers" / f"{name}.py")
             for name in FILES}

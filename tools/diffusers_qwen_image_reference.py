@@ -58,6 +58,9 @@ from _dew_torch.precision import float64, float64_twin
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "fixtures" / "hf" / "qwen-image-2.1-source"
+COHORT = "diffusers-qwen-image"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
 DIFFUSERS_COMMIT = "6256aa7666cedd47443adc8f82da9a10e110b09c"
 BASE = dict(patch_size=1, in_channels=8, out_channels=8, num_layers=2, attention_head_dim=12,
             num_attention_heads=2, context_in_dim=16, mlp_ratio=3, axes_dims_rope=(4, 4, 4),

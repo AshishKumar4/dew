@@ -132,12 +132,13 @@ def modules_imported(tree: ast.Module, parent: Sequence[str]) -> set[str]:
     return names
 
 
-def outside(scope: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef) -> list[ast.expr]:
+def outside(scope: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef) -> list[ast.AST]:
     """The parts of a nested scope's statement its enclosing scope evaluates:
     decorators, defaults, annotations, a class's bases and keywords."""
     if isinstance(scope, ast.ClassDef):
         return [*scope.decorator_list, *scope.bases, *scope.keywords]
-    defaults = [*scope.args.defaults, *(default for default in scope.args.kw_defaults if default is not None)]
+    defaults: list[ast.AST] = [*scope.args.defaults,
+                               *(default for default in scope.args.kw_defaults if default is not None)]
     if isinstance(scope, ast.Lambda):
         return defaults
     return [*scope.decorator_list, *defaults, *(annotation for _, annotation in annotated(scope))]
