@@ -694,8 +694,11 @@ def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
             "probes": [probe.record() for probe in probes], **search.kernels,
             "pool": pool_record(local_devices(search.mesh)),
             # Read at autotune 0 where compiled offline for a GPU kind (`report.autotuned`): its memory
-            # XLA's default choices', which a tuned one on the device may exceed.
-            "autotuned": report.autotuned(local_devices(search.mesh)), **above}
+            # XLA's default choices', which a tuned one on the device may exceed; and whether it leaves a
+            # convolution's algorithm to run time there (`report.at_run_time`), which a run compiles anew.
+            "autotuned": report.autotuned(local_devices(search.mesh)),
+            "at_run_time": planned.candidate.program is not None and report.at_run_time(
+                planned.candidate.program), **above}
 
 
 def pool_record(devices: Sequence) -> dict[str, JSON]:
