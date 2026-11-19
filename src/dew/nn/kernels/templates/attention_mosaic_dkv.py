@@ -116,7 +116,8 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         scoped.append(family.staged_memory((consumers, block_k, rows), dtype))
         if family.places_on_role:
             scoped += [family.staged_memory((consumers, REDUCED, rows, out_width // REDUCED), jnp.float32),
-                       *(plgpu.Barrier(num_arrivals=1, num_barriers=consumers * REDUCED) for _ in range(2))]
+                       *(tuple(plgpu.Barrier(num_arrivals=1, num_barriers=REDUCED) for _ in range(consumers))
+                         for _ in range(2))]
         else:
             scoped.append(family.staged_memory((consumers, rows, width), jnp.float32))
     if config.staged_logits:
@@ -316,11 +317,9 @@ class _PlacedDq:
             first += half
         return tuple(found)
 
-    def _turn(self, role, ordinal, piece: int):
-        """Piece `piece` of a compute warpgroup's (`role`'s) `ordinal`-th step's turn of its ring, and its
-        barrier's index among the ring's (each warpgroup's `REDUCED` in turn)."""
-        turn = rings.Turn.of(ordinal * len(self.pieces()) + piece, REDUCED)
-        return turn, role * REDUCED + turn.slot
+    def _turn(self, ordinal, piece: int):
+        """Piece `piece` of a compute warpgroup's `ordinal`-th step's turn of its ring."""
+        return rings.Turn.of(ordinal * len(self.pieces()) + piece, REDUCED)
 
     def _view(self, q_first, turn: int = 0):
         row, head = self.place
@@ -331,7 +330,8 @@ class _PlacedDq:
         walk's over the turns) written into its ring a slot at a time, each slot once the reducer's add has
         read its last fill (`emptied`), its writes fenced for the add's read and the fill published
         (`filled`); interpreted, added into its own copy of the call's (`Family.added`, no reducer)."""
-        family, (stage, filled, emptied) = self.walk.program.family, self.stages[1:]
+        family, stage = self.walk.program.family, self.stages[1]
+        filled, emptied = self.stages[2][slots.turn], self.stages[3][slots.turn]
         if self.walk.interpret:
             first = 0
             for half in halves:
@@ -343,13 +343,13 @@ class _PlacedDq:
         ordinal = slots.n // placed.TURNS
         written = [piece for half in halves for _, piece in mosaic.column_chunks(half, stage.shape[-1])]
         for index, piece in enumerate(written):
-            turn, at = self._turn(slots.turn, ordinal, index)
+            turn = self._turn(ordinal, index)
             before = rings.Turn.of(turn.counter - REDUCED, REDUCED)
-            pl.when(turn.counter >= REDUCED)(lambda before=before, at=at: plgpu.barrier_wait(
-                emptied.at[at], phase=before.rotation))
+            pl.when(turn.counter >= REDUCED)(lambda before=before, slot=turn.slot: plgpu.barrier_wait(
+                emptied.at[slot], phase=before.rotation))
             stage.at[slots.turn, turn.slot][...] = piece
             plgpu.commit_smem()
-            plgpu.barrier_arrive(filled.at[at])
+            plgpu.barrier_arrive(filled.at[turn.slot])
 
     def reduced(self, lo, hi, role: int) -> None:
         """A compute warpgroup's (`role`'s) reducer: the adds of its steps among the walk's `lo` to `hi` (step
@@ -359,7 +359,7 @@ class _PlacedDq:
         role's whole step in turn, the other's filling waiting on it. Interpreted, nothing (`added`)."""
         if self.walk.interpret:
             return
-        stage, filled, emptied = self.stages[1:]
+        stage, filled, emptied = self.stages[1], self.stages[2][role], self.stages[3][role]
         block_q, pieces = self.walk.program.tiles.block_q, self.pieces()
 
         def freed(last) -> None:
@@ -369,13 +369,13 @@ class _PlacedDq:
         def step(ordinal, last):
             view = self._view((lo + role + placed.TURNS * ordinal) * block_q)
             for index, (first, columns) in enumerate(pieces):
-                turn, at = self._turn(role, ordinal, index)
-                plgpu.barrier_wait(filled.at[at], phase=turn.rotation)
+                turn = self._turn(ordinal, index)
+                plgpu.barrier_wait(filled.at[turn.slot], phase=turn.rotation)
                 plgpu.copy_smem_to_gmem(stage.at[role, turn.slot], view.at[:, pl.ds(first, columns)],
                                         reduction_op="add")
                 plgpu.wait_smem_to_gmem(1, wait_read_only=True)
                 freed(last)
-                last = jnp.asarray(at, jnp.int32)
+                last = jnp.asarray(turn.slot, jnp.int32)
             return last
 
         steps = lax.div(jnp.maximum(hi - lo - role, 0) + placed.TURNS - 1, placed.TURNS)
@@ -390,13 +390,8 @@ class _PlacedDq:
         no scope after the walk written over a slot an add still reads."""
         if self.walk.interpret:
             return
-        emptied = self.stages[3]
         steps = lax.div(jnp.maximum(hi - lo - role, 0) + placed.TURNS - 1, placed.TURNS)
-        fills = steps * len(self.pieces())
-        for back in range(REDUCED, 0, -1):
-            turn = rings.Turn.of(fills - back, REDUCED)
-            pl.when(fills >= back)(lambda turn=turn: plgpu.barrier_wait(
-                emptied.at[role * REDUCED + turn.slot], phase=turn.rotation))
+        rings.drained((self.stages[3][role],), steps * len(self.pieces()), REDUCED)
 
 
 def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows: tuple, dtypes: tuple, *,

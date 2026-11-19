@@ -535,10 +535,12 @@ def test_an_integer_parameter_keys_and_runs():
 
 @pytest.mark.parametrize("beside", ["alone", "nan head"])
 def test_a_triton_walk_over_values_near_fp32s_largest_walks_scaled_on_par(beside):
-    """A bf16 Triton forward over two 64-key tiles, the second's logits 14 nats past the first's, over values
-    of 2^109 to 2^110: on par with the reference (check 1), finite. Beside a second head one of whose values
-    is NaN (`nan head`), the first head's still is: the host's bound takes finite magnitudes alone, where the
-    NaN left the whole call unscaled and the first head infinite (the base review of a648b3279, F5)."""
+    """A bf16 Triton forward over two 64-key halves, the second's logits 14 nats past the first's: the first
+    64 keys hold values of 2^123 to 2^124 (unscaled sum >= 64 * 2^123 = 2^129 overflows fp32 before the
+    rise), while the last 64 hold 2^118 to 2^119 so the reference's globally weighted sum stays finite
+    (row 8842). Beside a second head one of whose values is NaN (`nan head`), the first head's still is: the
+    host's bound takes finite magnitudes alone, where the NaN left the whole call unscaled and the first head
+    infinite (the base review of a648b3279, F5)."""
     spans = template.spans(128, 128, 1)
     pins = {attention_triton.TritonForward: PINNED[1]}
     heads = 1 if beside == "alone" else 2
@@ -550,7 +552,9 @@ def test_a_triton_walk_over_values_near_fp32s_largest_walks_scaled_on_par(beside
         # The logits natural at the call's scale of 1/8: the second tile's 14 above the first's.
         query = query.at[..., 0].set(8).astype(jnp.bfloat16)
         key = key.at[..., 0].set(0).at[:, 64:, :, 0].set(14).astype(jnp.bfloat16)
-        value = 2.0 ** 109 * jax.random.uniform(streams[2], (1, 128, heads, 64), jnp.float32, 1, 2)
+        scale = jnp.concatenate([jnp.full((64,), 2.0 ** 123),
+                                 jnp.full((64,), 2.0 ** 118)])[None, :, None, None]
+        value = scale * jax.random.uniform(streams[2], (1, 128, heads, 64), jnp.float32, 1, 2)
         if heads > 1:
             value = value.at[0, 5, 1, 3].set(jnp.nan)
         return query, key, value.astype(jnp.bfloat16)
