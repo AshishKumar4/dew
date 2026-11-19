@@ -62,9 +62,10 @@ constants and output tree (`held`), and its record, written last, so a prepare c
 reads."""
 
 UNPREPARED = "unprepared.json"
-"""A test's record, in its store, that it ran unprepared (`unprepared`): `{"test", "where", "error"}`, its
-first reason, the GPU tier's list of unprepared tests read from these alone (a ledger row each, the
-tier's)."""
+"""A test's record, in its store, that it ran unprepared (`unprepared`): `{"test", "where", "error",
+"reasons"}`, its first reason's where and why and every reason it gave, each once (a site, an arm, a cell:
+their count shows a tier drifting from its prepares), the GPU tier's list of unprepared tests read from these
+alone (a ledger row each, the tier's)."""
 
 DEFERRED = "deferred.json"
 """A test's record, in its store, of a GPU flow's cell its prepare deferred to its run (`unprepared`'s, as
@@ -375,21 +376,31 @@ def running() -> tuple[CompiledTruths, str] | None:
 
 def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str,
                record: str = UNPREPARED) -> None:
-    """The one writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
-    compiling a site or an arm on its devices with every site judged: its node id, where (`frames`, innermost
-    first, `(file, line)`: the first of the test's own file, else the test's file), and the first reason it
-    gives, a record already written kept (a prepare's, before its run's). Under `DEFERRED`, a GPU flow's cell
-    its prepare deferred to its run (`gpu_flow.run_cells`), which its run's store still serves, and which
-    the run names unprepared (tests/conftest.py's `compiled_ahead`)."""
-    record = directory / record
-    if record.exists():
-        return
+    """The writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
+    compiling a site or an arm on its devices with every site judged: its node id and each reason it gives,
+    where (`frames`, innermost first, `(file, line)`: the first of the test's own file, else the test's file)
+    and why (`reasoned`). Under `DEFERRED`, a GPU flow's cell its prepare deferred to its run
+    (`gpu_flow.run_cells`), which its run's store still serves, and which the run names unprepared
+    (tests/conftest.py's `compiled_ahead`)."""
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
     path = Path(load("grading", "tools/armada").owning(test))
     lines = [line for file, line in frames if Path(file).name == path.name]
-    directory.mkdir(parents=True, exist_ok=True)
-    record.write_text(json.dumps({"test": test, "where": f"{path}:{lines[0]}" if lines else str(path),
-                                  "error": why}))
+    reasoned(directory / record, test, f"{path}:{lines[0]}" if lines else str(path), why)
+
+
+def reasoned(record: Path, test: str, where: str, why: str) -> None:
+    """Into a test's `record` (`UNPREPARED`, `DEFERRED`), a reason it ran unprepared, `where` and `why`, each
+    reason once in the order given, its first's its record's own `where` and `error` (a prepare's, before
+    its run's): a test with three unprepared arms names three (Main)."""
+    reason = {"where": where, "error": why}
+    if record.exists():
+        held = json.loads(record.read_text())
+        if reason not in held["reasons"]:
+            held["reasons"].append(reason)
+            record.write_text(json.dumps(held))
+        return
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"test": test, **reason, "reasons": [reason]}))
 
 
 _log = logging.getLogger(__name__)

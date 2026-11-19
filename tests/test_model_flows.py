@@ -772,3 +772,16 @@ def test_a_site_whose_prepare_ended_before_its_arms_runs_them_unprepared(tmp_pat
     with compiled_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(dew, reference, draw, "a product whose arms went unprepared", seeds=8)
     assert (tmp_path / UNPREPARED).is_file()
+
+
+def test_a_tests_unprepared_record_names_every_reason(tmp_path):
+    """A test's record that it ran unprepared (`truths_ahead.UNPREPARED`) holds every reason it gave, each
+    once, its first's its own: two site-free arms no prepare reached, the first called twice, are two
+    reasons, where the record kept the first alone and hid the rest (Main: their count shows a tier
+    drifting from its prepares)."""
+    a = np.arange(6, dtype=np.float32)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        for label in ("an unreached product", "an unreached product", "another unreached product"):
+            ahead_arm(jax.jit(lambda x: x * 2.0), label)(a)
+    record = json.loads((tmp_path / UNPREPARED).read_text())
+    assert len(record["reasons"]) == 2 and record["reasons"][0]["error"] == record["error"]
