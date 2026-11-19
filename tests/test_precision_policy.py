@@ -1821,18 +1821,24 @@ def power2_rounds_a_subnormal_result_once():
     Its pullback applies the factors in reverse and rounds once too, a broadcast operand's cotangent summed
     after each term is scaled: the cotangent `0.5 + 2^-24` to `1` by `2^-149` is `2^-149`, and to a scalar by
     two such terms `2^-148`, where the remainder applied last rounded it to zero (base review 44e282c4f F1).
-    A GPU numerics cell (tests/test_gpu_numerics.py)."""
+    A GPU numerics cell (tests/test_gpu_numerics.py), one program prepared as an arm is in a GPU tier part
+    (`ahead_arm`, base review 85b5535a6 F4)."""
+    from reference_error import ahead_arm
+
     from dew.nn.precision import power2
 
-    found = np.asarray(jax.jit(power2)(jnp.float32(0.5 + 2.0 ** -24), jnp.int32(-149)))
-    # Its one correctly rounded answer, the least subnormal's bits.
-    assert found.dtype == np.float32 and found.view(np.uint32) == 1, found.view(np.uint32)
-    cotangent = jnp.float32(0.5 + 2.0 ** -24)
-    for exponent, bits in ((jnp.int32(-149), 1), (jnp.full((2,), -149, jnp.int32), 2)):
-        _, pullback = jax.vjp(lambda x, exponent=exponent: power2(x, exponent), jnp.float32(1.0))
-        (pulled,) = jax.jit(pullback)(jnp.broadcast_to(cotangent, exponent.shape))
-        pulled = np.asarray(pulled)
-        assert pulled.dtype == np.float32 and pulled.view(np.uint32) == bits, pulled.view(np.uint32)
+    def scaled(x, one, cotangent, exponents):
+        pulled = [jax.vjp(lambda y, k=k: power2(y, k), one)[1](jnp.broadcast_to(cotangent, k.shape))[0]
+                  for k in (exponents[0], exponents)]
+        return power2(x, exponents[0]), *pulled
+
+    tiny = np.float32(0.5 + 2.0 ** -24)
+    found = ahead_arm(jax.jit(scaled), "a power of two's scaling and its pullback")(
+        tiny, np.float32(1.0), tiny, np.full((2,), -149, np.int32))
+    # Each one correctly rounded answer: the least subnormal's bits, twice it summed.
+    for value, bits in zip(found, (1, 1, 2), strict=True):
+        value = np.asarray(value)
+        assert value.dtype == np.float32 and value.view(np.uint32) == bits, value.view(np.uint32)
 
 
 def test_a_python_integer_exponent_past_float32_saturates():
