@@ -1446,6 +1446,15 @@ def test_an_aligned_sums_tangent_leaks_no_tracer():
         jax.grad(lambda a: aligned_sum([(a, one)]))(one)
 
 
+@pytest.mark.parametrize("axis", [2, -3, (0, 0), (1, -1)], ids=["past the rank", "before it", "repeated",
+                                                               "repeated by its sign"])
+def test_an_aligned_sum_refuses_an_axis_its_term_has_not(axis):
+    """`aligned_sum([(x,)], axis)` of a `[2, 3]` term over an axis past its rank or repeated: a ValueError, as
+    `jnp.sum`'s, where the axis wrapped by the rank reduced another (row 8837)."""
+    with pytest.raises(ValueError):
+        aligned_sum([(jnp.ones((2, 3), jnp.float32),)], axis=axis)
+
+
 def test_an_aligned_sum_over_an_empty_axis_is_positive_zero():
     """`aligned_sum` over an empty fp32 axis: positive zero, IEEE's sum of no terms, where a sum of none
     counted as of negative zeros alone, negative zero (base review 6c68b90ad F4)."""
