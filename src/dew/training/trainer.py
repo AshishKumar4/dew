@@ -14,7 +14,6 @@ import contextlib
 import dataclasses
 import datetime
 import functools
-import gc
 import hashlib
 import logging
 import os
@@ -30,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.training import dynamic_scale as dynamic_scale_lib
-from jax.core import Tracer
+from jax._src import core as jax_core
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
@@ -147,6 +146,7 @@ from dew.training._fit import (
     restored,
     restored_or_restarted,
     resumed_on,
+    settled_heap,
     stage_reached,
     unrecorded_parts,
     validation_read,
@@ -444,10 +444,15 @@ class Trainer(Generic[Loss, Effects]):
         from dew.nn.inputs import request_key
         ready_process()  # A key given here opens the backend as the run's does (`key`).
         key = self.key if key is None else request_key(key)
-        if not self.host_master and not isinstance(key, Tracer):
-            # One program, not each operation's (`built_start`): the moving state its buffers, the frozen tree
-            # the held arrays as they are. A state held on the host takes the arrays over as it is placed.
-            return built_start(self.initial_state, initializer, key)
+        if not self.host_master and jax_core.trace_state_clean():
+            # Outside any trace, one program, not each operation's (`built_start`): the moving state its
+            # buffers, the frozen tree the held arrays. This body's, not the bound override's, which then
+            # changes it once (row 8730). A state held on the host takes the arrays over as it is placed.
+            return built_start(self._fresh_state, initializer, key)
+        return self._fresh_state(initializer, key)
+
+    def _fresh_state(self, initializer: Initializer, key: jax.Array) -> TrainState:
+        """`initial_state`'s body, which an override reaches through the base alone (`super()`)."""
         init_key, run_key = jax.random.split(key)
         initialized = initializer(init_key)
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
@@ -2295,22 +2300,18 @@ class Trainer(Generic[Loss, Effects]):
             # A process whose reader changed a field or a shape would compile
             # a program whose collectives its peers' never meet.
             agreed_same("training batch layout", lambda: batch_layout(batch))
-            began, held = time.perf_counter(), sys.getallocatedblocks()
+            began = time.perf_counter()
             with region("compile"), run.held():
                 compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
             seconds = time.perf_counter() - began
-            # A full collection walks the whole heap, run once the objects made since outnumber a quarter of
-            # those kept (Modules/gcmodule.c: long_lived_pending < long_lived_total / 4). A compile makes
-            # millions, so the first after it walked them in the loop, 0.75-0.9 s at a 4B step (row 6739);
-            # collected here unless the compile made fewer (a warm 3-step fit's took 0.48 s of 0.72).
-            if sys.getallocatedblocks() - held > held // 4:
-                gc.collect()
+            settled_heap(run)
             links = {axis: AxisLink(link.bytes_per_second, link.spread) for axis, link in self.links.items()}
             run.signatures[signature] = signature_digest(signature)
             self._report(StepCompiled(seconds, recompute_record(self.objective), links, self.memory,
                                       self.plan, run.signatures[signature]),
                          int(trials.state.step) if reported is None else reported)
             self._unproven = True
+        settled_heap(run)  # A step the process held, its fit's start collected all the same.
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
         return (*self._compiler.drawn(compiled[signature], interval, run.current), trials.state)

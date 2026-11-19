@@ -14,16 +14,39 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
-from ahead_programs import arguments, programs
+from lane_environment import without_flags
+from ahead_programs import arguments
 from jax.experimental import topologies
 
 from dew._devices import pool_share
-from dew.nn.kernels.generation import assumed, built_target
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.generation import assumed
 from dew.training.ahead import BuildTarget, compiled_in, dumps
 
 pytestmark = pytest.mark.gpu(reason="a program compiled ahead runs on the GPU it was built for")
 
+HERE = """
+import pickle
+import sys
+
+import numpy as np
+from ahead_programs import programs
+
+from dew.nn.kernels.generation import assumed, built_target
+from dew.nn.kernels.options import owned_program
+
+generation, multiprocessors = sys.argv[1], int(sys.argv[2])
+with open(sys.argv[3], "rb") as file:
+    arrays = pickle.load(file)
+here = {}
+for name, (function, _) in programs(generation).items():
+    # Under the facts the build used: this GPU's generation and its own multiprocessors.
+    with assumed(built_target(generation, multiprocessors)):
+        here[name] = np.asarray(owned_program(function)(*arrays[name]))
+with open(sys.argv[4], "wb") as file:
+    pickle.dump(here, file)
+"""
+"""A fresh process compiling the programs for argv[1] on this GPU at argv[2] multiprocessors, as the build
+compiles them, and running them on the arguments at argv[3], their outputs written to argv[4]."""
 BUILD = """
 import sys
 
@@ -259,17 +282,25 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
     # A target is the device's own, whatever generation this process assumes.
     with assumed("sm80" if generation != "sm80" else "sm90"):
         assert BuildTarget.of(jax.devices()[:1]) == own
-    for name, text in (("build.py", BUILD), ("run.py", RUN), ("refused.py", REFUSED)):
+    for name, text in (("here.py", HERE), ("build.py", BUILD), ("run.py", RUN), ("refused.py", REFUSED)):
         (tmp_path / name).write_text(text)
+    # Every process the autotuner on and measuring, the lane's level 0 and deterministic ops left out (under
+    # which XLA measures nothing and keeps no picks), every other flag kept, so the build and the run agree
+    # on their compile options; and one store of picks, which here's compile writes and the build reads
+    # (row 8457: at level 0 nothing tuned, so a node's compile never met an untuned choice and its file
+    # never said one).
     environment = environment_of(tmp_path)
+    picks = "--xla_gpu_per_fusion_autotune_cache_dir"
+    environment["XLA_FLAGS"] = " ".join((without_flags(
+        environment.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level", "--xla_gpu_deterministic_ops", picks),
+        f"{picks}={tmp_path / 'picks'}"))
     arrays = {name: [np.asarray(array) for array in drawn] for name, drawn in arguments(generation).items()}
-    # Compiled here first, on this GPU, which tunes them and leaves its choices beside the compilation cache
-    # the build reads (row 8422: a node's programs compile tuned or are refused).
-    here = {}
-    for name, (function, _) in programs(generation).items():
-        # Under the facts the build used: this GPU's generation and its own multiprocessors.
-        with assumed(built_target(generation, own.multiprocessors)):
-            here[name] = np.asarray(owned_program(function)(*arrays[name]))
+    (tmp_path / "arguments.pkl").write_bytes(pickle.dumps(arrays))
+    # Compiled first on this GPU, which tunes them and leaves its choices beside the compilation cache the
+    # build reads (row 8422: a node's programs compile tuned or are refused).
+    subprocess.run([sys.executable, str(tmp_path / "here.py"), generation, str(own.multiprocessors),
+                    str(tmp_path / "arguments.pkl"), str(tmp_path / "here.pkl")], env=environment, check=True)
+    here = pickle.loads((tmp_path / "here.pkl").read_bytes())
     topology = tmp_path / "topology.bin"
     topology.write_bytes(topologies.get_attached_topology("cuda").serialize())
     # Built where no GPU is visible, as a CPU host builds them, over this GPU's serialized topology.
@@ -277,7 +308,6 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
     build = [sys.executable, str(tmp_path / "build.py"), generation, str(tmp_path / "programs.dew-aot"),
              str(own.multiprocessors), str(topology)]
     subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
-    (tmp_path / "arguments.pkl").write_bytes(pickle.dumps(arrays))
     # Loaded and run in a fresh process whose compilers' dumps must stay empty; refused in one whose XLA
     # computes otherwise.
     run = [sys.executable, str(tmp_path / "run.py"), str(tmp_path / "programs.dew-aot"),

@@ -5,6 +5,7 @@ here, and runs on one in the GPU gate."""
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -2136,27 +2137,29 @@ def test_a_values_parts_sum_back_to_it_exactly_fp32s_largest_among_them():
     np.testing.assert_array_equal(np.asarray(product.whole(product.formed(x, 3))), np.asarray(x))
 
 STAGED = (8, 32, 3)
-"""A staged output's tile: its rows, a chunk buffer's columns, and its chunks (two buffers, two tiles)."""
+"""A staged output's tile: its rows, a chunk buffer's columns, and its chunks (two buffers)."""
 
 
-def _staged_launch(waits: tuple[int, ...], **launch):
-    """A kernel storing two tiles in turn of an output staged through two chunk buffers, `STAGED`'s chunks
-    a tile (`stores.staged_chunks` at `waits`, chunk c in buffer c % 2), each tile its columns' indices plus
-    a thousand times its own; `launch` the kernel's other arguments."""
-    rows, width, chunks = STAGED
+def _staged_launch(waits: tuple[int, ...], stored: tuple[int, ...] = (STAGED[0],) * 2,
+                   staging: Callable = stores.staged_chunks, **launch):
+    """A kernel storing tiles in turn of an output staged through two chunk buffers, a chunk a wait of
+    `waits` a tile (`staging`, `stores.staged_chunks` or its unguarded `stores.staged`, at `waits`: chunk c in
+    buffer c % 2), tile t's `stored[t]` rows at its own rows, `STAGED`'s rows and columns a chunk, each its
+    columns' indices plus a thousand times its own; `launch` the kernel's other arguments."""
+    rows, width, _ = STAGED
+    chunks = len(waits)
 
     def body(out_gmem):
         def scoped(smem):
-            for tile in range(2):
+            for tile, count in enumerate(stored):
                 value = jax.lax.broadcasted_iota(jnp.float32, (rows, chunks * width), 1) + 1000.0 * tile
-                stores.staged_chunks(smem, value, out_gmem, (tile * rows, 0, jnp.int32(rows), 0, rows, rows),
-                                     waits=waits)
+                staging(smem, value, out_gmem, (tile * rows, 0, jnp.int32(count), 0, rows, rows), waits=waits)
             plgpu.wait_smem_to_gmem(0)
 
         pl.run_scoped(scoped, plgpu.SMEM((2, rows, width), jnp.float32))
 
-    return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((2 * rows, chunks * width), jnp.float32),
-                        **launch)
+    out = jax.ShapeDtypeStruct((len(stored) * rows, chunks * width), jnp.float32)
+    return plgpu.kernel(body, out_type=out, **launch)
 
 
 @pytest.mark.parametrize("loosened", [None, 0, 2], ids=["derived", "first-chunk", "third-chunk"])
@@ -2187,49 +2190,65 @@ def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loo
         reset_gpu_interpret_mode_state()
 
 
-@pytest.mark.parametrize("staged", [False, True], ids=["skipped", "staged"])
-def test_a_share_storing_no_rows_stages_no_chunk_between_stored_tiles(staged):
-    """Three tiles of an output staged two chunks a tile through two chunk buffers at the derived waits
-    (`stores.buffer_waits`: one group left in flight before each), the second tile's share storing no rows,
-    under the GPU interpreter's race detection: `stores.staged_chunks` stages nothing for it (no buffer
-    written, no group issued), so each buffer is rewritten once its last store has read it and the output is
-    the first and third tiles' values. Staged anyway, its chunks writing their buffers but issuing no
-    copy, its second chunk's wait counts a group it never issued and rewrites the buffer the first tile's
-    last store still reads, which the detector names (base review 5b513e9af F1)."""
+SKIPPED = (STAGED[0], 0, STAGED[0])
+"""Three tiles' stored rows, the second's share storing none (a ragged last tile's second consumer's)."""
+
+SKIPPED_WAITS = stores.buffer_waits(2, 2)
+"""`SKIPPED`'s tiles' waits, two chunks a tile through two buffers: one group left in flight before each, so
+a zero-row share staged anyway writes a buffer another tile's store may still read (three chunks drain every
+store before a tile's first: base review 68e1f210f F3)."""
+
+
+@pytest.mark.parametrize("staging", [stores.staged_chunks, stores.staged], ids=["skipped", "staged"])
+def test_a_share_storing_no_rows_stages_no_chunk_between_stored_tiles(staging):
+    """Three tiles of an output staged through two chunk buffers at the derived waits, the second tile's share
+    storing no rows (`SKIPPED`), under the GPU interpreter's race detection: `stores.staged_chunks` stages
+    nothing for it, so each buffer is rewritten once its last store has read it and the output holds the
+    first and third tiles' values. Staged anyway (`stores.staged`, its chunks written but no copy issued),
+    a wait counts a group it never issued and a buffer is rewritten under the first tile's store, which the
+    detector names (base review 5b513e9af F1)."""
     from jax._src.pallas.mosaic_gpu.interpret.interpret_pallas_call import reset_gpu_interpret_mode_state
 
-    rows, width, chunks = 8, 32, 2
-    waits = stores.buffer_waits(chunks, 2)
-    assert waits == (1, 1)
-
-    def body(out_gmem):
-        def scoped(smem):
-            for tile, stored in enumerate((rows, 0, rows)):
-                value = jax.lax.broadcasted_iota(jnp.float32, (rows, chunks * width), 1) + 1000.0 * tile
-                place = (min(tile, 1) * rows, 0, jnp.int32(stored), 0, rows, rows)
-                if staged and stored == 0:
-                    for chunk in range(chunks):
-                        plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
-                        stores.staged_rows(smem.at[chunk], value[:, chunk * width:(chunk + 1) * width],
-                                           out_gmem, place[0], 0, place[2], chunk * width, rows, rows)
-                    continue
-                stores.staged_chunks(smem, value, out_gmem, place, waits=waits)
-            plgpu.wait_smem_to_gmem(0)
-
-        pl.run_scoped(scoped, plgpu.SMEM((2, rows, width), jnp.float32))
-
-    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((2 * rows, chunks * width), jnp.float32),
-                          interpret=plgpu.InterpretGPUParams(detect_races=True))
-    if not staged:
-        tiles = 1000.0 * np.repeat([0, 2], rows)[:, None]
-        columns = np.arange(chunks * width, dtype=np.float32)
-        np.testing.assert_array_equal(np.asarray(kernel()), columns + tiles)
+    rows, width, _ = STAGED
+    chunks = len(SKIPPED_WAITS)
+    assert SKIPPED_WAITS == (1, 1)
+    kernel = _staged_launch(SKIPPED_WAITS, SKIPPED, staging,
+                            interpret=plgpu.InterpretGPUParams(detect_races=True))
+    if staging is stores.staged_chunks:
+        out = np.asarray(kernel())
+        columns = np.broadcast_to(np.arange(chunks * width, dtype=np.float32), (rows, chunks * width))
+        np.testing.assert_array_equal(out[:rows], columns)
+        np.testing.assert_array_equal(out[2 * rows:], columns + 2000.0)
         return
     try:
         with pytest.raises(jax.errors.JaxRuntimeError):
             kernel()
     finally:
         reset_gpu_interpret_mode_state()
+
+
+@pytest.mark.parametrize("staging", [stores.staged_chunks, stores.staged], ids=["skipped", "staged"])
+def test_a_share_storing_no_rows_issues_no_write_and_no_group(staging):
+    """`SKIPPED`'s launch through the group-aware protocol checker (`ring_protocol`, its stores retired a
+    group at a time): skipped, the second tile's share writes no buffer and issues no group, the program
+    two tiles' staging, and every interleaving holds; staged anyway (`stores.staged`), its chunks write their
+    buffers with no group, so a wait counted in groups leaves the first tile's store reading a buffer as it
+    is written again, which the checker finds where the interpreter, ignoring commits, saw only its order
+    (base review 3150e8dfc F6)."""
+    from ring_protocol import Violation, commits_group, explore, programs
+
+    chunks = len(SKIPPED_WAITS)
+    threads, arrivals = programs(_staged_launch(SKIPPED_WAITS, SKIPPED, staging), threads=1)
+    [program] = threads
+    writes = sum(event.kind == "write" for event in program)
+    if staging is stores.staged_chunks:
+        groups = sum(map(commits_group, program))
+        assert (writes, groups) == (2 * chunks, 2 * chunks), program
+        assert explore(threads, arrivals) > 0
+        return
+    assert writes == 3 * chunks, program
+    with pytest.raises(Violation):
+        explore(threads, arrivals)
 
 
 def test_a_staged_outputs_launch_states_its_cost():
