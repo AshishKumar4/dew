@@ -789,15 +789,12 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
     """A node's own work and dependent steps at the chunk's extents: products as fp32 products at `precision`
     (`cost._mode`), elementwise work on the CUDA cores, exponentials on the special-function units,
     a reduction's and a product's kernel (each a root of XLA's fusion, `cost.work`'s) and its result kept on
-    chip, written and read (`Work.kept_bytes`, at a lane's bytes, `cost.LANE_BYTES`; a token step's state so
-    too), and a loop's and a substitution's rows a step each, whose launches the step's latency holds
-    (`GpuTarget.step_seconds`, a loop iteration's, measured with its kernels)."""
+    chip (`cost.kept`, at a lane's bytes; a token step's state so too), and a loop's and a substitution's
+    rows a step each, whose launches the step's latency holds (`GpuTarget.step_seconds`, a loop iteration's,
+    measured with its kernels)."""
     c, k, v, d = extents.tokens, extents.keys, extents.values, extents.decay_keys
     product = functools.partial(cost.product_work, precision=precision)
-
-    def kept(*extent: int) -> float:
-        # A kernel's result of `extent`, written once and read once (`cost.work`'s).
-        return 2.0 * cost.LANE_BYTES * math.prod(extent)
+    kept = cost.kept
 
     if get_callable_args(node, Chunk.loop) is not None or get_callable_args(node, Chunk.plain) is not None:
         corrected = get_callable_args(node, Chunk.loop) is not None
@@ -809,10 +806,10 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
         # group entered too (`scan._looped`'s `held`), a group of one token's the current state's.
         states = 2 if extents.apart > 1 else 1
         return Work(operations=c * per_token, exponentials=c * d, span=2.0 * c,
-                    kept_bytes=c * states * kept(k, v))
+                    kept_bytes=kept(c * states * k * v))
     if get_callable_args(node, Chunk.prefix) is not None:
         # The compensated prefix (`scan._decays`): one pass over the tokens' exponents, one kernel.
-        return Work(operations=12.0 * c * d, kernels=1.0, kept_bytes=kept(c, d))
+        return Work(operations=12.0 * c * d, kernels=1.0, kept_bytes=kept(c * d))
     if (args := get_callable_args(node, Chunk.decay)) is not None:
         # Its pairs' exponentials of the prefix's differences, fused with the prefix's pass.
         part = terms.text(args[0])
@@ -821,13 +818,13 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
     if (args := get_callable_args(node, Chunk.gram)) is not None:
         if d == 1:
             return product(c, k, c) + Work(operations=2.0 * c * c)
-        return Work(operations=3.0 * c * c * k, kernels=1.0, kept_bytes=kept(c, c))
+        return Work(operations=3.0 * c * c * k, kernels=1.0, kept_bytes=kept(c * c))
     if get_callable_args(node, Chunk.spread) is not None:
         # The reads `Q U^T`, then each pair's keys decayed and applied: a scalar decay's a product, a decay a
         # key's elementwise over the pairs' keys.
         reads = product(c, v, c)
         return reads + (product(c, c, k) if d == 1
-                        else Work(operations=3.0 * c * c * k, kernels=1.0, kept_bytes=kept(c, k)))
+                        else Work(operations=3.0 * c * c * k, kernels=1.0, kept_bytes=kept(c * k)))
     if get_callable_args(node, Chunk.applied) is not None:
         return product(c, v, k)
     if get_callable_args(node, Chunk.doubled) is not None:
