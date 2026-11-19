@@ -2341,3 +2341,24 @@ def test_a_program_compiled_for_a_compile_only_gpu_is_refused_by_the_keeper_not_
     with keeping() as programs:
         owned_program(lambda values: values * 2).executable(placed)
     assert programs.kept == {} and len(programs.refused) == 1
+
+
+@pytest.mark.mesh(devices=2)
+def test_programs_built_for_the_host_cpu_load_onto_it_whatever_the_process_lists_first(monkeypatch):
+    """Programs compiled ahead for the host's CPU (`BuildTarget.cpu`) load onto the host's first CPU
+    (`BuildTarget.own_devices`) in a process whose devices list another first, as a GPU's process lists its
+    GPUs before the CPUs it holds beside them: loaded onto the process's first devices, a CPU's program went
+    to them (row 8376's CPU-placed arms, `reference_error.ahead_arm(host=True)`)."""
+    from dew.training.ahead import AheadPrograms, BuildTarget, Executable
+
+    host = jax.devices("cpu")
+    x = np.arange(4.0, dtype=np.float32)
+    placed = jax.sharding.SingleDeviceSharding(host[0])
+    doubled = jax.jit(lambda x: x * 2.0, out_shardings=placed).lower(
+        jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=placed)).compile()
+    programs = AheadPrograms(BuildTarget.of(host[:1]), {"doubled": Executable.of(doubled)})
+    listed = jax.devices
+    # A process listing another device first, the host's first CPU among its CPUs.
+    monkeypatch.setattr(jax, "devices", lambda backend=None: listed(backend) if backend else listed()[1:])
+    ran = programs.loaded()["doubled"](x)
+    assert ran.devices() == {host[0]} and np.asarray(ran).tolist() == [0.0, 2.0, 4.0, 6.0]
