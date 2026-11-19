@@ -13,6 +13,12 @@ import urllib.request
 from pathlib import Path
 
 BASELINE = "7ad0d4079de7ab7280e08924201992e3ae1a7ff9"
+"""The reference checkout whose loaders the capture records."""
+
+LEGACY_SCRIPT = ("e542a4f7f2aed17fc49b494e979743bd71ac691a",
+                 "tools/measurements/data-pipeline/data_oracle_legacy.py")
+"""The capture script, as Dew last held it: it drives the reference checkout's own loader API, which no
+later Dew has, so it runs there and is read from that commit rather than kept beside this one."""
 
 
 def main() -> None:
@@ -20,9 +26,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--case", action="append", default=[])
     options = parser.parse_args()
-    script = Path(__file__).with_name("data_oracle_legacy.py").resolve()
     with tempfile.TemporaryDirectory(prefix="dew-oracle-") as directory:
         root = Path(directory)
+        commit, path = LEGACY_SCRIPT
+        script = root / "data_oracle_legacy.py"
+        source = f"https://raw.githubusercontent.com/AshishKumar4/dew/{commit}/{path}"
+        urllib.request.urlretrieve(source, script)
         archive = root / "baseline.tar.gz"
         urllib.request.urlretrieve(f"https://codeload.github.com/AshishKumar4/dew/tar.gz/{BASELINE}", archive)
         with tarfile.open(archive) as packed:

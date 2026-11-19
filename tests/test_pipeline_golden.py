@@ -38,7 +38,7 @@ from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Formatting
 
 GOLD = Path(__file__).parent / "fixtures/golden/loaders-7ad0d4079.json.gz"
-ORACLE = Path(__file__).parents[1] / "tools/measurements/data-pipeline/data_oracle_legacy.py"
+ORACLE = Path(__file__).parents[1] / "tools/measurements/data-pipeline/golden_records.py"
 CASES = ("text_windows", "text_packed", "text_phases", "chat", "prompts", "images_memory",
          "images_arrayrecord", "images_hf", "images_tfds", "hub_records", "tfds_records")
 """The corpora the old loaders read alike. Decision rows and preference pairs are not among them: they
@@ -50,10 +50,10 @@ resume."""
 
 @functools.cache
 def _oracle():
-    """The frozen reference's capture script, whose token stores the reference read: the stores this
-    test reads are the ones it wrote (`token_store`), and whose digest of a batch (`digest`) this test
-    reads Dew's by."""
-    spec = importlib.util.spec_from_file_location("data_oracle_legacy", ORACLE)
+    """The frozen capture's digest and input writers (`golden_records`), whose token stores the reference
+    read: the stores this test reads are the ones it wrote (`token_store`), and whose digest of a batch
+    (`digest`) this test reads Dew's by."""
+    spec = importlib.util.spec_from_file_location("golden_records", ORACLE)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
