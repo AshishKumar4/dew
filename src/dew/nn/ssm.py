@@ -36,29 +36,34 @@ def affine_spans(left, right, multiply=operator.mul, add=operator.add):
 def affine_states(decay, write, entering, axis: int):
     """The states `h_t = a_t h_(t-1) + b_t` along `axis` of decays `decay` (each at most one in magnitude) and
     writes `write` from the state `entering` (`write`'s shape without `axis`): the recurrence a token at a
-    time over the axis (a chunk's tokens), straight-line code up to `UNROLLED` tokens (a longer axis a scan
-    of them, its compile bounded), so its arithmetic and JAX's derivative of it at every order are the
-    recurrence's own. An associative scan's spans of writes from a zero state passed float32's largest
-    where every state was within it (row 8465), and halved, its faint values beside them flushed (row 8486);
-    a scan's transpose formed its last carry's zero cotangent times an infinite state, NaN at a second order
-    (the head review of fd1a993b6)."""
+    time over the axis (a chunk's tokens), straight-line code up to twice `UNROLLED` tokens (a longer axis's
+    interior a scan of such blocks, its compile bounded), so its arithmetic and JAX's derivative of it at
+    every order are the recurrence's own. An associative scan's spans of writes from a zero state passed
+    float32's largest where every state was within it (row 8465), and halved, its faint values beside them
+    flushed (row 8486); a scan's transpose formed its last carry's zero cotangent times an infinite state, NaN
+    at a second order (the head review of fd1a993b6)."""
     decay, write = (jnp.moveaxis(t, axis, 0) for t in (decay, write))
-    length = write.shape[0]
-    if length <= UNROLLED:
+    if write.shape[0] <= 2 * UNROLLED:
         return jnp.moveaxis(_tokens(decay, write, entering), 0, axis)
+    # The first and last blocks straight-line, the interior a scan of blocks: the first's states set the
+    # carry's dtype, and no scan's last carry meets a cotangent (its transpose's zero times an infinity).
+    first = _tokens(decay[:UNROLLED], write[:UNROLLED], entering)
+    blocks = (write.shape[0] - UNROLLED - 1) // UNROLLED
+    end = UNROLLED * (blocks + 1)
 
     def block(state, operands):
         states = _tokens(operands[0], operands[1], state)
         return states[-1], states
 
-    blocks = tuple(t[:length - length % UNROLLED].reshape(-1, UNROLLED, *t.shape[1:]) for t in (decay, write))
-    last, states = jax.lax.scan(block, entering, blocks)
-    rest = _tokens(decay[length - length % UNROLLED:], write[length - length % UNROLLED:], last)
-    return jnp.moveaxis(jnp.concatenate([states.reshape(-1, *states.shape[2:]), rest]), 0, axis)
+    interior = tuple(t[UNROLLED:end].reshape(blocks, UNROLLED, *t.shape[1:]) for t in (decay, write))
+    carried, states = jax.lax.scan(block, first[-1], interior)
+    last = _tokens(decay[end:], write[end:], carried)
+    states = states.reshape(blocks * UNROLLED, *states.shape[2:])
+    return jnp.moveaxis(jnp.concatenate([first, states, last]), 0, axis)
 
 
 UNROLLED = 64
-"""The tokens `affine_states` runs as straight-line code at once (a longer axis a scan of such blocks)."""
+"""The tokens of a block `affine_states` runs straight-line (a long axis's interior a scan of them)."""
 
 
 def _tokens(decay, write, entering):
