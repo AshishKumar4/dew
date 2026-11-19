@@ -379,7 +379,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
         result = jax.device_get(executable(*inputs))
         flops = compiled_flops(executable)
         assert flops is not None
-        moved = sharded.collective_bytes(executable.as_text(), COLLECTIVES)
+        moved = sharded.collective_bytes(executable, COLLECTIVES)
         return result, flops * sequence * tensor, moved
 
     expected, _, _ = compiled(1, 1, Link(None, None))
@@ -436,7 +436,7 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
             trainer.device_mesh = mesh.build(jax.devices()[:devices])
             state, shardings, _ = trainer.place()
             run = trainer.compile(state, shard_batch(trainer.device_mesh, drawn(0)))
-            gathered = sharded.collective_bytes(trainer.executable.as_text(), ("all-gather",))
+            gathered = sharded.collective_bytes(trainer.executable, ("all-gather",))
             built[frozen_whole, wide] = trainer, shardings, gathered, run
         return built[frozen_whole, wide]
 

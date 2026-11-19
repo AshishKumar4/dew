@@ -226,19 +226,22 @@ class Expected(NamedTuple):
     collectives: frozenset[tuple[str, frozenset[str]]] = frozenset()
 
 
-def _device(generation: str, axes: tuple[tuple[str, int], ...] = (("data", 1),)) -> Mesh:
-    """A mesh of compile-only devices of `generation`, of `axes` (one device's by default)."""
+def _device(generation: str, axes: tuple[tuple[str, int], ...] = (("data", 1),), memory: int | None = None
+            ) -> Mesh:
+    """A mesh of compile-only devices of `generation`, of `axes` (one device's by default), each stating
+    `memory` where given (else the generation's least part's, `generation.target_config`)."""
     sizes = tuple(size for _, size in axes)
-    devices = compile_only_gpus(generation, count=int(np.prod(sizes)))
+    devices = compile_only_gpus(generation, count=int(np.prod(sizes)), memory=memory)
     return Mesh(np.array(devices).reshape(sizes), tuple(name for name, _ in axes))
 
 
-def lowered_for(fn, args, generation: str, expected: Expected | None = None):
+def lowered_for(fn, args, generation: str, expected: Expected | None = None, *, memory: int | None = None):
     """`fn` traced on `args`, its abstract leaves placed on compile-only devices of the CUDA `generation`
-    (`_device`: one, replicated, or `expected`'s mesh, each argument by its spec), and lowered as on that GPU
-    (`assumed`, the mesh's abstract devices) within its block's shared memory: what XLA compiles for it,
-    never run."""
-    mesh = _device(generation) if expected is None else _device(generation, expected.axes)
+    (`_device`: one, replicated, or `expected`'s mesh, each argument by its spec, each device stating
+    `memory` where given), and lowered as on that GPU (`assumed`, the mesh's abstract devices) within its
+    block's shared memory: what XLA compiles for it, never run."""
+    mesh = (_device(generation, memory=memory) if expected is None
+            else _device(generation, expected.axes, memory=memory))
     specs = (None,) * len(args) if expected is None else expected.specs
     def placed_on(arg, sharding: NamedSharding):
         return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
@@ -455,7 +458,7 @@ def _route(lowered, executable, mesh: Mesh) -> dict:
         shards.setdefault(call.name, []).append([list(shape) for shape in call.operands])
     return {"launches": sorted(shards), "shards": shards,
             "collectives": sorted([op, sorted(axes)]
-                                  for op, axes in collective_axes(executable.as_text(), mesh))}
+                                  for op, axes in collective_axes(executable, mesh))}
 
 
 def route_failures(cases, found: list[dict]) -> list[str]:
