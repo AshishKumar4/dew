@@ -21,7 +21,7 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -1093,7 +1093,16 @@ def recorded_custom(processor: Processor | None) -> Processor | None:
     return processor
 
 
-def processor_settings(processor: Processor | None) -> Mapping[str, object]:
+class ProcessorSettings(TypedDict):
+    """The task settings' fields that record a run's host processor (`processor_settings`)."""
+
+    tokenizer: str | None
+    tokenizer_files: Mapping[str, str] | None
+    processor: SourceReference | None
+    custom: Processor | None
+
+
+def processor_settings(processor: Processor | None) -> ProcessorSettings:
     """The task settings' fields that record a run's host `processor` (`TaskSettings`): where its run
     tokenizer is and what it is, a source's processor, or a processor of the user's own (`recorded_custom`),
     each None where it is not that: what every objective's `task_settings` records alike."""
