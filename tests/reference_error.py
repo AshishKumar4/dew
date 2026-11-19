@@ -556,7 +556,7 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
             # on the GPU, their float64 on its FP64 units, as its arms (`_compile_arms`), named
             # (`truths_ahead.running`); the choice moves a float64 truth by float64's rounding alone
             # (row 8576).
-            store.compile_site(label, {}, {}, at_run=str(refused))
+            store.compile_site(label, programs, held, at_run=str(refused))
     # A qualification run sizes a plain site first (`_qualified`), on its sizing draws through its arms.
     sizing = _sizing_seeds(reference_fn) if os.environ.get(QUALIFY) and plain else range(0)
     # A library arm (`library_fn`) one of them, run on Dew's own inputs as a further reference is (row 8468).
@@ -628,7 +628,8 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
             except report.CompiledOnDevice as refused:
                 # Check 1 measures the arms as their GPU compiles them, a choice no compile without it
                 # holds: every arm of the site compiles in its run, as the prepare states (`_stored_arm`).
-                store.compile_site(armed(label), {}, {}, arms=True, at_run=str(refused))
+                store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain), arms=True,
+                                   at_run=str(refused))
 
 
 def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference: bool):

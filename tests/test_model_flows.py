@@ -468,6 +468,8 @@ def test_a_convolution_sites_truths_and_arms_compile_on_its_gpu_in_its_run(tmp_p
     sites = [json.loads(site.read_text()) for site in store.glob("*/site.json")]
     assert sorted((site["arms"], site["host"], "at_run" in site) for site in sites) == [
         (False, False, True), (True, False, True)], sites
+    # Their memory read offline, by which the lane sizes the run's worker (`compiled_memory`).
+    assert all(site["memory"] for site in sites), sites
     with compiled_truths(store, prepare=False, stamp="a"):
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
     # Its truths and its two arms, each named once.
@@ -968,7 +970,7 @@ def test_a_site_whose_truths_alone_are_at_run_computes_its_reference_as_its_trut
 
     def refusing_truths(store, label, programs, held, **options):
         # A choice its GPU makes, which no compile without that GPU holds, in its truths' programs alone.
-        if programs and not options.get("arms", False):
+        if programs and not options.get("arms", False) and options.get("at_run") is None:
             raise report.CompiledOnDevice(jax.jit(lambda x: x).lower(np.zeros(1, np.float32)), ["truth"])
         return real(store, label, programs, held, **options)
 
