@@ -559,6 +559,25 @@ def test_the_mosaic_walk_drops_a_slice_at_its_global_places(training, sliced):
         np.testing.assert_array_equal(value_grads.transpose(0, 2, 3, 1), expected)
 
 
+def _mosaic_gradients(spans, hooks):
+    """A training Mosaic call's gradients interpreted for an H100 (`attention_mosaic.backward` from its
+    split forward's residuals, `D` from them, `attention_gradient.split_delta`) and the reference's
+    (`template.reference` under `jax.vjp`), of `(query, key, value, dout)` at scale 1, for check 1."""
+    def ours(query, key, value, dout):
+        with generation.assumed("sm90", interpreted=True):
+            _, *residuals = attention_mosaic.forward(query, key, value, spans, hooks, scale=1.0,
+                                                     residuals=template.Kept.SPLIT, interpret=True)
+            grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                              scale=1.0, interpret=True)
+        return grads.query, grads.key, grads.value
+
+    def reference(query, key, value, dout):
+        _, pull = jax.vjp(lambda *qkv: template.reference(*qkv, spans, hooks, scale=1.0), query, key, value)
+        return pull(dout)
+
+    return ours, reference
+
+
 def test_a_mosaic_dropping_backwards_tiny_split_mean_keeps_its_query_gradient():
     """A bf16 Mosaic call interpreted for an H100, with logits 0 and -22, values 0 and 2^-126, dO 2^73,
     and dropout at rate 1 - 2^-53 keeping only the second key. Its split mean is below fp32's least
@@ -574,21 +593,27 @@ def test_a_mosaic_dropping_backwards_tiny_split_mean_keeps_its_query_gradient():
     key = key.at[0, 1, 0, 2].set(-4).at[0, 1, 0, 3].set(-2)
     value = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 1, 0, 0].set(2.0 ** -126)
     dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(2.0 ** 73)
-
-    def ours(query, key, value, dout):
-        with generation.assumed("sm90", interpreted=True):
-            _, *residuals = attention_mosaic.forward(query, key, value, spans, hooks, scale=1.0,
-                                                     residuals=template.Kept.SPLIT, interpret=True)
-            grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
-                                              scale=1.0, interpret=True)
-        return grads.query, grads.key, grads.value
-
-    def reference(query, key, value, dout):
-        _, pull = jax.vjp(lambda *qkv: template.reference(*qkv, spans, hooks, scale=1.0), query, key, value)
-        return pull(dout)
-
+    ours, reference = _mosaic_gradients(spans, hooks)
     assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
                     "a dropping split mean below fp32's least subnormal", seeds=FEWEST_SEEDS)
+
+
+def test_a_mosaic_dropping_backwards_kept_anchor_keeps_its_tiny_product():
+    """A bf16 Mosaic call interpreted for an H100 at logits -1 and 0, dropout at rate 1 - 2^-53 keeping only
+    the second key, the anchor, whose value is 2^-126 under a dO of 2^-40: the anchor's product with dO,
+    2^-166, is below fp32's least subnormal until its power of 2^53 joins it, so D takes the anchor's value
+    to the sums' power before the product (`attention_gradient.split_delta`): dQ's sign and size on par
+    with the reference's (check 1), where its product rounded to 0 first and dQ's second coordinate was
+    +6.96e-36 for -1.89e-35 (the base review of 6a57b66de, F1)."""
+    words = jnp.asarray([3181759654, 0], jnp.uint32)
+    hooks, spans = hooked(words, 1, 1, 1.0 - 2.0 ** -53), template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 1].set(1)
+    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 1].set(-1)
+    value = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 1, 0, 0].set(2.0 ** -126)
+    dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(2.0 ** -40)
+    ours, reference = _mosaic_gradients(spans, hooks)
+    assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
+                    "a dropping kept anchor's tiny product", seeds=FEWEST_SEEDS)
 
 
 def three_identical_keys():
@@ -801,14 +826,15 @@ def test_a_dropping_backwards_split_mean_past_fp32s_largest_before_its_power_is_
     """A bf16 row of four keys at equal logits, rate 1/4, three kept, values 3 2^126, dO 2^-125: the forward's
     split sums at the multiplier's reach of 2, over their total of 4, pass fp32's largest before the reach
     comes out, where D is 6. Taken out in one division with the total (`attention_gradient.split_delta`),
-    the gradients are on par with the reference's (check 1), where D was not finite (the base review of
-    e2b671ce9, F2)."""
+    the gradients of a Mosaic call interpreted for an H100, whose backward takes D from them, are on par
+    with the reference's (check 1), where D was not finite (the base review of e2b671ce9, F2; the portable
+    backward takes its own pass, of 6a57b66de, F2)."""
     words = first_seed(0.25, 4, lambda kept: int(np.sum(kept)) == 3)
-    query = jnp.zeros((1, 1, 1, 8), jnp.bfloat16).at[..., 1].set(1)
-    key = jnp.zeros((1, 4, 1, 8), jnp.bfloat16)
-    value = jnp.zeros((1, 4, 1, 8), jnp.bfloat16).at[:, :, :, 0].set(3 * 2.0 ** 126)
-    dout = jnp.zeros((1, 1, 1, 8), jnp.bfloat16).at[..., 0].set(2.0 ** -125)
-    ours, reference = _portable_gradients(template.spans(1, 4, 1), hooked(words, 1, 1, 0.25))
+    query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 1].set(1)
+    key = jnp.zeros((1, 4, 1, WIDTH), jnp.bfloat16)
+    value = jnp.zeros((1, 4, 1, WIDTH), jnp.bfloat16).at[:, :, :, 0].set(3 * 2.0 ** 126)
+    dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(2.0 ** -125)
+    ours, reference = _mosaic_gradients(template.spans(1, 4, 1), hooked(words, 1, 1, 0.25))
     assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
                     "a dropping split mean past fp32's largest", seeds=FEWEST_SEEDS)
 

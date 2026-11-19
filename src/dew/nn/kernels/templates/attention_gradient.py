@@ -265,16 +265,18 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
-    anchor = rows(anchor_value, cotangent)
     mean = others * expand(over, others)
 
     def centred(others: jax.Array, unit) -> tuple[jax.Array, jax.Array, jax.Array]:
-        # D's centre and numerators about it and about 0, each term in the units `unit` of `others`.
+        # D's centre and numerators about it and about 0, each term in the units `unit` of `others`, the
+        # anchor's value taken to them before its product with dO (after it, 2^-126 times 2^-40 rounded to 0
+        # before a power of 2^53, the base review of 6a57b66de, F1).
         own_held, others_held = own * over * unit, others_total * over * unit
+        held_value = anchor_value if isinstance(unit, float) else anchor_value * expand(unit, anchor_value)
+        anchor = rows(held_value, cotangent)
         about_zero = rows(read(split_output(others, own_held, anchor_value), cotangent), cotangent)
         off_anchor = others - expand(others_held, anchor_value) * anchor_value
-        return (anchor * unit, rows(read(off_anchor, cotangent), cotangent) - state_weight * unit * anchor,
-                about_zero)
+        return anchor, rows(read(off_anchor, cotangent), cotangent) - state_weight * anchor, about_zero
 
     if dropped == 1.0:
         return nearer_centre(*centred(mean, 1.0), key_index)
