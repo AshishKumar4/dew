@@ -619,19 +619,33 @@ def held_reference(flow: ModelFlow, found: list) -> None:
 
 def _compiled(flow: ModelFlow, named: Mapping[str, tuple[Callable, list]], arm: str, target):
     """The arm's programs of `named` (`programs_of`) compiled for `target` (`compile_programs`), one a call so
-    each program's routes are its own, and each program's routes by its kind (`ModelFlow.kinds`)."""
+    each program's routes are its own, each program's routes by its kind (`ModelFlow.kinds`), and the names
+    of those its compile refuses to prepare (`report.CompiledOnDevice`: a convolution, whose algorithm only
+    its GPU picks), which its run compiles on its GPU (`loaded`): their routes traced all the same. None of
+    the programs where every one is refused."""
+    from dew.nn.kernels.templates.report import CompiledOnDevice
     from dew.training.ahead import AheadPrograms, compile_programs
 
-    compiled, found = {}, {}
+    compiled, found, on_device = {}, {}, []
     for kind in flow.kinds:
         name = f"{kind} {arm}"
         with generation.routes() as found[kind]:
             # Over the node's own topology, tuned as its run's compile would be (row 8422).
-            compiled[kind] = compile_programs({name: named[name]}, target.generation, target.multiprocessors,
-                                              topology=os.environ[TOPOLOGY])
-    return AheadPrograms(compiled[flow.kinds[0]].target, {
+            try:
+                compiled[kind] = compile_programs({name: named[name]}, target.generation,
+                                                  target.multiprocessors, topology=os.environ[TOPOLOGY])
+            except CompiledOnDevice as refused:
+                on_device.extend(refused.programs or (name,))
+    if not compiled:
+        return None, found, on_device
+    return AheadPrograms(next(iter(compiled.values())).target, {
         name: program for each in compiled.values() for name, program in each.programs.items()},
-        tuned=all(each.tuned for each in compiled.values())), found
+        tuned=all(each.tuned for each in compiled.values())), found, on_device
+
+
+ON_DEVICE = "on_device.json"
+"""A flow's file in its store naming the programs its prepare could not prepare (`report.CompiledOnDevice`),
+each arm's, and why, which its run compiles on its GPU (`loaded`)."""
 
 
 def prepare(flow: ModelFlow) -> bool:
@@ -645,18 +659,24 @@ def prepare(flow: ModelFlow) -> bool:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / PORTABLE).unlink(missing_ok=True)
     named = programs_of(flow)
-    dew, found = _compiled(flow, named, "dew", target)
+    dew, found, on_device = _compiled(flow, named, "dew", target)
     if any(flow.native.values()) and not any(claimed(flow, found).values()):
         # No kernel off the reference path claims a choice the flow is for on this GPU: its run's to skip.
         (directory / PORTABLE).write_text(json.dumps({"stamp": stamp(), "target": target.generation}))
         return False
     (directory / PARAMS).write_bytes(pickle.dumps(flow.params))
-    dew.save(directory / "dew.programs")
     held_routes(flow, found, target.generation)
     with generation.chosen(**reference_kernels()):
-        reference, found = _compiled(flow, named, "reference", target)
-    reference.save(directory / "reference.programs")
+        reference, found, refused = _compiled(flow, named, "reference", target)
     held_reference(flow, [route for kind in flow.kinds for route in found[kind]])
+    for arm, programs in (("dew", dew), ("reference", reference)):
+        (directory / f"{arm}.programs").unlink(missing_ok=True)
+        if programs is not None:
+            programs.save(directory / f"{arm}.programs")
+    (directory / ON_DEVICE).write_text(json.dumps({
+        "programs": [*on_device, *refused], "stamp": stamp(),
+        "why": "a cuDNN convolution compiled without its GPU leaves its algorithm to run time "
+               "(report.DEVICELESS_CONVOLUTION_PICKS)"}))
     for kind in flow.kinds:
         judge(flow, {}, kind, target)
     programs = need(dew, reference, directory / "truths")
@@ -674,7 +694,9 @@ def need(dew, reference, truths: Path) -> dict[str, list[dict[str, int]]]:
     """A flow's run's programs as the allocator admits them (`truths_ahead.admitted_needs`): its own programs'
     (Dew's and its reference's, each `Executable.memory`), the state its run holds while its truths compute,
     and its truths' (`truths_ahead.compiled_memory`)."""
-    arms = [executable.memory._asdict() for programs in (dew, reference)
+    # A program its run compiles on its GPU (`ON_DEVICE`) states none ahead, as one whose compile states
+    # none (`Executable.memory`).
+    arms = [executable.memory._asdict() for programs in (dew, reference) if programs is not None
             for executable in programs.programs.values() if executable.memory is not None]
     return {"programs": admitted_needs(arms, compiled_memory(truths))}
 
@@ -715,10 +737,26 @@ def loaded(flow: ModelFlow) -> dict[str, Callable]:
     from dew.training.ahead import AheadPrograms
 
     directory = store_of(flow)
-    held = {name: program for arm in ("dew", "reference")
-            for name, program in AheadPrograms.load(directory / f"{arm}.programs").loaded().items()}
+    on_device = json.loads((directory / ON_DEVICE).read_text())["programs"]
+    held: dict[str, Callable] = {
+        name: program for arm in ("dew", "reference") if (directory / f"{arm}.programs").exists()
+        for name, program in AheadPrograms.load(directory / f"{arm}.programs").loaded().items()}
+    # Each program its prepare could not prepare compiled on this GPU as it first runs, under this process's
+    # flags, traced as its prepare traced it (the reference arm under its reference kernels), said.
+    named = programs_of(flow) if on_device else {}
+    for name in on_device:
+        kernels = reference_kernels() if name.endswith(" reference") else {}
+        held[name] = jax.jit(functools.partial(_traced_under, named[name][0], kernels))
+    if on_device:
+        print(f"{flow.name}: compiled on this GPU, its prepare unable to: {', '.join(on_device)}")
     return {name: as_given(lambda params, *inputs, program=program: jax.device_get(
                 program(*jax.tree.leaves(params), *inputs))) for name, program in held.items()}
+
+
+def _traced_under(program: Callable, kernels: Mapping[str, str], *arguments):
+    """`program(*arguments)` traced with `kernels` named (`generation.chosen`)."""
+    with generation.chosen(**kernels):
+        return program(*arguments)
 
 
 def judge(flow: ModelFlow, programs: Mapping[str, Callable], kind: str, target=None) -> None:
