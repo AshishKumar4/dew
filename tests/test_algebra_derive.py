@@ -301,13 +301,43 @@ def guarded(q, k, v, rows, keys):
     return (p @ v) / jnp.where(total == 0, 1.0, total)[:, None]
 
 
-@pytest.mark.parametrize("function", [unnormalized, guarded_backwards, guarded_signed],
-                         ids=["a sum", "a guard backwards", "a signed guard"])
+def over_unanchored(q, k, v, rows, keys):
+    """The values' plain sum over the weights' sum, `sum(v) / sum(exp(s - max s))`: a numerator no anchor
+    carries over one it does."""
+    del rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    total = jnp.sum(jnp.exp(s - jnp.max(s, axis=-1)[:, None]), axis=-1)
+    return jnp.sum(v)[None] / total
+
+
+def narrowed(q, k, v, rows, keys):
+    """The weights' sum narrowed to fp16 over itself, `fp16(S) / S`: of degree 0 but for the cast, which an
+    anchor's factor takes past fp16's largest."""
+    del v, rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    total = jnp.sum(jnp.exp(s - jnp.max(s, axis=-1)[:, None]), axis=-1)
+    return total.astype(jnp.float16).astype(jnp.float32) / total
+
+
+def across_rows(q, k, v, rows, keys):
+    """Each row's weights' sum over every row's, `S[:, None] / S[None, :]`: a ratio of carried sums whose
+    factors lie along different axes, one row's over another's."""
+    del v, rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    total = jnp.sum(jnp.exp(s - jnp.max(s, axis=-1)[:, None]), axis=-1)
+    return total[:, None] / total[None, :]
+
+
+@pytest.mark.parametrize("function", [unnormalized, guarded_backwards, guarded_signed, over_unanchored,
+                                      narrowed, across_rows],
+                         ids=["a sum", "a guard backwards", "a signed guard", "over an unanchored sum",
+                              "a narrowing cast", "across rows"])
 def test_an_anchor_of_an_output_its_sums_scale_is_refused(function):
     """A declaration whose output its sums' anchor scales is refused a moved anchor at its step
     (`derive.Refused`): a sum its maximum weighs (an anchor 1 below the maximum finished `1 + e` where it is
-    `1 + e^-1`, the base review of 9745e74f0, F2), a guard taken the wrong way round, and a guard of a signed
-    sum (the review of de9fbec82's `_anchored`, F1, F2)."""
+    `1 + e^-1`, the base review of 9745e74f0, F2), a guard taken the wrong way round, a guard of a signed sum
+    (the review of de9fbec82's `_anchored`, F1, F2), a ratio over an unanchored sum, a narrowing cast (the
+    base review of 25ceaae2f, F1, F2) and a ratio of one row's sum over another's."""
     forms = derive.derive(declared(function), accurate=False, saturation=SATURATION)
     values = operands(*draw(0))
     tile = tile_of(values, 0)

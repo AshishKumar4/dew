@@ -801,17 +801,17 @@ def _anchored(made: _Forms, state, anchor: Callable) -> dict:
     below the tile's maximum. Refused where a step reads its maximum but through its exponent (the held
     weights' select, `x < m`, an accurate form's: exactly 0 at the maximum, which a lower anchor makes
     false), and where no sum reads the maximum the step keeps (the anchor would reach no weight)."""
-    adjusted = {}
+    adjusted, carrying = {}, {}
     for index, (reduction, form) in enumerate(zip(made.reductions, made.steps, strict=True)):
         if _role(reduction) != "max":
             continue
         kept = terms.key(form)
-        others = [other for place, other in enumerate(made.steps) if place != index]
-        read = [term for other in others for term in terms.subterms(other)]
-        if not any(terms.key(term) == kept for term in read):
+        readers = {place for place, other in enumerate(made.steps)
+                   if place != index and any(terms.key(term) == kept for term in terms.subterms(other))}
+        if not readers:
             raise Refused(f"{reduction}: no sum of the walk reads the maximum its step keeps, so an anchor "
                           "would reach no weight")
-        for term in read:
+        for term in (term for place in readers for term in terms.subterms(made.steps[place])):
             args = get_callable_args(term, Term.compare)
             if args is not None and any(terms.key(read_term) == kept for arg in args if isinstance(arg, Term)
                                         for read_term in terms.subterms(arg)):
@@ -819,8 +819,9 @@ def _anchored(made: _Forms, state, anchor: Callable) -> dict:
                               "weights' select), which a lower anchor makes false: an anchor of an accurate "
                               "form's walk")
         adjusted[kept] = functools.partial(anchor, state[index])
-    if adjusted:
-        _invariant_finishes(made)
+        carrying[index] = {place: _factor_axes(made, place, kept) for place in readers}
+    for index, carried in carrying.items():
+        _invariant_finishes(made, index, carried)
     return adjusted
 
 
@@ -828,119 +829,195 @@ ZERO = "zero"
 """`_anchor_degree` of a zero literal: of every degree."""
 
 
-def _invariant_finishes(made: _Forms) -> None:
-    """Refuses an anchor (`_anchored`) unless every output's finish reads its sums homogeneously of degree 0
-    (`_anchor_degree`): a moved anchor takes every sum that reads it by one factor, which such an output
-    leaves, where an output of a sum itself took it (`sum(exp(x - max x))` at an anchor 1 below the
-    maximum finished at 1 + e where it is 1 + e^-1, the base review of 9745e74f0, F2)."""
-    maxima = {index for index, reduction in enumerate(made.reductions) if _role(reduction) == "max"}
+def _factor_axes(made: _Forms, index: int, kept) -> tuple[int, ...]:
+    """The axes of `made`'s state `index` its anchor's factor runs along (the step's `lifts` of the
+    correction reading the maximum `kept`), or every axis where its step broadcasts it none (a sum of the
+    anchor's own shape)."""
+    for term in terms.subterms(made.steps[index]):
+        args = get_callable_args(term, Term.shaped)
+        if (args is not None and terms.text(args[1]) == "broadcast_in_dim"
+                and any(terms.key(read) == kept for read in terms.subterms(args[0]))):
+            return tuple(made.region.params[terms.integer(args[2])][1]["broadcast_dimensions"])
+    return tuple(range(len(made.region.shape(made.reductions[index]))))
+
+
+def _invariant_finishes(made: _Forms, index: int, carried: dict) -> None:
+    """Refuses an anchor of `made`'s maximum `index` (`_anchored`) unless every output's finish is of degree
+    0 in the sums it carries (`carried`: each's factor axes, `_factor_axes`; `_anchor_degree`): a moved
+    anchor takes each by one factor a row, which such an output leaves, where an output of a sum itself took
+    it (`sum(exp(x - max x))` at an anchor 1 below the maximum finished at 1 + e, not 1 + e^-1, the base
+    review of 9745e74f0, F2), and one over an unanchored sum too (1/e for 1, the base review of 25ceaae2f,
+    F1)."""
     memo: dict = {}
     for form in made.finishes:
-        if form is not None and _anchor_degree(form, made, maxima, memo) not in (0, ZERO):
+        if form is not None and _anchor_degree(form, made, index, carried, memo) not in (0, ZERO):
             raise Refused(f"an output whose finish {form} is no ratio of the sums an anchor carries, which a "
                           "moved anchor would change")
 
 
-def _anchor_degree(term: Term, made: _Forms, maxima: set, memo: dict):
-    """`term`'s degree in the sums a walk's anchor carries (each a state of `made`'s that no maximum is,
-    degree 1; a maximum's state None, its value moving with the anchor), None where it has none: a product
-    adds degrees, a quotient subtracts them, a sum, a difference, an extreme, a comparison and a selection
-    take operands of one degree (a zero literal's every one, `ZERO`); an elementwise function other than a
-    negation or an absolute value takes degree 0 alone, a conversion to no floating type too; a guarded
-    denominator its sum's (`_selected_degree`). A finish reading a maximum's state is refused, a log-sum-exp
-    `m + log l` too, invariant but past the degrees: a training walk's residual rows are its state's own
-    (`attention_algebra.finished_rows`), no finish of the declaration's."""
+def _anchor_degree(term: Term, made: _Forms, index: int, carried: dict, memo: dict):
+    """`term`'s degree in the sums an anchor of `made`'s maximum `index` carries, with the axes its factor
+    runs along (`(degree, axes)`; 0 for none, `ZERO` for a zero literal's any), None where it has none: a
+    carried sum's state is of degree 1 along its factor axes (`carried`), the maximum's own state None (it
+    moves with the anchor), any other state, leaf or literal 0; a product adds degrees and a quotient
+    subtracts them, a sum, a difference, an extreme, a comparison and a selection take one (`_joined`), each
+    over the same axes; a broadcast or a transposition carries the axes, a reduction or a contraction keeps
+    a degree only over axes it reduces none of; a negation, an absolute value and a conversion to fp32 or
+    fp64 keep it, every other function needing 0 (a narrowing cast of a sum overflows at one anchor and not
+    another, the base review of 25ceaae2f, F2); a guarded denominator its sum's (`_guarded`). A finish
+    reading a maximum's state is refused, a log-sum-exp `m + log l` too, invariant but past the degrees: a
+    training walk's residual rows are its state's own (`attention_algebra.finished_rows`)."""
     key = terms.key(term)
-    if key not in memo:
-        def degree(of: Term):
-            return _anchor_degree(of, made, maxima, memo)
+    if key in memo:
+        return memo[key]
 
-        region = made.region
-        if (args := get_callable_args(term, Term.state)) is not None:
-            found = None if terms.integer(args[0]) in maxima else 1
-        elif get_callable_args(term, Term.leaf) is not None:
-            found = 0
-        elif (args := get_callable_args(term, Term.literal)) is not None:
-            found = ZERO if not np.any(np.asarray(region.literals[terms.integer(args[0])])) else 0
-        elif (args := get_callable_args(term, Term.binary)) is not None:
-            found = _binary_degree(region.params[terms.integer(args[3])][0], degree(args[0]), degree(args[2]))
-        elif (args := get_callable_args(term, Term.compare)) is not None:
-            found = None if _one_degree(degree(args[0]), degree(args[2])) is None else 0
-        elif (args := get_callable_args(term, Term.dot)) is not None:
-            found = _binary_degree(jax.lax.mul_p, degree(args[0]), degree(args[1]))
-        elif (args := get_callable_args(term, Term.select)) is not None:
-            found = _selected_degree(args, degree, made)
-        elif (args := get_callable_args(term, Term.unary)) is not None:
-            inner = degree(args[0])
-            kept = region.params[terms.integer(args[2])][0] in (jax.lax.neg_p, jax.lax.abs_p)
-            found = inner if kept else 0 if inner in (0, ZERO) else None
-        elif (args := get_callable_args(term, Term.convert)) is not None:
-            # A floating target keeps the degree; an integer's or a boolean's no scale passes (`S != 0`).
-            target = region.params[terms.integer(args[1])][1].get("new_dtype")
-            inner = degree(args[0])
-            found = (inner if target is not None and jnp.issubdtype(target, jnp.floating)
-                     else 0 if inner in (0, ZERO) else None)
-        elif (args := get_callable_args(term, Term.shaped)) is not None:
-            found = degree(args[0])
-        elif (args := get_callable_args(term, Term.reduce)) is not None:
-            inner = degree(args[0])
-            kept = terms.text(args[1]) in ("sum", "max", "min")
-            found = inner if kept else 0 if inner in (0, ZERO) else None
-        else:
-            found = None
-        memo[key] = found
-    return memo[key]
+    def degree(of: Term):
+        return _anchor_degree(of, made, index, carried, memo)
+
+    def given(position: int) -> tuple:
+        return made.region.params[terms.integer(args[position])]
+
+    region, found = made.region, None
+    if (args := get_callable_args(term, Term.state)) is not None:
+        place = terms.integer(args[0])
+        found = None if place == index else (1, carried[place]) if place in carried else 0
+    elif get_callable_args(term, Term.leaf) is not None:
+        found = 0
+    elif (args := get_callable_args(term, Term.literal)) is not None:
+        found = ZERO if not np.any(np.asarray(region.literals[terms.integer(args[0])])) else 0
+    elif (args := get_callable_args(term, Term.binary)) is not None:
+        primitive, operands = given(3)[0], (degree(args[0]), degree(args[2]))
+        found = (_product(*operands, sign=1 if primitive is jax.lax.mul_p else -1)
+                 if primitive in (jax.lax.mul_p, jax.lax.div_p) else _joined(*operands)
+                 if primitive in (jax.lax.add_p, jax.lax.sub_p, jax.lax.max_p, jax.lax.min_p)
+                 else 0 if _joined(*operands) in (0, ZERO) else None)
+    elif (args := get_callable_args(term, Term.compare)) is not None:
+        found = None if _joined(degree(args[0]), degree(args[2])) is None else 0
+    elif (args := get_callable_args(term, Term.dot)) is not None:
+        found = _contracted(made, args, degree(args[0]), degree(args[1]), given(2)[1]["dimension_numbers"])
+    elif (args := get_callable_args(term, Term.select)) is not None:
+        found = _guarded(made, args, degree)
+    elif (args := get_callable_args(term, Term.unary)) is not None:
+        inner = degree(args[0])
+        found = inner if given(2)[0] in (jax.lax.neg_p, jax.lax.abs_p) or inner in (0, ZERO) else None
+    elif (args := get_callable_args(term, Term.convert)) is not None:
+        inner, target = degree(args[0]), given(1)[1].get("new_dtype")
+        widest = target is not None and np.dtype(target) in (np.dtype(np.float32), np.dtype(np.float64))
+        found = inner if widest or inner in (0, ZERO) else None
+    elif (args := get_callable_args(term, Term.shaped)) is not None:
+        found = _reshaped(degree(args[0]), *given(2))
+    elif (args := get_callable_args(term, Term.reduce)) is not None:
+        inner, reduced = degree(args[0]), tuple(given(3)[1]["axes"])
+        kept = terms.text(args[1]) in ("sum", "max", "min") and not set(_axes(inner)) & set(reduced)
+        found = (inner if inner in (0, ZERO, None) else None if not kept
+                 else (inner[0], tuple(axis - sum(r < axis for r in reduced) for axis in inner[1])))
+    memo[key] = found
+    return found
 
 
-def _one_degree(*degrees):
-    """The one degree of `degrees` (`_anchor_degree`'s, a zero literal's any), None where they differ."""
-    found = {d for d in degrees if d != ZERO}
-    return ZERO if not found else found.pop() if len(found) == 1 and None not in found else None
+def _axes(degree) -> tuple:
+    """The factor axes of an `_anchor_degree`, none for 0 or `ZERO`."""
+    return degree[1] if isinstance(degree, tuple) else ()
 
 
-def _binary_degree(primitive, a, b):
-    """`_anchor_degree` of `primitive` over operands of degrees `a` and `b`."""
-    if None in (a, b):
+def _joined(*degrees):
+    """The one degree of `degrees` (`_anchor_degree`'s) over one set of axes, `ZERO` of none but zeros, None
+    where they differ."""
+    found = [degree for degree in degrees if degree != ZERO]
+    if not found:
+        return ZERO
+    return found[0] if None not in found and all(degree == found[0] for degree in found) else None
+
+
+def _product(a, b, *, sign: int):
+    """`_anchor_degree` of a product (`sign` 1) or a quotient (-1) of operands of degrees `a` and `b`, their
+    factors along the same axes."""
+    if None in (a, b) or (b == ZERO and sign < 0):
         return None
-    if primitive is jax.lax.mul_p:
-        return ZERO if ZERO in (a, b) else a + b
-    if primitive is jax.lax.div_p:
-        return ZERO if a == ZERO else None if b == ZERO else a - b
-    if primitive in (jax.lax.add_p, jax.lax.sub_p, jax.lax.max_p, jax.lax.min_p):
-        return _one_degree(a, b)
-    return 0 if _one_degree(a, b) in (0, ZERO) else None
+    if ZERO in (a, b):
+        return ZERO
+    if b == 0:
+        return a
+    if a == 0:
+        return (sign * b[0], b[1])
+    if a[1] != b[1]:
+        return None
+    total = a[0] + sign * b[0]
+    return 0 if total == 0 else (total, a[1])
 
 
-def _selected_degree(args, degree: Callable, made: _Forms):
+def _reshaped(degree, primitive, params: Mapping):
+    """`_anchor_degree` of a shaping of an operand of `degree`: a broadcast's or a transposition's axes
+    carried, any other's degree 0 alone."""
+    if degree in (0, ZERO, None):
+        return degree
+    if primitive is jax.lax.broadcast_in_dim_p:
+        return (degree[0], tuple(params["broadcast_dimensions"][axis] for axis in degree[1]))
+    if primitive is jax.lax.transpose_p:
+        return (degree[0], tuple(tuple(params["permutation"]).index(axis) for axis in degree[1]))
+    return None
+
+
+def _contracted(made: _Forms, args, left, right, numbers):
+    """`_anchor_degree` of a contraction (`dot_general`'s `numbers`) of operands of degrees `left` and
+    `right`: each's factor axes none it contracts, carried to the output's (batch, the left's free axes,
+    the right's), their product's."""
+    (left_contracted, right_contracted), (left_batch, right_batch) = numbers
+    ranks = [len(made.region.shape(operand)) for operand in (args[0], args[1])]
+    free = [[axis for axis in range(rank) if axis not in (*contracted, *batch)]
+            for rank, contracted, batch in ((ranks[0], left_contracted, left_batch),
+                                           (ranks[1], right_contracted, right_batch))]
+
+    def placed(degree, contracted, batch, side: int):
+        if degree in (0, ZERO, None):
+            return degree
+        if set(degree[1]) & set(contracted):
+            return None
+        offset = len(batch) + (len(free[0]) if side else 0)
+        return (degree[0], tuple(tuple(batch).index(axis) if axis in batch
+                                 else offset + free[side].index(axis) for axis in degree[1]))
+
+    return _product(placed(left, left_contracted, left_batch, 0),
+                    placed(right, right_contracted, right_batch, 1), sign=1)
+
+
+def _guarded(made: _Forms, args, degree: Callable):
     """`_anchor_degree` of a selection `(predicate, false, true)`: one degree of its branches under a
-    predicate of degree 0, or a guarded denominator's: `where(S == 0, literal, S)` (or `S != 0` its branches
-    swapped) over a sum `S` of a walk's weights alone (`_weights_sum`), its degree, where every sum of those
-    weights is zero alike (the weights nonnegative), so the literal's branch is taken before and after the
-    anchor moves with every numerator over it zero (the review of de9fbec82's `_anchored`, F1, F2)."""
+    predicate of degree 0, or a guarded denominator's, `where(S == 0, literal, S)` (or `S != 0`, the branches
+    swapped) over a sum `S` of a walk's weights alone (`_weights_sum`), `S`'s: a bare exponential is positive,
+    so `S` is zero only on a walk of no keys, where every sum the walk carries is zero alike (a masked
+    weight is no bare exponential and is refused: a masked row's `S` is zero beside others that are not), so
+    the literal's branch is taken before and after the anchor moves (the review of de9fbec82's `_anchored`,
+    F1, F2)."""
     predicate, false, true = args
-    taken = [degree(branch) for branch in (false, true)]
-    if degree(predicate) not in (0, ZERO) or None in taken:
+    if degree(predicate) not in (0, ZERO):
         return None
-    if (one := _one_degree(*taken)) is not None:
-        return one
+    if (joined := _joined(degree(false), degree(true))) is not None:
+        return joined
     compared = get_callable_args(predicate, Term.compare)
     if compared is None:
         return None
-    test = made.region.params[terms.integer(compared[3])][0]
     zero, summed = (compared[0], compared[2]) if degree(compared[0]) == ZERO else (compared[2], compared[0])
     orders = {jax.lax.eq_p: (true, false), jax.lax.ne_p: (false, true)}
-    literal, kept = orders.get(test, (None, None))
+    literal, kept = orders.get(made.region.params[terms.integer(compared[3])][0], (None, None))
     state = get_callable_args(summed, Term.state)
-    if (literal is None or degree(zero) != ZERO or get_callable_args(literal, Term.literal) is None
+    if (literal is None or degree(zero) != ZERO or not _literal(literal)
             or terms.key(kept) != terms.key(summed) or state is None
             or not _weights_sum(made, terms.integer(state[0]))):
         return None
     return degree(kept)
 
 
+def _literal(term: Term) -> bool:
+    """Whether `term` is a literal, broadcast or converted (a guard's constant as the program states it)."""
+    while (args := get_callable_args(term, Term.shaped) or get_callable_args(term, Term.convert)) is not None:
+        term = args[0]
+    return get_callable_args(term, Term.literal) is not None
+
+
 def _weights_sum(made: _Forms, index: int) -> bool:
-    """Whether `made`'s reduction `index` sums a walk's weights alone (an exponential's, nonnegative): a sum
-    of `exp` or `exp2` of the tile, no other factor."""
+    """Whether `made`'s reduction `index` sums a walk's weights alone: a sum of `exp` or `exp2` of the tile,
+    no other factor (positive, `_guarded`)."""
     reduced = get_callable_args(made.reductions[index], Term.reduce)
     if reduced is None or terms.text(reduced[1]) != "sum":
         return False
