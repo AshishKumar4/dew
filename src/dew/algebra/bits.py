@@ -769,7 +769,7 @@ def nvfp4_decoded(words: jax.Array, scales: jax.Array) -> jax.Array:
     value (`NVFP4_OWED`), a GEMM operand prologue's per stage (the template's matrix-operand hook,
     algebra.md 7.4)."""
     codes = _restored(NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T)
-    owed = scales.astype(jnp.float32) * np.float32(1 / NVFP4_OWED)
+    owed = scales_decoded(jax.lax.bitcast_convert_type(scales, jnp.uint8)) * np.float32(1 / NVFP4_OWED)
     return (codes * jnp.repeat(owed, NVFP4.depth, axis=0)).astype(jnp.bfloat16)
 
 
