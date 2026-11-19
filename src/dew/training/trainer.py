@@ -1827,17 +1827,20 @@ class Trainer(Generic[Loss, Effects]):
         counted = run.marked if self.rollout is None else functools.partial(
             consumption_counted, clocked=self._shape.examples is not None, counting=self._counting,
             marks_rows=False)
-        inputs = self.objective.inputs
+        objective, inputs = self.objective, self.objective.inputs
         # What the stream states it hands each step, a rollout's batches aside, which make their own rows.
         produced = None if self.rollout is not None else Produced.of(plan.dataset, run.partition)
+        whole = not plan.dataset.device
 
         def prepare(batch: Batch) -> Batch:
-            # Every batch as its loader states it, before it is placed (`Produced`), and its token ids within
-            # its model's table (`InputSpec.bounded`): an id past the table reads no row, and its gather
-            # fills NaN.
+            # Every batch as its loader states it, before it is placed (`Produced`), and as its objective
+            # admits it (`Objective.check`), where no device step reshapes it, else its token ids within its
+            # model's table (`InputSpec.bounded`): an id past the table reads no row; its gather fills NaN.
             if produced is not None:
                 produced.checked(batch)
-            if inputs is not None:
+            if whole:
+                objective.check(batch)
+            elif inputs is not None:
                 inputs.bounded(batch)
             return counted(batch)
         if run.pooled:

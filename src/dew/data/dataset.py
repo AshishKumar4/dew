@@ -822,6 +822,11 @@ class Loader:
     device: tuple[DeviceStep, ...] = ()
     """The training batch's steps the compiled training step runs, on the
     accelerator, after the reader delivers it (`DeviceStep`)."""
+    fields: Mapping[str, tuple[int | None, ...]] = dataclasses.field(default_factory=dict)
+    """Each field's per-row shape its chain fixes (`Dataset.facts`' `fields`; None an axis it leaves free),
+    which every training batch is held to on its host before its transfer
+    (`dew.training.distributed.Produced`); empty where the chain fixes none (a step that does not say what
+    it makes, a stream handed as it is read)."""
     widths: Mapping[str, object] = dataclasses.field(default_factory=dict)
     """The run's static widths its steps bound (`run_widths`): the facts its objective's run-scoped
     steps read (`Configured.scope`), such as a decision's `slots`, which a saved run of the objective

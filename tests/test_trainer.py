@@ -380,6 +380,42 @@ def test_a_batch_of_other_rows_than_its_loader_states_is_refused_before_it_is_pl
     assert int(make_trainer().fit(dataset(), steps=4).step) == 4
 
 
+@dataclasses.dataclass(frozen=True)
+class Narrowing:
+    """A step that states each row's `aux` holds three values (`Declares`) and, from the row `after` on,
+    hands two: a step that broke the shape its chain fixes."""
+
+    after: int
+
+    def declared(self, facts):
+        from dew.data.facts import shaped
+
+        return shaped(facts, "aux", [3])
+
+    def __call__(self, row):
+        return {**row, "aux": row["aux"][:2]} if int(row["i"]) >= self.after else row
+
+
+def test_a_batch_breaking_a_field_shape_its_chain_fixes_is_refused_before_it_is_placed():
+    """A chain that fixes each row's `aux` at three values (`Loader.fields`) and hands its second step rows of
+    two is refused at that batch, on its host before it is placed (row 9017: only its rows were held to the
+    loader, and the step compiled again for the new shape); one that hands what it states trains on."""
+    from dew.objectives.supervised import Supervised
+
+    rows = 2 * jax.device_count()
+    columns = {"x": np.ones((4 * rows, 8), np.float32), "y": np.zeros((4 * rows, 4), np.float32),
+               "aux": np.ones((4 * rows, 3), np.float32), "i": np.arange(4 * rows, dtype=np.int32)}
+
+    def fit(after: int):
+        chain = Pipeline(Memory(columns)).map(Narrowing(after), identity="narrowing@1").repeat().batch(rows)
+        objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
+        return Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(chain, steps=3, log_every=100)
+
+    with pytest.raises(ValueError):
+        fit(after=rows)
+    assert int(fit(after=8 * rows).step) == 3
+
+
 def test_a_direct_resume_into_another_models_computation_is_refused_and_its_own_resumes(tmp_path):
     """A trainer built directly over a checkpoint directory whose run trained another computation of the same
     shapes (its feed-forward's gating geglu, the run's swiglu) refuses to resume, as a configured run's

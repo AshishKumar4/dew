@@ -145,6 +145,7 @@ class Objective()  [dew.objectives.base]
   .bind_model(self, source: Model | Source[Model], *, variables: Variables | None | Omitted = <Omitted.OMITTED: 'omitted'>, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Model
   .bind_widths(self, widths: Mapping[str, object]) -> None
   .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
+  .check(self, batch: Batch) -> None
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
   .data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData
   .defines_validation_loss: property -> bool
@@ -249,6 +250,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .bind_model(self, source: Model | Source[Model], *, variables: Variables | None | Omitted = <Omitted.OMITTED: 'omitted'>, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Model
   .bind_widths(self, widths: Mapping[str, object]) -> None
   .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
+  .check(self, batch: Batch) -> None
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
   .data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData
   .defines_validation_loss: property -> bool

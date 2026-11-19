@@ -1923,6 +1923,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return self.model_tree(variables)
 
+    def check(self, batch: Batch) -> None:
+        """Refuse a host batch this objective cannot train on, as a run holds its batches
+        (docs/design/training.md, the producer's contract): a field its declared inputs name missing or of
+        another per-example shape (`InputSpec.check`), or an id outside the table it indexes
+        (`InputSpec.bounded`). The admission a fit runs on every training batch its loader hands the model as
+        it is (no device step reshaping it), and one a caller may run on a batch of their own."""
+        if self.inputs is not None:
+            self.inputs.check(batch)
+            self.inputs.bounded(batch)
+
     def bind_widths(self, widths: Mapping[str, object]) -> None:
         """Take the run's static widths, the facts its data's run-scoped steps bound (`Loader.widths`,
         such as a decision's `slots`), before the run records its task (`task_settings`). An objective

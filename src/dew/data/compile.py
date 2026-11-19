@@ -27,7 +27,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew._position import unplaced
-from dew._records import JSON, integer, json_value
+from dew._records import JSON, integer, json_value, record
 from dew.batch import Batch
 from dew.data.analysis import (
     _VIEWS,
@@ -1183,10 +1183,21 @@ def _compiled(
         statistics=statistics,
         batch_tokens=staged.batch_tokens,
         device=device,
+        fields=_fixed_fields(train),
         widths=_bound_widths(original),
         tail=tail(train, build),
         order_records=ordered,
     )
+
+
+def _fixed_fields(pipeline: Pipeline) -> Mapping[str, tuple[int | None, ...]]:
+    """Each field's per-row shape `pipeline`'s facts state (`Dataset.facts`, `Loader.fields`): the producer's
+    shape, which every batch it hands a step is held to (docs/design/training.md, the producer's contract)."""
+    from dew.data.facts import folded
+
+    stated = folded(pipeline).get("fields", {})
+    return {name: tuple(shape) for name, shape in record(stated, "fields").items()
+            if isinstance(shape, list) and all(axis is None or isinstance(axis, int) for axis in shape)}
 
 
 def _bound_widths(pipeline: Pipeline) -> Mapping[str, object]:
