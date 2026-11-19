@@ -1989,7 +1989,7 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     level_zero = dataclasses.replace(handed, built=BuildTarget.of(here))
     assert level_zero.runnable(here) is level_zero
     # One leaving a convolution's algorithm to run time is never taken: the run's own compile picks it.
-    at_run = dataclasses.replace(level_zero, plan={**record(level_zero.plan, "plan"), "at_run_time": True})
+    at_run = dataclasses.replace(level_zero, at_run=True)
     assert at_run.runnable(here) is None
     with pytest.raises(ValueError):
         own.runnable(here)
@@ -2261,6 +2261,19 @@ def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path
         compile_programs({"conv": (convolved, [image, kernel]),
                           "dot": (lambda x, y: x @ y, [square, square])}, "sm80")
     assert refused.value.programs == ("conv",)
+    # Compiled offline, for its memory or a step file's program, it holds the algorithm left to run time
+    # (`report.left_at_run`, by which a step file is never taken: `AheadOfTime.at_run`); the product not.
+    placed = jax.sharding.SingleDeviceSharding(compile_only_gpus("sm80", 1)[0])
+
+    def offline(function, *shapes):
+        lowered = jax.jit(function).trace(*(jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed)
+                                            for shape in shapes)).lower()
+        with report.read_offline():
+            return report.xla_compiled(lowered, None)
+
+    assert report.left_at_run(offline(convolved, image, kernel))
+    assert not report.left_at_run(offline(lambda x, y: x @ y, square, square))
+
 
 def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
     """A device's own target, what a program compiled ahead is checked against, is the one `gpu_target`

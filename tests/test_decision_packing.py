@@ -289,17 +289,18 @@ class AttentionTerms:
 
         self.total = total
         self.read = jax.jit(jax.grad(total, argnums=1, has_aux=True))
-        self.added: dict | None = None
+        self.outputs: dict | None = None
 
     def __call__(self, variables) -> dict:
         """The terms carried to each attention's projections, by its place in the parameters (`located`):
         each projection's input and its heads' terms."""
-        if self.added is None:
-            # Every draw's variables are of one tree, so its attentions' outputs of one shape.
+        if self.outputs is None:
+            # Every draw's variables are of one tree, so its attentions' outputs of one shape: their shapes
+            # kept, the zeros made in each call, as one made in a trace is that trace's own.
             _, shapes = jax.eval_shape(self.total, variables, {})
-            self.added = {path: jnp.zeros(record["out"].shape, record["out"].dtype)
-                          for path, record in shapes.items()}
-        cotangents, held = self.read(variables, self.added)
+            self.outputs = {path: record["out"] for path, record in shapes.items()}
+        added = {path: jnp.zeros(shape.shape, shape.dtype) for path, shape in self.outputs.items()}
+        cotangents, held = self.read(variables, added)
         carried = {}
         for path, record in held.items():
             query_name, key_name, value_name, out_name = self.names[path]
@@ -338,7 +339,9 @@ def test_an_attentions_terms_find_its_parameters_by_their_trace_where_their_valu
         variables = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
                                  nn.unbox(objective.init(jax.random.key(0))))
         traced = AttentionTerms(wide, rows)
-        jax.jit(traced)(variables)
+        # Traced twice, as a prepare's compile and a relowering trace it: neither holds the other's values.
+        for _ in range(2):
+            jax.jit(traced)(variables)
         # Each attention's parameters as an eager apply reads them, placed by their values.
         held = {}
 

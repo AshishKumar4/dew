@@ -1122,6 +1122,29 @@ def at_run_time(lowered: jax.stages.Lowered) -> bool:
     return found
 
 
+CUDNN_CONVOLUTION = b"__cudnn$conv"
+"""The custom call targets XLA's GPU compiles a convolution to (`__cudnn$convForward`, `...BackwardInput`,
+`...BackwardFilter`, `...BiasActivationForward`), by their shared prefix."""
+
+
+def left_at_run(compiled: jax.stages.Compiled) -> bool:
+    """Whether `compiled` holds a cuDNN convolution whose algorithm its compile left to run time (its backend
+    config's `algo_id` -1), as every compile without the GPU leaves it (`DEVICELESS_CONVOLUTION_PICKS`):
+    an executable compiled ahead that its load must not take (`dew.training.ahead.AheadOfTime.at_run`), read
+    from each module's instructions as XLA serialized them (`proto_fields`: a module's computations, field
+    3, their instructions, 2, each one's custom call target, 28, and backend config, 43)."""
+    for module in compiled.runtime_executable().hlo_modules():
+        for computation in proto_fields(module.as_serialized_hlo_module_proto()).get(3, []):
+            for instruction in proto_fields(computation).get(2, []):
+                fields = proto_fields(instruction)
+                if not fields.get(28, [b""])[0].startswith(CUDNN_CONVOLUTION):
+                    continue
+                config = json.loads(fields.get(43, [b"{}"])[0] or b"{}")
+                if config.get("cudnn_conv_backend_config", {}).get("algorithm", {}).get("algo_id") == "-1":
+                    return True
+    return False
+
+
 def target_devices(lowered: jax.stages.Lowered) -> Sequence | None:
     """The GPUs `lowered` compiles for, None where it compiles for none."""
     from jax._src.interpreters import pxla

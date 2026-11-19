@@ -389,6 +389,8 @@ def test_a_convolution_sites_truths_compute_on_the_host_and_its_arms_compile_on_
     sites = [json.loads(site.read_text()) for site in store.glob("*/site.json")]
     assert sorted((site["arms"], site["host"], "at_run" in site) for site in sites) == [
         (False, True, False), (True, False, True)], sites
+    # Its arms' memory read offline, by which the lane sizes the run's worker (`compiled_memory`).
+    assert all(site["memory"] for site in sites if site["arms"]), sites
     with compiled_truths(store, prepare=False, stamp="a"):
         assert_as_exact(jax.jit(convolved), jax.jit(convolved), draw, "a convolution", seeds=8)
     assert (store / AT_RUN).exists() and not (store / UNPREPARED).exists()
