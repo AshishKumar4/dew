@@ -47,7 +47,7 @@ def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
     and the right's) in their `decoded` forms; None where the target states no tensor rate. A pair's step is
     a CTA's: its rows by the pair's columns (`tile_columns`)."""
     rates = unit_cost.rates(target, device=False)
-    tensor, shared = rates[0], rates[5]
+    tensor, shared = rates.tensor, rates.shared
     if tensor is None:
         return None
     family = family_of(tiles, jnp.bfloat16)

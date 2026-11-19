@@ -13,6 +13,7 @@ derivation prices a form a template's algebra takes by it (`dew.algebra.derive`,
 import dataclasses
 import functools
 import math
+from typing import NamedTuple
 
 from jax.experimental import pallas as pl
 
@@ -89,7 +90,23 @@ class Work:
 
 
 @functools.cache
-def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, ...]:
+class Rates(NamedTuple):
+    """A target's rate of each unit `units` prices, per second (`rates`), read by name: the tensor cores'
+    16-bit, TF32 and FP8 modes, the CUDA cores, the special-function units, shared memory, the on-chip memory
+    XLA's fusion keeps its kernels' operands and results in, and device memory; None where the target
+    states none. Named, so a unit added among them misreads no consumer (the review of train 1074, F5)."""
+
+    tensor: float | None
+    tf32: float | None
+    eight: float | None
+    cuda: float | None
+    special: float | None
+    shared: float | None
+    kept: float | None
+    device: float | None
+
+
+def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
     """`target`'s rate of each unit `units` prices, per second: the tensor cores' 16-bit, TF32 and FP8 modes
     (FP8's the 16-bit one's where the generation states none, its codes unpacked into 16-bit products), the
     CUDA cores, the special-function units, shared memory, the on-chip memory XLA's fusion keeps its kernels'
@@ -117,23 +134,24 @@ def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, 
         tensor = target.bf16_peak
     eight = rate(target.tensor_rate("8bit")) or tensor
     kept = target.vmem_rate if device and generation.tpu(target) else math.inf
-    return (tensor, rate(target.tensor_rate("tf32")), eight, rate(target.tensor_rate("fp32")),
-            rate(None if held is None else held.exponentials_per_clock),
-            math.inf if device else rate(None if held is None else held.shared_bytes_per_clock), kept,
-            target.memory_rate if device else math.inf)
+    return Rates(tensor=tensor, tf32=rate(target.tensor_rate("tf32")), eight=eight,
+                 cuda=rate(target.tensor_rate("fp32")),
+                 special=rate(None if held is None else held.exponentials_per_clock),
+                 shared=math.inf if device else rate(None if held is None else held.shared_bytes_per_clock),
+                 kept=kept, device=target.memory_rate if device else math.inf)
 
 
-def units(work: Work, at: tuple[float | None, ...]) -> tuple[list[float], tuple[float, ...]]:
+def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
     """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit, TF32 and
     FP8 modes in turn), the CUDA cores (operations and conversions), the special-function units, on-chip
     memory (shared memory's bytes, then what XLA's fusion keeps there, one memory's two levels, so a TPU's
     one VMEM is one unit) and device memory; and, level by level, the work at a rate the target states none
     of, which no time prices (0 where one does)."""
-    tensor, tf32, eight, cuda, special, shared, kept, device = at
-    grouped = (((work.flops, tensor), (work.tf32_flops, tf32), (work.fp8_flops, eight)),
-               ((work.operations + work.conversions, cuda),),
-               ((work.exponentials, special),), ((work.shared_bytes, shared), (work.kept_bytes, kept)),
-               ((work.device_bytes, device),))
+    grouped = (((work.flops, at.tensor), (work.tf32_flops, at.tf32), (work.fp8_flops, at.eight)),
+               ((work.operations + work.conversions, at.cuda),),
+               ((work.exponentials, at.special),),
+               ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
+               ((work.device_bytes, at.device),))
     priced = [sum(amount / per_second for amount, per_second in unit if amount and per_second is not None)
               for unit in grouped]
     unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped for amount, per_second in unit)

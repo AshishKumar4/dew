@@ -56,7 +56,7 @@ def chunk_of(ba: tokamax.BoundArguments, family: mosaic.Family, target: generati
     role's rows where the device states neither rate."""
     rows = family.role_rows
     key_width, value_width, dtype = _widths(ba, family)
-    tensor, memory = cost.rates(target, device=True)[0], target.memory_rate
+    tensor, memory = cost.rates(target, device=True).tensor, target.memory_rate
     if not tensor or not memory:
         return rows
     work = 2 * (3 * key_width + 2 * value_width) + 4 * rows * (math.log2(rows) - 1)

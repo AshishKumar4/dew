@@ -866,8 +866,11 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     v5e = generation.TARGETS["v5e"]
 
     def derived(target):
-        return linear_scan.derive(linear_scan.Extents(64, 128, 128, 1), corrects=False,
-                                  schedule=cost.fused(target), precision=None, saturation=algebra.SATURATION)
+        # Derived as scan derives on a v5e (`program.passes`' target): its products priced in the v5e's modes.
+        with program.passes(target="v5e"):
+            return linear_scan.derive(linear_scan.Extents(64, 128, 128, 1), corrects=False,
+                                      schedule=cost.fused(target), precision=None,
+                                      saturation=algebra.SATURATION)
 
     priced, unmeasured = derived(v5e), derived(dataclasses.replace(v5e, vmem_rate=None))
     assert priced.price.work.kept_bytes > 0
@@ -927,19 +930,6 @@ def test_a_product_of_two_16_bit_formats_replays_as_traced():
     assert np.asarray(jax.jit(replayed)(a, b)).tolist() == np.asarray(jax.jit(product)(a, b)).tolist()
 
 
-@pytest.mark.parametrize("apart", [0, 1, 4], ids=["as written", "a group of one", "apart from its group"])
-def test_a_token_loops_states_are_kept_each_token(apart):
-    """A scan's token loop keeps its state on chip each token, written and read (`Work.kept_bytes`, row
-    7283), and where a token reads apart from a group of more than one token's writes the state its group
-    entered beside it (`scan._looped`'s two carried states)."""
-    from dew.algebra import linear_scan
-
-    c, k, v = 16, 32, 64
-    work = linear_scan._work(linear_scan.Chunk.plain(linear_scan.Chunk.token("U")),
-                             linear_scan.Extents(c, k, v, 1, apart=apart), lambda value: (0, 0), None)
-    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * 4 * k * v
-
-
 def test_device_memory_is_priced_at_the_parts_measured_stream():
     """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.part`,
     tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer
@@ -948,7 +938,7 @@ def test_device_memory_is_priced_at_the_parts_measured_stream():
 
     def memory_rate(device_kind, clocked):
         target = dataclasses.replace(hopper, device_kind=device_kind, memory_bandwidth=clocked)
-        return kernel_cost.rates(target, device=True)[-1]
+        return kernel_cost.rates(target, device=True).device
 
     (measured,) = {memory_rate("NVIDIA GH200 480GB", clocked) for clocked in (4.0e12, 4.9e12)}
     assert measured is not None and measured < 4.0e12

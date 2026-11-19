@@ -727,29 +727,38 @@ instructions, 2 live registers); its encoder the identity, its layout fixed."""
 
 E4M3_SCALE_OWED = 2.0 ** 120
 """The factor `E4M3_SCALE`'s register owes its scale: the code's value is the register's float32 times
-2^120, restored exactly by integer exponent arithmetic (`scale_restored`)."""
+2^120, restored exactly by integer exponent arithmetic (`raised`)."""
 
 
-def scale_restored(pattern: jax.Array) -> jax.Array:
-    """The E4M3 scale's decoded value (`E4M3_SCALE_FORM`'s register: the code's value times 2^-120 as a
-    float32's bits) of each of `pattern` (uint32), restored to the code's value in float32 by integer
-    arithmetic, exactly: a subnormal (a zero exponent field) as its mantissa's integer times 2^-9 with its
-    sign, every other value's exponent raised by 120, so no lane that flushes subnormals zeroes a subnormal
-    scale. The one definition of a block scale's decoded value; the NaN code (0x7F, which no block scale
-    holds) reads as 480, as `decoded` reads it."""
-    sign = pattern & jnp.uint32(0x80000000)
-    normal = jax.lax.bitcast_convert_type(pattern + jnp.uint32(120 << 23), jnp.float32)
-    mantissa = ((pattern >> jnp.uint32(20)) & jnp.uint32(0x7)).astype(jnp.float32) * jnp.float32(2.0 ** -9)
+def raised(bits: jax.Array, power: int, dtype=jnp.float32) -> jax.Array:
+    """The float32 each of `bits` (uint32, a float32's bits) holds times 2^`power`, in `dtype` (float32 by
+    default; a float64 truth's float64), by integer arithmetic, exactly: a subnormal (a zero exponent
+    field) as its signed fraction field times 2^(power - 149), every other value's exponent raised by
+    `power`, so no lane that flushes subnormals (XLA:CPU's, a GPU's) zeroes it; in a format wider than
+    float32, a raised value that is itself a float32 subnormal (a pattern outside a decode's codes, which a
+    flushing lane's cast would zero) widened from its fraction times 2^-149. The one restore of a decode
+    that owes its value a power of two: a block scale's (`scales_decoded`, 2^120) and an NVFP4 code's
+    (`restored`, 2^126)."""
+    sign = bits & jnp.uint32(0x80000000)
+    rebased = bits + jnp.uint32(power << 23)
+    normal = jax.lax.bitcast_convert_type(rebased, jnp.float32)
+    if jnp.finfo(dtype).bits > 32:
+        fraction = (rebased & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** -149, dtype)
+        tiny = jnp.where(rebased >> jnp.uint32(31) != 0, -fraction, fraction)
+        normal = jnp.where(rebased & jnp.uint32(0x7F800000) == 0, tiny, normal.astype(dtype))
+    mantissa = (bits & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** (power - 149), dtype)
     subnormal = jnp.where(sign != 0, -mantissa, mantissa)
-    return jnp.where(pattern & jnp.uint32(0x7F800000) == 0, subnormal, normal)
+    return jnp.where(bits & jnp.uint32(0x7F800000) == 0, subnormal, normal)
 
 
 def scales_decoded(codes: jax.Array) -> jax.Array:
     """Block scales' E4M3 codes (uint8 or uint32, a code each) as float32, exactly, by the declared
     transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx`, where inline
-    assembly runs) and its one restore rule (`scale_restored`)."""
+    assembly runs) and the one restore rule (`raised`, the register's owed 2^120: a subnormal scale as its
+    mantissa's integer times 2^-9; the NaN code, 0x7F, which no block scale holds, reads as 480, as `decoded`
+    reads it)."""
     (pattern,) = E4M3_SCALE_FORM.traced(codes.astype(jnp.uint32))
-    return scale_restored(pattern)
+    return raised(pattern, 120)
 
 
 NVFP4_OWED = 2.0 ** 8
@@ -786,25 +795,11 @@ def nvfp4_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
 def restored(pattern: jax.Array, dtype=jnp.float32) -> jax.Array:
     """The NVFP4 form's decoded value (`NVFP4_BFLOAT16_FORM`: each code times 2^-126 as a bfloat16) of each of
     `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in `dtype` (float32 by
-    default; a float64 truth's float64) by integer arithmetic: a subnormal (a code of 0 or 0.5) as its
-    mantissa's integer times 2^-7 with its sign, every other value's exponent raised by 126 (its bits moved to
-    a float32's high half, then cast, a format wider than float32's taking its subnormals exactly), so no
-    lane that flushes subnormals (XLA:CPU's, a GPU's) zeroes a code of 0.5. The one definition of the decoded
-    value: the portable decode's (`nvfp4_decoded`), the native staged decode's, whatever lanes each extracts,
-    and a truth's."""
-    sign = pattern & jnp.uint32(0x8000)
-    rebased = (pattern << jnp.uint32(16)) + jnp.uint32(126 << 23)
-    normal = jax.lax.bitcast_convert_type(rebased, jnp.float32)
-    if jnp.finfo(dtype).bits > 32:
-        # Widened from the rebased bits themselves where they hold a float32 subnormal (a pattern outside the
-        # format's codes), which a flushing lane's cast would zero: its fraction times 2^-149, exact in a
-        # wider format. A narrower one casts the float32 as it casts any.
-        fraction = (rebased & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** -149, dtype)
-        tiny = jnp.where(rebased >> jnp.uint32(31) != 0, -fraction, fraction)
-        normal = jnp.where(rebased & jnp.uint32(0x7F800000) == 0, tiny, normal.astype(dtype))
-    mantissa = (pattern & jnp.uint32(0x7F)).astype(dtype) * jnp.asarray(2.0 ** -7, dtype)
-    subnormal = jnp.where(sign != 0, -mantissa, mantissa)
-    return jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
+    default; a float64 truth's float64) by the one restore rule (`raised`, its bits moved to a float32's high
+    half, the owed 2^126: a code of 0.5 as its mantissa's integer times 2^-7). The one definition of the
+    decoded value: the portable decode's (`nvfp4_decoded`), the native staged decode's, whatever lanes each
+    extracts, and a truth's."""
+    return raised(pattern << jnp.uint32(16), 126, dtype)
 
 
 class Minifloat(NamedTuple):
