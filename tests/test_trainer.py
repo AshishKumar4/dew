@@ -2432,10 +2432,10 @@ def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path
 def test_a_trainers_refit_traces_its_step_and_start_once_and_another_trainers_its_own():
     """A trainer fit again in its process (a suite's draws, a pool's fits) reads the step and the start its
     first fit traced: its objective states its trace, and its optimizer, an Optax transformation given
-    built, keys them by the object itself (`objectives.base.Held`), so its refit traces neither (PF03, rows
-    7381, 8407). A trainer handed an equal-looking transformation built apart keys apart and traces its
-    own, and a user's objective that states no trace traces its step at each fit, as nothing states what its
-    loss reads."""
+    built, keys them by the object given (`objectives.base.Held`), so its refit traces neither, nor does a
+    trainer handed the same objective and transformation (a resume's; PF03, rows 7381, 8407, 8411). A
+    trainer handed an equal-looking transformation built apart keys apart and traces its own, and a user's
+    objective that states no trace traces its step at each fit, as nothing states what its loss reads."""
     from test_run_budgets import FEATURES, Pulled
 
     from dew.telemetry.compiles import Compiles
@@ -2449,10 +2449,13 @@ def test_a_trainers_refit_traces_its_step_and_start_once_and_another_trainers_it
             trainer.fit(data, steps=3, log_every=1)
         return {program.name for program in compiles.programs if program.kind == "traced"}
 
-    trainer = Trainer(objective, optax.adam(1e-2), key=0)
+    adam = optax.adam(1e-2)
+    trainer = Trainer(objective, adam, key=0)
     assert {"step", "traced"} <= traced(trainer, lm_data())
     again = traced(trainer, lm_data())
     assert not {"step", "traced"} & again, again
+    resumed = traced(Trainer(objective, adam, key=0), lm_data())
+    assert not {"step", "traced"} & resumed, resumed
     assert {"step", "traced"} <= traced(Trainer(objective, optax.adam(1e-2), key=0), lm_data())
     drawn = np.random.default_rng(0).standard_normal((64, FEATURES)).astype(np.float32)
     rows = Pipeline(Memory({"x": drawn})).repeat()
