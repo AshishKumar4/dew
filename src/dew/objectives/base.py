@@ -1301,7 +1301,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         if jax_core.trace_state_clean():
             # Outside any trace, one program, not each operation's, its held arrays kept (row 8682): this
             # body's, which an override calling it then changes once (row 8730's class).
-            return drawn_once(lambda tree, draw: self._initialized(draw, tree), held, key)
+            return drawn_once(lambda tree, draw: self._initialized(draw, tree), held, key, _whole,
+                              kept=(Held(self), "init"))
         return self._initialized(key, held)
 
     def _initialized(self, key: jax.Array, held: Variables | None) -> Variables:
@@ -2164,6 +2165,11 @@ class _Unkeyed:
 
 
 UNKEYED = _Unkeyed()
+
+
+def _whole[Tree](tree: Tree) -> Tree:
+    """`tree` whole: every leaf of an objective's init a held array may pass through as it is."""
+    return tree
 
 
 class Held:

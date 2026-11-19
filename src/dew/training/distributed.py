@@ -12,7 +12,7 @@ import hashlib
 import json
 import math
 import statistics
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping
 from pathlib import Path
 from typing import Any, Concatenate, Protocol
 
@@ -601,38 +601,6 @@ def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
     return holding(_TRACED_STARTS, (kept, held_context(), leaves), made, KEPT_STARTS)
 
 
-def built_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                key: jax.Array, kept: Hashable | None = None) -> TrainState:
-    """`initial_state(initializer, key)` for a caller outside any trace, unplaced, as an eager build returns
-    it: one program, where run eagerly each operation of the model's draw compiled alone (tens to hundreds a
-    model, row 8682), built as a placed start's is (row 8731): its draws rolled (`drawing`), the frozen leaves
-    its init passes through no output of it (`_rest`) but the held arrays themselves (`_reassembled`), its
-    trace, build and program kept as a refit's are where `kept` states what it traces from (`traced_start`,
-    `KEPT_STARTS`), so a second call compiles nothing."""
-    abstract, through, build = traced_start(initial_state, initializer, key, kept)
-    structure = jax.tree.structure(apart(abstract)[1])
-    built = [index for index in range(structure.num_leaves) if index not in through]
-    program = holding(_EAGER, (Held(build), tuple(built)), lambda: owned_program(_rest(build, built)),
-                      KEPT_STARTS)
-    with drawing():
-        state, made = program(initializer, key)
-    given = jax.tree.leaves(initializer)
-    return _reassembled(state, made, built, structure, lambda index: given[through[index]])
-
-
-_EAGER: collections.OrderedDict[Hashable, OuterProgram] = collections.OrderedDict()
-"""The programs `built_start` kept, by the build they run, the latest `KEPT_STARTS`."""
-
-
-def _reassembled(state: TrainState, made: Sequence[jax.Array], built: Sequence[int], structure,
-                 held_at: Callable[[int], jax.Array]) -> TrainState:
-    """`state` with its frozen tree of `structure`: the leaves a start's program made (`made`, at `built`,
-    their indices among its leaves), the rest held arrays its init passes through (`held_at`)."""
-    drawn = dict(zip(built, made, strict=True))
-    return together(state, jax.tree.unflatten(structure, [
-        drawn[index] if index in drawn else held_at(index) for index in range(structure.num_leaves)]))
-
-
 def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, abstract: TrainState,
                  shardings: Placement[TrainState], mesh: Mesh) -> TrainState:
     """A fresh state on `mesh`, built by `initial_state` from the objective's held tree (`placed_held`).
@@ -651,9 +619,13 @@ def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, ab
     placed = jax.tree.leaves(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
                                           is_leaf=lambda leaf: leaf is None))
 
-    def held_at(index: int) -> jax.Array:
+    drawn = dict(zip(start.built, made, strict=True))
+
+    def leaf(index: int) -> jax.Array:
+        if index in drawn:
+            return drawn[index]
         # A held leaf an init passes through at two places of other shardings is placed at the second too.
         held = placed[start.through[index]]
         return held if held.sharding == where[index] else jax.device_put(held, where[index])
 
-    return _reassembled(state, made, start.built, structure, held_at)
+    return together(state, jax.tree.unflatten(structure, [leaf(index) for index in range(len(where))]))

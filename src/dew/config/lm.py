@@ -280,7 +280,7 @@ class LMRunConfig(DecoderRunConfig):
                 key = jax.random.key(self.trainer.key)
                 # One program, not each operation's (row 8732).
                 base = drawn_once(lambda _, draw: model.init(draw, jnp.zeros((1, tokens.seq_len), jnp.int32)),
-                                  None, key)
+                                  None, key, lambda drawn: drawn)
                 adapter = self.lora.apply(model, base, key=jax.random.fold_in(key, 1))
                 model, variables = adapter.model, adapter.variables
             else:

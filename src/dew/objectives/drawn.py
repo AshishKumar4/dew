@@ -4,14 +4,16 @@ start a trainer builds (`dew.training.distributed.start_build`), each lowered as
 
 from __future__ import annotations
 
+import collections
 import contextlib
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 
 import jax
 from jax._src import config as jax_config
 
+from dew._cache import holding
 from dew.algebra.program import replaying
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.options import abstract_signature, held_context, owned_program
 
 
 def drawing() -> contextlib.AbstractContextManager[None]:
@@ -48,24 +50,46 @@ def passed_through[Tree, Built, Picked](function: Callable[[Tree, jax.Array], Bu
     return traced, through
 
 
-def drawn_once[Tree, Result](function: Callable[[Tree, jax.Array], Result], held: Tree, key: jax.Array
-                             ) -> Result:
+KEPT_DRAWS = 8
+"""The draws a process keeps for a later call to read (`drawn_once`'s `kept`), the latest of them."""
+
+_DRAWS: collections.OrderedDict[Hashable, tuple] = collections.OrderedDict()
+
+
+def drawn_once[Tree, Built, Picked](function: Callable[[Tree, jax.Array], Built], held: Tree, key: jax.Array,
+                                    picked: Callable[[Built], Picked], *, kept: Hashable | None = None
+                                    ) -> Built:
     """`function(held, key)` for a caller outside any trace, by one program, its draws rolled (`drawing`),
     where run eagerly each operation of a model's draw compiled alone (tens to hundreds a model, row 8682):
-    traced once, its leaves that are `held`'s as they are (`passed_through`) those arrays themselves, no
-    output of the program, which draws the rest from its replay (`dew.algebra.program.replaying`)."""
-    traced, through = passed_through(function, lambda built: built)
-    trace = owned_program(traced).trace(held, key)
-    structure = jax.tree.structure(trace.out_info)
-    replay = replaying(trace.jaxpr, structure, (), ())
-    made = [index for index in range(structure.num_leaves) if index not in through]
+    traced once, the leaves of `picked` of what it builds that are `held`'s as they are (`passed_through`)
+    those arrays themselves, no output of the program, which draws the rest from its replay
+    (`dew.algebra.program.replaying`); the rest are buffers of their own. Where `kept` states what it traces
+    from beside its arguments, its trace and program are kept by it, the trace's context and the arguments'
+    shapes (`dew._cache.holding`), so a second call compiles nothing (rows 8731, train 1080's F2). The one
+    eager draw: an objective's init (`Objective.init`) and a trainer's fresh state (`Trainer.initial_state`,
+    its frozen tree `picked`)."""
 
-    def rest(tree: Tree, draw: jax.Array) -> list[jax.Array]:
-        leaves = jax.tree.leaves(replay(tree, draw))
-        return [leaves[index] for index in made]
+    def made() -> tuple:
+        traced, through = passed_through(function, picked)
+        trace = owned_program(traced).trace(held, key)
+        structure = jax.tree.structure(trace.out_info)
+        # Each picked leaf's place among the built tree's leaves, read off a tree of its places.
+        places = jax.tree.leaves(picked(jax.tree.unflatten(structure, list(range(structure.num_leaves)))))
+        given = {places[index]: leaf for index, leaf in through.items()}
+        replay = replaying(trace.jaxpr, structure, (), ())
+        drawn = [index for index in range(structure.num_leaves) if index not in given]
 
+        def rest(tree: Tree, draw: jax.Array) -> list[jax.Array]:
+            leaves = jax.tree.leaves(replay(tree, draw))
+            return [leaves[index] for index in drawn]
+
+        return structure, given, drawn, owned_program(rest)
+
+    signature = (held_context(), abstract_signature(jax.tree.leaves((held, key))))
+    structure, given, drawn, program = (made() if kept is None
+                                        else holding(_DRAWS, (kept, signature), made, KEPT_DRAWS))
     with drawing():
-        drawn = dict(zip(made, owned_program(rest)(held, key), strict=True))
-    given = jax.tree.leaves(held)
-    return jax.tree.unflatten(structure, [drawn[index] if index in drawn else given[through[index]]
+        leaves = dict(zip(drawn, program(held, key), strict=True))
+    inputs = jax.tree.leaves(held)
+    return jax.tree.unflatten(structure, [leaves[index] if index in leaves else inputs[given[index]]
                                           for index in range(structure.num_leaves)])
