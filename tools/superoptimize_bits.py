@@ -154,8 +154,9 @@ def _seeded(form: _Seeded, primitive, args, signed: bool, equation):
 
 # --- each step's meaning over Z3's bit-vectors --------------------------------------------------------------
 
-def _word(expr: z3.ExprRef) -> z3.BitVecRef:
-    """`expr`, a 32-bit word: z3's `If` and `Concat` over words, which its stubs type as any expression."""
+def _word(expr: object) -> z3.BitVecRef:
+    """`expr`, a 32-bit word: z3's `If` and `Concat` over words, which its stubs type as any expression or
+    tactic (`If` builds both)."""
     if not isinstance(expr, z3.BitVecRef):
         raise TypeError(f"{expr}: not a word")
     return expr
