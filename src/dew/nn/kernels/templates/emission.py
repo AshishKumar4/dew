@@ -175,7 +175,7 @@ def _folded(equation, values: list) -> list:
                 for value, atom in zip(values, equation.invars, strict=True)]
     if equation.primitive in (lax.div_p, lax.rem_p) and _undefined(*operands):
         return [None]
-    if equation.primitive in _SHIFTS and not 0 <= int(operands[1]) < np.iinfo(operands[0].dtype).bits:
+    if equation.primitive in _SHIFTS and not 0 <= int(operands[1]) < jnp.iinfo(operands[0].dtype).bits:
         # Poison where Mosaic GPU computes it (MLIR's `shli`, `shrsi`, `shrui`), XLA's saturating fold apart.
         return [None]
     (out,) = equation.outvars
