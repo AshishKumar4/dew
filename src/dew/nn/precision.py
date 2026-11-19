@@ -1948,9 +1948,9 @@ def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, t
                                       jax.typeof(value), live)
 
 
-def _placed_as(x: jax.Array, like) -> jax.Array:
-    """`x` placed as `like`'s type (an array's or its aval), whole too, where its mesh has an Explicit one."""
-    placed = (like if isinstance(like, ShapedArray) else jax.typeof(like)).sharding
+def _placed_as(x: jax.Array, like: ShapedArray) -> jax.Array:
+    """`x` placed as the type `like`, whole too, where its mesh has an Explicit axis (rows 8757, 8849)."""
+    placed = like.sharding
     typed = isinstance(placed, jax.sharding.NamedSharding) and placed.mesh.explicit_axes
     return jax.sharding.reshard(x, placed) if typed else x
 
@@ -2013,7 +2013,8 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
                         along = tuple(d for d, size in enumerate(held) if size == 1)
                         terms.append(products)
                         laid.append((along if along else None, (held, factor.shape)))
-            gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype), factor))
+            gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype),
+                                        jax.typeof(factor)))
         return gradients
 
     return generation.linear_map(applied, pulled, list(primals), list(tangents),
