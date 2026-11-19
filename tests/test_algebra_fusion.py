@@ -297,6 +297,69 @@ def test_a_named_products_consumers_are_its_epilogue_its_name_the_launchs_residu
                         truth_fn=with_gradients(lambda *x: named_gate(*(a.astype(jnp.float64) for a in x))))
 
 
+def gated_mlp_product(x, w, up):
+    """A gated MLP's gate projection, named for remat (`gate_proj`), and its SwiGLU with `up` as a model takes
+    it (`activations.gated_product`: one marked region, `derivatives.Activation`, whose body is SwiGLU's
+    Pallas kernel where an H100's selector chooses it)."""
+    from jax.ad_checkpoint import checkpoint_name
+
+    from dew.nn import activations
+
+    return activations.gated_product("swiglu")(checkpoint_name(x @ w, "gate_proj"), up)
+
+
+def test_a_models_gated_product_is_its_gate_projections_epilogue():
+    """A model's SwiGLU (`gated_product`, its region marked `Activation`, its body SwiGLU's Pallas kernel on
+    an H100) after its named gate projection, under the pass on an H100 whose template a call names: the
+    region is the product's epilogue (its 'gemm_epilogue' route the fused kernel's), replayed as the
+    activation's arithmetic on the tile (`activations.gated_hook`), no region of it or dot left in the
+    program; the program computes as written, gradients too (check 1 against float64)."""
+    from contract_support import normal_drawn
+    from reference_error import assert_as_exact, with_gradients
+
+    from dew.nn import derivatives
+
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16),
+              jax.ShapeDtypeStruct((256, 256), jnp.bfloat16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        with generation.routes() as found:
+            traced = jax.jit(algebra.rewritten(gated_mlp_product, kernels=True)).trace(*shapes)
+        assert any(route.choice == "gemm_epilogue" and route.kernel == "fused" for route in found), [
+            (route.choice, route.kernel) for route in found]
+        left = [equation for equation in traced.jaxpr.jaxpr.eqns
+                if equation.primitive is jax.lax.dot_general_p
+                or isinstance(equation.params.get("kind"), derivatives.Activation)]
+        assert not left, left
+    operands = normal_drawn(5101, (256, 512), (512, 256), (256, 256), dtype=jnp.bfloat16)
+    cotangent = normal_drawn(5102, (256, 256), dtype=jnp.bfloat16)
+
+    def wide(x, w, up):
+        return jax.nn.silu(x.astype(jnp.float64) @ w.astype(jnp.float64)) * up.astype(jnp.float64)
+
+    # Run as the H100's routes on this CPU: their kernels interpreted where it places them.
+    with generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic"):
+        assert_as_exact(jax.jit(with_gradients(algebra.rewritten(gated_mlp_product, kernels=True))),
+                        jax.jit(with_gradients(gated_mlp_product)),
+                        lambda seed: (*operands(seed), *cotangent(seed)),
+                        "a model's gated product under the pass", seeds=8, truth_fn=with_gradients(wide))
+
+
+def test_a_gated_product_of_no_product_stays_its_region():
+    """A model's SwiGLU (`gated_product`) over projections the program takes as inputs, no product before it:
+    the pass leaves its region whole (`derivatives.Activation`, its body the route its dispatcher chose on an
+    H100), the activation fused into no launch, and the program computes it bit for bit as written."""
+    from dew.nn import activations, derivatives
+
+    product = activations.gated_product("swiglu")
+    gate, up = (jax.random.normal(jax.random.key(seed), (256, 256)).astype(jnp.bfloat16) for seed in (1, 2))
+    with generation.assumed("sm90"):
+        traced = jax.jit(algebra.rewritten(product, kernels=True)).trace(gate, up)
+        assert [equation for equation in traced.jaxpr.jaxpr.eqns
+                if isinstance(equation.params.get("kind"), derivatives.Activation)]
+    np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(product, kernels=True))(gate, up),
+                                             np.float32), np.asarray(jax.jit(product)(gate, up), np.float32))
+
+
 def named_rows(x, w):
     """A sine of rows named for remat before it, then their product: a name on a prologue's value."""
     from jax.ad_checkpoint import checkpoint_name
