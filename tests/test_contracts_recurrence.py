@@ -769,8 +769,8 @@ def test_a_turned_template_call_holds_every_order(edge):
     """A turned call on the template (`templates.recurrence.turned.call`: its keys and queries in their
     documents' frames, its turns' gradient in the crossing form) over a plain launch of the template's
     arithmetic (`_framed_scores`), its keys, queries and values at `edge` and its turns of up to 3 radians:
-    each order it runs (reverse, its rule a custom one) finite where the plain formula's is
-    (`_turned_plainly`, its float64 the truth; row 7419)."""
+    every order finite where the plain formula's is (`_turned_plainly`, its float64 the truth; row 7419),
+    forward mode through its launch's own tangent (row 8573)."""
     shapes = ((1, 40, 1, 6),) * 2 + ((1, 40, 1, 2),)
     def draw(seed):
         operands = normal_draw(7419 + 4096 * seed, *shapes, scale=EDGES[edge])
@@ -780,14 +780,13 @@ def test_a_turned_template_call_holds_every_order(edge):
                 normal_draw(7421 + 4096 * seed, (1, 40, 1, 2), (1, 1, 6, 2)))
     ones, decays = jnp.ones((1, 40, 1), jnp.float32), jnp.full((1, 40, 1), -0.05, jnp.float32)
 
-    def launch(query, key, value, g, beta, state, skip, entry, turning):
-        del g, beta, state, skip, entry, turning
+    def launch(context, query, key, value, g, beta, state, skip, entry, turning):
+        del context, g, beta, state, skip, entry, turning
         return _framed_scores(query, key, value, TURNED_STARTS)
 
     def rule(query, key, value, turn):
         return turned.call(launch, query, key, value, decays, ones, None, None, turn, TURNED_STARTS,
                            scale=1.0, group=1)
 
-    assert_contract(rule, *draw(0), f"a turned template call {edge}",
-                    truth_fn=_turned_plainly, plain_fn=_turned_plainly, without=REVERSE_ONLY,
-                    draw=measured(edge, draw))
+    assert_contract(rule, *draw(0), f"a turned template call {edge}", truth_fn=_turned_plainly,
+                    plain_fn=_turned_plainly, draw=measured(edge, draw))
