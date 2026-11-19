@@ -26,6 +26,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import LogicalAxes
+from dew.nn.activations import logistic
 from dew.nn.attention import AttentionImpl, kernel_for_materialized_mask, scaled_dot_product_attention
 from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits, visibility_mask
 from dew.nn.cross_attention import sow_context_logits, with_context_logits
@@ -1107,9 +1108,9 @@ class MultiHeadLatentAttention(LinearProducts):
         )
         if self.query_gate:
             wide = at_least_fp32(context.dtype)
-            context = (context.astype(wide) * nn.sigmoid(gating.astype(wide))).astype(context.dtype)
+            context = (context.astype(wide) * logistic(gating.astype(wide))).astype(context.dtype)
         elif self.output_gate:
-            context = context * nn.sigmoid(self.g_proj(gating))
+            context = context * logistic(self.g_proj(gating))
         return checkpoint_name(self.o_proj(context), Residual.O_PROJ)
 
 

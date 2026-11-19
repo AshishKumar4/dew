@@ -57,13 +57,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     walk_stores,
     whole_blocks,
 )
-from dew.nn.kernels.templates.recurrence.table import (
-    Table,
-    returned_by,
-    table_landing,
-    table_returned,
-    table_slots,
-)
+from dew.nn.kernels.templates.recurrence.table import Table, returned_by, table_landing, table_returned
 from dew.nn.kernels.templates.resources import largest_live_set
 from dew.nn.precision import compensated_sum
 
@@ -141,7 +135,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   max_segments: int | None = None, scale: float | None = None,
                   family: mosaic.Family | None = None, interpret: bool = False,
                   inverse=None, kept=None, delta: bool = True,
-                  rounded: bool = False, values_gated: bool = False,
+                  rounded: bool = False, apart: int = 0, values_gated: bool = False,
                   unit_keys: bool = False, ranged: bool = False,
                   skip=None,
                   forked: ForkedTable | None = None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
@@ -171,7 +165,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                                   "fp32 call's under the run's fast forms alone")
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                   firsts=firsts, rounded=rounded, values_gated=values_gated,
+                   firsts=firsts, rounded=rounded, apart=apart, values_gated=values_gated,
                    unit_keys=unit_keys, ranged=ranged, forked=forked,
                    skipped=skip is not None)
     call = run.call
@@ -248,8 +242,20 @@ def _taken_up(run, taken):
     """The gradient of the memory each chunk takes up (`taken`, the reverse walk's, `[chunks * HV * Dk, Dv]`),
     `[NC, HV, Dk, Dv]`, zero at a chunk that takes nothing up (which the walk wrote nothing to)."""
     call, table = run.call, run.table
+    taken = taken[table.pad:taken.shape[0] - table.pad]
     taken = taken.reshape(-1, call.heads, call.width, call.value_width)
     return jnp.where((table.loads >= 0)[:, None, None, None], taken, 0.0)
+
+
+def _turned_back(run, taken):
+    """`taken` (`_taken_up`'s) turned back by each chunk's load rotation (`table.Table.turning`), its slots'
+    own frames; as it is where the call turns none."""
+    table = run.table
+    if table.turning is None:
+        return taken
+    rows, after, before = (part.reshape(*taken.shape[:2], -1)[..., None] for part in table.turning)
+    shifted = jnp.pad(taken, ((0, 0),) * 2 + ((1, 1), (0, 0)))
+    return rows * taken - after * shifted[..., 2:, :] - before * shifted[..., :-2, :]
 
 
 def _tabled_gradients(run, grads: tuple, taken) -> tuple:
@@ -259,13 +265,15 @@ def _tabled_gradients(run, grads: tuple, taken) -> tuple:
     if taken is None:
         return grads
     table = run.table
-    # Each chunk taking a given slot up adds to its row's slot (a stored slot's, its storing chunk's walk).
-    given = jnp.zeros((run.batch, table.count, *_taken_up(run, taken).shape[1:]), jnp.float32)
-    # A slot a chunk adds (`Table.adds`) takes the same gradient as the one it loads.
+    # Each chunk taking a given slot up adds to its row's slot (a stored slot's, its storing chunk's walk),
+    # its gradient turned back into the slot's frame where the call turns it (`_turned_back`); a slot a chunk
+    # adds (`Table.adds`) takes the same gradient as the one it loads.
+    returned = _turned_back(run, _taken_up(run, taken))
+    given = jnp.zeros((run.batch, table.count, *returned.shape[1:]), jnp.float32)
     for slots in (table.loads, *(() if table.adds is None else (table.adds,))):
         given_slot = (slots > 0) & (slots <= table.count)
         given = given.at[table.rows, jnp.clip(slots - 1, 0, table.count - 1)].add(
-            jnp.where(given_slot[:, None, None, None], _taken_up(run, taken), 0.0), mode="drop")
+            jnp.where(given_slot[:, None, None, None], returned, 0.0), mode="drop")
     return (*grads[:5], given[..., :run.key_width, :run.value_width])
 
 
@@ -385,7 +393,7 @@ def _local_back(q, k, do, hi, lo, taken, call: Call, *, scale: float):
                 functools.partial(block, "keys"), functools.partial(block, "queries"), width // call.block,
                 gate, low, lambda j: stream_tile(slots, "out", given, columns=pl.ds(j * vb, vb)),
                                    value_width // vb,
-                scale, call.held.dtype, issue, issue.summed, emit=stored, laid=laid)
+                scale, call.held.dtype, issue, issue.summed, emit=stored, laid=laid, apart=call.apart)
             return carry, accumulators
 
         return mosaic.Walk(views, step, prologue=None if streamed else lambda: read(None))
@@ -628,7 +636,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                 *refs, streams, staging, landing):
         skip_ref, refs = (refs[0], refs[1:]) if skips else (None, refs)
         entered_ref, refs = (refs[0], refs[1:]) if call.per_key else (None, refs)
-        taken = 0 if table is None else len(table_slots(table))
+        taken = 0 if table is None else len(table.returning)
         table_refs, refs = refs[:taken], refs[taken:]
         refs, returned_refs = refs[:len(refs) - returns], refs[len(refs) - returns:]
         dh_ref, dv_ref, dh0_ref, *gated_ref = refs
@@ -707,7 +715,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                                  table=table)(
         q, k, k if w is None else w, do, local, hi, lo, dht, sequences, k if v is None else v,
         hi if beta is None else beta, *(() if skip is None else (skip.astype(jnp.float32),)),
-        *(() if memory is None else (memory,)), *(() if table is None else table_slots(table)))
+        *(() if memory is None else (memory,)), *(() if table is None else table.returning))
     # A forked call's stored slots' gathered gradients the walk alone reads.
     return launched[:-1] if returns == 2 else launched
 
@@ -789,17 +797,17 @@ def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, 
 
 
 def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequence, sums: dict, first,
-                     landing: dict, apart: bool = False) -> None:
+                     landing: dict, split: bool = False) -> None:
     """`algebra.memory_gradients`' emit in `_query_key`: the weights' gradient (`kind` 'dw') in the
     operands' dtype to `weights` (its parts' views) as it is final, as fla's dqkwg writes it; the queries'
     and keys' ('dq', 'dk') to `sums[kind]` summed over the key head's value heads in fp32, stored at the
     first (`first`) and added at the rest (`Family.added`: a TMA reduction, or whole rows through
-    registers), each through its launch's landing tiles. A value split's (`apart`) weights' gradient is its
+    registers), each through its launch's landing tiles. A value split's (`split`) weights' gradient is its
     split's own part of it, fp32, which XLA adds, through its own landing tile."""
     del block
     family = call.family
     if kind == "dw":
-        if apart:
+        if split:
             family.stored([grad], weights, smem=landing["weights"])
             return
         pieces = product.formed(grad.astype(jnp.float32), call.held.parts) if call.held.parts > 1 else (grad,)
@@ -975,7 +983,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
                        held.views(weights_ref[0], row, chunk, weights_at, call.block) if splits == 1 else
                        [weights_ref[0].at[span, pl.ds(split * call.heads * width + weights_at, call.block)]])
             stored = functools.partial(_gradient_stored, call, weights=weights, sums=sums, first=first_head,
-                                       landing=landing, apart=splits > 1)
+                                       landing=landing, split=splits > 1)
 
             issue = Issuer(call)
             ds = stream_tile(slots, "ds", grads) if scores else None
@@ -1184,7 +1192,8 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
                 width // call.block, functools.partial(value_column, "values", held),
                 functools.partial(value_column, "out", given), blocks, gate, low, scale,
                 grads.dtype if accumulated is None else jnp.float32, Issuer(call).summed, laid=laid,
-                column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None)
+                column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None,
+                apart=call.apart)
             # The pairs' sum before the scores' gradient's store, so an fp32 call's parts form after the
             # pairs are gone.
             decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, column_sums)

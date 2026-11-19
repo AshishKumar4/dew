@@ -16,7 +16,7 @@ import io
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, get_args
 
 import jax
 import numpy as np
@@ -470,7 +470,14 @@ def _openai_fields(model: str, prompts: str | Sequence[str] | TokenRows, budget:
     return _bound(parameters, fixed), count * n
 
 
-def _engine_stops(sampling: Sampling, provider: Literal["vllm", "sglang"]) -> Mapping[str, JSON]:
+EngineProvider = Literal["sglang", "vllm"]
+"""Provider names for SGLang and vLLM, which expose engine-specific token rollout controls."""
+
+ENGINE_PROVIDERS: tuple[EngineProvider, ...] = get_args(EngineProvider)
+"""Each engine provider (`EngineProvider`), in its declared order."""
+
+
+def _engine_stops(sampling: Sampling, provider: EngineProvider) -> Mapping[str, JSON]:
     """The request fields that end an engine's draw on `sampling.stops`.
 
     vLLM ends a draw on its model's EOS and its generation config's EOS ids unless told to ignore
@@ -505,11 +512,11 @@ class OpenAICompletion:
 
     model: str
     client: OpenAI | AsyncOpenAI
-    provider: Literal["openai", "vllm", "sglang"] = "openai"
+    provider: Literal["openai"] | EngineProvider = "openai"
 
     def __post_init__(self) -> None:
-        if self.provider not in ("openai", "vllm", "sglang"):
-            raise ValueError("provider must be openai, vllm or sglang")
+        if self.provider not in ("openai", *ENGINE_PROVIDERS):
+            raise ValueError(f"provider must be one of openai, {', '.join(ENGINE_PROVIDERS)}")
 
     def _parameters(self, supplied: Mapping[str, object]) -> Mapping[str, object]:
         if "seed" in supplied:

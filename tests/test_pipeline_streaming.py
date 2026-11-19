@@ -15,7 +15,6 @@ takes prompts its conditioner encoded alone (`prepare(conditions=...)`): the
 same images as the prompted call, bit for bit.
 """
 
-import tarfile
 from pathlib import Path
 
 import jax
@@ -23,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from interop_support import drawn_prompts
+from interop_support import drawn_prompts, extract_fixture
 from model_support import streamed_export
 from reference_error import as_given, assert_as_exact
 
@@ -48,8 +47,7 @@ PIPELINES = {
 def extracted(tmp_path_factory):
     root = tmp_path_factory.mktemp("pipelines")
     for archive in sorted({name for name, _ in PIPELINES.values()}):
-        with tarfile.open(ROOT / f"tests/fixtures/{archive}.tar.xz") as opened:
-            opened.extractall(root / archive, filter="data")
+        extract_fixture(ROOT / f"tests/fixtures/{archive}.tar.xz", root / archive)
     return {family: root / archive / inside for family, (archive, inside) in PIPELINES.items()}
 
 

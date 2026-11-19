@@ -39,6 +39,7 @@ import contextvars
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -52,6 +53,7 @@ from jax.extend.core import primitives
 from dew import _cache, algebra
 from dew.algebra import cost as algebra_cost, program as algebra_program
 from dew.nn import programs
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
@@ -305,14 +307,14 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     # The program's names lifted first (`_named`): the algebra's rewriting reads a name as an identity.
     named_consumer = consumer
     consumer, names = _named(consumer, values, acc)
-    consumer = _rewritten_consumer(consumer, values, acc)
+    written, consumer = _rewritten_consumer(consumer, values, acc)
     leaves, treedef = jax.tree.flatten(values)
     axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
                   if prefetch else _axes(consumer, values, acc))
     if axes is None:
         # A consumer the launch takes not runs after the plain product, XLA's, unpriced, the program's
         # names where it wrote them.
-        return _rewritten_consumer(named_consumer, values, acc)(values, plain())
+        return _rewritten_consumer(named_consumer, values, acc)[0](values, plain())
     # A consumer the launch takes as its epilogue is priced (`priced`), its work counted as the launch's
     # body counts it.
     if collected is not None:
@@ -324,7 +326,8 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
             float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs)), formed))
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
-    epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc)
+    epilogue = _declared(functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc), written,
+                         treedef, out_treedef, acc)
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
     # Each value the program names (`checkpoint_name`) an output of the launch's, a residual of its
@@ -396,19 +399,42 @@ def _prologue(fusion) -> tuple[jax.Array, dict, Formed | None]:
                   'prologue_jvp': jvp}, formed
 
 
-def _rewritten_consumer(consumer, values, acc):
-    """The consumer as the algebra pass rewrites it (docs/design/algebra.md §2), traced once at the whole
-    product `acc` beside its captured `values`: the one program the analysis tiles (`_axes`), the epilogue
-    runs on each tile (`_tiled`, pulled at the whole product) and XLA runs whole where the kernels refuse
-    it, as the producer's stage is (`_split`). Its derivative is the launch's glue (`gemm`'s `KernelGlue`),
-    which the outer program's pass rewrites; a launch's own body it never sees."""
+def _rewritten_consumer(consumer, values, acc) -> tuple[Callable, Callable]:
+    """The consumer as the algebra pass rewrites it (docs/design/algebra.md §2), traced and rewritten once at
+    the whole product `acc` beside its captured `values`, evaluated two ways from that one program: as
+    written, each call it makes kept, its declared tangent its derivative (`_declared`), what XLA runs whole
+    where the kernels refuse it; and inlined, each call read through to its body (`_inlined`: a marked
+    span's, Dew's one logistic in a gated product's arithmetic, as a kernel's body lowers a call), where the
+    fuser has no rule to tile a call (`_pulled`): the program the analysis tiles (`_axes`) and the epilogue
+    runs on each tile (`_tiled`, pulled at the whole product), as the producer's stage is (`_split`)."""
     closed, shapes = jax.make_jaxpr(algebra.rewritten(consumer), return_shape=True)(values, acc)
     structure = jax.tree.structure(shapes)
 
-    def rewritten(values, acc):
+    def written(values, acc):
         return jax.tree.unflatten(structure, jax_core.jaxpr_as_fun(closed)(*jax.tree.leaves((values, acc))))
 
-    return rewritten
+    def inlined(values, acc):
+        return jax.tree.unflatten(structure, _inlined(closed, *jax.tree.leaves((values, acc))))
+
+    return written, inlined
+
+
+def _declared(tiled, written, treedef, out_treedef, whole: jax.ShapeDtypeStruct):
+    """The epilogue a launch applies: `tiled` (`_tiled`, the consumer's arithmetic with each call read
+    through to its body, which the fuser tiles) on a kernel's tiles and on XLA's whole arrays alike, its
+    derivative the consumer's as written (`written`, each call kept): a marked span's declared tangent, Dew's
+    one logistic's in a gated product, where the arithmetic's own derivative is no number past exp's overflow
+    (a gated product's gate and rows gradients not finite at 1.6% of a draw's entries). The launch's glue
+    (`gemm`'s `KernelGlue`) as the prologue's derivative is (`gemm._prologued`)."""
+    def as_written(acc, *tiles):
+        outs = jax.tree.leaves(written(jax.tree.unflatten(treedef, list(tiles)), acc.astype(whole.dtype)))
+        return tuple(outs) if out_treedef.num_leaves > 1 else outs[0]
+
+    def tangent(primals, tangents):
+        return jax.jvp(as_written, primals, tangents)
+
+    return contracted("test_a_fused_gemm_epilogue_holds_every_order")(
+        declared_tangent(KernelGlue(), tiled, tangent))
 
 
 def _named(consumer, values, acc):

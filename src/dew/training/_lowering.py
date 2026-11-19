@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 
 import jax
@@ -121,12 +121,13 @@ def _known(count: float) -> int | None:
     return int(count) if math.isfinite(count) else None
 
 
-def kernel_report(routes, lowered: jax.stages.Lowered) -> KernelReport:
-    """The `KernelReport` of a step whose trace reported `routes` and lowered to `lowered`, its calls without
+def kernel_report(routes, *lowered: jax.stages.Lowered) -> KernelReport:
+    """The `KernelReport` of a step whose trace reported `routes` and lowered to `lowered`, its one program
+    or each of its several (a host step's, each program's launches once a call of it), its calls without
     their kernels' IR, which nothing that reads a report reads: a run keeps the report after it releases
     the program (`planning.Planned.released`, the data lane)."""
-    return KernelReport(tuple(routes),
-                        tuple((replace(call, ir=b""), runs) for call, runs in kernel_launches(lowered)))
+    return KernelReport(tuple(routes), tuple((replace(call, ir=b""), runs) for program in lowered
+                                             for call, runs in kernel_launches(program)))
 
 
 def routed[Made, *Arguments](lower: Callable[[*Arguments], Made], *arguments: *Arguments
@@ -161,14 +162,23 @@ class Lowered(SystemExit):
     """Raised by `Trainer.fit` under `lower_for` once the run's first step has lowered for its target.
 
     Lowering was the whole run, so uncaught it ends the program with status 0
-    and no traceback, the step's kernels logged (`--trainer.lower-for`'s dry run). `kernels` is the step's
-    kernel report (`KernelReport`: its dispatches' routes and its lowered launches), and `lowered` is
-    the step itself. A step for devices this host is not compiles ahead (`dew.training.ahead`).
+    and no traceback, the step's kernels logged (`--trainer.lower-for`'s dry run). `programs` are the
+    step's programs, each lowered with its name: a device step's one, a host step's each (the CPU's and the
+    accelerator's, `dew.training.compiler.HostRun`, as its steady steps call them); `kernels` is their
+    kernel report (`KernelReport`: the dispatches' routes and the lowered launches). A step for devices
+    this host is not compiles ahead (`dew.training.ahead`).
     """
 
-    def __init__(self, target: str, lowered: jax.stages.Lowered, routes=()):
+    def __init__(self, target: str, programs: Sequence[tuple[str, jax.stages.Lowered]], routes=()):
         super().__init__(0)
         self.generation = target
-        self.lowered = lowered
-        self.kernels = kernel_report(routes, lowered)
+        self.programs = tuple(programs)
+        self.kernels = kernel_report(routes, *(lowered for _, lowered in self.programs))
         _log.info("the step lowered for %s; its %s", target, self.kernels.summary())
+
+    @property
+    def lowered(self) -> jax.stages.Lowered:
+        """The step's program, where it is one (a device step's): a host step's are several (`programs`)."""
+        if len(self.programs) != 1:
+            raise ValueError(f"the step lowered {len(self.programs)} programs (a host step's): read programs")
+        return self.programs[0][1]

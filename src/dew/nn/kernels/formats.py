@@ -16,6 +16,11 @@ from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
 from dew.nn.precision import at_least_fp32
 
+FORM = np.frombuffer(bytes.fromhex(bits.NVFP4_BFLOAT16_FORM.version), np.uint8)
+"""The version of the form an `NvFp4`'s words are packed by (`bits.BitForm.version`, its encoder's digest),
+as the bytes a matrix stores beside its words (`NvFp4.form`): words another encoder packed decode wrong by
+this Dew's form, so a load refuses them (`NvFp4.checked`; algebra.md 7.4, row 6101)."""
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -35,6 +40,23 @@ class NvFp4:
     words: jax.Array | np.ndarray
     scales: jax.Array | np.ndarray
     scale: jax.Array | np.ndarray
+    form: jax.Array | np.ndarray = dataclasses.field(default_factory=FORM.copy)
+    """The version of the form its words were packed by (`FORM`'s bytes; a stack of banks' one a layer),
+    stored with them, so a checkpoint's words carry the encoder that packed them (`checked`)."""
+
+    def checked(self) -> "NvFp4":
+        """Itself, where its words are the checked-in form's (`FORM`), every layer's; refused otherwise:
+        words another encoder packed (a checkpoint an earlier Dew wrote) read wrong through this form's
+        decode, so they are repacked from the source weights, never decoded. A host check of its stored
+        bytes (one replicated shard's, on any host)."""
+        form = self.form
+        held = np.asarray(form.addressable_shards[0].data if isinstance(form, jax.Array) else form)
+        found = {bytes(row).hex() for row in held.reshape(-1, FORM.size)}
+        if found != {FORM.tobytes().hex()}:
+            raise ValueError(f"NVFP4 words packed by form version {', '.join(sorted(found))}, where this Dew "
+                             f"decodes form version {FORM.tobytes().hex()}: repack them from the source "
+                             f"weights (`NvFp4.of`)")
+        return self
 
     @classmethod
     def quantized(cls, x: jax.Array) -> "NvFp4":
@@ -76,7 +98,8 @@ class NvFp4:
     def decoded(self) -> jax.Array:
         """Its values over `bits.NVFP4_OWED` and the tensor scale, exactly, in bfloat16 (`[..., depth,
         width]`): each code times its block's scale over 2^8, as the mainloop's stage decode forms it."""
-        owed = jnp.swapaxes(self.scales, -1, -2).astype(jnp.float32) * jnp.float32(1 / bits.NVFP4_OWED)
+        owed = bits.scales_decoded(jax.lax.bitcast_convert_type(jnp.swapaxes(self.scales, -1, -2), jnp.uint8)
+                                   ) * jnp.float32(1 / bits.NVFP4_OWED)
         return (self.codes() * jnp.repeat(owed, 16, axis=-2)).astype(jnp.bfloat16)
 
     @property
@@ -94,7 +117,7 @@ class NvFp4:
         """A stack of banks' bank at layer `index` (a traced index): its fields led by a layers axis before
         their group axis (a scanned load's stacked banks, row 4861), each field's slice at it."""
         return NvFp4(*(jax.lax.dynamic_index_in_dim(jnp.asarray(field), index, keepdims=False)
-                       for field in (self.words, self.scales, self.scale)))
+                       for field in (self.words, self.scales, self.scale, self.form)))
 
     @property
     def factor(self) -> jax.Array:

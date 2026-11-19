@@ -95,6 +95,28 @@ def test_a_sampled_steps_summaries_are_its_commits_arrays():
         name: float(value) for name, value in expected.items()}
 
 
+class Printing(Pulled):
+    """`Pulled`, its loss printed from the step (`jax.debug.print`, a host callback)."""
+
+    def loss(self, variables, batch, step):
+        loss, aux = super().loss(variables, batch, step)
+        jax.debug.print("loss {}", loss)
+        return loss, aux
+
+
+def test_a_run_whose_step_calls_the_host_inspects_it():
+    """A run whose step calls a host callback (`jax.debug.print`) plans its sampled step and logs its
+    summaries: no file of programs can hold such a program, so its digest is taken only where a run is
+    compiled ahead. Digested on every inspecting run's plan, it crashed the search (train 1013's
+    review, F1)."""
+    tracker = Kept()
+    Trainer(Printing(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker,
+            inspection=Inspection(paths=("w",), every=1)).fit(
+        Loader(lambda partition: stream(), None, batch=BATCH, records=None), steps=1, log_every=1,
+        eval_every=None, checkpoint_every=None)
+    assert np.isfinite(tracker.rows[1]["inspect/updates/w/rms"])
+
+
 def test_a_step_of_two_commits_reports_its_latest_sample_and_sums_its_telemetry():
     """A split step can commit twice (a window a rejection left part filled, then the closing part of a
     run's last batch): its parts' counts, tokens and norms add, and its inspection is the last part's
@@ -823,6 +845,57 @@ def test_a_watched_cotangent_is_the_updates_loss_whatever_its_split():
     squares = np.square(whole["inspect/cotangents/Block_1/rms"])
     assert_fp32_reduction_bound(np.square(split["inspect/cotangents/Block_1/rms"]), squares, squares,
                                 terms=ROWS.size)
+
+
+def test_a_host_runs_sampled_step_summarizes_what_a_device_run_summarizes():
+    """A run keeping its variables on the host (`Layout(host=("variables",))`) inspects as a device run does:
+    its sampled step logs every summary the device run's logs, the watched block's activation and cotangent
+    and its parameters', each on par from float64 with the device run's (check 1: the host's forward and
+    pullback are programs of their own, whose sums the compiler orders apart from the device step's one
+    program)."""
+    from placement_parity import layouts_agree
+
+    from dew.distributed.placement import Layout
+
+    def logged(layout, rows):
+        objective = watched_run(Stacked(scanned=False), None).objective
+        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), layout=layout,
+                      inspection=Inspection(modules=("Block_1",), targets=("params",), cotangents=True))
+        found = inspected(run, {"x": rows})
+        return {name: jnp.asarray(value) for name, value in sorted(found.items())}
+
+    def draw(seed):
+        """The rows, each drawn normal."""
+        return (np.random.default_rng([233, seed]).standard_normal(ROWS.shape).astype(np.float32),)
+
+    host, device = logged(Layout(host=("variables",)), ROWS), logged(Layout(), ROWS)
+    assert set(host) == set(device) and any("/cotangents/" in name for name in host), sorted(host)
+    layouts_agree(logged, draw, "a host run's inspected summaries", Layout(host=("variables",)), Layout())
+
+
+def test_a_host_runs_unsampled_steps_are_the_uninspected_runs():
+    """A host run that inspects steps its unsampled steps as a host run that inspects nothing: its
+    unsampled body is built as the uninspected run's, with no inspection (no probe enters it, no loss
+    scale crosses), so the two compile one program, which steps the same parameters to the same bits.
+    The bitwise claim holds only so (testing.md:109: two arms held bit for bit compile to one program);
+    a sampled step's forward is another program, differentiating its probes beside the parameters, and is
+    held by check 1 (`test_a_host_runs_sampled_step_summarizes_what_a_device_run_summarizes`), never here."""
+    from dew.distributed.placement import Layout
+
+    def stepped(inspection):
+        objective = watched_run(Stacked(scanned=False), None).objective
+        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), layout=Layout(host=("variables",)),
+                      inspection=inspection)
+        state, _, _ = run.place()
+        batch = {"x": jnp.asarray(ROWS)}
+        step = run.compile(state, batch)
+        for _ in range(3):
+            state, *_ = step(state, batch, sampled=False)
+        return state.variables["params"]
+
+    watched = stepped(Inspection(modules=("Block_1",), targets=("params",), cotangents=True, every=2))
+    for one, other in zip(jax.tree.leaves(watched), jax.tree.leaves(stepped(None)), strict=True):
+        np.testing.assert_array_equal(np.asarray(one), np.asarray(other))
 
 
 def test_a_watched_cotangent_is_summarized_unscaled_under_a_dynamic_loss_scale():

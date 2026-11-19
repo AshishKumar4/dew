@@ -1,12 +1,19 @@
 """Check 1's arms beside Dew's and its reference (`assert_as_exact`'s `library_fn` and `also`): each is held
 as the reference is."""
 
+import contextlib
 import itertools
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
+from contract_support import normal_drawn
 from reference_error import GateFailure, Inconclusive, UnpairedDraw, as_given, assert_as_exact, seeds_for
 from test_reference_error import exact_rows, noised_draw, stacked_arm, stacked_examples
+from truths_ahead import compiled_truths
+
+from dew.nn.kernels import gemm, generation
 
 
 def noised(scale: float, noise: str, own: float = 0.0):
@@ -78,3 +85,72 @@ def test_a_library_arm_leaves_the_leaves_it_does_not_cover_judged_by_their_examp
         assert_as_exact(beside(stacked_arm(0, 3.0, every=5), 0), reference, stacked_examples,
                         "a fifth three times off", seeds=seeds, truth_fn=truth, examples=True, **allowed)
     assert not isinstance(failed.value, Inconclusive)
+
+
+def test_a_prepared_sites_arms_report_the_routes_their_unprepared_run_reports(tmp_path):
+    """A site whose arms its prepare compiled ahead (`truths_ahead.compiled_truths`, a GPU tier part's)
+    reports, as its run calls each arm's program, the routes the arm's trace reported where its prepare traced
+    it: those the site run unprepared reports. A run calling its executables traced nothing and reported no
+    route, so a matrix cell asserting its routes failed on its GPU (row 8374)."""
+    draw = normal_drawn(0x8374, (8, 16), (16, 4))
+
+    def dew(rows, matrix):
+        return gemm.gemm(rows, matrix, out_dtype=jnp.float32)
+
+    truth = as_given(lambda rows, matrix: np.asarray(rows, np.float64) @ np.asarray(matrix, np.float64))
+
+    def reported(**store) -> set:
+        with contextlib.ExitStack() as stack:
+            if store:
+                stack.enter_context(compiled_truths(tmp_path, stamp="here", **store))
+            found = stack.enter_context(generation.routes())
+            assert_as_exact(jax.jit(dew), jax.jit(jnp.dot), draw, "a routed product", seeds=16,
+                            truth_fn=truth)
+        return {(route.choice, route.kernel) for route in found}
+
+    unprepared = reported()
+    reported(prepare=True)
+    assert unprepared and reported(prepare=False) == unprepared, unprepared
+
+
+def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed():
+    """`arm_forms.without_ynn` takes XLA:CPU's options (WITHOUT_YNN) where the context places its calls on a
+    CPU, and none where it places them on a GPU, whatever the process's default backend: a GPU tier part's
+    prepare, a CPU process placing on its compile-only GPU, builds the arm its run on the GPU builds, which
+    the gate's statement names alike (`truths_ahead.arm_role`); keyed on the default backend, the prepare's
+    arm held YNNPACK's options and its run's none, and the run found no program (MissingTruth, the review of
+    row 8075's conversion)."""
+    from arm_forms import without_ynn
+    from truths_ahead import arm_role
+
+    def scaled(x):
+        return x * 2.0
+
+    plain = arm_role("dew", jax.jit(scaled), "a scaled arm")
+    with jax.default_device("gpu"):
+        on_a_gpu = arm_role("dew", without_ynn(scaled), "a scaled arm")
+    with jax.default_device("cpu"):
+        on_a_cpu = arm_role("dew", without_ynn(scaled), "a scaled arm")
+    assert on_a_gpu == plain != on_a_cpu
+
+
+def test_the_arms_arithmetic_is_that_of_where_their_calls_are_placed():
+    """Check 1 runs its arms in the arithmetic of where the context places their calls
+    (`arm_arithmetic.summed_as_run`): placed on the CPU lane, its fp32 sums (`FP32_SUMS`); placed on a GPU,
+    whatever the process's default backend, as a GPU tier part's prepare places them on its compile-only GPU,
+    the GPU's own, no preset (row 8580: keyed on the default backend, that prepare traced a cuBLASLt FP8
+    arm under the CPU's preset, which compiled it without its default fast accumulation)."""
+    from arm_arithmetic import summed_as_run
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.precision import FP32_SUMS
+
+    def preset():
+        with summed_as_run():
+            return jax.config.jax_default_matmul_precision
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        on_a_cpu = preset()
+    with jax.default_device(compile_only_gpus("sm90", 1)[0]):
+        on_a_gpu = preset()
+    assert on_a_cpu == FP32_SUMS and on_a_gpu == jax.config.jax_default_matmul_precision

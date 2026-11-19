@@ -104,8 +104,15 @@ class PretrainedDecision(Pretrained):
     release format writes."""
 
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
+        """This bundle with each of its trees transformed (`Pretrained.map_variables`): the backbone's, the
+        head's and its configured context encoder's weights (`context`), which a load places, casts or
+        holds as shapes as it does the rest."""
+        context = self.context
+        if context is not None:
+            encoder = dataclasses.replace(context.encoder, params=transform(context.encoder.params))
+            context = dataclasses.replace(context, encoder=encoder)
         return dataclasses.replace(self, variables=transform(self.variables),
-                                   head_variables=transform(self.head_variables))
+                                   head_variables=transform(self.head_variables), context=context)
 
     def backbone(self) -> Pretrained:
         """The native backbone alone, as it was read and as it is adapted (`adapt`), without the

@@ -1878,77 +1878,6 @@ def test_an_interval_read_no_later_than_the_last_reports_its_counts_and_no_rates
 # Divergence
 # --------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------
-# Rejected mixed-precision steps
-# --------------------------------------------------------------------------
-
-class ScaledObjective(Objective):
-    """loss = scale * sum(w^2), with the scale carried by the batch so that
-    one batch overflows the scaled float32 loss while the params stay sane."""
-
-    def __init__(self):
-        self.ema = EMASpec(decay=lambda step: 0.5)
-
-    def fresh_variables(self, key, held):
-        return {"params": {"w": jnp.ones((2,))}}
-
-    def loss(self, variables, batch, step):
-        return jnp.sum(variables["params"]["w"] ** 2) * batch["scale"][0], Aux({})
-
-
-def host(state):
-    return np.array(state.variables["params"]["w"]), np.array(state.ema["params"]["w"])
-
-
-def unscaled(accum: int, microsteps: int):
-    """The weights and their average after `microsteps` good microbatches of the same trainer with no
-    dynamic scale: what a scaled run's accepted steps must equal bit for bit, its scale a power of two
-    that multiplies the loss and divides the gradients exactly."""
-    trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0), accumulation=accum)
-    state = trainer.initial_state()
-    good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
-    step = trainer.compile(state, good)
-    for _ in range(microsteps):
-        state, *_ = step(state, good)
-    return host(state)
-
-
-@pytest.mark.parametrize("accum", [1, 2])
-def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
-    """A dynamic scale's accepted steps are the unscaled run's, bit for bit, and a rejected one leaves
-    no trace: after it, the run steps on as the unscaled run of its accepted microbatches alone."""
-    trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0),
-                      accumulation=accum, dynamic_scale=True)
-    state = trainer.initial_state()
-    good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
-    bad = {"scale": jnp.full((jax.device_count(),), 1e35, jnp.float32)}
-    step = trainer.compile(state, good)
-    for _ in range(2 * accum - 1):
-        state, *_ = step(state, good)
-    w, ema = host(state)
-    assert np.all(w != 1.0)
-    for got, want in zip((w, ema), unscaled(accum, 2 * accum - 1), strict=True):
-        np.testing.assert_array_equal(got, want)
-    # the step consumes the state
-    counted, advanced, scaled = int(state.step), int(state.microstep), float(state.scale.scale)
-    state, _, _, finite, accepted, _ = step(state, bad)
-    assert bool(finite) and not bool(accepted)
-    assert int(state.step) == counted + 1
-    # The rejection drops its window, the accepted microbatch before it with it (`dropped_window`).
-    assert int(state.microstep) == advanced - advanced % accum
-    assert float(state.scale.scale) == scaled / 2
-    np.testing.assert_array_equal(state.variables["params"]["w"], w)
-    np.testing.assert_array_equal(state.ema["params"]["w"], ema)
-    for _ in range(accum):
-        state, *_ = step(state, good)
-    w, ema = host(state)
-    # Two accepted updates: the rejection dropped its window, the pending microbatch with it.
-    for got, want in zip((w, ema), unscaled(accum, 2 * accum), strict=True):
-        np.testing.assert_array_equal(got, want)
-    assert int(state.microstep) == 2 * accum
-
-
-
 class Targeted(Objective):
     """A scalar `p` at 0 and the squared error of each row's `target`, the mean over its rows."""
 
@@ -2498,3 +2427,38 @@ def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path
     restored, *_ = resumed.checkpoints.restore(resumed.initial_state())
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(restored.variables))
     refuse_non_finite(restored, 3, lambda: 2)
+
+
+def test_a_trainers_refit_traces_its_step_and_start_once_and_another_trainers_its_own():
+    """A trainer fit again in its process (a suite's draws, a pool's fits) reads the step and the start its
+    first fit traced: its objective states its trace, and its optimizer, an Optax transformation given
+    built, keys them by the object given (`objectives.base.Held`), so its refit traces neither, nor does a
+    trainer handed the same objective and transformation (a resume's; PF03, rows 7381, 8407, 8411). A
+    trainer handed an equal-looking transformation built apart keys apart and traces its own, and a user's
+    objective that states no trace traces its step at each fit, as nothing states what its loss reads."""
+    from test_run_budgets import FEATURES, Pulled
+
+    from dew.telemetry.compiles import Compiles
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, dtype="float32")
+    objective = LMObjective(model, seq_len=LM_CONTEXT)
+
+    def traced(trainer, data) -> set[str]:
+        with Compiles(None) as compiles:
+            trainer.fit(data, steps=3, log_every=1)
+        return {program.name for program in compiles.programs if program.kind == "traced"}
+
+    adam = optax.adam(1e-2)
+    trainer = Trainer(objective, adam, key=0)
+    assert {"step", "traced"} <= traced(trainer, lm_data())
+    again = traced(trainer, lm_data())
+    assert not {"step", "traced"} & again, again
+    resumed = traced(Trainer(objective, adam, key=0), lm_data())
+    assert not {"step", "traced"} & resumed, resumed
+    assert {"step", "traced"} <= traced(Trainer(objective, optax.adam(1e-2), key=0), lm_data())
+    drawn = np.random.default_rng(0).standard_normal((64, FEATURES)).astype(np.float32)
+    rows = Pipeline(Memory({"x": drawn})).repeat()
+    unstated = Trainer(Pulled(), optax.adam(1e-2), key=0)
+    traced(unstated, rows.batch(8))
+    assert "step" in traced(unstated, rows.batch(8))

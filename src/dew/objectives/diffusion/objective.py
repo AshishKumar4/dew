@@ -41,7 +41,6 @@ from dew.lora import unadapted
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.flops import MissingFlopsCount
-from dew.nn.kernels.options import Held
 from dew.nn.mp import Uncertainty
 from dew.nn.programs import on_host
 from dew.nn.protocols import (
@@ -242,6 +241,21 @@ class PipelineSource(Protocol):
     @property
     def grid(self) -> SourceGrid | None: ...
 
+    @property
+    def grid_process(self) -> bool:
+        """Whether `process` is `grid`'s own training process at the grid's tokens: a published
+        pipeline's, as it assembles it at its size, and a saved run's where its record says so
+        (`DiffusionObjective.grid_process`)."""
+        ...
+
+
+def _trains_its_grid(source: PipelineSource, process, grid) -> bool:
+    """Whether an objective over `source` given `process` and `grid` trains its process over its grid
+    (`DiffusionObjective.grid_process`): each the source's own object, None or omitted where the source
+    supplies it, and the source's process its grid's."""
+    return (source.grid_process and (process is None or process is source.process)
+            and (grid is OMITTED or grid is source.grid))
+
 
 class DiffusionObjective(Objective[Ratio]):
     """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
@@ -252,6 +266,13 @@ class DiffusionObjective(Objective[Ratio]):
     resolved = ("solver", "guidance", "steps")
 
     counts_tokens = False
+
+    grid_process: bool
+    """Whether it trains its pipeline's own process over its grid, read once as it is built: the source's
+    process and grid objects themselves (each None or omitted, or the source's own given back, as a run
+    naming no preset passes its process) where its process is its grid's (`PipelineSource.grid_process`).
+    A process or grid given over the source's, even an equal one, is the run's own, its process kept as
+    it is at another size (`dew.interop.pipeline_assembly.bound_at_size`)."""
 
     def data(self, tokenizer=None) -> ObjectiveData:
         """Each batch's captions tokenized for the conditions, on the host, as
@@ -435,6 +456,7 @@ class DiffusionObjective(Objective[Ratio]):
         collection. A published task includes the tuned autoencoder, with those
         statistics as its latent normalization.
         """
+        grid_process = isinstance(model, PipelineSource) and _trains_its_grid(model, process, grid)
         if isinstance(model, PipelineSource):
             source = model
             model = source.model
@@ -477,6 +499,7 @@ class DiffusionObjective(Objective[Ratio]):
         self.guidance = guidance
         self.steps = steps
         self.grid = grid
+        self.grid_process = grid_process
         self.ema = (None if ema_decay is None else EMASpec(
             decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
             select=under("params")))
@@ -503,7 +526,8 @@ class DiffusionObjective(Objective[Ratio]):
                              self.solver, self.guidance, self.steps,
                              # A tuned autoencoder's weights and statistics sit in the run's own tree.
                              None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd),
-                             grid=None if self.grid is None else to_record(self.grid, SourceGrid))
+                             grid=None if self.grid is None else to_record(self.grid, SourceGrid),
+                             grid_process=self.grid_process)
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> TextToImage:
@@ -528,15 +552,6 @@ class DiffusionObjective(Objective[Ratio]):
         """
         shape = self.inputs.sample.shape
         return shape if self.autoencoder is None else self.autoencoder.latent_shape(shape)
-
-    def towers(self) -> tuple[Held, ...]:
-        """The modules `program_key` names, the conditions' encoders a step encodes its captions with,
-        the autoencoder it encodes its images with and an alignment's frozen representation encoder."""
-        autoencoder = () if self.autoencoder is None else self.autoencoder.towers()
-        representation = None if self.alignment is None else self.alignment.encoder
-        alignment = () if representation is None else (representation,)
-        encoders = (encoder for _, encoder in self.inputs.encoders)
-        return (*super().towers(), *encoders, *autoencoder, *alignment)
 
     def encoder_params(self) -> dict:
         if self.variables is not None and "encoders" in self.variables:

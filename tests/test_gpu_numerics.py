@@ -52,6 +52,9 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
              precision_policy.divides_as_ieee_division_at_its_edges, fault=OWN),
         Cell("a correctly rounded division is IEEE division's on a GPU dividing approximately",
              precision_policy.divides_as_ieee_division_on_an_approximate_divider, fault=OWN),
+        *(Cell(f"a compensated primitive under jit is its eager arithmetic on a GPU: {shape}",
+               functools.partial(precision_policy.compensated_primitives_hold_under_jit, shape), fault=OWN)
+          for shape in precision_policy.COMPENSATED_SHAPES),
         Cell("a frozen FP8 site's products take no FP8 GEMM whose sum is narrower",
              when(fp8_base.FP8_CORES, "this GPU has no FP8 tensor cores", isolated(tmp_path_factory)(
                  fp8_base.a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower, "fp8")), fault=OWN),
@@ -63,6 +66,9 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
              lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it, fault=OWN),
         Cell("a GPU reports its clock and memory bandwidth from its driver",
              lowering.a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver, fault=OWN),
+        # A GPU process walks a truth's terms where its values lie, from either placement in either order
+        # (`float64_terms.evaluated_on`: an unprepared site's, a steered walk's), each compiled evaluation
+        # keyed by its platform (row 8531).
         Cell("a Dense layer's float64 terms are its placement's own on a GPU host",
              isolated(tmp_path_factory)(
                  float64_terms_tests.a_dense_layers_terms_are_its_placements_own_on_a_gpu_host, "placed"),
@@ -85,6 +91,8 @@ def norm_cells(_) -> list[Cell]:
                functools.partial(norm_swiglu_tests.every_config_of_the_swiglu_kernels_holds_the_float64_gate,
                                  kernel, dtype), native={"kernel": kernel.__name__, "dtype": dtype.__name__})
           for kernel in (norm_swiglu.SwigluForward, norm_swiglu.SwigluBackward) for dtype in DTYPES),
+        Cell("a norm with Dew's silu after it holds the float64 gate",
+             norm_swiglu_tests.a_norm_with_dews_silu_after_it_holds_the_float64_gate),
     ]
 
 

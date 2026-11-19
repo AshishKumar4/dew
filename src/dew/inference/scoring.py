@@ -54,6 +54,12 @@ class PassPlan[Row](Protocol):
         the plan: it takes no row after."""
         ...
 
+    def taken(self) -> int:
+        """How many of the rows it holds, the first by the order they were added, the pass runs now: all,
+        or fewer where the rest in a pass of their own compute fewer padded tokens; a later pass takes the
+        rest first."""
+        ...
+
 
 class Scoring[Request, Row, Payload, Output, Answer](Protocol):
     """A task served by forward passes over its requests' rows (`ScoringServer`). It holds no weights
@@ -241,34 +247,60 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
 
     def _chosen(self) -> list[tuple[_Request[Row, Payload, Output, Answer], int]]:
         """The rows of one pass, each with its request, oldest first: while the task says they fit,
-        from requests of one pair, a request's rows in order; at most `rows` requests looked at, a
+        from requests of one pair, a request's rows in order, as many of them as the plan runs now
+        (`PassPlan.taken`), the rest first in the next pass; at most `rows` requests looked at, a
         cancelled one dropped as it is looked at."""
-        chosen: list[tuple[_Request[Row, Payload, Output, Answer], int]] = []
+        # Each row the plan holds, with its request, in the order the plan took them.
+        placed: list[tuple[_Request[Row, Payload, Output, Answer], int]] = []
         plan: PassPlan[Row] | None = None
         now = time.perf_counter()
         # The bounded prefix alone: a turn looks at no more than `rows` requests of the queue.
         for request in list(itertools.islice(self._waiting.queue, self.rows)):
-            if chosen and request.served is not chosen[0][0].served:
+            if placed and request.served is not placed[0][0].served:
                 break
             task = request.served[0]
             while request.taken < len(request.scored.rows):
                 # The pass grows a row at a time, each placed once (`Scoring.planned`); its first row
                 # runs whatever the plan says of it, a pass of its own.
                 plan = task.planned() if plan is None else plan
-                if not plan.add(request.scored.rows[request.taken]) and chosen:
-                    return chosen
-                # A request runs from its first row's pass on; one cancelled before it leaves the queue,
-                # and a plan of its row alone with it, so the next request, perhaps another task's after
-                # a reload, starts a plan of its own.
-                if request.taken == 0:
+                if not plan.add(request.scored.rows[request.taken]) and placed:
+                    return self._kept(placed, plan)
+                # A request runs from its first row's pass on (one whose first row a pass left to the next,
+                # `_kept`, is running already); one cancelled before it leaves the queue, and the plan is
+                # made again over the rows placed without its row, so the pass is costed as it runs
+                # (`PassPlan.taken`) and, where none is placed, the next request, perhaps another task's
+                # after a reload, starts a plan of its own.
+                if request.taken == 0 and not request.future.running():
                     if not request.future.set_running_or_notify_cancel():
                         self._waiting.queue.remove(request)
-                        plan = plan if chosen else None
+                        plan = self._replanned(task, placed)
                         break
                     request.future.admitted = now
-                chosen.append((request, request.taken))
+                placed.append((request, request.taken))
                 request.taken += 1
-        return chosen
+        return self._kept(placed, plan)
+
+    @staticmethod
+    def _replanned(task: Scoring[Request, Row, Payload, Output, Answer],
+                   placed: Sequence[tuple[_Request[Row, Payload, Output, Answer], int]]
+                   ) -> PassPlan[Row] | None:
+        """A plan of `placed`'s rows alone, in their order, or None where none is placed."""
+        if not placed:
+            return None
+        plan = task.planned()
+        for request, index in placed:
+            plan.add(request.scored.rows[index])
+        return plan
+
+    def _kept(self, placed: list[tuple[_Request[Row, Payload, Output, Answer], int]],
+              plan: PassPlan[Row] | None) -> list[tuple[_Request[Row, Payload, Output, Answer], int]]:
+        """`placed`'s rows the plan runs now (`PassPlan.taken`: the first it added, the first always): a
+        request whose row the pass leaves takes it and its rows after first in the next pass, running
+        already (its first row's pass may be the next)."""
+        run = len(placed) if plan is None else max(plan.taken(), 1)
+        for request, index in placed[run:]:
+            request.taken = min(request.taken, index)
+        return placed[:run]
 
     def run(self) -> None:
         """Step until no request waits."""

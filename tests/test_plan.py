@@ -5,6 +5,7 @@ the update pools the same rows, the clocks count the same steps, and a
 resumed run reads its batches as the run it continues did.
 """
 
+import collections
 import contextlib
 import dataclasses
 import functools
@@ -13,6 +14,7 @@ import itertools
 import json
 import logging
 import struct
+import types
 import weakref
 from collections.abc import Callable, Iterator
 
@@ -25,6 +27,7 @@ from affine_run import FEATURES, Affine, Regression
 from arm_arithmetic import float64_held
 from export_support import Stalled
 from jax.extend.backend import get_backend
+from map_judge import marked_seeds, sharded
 from port_support import row_names_port
 from process_support import assert_exits_cleanly
 from reference_error import as_given, assert_as_exact, seeds_for
@@ -474,11 +477,11 @@ def autopgle(runs: int) -> Iterator[None]:
 @dataclasses.dataclass
 class Handed(Trials):
     """Trials that profile the plan admitted, keep a weak reference to the executable it was admitted with
-    (`unguided`) and count the executables the backend holds then, it among them (`live`), and hand back
-    `profile` where given in place of the profile they measured."""
+    (`unguided`) and the executables the backend holds then, it among them (`live`, by module), and hand
+    back `profile` where given in place of the profile they measured."""
     profile: bytes | None = None
     unguided: weakref.ref | None = None
-    live: int = 0
+    live: collections.Counter | None = None
 
     def profiled(self, step, planned, mesh, runs):
         measured = super().profiled(step, planned, mesh, runs)
@@ -487,10 +490,45 @@ class Handed(Trials):
         return measured if self.profile is None else self.profile
 
 
-def live_executables() -> int:
-    """The executables the backend holds once the garbage they are part of is collected."""
+def live_executables() -> collections.Counter:
+    """The executables the backend holds once the garbage they are part of is collected, by their module's
+    name: two counts' difference names what one holds the other does not."""
     gc.collect()
-    return len(get_backend().live_executables())
+    return collections.Counter(executable.hlo_modules()[0].name
+                               for executable in get_backend().live_executables())
+
+
+def holding(modules: collections.Counter, depth: int = 8) -> dict[str, list[list[str]]]:
+    """For each live executable of `modules`' names, the chains of objects that keep it, from the executable
+    out to a module's namespace or a class, each named by its type (a namespace by its module's name), the
+    first four found: what a test of an executable's release reads where one outlives its step."""
+    gc.collect()
+    found: dict[str, list[list[str]]] = {}
+    for executable in get_backend().live_executables():
+        name = executable.hlo_modules()[0].name
+        if name not in modules:
+            continue
+        chains: list[list[str]] = []
+        frontier, seen = [(executable, [type(executable).__name__])], {id(executable)}
+        for _ in range(depth):
+            reached = []
+            for held, chain in frontier:
+                for referrer in gc.get_referrers(held):
+                    # The walk's own lists and frames hold what it walks, and keep nothing past it.
+                    if (id(referrer) in seen or isinstance(referrer, types.FrameType)
+                            or referrer is frontier or referrer is reached):
+                        continue
+                    seen.add(id(referrer))
+                    namespace = isinstance(referrer, dict) and "__name__" in referrer
+                    named = f"({referrer['__name__']})" if namespace else ""
+                    step = [*chain, type(referrer).__name__ + named]
+                    if namespace or isinstance(referrer, type):
+                        chains.append(step)
+                    else:
+                        reached.append((referrer, step))
+            frontier = reached
+        found.setdefault(name, []).extend(chains[:4])
+    return found
 
 
 def test_a_plan_search_keeps_the_freeze_a_process_made_before_it():
@@ -586,7 +624,9 @@ def test_the_executable_a_profile_replaces_goes_with_its_program():
         state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
     assert trainer.plan["pgle"] == {"runs": 2, "bytes": len(COST)}
     assert trials.unguided is not None and trials.unguided() is None
-    assert live_executables() == trials.live and int(state.step) == 3
+    live = live_executables()
+    assert live == trials.live and int(state.step) == 3, (live - trials.live, trials.live - live,
+                                                            holding(live - trials.live))
 
 
 def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path,
@@ -904,16 +944,14 @@ def test_a_step_handed_a_state_another_split_left_at_an_updates_end_reads_it_in_
         lm(split=4, accumulation=2).compile(pooled, BATCH)(pooled, BATCH)
 
 
-RESUMED_SEEDS = 128
-"""Check 1's declared seeds for a run resumed at a finer split against the uninterrupted run, sized paired
-(`seeds_for` with the resumed run as `dew_fn`, the float64 truth) on armada at main 2aa25af4e (probe
-slow-theme, 2026-11-14): 128, where sizing them live at every run cost 418 s of 522 fits (row 5673)."""
-
-
-def test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does(tmp_path):
+@pytest.mark.check1_shards(seeds=128, per_task=16)
+def test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does(tmp_path, request):
     """A run saved at an update's end in two microbatches a step and resumed in four, a memory setting
     alone, lands where the run nobody stopped lands: its weights as exact as that run's (check 1), from
-    the float64 run of its steps (`regression_truth`)."""
+    the float64 run of its steps (`regression_truth`). Its 128 seeds were sized paired (`seeds_for`, the
+    resumed run as `dew_fn`) on armada at main 2aa25af4e, where sizing them live cost 418 s of 522 fits
+    (row 5673); its mark declares them, 16 a map task: a seed's three fits take about 3 s, so 32 a task
+    ran 86 to 126 s on armada (row 6068), past the group target."""
     runs = itertools.count()
 
     @as_given
@@ -932,7 +970,8 @@ def test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does(t
         return {"params": truthful(x)["params"]}
 
     label = "a run resumed at a finer split"
-    assert_as_exact(resumed, uninterrupted, regression_rows, label, truth_fn=truth, seeds=RESUMED_SEEDS)
+    assert_as_exact(resumed, uninterrupted, regression_rows, label, truth_fn=truth,
+                    seeds=marked_seeds(request))
 
 
 def regression_truth() -> Callable:
@@ -989,7 +1028,9 @@ def a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly
         trainer = lm()
         _, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH))
     assert trainer.plan["pgle"]["runs"] == 2 and trainer.plan["pgle"]["bytes"] > 0
-    assert trials.unguided is not None and trials.unguided() is None and live_executables() == trials.live
+    assert trials.unguided is not None and trials.unguided() is None
+    live = live_executables()
+    assert live == trials.live, (live - trials.live, trials.live - live, holding(live - trials.live))
     guided = as_given(functools.partial(regression_steps, pgle=True))
     unguided = as_given(functools.partial(regression_steps, pgle=False))
     label, truth = "a step guided by its profile", regression_truth()
@@ -1253,7 +1294,8 @@ H100 = 2 ** 40
 """The allocator limit of the compile-only H100 a census shape's need at each rung is read on: past any."""
 
 
-def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of) -> tuple[list, int, tuple, tuple]:
+def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, request
+            ) -> tuple[list, int, tuple, tuple] | None:
     """A census shape's step at four microbatches on `target` ('cpu', its devices' memory stated through
     `free`; 'h100', a compile-only H100 compiled ahead, what a GPU start plans for): the places of the fit
     ladder in its order (`recompute_more`: at each remat rung its head's rungs, then the next), as the
@@ -1262,7 +1304,9 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of) -> tup
     place the start's climb settles in that room, its rung unstated; and the first place of the ladder whose
     step, compiled in that room, fits: an exhaustive walk. XLA schedules a GPU's program to the memory its
     target states, so a place's need in that room is its compile there, not its need with room past all. A
-    place is its head's tile, whether that head is fused, and its remat."""
+    place is its head's tile, whether that head is fused, and its remat. A case its test marks `shards` walks
+    its places over CI's map tasks, each compiling its own (`map_judge.sharded`): a map task records them and
+    gets None, the judge reads them all and climbs."""
     from dew.training.memory import recompute_more, rung_record
 
     def described(objective) -> tuple:
@@ -1318,7 +1362,15 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of) -> tup
         except PlanRefused as refused:
             return refused.probes[0].fits
 
-    lightest = next((place for moves, place in enumerate(places) if fits(moves)), None)
+    if request.node.get_closest_marker("shards") is None:
+        lightest = next((place for moves, place in enumerate(places) if fits(moves)), None)
+    else:
+        walked = sharded(f"{request.node.name} walk", lambda start, stop: [fits(moves) for moves in
+                                                                            range(start, stop)], len(places))
+        if walked is None:
+            return None
+        found = [fit for part in walked for fit in part]
+        lightest = next((place for place, fit in zip(places, found, strict=True) if fit), None)
     return places, room, placed(planned(0, room)), lightest
 
 
@@ -1333,10 +1385,14 @@ CENSUS = {
 remat at their own head, each read as asked (`climbed`): no other rung's need is compiled."""
 
 
-@pytest.mark.parametrize(("shape", "target"),
-                         [("decoder", "cpu"), ("decoder", "h100"), ("delta-scanned", "h100")],
-                         ids=["decoder-cpu", "decoder-h100", "delta-scanned-h100"])
-def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target):
+@pytest.mark.parametrize(("shape", "target"), [
+    pytest.param("decoder", "cpu", id="decoder-cpu"),
+    pytest.param("decoder", "h100", id="decoder-h100"),
+    pytest.param("delta-scanned", "h100", id="delta-scanned-h100",
+                 marks=pytest.mark.shards(units=18, per_task=3)),
+])
+def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
+                                                                                    request):
     """A start whose step does not fit at its own rung climbs the ladder in its order, each rung asked, and
     settles the first that fits: no later than the first place of the ladder an exhaustive walk compiles
     under the step's own options and finds fits in the same room, and that place where the plan is no rung
@@ -1346,10 +1402,15 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
     in 418 s of a train's call time past the train's bound (row 7414), and the CPU's walk is the decoder's.
     What a rung keeps orders its residuals, not XLA's peak (the scanned delta decoder needed more recomputing
     its scans and convolutions too than not), so a search that passed over a rung for one seen to miss
-    settled a heavier plan than one that fits."""
+    settled a heavier plan than one that fits. The scanned delta decoder's walk of its 18 places runs over
+    CI's map tasks, 3 a task: compiled in one it took 262 to 350 s of a train's task (row 8438), 6 a task
+    469 s, its judge 168 s after (row 8524)."""
     fields, batch, room_of = CENSUS[shape]
     with row_names_port("gated_delta_rule", "fla"):
-        ladder, room, plan, lightest = climbed(monkeypatch, target, fields, batch, room_of)
+        climb = climbed(monkeypatch, target, fields, batch, room_of, request)
+    if climb is None:
+        return
+    ladder, room, plan, lightest = climb
     places = [place[:3] for place in ladder]
     assert lightest is not None and places.index(plan[:3]) <= places.index(lightest[:3]), (ladder, room, plan)
     assert plan[3] or plan == lightest, (ladder, room, plan, lightest)
@@ -1534,8 +1595,7 @@ class Displayed:
 def test_a_rung_key_states_its_modules_configuration_not_their_display():
     """A rung record's key states its modules as plain data (`dew._stated.stated`), not as they print: two
     equal configurations whose displays differ name one record, another width another; a module holding an
-    array of JAX's, which no plain form states, keeps no record, its run deciding its rung
-    as it compiles, never refused."""
+    array of JAX's, or a typed PRNG key, by its values, the same values one record and others another."""
     from dew.training.rungs import rung_key
 
     trainer = lm()
@@ -1545,7 +1605,11 @@ def test_a_rung_key_states_its_modules_configuration_not_their_display():
         return rung_key([module], (state, BATCH), [1, 2], trainer.device_mesh)
 
     assert key(Displayed(4)) == key(Displayed(4)) != key(Displayed(8))
-    assert key(Displayed(4, held=jnp.zeros(2))) is None
+    zeros, ones = (key(Displayed(4, held=values)) for values in (jnp.zeros(2), jnp.ones(2)))
+    assert zeros is not None and zeros == key(Displayed(4, held=jnp.zeros(2))) != ones
+    # A typed PRNG key by its key data, its key type beside it (train 1019's review, F1).
+    first, second = (key(Displayed(4, held=jax.random.key(seed))) for seed in (0, 1))
+    assert first is not None and first == key(Displayed(4, held=jax.random.key(0))) != second
 
 
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():
@@ -1710,8 +1774,8 @@ def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_rec
     """A Muon step whose joined Newton-Schulz stacks' copies leave it short of the devices' room, and which
     fits with them parted, its split fixed: its plan parts them, joining one at a time (`ns_group` 1, the
     climb's release after the narrow copies, `FitSearch.searched`), and recomputes nothing more, where it
-    climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a step).
-    A run that states its group keeps it, the release asked of no step of it."""
+    climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a
+    step)."""
     joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
     parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
     assert parted < joined, (parted, joined)
@@ -1720,6 +1784,12 @@ def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_rec
     fitted_once(planned)
     assert planned.plan["ns_group"] == 1, planned.plan
     assert planned.plan["remat"] == trainer.plan["remat"], planned.plan
+
+
+def test_a_muon_run_that_states_its_stacks_group_keeps_it(monkeypatch):
+    """A Muon run that states its Newton-Schulz group keeps it: the release of its joined stacks asked of no
+    step of it (`FitSearch.searched`), the plan recording none (apart from the parting cell above, which
+    took 148 s with it, row 8546)."""
     stated = muon_lm(ns_group=2)
     free(monkeypatch, LIMIT)
     fitted_once(stated)

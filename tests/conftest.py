@@ -15,6 +15,7 @@ from pathlib import Path
 import lane_environment
 import apart_records
 import check1_wire
+import tier_wire
 
 # The lane's environment, before JAX reads it.
 os.environ.update(lane_environment.configured(os.environ))
@@ -135,13 +136,32 @@ def pytest_collectstart(collector):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    """Each file's programs join its bundle of the shared cache, written back after each run of its
-    tests, every program they used so far."""
+    """Each file's programs join its bundle of the shared cache, written back after each run of its tests,
+    every program they used so far; where a shared cache is installed, each test's programs compiled from
+    its setup on (`remote_cache.RemoteCache.mark`) are counted at its teardown
+    (`pytest_runtest_teardown`)."""
     if _remote is not None:
         _remote.opened(bundle(item))
+        item.stash[_COMPILE_MARK] = _remote.mark()
     yield
     if _remote is not None and (nextitem is None or bundle(nextitem) != bundle(item)):
         _remote.closed(bundle(item))
+
+
+_COMPILE_MARK = pytest.StashKey[tuple]()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """A test's programs compiled that the shared cache did not hold, from its setup through its teardown, as
+    its JUnit property `compiled` (where known): a test that compiled ran cold, its seconds a cold run's,
+    which CI's durations record keeps apart (tools/armada/grading.py `compiled_cold`, row 7939). None is
+    recorded where no shared cache is installed, so a local run's JUnit is as it was."""
+    yield
+    if _remote is not None and (mark := item.stash.get(_COMPILE_MARK, None)) is not None:
+        compiled = _remote.compiled_since(mark)
+        if compiled:
+            item.user_properties.append(("compiled", compiled))
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -164,6 +184,25 @@ def pytest_runtest_makereport(item, call):
     `gate_findings`, a JSON list of each finding's leaf, rule, measure (an infinite one `Infinity`) and
     the phase it failed: what a promotion matches a candidate's failures to its parent's by."""
     outcome = yield
+    # A part's test that failed in its prepare before any check-1 site (`compiled_ahead`) computed before its
+    # sites, on a device that computes nothing: it is recorded where it did (`truths_ahead.UNPREPARED`, the
+    # tier's list of unprepared tests read from these records alone, a ledger row each), and its run runs
+    # it unprepared, compiling its sites on its GPU as a test outside a part does, every site judged; in one
+    # that prepared any site, a site its prepare did not reach runs unprepared too (`truths_ahead.running`),
+    # and one prepared at another commit or for other shapes is a red (`truths_ahead.MissingTruth`).
+    # A test its prepare skipped (a cell no GPU of the node runs) computed nothing: its run skips it too.
+    if (call.when == "call" and call.excinfo is not None
+            and not call.excinfo.errisinstance(pytest.skip.Exception) and tier_wire.preparing()
+            and (store := _sites_store(item)) is not None and not any(store.glob("*/site.json"))):
+        from truths_ahead import UNPREPARED, unprepared
+
+        frames = [(str(entry.path), entry.lineno + 1) for entry in reversed(call.excinfo.traceback)]
+        unprepared(store, item.nodeid, frames, call.excinfo.exconly().splitlines()[0][:400])
+        where = json.loads((store / UNPREPARED).read_text())["where"]
+        report = outcome.get_result()
+        report.outcome, report.longrepr = "skipped", (str(item.path), item.location[1] or 0,
+                                                      f"computes before its first check-1 site, at {where}: "
+                                                      "its run runs it unprepared")
     # A map task's sites of this test, written as its manifest once its call is done, whatever it ended in
     # (`map_judge.manifested`): its judge judges the test from them. Only a test that loaded the map judge
     # reached a site.
@@ -232,9 +271,28 @@ def pytest_sessionfinish(session, exitstatus):
         _remote.drain()
 
 
+UNPREPARED_RUN = pytest.StashKey[list]()
+"""This run's tests run unprepared (`compiled_ahead`, `truths_ahead.UNPREPARED`): their records, in the
+order they ran."""
+
+
+AT_RUN_SITES = pytest.StashKey[list]()
+"""This run's tests whose sites' programs their prepare left to the run to compile on its GPU
+(`truths_ahead.AT_RUN`): their records, in the order they ran."""
+
+
 def pytest_terminal_summary(terminalreporter):
     if _remote is not None:
         terminalreporter.write_line(_remote.summary())
+    # Each test run unprepared, with every reason it gave, where and why (`truths_ahead.reasoned`).
+    for record in terminalreporter.config.stash.get(UNPREPARED_RUN, []):
+        terminalreporter.write_line(f"unprepared, its sites compiled on its GPU: {record['test']}")
+        for reason in record["reasons"]:
+            terminalreporter.write_line(f"  at {reason['where']}: {reason['error']}")
+    # Each test whose programs its run compiled on its GPU as its prepare declared (`truths_ahead.AT_RUN`).
+    for record in terminalreporter.config.stash.get(AT_RUN_SITES, []):
+        for reason in record["reasons"]:
+            terminalreporter.write_line(f"compiled at run on its GPU: {record['test']}: {reason['error']}")
 
 
 def pytest_runtest_setup(item):
@@ -250,16 +308,89 @@ def pytest_runtest_setup(item):
         # other in the lane's; both select a file's tests alike, so the tier cuts its groups alike.
         pytest.skip("runs in the lane's process" if users else "runs in a process that computes as a user's "
                     f"does ({lane_environment.USERS_ARITHMETIC}=1)")
-    if os.environ.get("DEW_TIER_PREPARE") == "1":
-        # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there; every other
-        # test of the part, a GPU's or not, has nothing to prepare and runs in the part's run.
-        if item.get_closest_marker("prepares") is None:
-            pytest.skip("a GPU tier's prepare runs the flows that prepare alone")
+    if tier_wire.preparing():
+        # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there, and every
+        # other test of the part's files compiles its check-1 sites' programs (`compiled_ahead`), however it
+        # is marked: the part's run runs each of them on its GPU. One that prepares none runs in the run.
         return
     for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu")):
         marker = item.get_closest_marker(backend)
         if marker and jax.default_backend() != backend:
             pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
+
+
+def _sites_store(item) -> Path | None:
+    """A test's directory of its GPU tier part's store of programs compiled ahead (`compiled_ahead`), by its
+    node id; None for a flow's (which opens its own), or outside a part with a store."""
+    if item.get_closest_marker("prepares") is not None or tier_wire.TRUTHS not in os.environ:
+        return None
+    digest = hashlib.sha256(item.nodeid.encode()).hexdigest()[:24]
+    return Path(os.environ[tier_wire.TRUTHS]) / "sites" / digest
+
+
+def _named_records(request, directory: Path) -> None:
+    """A store's records of what its test's run compiled on its GPU, into this run's summary: as its prepare
+    declared (`truths_ahead.AT_RUN`), and unprepared, a site its prepare did not reach or an arm no statement
+    names (`truths_ahead.UNPREPARED`, `truths_ahead.running`)."""
+    from truths_ahead import AT_RUN, UNPREPARED
+
+    for name, key in ((AT_RUN, AT_RUN_SITES), (UNPREPARED, UNPREPARED_RUN)):
+        if (directory / name).exists():
+            request.config.stash.setdefault(key, []).append(json.loads((directory / name).read_text()))
+
+
+@pytest.fixture(autouse=True)
+def compiled_ahead(request):
+    """A GPU tier part's test's check-1 sites on the part's store of programs compiled ahead
+    (tests/truths_ahead.py, its own directory of the part's, `DEW_TIER_TRUTHS`), whatever marks the test (a
+    `gpu`, `kernel` or `runs` test alike: the part runs each on its GPU), but a flow's, which opens its own
+    (tests/model_flows.py): its prepare, on the node's CPU, compiles each site's truths and arms for the
+    node's GPU with that GPU's compile-only device this process's default, on which nothing computes, so a
+    test computing more than its draws before its sites fails there (bible §8: no dense math on a node's
+    CPU), recorded where (`truths_ahead.UNPREPARED`), and files its programs' needs under the part's unit
+    (`tier_wire.unit_needs`), by which the lane sizes its worker; its run reads them, tracing, lowering and
+    compiling none, and runs a test so recorded unprepared, every site judged, named in its summary. Outside
+    a part with a store, nothing."""
+    store = _sites_store(request.node)
+    if store is None:
+        if tier_wire.TRUTHS in os.environ and not tier_wire.preparing():
+            # A flow's run, which opens its own stores (tests/model_flows.py): each it read named as a
+            # test's own is.
+            import truths_ahead
+
+            first = len(truths_ahead.READ)
+            yield
+            for directory in dict.fromkeys(truths_ahead.READ[first:]):
+                _named_records(request, directory)
+            return
+        # Outside a part's store the gate's modules stay unloaded (a test outside the gate loads none).
+        yield
+        return
+    import model_flows
+    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths, reasoned
+
+    if not tier_wire.preparing():
+        record = store / UNPREPARED
+        if record.exists():
+            # Its prepare computed before its first site: it runs unprepared, named in the run's summary.
+            request.config.stash.setdefault(UNPREPARED_RUN, []).append(json.loads(record.read_text()))
+            yield
+            return
+        with compiled_truths(store, prepare=False, stamp=model_flows.stamp()):
+            yield
+        # A flow's cells its prepare deferred (`gpu_flow.run_cells`) ran unprepared beside its served ones,
+        # each named.
+        if (store / DEFERRED).exists():
+            deferred = json.loads((store / DEFERRED).read_text())
+            for reason in deferred["reasons"]:
+                reasoned(record, deferred["test"], reason["where"], reason["error"])
+        _named_records(request, store)
+        return
+
+    from truths_ahead import prepared
+
+    with prepared(store, stamp=model_flows.stamp(), target=model_flows.node_target()):
+        yield
 
 
 @pytest.fixture(autouse=True)

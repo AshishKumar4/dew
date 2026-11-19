@@ -126,7 +126,8 @@ def assert_mid_window_resume(objective, batch_a, batch_b, directory: str, *, nud
 
 def prepare_split_whole_steps(objective, rate: float, run_key: jax.Array, template, filled_template):
     """Compile paired `split=2` (on `filled_template`) and `split=1` (on `template`) SGD steps and return
-    `(split_start, whole_start, split_step, whole_step, update_key)`."""
+    `(split_start, whole_start, split_step, whole_step, update_key)`, the split start holding its step's
+    empty window."""
     from dew.objectives.base import EXAMPLE_STREAM
 
     mesh = MeshSpec().build(jax.devices()[:1])
@@ -137,6 +138,15 @@ def prepare_split_whole_steps(objective, rate: float, run_key: jax.Array, templa
     split_start, whole_start = split_trainer.initial_state(), whole_trainer.initial_state()
     split_step = split_trainer.compile(split_start, filled_template)
     whole_step = whole_trainer.compile(whole_start, template)
+    # The split start holding the window its step builds, once (its first call's): a call per seed over it
+    # steps alone, building none (an eval_shape of the objective's batch statistics each, row 7849). A step
+    # a window long leaves its window committed, holding no microbatch (`Accumulation.fill` 0), whose next
+    # first microbatch replaces what it left; the start takes it.
+    stepped = split_step(jax.tree.map(jnp.copy, split_start), filled_template)[0]
+    window, size = stepped.accumulation, stepped.window_size
+    assert window is not None and window.fill is not None and size is not None
+    assert (int(size), int(window.fill)) == (2, 0), "a step a window long left its window uncommitted"
+    split_start = split_start.replace(accumulation=stepped.accumulation, window_size=stepped.window_size)
     update_key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(split_start.key, EXAMPLE_STREAM),
                                                        0), 0)
     return split_start, whole_start, split_step, whole_step, update_key

@@ -19,7 +19,7 @@ too large to keep over the seeds, is summarized from those by `record_distances`
 import dataclasses
 import sys
 import urllib.parse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import jax
@@ -259,18 +259,10 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
         confirmed = MOST_SEEDS
     # The recording is the confirmed count's draws and their redraw, no more.
     kept = staged_units(confirmed)
-    weighed, scales = 0, {}
-
-    def scaled(seed: int):
-        if seed not in scales:
-            inputs = record(seed)[0]
-            (made,) = held.kept.made("scale", seed, inputs, lambda: (scale(inputs, seed),))
-            # As the recording holds it, float32, for the sizing, the reference's weighed evidence and
-            # the test's weighing of Dew's arm alike: one denominator for both arms.
-            scales[seed] = {name: np.asarray(value, np.float32) for name, value in made.items()}
-        return scales[seed]
-
-    if scale is not None:
+    weighed = 0
+    # The weighed check's scale a seed, where the site weighs (`_scales`).
+    scaled = None if scale is None else _scales(held, record, scale)
+    if scaled is not None:
         weighed = seeds_for(recorded, recorded_draw, label, start=start,
                             truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
                             dew_fn=live, conditioning=True,
@@ -281,8 +273,8 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
     kept_records = [] if streamed else [records[seed] for seed in range(kept)]
     decided = _decided(label, held.decisions, kept) if followed else {}
     # The weighed check's own entries, the same whether the outputs are kept or summarized.
-    weighing = {} if scale is None else {
-        f"{label}.conditioning": np.int32(weighed),
+    weighing = {} if scaled is None else {
+        f"{label}.conditioning": np.asarray(weighed, np.int32),
         **{f"{label}.scale.{name}": np.stack([scaled(seed)[name]
                                              for seed in range(staged_units(weighed))])
            for name in scaled(0)}}
@@ -292,13 +284,14 @@ def record_case(label: str, draw, evaluate, *, store_inputs: bool = True,
         rows = (held.rows[seed] if streamed else row(seed, kept_records[seed]) for seed in range(kept))
         result = _finished(label, _rows_evidence(label, range(kept), rows), confirmed, kept)
         result.update(decided)
-        if scale is not None:
+        if scaled is not None:
             result.update(weighing)
             result.update(_weighed(label, kept_records[:staged_units(weighed)], scaled))
         print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
         return result
     result = _stacked(label, kept_records, replayed, store_inputs)
-    result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
+    result.update({f"{label}.seeds": np.asarray(confirmed, np.int32),
+                   f"{label}.redraw": np.asarray(REDRAW, np.int32)})
     result.update(weighing)
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
@@ -355,6 +348,21 @@ def _stacked(label: str, records: Sequence, replayed: set, store_inputs: bool) -
             input_digest({name: value for name, value in entry[0].items() if name not in replayed})
             for entry in records])
     return result
+
+
+def _scales(held: _Records, record, scale: Callable) -> Callable[[int], dict[str, np.ndarray]]:
+    """A weighed site's reference rounding scale at a seed (`scale(inputs, seed)`, `record_case`'s), made once
+    a seed (`held.kept`) and held as the recording keeps it, float32: one denominator for the sizing, the
+    reference's weighed evidence and the test's weighing of Dew's arm alike."""
+    scales: dict[int, dict[str, np.ndarray]] = {}
+
+    def scaled(seed: int) -> dict[str, np.ndarray]:
+        if seed not in scales:
+            inputs = record(seed)[0]
+            (made,) = held.kept.made("scale", seed, inputs, lambda: (scale(inputs, seed),))
+            scales[seed] = {name: np.asarray(value, np.float32) for name, value in made.items()}
+        return scales[seed]
+    return scaled
 
 
 def _weighed(label: str, records, scaled) -> dict[str, np.ndarray]:
@@ -424,7 +432,7 @@ def record_truths(label: str, draw, evaluate, count: int, *, followed: bool = Fa
             sketches.setdefault(name, []).append(truth_sketch(value, seed))
             shapes.setdefault(name, np.asarray(np.shape(value), np.int64))
         inputs.append(drawn)
-    return {f"{label}.truths": np.int32(count),
+    return {f"{label}.truths": np.asarray(count, np.int32),
             **{f"{label}.input.{name}": np.stack([each[name] for each in inputs]) for name in inputs[0]},
             **{f"{label}.sketch.{name}": np.stack(rows) for name, rows in sketches.items()},
             **{f"{label}.shape.{name}": shape for name, shape in shapes.items()},
@@ -463,8 +471,9 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
     if draw is None:
         ids_of = fixture_ids(directory)
 
-        def draw(seed):
+        def fixture_draw(seed):
             return {"input_ids": ids_of(seed)[0]}
+        draw = fixture_draw
 
     def logits(network, ids, *, prefixes: bool = True):
         tokens = torch.from_numpy(ids.astype(np.int64))
@@ -627,7 +636,7 @@ def _joined(label: str, shards: Sequence[Mapping[str, np.ndarray]], first: int) 
     joined.update({key: ordered[0][key] for key in ordered[0] if _whole(label, key)})
     for shard in ordered[1:]:
         for key in (key for key in shard if _whole(label, key)):
-            if not np.array_equal(shard[key], joined.get(key)):
+            if key not in joined or not np.array_equal(shard[key], joined[key]):
                 raise ValueError(f"{label}: one shard's {key} is {shard[key]}, another's {joined.get(key)}")
     drawn = joined[f"{label}.drawn"]
     if not np.array_equal(drawn, np.arange(first, first + len(drawn))):
@@ -654,7 +663,7 @@ class _Row:
     """One seed's evidence as a summarized recording keeps it (`_rows_evidence`): its inputs' digest and, by
     leaf, the reference's summary, its truth's sketch and its truth's shape."""
 
-    digest: str
+    digest: np.uint64
     leaves: Mapping[str, RecordedLeaf]
     sketches: Mapping[str, np.ndarray]
     shapes: Mapping[str, np.ndarray]
@@ -732,7 +741,8 @@ def _finished(label: str, evidence: Mapping[str, np.ndarray], confirmed: int,
     times that many seeds, or `kept` of them where a weighed check draws further, each leaf's rows of
     float64 zero by their span a seed (`zero_offsets`)."""
     result = _kept(label, evidence, staged_units(confirmed) if kept is None else kept)
-    result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
+    result.update({f"{label}.seeds": np.asarray(confirmed, np.int32),
+                   f"{label}.redraw": np.asarray(REDRAW, np.int32)})
     return result
 
 

@@ -53,7 +53,7 @@ from dew.nn.kernels.templates.gemm import mosaic_gpu, scattered
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
-from dew.nn.programs import read_by
+from dew.nn.programs import called, read_by
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -665,10 +665,16 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         matrices = _undeferred(words, scales).decoded()
         return matrices[0] if dense else matrices
 
+    def kernel(rows, words, scales, sizes, gather, first, *, interpret):
+        return launch(rows, _undeferred(words, scales), sizes, (), (), None, first, gather,
+                      out_dtype='float32', trans_rhs=False, interpret=interpret, dense=dense, exact_sums=True)
+
     def forward(rows, words, scales, sizes, gather, first):
-        out = launch(rows, _undeferred(words, scales), sizes, (), (), None, first, gather,
-                     out_dtype='float32', trans_rhs=False, interpret=interpret, dense=dense, exact_sums=True)
-        return out, ()
+        # The launch where the call lowers for CUDA, interpreted on a CPU where asked, the decoded values'
+        # product elsewhere (`_dispatched`; `portable`, the tangent's too), as every launch of gemm's: a CPU
+        # process's call lowered the launch for its CPU uninterpreted (row 8492: "Only interpret mode is
+        # supported on CPU backend").
+        return _dispatched(kernel, portable, interpret, rows, words, scales, sizes, gather, first), ()
 
     def backward(saved, operands, cotangent, live):
         # The cotangent at its own precision times the decoded values' transpose, rounded once to the rows',
@@ -1244,7 +1250,7 @@ def _launch_takes(d, matrix, form: dict, group_sizes, dtype, prologue, options: 
     """Whether Mosaic GPU's launch takes `d @ matrix` in `form` (`_one_launch`'s) as `_gemm` binds it; a
     chain not at a pinned tile it does not hold (its replay narrower than a column unit: base review
     2e4651b2e F1, the chain narrowed a 64-column pin to 16)."""
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     sizes = jnp.full((1,), d.shape[0], jnp.int32) if group_sizes is None else group_sizes
     out = at_least_fp32(dtype) if prologue is not None else jnp.dtype(dtype)
     call, product = _gemm_call(d, matrix, sizes, None, (), (), None, (), (), (out,), several=False,
@@ -1277,7 +1283,7 @@ def _keeps_launch(lhs, rhs, group_sizes, hook, sides: tuple, outs: tuple, summed
     asked above the default precision runs as its bf16 parts' launches, the hook the last part's
     (`_gemm`'s `_in_parts`), so the launches asked about are those parts' (a wide cotangent's chained input
     gradient, `_input_cotangents`)."""
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if group_sizes is None else group_sizes
     if _part_counts(lhs.dtype, rhs.dtype, options['precision']) is not None:
         lhs, rhs = lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16)
@@ -1338,7 +1344,7 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
     XLA's program of the whole product. Gathered rows keep the prologue (`_gemm_t` gathers them first)."""
     if options['gather'] is not None:
         return True
-    interpret = options['interpret_on_cpu'] and jax.default_backend() == 'cpu'
+    interpret = xla_products.interpreted(options['interpret_on_cpu'])
     dense = group_sizes is None
     sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     product = declared(lhs.dtype, options['precision'], outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))
@@ -1599,10 +1605,25 @@ def _rounded_accumulator(kept: dict, count: int, epilogue, acc, sides) -> jax.Ar
     if not kept or count != 1:
         return None
     jaxpr = jax.make_jaxpr(lambda acc, *sides: _tupled(epilogue, acc, *sides))(acc, *sides).jaxpr
-    reading = [eqn for eqn in jaxpr.eqns if jaxpr.invars[0] in eqn.invars]
-    if len(reading) != 1 or reading[0].primitive is not jax.lax.convert_element_type_p:
+    rounded = _rounding(jaxpr, jaxpr.invars[0])
+    return next((value for at, value in kept.items() if jaxpr.outvars[at] is rounded), None)
+
+
+def _rounding(jaxpr, var):
+    """The value of `jaxpr` that is `var` rounded, where `var`'s one reader is that conversion, or a call
+    whose program's is (`dew.nn.programs.called`: an epilogue its fused consumer's derivative declares,
+    `fused_gemm._declared`), its output then the call's; None otherwise."""
+    reading = [eqn for eqn in jaxpr.eqns if var in eqn.invars]
+    if len(reading) != 1:
         return None
-    return next((value for at, value in kept.items() if jaxpr.outvars[at] is reading[0].outvars[0]), None)
+    (eqn,) = reading
+    if eqn.primitive is jax.lax.convert_element_type_p:
+        return eqn.outvars[0]
+    body = called(eqn)
+    if body is None or eqn.invars.count(var) != 1:
+        return None
+    inner = _rounding(body, body.invars[eqn.invars.index(var)])
+    return eqn.outvars[body.outvars.index(inner)] if inner in body.outvars else None
 
 
 def _reads_accumulators(vjp: tuple, count: int) -> bool:

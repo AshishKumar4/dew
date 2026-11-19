@@ -49,17 +49,39 @@ def widened(tree):
     device's FP64 units with no host round trip (a decode step's keys and values, a hundred megabytes a
     draw to the host and back); any other is a host array, as is every leaf on a process whose float64
     computes on its host (`float64_host`, a TPU's): a truth computes there (`on_float64_device`, `Truth`),
-    and one run as given reads host values (a torch truth's `torch.from_numpy`)."""
-    def wide(leaf):
-        to = (np.complex128 if jnp.issubdtype(leaf.dtype, jnp.complexfloating)
-              else np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype)
-        if isinstance(leaf, jax.Array) and to != leaf.dtype and float64_host() is None and all(
-                device.platform != "cpu" for device in leaf.devices()):
-            with jax.enable_x64(new_val=True):
-                return leaf.astype(to)
-        return np.asarray(leaf, to)
+    and one run as given reads host values (a torch truth's `torch.from_numpy`). The accelerator's leaves
+    widen in one program a tree's shapes (`_widened_on_device`): a conversion a leaf, each traced and
+    compiled, held a GPU idle 200 times a recurrence tier file (row 7675)."""
+    leaves, structure = jax.tree.flatten(tree)
+    held = [index for index, leaf in enumerate(leaves)
+            if isinstance(leaf, jax.Array) and _wide(leaf.dtype) != leaf.dtype and float64_host() is None
+            and all(device.platform != "cpu" for device in leaf.devices())]
+    # One program a sharding: a jit takes its arguments on one ordered assignment of devices (a truth run as
+    # given may hold leaves apart, each on its own GPU, or on meshes of one device set in two orders).
+    grouped: dict[jax.sharding.Sharding, list[int]] = {}
+    for index in held:
+        grouped.setdefault(leaves[index].sharding, []).append(index)
+    with jax.enable_x64(new_val=True):
+        for group in grouped.values():
+            for index, value in zip(group, _widened_on_device([leaves[index] for index in group]),
+                                    strict=True):
+                leaves[index] = value
+    placed = set(held)
+    return jax.tree.unflatten(structure, [leaf if index in placed else np.asarray(leaf, _wide(leaf.dtype))
+                                          for index, leaf in enumerate(leaves)])
 
-    return jax.tree.map(wide, tree)
+
+def _wide(dtype) -> np.dtype:
+    """`dtype` widened (`widened`): a complex one to complex128, a float to float64, any other as it is."""
+    return np.dtype(np.complex128 if jnp.issubdtype(dtype, jnp.complexfloating)
+                    else np.float64 if jnp.issubdtype(dtype, jnp.floating) else dtype)
+
+
+@jax.jit
+def _widened_on_device(leaves: list) -> list:
+    """`leaves`, arrays an accelerator holds, each widened where it lies (`widened`, under x64): one
+    program a list of shapes."""
+    return [leaf.astype(_wide(leaf.dtype)) for leaf in leaves]
 
 
 EXACT = frozenset({jax.lax.neg_p, jax.lax.abs_p, jax.lax.max_p, jax.lax.min_p, jax.lax.select_n_p,
@@ -123,7 +145,10 @@ def float64_held(tree):
 
 def summed_as_run():
     """The scope a check runs each arm in (`_drawn`), the truth and its terms outside it: on the CPU lane,
-    the process's default backend (`jax.default_backend()`), fp32 products summed in fp32
+    where the context places a call (`generation.placed_platform`: a GPU tier part's prepare, a CPU process,
+    places its arms on its compile-only GPU and takes the GPU's own arithmetic, as its run does; row 8580's
+    cuBLASLt FP8 arm, traced under the CPU's preset in that prepare, compiled without its fast
+    accumulation), fp32 products summed in fp32
     (`dew.nn.precision.FP32_SUMS`), as an accelerator sums them and as a CPU does in any process but
     the suite's, whose wide arithmetic (`WIDE_CPU_ARITHMETIC`) sums Dew's products in float64, so the
     gate measures each arm as its users run it; elsewhere the process's own precision. A Dew arm that
@@ -133,7 +158,9 @@ def summed_as_run():
     and sums them in float32, as a GPU's fp32-accumulated product does, and a loop's running sum of
     them is the plain one (`compensates_loops`); the setting's widened reductions, which are not
     product sums, stay."""
-    if jax.default_backend() == "cpu":
+    from dew.nn.kernels.generation import placed_platform
+
+    if placed_platform() == "cpu":
         return jax.default_matmul_precision(FP32_SUMS)
     return contextlib.nullcontext()
 

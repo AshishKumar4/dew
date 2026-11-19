@@ -77,7 +77,7 @@ def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_befo
     (own / "memory.max").write_text(f"{3 * 2**30}\n")
     membership = tmp_path / "cgroup"
     membership.write_text("1:name=systemd:/elsewhere\n0::/session\n")
-    reader = Path(__file__).resolve().parents[1] / "src" / "dew" / "data" / "cgroups.py"
+    reader = Path(__file__).resolve().parents[1] / "src" / "dew" / "_cgroups.py"
     program = (
         "import importlib.util, sys\n"
         f"spec = importlib.util.spec_from_file_location('cgroups', {str(reader)!r})\n"
@@ -90,9 +90,11 @@ def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_befo
         "import json\n"
         "print(json.dumps([group.name, [cgroups.cpus(level) for level in levels],\n"
         "                  [cgroups.memory(level) for level in levels],\n"
+        "                  [cgroups.memory_peak(level) for level in levels],\n"
         "                  any(name.split('.')[0] == 'dew' for name in sys.modules)]))\n")
+    (own / "memory.peak").write_text(f"{7 * 2**30}\n")
     done = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, check=True)
-    assert json.loads(done.stdout) == ["session", [None, 3], [3 * 2**30, None], False]
+    assert json.loads(done.stdout) == ["session", [None, 3], [3 * 2**30, None], [7 * 2**30, None], False]
 
 
 class _Filled:

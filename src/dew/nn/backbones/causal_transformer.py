@@ -827,8 +827,10 @@ class CausalTransformer(LinearProducts):
                                               name='engram_hashes')
         self._final_norm()
         if self.loop is not None and self.loop.implicit:
-            # Per channel, as a norm's scale: no logical axes, placed whole (`Layout.min_shard`).
-            self.loop_theta = self.param('loop_theta', nn.initializers.zeros, (self.emb_features,),
+            # Per channel, as a norm's scale (a row of it per later pass under `theta_passes`): no logical
+            # axes, placed whole (`Layout.min_shard`).
+            rows = () if self.loop.theta_passes is None else (self.loop.theta_passes - 1,)
+            self.loop_theta = self.param('loop_theta', nn.initializers.zeros, (*rows, self.emb_features),
                                          jnp.float32)
         if self.loop is not None and self.loop.exit_gate:
             # Drawn at zero, every pass's hazard a half, where a loaded decoder gains the gate
@@ -1655,18 +1657,21 @@ class CausalTransformer(LinearProducts):
     def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
                     backprop_steps: int | None = None, remat: bool | None = None,
                     implicit: bool | None = None, exit_gate: bool | None = None,
-                    exit_threshold: float | None = None, exits: bool | None = None) -> Self | None:
+                    exit_threshold: float | None = None, exits: bool | None = None,
+                    theta_passes: int | None = None) -> Self | None:
         """This model with its loop run `steps` times (None keeps its count), over the block `layers`
         where given (None keeps its block). `backprop_steps` sets how many final passes train through,
         `remat` checkpoints each pass, `implicit` takes each later pass by the θ-method, and `exit_gate`,
-        `exit_threshold` and `exits` weigh, take and give each pass's exit (`Loop`); None keeps its own.
+        `exit_threshold` and `exits` weigh, take and give each pass's exit, and `theta_passes` gives an
+        implicit loop a θ row for each later pass of that many (`Loop`); None keeps its own.
 
         A model with no loop gains one over `layers`, with no norm between its
         passes, so one pass computes the model as it was, and every count does
         where it is implicit; None when it has no loop and the two do not both
         say what to add."""
         stated = {'backprop_steps': backprop_steps, 'remat': remat, 'implicit': implicit,
-                  'exit_gate': exit_gate, 'exit_threshold': exit_threshold, 'exits': exits}
+                  'exit_gate': exit_gate, 'exit_threshold': exit_threshold, 'exits': exits,
+                  'theta_passes': theta_passes}
         options = {name: value for name, value in stated.items() if value is not None}
         if self.loop is None:
             if steps is None or layers is None:

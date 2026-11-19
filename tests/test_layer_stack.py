@@ -39,7 +39,7 @@ from dew.distributed.batches import shard_batch
 from dew.inference.banks import HeldBanks
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
-from dew.nn.backbones.decoder_stack import StackView, stacked_rows
+from dew.nn.backbones.decoder_stack import Loop, StackView, stacked_rows
 from dew.nn.backbones.layer_names import array_rows, stored_layers
 from dew.nn.mixers.attention import ATTENTION_AXES
 from dew.nn.mlp import MLP_AXES
@@ -217,9 +217,12 @@ def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
 
 
 def scanned_pair(build):
+    """`build`'s plain loop and scanned stack, the plain loop's variables and the ids it was initialized
+    over: its initializer one program, where run op by op Gemma 3n's compiled 448 programs, 16 s of a cold
+    test (row 7860)."""
     plain, scanned = build(), build(scan_layers=True)
     ids = jax.random.randint(jax.random.key(1), (2, 12), 0, VOCAB)
-    variables = nn.unbox(plain.init(jax.random.key(0), ids))
+    variables = nn.unbox(jax.jit(plain.init)(jax.random.key(0), ids))
     return plain, scanned, variables, ids
 
 
@@ -653,10 +656,13 @@ def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
     scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
     plain = tiny(num_layers=4, max_seq_len=16, mixture=routed)
-    variables = plain.init(jax.random.key(0), jnp.zeros((2, 10), jnp.int32))
+    # Each init and the allocating call one compiled program, where op by op they took most of the test's
+    # 149 s (row 7456).
+    variables = jax.jit(plain.init)(jax.random.key(0), jnp.zeros((2, 10), jnp.int32))
     banked = HeldBanks(variables).place(scanned)
     first = jnp.zeros((2, 1), jnp.int32)
-    allocated = scanned.apply(banked, first, decode=True, mutable=["cache"])[1]["cache"]
+    allocate = jax.jit(lambda store, ids: scanned.apply(store, ids, decode=True, mutable=["cache"])[1])
+    allocated = allocate(banked, first)["cache"]
     assert "layers_0_3" in allocated and not any(f"layers_{index}" in allocated for index in range(4))
 
     def decoded(model, store, cache):
@@ -680,7 +686,7 @@ def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_
         return lambda ids: {name: value for name, value in run(ids).items()
                             if jnp.issubdtype(value.dtype, jnp.floating)}
 
-    per_layer = scanned.init(jax.random.key(0), first, decode=True)["cache"]
+    per_layer = jax.jit(functools.partial(scanned.init, decode=True))(jax.random.key(0), first)["cache"]
     bank, layers = decoded(scanned, banked, allocated), decoded(scanned, banked, per_layer)
     def integral(run):
         """`run`'s slots and cursors, which both arms hold exactly."""
@@ -696,8 +702,8 @@ def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_
     # compiles for every draw.
     with jax.enable_x64(new_val=True):
         wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
-        truth = floating(decoded(wide, float64_held(variables),
-                                 float64_held(wide.init(jax.random.key(0), first, decode=True)["cache"])))
+        cache = jax.jit(functools.partial(wide.init, decode=True))(jax.random.key(0), first)["cache"]
+        truth = floating(decoded(wide, float64_held(variables), float64_held(cache)))
 
     assert_as_exact(floating(bank), floating(layers), drawn_ids(0x4550, 10), "banked decode",
                     seeds=BANKED_DECODE_SEEDS, truth_fn=truth)
@@ -901,6 +907,40 @@ def test_a_pipeline_trains_an_exchange_dispatch():
     assert abs(loss - piped) < 1e-5, (loss, piped)
     difference = largest_difference(grads, piped_grads)
     assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
+
+
+def router_counts_on(objective, spec, variables, batch, microbatches=None):
+    """The router counts `objective`'s balancing bias takes over `batch` (`ExpertBalance.effects`) on
+    `spec`'s mesh, placed as `loss_and_grads` places them, with the pipeline's schedule of `microbatches`
+    in context."""
+    mesh = spec.build()
+    with boxed(objective.parameter_axes):
+        placed = jax.device_put(variables, Layout(min_shard=TINY_SHARD).shardings(mesh, variables))
+    batch = shard_batch(mesh, batch)
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
+    with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
+        effects = jax.jit(lambda tree: objective.scalar_loss(tree, batch, step)[1].effects)(placed)
+    return {path: np.asarray(count) for path, count in flat_tree(effects).items()}
+
+
+@mesh_lane
+def test_a_pipelined_loop_counts_every_passs_routing():
+    """A whole stack a loop runs twice, pipelined over two stages: each pass sows its routers' choices at
+    its layers' own names entering none, so the pipeline's scan writes them (a collection entering it
+    holding the first pass's sows is one it broadcasts, which no sow may change), and every router's
+    counts are the slots both passes chose, each of a row's positions choosing `top_k` a pass, as the
+    unpipelined loop's are (row 7885)."""
+    model = routed(loop=Loop(2))
+    top_k = model.mixture.top_k
+    objective = LMObjective(model, SEQ_LEN, balance=ExpertBalance(balance_rate=0.01))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
+    batch = token_batch(PIPELINED_ROWS)
+
+    plain = router_counts_on(objective, MeshSpec(fsdp=4), variables, batch)
+    piped = router_counts_on(objective, MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=4)
+    assert plain.keys() == piped.keys() and len(piped) == TINY["num_layers"]
+    for path, counts in piped.items():
+        assert int(counts.sum()) == int(plain[path].sum()) == 2 * PIPELINED_ROWS * SEQ_LEN * top_k, path
 
 
 @mesh_lane
@@ -1135,6 +1175,7 @@ def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_dec
         assert our_paths == their_paths
 
 
+@pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_resident_one():
     """A scanned run of host-resident layers runs one layer at a time in a scope of its
     own (`decoder_stack.run_stack`, `_prefetched_run`), reading each layer's slice of
@@ -1142,7 +1183,9 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
     balancing biases off zero, two calls and a decode through the cache they allocate
     and reuse give the resident stack's state, its routing exactly, and its logits, scores
     and cache as exact as the resident's own, both measured from the resident stack in
-    float64 (tests/reference_error.py), the two paths compiling the same layers apart."""
+    float64 (tests/reference_error.py), the two paths compiling the same layers apart. Its
+    512 seeds took 78 s alone cold, most of it their draws' arms and truth computing, on armada's CI
+    CPU and 123 s in train 1021's CI: CI draws them in map tasks of 128 (row 7860)."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import Mixture
 
@@ -1151,7 +1194,7 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
                               attention_impl="reference", scan_layers=True,
                               mixture=Mixture(experts=4, top_k=2, bias=True))
     tokens = jnp.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], jnp.int32)
-    variables = nn.unbox(model.init(jax.random.key(0), tokens))
+    variables = nn.unbox(jax.jit(model.init)(jax.random.key(0), tokens))
     variables = {**variables, "moe": jax.tree.map(lambda bias: bias + 4.0 * (jnp.arange(bias.shape[-1]) % 3),
                                                   variables["moe"])}
     assert any(count > 1 for _, count in model.bind(variables).groups)
@@ -1165,7 +1208,9 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
         """The fixed tokens at seed 0, else tokens drawn uniformly from the vocabulary."""
         if seed == 0:
             return (tokens,)
-        return (np.random.default_rng(seed).integers(0, model.vocab_size, tokens.shape).astype(np.int32),)
+        # A JAX array: a draw holding NumPy runs each arm once first (`arm_forms._refuse_numpy_arms`).
+        drawn = np.random.default_rng(seed).integers(0, model.vocab_size, tokens.shape)
+        return (jnp.asarray(drawn, jnp.int32),)
 
     def run(model, tree, tokens):
         calls = []

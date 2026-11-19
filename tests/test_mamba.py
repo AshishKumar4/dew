@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through, float64_twin
-from reference_error import assert_as_exact
+from reference_error import FEWEST_SEEDS, assert_as_exact
+from selective_support import near_the_largest, rate_past_the_range, stepwise
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 
 from dew.interop import Pretrained
@@ -33,15 +34,6 @@ def operands(length=11, channels=16, state=4, seed=0):
             jax.random.normal(keys[5], (channels,)))
 
 
-def stepwise(x, dt, A, B, C, D, state):
-    """`mamba_selective_state_update` (modeling_mamba.py:129-172), one token at a time."""
-    outputs = []
-    for t in range(x.shape[1]):
-        state = jnp.exp(dt[:, t, :, None] * A) * state + (dt[:, t] * x[:, t])[..., None] * B[:, t, None, :]
-        outputs.append(jnp.einsum('bdn,bn->bd', state, C[:, t]) + x[:, t] * D)
-    return jnp.stack(outputs, 1), state
-
-
 @pytest.mark.parametrize('chunk', [1, 4, 64])
 def test_the_chunked_scan_is_the_recurrence_from_any_state(chunk):
     """Each chunk size, one that divides the sequence and one that pads it,
@@ -52,6 +44,51 @@ def test_the_chunked_scan_is_the_recurrence_from_any_state(chunk):
     expected, last = stepwise(x, dt, A, B, C, D, held)
     np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(final, last, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize('chunk', [16, 64])
+def test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence(chunk):
+    """The chunked scan's output and final state near float32's largest (`near_the_largest`'s entering state:
+    two writes past it together over a state entering near its negative, every state finite) on par from
+    float64 with the recurrence a token at a time (`stepwise`, check 1, which refuses a value not finite
+    where float64's is), where its spans summed the writes from a zero state past float32's largest, inf
+    (row 8465). Its gradients there, and a faint write after them, are row 8486's."""
+    def scan(x, dt, A, B, C, D, state):
+        return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=chunk)
+
+    def draw(seed):
+        return near_the_largest("an entering state", seed)[:-1]
+
+    exact = jax.jit(stepwise)
+    assert_as_exact(jax.jit(scan), exact, draw, f"the chunked scan near float32's largest, chunks of {chunk}",
+                    seeds=FEWEST_SEEDS, truth_fn=exact)
+
+
+def decayed(fn):
+    """`fn(x, dt, A, B, C, D, state)` as `run(x, dt, A, B, C, D, state, cotangent)`, which returns its output
+    and the gradients of the decay's step and rate `(dt, A)` under the cotangent: the operands a decay's form
+    reaches."""
+    def run(x, dt, A, B, C, D, state, cotangent):
+        out, pull = jax.vjp(lambda dt, A: fn(x, dt, A, B, C, D, state), dt, A)
+        return out, *pull(cotangent)
+
+    return run
+
+
+@pytest.mark.parametrize('chunk', [16, 64])
+def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk):
+    """A scan whose rate `A log2(e)` passes float32's range over a ragged chunk (`rate_past_the_range`): its
+    output, final state and its decay's step's and rate's gradients (`decayed`) on par from float64 with the
+    recurrence a token at a time (`stepwise`, check 1), where the rate taken to base 2 before the step was
+    -inf and a padded token's zero step made its decay NaN (row 8491). Its B's and C's gradients there are
+    row 8563's."""
+    def scan(x, dt, A, B, C, D, state):
+        return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=chunk)
+
+    exact = jax.jit(decayed(stepwise))
+    assert_as_exact(jax.jit(decayed(scan)), exact, rate_past_the_range,
+                    f"the chunked scan at a rate past float32's range, chunks of {chunk}", seeds=FEWEST_SEEDS,
+                    truth_fn=exact)
 
 
 def test_a_document_start_drops_the_state_entering_it():
@@ -99,7 +136,7 @@ def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_on
     """Under a sequence axis of 4, the layer runs rows with padding and packed documents as `held_scan`
     runs them on one device (`assert_split_as_whole`): each shard's conv reads the real tokens before it
     from the earlier shards, and its scan enters with the state they leave it, each channel's and state's
-    decay its own (`_sequence_scan`, row 1710)."""
+    decay its own (`linear.sequence_entered`, rows 1710, 7423)."""
     mixer = Mamba(emb_features=8, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4)
     variables = jax.tree.map(np.asarray, mixer.init(jax.random.key(1), jnp.zeros((1, 32, 8))))
     assert_split_as_whole(mixer, variables, row, SPLIT_SEEDS[row], f"mamba split over the sequence, {row}",

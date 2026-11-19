@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import cublas_compiled
+from generation_support import cublas_compiled, pinned
 from gpu_flow import cell
 from jax.sharding import Mesh
 from kernel_matrix import AXES
@@ -39,9 +39,10 @@ KERNELS = {"blockwise_fp8": frozenset({"mosaic"})}
 """The kernels under test of each choice the cells run: the template's step-scaled walk."""
 
 
-def _sizes(groups: int) -> jnp.ndarray:
-    """`groups` groups' row counts over `ROWS`, ragged where there are several."""
-    return jnp.asarray([ROWS] if groups == 1 else [70, 0, 129, ROWS - 199], jnp.int32)
+def _sizes(groups: int) -> np.ndarray:
+    """`groups` groups' row counts over `ROWS`, ragged where there are several: NumPy's, formed on no device
+    (a GPU tier's prepare computes on none, its default a compile-only GPU's)."""
+    return np.asarray([ROWS] if groups == 1 else [70, 0, 129, ROWS - 199], np.int32)
 
 
 def _operands(case: dict[str, str], seed: int) -> tuple:
@@ -143,8 +144,7 @@ def truth(sizes) -> callable:
 
 
 @cell("blockwise_fp8", covers=lambda case: dict(zip(AXES["blockwise_fp8"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=pinned(case[0]))
     for case in CASES], ids="-".join)
 def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
     """The blockwise-scaled FP8 product of `case` on its GPU through the template on par with cuBLASLt's FP8
@@ -154,7 +154,7 @@ def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["blockwise_fp8"], case, strict=True))
     groups, out_dtype = int(combination["groups"]), combination["out_dtype"]
     draw = functools.partial(_operands, combination)
-    reference = cublaslt_arm(cublaslt(_sizes(groups), out_dtype), draw(0))
+    reference = cublaslt_arm(cublaslt(_sizes(groups), out_dtype), jax.eval_shape(lambda: draw(0)))
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_product(groups, out_dtype, "mosaic")), reference, draw, "-".join(case),
                         seeds=SEEDS, truth_fn=truth(_sizes(groups)))

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
-from reference_runs import assert_arms_as_recorded
+from recorded_runs import assert_arms_as_recorded
 
 EXPORTED = Path(__file__).resolve().parent / "fixtures" / "llama_cpp" / "reference.npz"
 """tools/llama_cpp_reference.py's record of the export llama.cpp converted and the vocabulary its GGUF

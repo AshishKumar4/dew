@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from arm_arithmetic import summed_as_run
 from flax import linen as nn
 from model_support import decoder, float64_twin
 from reference_error import as_given, assert_as_exact, widened
@@ -180,16 +181,22 @@ def clears_margin(model, params, prompt, lengths, tokens, sampling, positions=No
 def generation_draw(model, params, sampling, steps: int, *, margin: bool, progress: Progress = END,
                     **prompt_shape):
     """Check 1's draw of drawn prompts, a key and the tokens `generate` draws from them: with `margin`,
-    the first of the seed's attempts whose steps clear MARGIN."""
+    the first of the seed's attempts whose steps clear MARGIN. Drawn in the arithmetic its arms replay it in
+    (`summed_as_run`), so `generated` draws the same tokens bit for bit: drawn in the suite's wide arithmetic,
+    a step's log probabilities 3e-6 apart from the arm's flipped a sampled token at a near tie (train 1000's
+    return of a Mamba-3 head, its mamba3 registered cell's row 15)."""
     def draw(seed):
         for attempt in range(64 if margin else 1):
             prompt, lengths = drawn_prompts(seed, attempt, int(model.vocab_size), **prompt_shape)
             key = jax.random.key_data(jax.random.fold_in(jax.random.key(seed), attempt))
-            result = generate(model, params, prompt_inputs({"prompt": prompt, "prompt_length": lengths}),
-                              steps, key=jax.random.wrap_key_data(key), sampling=sampling, progress=progress)
-            tokens = np.asarray(result.tokens)[:, prompt.shape[1]:]
-            if not margin or clears_margin(model, params, prompt, lengths, tokens, sampling,
-                                           progress=progress):
+            inputs = prompt_inputs({"prompt": prompt, "prompt_length": lengths})
+            with summed_as_run():
+                result = generate(model, params, inputs, steps, key=jax.random.wrap_key_data(key),
+                                  sampling=sampling, progress=progress)
+                tokens = np.asarray(result.tokens)[:, prompt.shape[1]:]
+                cleared = not margin or clears_margin(model, params, prompt, lengths, tokens, sampling,
+                                                      progress=progress)
+            if cleared:
                 return prompt, lengths, np.asarray(key), tokens
         raise AssertionError(f"no draw of seed {seed} clears MARGIN")
     return draw
@@ -607,27 +614,36 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
 
     def by_hand(dtype=None):
         if dtype is None:
-            return as_given(lambda key, rolled: stepped(objective, params, rolled))
+            step = stepped(objective)
+            return as_given(lambda key, rolled: step(params, rolled))
         weights = widened(params)
         # Built under x64, as it computes, so nothing it holds narrows to float32.
         with jax.enable_x64(new_val=True):
-            wide = GRPOObjective(model.clone(dtype=dtype), seq_len=7, variables=weights)
+            wide = stepped(GRPOObjective(model.clone(dtype=dtype), seq_len=7, variables=weights))
 
         def run(key, rolled):
             with jax.enable_x64(new_val=True):
-                return stepped(wide, weights, widened(rolled))
+                return wide(weights, widened(rolled))
         return as_given(run)
 
-    def stepped(objective, params, rolled):
-        def raw_policy_loss(p):
-            policy = objective.packed_log_probs(p, rolled)
-            return clipped_surrogate(
-                policy - jnp.asarray(rolled["old_log_probs"]),
-                jnp.asarray(rolled["advantages"]), jnp.asarray(rolled["response_mask"]))[0]
+    def stepped(objective):
+        """The raw policy ratio's SGD step by hand, one compiled program over a rollout's device fields,
+        where op by op its 65 calls took 107 s of the test (row 7447)."""
+        @jax.jit
+        def step(params, placed):
+            def raw_policy_loss(p):
+                policy = objective.packed_log_probs(p, placed)
+                return clipped_surrogate(policy - placed["old_log_probs"], placed["advantages"],
+                                         placed["response_mask"])[0]
 
-        loss, grads = jax.value_and_grad(raw_policy_loss)(params)
-        assert np.isfinite(loss)
-        return jax.tree.map(lambda p, g: p - 0.01 * g, params, grads)
+            loss, grads = jax.value_and_grad(raw_policy_loss)(params)
+            return loss, jax.tree.map(lambda p, g: p - 0.01 * g, params, grads)
+
+        def run(params, rolled):
+            loss, moved = step(params, split_fields(rolled)[0])
+            assert np.isfinite(loss)
+            return moved
+        return run
 
     rolled = rolled_from(jax.random.key(5))
     assert np.any(rolled["advantages"] != 0)

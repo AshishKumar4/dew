@@ -2,6 +2,7 @@
 record it drops as a marker, which the reading process drops, so a worker whose own inputs are
 all dropped never holds up the others' (row 883)."""
 
+import dataclasses
 import json
 from dataclasses import dataclass
 
@@ -268,3 +269,127 @@ def test_a_nested_mixture_reads_in_the_workers_it_writes():
     topology = record(plan["topology"], "topology")
     assert set(_ids(reader, 8)) <= set(range(0, 12, 2))
     assert "pools" not in topology and "workers" not in topology
+
+
+@dataclass(frozen=True)
+class _Odd:
+    """Rejects every even id, permanently: a record steps cannot make."""
+
+    identity = "odd@1"
+    rejects = True
+
+    def __call__(self, row):
+        return Rejected("even") if int(row["id"]) % 2 == 0 else row
+
+
+def test_a_share_whose_records_a_step_keeps_none_of_is_refused_not_read_forever():
+    """Two shares of a repeated indexed read whose rejecting step keeps only the odd ids: the share cut every
+    other record holds the even ones alone, a pass of which keeps no row on any pass, so its read is
+    refused at its first batch, where it read empty passes forever (a counted-passes cell's 40-minute
+    hang); the other share reads its records."""
+    ids = Pipeline(Memory({"id": np.arange(1, 11, dtype=np.int32)}, shard_rows=3)).filter_map(_Odd())
+    loader = compile(ids.read("indexed").repeat().batch(2), loading=Loading(workers=0))
+    kept = loader.train(DataPartition(0, 2))
+    empty = loader.train(DataPartition(1, 2))
+    try:
+        assert {int(row) % 2 for row in np.asarray(next(kept)["id"]).ravel()} == {1}
+        with pytest.raises(ValueError):
+            next(empty)
+    finally:
+        kept.close()
+        empty.close()
+
+
+
+@dataclass(frozen=True)
+class _NoneKept:
+    """Rejects every record, permanently: a step no pass gets a row from."""
+
+    identity = "none-kept@1"
+    rejects = True
+
+    def __call__(self, row):
+        return Rejected("unkept")
+
+
+@pytest.mark.parametrize("shares", [1, 2])
+def test_a_shuffled_share_whose_records_a_step_keeps_none_of_is_refused_whatever_its_shares(shares):
+    """A seeded shuffle, a take of five after it, a step that rejects every record and an endless repeat,
+    read by one share and by each of two: the repeat replays its first pass, the shuffle, the take and the
+    share's cut alike, so no pass makes a row and every share's read is refused at its first batch, where it
+    read empty passes forever, saying the shuffle might make a row (row 7942)."""
+    ids = Pipeline(Memory({"id": np.arange(1, 11, dtype=np.int32)})).shuffle(seed=0).take(5).filter_map(
+        _NoneKept())
+    loader = compile(ids.read("indexed").repeat().batch(2), loading=Loading(workers=0))
+    for index in range(shares):
+        stream = loader.train(DataPartition(index, shares))
+        try:
+            with pytest.raises(ValueError):
+                next(stream)
+        finally:
+            stream.close()
+
+def _jitter(row, rng):
+    """A draw a record's generator makes, kept beside the record: a step that may make other rows on a
+    later pass."""
+    return {**row, "draw": np.int64(rng.integers(0, 2**31))}
+
+
+@dataclass(frozen=True)
+class _KeptFromFifthPass:
+    """Rejects every record of a six-record source's first four passes, keeping them after: a step whose
+    rows a later pass makes, as a fetch that failed for now does."""
+
+    calls: list = dataclasses.field(default_factory=list)
+    identity = "kept-from-fifth@1"
+    rejects = True
+
+    def __call__(self, row):
+        self.calls.append(None)
+        return Rejected("not yet") if len(self.calls) <= 24 else row
+
+
+def test_a_read_whose_passes_keep_nothing_after_a_draw_says_so_at_every_empty_pass(caplog):
+    """A repeated read whose draw before its repeat may make other rows on a later pass, whose first four
+    passes its rejecting step keeps none of, reads on, as a later pass may yield, and does: it says so at
+    each empty pass after the first, naming the share, the passes so far and the step that makes it read
+    on, so a run that is not moving says why, where it logged only at each doubling of its empty passes."""
+    ids = Pipeline(Memory({"id": np.arange(1, 7, dtype=np.int32)})).random_map(_jitter, identity="jitter@1")
+    stream = compile(ids.filter_map(_KeptFromFifthPass()).read("indexed").repeat().batch(2),
+                     loading=Loading(workers=0)).train(DataPartition())
+    caplog.set_level("WARNING", logger="dew.data.lowering")
+    try:
+        assert len(next(stream)["id"]) == 2
+    finally:
+        stream.close()
+    told = [record.args for record in caplog.records if record.name == "dew.data.lowering"
+            and isinstance(record.args, tuple) and len(record.args) == 3]
+    assert [passes for _, passes, _ in told] == [2, 3, 4]
+    assert all("share 0 of 1" in share and "jitter" in steps for share, _, steps in told)
+
+
+@dataclass(frozen=True)
+class _KeepsOnly:
+    """Keeps the one record of id `kept`, rejecting the rest."""
+
+    kept: int
+    identity = "keeps-only@1"
+    rejects = True
+
+    def __call__(self, row):
+        return row if int(row["id"]) == self.kept else Rejected("other")
+
+
+def test_a_shuffled_limit_rejected_for_passes_reads_on_to_the_pass_that_keeps_one():
+    """A shuffle reseeded each pass, a limit of one record after it, an endless repeat and a step after it
+    keeping one id alone: a pass holds whichever record the shuffle put first, so a run of rejected passes
+    is no proof that none is kept later. Each id is read, at whichever pass first holds it, where a run of
+    two rejected passes was refused as certain to read nothing forever."""
+    ids = Pipeline(Memory({"id": np.arange(1, 13, dtype=np.int32)})).shuffle(seed=0).take(1)
+    for kept in range(1, 13):
+        stream = compile(ids.read("indexed").repeat().filter_map(_KeepsOnly(kept)).batch(1),
+                         loading=Loading(workers=0)).train(DataPartition())
+        try:
+            assert np.asarray(next(stream)["id"]).ravel().tolist() == [kept]
+        finally:
+            stream.close()

@@ -75,15 +75,16 @@ class TimeStep:
 
 class Env[State: EnvState](Protocol):
     """An environment as two jittable functions over its state, a pytree: `reset(key)` starts an
-    episode and `step(state, action)` advances it, each answering a `TimeStep`. `action_size` is the
-    width of a continuous action in [-1, 1]."""
+    episode and `step(state, action)` advances it, each answering a `TimeStep`, their arguments given by
+    position, so an environment names its own (a race's `race`). `action_size` is the width of a
+    continuous action in [-1, 1]."""
 
     @property
     def action_size(self) -> int: ...
 
-    def reset(self, key: jax.Array) -> tuple[State, TimeStep]: ...
+    def reset(self, key: jax.Array, /) -> tuple[State, TimeStep]: ...
 
-    def step(self, state: State, action: jax.Array) -> tuple[State, TimeStep]: ...
+    def step(self, state: State, action: jax.Array, /) -> tuple[State, TimeStep]: ...
 
 
 @struct.dataclass
@@ -177,12 +178,12 @@ class Transition:
 
 
 @struct.dataclass
-class Carry:
-    """A rollout's running state between calls: the environments' state, the observation each
-    acts on next, the key the next restarts and actions draw from, and the policy's own `memory`
-    (a recurrent policy's state, None for one that keeps none)."""
+class Carry[State: EnvState]:
+    """A rollout's running state between calls: the environments' state, of their own type, the
+    observation each acts on next, the key the next restarts and actions draw from, and the policy's own
+    `memory` (a recurrent policy's state, None for one that keeps none)."""
 
-    state: EnvState
+    state: State
     observation: Observation
     key: jax.Array
     memory: Memory = None
@@ -197,7 +198,7 @@ environment, what to record beside it, and the policy's memory after it (None fo
 none)."""
 
 
-def start(env: Env, key: jax.Array, memory: Memory = None) -> Carry:
+def start[State: EnvState](env: Env[State], key: jax.Array, memory: Memory = None) -> Carry[State]:
     """A rollout's carry at fresh episodes of `env`, the policy's `memory` as it starts."""
     reset_key, key = jax.random.split(key)
     state, step = env.reset(reset_key)

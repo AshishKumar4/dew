@@ -14,6 +14,7 @@ from flax import linen as nn
 
 from dew.nn.dense import Dense, DenseGeneral
 
+from ..activations import silu
 from ..blocks import sinusoidal_time
 from ..conv import Conv
 from ..dit import (
@@ -148,7 +149,7 @@ class UViT(_TransformerOptions):
         self.pos_embed = self.param("pos_embed", nn.initializers.truncated_normal(0.02),
                                     (1, 1 + self.text_tokens + patches, self.emb_features))
         if self.mlp_time_embed:
-            self.time_mlp = GatedMLP(4 * self.emb_features, self.emb_features, activation=nn.silu,
+            self.time_mlp = GatedMLP(4 * self.emb_features, self.emb_features, activation=silu,
                                       use_bias=True, names=("time_embed_0", "time_embed_2"),
                                       dtype=self.dtype, precision=self.precision)
             nn.share_scope(self, self.time_mlp)

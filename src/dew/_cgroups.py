@@ -1,11 +1,14 @@
 """A process's cgroup (v2) limits, read raw: its own cgroup, which /proc/self/cgroup names, each ancestor
 up to the hierarchy's root, and the CPU quota and memory each states. The standard library alone, so a
 tool loads it by its path before Dew is importable (CI's `tools/armada/host.py`); `dew.data.dataset.Host`
-sizes automatic loading by it (row 4161)."""
+sizes automatic loading by it (row 4161) and the kernels' compile slots their count (`usable_cpus`), so it
+sits below both the data and the model layers."""
 
 from __future__ import annotations
 
 import math
+import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -39,6 +42,31 @@ def cpus(level: Path) -> int | None:
     return None if limit == "max" else math.ceil(int(limit) / int(period))
 
 
+def allowed_cpus() -> int:
+    """The CPUs the operating system lets this process run on: its affinity where the OS keeps one
+    (`os.process_cpu_count` from Python 3.13, `sched_getaffinity` on Linux before it), else every CPU the
+    machine has (macOS and Windows on Python 3.12)."""
+    if sys.version_info >= (3, 13):
+        counted = os.process_cpu_count()
+    elif sys.platform.startswith("linux"):
+        counted = len(os.sched_getaffinity(0))
+    else:
+        counted = os.cpu_count()
+    return max(1, counted or 1)
+
+
+def usable_cpus(group: Path | None = None, root: Path = ROOT) -> int:
+    """The CPUs this process may use: those it is allowed (`allowed_cpus`), bound by every CPU quota of its
+    cgroup (`group`, its own by default, `own`) and each ancestor up to `root` (a container's limit on a
+    parent binds an unlimited child). The one reading of it a data host's sizing (`dew.data.dataset.Host`)
+    and a compile pool take; a host with no cgroup v2 states no quota."""
+    usable = allowed_cpus()
+    for level in levels(own(root) if group is None else group, root):
+        if (quota := cpus(level)) is not None:
+            usable = min(usable, quota)
+    return usable
+
+
 def memory(level: Path) -> int | None:
     """The bytes `level`'s limit (`memory.max`) allows, None where it states none."""
     maximum = level / "memory.max"
@@ -46,6 +74,24 @@ def memory(level: Path) -> int | None:
         return None
     limit = maximum.read_text().strip()
     return None if limit == "max" else int(limit)
+
+
+def memory_peak(level: Path) -> int | None:
+    """The most bytes `level` has held since it was made (`memory.peak`), None where it states none: a CI
+    task's bound of its tests' memory (tools/armada/progress.py, row 6003)."""
+    peak = level / "memory.peak"
+    return int(peak.read_text()) if peak.is_file() else None
+
+
+def oom_kills(level: Path) -> int | None:
+    """How many processes the kernel's OOM killer has killed in `level` and below it (`memory.events`'
+    `oom_kill`), None where it states none (cgroup v1, a host that is not Linux): a pool's launcher names a
+    rank the kernel took (`dew._cli.launch`, row 6003)."""
+    events = level / "memory.events"
+    if not events.is_file():
+        return None
+    counts = dict(line.split() for line in events.read_text().splitlines() if line.strip())
+    return int(counts["oom_kill"]) if "oom_kill" in counts else None
 
 
 def memory_held(level: Path) -> int | None:

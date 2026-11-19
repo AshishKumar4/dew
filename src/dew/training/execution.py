@@ -33,9 +33,9 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
-from dew.batch import FROZEN, at_path, merge, placed_at, select, thaw
+from dew.batch import FROZEN, PROBES, at_path, merge, placed_at, select, thaw
 from dew.distributed.batches import batch_shardings
 from dew.distributed.host import transfer
 from dew.inference.banks import (
@@ -53,9 +53,11 @@ from dew.inference.banks import (
 from dew.mesh import batch_axes
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.backbones.layer_names import layer_index
-from dew.nn.kernels.options import Option, program
-from dew.training.memory import device_tokens, step_compiler_options
-from dew.training.transaction import Realization, placed_as_rows
+from dew.nn.inspection import unscaled, unscaling
+from dew.nn.kernels.options import Option, owned_program, program
+from dew.nn.sharding import rows_spec
+from dew.training.memory import compiled_if_it_fits, device_tokens, step_compiler_options
+from dew.training.transaction import Realization, discovered_probes, placed_as_rows, refuse_unread_probes
 
 if TYPE_CHECKING:
     from dew.data.pipeline import DeviceStep
@@ -158,6 +160,17 @@ def check_bank_pool(nbytes: int, mesh) -> None:
             "the JAX backend starts")
 
 
+def unscanned(sites) -> str | None:
+    """Why a host layout cannot hold the stacks `sites` in bank memory, None where it can: a stack whose
+    decoder runs a plain loop, whose layer fetches the compiler hoists together (`resident`)."""
+    loops = [".".join(site.namespace) or "<root>" for site in sites if not site.scanned]
+    if not loops:
+        return None
+    return (f"a host layout streams a scanned stack; the decoder at {', '.join(loops)} runs a plain loop "
+            "(scan_layers=False), whose layer fetches the compiler hoists together, so set "
+            "scan_layers=True (and bank_layers to bound a run) on it")
+
+
 def resident(placement, sites, accelerator):
     """Return where the frozen collection sits beside the accelerator.
 
@@ -169,14 +182,10 @@ def resident(placement, sites, accelerator):
     per iteration, so the device holds one layer of the bank at a time. A
     plain loop's fetches have no order between them, so the scheduler hoists
     them all to the front and the whole stack lands on the device. That is
-    the memory the layout was asked to avoid, so it is refused by name."""
-    unscanned = [".".join(site.namespace) or "<root>" for site in sites if not site.scanned]
-    if unscanned:
-        raise ValueError(
-            "a host layout streams a scanned stack; the decoder at "
-            f"{', '.join(unscanned)} runs a plain loop (scan_layers=False), whose layer "
-            "fetches the compiler hoists together, so set scan_layers=True (and bank_layers "
-            "to bound a run) on it")
+    the memory the layout was asked to avoid, so it is refused by name (`unscanned`)."""
+    refused = unscanned(sites)
+    if refused is not None:
+        raise ValueError(refused)
     def leaf(path, sharding):
         keys = tuple(entry.key for entry in path)
         kind = BANK_MEMORY if _in_stack(keys, sites) else None
@@ -201,19 +210,42 @@ def _after(device: tuple[DeviceStep, ...], loss, variables, batch, execution):
     return loss(variables, batch, execution)
 
 
-def _forward(loss, primal, frozen, store, batch, execution, *, layout):
+def _forward(loss, primal, frozen, store, batch, execution, scale=None, *, layout):
     """`loss` of the moving leaves `primal` beside the `frozen` ones, the
     store's other collections, the batch and the step's clock and keys, with
     its pullback. Compiled once for its objective (`HostExecution`), it hands
     back a pullback whose static part is the same program each realization,
-    so `_trainable_cotangent` traces once rather than once an attempt."""
+    so `_trainable_cotangent` traces once rather than once an attempt. A step
+    that watches its outputs' cotangents (`Step.watched`) differentiates its
+    watched modules' probes beside the moving leaves, laid out as its model
+    calls read them (`discovered_probes`), its pullback giving both, each
+    probe's cotangent read unscaled by the loss `scale` the backward is
+    seeded with, an argument of the program (`dew.nn.inspection.unscaled`)."""
     treedef, held = layout
 
-    def evaluate(trainable):
+    def merged(trainable):
         moved, kept = iter(trainable), iter(frozen)
-        merged = treedef.unflatten([next(kept) if known else next(moved) for known in held])
-        return loss({**store, "params": merged}, batch, execution)
-    return jax.vjp(evaluate, primal, has_aux=True)
+        return treedef.unflatten([next(kept) if known else next(moved) for known in held])
+
+    watched = execution.watched
+    if watched is None or not watched.cotangents:
+        return jax.vjp(lambda trainable: loss({**store, "params": merged(trainable)}, batch, execution),
+                       primal, has_aux=True)
+    probes = discovered_probes(loss, {**store, "params": merged(primal)}, batch, execution)
+
+    def evaluate(trainable, probes):
+        return loss({**store, "params": merged(trainable), PROBES: probes}, batch, execution)
+    with unscaled(scale):
+        stats, back, aux = jax.vjp(evaluate, primal, probes, has_aux=True)
+    refuse_unread_probes(probes, aux)
+    return stats, back, aux
+
+
+def _probed_cotangent(back, cotangent, *, sites, paths, layout):
+    """`_trainable_cotangent` of a watching step's pullback, and its probes' cotangents beside it, one
+    backward for both (`_forward`)."""
+    return (_trainable_cotangent(back, cotangent, sites=sites, paths=paths, layout=layout),
+            back(cotangent)[1])
 
 
 def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
@@ -234,6 +266,73 @@ def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
     return select(gradient, lambda path: path in trainable)
 
 
+def spec_on(mesh: Mesh):
+    """Where `HostExecution`'s moves to `mesh` place a leaf: the partition spec it has, or replicated where
+    it states none (a scalar clock, a key crossing the boundary)."""
+    def placement(leaf):
+        sharding = getattr(leaf, "sharding", None)
+        return NamedSharding(mesh, sharding.spec if isinstance(sharding, NamedSharding) else P())
+    return placement
+
+
+def placed_as(tree, placement):
+    """`tree`'s leaves as their shapes where `placement` puts them, each keeping its dtype and weak type
+    (`placed_shapes`, which drops the weak type: a lowering's of a state not yet placed): what a host
+    step's pass over shapes reads, its programs keyed as the step's calls over arrays key them
+    (`OuterProgram.abstract_of`)."""
+    return jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(
+        np.shape(leaf), leaf.dtype, sharding=sharding, weak_type=_weak(leaf)), tree, placement)
+
+
+def _weak(leaf) -> bool:
+    """Whether `leaf`, an array, a shape or a host value, is weakly typed: a host value never is."""
+    if isinstance(leaf, jax.Array):
+        return jax.typeof(leaf).weak_type
+    return leaf.weak_type if isinstance(leaf, jax.ShapeDtypeStruct) else False
+
+
+def _stack(*rows):
+    """A bank of `rows`, stacked on the CPU (`HostExecution._stack_rows`)."""
+    return jnp.stack(rows)
+
+
+class _Abstract:
+    """A realization's moves of shapes (`HostExecution.inputs`' `moved`): each leaf the shape it would
+    take, placed where the move would place it (`placed_as`), and a bank of rows its stack's shape."""
+
+    def placed(self, tree, placement):
+        return placed_as(tree, placement)
+
+    def _stack_rows(self, rows, sharding):
+        return jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype, sharding=sharding)
+
+    def _moved(self, tree, mesh):
+        return self.placed(tree, jax.tree.map(spec_on(mesh), tree))
+
+    def rows(self, index, batch):
+        placed = rows_spec(next(leaf for leaf in jax.tree.leaves(batch) if np.ndim(leaf)), 1)
+        return index if placed is None else self.placed(index, placed)
+
+
+class _Collected(_Abstract):
+    """A realization's moves of shapes within `options.collecting` (`HostExecution.collected`): as
+    `_Abstract`'s, a bank's stack its program's, compiled over its rows' shapes on the CPU as a
+    realization over arrays runs it (`HostExecution._stacked`)."""
+
+    def __init__(self, execution: HostExecution):
+        self.execution = execution
+
+    def _stack_rows(self, rows, sharding):
+        stacked = self.execution._stacked(*self._moved(rows, self.execution.cpu))
+        return self.placed(stacked, sharding)
+
+
+def on_mesh(mesh: Mesh | AbstractMesh):
+    """`mesh` in context, as a program traced on it reads it: an abstract mesh (a target's devices this
+    process holds none of, `generation.gpu_mesh`) as JAX's abstract mesh, a mesh of devices as `set_mesh`."""
+    return jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
+
+
 class HostExecution:
     """Runs one objective evaluation and its pullback on the accelerator.
 
@@ -252,6 +351,7 @@ class HostExecution:
         self.sites, self.own = sites, _own(sites)
         self.device = device
         self.unstack = functools.partial(program(logical, static_argnames="sites"), sites=self.own)
+        self._stacked = program(_stack)
 
     def forward(self, step: Mapping[str, Option]):
         """The loss and its pullback, compiled for the objective's modules as they are now, under the
@@ -270,12 +370,15 @@ class HostExecution:
         weights, and the accelerator's devices."""
         shards = math.prod(self.accelerator.shape[axis] for axis in batch_axes(self.accelerator))
         options = step_compiler_options(self.objective, device_tokens(self.objective, batch, shards),
-                                        FROZEN in variables, self.accelerator.devices.size,
+                                        FROZEN in variables, self.accelerator.size,
                                         gathered=self.gathered)
         return dict(options or {})
 
-    def snapshot(self, variables):
-        """The declared stacks as banks, everything else as it is stored.
+    def snapshot(self, variables, *, moved=None):
+        """The declared stacks as banks, everything else as it is stored, each moved by `moved` (this
+        execution, where None): `_Abstract()`, the shapes and placements it would hold, of `variables`'
+        shapes, nothing moved, what a plan reads before the state is placed (`compiled_whole`); `_Collected`,
+        those shapes with its banks' stacks compiled (`collected`).
 
         The frozen split is undone by reference, so a bank holds every one of
         a layer's parameter leaves and a partially frozen run does not stack
@@ -289,18 +392,24 @@ class HostExecution:
         """
         if variables is None:
             return None
+        moved = self if moved is None else moved
         if not self.sites:
-            return transfer(variables, self.layout.shardings(self.accelerator, variables))
+            return moved.placed(variables, self.layout.shardings(self.accelerator, variables))
         # The layout names a leaf's axes as its module declares them, which a
         # bank's leading layer axis is not; a bank is already placed, so the
         # placement is asked about everything but the banks.
         placement = self.layout.shardings(self.accelerator, _without_banks(variables, self.sites))
-        return self._assembled(variables, placement, self.sites)
+        return self._assembled(variables, placement, self.sites, moved)
 
-    def _assembled(self, variables, placement, sites):
+    @staticmethod
+    def placed(tree, placement):
+        """`tree` moved where `placement` places it (`transfer`)."""
+        return transfer(tree, placement)
+
+    def _assembled(self, variables, placement, sites, moved):
         """`snapshot` of `variables` placed by `placement`: the stacks of `sites` in their own tree as
         banks, each nested root's (`DecoderBank.root`) assembled the same way in the collection holding
-        it, and everything else as it is stored."""
+        it, and everything else as it is stored, each moved by `moved` (`placed`, `_stack_rows`)."""
         nested, own = _nested(sites), _own(sites)
         whole, placement = thaw(variables), thaw(placement)
         weights = {"params": whole["params"]}
@@ -310,7 +419,7 @@ class HostExecution:
         # Only model weights adopt execution banks.
         entries = {**{collection: tree for collection, tree in whole.items()
                       if collection != "params" and collection not in nested}, **entry_tree(weights, own)}
-        store = transfer(entries, narrowed(placement, entries))
+        store = moved.placed(entries, narrowed(placement, entries))
 
         def bank(site, first: int, count: int, name: str):
             """A group's bank from the state: its rows stacked on the CPU into the bank's placement
@@ -324,13 +433,13 @@ class HostExecution:
             spread = _bank_shardings(one_layer(places, first, namespace=site.namespace),
                                      self.accelerator, count)
             if count == 1:
-                return transfer(rows[0], spread)
+                return moved.placed(rows[0], spread)
             return merge(held, jax.tree_util.tree_map_with_path(
-                lambda path, sharding, *leaves: self._stack_rows(leaves, sharding), spread, *rows))
+                lambda path, sharding, *leaves: moved._stack_rows(leaves, sharding), spread, *rows))
 
         return {**merge(store, assembled(own, bank)),
                 **{collection: self._assembled(variables[collection], placement[collection],
-                                               _within(sites, collection))
+                                               _within(sites, collection), moved)
                    for collection in nested if collection in variables}}
 
     def _stack_rows(self, rows, sharding):
@@ -343,19 +452,17 @@ class HostExecution:
         materialise the whole bank in device memory, which is exactly what
         the bank's placement avoids. One bank crosses host memory at a time.
         """
-        return transfer(jnp.stack(self.on_cpu(rows)), sharding)
+        return transfer(self._stacked(*self.on_cpu(rows)), sharding)
 
-    def _moved(self, tree, mesh):
-        """Move `tree` to `mesh`, each leaf keeping the partition spec it has.
+    @staticmethod
+    def _moved(tree, mesh):
+        """Move `tree` to `mesh`, each leaf keeping the partition spec it has (`spec_on`)."""
+        return transfer(tree, jax.tree.map(spec_on(mesh), tree))
 
-        A leaf with no named sharding is replicated, which is what a scalar
-        clock or a key crossing the boundary asks for.
-        """
-        def placement(leaf):
-            sharding = getattr(leaf, "sharding", None)
-            spec = sharding.spec if isinstance(sharding, NamedSharding) else P()
-            return NamedSharding(mesh, spec)
-        return transfer(tree, jax.tree.map(placement, tree))
+    @staticmethod
+    def rows(index, batch):
+        """`index`, an entry for each of `batch`'s rows, placed as its rows are (`placed_as_rows`)."""
+        return placed_as_rows(index, batch)
 
     def on_cpu(self, tree):
         """Move `tree` to the CPU mesh, where the state lives."""
@@ -365,8 +472,68 @@ class HostExecution:
         """Move `tree` to the accelerator mesh, where the loss runs."""
         return self._moved(tree, self.accelerator)
 
+    def inputs(self, variables, batch, step, *, moved=None):
+        """What one realization hands the accelerator (`realize`): the moving leaves of the state's snapshot
+        (`snapshot`), the vjp's primal; its frozen leaves, rows and banks, the state's own arrays, which the
+        vjp reads as values; its other collections; the batch placed on the accelerator; and the step, which
+        crosses whole, so its examples' draws are the resident step's (`Step.sample`), its averaged weights
+        the snapshot's and its places the batch's rows'; with the layout `_trainable_cotangent` reads.
+        Each moved by `moved` (this execution, where None; `snapshot`): `_Abstract()`, their shapes, placed
+        where the moves would place them, nothing moved, what a plan compiles before anything is placed
+        (`compiled_whole`)."""
+        moved = self if moved is None else moved
+        with jax.set_mesh(self.cpu):
+            store = self.snapshot(variables, moved=moved)
+            ema = self.snapshot(step.ema, moved=moved)
+        assert store is not None, "a realization always receives model variables"
+        # A frozen leaf by its path: the frozen collection's leaves stand at their own paths in the
+        # snapshot's parameters (`thaw`), a stack's banked rows at their bank's, which the vjp differentiates
+        # as its moving rows (`snapshot`): one answer over arrays and over their shapes alike, which a run's
+        # startup pass reads (`collected`).
+        frozen_paths = {path for path, _ in
+                        jax.tree_util.tree_flatten_with_path(variables.get(FROZEN, {}))[0]}
+        named, treedef = jax.tree_util.tree_flatten_with_path(store["params"])
+        leaves = [leaf for _, leaf in named]
+        held = tuple(path in frozen_paths for path, _ in named)
+        primal = [leaf for leaf, known in zip(leaves, held, strict=True) if not known]
+        frozen = [leaf for leaf, known in zip(leaves, held, strict=True) if known]
+        with on_mesh(self.accelerator):
+            batch = moved.placed(batch, batch_shardings(self.accelerator, batch))
+            here = moved._moved(step.replace(ema=None), self.accelerator).replace(ema=ema)
+            if here.example_index is not None:
+                here = here.replace(example_index=moved.rows(here.example_index, batch))
+        rest = {name: tree for name, tree in store.items() if name != "params"}
+        return primal, frozen, rest, batch, here, (treedef, held)
+
+    def compiled_whole(self, variables, batch, step) -> tuple[jax.stages.Compiled | None, tuple]:
+        """The accelerator's work of one realization and its pullback as one program over the shapes of
+        `variables`, `batch` and `step` as a realization hands them over (`inputs`), compiled for the
+        accelerator under the step's options (`step_options`) as a plan's candidates compile
+        (`compiled_if_it_fits`: None where XLA refuses it for memory): what a plan reads of a step that
+        streams its parameters from the host before anything is placed
+        (`dew.training.memory.streamed_price`), its FLOPs the forward's and the pullback's and its memory the
+        forward's residuals held into the pullback, as the two programs a realization runs hold them; and
+        those inputs, which an admission counts."""
+        primal, frozen, rest, placed, here, layout = self.inputs(variables, batch, step, moved=_Abstract())
+        moving = tuple(tuple(entry.key for entry in path) for path, _ in
+                       jax.tree_util.tree_leaves_with_path(variables["params"]))
+        loss = functools.partial(_after, self.device, self.objective._loss)
+
+        def whole(primal, frozen, rest, batch, step):
+            stats, back, aux = _forward(loss, primal, frozen, rest, batch, step, layout=layout)
+            return stats, aux, _trainable_cotangent(back, jax.tree.map(jnp.ones_like, stats), sites=self.own,
+                                                    paths=moving, layout=layout)
+
+        with on_mesh(self.accelerator):
+            compiled = owned_program(whole, step=self.step_options(variables, batch))
+            arguments = (primal, frozen, rest, placed, here)
+            refusals: list[RuntimeError] = []
+            executable = compiled_if_it_fits(compiled.lower(*arguments), compiled.options, refusals,
+                                             relower=lambda: compiled.lower(*arguments))
+        return executable, arguments
+
     def realize(self, variables, batch, step):
-        """Evaluate the objective on the accelerator, over a snapshot of the state.
+        """Evaluate the objective on the accelerator, over a snapshot of the state (`inputs`).
 
         The moving leaves are the vjp's primal; every frozen leaf, row or
         bank enters as a value. The forward then keeps nothing for a
@@ -374,47 +541,56 @@ class HostExecution:
         to the CPU, while the pullback stays here and runs on the accelerator
         when it is called.
         """
-        with jax.set_mesh(self.cpu):
-            store = self.snapshot(variables)
-            # A frozen leaf, row or bank, is the state's own array: those the
-            # vjp reads as values.
-            resident = {id(leaf) for leaf in jax.tree.leaves(variables.get(FROZEN, {}))}
-            ema = self.snapshot(step.ema)
-        assert store is not None, "a realization always receives model variables"
+        # A host step's pass over its state's shapes (its run's startup, `options.collecting`) realizes
+        # over shapes: every program it runs compiled there (`collected`).
+        if isinstance(jax.tree.leaves(variables)[0], jax.ShapeDtypeStruct):
+            return self.collected(variables, batch, step)
+        return self._realized(variables, batch, step, self)
+
+    def collected(self, variables, batch, step) -> Realization:
+        """`realize` over the shapes of `variables`, `batch` and `step` within `options.collecting`: every
+        program a realization runs (its banks' stacks, the forward, the unstack of its collections and,
+        once called, the pullback) compiled over them as a realization over arrays of those shapes calls
+        it, the run then stepping on them (`OuterProgram`'s `_shaped`), its results' shapes in place of
+        values (`_Collected`): a host step's startup pass (`dew.training.compiler`)."""
+        return self._realized(variables, batch, step, _Collected(self))
+
+    def _realized(self, variables, batch, step, moved) -> Realization:
+        """`realize`'s body, each move made by `moved` (`inputs`): one path over arrays and over shapes."""
         moving = tuple(tuple(entry.key for entry in path) for path, _ in
                        jax.tree_util.tree_leaves_with_path(variables["params"]))
-        leaves, treedef = jax.tree.flatten(store["params"])
-        held = tuple(id(leaf) in resident for leaf in leaves)
-        primal = [leaf for leaf, known in zip(leaves, held, strict=True) if not known]
-        frozen = [leaf for leaf, known in zip(leaves, held, strict=True) if known]
-        layout = (treedef, held)
-        with jax.set_mesh(self.accelerator):
-            batch = transfer(batch, batch_shardings(self.accelerator, batch))
+        primal, frozen, rest, batch, here, layout = self.inputs(variables, batch, step, moved=moved)
+        watched = step.watched
+        # A watching step's loss scale, which its probes unscale their cotangents by, crosses with it
+        # (`_forward`); a step that watches none reads none, its program the one an uninspected run runs.
+        scale = None
+        if watched is not None and watched.cotangents and (held := unscaling()) is not None:
+            scale = moved._moved(held, self.accelerator)
+        with on_mesh(self.accelerator):
             options = self.step_options(variables, batch)
-            # The step crosses whole, so its examples' draws are the resident step's (`Step.sample`);
-            # its averaged weights are the snapshot's, and its places the batch's rows'.
-            here = self.on_accelerator(step.replace(ema=None)).replace(ema=ema)
-            if here.example_index is not None:
-                here = here.replace(example_index=placed_as_rows(here.example_index, batch))
-            rest = {name: tree for name, tree in store.items() if name != "params"}
-            stats, back, aux = self.forward(options)(primal, frozen, rest, batch, here, layout=layout)
-        stats, aux = self.on_cpu((stats, aux))
+            stats, back, aux = self.forward(options)(primal, frozen, rest, batch, here, scale, layout=layout)
+        stats, aux = moved._moved((stats, aux), self.cpu)
         if aux.variables is not None:
             with jax.set_mesh(self.cpu):
                 aux = dataclasses.replace(aux, variables=self.unstack(aux.variables))
 
-        def pullback(cotangent):
-            # A shared owner is one bank input, so native reverse mode already
-            # sums every use's contribution into it.
-            with jax.set_mesh(self.accelerator):
-                # The pullback runs its int8 dots here, apart from the forward's program, with an
-                # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
-                pulled = program(_trainable_cotangent, *self.objective.towers(), step=options,
-                                 static_argnames=("sites", "paths", "layout"))
-                gradient = pulled(back, self.on_accelerator(cotangent), sites=self.own, paths=moving,
-                                  layout=layout)
-            return self.on_cpu(gradient)
-        return Realization(stats, aux, pullback)
+        def pulled_by(cotangent_of):
+            def pulled(cotangent):
+                # A shared owner is one bank input, so native reverse mode already
+                # sums every use's contribution into it.
+                with on_mesh(self.accelerator):
+                    # The pullback runs its int8 dots here, apart from the forward's program, with an
+                    # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
+                    compiled = program(cotangent_of, step=options,
+                                       static_argnames=("sites", "paths", "layout"))
+                    found = compiled(back, moved._moved(cotangent, self.accelerator), sites=self.own,
+                                     paths=moving, layout=layout)
+                return moved._moved(found, self.cpu)
+            return pulled
+
+        probed = (None if watched is None or not watched.cotangents
+                  else pulled_by(_probed_cotangent))
+        return Realization(stats, aux, pulled_by(_trainable_cotangent), probed)
 
 
 def banked_frozen(objective, variables, stack, release=None):

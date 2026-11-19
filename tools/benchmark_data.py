@@ -48,7 +48,7 @@ import tyro
 from absl import flags
 
 from dew.data import Loading
-from dew.data.dataset import Forwarding
+from dew.data.dataset import Closeable, Forwarding
 from dew.data.storage import EXPORT_MANIFEST, object_info
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -368,6 +368,14 @@ def _dropping(config: Worker):
     return documents.pipe(presets.lm, None, seq_len=measured.seq_len, batch=measured.batch, bins=32)
 
 
+def array_records(grain, path: str):
+    """The ArrayRecord file at `path` as Grain reads it by index (`RandomAccessDataSource`)."""
+    source = grain.ArrayRecordDataSource([path])
+    if not isinstance(source, grain.RandomAccessDataSource):
+        raise TypeError(f"Grain reads {path} as a {type(source).__name__}, which it cannot index")
+    return source
+
+
 def grain_options(rows, config: Worker):
     measured = config.measurement
     import grain.experimental as gx
@@ -396,7 +404,7 @@ def grain_reader(config: Worker, objective, loading: Loading):
 
     read_options = grain.ReadOptions(loading.threads, loading.read_buffer)
     if config.workload == "image":
-        source = grain.ArrayRecordDataSource([str(config.source / "images.array_record")])
+        source = array_records(grain, str(config.source / "images.array_record"))
         rows = grain.MapDataset.source(source).shuffle(seed=measured.seed).repeat()
         # The images preset's own record steps, applied by Grain alone.
         rows = rows.map(images.DecodeImage("image", at_least=measured.image_size, rejects=False))
@@ -641,20 +649,25 @@ def rated(seconds: float, steps: int, rows: int, hlo_flops, model_flops: float |
     (`StepFlops`, each device's) and the objective's `model_flops` (the whole mesh's), rated as the
     trainer's interval rates its steps (`dew.training.interval.throughput`) on `devices` devices of dense
     bf16 `peak` (the device's own by default): the objective's work over the whole mesh's peak, and the
-    compiled work a lower bound where a launch's went uncounted (`StepFlops.unsized`)."""
+    compiled work named by what its count is (`StepFlops.bound`: a lower bound where a launch's went
+    uncounted, an upper bound where a loop was counted at its stated bound)."""
+    from dew.telemetry.instrumentation import logged_utilization
     from dew.training.interval import throughput
 
     rates = throughput(seconds, steps, rows, hlo_flops, devices, training_flops=model_flops, peak=peak)
-    bound = "_lower_bound" if hlo_flops is not None and hlo_flops.unsized else ""
+    hfu = logged_utilization(rates, "hfu")
     return {"model_mfu_bf16_peak": rates.get("train/mfu"),
             "model_flops_scope": "objective.training_flops on real host lengths and layout, over the mesh's "
                                  "dense bf16 peak; custom image-mean model and frozen legacy API have no "
                                  "analytic count",
-            "hlo_utilization_bf16_peak": rates.get(f"train/hfu{bound}"),
+            "hlo_utilization_bf16_peak": None if hfu is None else hfu[0],
+            # What it is (`StepFlops.bound`): "_lower_bound" where a launch's work went uncounted
+            # (unsized_kernels_per_step), "_upper_bound" where a loop was counted at its stated bound,
+            # "_estimate" where both, "" the step's own count.
+            "hlo_utilization_bound": None if hfu is None else hfu[1],
             "unsized_kernels_per_step": None if hlo_flops is None else hlo_flops.unsized / steps,
-            "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; "
-                                 "a lower bound where unsized_kernels_per_step is not zero; "
-                                 "not an analytic real-token MFU"}
+            "utilization_scope": "optimized executable work, including padding, over dense bf16 peak, "
+                                 "bounded as hlo_utilization_bound names; not an analytic real-token MFU"}
 
 
 def device_idle(directory: str) -> dict[str, float]:
@@ -688,7 +701,7 @@ def host_facts() -> dict:
     counts and the cgroup files it reads, so an arm's record says why its workers were what they were."""
     import psutil
 
-    from dew.data import cgroups
+    from dew import _cgroups as cgroups
     from dew.data.dataset import Host
 
     group = cgroups.own()
@@ -1004,7 +1017,8 @@ def run_caching(config: Caching) -> None:
                                                       batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)),
                                                       strict=True) if valid]
             finally:
-                stream.close()
+                if isinstance(stream, Closeable):
+                    stream.close()
             if len(read) != config.records:
                 raise ValueError(f"a pass read {len(read)} of the {config.records} records")
             return time.perf_counter() - started, read
@@ -1141,7 +1155,7 @@ def run_declared_shard(config: DeclaredShard) -> None:
         started = time.perf_counter()
         # Held to the declared generation as Arrow's own clients are (`Declared.still_held`, `Files`).
         declared.still_held()
-        source = grain.ArrayRecordDataSource([config.url])
+        source = array_records(grain, config.url)
         order = np.random.default_rng(count).permutation(len(source))[:count]
         first = None
         for index in order:
@@ -1157,7 +1171,7 @@ def run_declared_shard(config: DeclaredShard) -> None:
             held = Store(config.url, options)
             local, pin = Declared(held, {**stated, "sha256": digest}).leased()
             with pin:
-                source = grain.ArrayRecordDataSource([local])
+                source = array_records(grain, local)
                 order = np.random.default_rng(count).permutation(len(source))[:count]
                 first = None
                 for index in order:

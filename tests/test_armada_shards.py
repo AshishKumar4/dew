@@ -768,7 +768,7 @@ def planned_now(ci) -> tuple[set[tuple[str, str]], list[dict]]:
     """The rows the plan keeps, and the entries it runs, each holding a row no kept task reads."""
     entries = list(planned(ci).values())
     kept = {held for entry in entries for held in ci.kept_of(entry["tests"].split())[1]}
-    return kept, [entry for entry in entries if ci.KEPT_AT not in entry["tests"]]
+    return kept, [entry for entry in entries if ci.session.KEPT_AT not in entry["tests"]]
 
 
 @KINDS
@@ -786,6 +786,32 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
     maps = [entry for entry in ran if "after" not in entry]
     assert {ci.session.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
     assert maps and set(again["after"]) == {entry["name"] for entry in maps}
+
+
+PARAMETERED = SITE.replace("@pytest.mark.check1_shards(seeds=4, per_task=8)\ndef test_site():",
+                           "@pytest.mark.parametrize(\"form\", [pytest.param(\"dense\", id=\"dense\", "
+                           "marks=pytest.mark.check1_shards(seeds=4, per_task=8))])\ndef test_site(form):")
+"""The site of one parameter, `test_site[dense]`: its group's name holds brackets, outside the Worker's key
+alphabet."""
+
+
+def test_a_parametrized_sites_row_is_kept_under_a_key_the_worker_takes_and_reused_cached(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A site of one parameter (`test_site[dense]`) records its judge's row under a place the Worker takes
+    (`rows.spelled`), so an unchanged rerun keeps it, its tasks unrun, and the task that reads it reports it
+    `cached` (2026-11-18: every such row's record was refused before any request, 19,218 lookups from 11-13
+    on, and none was reused)."""
+    assert PARAMETERED != SITE
+    run_cached(ci, tmp_path, monkeypatch, cache_worker, PARAMETERED, later=True)
+    kept, ran = planned_now(ci)
+    assert ("tests/test_site.py", "test_site[dense]") in kept and ran == []
+    out = tmp_path / ".verdict/verdict.json"
+    rows = []
+    for entry in planned(ci).values():
+        assert entry_task(ci, monkeypatch, entry, out) == 0
+        rows += json.loads(out.read_text())["rows"]
+    [judged] = [row for row in rows if row["name"] == "3.12:tests/test_site.py#test_site[dense]"]
+    assert judged["exitCode"] == 0 and judged["cached"]
 
 
 def test_a_judge_after_a_cut_finer_than_declared_is_kept_on_what_its_map_tasks_drew(

@@ -332,7 +332,7 @@ def test_an_earlier_mains_run_resumes_its_state_and_its_data_by_its_mode(
 def holds_its_tokenizer_from_its_next_save(tmp_path: Path, monkeypatch, run: Path, objective) -> None:
     """A run an earlier main saved, resumed, holds the Hugging Face tokenizer its next save records, each
     file as its record states it (`dew.inference.tasks.hold_tokenizer`), and loads as its task from that
-    copy with this host's cache fresh (`saved_tokenizer`). A run saved before runs held their tokenizers
+    copy with this host's cache fresh (`tokenizer_for`). A run saved before runs held their tokenizers
     holds none, and its next save was checked by no load of a saved run (train 972's review)."""
     from dew.data.text import files_digest, held_place
 

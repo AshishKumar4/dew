@@ -6,6 +6,7 @@ from typing import Literal, get_args
 import jax
 import jax.numpy as jnp
 
+from dew.nn.activations import logistic
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 
 from .common import ContinuousNoiseScheduler, times
@@ -95,7 +96,7 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler, RectifiedFlow):
         self.dynamic = dynamic
         self.logit_mean = logit_mean
         self.logit_std = logit_std
-        self.density = density
+        self.density: Density = density
         self.mode_scale = mode_scale
 
     def shift_timesteps(self, t) -> jax.Array:
@@ -108,7 +109,7 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler, RectifiedFlow):
     def sample_t(self, key, n):
         if self.density == "logit_normal":
             normal = jax.random.normal(key, (n,), dtype=jnp.float32)
-            return jax.nn.sigmoid(normal * self.logit_std + self.logit_mean)
+            return logistic(normal * self.logit_std + self.logit_mean)
         u = jax.random.uniform(key, (n,), dtype=jnp.float32)
         if self.density == "mode":
             return 1 - u - self.mode_scale * (jnp.cos(jnp.pi / 2 * u) ** 2 - 1 + u)

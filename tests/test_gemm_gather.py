@@ -79,7 +79,8 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
     cuBLAS's: XLA's default product there is a Triton fusion on mma.sync, whose running sum the template's
     read 1.658 times the error of (M-EM-19c), where cuBLAS's equals the template's."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
-    sizes, depth = jnp.asarray([70, 0, 129, 51], jnp.int32), 128
+    # NumPy's, formed on no device: a GPU tier's prepare computes on none (its default a compile-only GPU's).
+    sizes, depth = np.asarray([70, 0, 129, 51], np.int32), 128
     # A pair summed apart (into fp32 above the default precision) carries four accumulators, which the
     # cooperative 128 x 128 tile's threads spill (the compile gate's "paired forward exact fp32"; 324 bytes
     # on a GH200, M-EM-19c): a pin of it is refused, and its 128 x 64 holds them.
@@ -88,11 +89,10 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        tokens = jnp.asarray(rng.normal(size=(200, depth)), jnp.bfloat16)
-        table = jnp.asarray(rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 106)])),
-                            jnp.int32)
-        matrices = jnp.asarray(rng.normal(size=(2, 4, depth, 256)) / np.sqrt(depth), jnp.bfloat16)
-        slots = jnp.asarray(rng.permutation(256), jnp.int32)
+        tokens = rng.normal(size=(200, depth)).astype(jnp.bfloat16)
+        table = rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 106)])).astype(np.int32)
+        matrices = (rng.normal(size=(2, 4, depth, 256)) / np.sqrt(depth)).astype(jnp.bfloat16)
+        slots = rng.permutation(256).astype(np.int32)
         return tokens, table, matrices, slots
 
     def through(kernel, pin=tiles if pinned else None):
@@ -131,9 +131,13 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
     if refused is not None and pinned:
         with pytest.raises(tuning.Unpinnable):
             jax.eval_shape(through("mosaic", refused), *draw(0))
+    # One site a variant: a store of compiled truths holds one site a label.
+    variant = " ".join(name for name, on in (("paired", paired), ("scattered", scattered), ("pinned", pinned),
+                                             ("cublas", cublas)) if on)
     with tuning.seen() as launches:
         assert_as_exact(jax.jit(through("mosaic")), jax.jit(through("xla")), draw,
-                        "a gathered grouped product", seeds=SEEDS, truth_fn=through("xla"), **library)
+                        f"a gathered grouped product: {variant or 'derived'}", seeds=SEEDS,
+                        truth_fn=through("xla"), **library)
     taken = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
              if type(op) is grouped_matmul.MosaicGmm]
     assert taken and all(config == tiles for config in taken) if pinned else taken, taken
@@ -329,21 +333,29 @@ def a_gathered_kernel_gradient_is_its_gathered_rows_gradient(interpret=False, sp
     past them, its depth split or not, at 257 rows (a table padded to whole steps, an ungathered operand to
     8 rows), at `tiles` (Hopper's by default; `KERNEL_GRADIENT_TILES`). Integers, every sum exact. Its
     tokens, cotangent and table."""
+    from reference_error import ahead_arm
+
     tiles = dataclasses.replace(tiles or KERNEL_GRADIENT_TILES["sm90"], splits=splits)
-    sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
+    sizes = np.asarray([70, 0, 129, 51], np.int32)
+    # NumPy's, as a site's draws are: a GPU tier's prepare computes on no device.
     rng = np.random.default_rng(11)
-    tokens = jnp.asarray(rng.integers(-3, 4, size=(200, 256)), jnp.bfloat16)
-    table = rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 107)]))
-    table = jnp.asarray(table, jnp.int32)
-    cotangent = jnp.asarray(rng.integers(-3, 4, size=(257, 128)), jnp.bfloat16)
-    slots = jnp.asarray(rng.permutation(257), jnp.int32)
-    gradient = jax.jit(functools.partial(mosaic_gpu.tgmm, group_sizes=sizes, tiles=tiles,
-                                         out_dtype=jnp.float32, multiprocessors=4 if interpret else 132,
-                                         interpret=interpret))
-    for tables, rows, columns in (((table, None), tokens[table], cotangent),
-                                  ((table, slots), tokens[table], cotangent[slots])):
-        np.testing.assert_array_equal(np.asarray(gradient(tokens, cotangent, gather=tables)),
-                                      np.asarray(gradient(rows, columns)))
+    tokens = rng.integers(-3, 4, size=(200, 256)).astype(jnp.bfloat16)
+    table = rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 107)])).astype(np.int32)
+    cotangent = rng.integers(-3, 4, size=(257, 128)).astype(jnp.bfloat16)
+    slots = rng.permutation(257).astype(np.int32)
+    gradient = functools.partial(mosaic_gpu.tgmm, group_sizes=sizes, tiles=tiles, out_dtype=jnp.float32,
+                                 multiprocessors=4 if interpret else 132, interpret=interpret)
+
+    def gathered(rows, columns, *tables):
+        return gradient(rows, columns, gather=(*tables, None)[:2])
+
+    # Each program compiled in a tier's prepare (`ahead_arm`), one a label.
+    for name, tables, rows, columns in (("tokens", (table,), tokens[table], cotangent),
+                                        ("both", (table, slots), tokens[table], cotangent[slots])):
+        label = f"a gathered kernel gradient of {name}: {splits} splits"
+        found = ahead_arm(jax.jit(gathered), label)(tokens, cotangent, *tables)
+        expected = ahead_arm(jax.jit(gradient), f"{label}, gathered first")(rows, columns)
+        np.testing.assert_array_equal(np.asarray(found), np.asarray(expected))
     return tokens, cotangent, table
 
 

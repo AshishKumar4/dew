@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import hashlib
 import itertools
 from collections.abc import Iterator, Mapping, Sequence
 from typing import NamedTuple
@@ -242,7 +243,10 @@ class BitTransform:
     may be any invertible re-encoding of the input (its encoder run where the weights are stored), so a form
     need only read its bits back in some order; else the stored word is the input. `units`: the pipes its
     form may issue on (the ALU always, which issues every LOP3; a consumer whose own math holds the FMA pipe
-    keeps its decode off it)."""
+    keeps its decode off it). `fragments`: each consumer's MMA fragment layout its registers are read in, by
+    the consumer's name, the MMA that issues them (`wgmma`, whatever family feeds it: algebra.md 7.4): a
+    consumer reads its own entry and refuses a transform naming none for it, so a new consumer's fragment is
+    a new entry here, no second declaration."""
 
     name: str
     width: int
@@ -250,6 +254,7 @@ class BitTransform:
     rows: tuple[int, ...]
     free: bool = True
     units: frozenset[Unit] = frozenset(Unit)
+    fragments: Mapping[str, str] = dataclasses.field(default_factory=dict, compare=False, hash=False)
 
     def __post_init__(self):
         if not 0 < self.width <= WORD or len(self.rows) != sum(len(_bits(mask)) for mask in self.outputs):
@@ -263,13 +268,13 @@ class BitTransform:
 
     @classmethod
     def placed(cls, name: str, width: int, outputs: Sequence[int], placement: Mapping[int, tuple[int, int]],
-               *, free: bool = True) -> BitTransform:
+               *, free: bool = True, fragments: Mapping[str, str] | None = None) -> BitTransform:
         """A bit placement: input bit `j` read at register `placement[j][0]`'s bit `placement[j][1]`, a
         format's decode, its codes' fields placed where the consumer's arithmetic reads them."""
         source = {target: bit for bit, target in placement.items()}
         rows = tuple(1 << source[register, bit] if (register, bit) in source else 0
                      for register, mask in enumerate(outputs) for bit in _bits(mask))
-        return cls(name, width, tuple(outputs), rows, free)
+        return cls(name, width, tuple(outputs), rows, free, fragments=dict(fragments or {}))
 
     def applied(self, inputs: np.ndarray) -> tuple[np.ndarray, ...]:
         """Each register the transform gives each of `inputs`."""
@@ -296,6 +301,13 @@ class BitForm:
         """Each output register of each stored word of `words` (`_run`'s, in NumPy), as uint64."""
         return tuple(value.astype(np.uint64)
                      for value in _run(self.steps, self.outputs, words.astype(np.uint32), np))
+
+    @property
+    def version(self) -> str:
+        """Its stored layout's version: a digest of its encoder, which a packed checkpoint records beside its
+        words and a load holds to the checked-in form's (algebra.md 7.4), so words stored in another layout
+        are refused, never decoded by this form. Forms of one encoder share it, whatever their steps."""
+        return hashlib.sha256(",".join(map(str, self.encoder)).encode()).hexdigest()[:16]
 
     def encoded(self, inputs: np.ndarray) -> np.ndarray:
         """The stored word of each of `inputs`, as uint64."""
@@ -672,11 +684,13 @@ _E2M1_IN_BFLOAT16 = {0: 6, 1: 7, 2: 8, 3: 15}
 NVFP4_BFLOAT16 = BitTransform.placed(
     "nvfp4-bf16", WORD, (0x81C081C0,) * 4,
     {4 * code + field: (code // 2, 16 * (code % 2) + bit)
-     for code in range(8) for field, bit in _E2M1_IN_BFLOAT16.items()})
+     for code in range(8) for field, bit in _E2M1_IN_BFLOAT16.items()},
+    fragments={"wgmma": "wgmma"})
 """Eight E2M1 codes of a word in their natural order (code `i` at bits `4i` to `4i + 3`: a byte's low nibble
 the earlier element), decoded into four registers of two bfloat16s, code `2i` the low half of register `i` and
 `2i + 1` the high, each the code's value times 2^-126: the exponent's bias, which the block scale's multiply
-takes (the GEMM template's matrix-operand hook, algebra.md 7.4). Its layout is free."""
+takes (the GEMM template's matrix-operand hook, algebra.md 7.4). Its layout is free; its consumer, the packed
+GEMM on the warpgroup MMA (`wgmma`), reads its registers in that MMA's fragment layout."""
 
 NVFP4_BFLOAT16_FORM = BitForm(
     steps=(BitStep(BitOp.ROTR, (0,), 6, Unit.ALU), BitStep(BitOp.SHL, (0,), 2, Unit.FMA),
@@ -693,10 +707,55 @@ four masked XORs, the fp4 challenge's price (5 issues on the busiest pipe, 8 ins
 the stored layout's version: weights stored in it decode by this form alone."""
 
 
+# E4M3 (OCP 8-bit Floating Point v1.0, e4m3fn): three mantissa bits, four exponent bits of bias 7, a sign;
+# each field's bit in a float32's, so the float32 is the code's value times 2^-120.
+E4M3_SCALE = BitTransform.placed(
+    "e4m3-scale", 8, (0x87F00000,), {**{bit: (0, 20 + bit) for bit in range(7)}, 7: (0, 31)}, free=False)
+"""A block scale's E4M3 code (the low byte of a 32-bit word) decoded into a float32 register, the code's value
+times 2^-120 (`E4M3_SCALE_OWED`): its fields placed where float32's own lie, mantissa at bits 20 to 22,
+exponent at 23 to 26, sign at 31. Its layout is fixed: a form may re-encode a format's codes, never its
+scales, which feed the GEMM template's promotion and epilogue as stored (algebra.md 7.4)."""
+
+E4M3_SCALE_FORM = BitForm(
+    steps=(BitStep(BitOp.SHR, (0,), 3, Unit.ALU), BitStep(BitOp.SHL, (0,), 20, Unit.FMA),
+           BitStep(BitOp.SHL, (1,), 27, Unit.FMA), BitStep(BitOp.LOP3, (2, 3), 0x87F00000, Unit.ALU)),
+    outputs=(4,),
+    encoder=(1, 2, 4, 8, 16, 32, 64, 128))
+"""`E4M3_SCALE`'s form as `synthesized(E4M3_SCALE)` finds it, checked in: a right shift by 3, left shifts of
+the code by 20 and of that by 27 (on the FMA pipe), one masked XOR (2 issues on the busiest pipe, 4
+instructions, 2 live registers); its encoder the identity, its layout fixed."""
+
+E4M3_SCALE_OWED = 2.0 ** 120
+"""The factor `E4M3_SCALE`'s register owes its scale: the code's value is the register's float32 times
+2^120, restored exactly by integer exponent arithmetic (`scale_restored`)."""
+
+
+def scale_restored(pattern: jax.Array) -> jax.Array:
+    """The E4M3 scale's decoded value (`E4M3_SCALE_FORM`'s register: the code's value times 2^-120 as a
+    float32's bits) of each of `pattern` (uint32), restored to the code's value in float32 by integer
+    arithmetic, exactly: a subnormal (a zero exponent field) as its mantissa's integer times 2^-9 with its
+    sign, every other value's exponent raised by 120, so no lane that flushes subnormals zeroes a subnormal
+    scale. The one definition of a block scale's decoded value; the NaN code (0x7F, which no block scale
+    holds) reads as 480, as `decoded` reads it."""
+    sign = pattern & jnp.uint32(0x80000000)
+    normal = jax.lax.bitcast_convert_type(pattern + jnp.uint32(120 << 23), jnp.float32)
+    mantissa = ((pattern >> jnp.uint32(20)) & jnp.uint32(0x7)).astype(jnp.float32) * jnp.float32(2.0 ** -9)
+    subnormal = jnp.where(sign != 0, -mantissa, mantissa)
+    return jnp.where(pattern & jnp.uint32(0x7F800000) == 0, subnormal, normal)
+
+
+def scales_decoded(codes: jax.Array) -> jax.Array:
+    """Block scales' E4M3 codes (uint8 or uint32, a code each) as float32, exactly, by the declared
+    transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx`, where inline
+    assembly runs) and its one restore rule (`scale_restored`)."""
+    (pattern,) = E4M3_SCALE_FORM.traced(codes.astype(jnp.uint32))
+    return scale_restored(pattern)
+
+
 NVFP4_OWED = 2.0 ** 8
 """The factor an NVFP4 tile's decode (`nvfp4_decoded`) owes its values, which the epilogue's fp32 scale takes:
 a prologue restores each code to float32 from the form's decode (`code 2^-126`, `NVFP4_BFLOAT16`,
-`_restored`), multiplies it by its block scale over 2^8 and narrows the product to bfloat16, exact and
+`nvfp4_codes`), multiplies it by its block scale over 2^8 and narrows the product to bfloat16, exact and
 within bfloat16's range, so the tile is the values over 2^8."""
 
 
@@ -705,31 +764,45 @@ def nvfp4_decoded(words: jax.Array, scales: jax.Array) -> jax.Array:
     exactly: `words` `[depth / 8, columns]` uint32, each the stored (`BitForm.prepared`) word of a column's
     eight consecutive codes along the depth, and `scales` `[depth / 16, columns]` float8_e4m3fn, one for
     each sixteen (`product.NVFP4.depth`, the format's one statement of its block); `[depth, columns]`: the
-    code restored from its decode (`_restored`) times its scale over 2^8 in float32, exact (at most six
+    code restored from its decode (`nvfp4_codes`) times its scale over 2^8 in float32, exact (at most six
     significant bits) and within bfloat16's normal range, as a GPU's prologue forms it in one multiply per
     value (`NVFP4_OWED`), a GEMM operand prologue's per stage (the template's matrix-operand hook,
     algebra.md 7.4)."""
-    codes = _restored(NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T)
-    owed = scales.astype(jnp.float32) * np.float32(1 / NVFP4_OWED)
+    codes = nvfp4_codes(words)
+    owed = scales_decoded(jax.lax.bitcast_convert_type(scales, jnp.uint8)) * np.float32(1 / NVFP4_OWED)
     return (codes * jnp.repeat(owed, NVFP4.depth, axis=0)).astype(jnp.bfloat16)
 
 
-def _restored(decoded: jax.Array) -> jax.Array:
-    """A decode's bfloat16 values (`NVFP4_BFLOAT16_FORM.values`, each `code 2^-126`) times 2^126, in float32
-    (`restored`)."""
-    return restored(jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32))
+def nvfp4_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
+    """The E2M1 codes of NVFP4's stored words (`words` `[depth / 8, columns]` uint32, each the stored word of
+    a column's eight consecutive codes along the depth), `[depth, columns]` in `dtype` (float32 by default; a
+    float64 truth's float64): the form's decode (`NVFP4_BFLOAT16_FORM`, each code times 2^-126 as a
+    bfloat16) read as its lanes' bits and restored (`restored`). The portable decode's (`nvfp4_decoded`) and
+    a truth's codes alike."""
+    pattern = NVFP4_BFLOAT16_FORM.values(words.T, jnp.uint16).T.astype(jnp.uint32)
+    return restored(pattern, dtype)
 
 
-def restored(pattern: jax.Array) -> jax.Array:
+def restored(pattern: jax.Array, dtype=jnp.float32) -> jax.Array:
     """The NVFP4 form's decoded value (`NVFP4_BFLOAT16_FORM`: each code times 2^-126 as a bfloat16) of each of
-    `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in float32 by integer
-    arithmetic: a subnormal (a code of 0 or 0.5) as its mantissa's integer times 2^-7 with its sign, every
-    other value's exponent raised by 126 (its bits moved to a float32's high half), so no lane that flushes
-    subnormals (XLA:CPU's, a GPU's) zeroes a code of 0.5. The one definition of the decoded value: the
-    portable decode's (`nvfp4_decoded`) and the native staged decode's, whatever lanes each extracts."""
+    `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in `dtype` (float32 by
+    default; a float64 truth's float64) by integer arithmetic: a subnormal (a code of 0 or 0.5) as its
+    mantissa's integer times 2^-7 with its sign, every other value's exponent raised by 126 (its bits moved to
+    a float32's high half, then cast, a format wider than float32's taking its subnormals exactly), so no
+    lane that flushes subnormals (XLA:CPU's, a GPU's) zeroes a code of 0.5. The one definition of the decoded
+    value: the portable decode's (`nvfp4_decoded`), the native staged decode's, whatever lanes each extracts,
+    and a truth's."""
     sign = pattern & jnp.uint32(0x8000)
-    normal = jax.lax.bitcast_convert_type((pattern << jnp.uint32(16)) + jnp.uint32(126 << 23), jnp.float32)
-    mantissa = (pattern & jnp.uint32(0x7F)).astype(jnp.float32) * jnp.float32(2.0 ** -7)
+    rebased = (pattern << jnp.uint32(16)) + jnp.uint32(126 << 23)
+    normal = jax.lax.bitcast_convert_type(rebased, jnp.float32)
+    if jnp.finfo(dtype).bits > 32:
+        # Widened from the rebased bits themselves where they hold a float32 subnormal (a pattern outside the
+        # format's codes), which a flushing lane's cast would zero: its fraction times 2^-149, exact in a
+        # wider format. A narrower one casts the float32 as it casts any.
+        fraction = (rebased & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** -149, dtype)
+        tiny = jnp.where(rebased >> jnp.uint32(31) != 0, -fraction, fraction)
+        normal = jnp.where(rebased & jnp.uint32(0x7F800000) == 0, tiny, normal.astype(dtype))
+    mantissa = (pattern & jnp.uint32(0x7F)).astype(dtype) * jnp.asarray(2.0 ** -7, dtype)
     subnormal = jnp.where(sign != 0, -mantissa, mantissa)
     return jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
 

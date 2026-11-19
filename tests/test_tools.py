@@ -1949,6 +1949,17 @@ SOFTPLUS_SITE = ("import jax\n"
 """SLOP030's site: JAX's softplus by its module's path and imported by its own name, Flax's, and both's
 log-sigmoid (lines 5, 6, 7, 9, 10); the package's own softplus, which it is not."""
 
+SILU_SITE = ("import jax\nimport flax.linen as nn\nfrom jax.nn import silu\n"
+             "from sparx.nn import activations\n"
+             "a = jax.nn.silu(1.0)\n"
+             "b = silu(1.0)\n"
+             "c = nn.swish\n"
+             "d = activations.silu(1.0)\n"
+             "e = jax.nn.sigmoid(1.0)\n"
+             "f = activations.logistic(1.0)\n")
+"""SLOP031's site: JAX's silu by its module's path and imported by its own name, Flax's swish passed as a
+value, JAX's sigmoid (lines 5, 6, 7, 9); the package's own silu and logistic, which it is not."""
+
 
 @pytest.mark.parametrize(("code", "site", "packages", "lines", "owner"), [
     ("SLOP025", ROLLOUT, ("rl", "objectives", "training"), (3, 5, 6, 8),
@@ -1958,11 +1969,13 @@ log-sigmoid (lines 5, 6, 7, 9, 10); the package's own softplus, which it is not.
      ("src/sparx/nn/derivatives.py", "import jax\n@jax.custom_vjp\ndef rule(x): return x\n")),
     ("SLOP030", SOFTPLUS_SITE, ("nn", "rl", "objectives"), (5, 6, 7, 9, 10),
      ("src/sparx/nn/precision.py", "import jax\nfine = jax.nn.softplus(1.0)\n")),
-], ids=["outer program", "custom derivative", "softplus"])
+    ("SLOP031", SILU_SITE, ("nn", "rl", "objectives"), (5, 6, 7, 9),
+     ("src/sparx/nn/activations.py", "import jax\nfine = jax.nn.silu(1.0)\n")),
+], ids=["outer program", "custom derivative", "softplus", "silu"])
 def test_a_construct_built_outside_its_owner_module_is_reported(tmp_path, code, site, packages, lines, owner):
-    """SLOP025, SLOP026 and SLOP030: a construct one module of `src/<package>` owns (the compile point's
-    `OuterProgram`, JAX's custom derivatives, softplus) is reported wherever its site builds it in any
-    package but that module, and not in the owner, the tests or the tools. Its findings alone: a custom
+    """SLOP025, SLOP026, SLOP030 and SLOP031: a construct one module of `src/<package>` owns (the compile
+    point's `OuterProgram`, JAX's custom derivatives, softplus, silu) is reported wherever its site builds it
+    in any package but that module, and not in the owner, the tests or the tools. Its findings alone: a custom
     derivative's site is SLOP028's too, which reads whether it declares its contract."""
     def found(root, files: dict[str, str]) -> list[tuple[str, int, str]]:
         return [entry for entry in linted(root, files) if entry[2] == code]
@@ -2344,11 +2357,16 @@ def test_the_data_benchmark_rates_its_training_window_over_the_whole_mesh_as_the
     rates = tool.rated(2.0, 2, 16, compiled, work, 8, peak=peak)
     assert rates["model_mfu_bf16_peak"] == work / 8 / 2 / (2.0 / 2) / peak
     assert rates["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
-    assert rates["unsized_kernels_per_step"] == 0
+    assert (rates["unsized_kernels_per_step"], rates["hlo_utilization_bound"]) == (0, "")
     uncounted = tool.rated(2.0, 2, 16, StepFlops(2.0e12, 4.0e12, 6.0), None, 8, peak=peak)
     assert uncounted["model_mfu_bf16_peak"] is None
     assert uncounted["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
     assert uncounted["unsized_kernels_per_step"] == 3.0
+    assert uncounted["hlo_utilization_bound"] == "_lower_bound"
+    # A loop counted at its stated bound: an upper bound, named so (train 1025's F3).
+    bounded = tool.rated(2.0, 2, 16, StepFlops(2.0e12, 4.0e12, 0.0, 1.0e12), None, 8, peak=peak)
+    assert bounded["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
+    assert bounded["hlo_utilization_bound"] == "_upper_bound"
 
 
 @pytest.mark.mesh

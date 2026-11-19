@@ -511,6 +511,16 @@ def _refuse_reshaped(template, stored, where: str) -> None:
                          f"the shapes it was written with.")
 
 
+def _packed_checked(tree) -> None:
+    """Refuse a restored tree holding a packed bank whose words another encoder packed (its stored form
+    version, `dew.nn.kernels.formats.NvFp4.checked`), as this Dew's decode reads them wrong."""
+    from dew.nn.kernels.formats import NvFp4
+
+    for leaf in jax.tree.leaves(tree, is_leaf=lambda leaf: isinstance(leaf, NvFp4)):
+        if isinstance(leaf, NvFp4):
+            leaf.checked()
+
+
 def _paths(tree) -> set[str]:
     """`tree`'s leaves' paths by their names alone (`keystr`'s simple form): a registered dataclass's
     fields (a packed bank's, `dew.nn.kernels.formats.NvFp4`) are attributes in a tree and keys in Orbax's
@@ -2195,6 +2205,7 @@ class Checkpoints:
         table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
         restored = _filled(placed, restored, step)
+        _packed_checked(restored)
         return restored, saved
 
     def _host_restored(self, step: int, snapshot, metadata, *, local: bool) -> dict:

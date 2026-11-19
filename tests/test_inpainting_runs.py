@@ -7,7 +7,6 @@ that draws one."""
 import dataclasses
 import json
 import shutil
-import tarfile
 from pathlib import Path
 
 import jax
@@ -39,10 +38,10 @@ def inpainting(tmp_path_factory) -> dict[str, Path]:
     """The tiny inpainting pipeline (a UNet of 9 input channels, its latents, the masked image's and the
     mask), as published with its DDIM scheduler (`ddim`) and with Diffusers' rectified-flow scheduler
     file in its place (`flow`), which Flow-GRPO walks."""
+    from interop_support import tiny_pipeline
+
     root = tmp_path_factory.mktemp("inpainting")
-    with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
-        archive.extractall(root, members=[member for member in archive.getmembers()
-                                          if member.name.split("/")[0] == "inpaint"], filter="data")
+    tiny_pipeline(root, "inpaint")
     flow = root / "flow"
     shutil.copytree(root / "inpaint", flow)
     (flow / "scheduler" / "scheduler_config.json").write_text(json.dumps(FLOW_SCHEDULER))

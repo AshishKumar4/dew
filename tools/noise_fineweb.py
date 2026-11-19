@@ -57,6 +57,8 @@ def prepared(parquet: list[str] | None) -> dict[str, np.ndarray]:
 
     tokenizer = Tokenizer.from_file(str(github(NOISE, COMMIT, "tokenizer/tokenizer.json", TOKENIZER_SHA256)))
     end = tokenizer.token_to_id("<|endoftext|>")
+    if end is None:
+        raise ValueError("the tokenizer holds no <|endoftext|> token")
     corpus = (load_dataset("parquet", data_files=parquet, split="train", streaming=True) if parquet else
               load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train", streaming=True))
     texts = (record["text"] for record in itertools.islice(corpus, SKIP_DOCS, None))

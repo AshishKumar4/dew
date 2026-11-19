@@ -11,10 +11,14 @@ hands on.
 from __future__ import annotations
 
 import contextlib
+import functools
+import itertools
+import math
 from collections.abc import Collection, Hashable, Iterator, Sequence
-from dataclasses import dataclass, field
-from typing import Protocol
+from dataclasses import dataclass, field, replace
+from typing import ClassVar, Protocol
 
+import numpy as np
 from flax import linen as nn
 
 from dew.batch import PHASE, Batch
@@ -34,17 +38,30 @@ def _looped(module: nn.Module) -> bool:
     return isinstance(module, Looped) and isinstance(module, Looping) and module.loop is not None
 
 
-def _counted[L, E](objective: Objective[L, E], passes: int) -> list[nn.Module]:
-    """`objective`'s modules (`program_key`) with each looped one run `passes` times."""
-    return [_passed(entry.module, passes) for entry in objective.program_key()]
+def _horizons[L, E](objective: Objective[L, E]) -> tuple[int | None, ...]:
+    """The final passes each of `objective`'s modules (`program_key`) trains through
+    (`Loop.backprop_steps`), None for one that loops through every pass or loops not at all."""
+    return tuple(entry.module.loop.backprop_steps if _looped(entry.module) else None
+                 for entry in objective.program_key())
 
 
-def _passed(module: nn.Module, passes: int) -> nn.Module:
-    """`module` run `passes` times where it loops (`Looping.with_passes`), else as it is."""
+def _counted[L, E](objective: Objective[L, E], passes: int,
+                   horizons: Sequence[int | None]) -> list[nn.Module]:
+    """`objective`'s modules (`program_key`) with each looped one run `passes` times, each training through
+    its run's configured final passes (`horizons`, `_horizons` of the run's own objective) or all of them
+    where `passes` is fewer: a module a rung restored at another count keeps the run's horizon, not the one
+    that count clamped it to."""
+    return [_passed(entry.module, passes, horizon)
+            for entry, horizon in zip(objective.program_key(), horizons, strict=True)]
+
+
+def _passed(module: nn.Module, passes: int, trained: int | None) -> nn.Module:
+    """`module` run `passes` times where it loops (`Looping.with_passes`), else as it is, training through
+    its final `trained` passes (`Loop.backprop_steps`), or all of them where `passes` is fewer."""
     if not _looped(module):
         return module
     assert isinstance(module, Looping)
-    passed = module.with_passes(passes)
+    passed = module.with_passes(passes, backprop_steps=None if trained is None else min(trained, passes))
     assert isinstance(passed, nn.Module), "a looped module keeps its loop"
     return passed
 
@@ -59,11 +76,25 @@ class PhasePasses[L, E]:
     counts: tuple[int, ...] = ()
     current: int | None = None
     built: dict[int, Objective[L, E]] = field(default_factory=dict)
+    horizons: tuple[int | None, ...] = ()
+    """The final passes each of `base`'s modules trains through (`_horizons`), which every count keeps."""
+    sampled: SampledPasses | None = None
+    """The law a run draws its pass count from per microbatch, in place of a count a phase (`SampledPasses`):
+    its step one program a count from 1 to its cap, its cap the count the objective holds, whatever phase
+    its data reads (`count`), with no later phase's step of its own (`counts` none)."""
 
     @classmethod
-    def of(cls, objective: Objective[L, E], stated: Sequence[int] | None) -> PhasePasses[L, E]:
+    def of(cls, objective: Objective[L, E], stated: Sequence[int] | None,
+           sampled: SampledPasses | None = None) -> PhasePasses[L, E]:
         """`stated` checked: each count at least one, the objective's modules looping, the last phase's count
-        the one they hold, the model the run hands on. No counts where it states none."""
+        the one they hold, the model the run hands on. No counts where it states none; a run that draws its
+        count per microbatch (`sampled`) holds its cap's, and states no count a phase beside it."""
+        if sampled is not None:
+            if stated is not None:
+                raise ValueError("a run states its loop's pass counts once: one a phase of its data "
+                                 "(phase_passes) or one drawn per microbatch (sampled_passes)")
+            # Its loop holding the cap, checked as a phase's count is; no phase's count beside it.
+            return replace(cls.of(objective, (sampled.cap,)), counts=(), current=sampled.cap, sampled=sampled)
         if stated is None:
             return cls(objective)
         counts = tuple(int(count) for count in stated)
@@ -78,11 +109,14 @@ class PhasePasses[L, E]:
         if held != {counts[-1]}:
             raise ValueError(f"the objective's loop runs {sorted(held)} passes and the last phase "
                              f"{counts[-1]}: it holds the count the run hands on")
-        return cls(objective, counts)
+        return cls(objective, counts, horizons=_horizons(objective))
 
     def count(self, batch: Batch) -> int | None:
         """The count of the phase `batch` was read in (its host `PHASE`, phase 0 where its data has none);
-        None where the run states no counts. A phase past the counts is refused, naming both."""
+        None where the run states no counts; the cap where it draws one per microbatch, whatever phase its
+        data reads. A phase past the counts is refused, naming both."""
+        if self.sampled is not None:
+            return self.sampled.cap
         if not self.counts:
             return None
         phase = batch[PHASE].index if PHASE in batch else 0
@@ -90,6 +124,22 @@ class PhasePasses[L, E]:
             raise ValueError(f"a batch of the run's phase {phase} meets phase_passes of {len(self.counts)} "
                              "phase(s): one count a phase")
         return self.counts[phase]
+
+    def drawn_count(self) -> int | None:
+        """The count the step being compiled runs where the run draws one per microbatch
+        (`StepSettings.sampled_passes`); None for any other run."""
+        return None if self.sampled is None else self.current
+
+    def drawn_cap(self) -> int | None:
+        """The cap of the pass count a run draws per microbatch, a batch's counted work's width
+        (`prepare_counts`); None for any other run."""
+        return None if self.sampled is None else self.sampled.cap
+
+    def counted(self) -> list[Objective[L, E]] | None:
+        """The run's objective at each count from 1 to its cap where it draws one per microbatch, whose work
+        a batch counts at each (`prepare_counts`'s `counts`); None for any other run."""
+        return None if self.sampled is None else [self.objective_for(count)
+                                                  for count in range(1, self.sampled.cap + 1)]
 
     def begins(self, compiled: Collection[Hashable]) -> bool:
         """Whether the step being compiled (`current`) begins a phase whose count no step of `compiled`
@@ -118,7 +168,7 @@ class PhasePasses[L, E]:
 
     def run(self, objective: Objective[L, E], passes: int) -> None:
         """Run `objective`'s looped modules `passes` times, each keeping its other choices, the rest as is."""
-        objective.substitute(_counted(objective, passes))
+        objective.substitute(_counted(objective, passes, self.horizons))
 
     def restored(self, objective: Objective[L, E]) -> None:
         """`objective`'s looped modules at the step's count again (`current`), where a rung restored the
@@ -143,8 +193,9 @@ class PhasePasses[L, E]:
         count, kept by no one else (`built` holds none of it), which a compile off the loop builds and
         climbs its step's rungs on (`dew.training.ahead.LaterPlans`) while the loop's objectives stay as
         they are."""
-        objective = self.base.substituted(_counted(self.base, passes))
-        return PhasePasses(objective, self.counts, passes, dict.fromkeys(self.counts, objective))
+        objective = self.base.substituted(_counted(self.base, passes, self.horizons))
+        return PhasePasses(objective, self.counts, passes, dict.fromkeys(self.counts, objective),
+                           self.horizons)
 
     def begun(self, first: int, phases: Sequence[int]) -> list[int]:
         """Those of `phases` whose step is planned at its boundary, after the run's `first` phase: each the
@@ -164,8 +215,148 @@ class PhasePasses[L, E]:
         prefetch worker) hold while validation and the model the run hands on read `base`. Read off
         `base`, never off a holder that holds a count's copy meanwhile; one copy a count, whichever thread
         asks first."""
-        if passes is None or passes == self.counts[-1]:
+        if passes is None or passes == (self.counts[-1] if self.sampled is None else self.sampled.cap):
             return self.base
         if passes not in self.built:
-            self.built.setdefault(passes, self.base.substituted(_counted(self.base, passes)))
+            self.built.setdefault(passes, self.base.substituted(_counted(self.base, passes, self.horizons)))
         return self.built[passes]
+
+
+RATE_SPAN = 39
+"""The standard deviations either side of its mode past which a count's integrand over the log rate (a
+log-concave one, at least as narrow as its normal density) is 0 beside its peak in float64 (exp(-39² / 2)
+underflows past the least subnormal): the span `SampledPasses.cumulative` integrates each count's over."""
+
+MODE_NODES = 64
+"""The Gauss-Legendre nodes a unit of count takes in `SampledPasses.cumulative`'s integral of the log rate's
+mode over the count, whose integrand is analytic there."""
+
+
+@dataclass(frozen=True)
+class SampledPasses:
+    """A looped model's pass count drawn afresh for each microbatch a run steps (`count`), from a named law
+    bounded to `cap` (row 7660): `law` 'lognormal-poisson', the count `1 + N`, `N ~ Poisson(Λ)`,
+    `log Λ ~ Normal(log(mean - 1) - dispersion² / 2, dispersion²)`, so `mean` is the count's mean before its
+    bound, conditioned on 1 to `cap`, as recurrent-depth training draws it (Geiping et al. 2025, arXiv
+    2502.05171), by the bounded law's inverse cumulative (`cumulative`), one uniform a draw however little of
+    the unbounded law's mass the cap holds. A draw is a function of the run's key and the microbatch's global
+    position alone,
+    its place among every microbatch the run dispatched: every process draws alike, and a resume, a replan
+    or a step of another split draws on as the run would have."""
+
+    mean: float
+    dispersion: float
+    cap: int
+    law: str = "lognormal-poisson"
+
+    LAWS: ClassVar[tuple[str, ...]] = ("lognormal-poisson",)
+
+    def __post_init__(self) -> None:
+        if self.law not in self.LAWS:
+            raise ValueError(f"a sampled pass count follows one of the laws {list(self.LAWS)}, "
+                             f"not {self.law!r}")
+        if not (math.isfinite(self.mean) and self.mean > 1):
+            raise ValueError("a log-normal Poisson pass count's mean is above 1, its least count, "
+                             f"not {self.mean}")
+        if not (math.isfinite(self.dispersion) and self.dispersion >= 0):
+            raise ValueError("a log-normal Poisson pass count's dispersion is at least 0, "
+                             f"not {self.dispersion}")
+        if self.cap < 1:
+            raise ValueError(f"a sampled pass count's cap is at least one pass, not {self.cap}")
+
+    def count(self, key: Sequence[int], position: int) -> int:
+        """The pass count of the run's microbatch at global `position` under the run's `key` (its words,
+        `jax.random.key_data`): the bounded law's inverse cumulative (`cumulative`) at one uniform draw."""
+        draws = np.random.Generator(np.random.Philox(np.random.SeedSequence([*map(int, key), int(position)])))
+        return 1 + int(np.searchsorted(self.cumulative, draws.random(), side="right"))
+
+    @functools.cached_property
+    def cumulative(self) -> np.ndarray:
+        """The bounded law's cumulative probability at each count 1 to `cap`, its last 1, from each count's
+        log probability less a term common to all: the Poisson's of the count less one at the rate
+        `exp(location)` without dispersion (its common `-exp(location)` left out, which past a mean of
+        2^53 would round every count's alike); else the Poisson's integrated over the log rate's normal
+        density, its log integrand `n x - exp(x) - (x - location)² / (2 dispersion²) - log n!` concave in the
+        log rate `x`: its peak value, its integral over the count of its mode (`_mode`, Laplace's envelope:
+        the peak's derivative in `n` is the mode less `digamma(n + 1)`), so no count's peak is the difference
+        of the exponential's large values; and its integral about its own mode scaled by the peak
+        (`_about_mode`), never about `location`, from which a cap low beside the mean moves each count's mass
+        far. Then conditioned on the cap."""
+        below = np.arange(self.cap)
+        factorials = np.array([math.lgamma(n + 1) for n in below])
+        location = math.log(self.mean - 1) - self.dispersion * self.dispersion / 2
+        if location == -math.inf:
+            # A dispersion whose square float64 cannot hold: a count past one is drawn with chance
+            # exp(-dispersion² / 8) or less (its rate past its least value), 0 in float64.
+            return np.ones(self.cap)
+        if self.dispersion == 0:
+            logs = below * location - factorials
+        else:
+            nodes, weights = np.polynomial.legendre.leggauss(MODE_NODES)
+            counts = below[1:, None] + (nodes[None, :] - 1) / 2
+            units = _mode(counts, location, self.dispersion) @ (weights / 2)
+            modes = _mode(below.astype(float), location, self.dispersion)
+            logs = (np.concatenate([[0.0], np.cumsum(units)]) - factorials
+                    + np.array([_about_mode(float(mode), self.dispersion) for mode in modes]))
+        probabilities = np.exp(logs - logs.max())
+        cumulative = np.cumsum(probabilities / probabilities.sum())
+        # The sum's last partial is 1 but for its rounding, which a uniform draw past it must not reach.
+        cumulative[-1] = 1.0
+        return cumulative
+
+
+def _mode(counts: np.ndarray, location: float, dispersion: float) -> np.ndarray:
+    """The log rate at which each count's log integrand peaks (`SampledPasses.cumulative`), at real counts
+    `counts` too: the root of its derivative `dispersion² (count - exp(x)) - (x - location)`, decreasing in
+    `x`, bisected between `location` and the count's log (a count of 0 left of `location` by
+    `dispersion² exp(location)`, at most a million) to float64's last bit, its sign compared, never
+    computed, where the exponential's terms overflow."""
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        logs = np.log(np.where(counts > 0, counts, 1.0))
+        reach = min(dispersion ** 2 * math.exp(min(location, 709.0)), 1e6)
+        low = np.where(counts > 0, np.minimum(location, logs), location - reach)
+        high = np.where(counts > 0, np.maximum(location, logs), location)
+        while True:
+            middle = (low + high) / 2
+            if not np.any((middle > low) & (middle < high)):
+                return low
+            rising = dispersion ** 2 * (counts - np.exp(middle)) > middle - location
+            low, high = np.where(rising, middle, low), np.where(rising, high, middle)
+
+
+def _about_mode(mode: float, dispersion: float) -> float:
+    """The log of a count's integrand over the log rate (`SampledPasses.cumulative`) about its `mode`, scaled
+    by its peak and by the normal density's width: the integral over the standardized log rate `z` (`x = mode
+    + dispersion z`) of `exp(-exp(mode) (expm1(dispersion z) - dispersion z) - z² / 2)`, the peak's own terms
+    cancelled exactly by the mode's equation, so nothing in it is the difference of large values. In units
+    of its peak's width (`1 / sqrt(1 + dispersion² exp(mode))`, held as its log so no dispersion's square
+    overflows, `u = z / width`): its log's curvature is at least 1 in `u` above the mode and in `z` below it,
+    so it is 0 beside its peak past `RATE_SPAN` units above and `RATE_SPAN` deviations below, or where it
+    reaches 0 first; each side in panels doubling from one unit (scipy's adaptive quadrature on each), so no
+    panel is wider than the integrand's own scale where it starts."""
+    from scipy import integrate
+
+    scale = math.exp(mode)
+    # log(1 + dispersion² exp(mode)) as a softplus of its log, finite however large the dispersion.
+    curvature = 2 * math.log(dispersion) + mode
+    log_width = -(curvature + math.log1p(math.exp(-curvature)) if curvature > 0
+                  else math.log1p(math.exp(curvature))) / 2
+    width, stride = math.exp(log_width), math.exp(math.log(dispersion) + log_width)
+
+    def integrand(u: float) -> float:
+        t = stride * u
+        # expm1(t) - t, its series where the difference would cancel.
+        lost = t * t / 2 * (1 + t / 3 + t * t / 12) if abs(t) < 1e-4 else math.expm1(min(t, 709.0)) - t
+        exponent = scale * lost + (width * u) ** 2 / 2
+        return 0.0 if exponent > 745 else math.exp(-exponent)
+
+    def panels(side: float, reach: float) -> list[float]:
+        edges = [0.0, side]
+        while abs(edges[-1]) < reach and integrand(edges[-1]) > 0:
+            edges.append(side * min(2 * abs(edges[-1]), reach))
+        return edges
+
+    halves = (panels(1.0, RATE_SPAN), panels(-1.0, RATE_SPAN / width if width > 0 else math.inf)[::-1])
+    total = sum(integrate.quad(integrand, start, end, epsabs=0, epsrel=1e-13, limit=200)[0]
+                for edges in halves for start, end in itertools.pairwise(edges))
+    return log_width + math.log(total)

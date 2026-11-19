@@ -364,8 +364,20 @@ class Completed:
     terminated: jax.Array
 
 
+class Regrouping:
+    """A strategy whose decode reparents its rows (`DecodeOps.reindex`: a beam's branches), `width` rows
+    a prompt, each row writing its next token alone between two regroupings. `generate` decodes it over
+    its model's layout as `dew.nn.kv_cache.regrouped_layout` lays it: a pool split among groups unpaged,
+    an undivided one keeping its pages, sized for the search, where a regrouped row shares its parent's
+    written pages (`dew.nn.kv_cache.gather_cache_rows`). `Beam` is such; your own strategy that regroups
+    its rows inherits it."""
+
+    width: int
+    """The rows each prompt's search holds, which a regrouping strategy states (`Beam`'s field)."""
+
+
 @struct.dataclass
-class Beam:
+class Beam(Regrouping):
     """Runs deterministic beam search over one shared prefill.
 
     The bookkeeping follows `_beam_search` in Transformers 5.16.1. Each step

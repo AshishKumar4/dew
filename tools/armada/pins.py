@@ -13,6 +13,8 @@ to other generations than its own.
 
 import json
 
+import grading
+
 MARK = "generations"
 
 
@@ -26,7 +28,7 @@ def pytest_collection_finish(session):
         return
     pinned: dict[str, set[str] | None] = {}
     for item in session.items:
-        name = item.nodeid.split("::")[0]
+        name = grading.owning(item.nodeid)
         own = {str(generation) for mark in item.iter_markers(MARK) for generation in mark.args}
         if not own:
             pinned[name] = None

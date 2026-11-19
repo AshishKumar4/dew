@@ -31,7 +31,7 @@ from jax.experimental.profiler import get_profiled_instructions_proto
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
-from dew._devices import device_memory, pool_share, pool_statement
+from dew._devices import device_memory, pool_share, pool_statement, stated_share
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
@@ -45,6 +45,8 @@ from dew.nn.kernels.options import (
     hold,
     owned_program,
     program_key,
+    running,
+    shapes_of,
     unhold,
 )
 from dew.nn.kernels.templates import report
@@ -89,14 +91,15 @@ _log = logging.getLogger(__name__)
 def read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
                rollout: Rollout | None, mesh: MeshSpec | Mesh) -> str | None:
     """Why every step of a trainer reads its batch whole, or None where a plan may split it (`splits`):
-    a custom `step`, a layout that keeps the variables on the host, a `rollout` or an Explicit mesh
-    axis. Refuses the arguments no Trainer takes together."""
+    a custom `step`, a layout that keeps the variables on the host where the run states no split (no plan
+    splits the host's step: it reads its batch in the split stated, `StepCompiler._compile_host`), a
+    `rollout` or an Explicit mesh axis. Refuses the arguments no Trainer takes together."""
     if accumulation < 1:
         raise ValueError(f"accumulation must be at least 1, got {accumulation}")
     # Split under an Explicit axis, a step met a cotangent the split typed
     # float32[16@data,16,16] against its forward's float32[16,16,16].
     whole = ("a custom step owns its execution" if step is not None else
-             "the layout keeps the variables on the host" if "variables" in layout.host else
+             "the layout keeps the variables on the host" if "variables" in layout.host and split is None else
              "a rollout writes a batch of its own" if rollout is not None else
              "an Explicit mesh axis types the step's rows" if explicit_axes(mesh) else None)
     if split is not None and (split < 1 or (whole is not None and split > 1)):
@@ -190,22 +193,26 @@ class Relowered:
 
 class SampledStep(NamedTuple):
     """A step that also summarizes what the run inspects (`Candidate.sampled`): the program it compiled
-    from (its lowering) and its executable."""
+    from (its lowering), which a run compiled ahead names it by (`program_digest`), and its executable.
+    A plan the run steps by lets the lowering go (`Planned.released`): JAX holds every executable
+    compiled from a lowering while the lowering lives, so a kept one held the sampled module resident
+    through the run (base review of 2ffc61c8c, F2)."""
 
-    lowered: jax.stages.Lowered
+    lowered: jax.stages.Lowered | None
     executable: jax.stages.Compiled
 
 
-def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
+def whole_step_program[L, E](objective: Objective[L, E], parted_work: bool = False) -> OuterProgram:
     """`whole_step` over `objective`'s statistics (`Objective.reduce_loss`), the one program a split step
-    runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
-    compiles with its step (`dew.training.ahead`)."""
+    runs on its microbatches' outputs, compiled through Dew's compile point, which a run compiled ahead
+    compiles with its step (`dew.training.ahead`); `parted_work` where each microbatch counts its own
+    work (a sampled pass count's, `step_counts`)."""
     return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss,
-                                           shown=frozenset(objective.shown)), *objective.towers())
+                                           shown=frozenset(objective.shown), parted_work=parted_work))
 
 
 def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
-                  shown: frozenset[str] = frozenset()):
+                  shown: frozenset[str] = frozenset(), parted_work: bool = False):
     """A step's outputs from those of the microbatches it was read in: its loss as an unsplit step logs it,
     whatever the split (docs/design/training.md, the logged loss): where a microbatch of it commits, the
     latest such commit's update's, pooled over its window; elsewhere its own batch's, its microbatches'
@@ -217,9 +224,11 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
     run's interval keeps the latest sampled commit: a step of two commits (a window a rejection left part
     filled, then the closing part of a run's last batch) reports its second's summaries, never the two
     added. A pure function, which a step compiles as a program of its own (`dew.training.compiler`) or
-    traces within its own (`dew.training.ahead`)."""
+    traces within its own (`dew.training.ahead`). Where each microbatch counted its own work
+    (`parted_work`, a sampled pass count's), the step's is their sum."""
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
-    report = {name: _pooled(name, [part[name] for part in metrics]) for name in metrics[-1]}
+    report = {name: (sum(part[name] for part in metrics) if parted_work and name == TRAINING_FLOPS
+                     else _pooled(name, [part[name] for part in metrics])) for name in metrics[-1]}
     if len(metrics) > 1:
         # A metric that states no pooling is one microbatch's, named so (`Aux.metrics`); a shown one, which
         # a run selects its best and its plateau by under its name, is refused.
@@ -246,10 +255,13 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
             loss = jnp.where(part.count > 0, update, loss)
     summed = jax.tree.map(lambda *values: sum(values),
                           *(dataclasses.replace(part, inspected=None, own=None, finite=None,
-                                                unfinite_layer=None) for part in committed))
+                                                unfinite_layer=None, unfinite_state=None)
+                            for part in committed))
     walked = [part.unfinite_layer for part in committed if part.unfinite_layer is not None]
-    summed = dataclasses.replace(summed,
-                                 unfinite_layer=functools.reduce(jnp.maximum, walked) if walked else None)
+    # The state the step leaves is its last part's, whose committed state's report it keeps, a leaf's
+    # index no sum over parts (row 8269).
+    summed = dataclasses.replace(summed, unfinite_layer=functools.reduce(jnp.maximum, walked) if walked
+                                 else None, unfinite_state=committed[-1].unfinite_state)
     sample = None
     for part in committed:
         if part.inspected is not None:
@@ -496,8 +508,7 @@ class Planned:
         if not profile:
             return dataclasses.replace(self, profiled=(runs, 0))
         relowered = Relowered(relower)
-        executable = report.compiled(self.candidate.lowered, {**(self.options or {}), "fdo_profile": profile},
-                                     relower=relowered)
+        executable = guided_compile(self.candidate.lowered, self.options, profile, relowered)
         candidate = relowered.candidate(self.candidate)
         fit, headroom = step_fits(executable, mesh, candidate.held)
         if not fit:
@@ -508,11 +519,14 @@ class Planned:
                                    profiled=(runs, len(profile)))
 
     def released(self) -> Planned:
-        """This plan as the run keeps it once admitted: its executable without the program it was lowered
-        from. JAX keeps each executable compiled from a lowering while the lowering lives (its in-memory
-        compilation cache, keyed by the lowered module), so releasing it lets every executable the search
-        or a guided compile made of it go, the one the run steps alone held."""
-        return dataclasses.replace(self, candidate=dataclasses.replace(self.candidate, program=None))
+        """This plan as the run keeps it once admitted: its executables without the programs they were
+        lowered from, the step's and its sampled step's. JAX keeps each executable compiled from a lowering
+        while the lowering lives (its in-memory compilation cache, keyed by the lowered module), so
+        releasing them lets every executable the search or a guided compile made of them go, the ones the
+        run steps alone held."""
+        sampled = None if self.sampled is None else self.sampled._replace(lowered=None)
+        return dataclasses.replace(self, candidate=dataclasses.replace(self.candidate, program=None),
+                                   sampled=sampled)
 
 
 def released(trees) -> None:
@@ -581,18 +595,81 @@ class Trials:
             stepped, *_ = step(state, self.batch)
             current, held = apart(stepped)
             parts = planned.parts(mesh)
-            with tempfile.TemporaryDirectory() as directory:
-                # XLA reads the trace alone, so the capture writes no XProf reports.
-                with Profiler(directory, reports=False) as profiler:
-                    for _ in range(runs):
-                        for part in parts:
-                            current, *_ = planned.executable(current, held, self.batch, part)
-                        jax.block_until_ready(current)
-                (capture,) = profiler.captures
-                (session,) = capture.glob("plugins/profile/*")
-                return get_profiled_instructions_proto(str(session))
+
+            def once() -> None:
+                nonlocal current
+                for part in parts:
+                    current, *_ = planned.executable(current, held, self.batch, part)
+                jax.block_until_ready(current)
+
+            return profile_of(once, runs)
 
         return self.run(profile)
+
+    def profiled_programs(self, step: Callable, runs: int, platform: Callable[[jax.stages.Compiled], bool]
+                          ) -> tuple[bytes, list[Ran]]:
+        """XLA's profile of `runs` steps of `step` (a host step, whose programs are each an executable of
+        its own run through Dew's compile point) on a trial (`profile_of`), after one untraced, as
+        `profiled`'s; with each executable those steps ran that `platform` takes (an accelerator's), its
+        program and its lowering, traced as the call traced it (`options.running`), which a guided compile
+        reads (`guided_compile`). One profile serves every program: XLA keys each instruction's cost by its
+        module's fingerprint. A trial borrowed on the host holds its copy in host memory, no device's."""
+        if active_profile() is not None:
+            raise RuntimeError(PGLE_CAPTURE)
+        ran: dict[int, Ran] = {}
+
+        @contextlib.contextmanager
+        def recorded(program: OuterProgram, executable: jax.stages.Compiled, args: tuple, kwargs: dict):
+            if id(executable) not in ran and platform(executable):
+                # Over its arguments' shapes, which a later lowering (a spill's) reads after the trial
+                # donated them; lowered here, under the contexts the call traced in.
+                shaped, named = jax.tree.map(
+                    lambda leaf: shapes_of(leaf) if isinstance(leaf, jax.Array) else leaf, (args, kwargs))
+                lower = functools.partial(program.lower, *shaped, **named)
+                ran[id(executable)] = (program, executable, lower(), lower)
+            yield
+
+        def profile(state: TrainState) -> bytes:
+            current, *_ = step(state, self.batch)
+
+            def once() -> None:
+                nonlocal current
+                current, *_ = step(current, self.batch)
+                jax.block_until_ready(current)
+
+            with running(recorded):
+                return profile_of(once, runs)
+
+        return self.run(profile), list(ran.values())
+
+
+type Ran = tuple[OuterProgram, jax.stages.Compiled, jax.stages.Lowered, Callable[[], jax.stages.Lowered]]
+"""An executable a profiled trial ran (`Trials.profiled_programs`): its program, it, its lowering and what
+lowers it again (a spill's relowering, `report.compiled`)."""
+
+
+def profile_of(run: Callable[[], None], runs: int) -> bytes:
+    """XLA's profile of `runs` calls of `run`, each waiting on what it ran, as JAX's AutoPGLE waits on the
+    runs it profiles, in one profiling session of its own (`jax.experimental.profiler
+    .get_profiled_instructions_proto`): empty on a backend XLA profiles none of. The one place Dew reads
+    JAX's profile of a trial (`Trials`)."""
+    with tempfile.TemporaryDirectory() as directory:
+        # XLA reads the trace alone, so the capture writes no XProf reports.
+        with Profiler(directory, reports=False) as profiler:
+            for _ in range(runs):
+                run()
+        (capture,) = profiler.captures
+        (session,) = capture.glob("plugins/profile/*")
+        return get_profiled_instructions_proto(str(session))
+
+
+def guided_compile(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None, profile: bytes,
+                   relower: Callable[[], jax.stages.Lowered]) -> jax.stages.Compiled:
+    """`lowered` compiled again under `options` guided by `profile` (`profile_of`), as JAX's jit guides
+    AutoPGLE's (XLA's feedback-directed `fdo_profile`), through the kernel templates' reports
+    (`report.compiled`, `relower` lowering afresh where a kernel spills): a device plan's step
+    (`Planned.guided`) and each program of a host step (`StepCompiler._guided_host`) alike."""
+    return report.compiled(lowered, {**(options or {}), "fdo_profile": profile}, relower=relower)
 
 
 def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
@@ -628,8 +705,10 @@ def pool_record(devices: Sequence) -> dict[str, JSON]:
     plan against the memory stated for them (`compile_only`), at the share their loading run takes."""
     limits = [limit for device in devices if (limit := device_memory(device).get("bytes_limit")) is not None]
     attached = set(jax.local_devices())
-    stated = {"share": pool_share(), "source": "compile_only"} if not attached.issuperset(devices) else (
-        pool_statement())
+    # Devices this process does not attach plan at the share their loading run states (`stated_share`).
+    shares = [pool_share() if (share := stated_share(device)) is None else share
+              for device in devices if device not in attached]
+    stated = {"share": min(shares), "source": "compile_only"} if shares else pool_statement()
     return {"limit": min(limits, default=None), **stated}
 
 
@@ -793,7 +872,7 @@ class FitSearch[LossT, EffectsT]:
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
         # step's own (`options`) are made; the target's own policy is the compile point's
         # (`report.targeted`).
-        self.required = compiler_options(*self.objective.towers()) or None
+        self.required = compiler_options() or None
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
         """The first fitting plan the split-and-rung search finds (`searched`), and every compile it made:

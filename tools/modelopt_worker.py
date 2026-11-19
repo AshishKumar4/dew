@@ -31,6 +31,9 @@ from modelopt.torch.quantization.tensor_quant import fp8_eager
 from safetensors.torch import load_file
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+COHORT = "modelopt"
+"""The releases this file runs against, which its type check reads (tools/reference_releases.RELEASES)."""
+
 ROOT = Path(__file__).resolve().parents[1]
 CODECS = ROOT / "tests" / "fixtures" / "codecs" / "modelopt"
 
@@ -52,6 +55,9 @@ def nvfp4_qdq(x: torch.Tensor, global_scale: torch.Tensor) -> torch.Tensor:
     """The author's NVFP4 input quantization on the CPU (`NVFP4QTensor`): 16-value blocks, each scale its
     amax over 6 times the stored global scale in E4M3."""
     quantized, scale, double_scale = NVFP4QTensor.quantize(x, 16, weights_scaling_factor_2=global_scale)
+    # Its packed tensor: `quantize` returns the scaled tensor alone where asked to keep it high precision.
+    if not isinstance(quantized, NVFP4QTensor):
+        raise TypeError(f"NVFP4QTensor.quantize gave a {type(quantized).__name__}, not its packed tensor")
     return quantized.dequantize(scale=scale, double_scale=double_scale, block_sizes={-1: 16})
 
 
@@ -66,10 +72,14 @@ def author_models(directory: Path, quantize: Callable = nvfp4_qdq, device: str =
     from _dew_torch.precision import float64_twin
 
     stored = load_file(directory / "model.safetensors", device=device)
-    config = Qwen3Config.from_pretrained(directory)
-    del config.quantization_config
-    config._attn_implementation = "eager"
-    reference = Qwen3ForCausalLM(config).to(device).eval()
+    # The checkpoint's config but its quantization (the reference holds the stored tensors itself), its
+    # attention eager.
+    stored_config = Qwen3Config.from_pretrained(directory).to_dict()
+    config = Qwen3Config.from_dict({key: value for key, value in stored_config.items()
+                                    if key != "quantization_config"}, attn_implementation="eager")
+    reference = Qwen3ForCausalLM(config).eval()
+    # Moved in place, as a module moves (transformers' own `to` is typed for a dtype's casts).
+    torch.nn.Module.to(reference, device)
     quantized = [name.removesuffix('.weight_scale') for name in stored if name.endswith('.weight_scale')]
     suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
     parts = {stem + suffix for stem in quantized for suffix in suffixes}

@@ -5,7 +5,7 @@ import dataclasses
 import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping
-from typing import Self
+from typing import ClassVar, Self
 
 import jax
 import jax.numpy as jnp
@@ -121,11 +121,13 @@ class AutoEncoder(ABC):
     normalization: LatentNormalization = IDENTITY
     params: Variables
     model: nn.Module
+    parameter_collections: ClassVar[tuple[str, ...] | None] = None
+    """The collections of its variables that are parameters, which a storage-dtype override casts; None
+    for all of them (a wrapper holding statistics beside its weights names its weights')."""
 
     def towers(self) -> tuple[nn.Module, ...]:
-        """The networks this autoencoder runs, whose quantization the programs that call it compile for
-        (`dew.nn.kernels.options.compiler_options`): its `model`, none for one that computes without a
-        network (a pooling one)."""
+        """The networks this autoencoder runs, which key the programs that call it (`sampling_modules`): its
+        `model`, none for one that computes without a network (a pooling one)."""
         model = vars(self).get("model")
         return () if model is None else (model,)
 
@@ -164,12 +166,20 @@ class AutoEncoder(ABC):
         """Rebuild the autoencoder a run recorded (`dew.registry.to_record`), around the checkpoint's own
         `params`, reading no source: its class found as every component's is (`dew.registry.component`),
         of Dew's or of a package the run trusts, and its fields read against its constructor."""
-        from dew.registry import component, read_arguments
+        from dew.registry import component
 
         autoencoder, fields = component(AutoEncoder, record)
+        return _built(autoencoder, autoencoder.bound_arguments(fields, params), params)
+
+    @classmethod
+    def bound_arguments(cls, fields: Mapping[str, object], params: Variables) -> Mapping[str, object]:
+        """The constructor's arguments besides `params` that its record's `fields` give (`bound`), each
+        read against the constructor (`dew.registry.read_arguments`), its `model` a module's record. A
+        wrapper of another autoencoder binds the one it wraps around its own part of `params`."""
+        from dew.registry import read_arguments
+
         # The module's record names its class, which an inherited constructor's `model: M` cannot.
-        arguments = read_arguments(autoencoder, fields, declared={'model': nn.Module})
-        return _built(autoencoder, arguments, params)
+        return read_arguments(cls, fields, declared={'model': nn.Module})
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray, key: jax.Array | None = None,
@@ -293,8 +303,8 @@ class ModuleAutoEncoder[M: nn.Module](AutoEncoder):
     def __init__(self, model: M, params: Variables):
         self.model = model
         self.params = params
-        self.encode_single_frame = functools.partial(program(_encoded, model, static_argnums=0), model)
-        self.decode_single_frame = functools.partial(program(_decoded, model, static_argnums=0), model)
+        self.encode_single_frame = functools.partial(program(_encoded, static_argnums=0), model)
+        self.decode_single_frame = functools.partial(program(_decoded, static_argnums=0), model)
 
     def encode_batch(self, params, x, key=None, noise=None):
         return self.encode_single_frame(params, x, key, noise)

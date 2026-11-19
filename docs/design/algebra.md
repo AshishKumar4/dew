@@ -79,6 +79,8 @@ checked-in output yet. The text stays as the design to resume.
     rule relates it to anything outside it.
   - `KernelGlue`: the XLA glue of a kernel's custom derivative around its Pallas launches, which rules rewrite as
     any other math; the launches stay opaque leaves.
+  - `Activation`: an activation's gated or ungated product (the fusion seam its epilogue reads), which rules
+    rewrite within, as a `Surrogate` span's body.
   - `Algebra`: a derivative written only to restructure algebra (§1.3), which the pass rewrites freely: a span
     with no effects over arrays opens into the region around it, and any other is rewritten within its call, as
     a control-flow body is (its constants at hand, its inputs arrays).
@@ -509,7 +511,7 @@ class Term(Expr):
   every maximal set. It never crosses:
   - a checkpoint (remat) boundary;
   - an opaque equation;
-  - a marker (§6.10): a `Protected` span is a leaf, and a `Surrogate` or `KernelGlue` span a region of its own
+  - a marker (§6.10): a `Protected` span is a leaf, and a `Surrogate`, `KernelGlue` or `Activation` span a region of its own
     (an `Algebra` span with no effects over arrays is no boundary: it opens into the region around it, §6.10);
   - a `scan`, `while`, `cond` or `pjit` body (those are regions of their own).
 
@@ -1124,6 +1126,13 @@ class Scan:                          # a recurrence
                                      # exponent `scan.RESET_DECAY` for its own (the state entering it
                                      # decays to exactly 0 in fp32), the replaced exponent given no gradient
     ranges: Mapping[str, float | tuple[float, float]] = {}   # bounds, "state" and "overlap" among them
+    reads: Literal["after", "before", "apart"] = "after"   # the state after the token, entering it (RWKV-6),
+                                     # or after its decay less its group's writes (Mamba-3's ranks)
+    group: int = 1                   # the tokens a readout "apart" reads none of the writes of
+    turn: str | None = None          # an operand neither reads, [..., A]: each token turns the state's first
+                                     # A key pairs by e^{-i turn} before its decay (Mamba-3's rotating
+                                     # basis); the chunk forms read each token in its chunk's frame, a
+                                     # turn's cotangent the replay's, of the pairs crossing it (row 7419)
 
 class Derived(NamedTuple):           # dew.algebra.forms
     init: Callable                   # shapes -> the empty state
@@ -1371,12 +1380,17 @@ Agreed with the GEMM template's owner (2026-11-03):
 - A declaration names the fragment layout the family's MMA reads, which the family bundle supplies: on sm90
   the wgmma A-operand fragment, the weight taken as A and swapped onto M at decode shapes so the decoder writes
   straight into it; on sm100 the tcgen05 and tensor-memory layouts. A thread's input is the packed words it
-  loads: a 32-bit word holds 8 E2M1 codes. (Today a declaration, `bits.BitTransform`, names no layout: the
-  packed GEMM takes the warpgroup MMA's fragment layout itself, `templates/gemm/packed.py`.)
+  loads: a 32-bit word holds 8 E2M1 codes. A declaration names it for each consumer by the consumer's name,
+  the MMA that issues its registers (`BitTransform.fragments`: `NVFP4_BFLOAT16`'s `{"wgmma": "wgmma"}`, which
+  the packed GEMM reads as `packed.CONSUMER`, whatever family feeds it), a missing entry refused; a new
+  consumer's fragment is a new entry, no second declaration.
 - Block scales (NVFP4's 1×16, MX's 1×32) are a separate transform of a fixed layout, which feeds the
-  template's promotion and epilogue: a form may re-encode the codes, never the scales. (Today the scales are
-  no declared transform: the packed path reads their E4M3 codes by the format's integer decode,
-  `bits.decoded`.)
+  template's promotion and epilogue: a form may re-encode the codes, never the scales. NVFP4's E4M3 scale is
+  `bits.E4M3_SCALE`, its fields placed at a float32's own (the code's value times 2^-120,
+  `E4M3_SCALE_OWED`), its form `E4M3_SCALE_FORM` (the search's: one right and two left shifts and a masked
+  XOR), restored by one integer rule (`scale_restored`: a subnormal scale as its mantissa's integer times
+  2^-9, never through a flushing lane), `scales_decoded` the two together, the format's integer decode
+  (`bits.decoded`) on every code.
 - Each decode a template takes is declared and checked in once, in `dew.algebra.bits`, the one source the
   engine's and the consumer's tests prove: `NVFP4_BFLOAT16`, eight E2M1 codes of a word in their natural
   order (code `i` at bits `4i`, a byte's low nibble the earlier element) into four bfloat16 pairs, each the
@@ -1392,10 +1406,9 @@ Agreed with the GEMM template's owner (2026-11-03):
   multiplied by the block scale over 2^8 in float32 and narrowed to bfloat16, every such product within its
   range, and the epilogue's fp32 scale takes the owed factor with the tensor scale. An E2M1 subnormal (±0.5) decodes to a bfloat16 subnormal, so
   the portable path scales it in integer exponent arithmetic, never through a lane that flushes subnormals.
-- The consumer records the form it takes: its encoder and the encoder's version (in the
-  checkpoint), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
-  and its issues by pipe (`BitForm.issues`). (Today the packed matrix, `formats.NvFp4`, stores its words in
-  the checked-in form's layout beside its scales, and no encoder or version with them.) `Work` holds no
+- The consumer records the form it takes: its encoder and the encoder's version (`BitForm.version`, a digest
+  of its encoder, in the checkpoint, a load refusing words of another), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
+  and its issues by pipe (`BitForm.issues`). `Work` holds no
   integer pipe yet (kernel-templates.md §6, row 5386). Its tests prove the form again.
 - The decoder is emitted inline at a matrix-operand hook the GEMM template adds (row 3621): `BitForm.ptx(i)`
   writes output register `i` as one PTX block over the stored word (`$1`) into the register (`$0`), each step

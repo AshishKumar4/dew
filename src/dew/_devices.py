@@ -10,6 +10,7 @@ own flags, before anything it imports loads jaxlib.
 """
 
 import ctypes
+import dataclasses
 import importlib.util
 import logging
 import os
@@ -279,10 +280,10 @@ def pool_share() -> float:
     `bytes_limit` states (its memory times this, `CreateBFCAllocator`'s memory fraction): its fraction
     where it names one (`fraction_name`); Dew's own where it names none, as a prepared training process
     takes it (`preallocate_gpu_pool`), its preallocation or allocator named or not. The platform's
-    allocator holds no pool, so no share, and is refused (`pool_statement` says so). A compile for absent
-    GPUs reads it for the prepared run that loads its program (`allocator_limit`): one loaded where Dew did
-    not prepare the process (a notebook's, at JAX's 75%) holds less, and its loader refuses the program
-    naming both limits (`dew.training.ahead.BuildTarget.differences`)."""
+    allocator holds no pool, so no share, and is refused (`pool_statement` says so). This process's own
+    GPUs read it (`allocator_limit`); a GPU it does not attach is admitted at the share the run that loads
+    its programs states (`StatedGpu.share`), never this process's, which a prepare packed beside another
+    job holds of its own GPU alone."""
     named = os.environ.get(fraction_name())
     if named is not None:
         return float(named)
@@ -292,43 +293,62 @@ def pool_share() -> float:
     return DEW_SHARE
 
 
-COMPILE_ONLY_MEMORY: dict = {}
-"""Each compile-only GPU's memory, its total bytes, as its topology states it to XLA (`device_memory_size`,
-written by `dew.nn.kernels.generation.compile_only_gpus`, read from a host's own by `host_gpus`), and each CPU
-device's standing in for a GPU (`dew.training.ahead.stand_in_gpus`): the one statement every admission
-and layout check on the device reads (`device_memory`, `allocator_limit`)."""
+@dataclasses.dataclass(frozen=True)
+class StatedGpu:
+    """A GPU this process does not attach, as its stater states it (`STATED_GPUS`): its `memory`, its total
+    bytes as the GPU states them, and the `share` of it XLA's pool takes in the run that loads its
+    programs (`pool_share` there)."""
+
+    memory: int
+    share: float
 
 
-def allocator_limit(memory: int) -> int:
+STATED_GPUS: dict = {}
+"""Each compile-only GPU (`dew.nn.kernels.generation.compile_only_gpus`, a host's own topology's,
+`dew.training.ahead.host_gpus`) and each CPU device standing in for a GPU (`dew.training.ahead.stand_in_gpus`)
+whose memory is stated, as stated (`StatedGpu`): the one record every admission and layout check on the
+device reads (`device_memory`, `stated_share`), one per device, so two shares are two devices."""
+
+
+def stated_share(device) -> float | None:
+    """The pool share the run loading `device`'s programs states (`StatedGpu.share`), None for a device
+    whose memory no one stated, which takes this process's own (`pool_share`)."""
+    stated = STATED_GPUS.get(device)
+    return stated.share if stated is not None else None
+
+
+def allocator_limit(memory: int, share: float | None = None) -> int:
     """The bytes XLA's allocator is limited to on a GPU of `memory` bytes, as the run that loads a program
-    states it (`bytes_limit`): its memory times the pool's share (`pool_share`), as a double truncated
+    states it (`bytes_limit`): its memory times the pool's share, the loading run's stated one (`share`,
+    `StatedGpu.share`) else this process's (`pool_share`), as a double truncated
     (`CreateBFCAllocator`, xla/pjrt/gpu/gpu_helpers.cc), the one rule a compile for absent GPUs and the
     GPU's own allocator read alike. The GPU's own rounds it up to 2 MiB besides (`RoundUpGpuMemoryLimit`,
     there), so a plan held to this limit is held to at most 2 MiB less than the GPU's, and loads there:
     a GH200 of 101,468,602,368 bytes at Dew's share derives 96,395,172,249 against the 96,395,591,680 it
     states (M-IG-6, measured)."""
-    return int(memory * pool_share())
+    return int(memory * (pool_share() if share is None else share))
 
 
 def device_memory(device, arguments: int = 0) -> Mapping[str, int]:
     """What `device`'s allocator states, in bytes (`Device.memory_stats`' keys). A device whose memory is
-    stated (`COMPILE_ONLY_MEMORY`: a compile-only GPU's, or a CPU device's standing in for a GPU) states a
-    fresh BFC pool at its allocator's limit (`allocator_limit`) with `arguments` resident: its free block
-    and temporary-stranding policy are read exactly as for that allocator. An attached device states its
-    own, empty where it states nothing (a CPU's), as does a compile-only GPU whose memory no one stated."""
+    stated (`STATED_GPUS`: a compile-only GPU's, or a CPU device's standing in for a GPU) states a fresh
+    BFC pool at its allocator's limit at its stated share (`allocator_limit`) with `arguments` resident:
+    its free block and temporary-stranding policy are read exactly as for that allocator. An attached
+    device states its own, empty where it states nothing (a CPU's), as does a compile-only GPU whose memory
+    no one stated."""
     import jax
 
-    memory = COMPILE_ONLY_MEMORY.get(device)
-    if memory is None:
+    stated = STATED_GPUS.get(device)
+    if stated is None:
         return (device.memory_stats() or {}) if device in jax.local_devices() else {}
-    return fresh_pool(memory, arguments)
+    return fresh_pool(stated.memory, arguments, stated.share)
 
 
-def fresh_pool(memory: int, arguments: int = 0) -> dict[str, int]:
+def fresh_pool(memory: int, arguments: int = 0, share: float | None = None) -> dict[str, int]:
     """What XLA's BFC pool states on a GPU of `memory` bytes, fresh at its allocator's limit
-    (`allocator_limit`) with `arguments` resident: the one stated memory of a GPU not attached
-    (`device_memory`, `dew.training.memory.needed`)."""
-    limit = allocator_limit(memory)
+    (`allocator_limit`, at `share` where the loading run's is stated) with `arguments` resident: the one
+    stated memory of a GPU not attached (`device_memory`, `dew.training.memory.needed`)."""
+    limit = allocator_limit(memory, share)
     return {"bytes_limit": limit, "bytes_in_use": arguments, "pool_bytes": limit,
             "largest_free_block_bytes": limit - arguments}
 

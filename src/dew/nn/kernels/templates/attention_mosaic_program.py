@@ -1690,11 +1690,13 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     return step, vectors
 
 
-def _held_registers(family: mosaic.Family, block_q: int, params: tuple, *, residuals: bool = False) -> int:
+def _held_registers(family: mosaic.Family, block_q: int, params: tuple, *, residuals: bool = False,
+                    natural: bool = False) -> int:
     """The registers a forward walk holds across its steps in the accumulator's row layout: its query tile's
-    score-hook parameters (`held_params`, a QUERY's vector in the dtype its kernel loads it) and, a training
-    walk's (`residuals`), its per-query rows (`TRAINING_ROWS`)."""
-    rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
+    score-hook parameters (`held_params`, a QUERY's vector in the dtype its kernel loads it) and its per-query
+    rows, a training walk's (`residuals`, `TRAINING_ROWS`) or an inference fold walk's (`INFERENCE_ROWS`)."""
+    count = TRAINING_ROWS if residuals else 0 if natural or family.scalars_whole else INFERENCE_ROWS
+    rows = count * family.row_registers(block_q, jnp.float32)
     return rows + sum(family.row_registers(block_q, dtype) for kind, dtype in params if kind is Kind.QUERY)
 
 
@@ -1844,7 +1846,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     if codes:
         phases += _converted(block_k, value_width if width is None else width, value_width)
     walked = (max(resources.live_registers(family, carried, *phases, *products), scored)
-              + _held_registers(family, block_q, params, residuals=residuals)
+              + _held_registers(family, block_q, params, residuals=residuals, natural=natural)
               + (_started_rows(family, block_q) if started else 0))
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
 
@@ -2034,6 +2036,18 @@ TRAINING_ROWS = 5
 denominator and the anchor it carries, and its anchor reduction's shuffled and loaded rows (the corrected IR
 live set, ET-HOOKBREAK at the held term: 3 carried rows and 2 at the peak's shuffle beside its tiles, 174 and
 176 at 64 x 64 and width 64 where the model without them held 164 and 166)."""
+
+
+INFERENCE_ROWS = 5
+"""The per-query rows an inference fold walk holds at its peak (`forward_registers`), its denominator's
+reduction (`attention_algebra.plain_step`'s `weighed`): its denominator and new maximum carried, the factor
+its sums and denominator take, and the reduction's partial and shuffled rows. Priced none, an H100's two
+consumers at 64 x 128, width 128, priced 160 and spilled 48 bytes at their 168 (the base sync's training
+step's output walk, 2ee20e39c); ptxas's least spill-free cap ran 9 to 24 past the model at every width and
+key tile (FS-FOLD-CAUSAL, FS-FOLD-FULL). Its natural form takes none: its exponential's terms price it at or
+past ptxas's need without them (the same census: 160 where 152 held, 224 where 200); nor a family whose
+scalars are a measured whole (`Family.scalars_whole`, mma.sync's), which holds them: an A100's inference walk
+at width 128 held unnarrowed in 247 of its 255 (et-a100-infer3)."""
 
 
 STATISTICS = MappingProxyType({"peak": jnp.float32, "total": jnp.float32, "anchor": jnp.float32,

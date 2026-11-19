@@ -276,45 +276,66 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
             source_route(refused)
 
 
-def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
+TIER_THREE = {
+    # BERT configured as a decoder (`is_decoder`), each position reading the tokens before it.
+    "bert-decoder": (lambda: tiny_config("bert", is_decoder=True).to_dict(), "admitted"),
+    # A rotary whose tables transformers recomputes from each call's positions (dynamic NTK), its tables
+    # computed in the trace (`functional_rotaries`).
+    "cohere-dynamic-ntk": (lambda: tiny_config("cohere", rope_parameters={
+        "rope_type": "dynamic", "rope_theta": 10000.0, "factor": 2.0}).to_dict(), "admitted"),
+    # Longcat Flash routes its top 12 of routed and identity experts; the probe shrinks all three under
+    # the config's own keys (`moe_topk`), so its shrunken router routes within its experts.
+    "longcat-flash": (lambda: tiny_config(
+        "longcat_flash", n_routed_experts=16, zero_expert_num=8, moe_topk=12, num_key_value_heads=4,
+        q_lora_rank=32, kv_lora_rank=16, qk_nope_head_dim=8, qk_rope_head_dim=8, head_dim=8, v_head_dim=8,
+        expert_ffn_hidden_size=32, num_layers=1, num_hidden_layers=2).to_dict(), "admitted"),
+    # Configured as an encoder, BERT reads the later tokens too.
+    "bert-encoder": (lambda: tiny_config("bert", is_decoder=False).to_dict(), "refused"),
+    # BioGPT's training forward draws its layer drop on the host, which a traced step would fix.
+    "biogpt": (lambda: tiny_config("biogpt").to_dict(), "refused"),
+    # Tier 3 reads float weights.
+    "cohere-gptq": (lambda: {**tiny_config("cohere").to_dict(), "quantization_config": {
+        "quant_method": "gptq", "bits": 4, "group_size": 64, "desc_act": False, "sym": True}}, "refused"),
+    # A speculative drafter is no model on its own, whatever its type.
+    "cohere-drafter": (lambda: {**tiny_config("cohere").to_dict(), "num_target_layers": 4}, "drafter"),
+    # Of 8 positions the shrunken model does not run at the probe's length, and qualifies on its full
+    # config (`torchax_fallback.qualified`, ledger 1595): a BERT decoder runs, causal by its program, and a
+    # BERT encoder is refused, its attention reading later keys, not for a probe that could not run.
+    "bert-decoder-8": (lambda: tiny_config("bert", is_decoder=True, max_position_embeddings=8).to_dict(),
+                       "admitted"),
+    "bert-encoder-8": (lambda: tiny_config("bert", is_decoder=False, max_position_embeddings=8).to_dict(),
+                       "refused by its program"),
+}
+"""Tier 3's cases: each config, and whether its route is tier 3's (`TorchRoute`), refused, refused as a
+drafter (`DrafterRefused`) or refused by its admission, not for a probe that could not run."""
+
+
+@pytest.mark.parametrize("case", list(TIER_THREE))
+def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest(case):
     """Tier 3 runs an unregistered type's forward only where it is a causal LM tier 3 can train, each
-    refusal its own: BERT configured as a decoder (`is_decoder`) is one, each position reading the
-    tokens before it, and configured as an encoder it reads the later tokens too and is refused; a
-    speculative drafter is no model on its own (`DrafterRefused`), whatever its type; a rotary whose
-    tables transformers recomputes from each call's positions (dynamic NTK) is admitted, its tables
-    computed in the trace (`functional_rotaries`); BioGPT's
-    training forward draws its layer drop on the host, which a traced step would fix; a quantized
-    source is refused, tier 3 reading float weights; and one whose shrunken model does not run at the
-    probe's length qualifies on its full config instead (`torchax_fallback.qualified`, ledger 1595): a
-    BERT decoder of 8 positions runs, causal by its program, and a BERT encoder of 8 is refused, its
-    attention reading later keys."""
+    refusal its own (`TIER_THREE`): BERT configured as a decoder (`is_decoder`) is one, each position
+    reading the tokens before it, and configured as an encoder it reads the later tokens too and is
+    refused; a speculative drafter is no model on its own (`DrafterRefused`), whatever its type; a rotary
+    whose tables transformers recomputes from each call's positions (dynamic NTK) is admitted, its tables
+    computed in the trace (`functional_rotaries`); BioGPT's training forward draws its layer drop on the
+    host, which a traced step would fix; a quantized source is refused, tier 3 reading float weights; and
+    one whose shrunken model does not run at the probe's length qualifies on its full config instead
+    (`torchax_fallback.qualified`, ledger 1595): a BERT decoder of 8 positions runs, causal by its
+    program, and a BERT encoder of 8 is refused, its attention reading later keys."""
     from dew.interop import decoder_parts, verify
     from dew.interop.routes import TorchRoute, source_route
 
-    assert isinstance(source_route(tiny_config("bert", is_decoder=True).to_dict()), TorchRoute)
-    dynamic = {"rope_type": "dynamic", "rope_theta": 10000.0, "factor": 2.0}
-    assert isinstance(source_route(tiny_config("cohere", rope_parameters=dynamic).to_dict()), TorchRoute)
-    # Longcat Flash routes its top 12 of routed and identity experts; the probe shrinks all three
-    # under the config's own keys (`moe_topk`), so its shrunken router routes within its experts.
-    longcat = tiny_config("longcat_flash", n_routed_experts=16, zero_expert_num=8, moe_topk=12,
-                          num_key_value_heads=4, q_lora_rank=32, kv_lora_rank=16, qk_nope_head_dim=8,
-                          qk_rope_head_dim=8, head_dim=8, v_head_dim=8, expert_ffn_hidden_size=32,
-                          num_layers=1, num_hidden_layers=2)
-    assert isinstance(source_route(longcat.to_dict()), TorchRoute)
-    cohere = tiny_config("cohere").to_dict()
-    for refused in (tiny_config("bert", is_decoder=False).to_dict(),
-                    tiny_config("biogpt").to_dict(),
-                    {**cohere, "quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 64,
-                                                       "desc_act": False, "sym": True}}):
-        with pytest.raises(ValueError):
-            source_route(refused)
-    with pytest.raises(decoder_parts.DrafterRefused):
-        source_route({**cohere, "num_target_layers": 4})
-    assert isinstance(source_route(tiny_config("bert", is_decoder=True, max_position_embeddings=8).to_dict()),
-                      TorchRoute)
-    with pytest.raises(ValueError) as refused:
-        source_route(tiny_config("bert", is_decoder=False, max_position_embeddings=8).to_dict())
-    assert not isinstance(refused.value, verify.ProbeUnavailable)
+    config, expected = TIER_THREE[case]
+    if expected == "admitted":
+        assert isinstance(source_route(config()), TorchRoute)
+    elif expected == "drafter":
+        with pytest.raises(decoder_parts.DrafterRefused):
+            source_route(config())
+    else:
+        with pytest.raises(ValueError) as refused:
+            source_route(config())
+        if expected == "refused by its program":
+            assert not isinstance(refused.value, verify.ProbeUnavailable)
 
 
 def test_a_bidirectional_encoder_offered_as_a_causal_lm_is_refused_by_its_programs_walk(tmp_path):

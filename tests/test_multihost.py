@@ -160,9 +160,7 @@ def gang_pool(mode, directory: Path, processes: int, *, timeout=600, start=spawn
         mine = {"failed": f"rank {RANK}: {failure}"}
         raise
     finally:
-        for process in running.values():
-            if process.poll() is None:
-                terminate(process)
+        terminate(list(running.values()))
         parts = exchange(sequence, mine)
     failed = [part["failed"] for part in parts if "failed" in part]
     if failed:
@@ -210,14 +208,14 @@ def lost_host(sequence: int, tmp_path: Path) -> list:
     alive = process.poll() is None
     killed = time.monotonic()
     if RANK == 1:
-        terminate(process)
+        terminate([process])
     outcome = None
     if RANK == 0:
         try:
             output(process, 600)
             outcome = process.returncode
         except subprocess.TimeoutExpired:
-            terminate(process)
+            terminate([process])
     return [alive, outcome, time.monotonic() - killed]
 
 

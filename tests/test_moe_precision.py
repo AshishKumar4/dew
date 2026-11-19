@@ -290,11 +290,12 @@ def _tile_gate(kernel, width, features):
     rows = int(TILE_SIZES.sum())
 
     def draw(seed):
+        # NumPy's, formed on no device: the gate traces its launches' configs on a first draw outside its
+        # site, which a GPU tier's prepare, computing on no device, takes as it is (row 8077).
         rng = np.random.default_rng(seed)
-        return (jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16),
-                jnp.asarray(rng.normal(size=(len(TILE_SIZES), width, features)) / np.sqrt(width),
-                            jnp.float32),
-                jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16))
+        return (rng.normal(size=(rows, width)).astype(jnp.bfloat16),
+                (rng.normal(size=(len(TILE_SIZES), width, features)) / np.sqrt(width)).astype(np.float32),
+                rng.normal(size=(rows, features)).astype(jnp.bfloat16))
 
     @as_given
     def truth(x, kernel_matrix, dy):

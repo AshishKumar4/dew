@@ -87,6 +87,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.batch import Coordinates, prefix_sum, valid_order
 from dew.newton_schulz import NEWTON_SCHULZ, newton_schulz
 from dew.nn import linear
+from dew.nn.activations import logistic
 from dew.nn.dense import Dense
 from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
@@ -339,7 +340,7 @@ class InContextMemory(LinearProducts):
         """The gate's value a token and head `[B, S, H]`, in at least float32."""
         if gate.value is not None:
             return rows_like(jnp.full((*x.shape[:2], self.heads), gate.value, at_least_fp32(self.dtype)), x)
-        return gate.scale * jax.nn.sigmoid(self._logit(name, gate, x))
+        return gate.scale * logistic(self._logit(name, gate, x))
 
     def _kept(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
         """The share `a = 1 - alpha` of the network each token keeps `[B, S, H]` and its log, in at least
@@ -356,7 +357,7 @@ class InContextMemory(LinearProducts):
         # log(1 - s sigmoid(z)) = log((1 - s) + e^-z) - log(1 + e^-z): finite wherever s is at most one,
         # where the sigmoid rounds to one included.
         log_kept = jnp.logaddexp(jnp.log1p(-gate.scale), -logit) - softplus(-logit)
-        return 1 - gate.scale * jax.nn.sigmoid(logit), log_kept
+        return 1 - gate.scale * logistic(logit), log_kept
 
     def _heads(self, features: int) -> tuple[_Head, ...]:
         """Each head's network as this call computes it (`_Head`).

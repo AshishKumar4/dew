@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import GateFailure, _drawn, as_given, assert_as_exact, seeds_for
+from reference_error import GateFailure, _drawn, as_given, as_recorded, assert_as_exact, seeds_for
 
 from dew.parity import RESOLUTION
 
@@ -70,10 +70,10 @@ def test_an_orbit_judges_each_arms_worst_row_over_the_same_orders():
     assert raised.type is GateFailure
     assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds,
                     orders=_swapped)
-    over = _drawn(_left_to_right, _outer_first, _cancelling_draw, range(8), orders=_swapped)
+    [over] = _drawn(_left_to_right, _outer_first, _cancelling_draw, range(8), orders=_swapped)
     # Each order alone, its truth the same sums in float64 (exact: three float32 terms).
     at = [_drawn(_left_to_right, _outer_first, lambda seed, k=k: _swapped(_cancelling_draw(seed))[k],
-                 range(8)) for k in range(2)]
+                 range(8))[0] for k in range(2)]
     np.testing.assert_array_equal(over.worst, np.maximum(at[0].worst, at[1].worst))
     np.testing.assert_array_equal(over.mine, at[0].mine)
     np.testing.assert_array_equal(over.theirs, at[0].theirs)
@@ -154,9 +154,9 @@ def test_an_orbit_still_fails_a_sum_that_differs():
 def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
     """A recorded reference (`indexed_recording`'s, which it marks `recorded`), the site's or a further one,
     holds its recorded draws alone, and an orbit holds the draw's own order and another."""
+    @as_recorded
     def recorded(terms):
         return _outer_first(terms)
-    recorded.recorded = True
 
     with pytest.raises(ValueError):
         _drawn(_left_to_right, recorded, _cancelling_draw, range(2), orders=_swapped)

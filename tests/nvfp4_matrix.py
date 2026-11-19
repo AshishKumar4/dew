@@ -16,6 +16,7 @@ What the route serves is read from the product's own selector: the product trace
 case's generation with the packed kernel named, the route its choice reports the packed kernel.
 """
 
+import generation_support
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -41,7 +42,11 @@ XLA = {"grouped_matmul": "xla"}
 def _matrix(case: dict[str, str]) -> tuple[formats.NvFp4, np.ndarray]:
     """`case`'s NVFP4 matrix (`low_precision_support.nvfp4`, tensor scale 0.75) and its values in float64."""
     depth, width = int(case["depth"]), int(case["width"])
-    return nvfp4(depth + width, depth, width, scale=0.75)
+    # Formed on the host's CPU and held as NumPy's, as a site's draws are
+    # (`reference_error.drawn_on_the_host`): a GPU tier's prepare computes on no other device (its default a
+    # compile-only GPU's, rows 8020-8103).
+    with jax.default_device(jax.devices("cpu")[0]):
+        return jax.device_get(nvfp4(depth + width, depth, width, scale=0.75))
 
 
 def supported(case: dict[str, str]) -> bool:
@@ -84,8 +89,7 @@ def _truth(values: np.ndarray):
 
 
 @cell("nvfp4", covers=lambda case: dict(zip(AXES["nvfp4"], case, strict=True)))
-@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
-    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+@pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
     for case in CASES], ids="-".join)
 def an_nvfp4_products_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The NVFP4 product's training step of `case` on its GPU with its matrix decoded in the mainloop on par
@@ -106,3 +110,62 @@ def an_nvfp4_products_training_step_is_on_par(case: tuple[str, ...]) -> None:
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
     assert ("nvfp4", "packed") in recorded and not unnamed, (sorted(recorded), unnamed)
+
+
+SHARD_ROWS = (4, 8)
+"""A per-shard cell's tokens, `[batch, length]`: its batch split over a two-device data axis."""
+SHARD_EXPERTS, SHARD_HIDDEN, SHARD_INTERMEDIATE = 4, 256, 256
+"""A per-shard cell's GPT-OSS experts: each bank's depth whole 256s and its width whole 64s, which the packed
+kernel takes (`model_flows.GPT_OSS_PACKED`'s)."""
+
+
+def per_shard(choice: str, kernel: str) -> dict:
+    """`kernel`'s per-shard cells (`sharded.Shard`, tests/test_per_shard.py): GPT-OSS's experts with their
+    routed matrices packed NVFP4 banks (`model_flows.packed_variables`, a packed load's), every token routed
+    to every expert, as its packed model flow runs them, over tokens a two-device data axis splits, the banks
+    and the biases whole, the products `kernel` (interpreted on the CPU's devices) and every other GEMM at XLA
+    (`XLA`): the output and the gradients of the tokens, the routing weights and the biases on par with one
+    device's, from the experts in float64 over each bank's exact matrix (`model_flows.exact_banks`)."""
+    from jax.sharding import PartitionSpec
+    from model_flows import exact_banks, packed_variables
+    from sharded import Shard, layer_scope
+
+    from dew.nn.gpt_oss import GptOssExperts
+    from dew.quantization import QUANTIZATION
+
+    del choice, kernel
+    layer = GptOssExperts(SHARD_HIDDEN, SHARD_INTERMEDIATE, SHARD_EXPERTS, dtype=jnp.bfloat16)
+    indices = jnp.broadcast_to(jnp.arange(SHARD_EXPERTS, dtype=jnp.int32), (*SHARD_ROWS, SHARD_EXPERTS))
+    # Formed on the host's CPU and held as NumPy's (`_matrix`'s), the banks packed there.
+    with jax.default_device(jax.devices("cpu")[0]):
+        held = jax.device_get(packed_variables(layer.init(
+            jax.random.key(5), jnp.zeros((*SHARD_ROWS, SHARD_HIDDEN), jnp.bfloat16),
+            jnp.ones((*SHARD_ROWS, SHARD_EXPERTS), jnp.bfloat16), indices)))
+    banks = held[QUANTIZATION]
+
+    def call(params, tokens, weights):
+        return layer.apply({"params": params, QUANTIZATION: banks}, tokens, weights, indices)
+
+    def exact(params, tokens, weights):
+        # Each bank's exact matrix in float64, its tensor scale widened first (`exact_banks`).
+        wide = jax.tree.map(
+            lambda bank: formats.NvFp4(bank.words, bank.scales, jnp.asarray(bank.scale, jnp.float64)), banks,
+            is_leaf=lambda leaf: isinstance(leaf, formats.NvFp4))
+        matrices = exact_banks({QUANTIZATION: wide})[QUANTIZATION]
+        return layer.clone(dtype=jnp.float64).apply({"params": params, QUANTIZATION: matrices}, tokens,
+                                                    weights, indices)
+
+    def truth(*operands):
+        with generation.chosen(**XLA):
+            return with_gradients(exact)(*operands)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 3)
+        tokens, weights, cotangent = (jax.random.normal(key, (*SHARD_ROWS, width)).astype(jnp.bfloat16)
+                                      for key, width in zip(keys, (SHARD_HIDDEN, SHARD_EXPERTS, SHARD_HIDDEN),
+                                                            strict=True))
+        return held["params"], tokens, weights, cotangent
+
+    rows = PartitionSpec("data")
+    return {"data": Shard(with_gradients(call), draw, lambda mesh: [PartitionSpec(), rows, rows, rows], truth,
+                          SEEDS, "data", context=lambda: layer_scope(**XLA))}
