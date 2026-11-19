@@ -531,3 +531,21 @@ def test_a_gathered_load_warp_skipping_its_slots_release_wait_is_caught():
     assert len(mutated[loaders[1]]) < len(program)
     with pytest.raises(Violation):
         explore(mutated, arrivals)
+
+
+@pytest.mark.parametrize("waits", [True, False], ids=["ordered", "unordered"])
+def test_a_slot_under_a_roles_index_is_ordered_against_a_read_of_the_roles_whole(waits):
+    """A write of a role's ring's slot (`[0, 1]` of a buffer laid `[role, slot]`) and a read of the role's
+    every slot (`[0]`): one location under the other (`_located`'s leading indices, `_overlaps`), so the
+    read is ordered after the write by the barrier its thread waits on, and caught where it waits on none.
+    The role's other slot (`[0, 0]`) is a location apart from the write's, read unordered with it."""
+    writer = [Event("write", ("ring", 0, 1)), Event("arrive", ("filled", 1))]
+    apart = [Event("read", ("ring", 0, 0))]
+    reader = [Event("wait", ("filled", 1), 0)] if waits else []
+    reader.append(Event("read", ("ring", 0)))
+    if waits:
+        assert explore([writer, apart, reader], {"filled": 1}) > 0
+    else:
+        with pytest.raises(Violation) as found:
+            explore([writer, apart, [*reader, Event("wait", ("filled", 1), 0)]], {"filled": 1})
+        assert found.value.kind == "unordered"
