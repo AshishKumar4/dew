@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, get_args
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +45,7 @@ from dew.sampling.decoding import EndOfSequence, StopStrings
 from dew.sampling.text import Generation, Sampling
 
 from .clients import (
+    ENGINE_PROVIDERS,
     EngineProvider,
     OpenAICompletion,
     _engine_stops,
@@ -641,8 +642,8 @@ class SafetensorsReload:
     timeout: float = 600.0
 
     def __post_init__(self) -> None:
-        if self.engine not in get_args(EngineProvider):
-            raise ValueError("engine must be vllm or sglang")
+        if self.engine not in ENGINE_PROVIDERS:
+            raise ValueError(f"engine must be one of {', '.join(ENGINE_PROVIDERS)}")
 
     def write(self, variables: Variables) -> None:
         """Write `variables` into `directory`, replacing each file atomically.

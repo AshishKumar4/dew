@@ -46,13 +46,13 @@ import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, get_args
+from typing import TYPE_CHECKING
 
 import httpx
 
 from dew._cleanup import owned_group
 from dew._records import JSON
-from dew.inference.clients import EngineProvider
+from dew.inference.clients import ENGINE_PROVIDERS, EngineProvider
 from dew.interop.gateway import Gateway
 
 if TYPE_CHECKING:
@@ -194,17 +194,16 @@ def _recorded(exchanges: list[dict[str, JSON]]) -> type[BaseHTTPRequestHandler]:
 
 def _policy() -> tuple[HFTokenizer, list[int], list[int]]:
     """Return the model's tokenizer, the capture's one-message chat prompt as the model's template renders
-    it with the generation prompt, and the model's EOS ids from its generation config and its tokenizer."""
-    from huggingface_hub import hf_hub_download
-
+    it with the generation prompt, and the model's EOS ids from its generation config and its tokenizer,
+    both read from the one snapshot the tokenizer pinned."""
     from dew.data.chat import Conversation, render_prompt
     from dew.data.text import HFTokenizer
-    from dew.interop.generation_config import eos_ids
+    from dew.interop.generation_config import eos_ids, read_generation_config
 
     vocabulary = HFTokenizer(MODEL)
     message = Conversation.parse([{"role": "user", "content": "Say hello."}])
     prompt = render_prompt(vocabulary.tokenizer, message, "gateway capture")
-    generation = json.loads(Path(hf_hub_download(MODEL, "generation_config.json")).read_text())
+    generation = read_generation_config(Path(vocabulary.pinned.directory))
     eos = vocabulary.eos_id
     if eos is None:
         raise ValueError(f"{MODEL}'s tokenizer names no EOS, which the captures stop at")
@@ -341,11 +340,10 @@ def main() -> None:
     args = parser.parse_args()
     args.venvs.mkdir(parents=True, exist_ok=True)
     given = dict(entry.split("=", 1) for entry in args.python)
-    engines = get_args(EngineProvider)
-    if not set(given) <= set(engines):
-        parser.error(f"--python names one of {', '.join(engines)}")
+    if not set(given) <= set(ENGINE_PROVIDERS):
+        parser.error(f"--python names one of {', '.join(ENGINE_PROVIDERS)}")
     captures = args.only or ["gateway", "stops"]
-    for name in engines:
+    for name in ENGINE_PROVIDERS:
         bin = Path(given[name]).parent if name in given else venv(args.venvs, name)
         if "gateway" in captures:
             capture_gateway(name, bin, venv(args.venvs, "gateway"), args.venvs, args.out)

@@ -470,9 +470,11 @@ def _openai_fields(model: str, prompts: str | Sequence[str] | TokenRows, budget:
     return _bound(parameters, fixed), count * n
 
 
-EngineProvider = Literal["vllm", "sglang"]
-"""An OpenAI-compatible engine a completion names as its provider (`OpenAICompletion.provider`) for the
-fields it alone reads: its stops, seeds and returned ids, vLLM's or SGLang's."""
+EngineProvider = Literal["sglang", "vllm"]
+"""Provider names for SGLang and vLLM, which expose engine-specific token rollout controls."""
+
+ENGINE_PROVIDERS: tuple[EngineProvider, ...] = get_args(EngineProvider)
+"""Each engine provider (`EngineProvider`), in its declared order."""
 
 
 def _engine_stops(sampling: Sampling, provider: EngineProvider) -> Mapping[str, JSON]:
@@ -513,8 +515,8 @@ class OpenAICompletion:
     provider: Literal["openai"] | EngineProvider = "openai"
 
     def __post_init__(self) -> None:
-        if self.provider not in ("openai", *get_args(EngineProvider)):
-            raise ValueError("provider must be openai, vllm or sglang")
+        if self.provider not in ("openai", *ENGINE_PROVIDERS):
+            raise ValueError(f"provider must be one of openai, {', '.join(ENGINE_PROVIDERS)}")
 
     def _parameters(self, supplied: Mapping[str, object]) -> Mapping[str, object]:
         if "seed" in supplied:
