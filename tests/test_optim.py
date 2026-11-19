@@ -1465,8 +1465,11 @@ def test_every_objective_carries_live_qk_statistics_to_muonclip(kind, tmp_path):
     initial = trainer.initial_state()
     asked = Step(jnp.array(0), jax.random.key(1), None, qk_stats=True)
 
+    # One program, not the model's operations dispatched alone (row 7828).
+    loss = jax.jit(objective.loss)
+
     def maxima(rows):
-        _, aux = objective.loss(initial.variables, rows, asked)
+        _, aux = loss(initial.variables, rows, asked)
         assert aux.qk_stats is not None
         observed = compact_qk(aux.qk_stats)
         for name in clipped:
