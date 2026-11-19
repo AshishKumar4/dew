@@ -1834,14 +1834,14 @@ def _halved_over(pair, axis) -> tuple[jax.Array, jax.Array]:
     """A `(high, low)` pair summed over `axis` (kept; none where None), each addition's rounding kept in the
     low part: one XLA reduction of pairs (`_renormalized`), which partitions as any reduction does, so an
     axis a mesh shards is summed a shard at a time and then across (sliced in halves, its shards split at
-    a size their count does not divide, base review 9e56c760b F1), an empty axis its identity; in a compiled
-    launch's body (`launches.interpreting` False), in halves (`two_sum`), elementwise and slices alone, which
-    a Pallas TPU kernel forms."""
+    a size their count does not divide, base review 9e56c760b F1), an empty axis its identity; in a launch's
+    body (`launches.interpreting` not None), compiled or interpreted alike, in halves (`two_sum`),
+    elementwise and slices alone, which a Pallas TPU kernel forms (base review 8d59803fd F3)."""
     from dew.nn.kernels.launches import interpreting
 
     high, low = pair
     axes = () if axis is None else tuple(sorted({int(a) % high.ndim for a in np.atleast_1d(axis)}))
-    if axes and interpreting() is not False:
+    if axes and interpreting() is None:
         zero = jnp.zeros((), high.dtype)
         high, low = jax.lax.reduce((high, low), (zero, zero), _renormalized, axes)
         return jnp.expand_dims(high, axes), jnp.expand_dims(low, axes)
@@ -1978,9 +1978,11 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals
                         terms.append(products)
                         laid.append((along if along else None, (held, factor.shape)))
             gradient = _aligned_terms(terms, tuple(laid)).astype(factor.dtype)
-            # Placed as the factor is where an Explicit axis splits it: a transpose's cotangent its type's.
-            placed = explicit_spec(factor)
-            gradients.append(gradient if placed is None else jax.sharding.reshard(gradient, placed))
+            # Placed as the factor's type places it, whole too, where its mesh has an Explicit axis: a
+            # transpose's cotangent takes its operand's type (base review 8d59803fd F1).
+            placed = jax.typeof(factor).sharding
+            typed = isinstance(placed, jax.sharding.NamedSharding) and placed.mesh.explicit_axes
+            gradients.append(jax.sharding.reshard(gradient, placed) if typed else gradient)
         return gradients
 
     return generation.linear_map(applied, pulled, list(primals), list(tangents))
