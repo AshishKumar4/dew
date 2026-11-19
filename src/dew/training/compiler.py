@@ -41,7 +41,7 @@ from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
 from dew.state import Accumulation, TrainState, apart, occupied, together
 from dew.telemetry.compiles import Compiles
-from dew.telemetry.instrumentation import StepFlops
+from dew.telemetry.instrumentation import StepFlops, compiled_memory
 from dew.training._candidates import RunShape, Stepping, _shaped, candidate_for, forget, lowered_for
 from dew.training._lowering import Lowered, routed
 from dew.training.distributed import (
@@ -57,6 +57,7 @@ from dew.training.memory import (
     layer_gathers,
     local_devices,
     memory_record,
+    placed_beside,
     rung_record,
     step_fits,
     step_options,
@@ -899,10 +900,15 @@ class StepCompiler[L, E]:
             held.keep()
             plan = record(compiled.plan, "plan")
             # The search's probes, its own read at the headroom the placed devices hold (what a step's need is
-            # read from), and the placed judgement whole (`placed`): that headroom with its copies built, and
-            # the bytes it held beside the step that the allocators did not (its window, its batches).
+            # read from) with the bytes that judgement placed beside the step, not the unplaced search's
+            # charge of a state the devices held none of (row 8962: a headroom and a charge of two
+            # judgements in one record); and the placed judgement whole (`placed`): that headroom with its
+            # copies built, and the bytes it held beside the step that the allocators did not.
             held_out = judging.charged[0]
-            probes = [*probes[:own], {**probes[own], "headroom": headroom}, *probes[own + 1:]]
+            stats = compiled_memory(planned.executable)
+            beside = None if stats is None else placed_beside(stats, held_out)
+            probes = [*probes[:own], {**probes[own], "headroom": headroom, "beside": beside},
+                      *probes[own + 1:]]
             memory = memory_record(planned.executable, local_devices(mesh), held_out, fits=True)
             compiled = dataclasses.replace(
                 compiled, plan={**plan, "probes": probes, "placed": {"headroom": headroom, "held": held_out}},
