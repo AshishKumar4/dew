@@ -366,10 +366,10 @@ def test_a_walked_placement_takes_only_the_launch_it_is_written_for(pin):
 @pytest.mark.parametrize("call", ["full", "causal"])
 def test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_interleaving(call):
     """The fused keys-first dK/dV launch on a B200 (`KEYS_TILES["fused"]` at width 64: each compute
-    warpgroup's step's dQ filled a slot at a time into its ring, which the reducer warp's TMA adds read, a
+    warpgroup's step's dQ filled a slot at a time into its ring, which its reducer warp's TMA adds read, a
     slot's fill and free a barrier's phase each, `attention_mosaic_dkv._PlacedDq`), traced as a B200 builds
     it over 128 keys and four query steps, the full call's and the causal's (whose program walks fewer):
-    every interleaving of its compute warpgroups, its load, issuer and reducer warps and its copies'
+    every interleaving of its compute warpgroups, its load, issuer and two reducer warps and its copies'
     landings explored (`ring_protocol.explore`), no deadlock, every barrier's phase whole and observed, and
     no slot written while an add still reads it."""
     from ring_protocol import explore, programs
@@ -395,7 +395,7 @@ def test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_inte
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
 def test_a_fused_walk_and_its_dq_reducer_compile_spill_free_on_a_b200(width):
-    """The fused keys-first backward (`KEYS_TILES["fused"]`: its dQ ring drained by the reducer warp's TMA
+    """The fused keys-first backward (`KEYS_TILES["fused"]`: its dQ rings drained by their reducer warps' TMA
     adds, `attention_mosaic_dkv._PlacedDq`) at widths 64 and 128 over 512 causal tokens, four query heads
     over two, compiled by ptxas for a compile-only B200: its launch lowers, the reducer's barrier waits,
     adds and arrivals among it, and spills nothing (`mosaic_failures`)."""

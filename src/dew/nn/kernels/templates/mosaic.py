@@ -1620,15 +1620,15 @@ class Transport[Allocated, Opened](abc.ABC):
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
                   exclusive: bool = False, issuer: Callable | None = None, reducer: Callable | None = None):
         """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)`, `producer()`,
-        `issuer()` where it issues on a role (`Issuer.places_on_role`) and `reducer()` on a warp of its own
-        (`handoffs.REDUCER`), each a branch of one switch where `exclusive`; the consumers' value, if any."""
+        `issuer()` where it issues on a role (`Issuer.places_on_role`) and `reducer(index)` on a warp a
+        consumer (`handoffs.REDUCER`), each a branch of one switch where `exclusive`; the consumers' value."""
         schedule = self.roles(consumers, floor)
-        schedule = schedule if reducer is None else schedule.joined(handoffs.REDUCER)
-        # The producer, the issuer and the reducer one unit each, of no index (`handoffs.Schedule.run`'s).
-        units = {"producer": producer, "issuer": issuer, "reducer": reducer}
-        return schedule.run(exclusive=exclusive, **{role.name: consumer if role.name == "consumer" else
-                                                    (lambda index, body=units[role.name]: body())
-                                                    for role in schedule.roles})
+        schedule = schedule if reducer is None else schedule.joined(handoffs.REDUCER, consumers)
+        # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
+        units = {"producer": producer, "issuer": issuer}
+        bodies = {"consumer": consumer, "reducer": reducer, **{name: lambda index, body=body: body()
+                                                               for name, body in units.items()}}
+        return schedule.run(exclusive=exclusive, **{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
         """A program's `streams` (`streams`') by lifetime (`resources.Scope`): those the program holds whole,

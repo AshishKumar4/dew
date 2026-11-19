@@ -350,29 +350,37 @@ class _PlacedDq:
             plgpu.commit_smem()
             plgpu.barrier_arrive(filled.at[at])
 
-    def reduced(self, lo, hi) -> None:
-        """The reducer's adds of the walk's steps `lo` to `hi`, its compute warpgroups' in turn (step `n`
-        the warpgroup of its turn's, `placed.TURNS`), each piece once its warpgroup has filled its slot
-        (`filled`), its slot freed once the add has read it (`emptied`); its last adds' reads done before the
-        program ends. Interpreted, nothing: each warpgroup adds its own (`added`)."""
+    def reduced(self, lo, hi, role: int) -> None:
+        """A compute warpgroup's (`role`'s) reducer: the adds of its steps among the walk's `lo` to `hi` (step
+        `n` the warpgroup's of its turn, `placed.TURNS`), each piece once filled (`filled`), each slot freed
+        once the add after it is issued and its own read done (`emptied`), two adds reading at once; its last
+        freed and its adds done before the program ends. A reducer a role: one serving both took each
+        role's whole step in turn, the other's filling waiting on it. Interpreted, nothing (`added`)."""
         if self.walk.interpret:
             return
         stage, filled, emptied = self.stages[1:]
-        block_q = self.walk.program.tiles.block_q
+        block_q, pieces = self.walk.program.tiles.block_q, self.pieces()
 
-        def step(n, carry):
-            role, ordinal = lax.rem(n, placed.TURNS), lax.div(n, placed.TURNS)
-            view = self._view((lo + n) * block_q)
-            for index, (first, columns) in enumerate(self.pieces()):
+        def freed(last) -> None:
+            # The add before the one just issued read: its slot free (the walk's first has none before it).
+            pl.when(last >= 0)(lambda: plgpu.barrier_arrive(emptied.at[last]))
+
+        def step(ordinal, last):
+            view = self._view((lo + role + placed.TURNS * ordinal) * block_q)
+            for index, (first, columns) in enumerate(pieces):
                 turn, at = self._turn(role, ordinal, index)
                 plgpu.barrier_wait(filled.at[at], phase=turn.rotation)
                 plgpu.copy_smem_to_gmem(stage.at[role, turn.slot], view.at[:, pl.ds(first, columns)],
                                         reduction_op="add")
-                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                plgpu.barrier_arrive(emptied.at[at])
-            return carry
+                plgpu.wait_smem_to_gmem(1, wait_read_only=True)
+                freed(last)
+                last = jnp.asarray(at, jnp.int32)
+            return last
 
-        lax.fori_loop(0, jnp.maximum(hi - lo, 0), step, None)
+        steps = lax.div(jnp.maximum(hi - lo - role, 0) + placed.TURNS - 1, placed.TURNS)
+        last = lax.fori_loop(0, steps, step, jnp.int32(-1))
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+        freed(last)
         plgpu.wait_smem_to_gmem(0)
 
     def drained(self, lo, hi, role: int) -> None:
@@ -768,7 +776,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             family.stream, streams, views, *streamed), functools.partial(
             _keys_first_issued, walk, streams, reached, first=streamed[0],
             resident=(k_smem, v_smem, k_loaded, v_loaded), staged=fused_stages, shares=shares),
-            reducer=None if ring is None else lambda: ring.reduced(*reached()[:2]))
+            reducer=None if ring is None else lambda role: ring.reduced(*reached()[:2], role))
 
     scoped, rings, after = _dkv_allocations(family, program.tiles, width, value_width, query.dtype,
                                             stages=stages, columns=program.tiles.columns, tiled=tiled,
