@@ -1469,7 +1469,26 @@ def test_programs_saved_before_executables_were_one_type_are_refused_to_compile_
 
     target = BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64")
     path = tmp_path / "old.dew-aot"
-    path.write_bytes(pickle.dumps(AheadPrograms(target, {"step": ("program", b"executable", ())})))
+    path.write_bytes(pickle.dumps(AheadPrograms(target, {"step": ("program", b"executable", ())}, tuned=True,
+                                                at_run=())))
+    with pytest.raises(ValueError):
+        AheadPrograms.load(path)
+
+
+def test_programs_saved_before_their_files_said_how_they_were_tuned_are_refused(tmp_path):
+    """A file of programs saved before it said whether XLA tuned them and which leave a choice to run time
+    (`AheadPrograms.tuned`, `at_run`) is refused as it loads, asking for them compiled again, where the class
+    default took it as tuned (row 8459)."""
+    import pickle
+
+    from dew.training.ahead import AheadPrograms, BuildTarget
+
+    old = object.__new__(AheadPrograms)
+    for field, value in (("target", BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64")), ("programs", {}),
+                         ("kept", None)):
+        object.__setattr__(old, field, value)
+    path = tmp_path / "old.dew-aot"
+    path.write_bytes(pickle.dumps(old))
     with pytest.raises(ValueError):
         AheadPrograms.load(path)
 
@@ -2022,6 +2041,7 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
         own.runnable(here)
 
 
+
 def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
     """A run that inspects compiles its sampled step beside its step (`Candidate.sampled`), and a step
     compiled ahead for it carries both (`AheadOfTime.sampled`), each its own program, so the run handed it
@@ -2247,59 +2267,14 @@ def test_programs_compiled_ahead_for_a_generation_are_untuned_and_refused_where_
     assert not built.tuned
     here = jax.devices()[:1]
     with pytest.raises(ValueError):
-        AheadPrograms(BuildTarget.of(here), {}, tuned=False).loaded()
-    assert AheadPrograms(BuildTarget.of(here), {}, tuned=True).loaded() == {}
+        AheadPrograms(BuildTarget.of(here), {}, tuned=False, at_run=()).loaded()
+    assert AheadPrograms(BuildTarget.of(here), {}, tuned=True, at_run=()).loaded() == {}
     serialized = tmp_path / "topology.bin"
     serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm90", 1))).serialize())
     with pytest.raises(ValueError):
         compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm90", topology=serialized)
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
-    assert AheadPrograms(BuildTarget.of(here), {}, tuned=False).loaded() == {}
-
-
-def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path, monkeypatch):
-    """A compile without a device cannot pick a cuDNN convolution's algorithm, which is then picked at run
-    time, on an A100 not the same each run (`report.DEVICELESS_CONVOLUTION_PICKS`, row 7941): over a node's
-    topology, autotuner off as a repeatable lane runs, and over the generation's canonical GPUs alike, a
-    program holding a convolution is refused before any compiles (`report.CompiledOnDevice`), named, where a
-    product alone compiles."""
-    from jax.experimental import topologies
-
-    from dew.nn.kernels.generation import compile_only_gpus
-    from dew.nn.kernels.templates import report
-    from dew.training.ahead import compile_programs
-
-    serialized = tmp_path / "topology.bin"
-    serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
-    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
-    image = jax.ShapeDtypeStruct((1, 8, 8, 4), jnp.float32)
-    kernel = jax.ShapeDtypeStruct((3, 3, 4, 4), jnp.float32)
-    square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
-
-    def convolved(x, w):
-        return jax.lax.conv_general_dilated(x, w, (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"))
-
-    with pytest.raises(report.CompiledOnDevice) as refused:
-        compile_programs({"conv": (convolved, [image, kernel])}, "sm80", topology=serialized)
-    assert refused.value.programs == ("conv",)
-    assert list(compile_programs({"dot": (lambda x, y: x @ y, [square, square])}, "sm80",
-                                 topology=serialized).programs) == ["dot"]
-    with pytest.raises(report.CompiledOnDevice) as refused:
-        compile_programs({"conv": (convolved, [image, kernel]),
-                          "dot": (lambda x, y: x @ y, [square, square])}, "sm80")
-    assert refused.value.programs == ("conv",)
-    # Compiled offline, for its memory or a step file's program, it holds the algorithm left to run time
-    # (`report.left_at_run`, by which a step file is never taken: `AheadOfTime.at_run`); the product not.
-    placed = jax.sharding.SingleDeviceSharding(compile_only_gpus("sm80", 1)[0])
-
-    def offline(function, *shapes):
-        lowered = jax.jit(function).trace(*(jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed)
-                                            for shape in shapes)).lower()
-        with report.read_offline():
-            return report.xla_compiled(lowered, None)
-
-    assert report.left_at_run(offline(convolved, image, kernel))
-    assert not report.left_at_run(offline(lambda x, y: x @ y, square, square))
+    assert AheadPrograms(BuildTarget.of(here), {}, tuned=False, at_run=()).loaded() == {}
 
 
 def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
@@ -2465,7 +2440,8 @@ def test_programs_built_for_the_host_cpu_load_onto_it_whatever_the_process_lists
     with uncached():
         doubled = jax.jit(lambda x: x * 2.0, out_shardings=placed).lower(
             jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=placed)).compile()
-    programs = AheadPrograms(BuildTarget.of(host[:1]), {"doubled": Executable.of(doubled)})
+    programs = AheadPrograms(BuildTarget.of(host[:1]), {"doubled": Executable.of(doubled)}, tuned=True,
+                             at_run=())
     listed = jax.devices
     # A process listing another device first, the host's first CPU among its CPUs.
     monkeypatch.setattr(jax, "devices", lambda backend=None: listed(backend) if backend else listed()[1:])

@@ -1173,9 +1173,6 @@
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[near the least normal-second orders, staged]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-grad of grad]"
 ],
-"tests/test_contracts_sampling.py": [
-"tests/test_contracts_sampling.py::test_a_transitions_quadratic_term_holds_every_order[near the least normal]"
-],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_cached_document_reads_its_own_context_without_it[the layer's attention]",
 "tests/test_cross_attention.py::test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it",
@@ -1580,7 +1577,7 @@
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[keys near fp32's largest at equal logits-float16-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[small values beside unseen ones near fp32's largest, float32-float16-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[ties at scale 1/4, cotangents near 2**125-float16-fast]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[values near fp32's largest over 2 equal keys-float16-accurate]"
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[values near fp32's largest over 2 equal keys-float16-fast]"
 ],
 "tests/test_diffusion_gemma_workflow.py": [
 "tests/test_diffusion_gemma_workflow.py::test_public_pipeline_source_storage_and_saved_block_compute_are_independent",
@@ -2326,7 +2323,7 @@
 "tests/test_lowering.py::test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh[sm90-attention]"
 ],
 "tests/test_mamba.py": [
-"tests/test_mamba.py::test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones[right_padded]"
+"tests/test_mamba.py::test_a_rate_past_float32s_range_scans_as_the_recurrence[64-a decay of e^-3]"
 ],
 "tests/test_mamba2.py": [
 "tests/test_mamba2.py::test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones[empty_shard]",
