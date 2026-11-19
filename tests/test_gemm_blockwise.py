@@ -73,15 +73,16 @@ def _gradient_operands(seed: int) -> tuple:
     block's depth rows' and columns' scales."""
     rng = np.random.default_rng(seed)
     rows = 128 * sum(GRADIENT_BLOCKS)
-    return (jnp.asarray(rng.normal(size=(GRADIENT_DEPTH, rows)), jnp.float8_e4m3fn),
-            jnp.asarray(rng.normal(size=(GRADIENT_WIDTH, rows)), jnp.float8_e4m3fn),
-            jnp.asarray(rng.uniform(0.5, 2.0, size=(rows // 128, GRADIENT_DEPTH)), jnp.float32),
-            jnp.asarray(rng.uniform(0.5, 2.0, size=(rows // 128, GRADIENT_WIDTH)), jnp.float32))
+    # NumPy's, as a site's draws are: a GPU tier's prepare computes on no device.
+    return (rng.normal(size=(GRADIENT_DEPTH, rows)).astype(jnp.float8_e4m3fn),
+            rng.normal(size=(GRADIENT_WIDTH, rows)).astype(jnp.float8_e4m3fn),
+            rng.uniform(0.5, 2.0, size=(rows // 128, GRADIENT_DEPTH)).astype(np.float32),
+            rng.uniform(0.5, 2.0, size=(rows // 128, GRADIENT_WIDTH)).astype(np.float32))
 
 
 def _gradient(kernel: str, interpret: bool = False):
     """The blockwise FP8 kernel gradient of `_gradient_operands`, its selector naming `kernel`."""
-    blocks = jnp.asarray(GRADIENT_BLOCKS, jnp.int32)
+    blocks = np.asarray(GRADIENT_BLOCKS, np.int32)
 
     def gradient(*operands):
         with generation.chosen(blockwise_fp8=kernel):
