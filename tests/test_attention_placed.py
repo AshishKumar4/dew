@@ -131,13 +131,13 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
     for i, event in enumerate(issuer):
         if event.kind == "write":
             written_at.setdefault(event.at, i)
-        elif event.kind == "product" and not event.at:
+        elif event.kind == "product" and len(event.argument) == 1:
             copied_smem.update(event.argument)
     assert len(written_at) == tiles.consumers
     assert len(copied_smem) == tiles.consumers
-    # Score MMAs are products that write into logits (not weigh MMAs that write into sums and read weights).
+    # Score MMAs are 2-operand products reading a consumer's initialized Q TMEM ref.
     score_mmas = [(i, event) for i, event in enumerate(issuer)
-                  if event.kind == "product" and event.at
+                  if event.kind == "product" and len(event.argument) == 2
                   and any(src in written_at for src in event.argument)]
     assert len(score_mmas) >= tiles.consumers
     read_q = set()

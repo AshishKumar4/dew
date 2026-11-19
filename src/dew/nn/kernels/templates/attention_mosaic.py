@@ -843,8 +843,7 @@ class MosaicForward(_Mainloop[Tiles]):
                       if config.block_k % block == 0)
         relaunch = next((tiles for tiles in relaunches
                          if self._launch_legal(ba, tiles, target, decides=decides)
-                         and self.proposes(ba, tiles, target,
-                                           registers=self.registers(ba, tiles, decides=decides))),
+                         and self.proposed(ba, tiles, target, self.registers(ba, tiles, decides=decides))),
                         None)
         if relaunch is None:
             return None
@@ -956,8 +955,6 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def tmem_columns(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
-        if not scopes_products(family):
-            return 0
         return family.product_columns(self._products(ba, config, target))
 
     def _ahead(self, ba: tokamax.BoundArguments, config: Tiles) -> bool:

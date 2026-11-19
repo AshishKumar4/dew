@@ -30,13 +30,6 @@ _DERIVED: collections.OrderedDict[Hashable, Hashable] = collections.OrderedDict(
 `_cache.holding`), the least recently read first."""
 
 
-class _Omitted:
-    """Sentinel distinguishing an omitted register estimate from an explicit `None` (`Template.held`)."""
-
-
-_OMITTED = _Omitted()
-
-
 def _derived_once(derive: Callable) -> Callable:
     """A launch's `derived`, run once for what it reads: the call, the target and the configs its compiles
     refused (`report.derivation_inputs`), and the run's numerics, its algebra pass and its kernel choices,
@@ -136,11 +129,15 @@ class Template[Config: Hashable](tuning.KernelOp):
         derivation steps past it (`report.refused`)."""
         return self.legal(ba, config, target) and self.proposes(ba, config, target)
 
-    def proposes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget, *,
-                 registers: int | None | _Omitted = _OMITTED) -> bool:
+    def proposes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
         """Whether the derivation offers `config` for `ba` on `target` to its legality: any config where the
         call ranks alone (`ranks_alone`), else one its register model holds (`held`)."""
-        return self.ranks_alone(ba, target) or self.held(ba, config, registers=registers)
+        return self.proposed(ba, config, target, self.registers(ba, config))
+
+    def proposed(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget,
+                 registers: int | None) -> bool:
+        """`proposes` at an explicit register estimate `registers` (`within`, row 9108)."""
+        return self.ranks_alone(ba, target) or self.within(registers, config)
 
     def program_shared(self, config: Config, target: generation.GpuTarget) -> int:
         """The shared memory a program of the launch at `config` may stage on `target`: a block's
@@ -171,14 +168,15 @@ class Template[Config: Hashable](tuning.KernelOp):
         """Whether `config` is of the launch's config type (`config_cls`)."""
         return isinstance(config, self.config_cls)
 
-    def held(self, ba: tokamax.BoundArguments, config: Config, *,
-             registers: int | None | _Omitted = _OMITTED) -> bool:
+    def held(self, ba: tokamax.BoundArguments, config: Config) -> bool:
         """Whether the launch's register model proposes `config` (`takes`): its threads' modeled registers
-        (`registers`, or `self.registers(ba, config)` when omitted) within `register_budget`; a launch
-        stating none (a TPU's, the XLA program's) proposes any. A proposal, not legality: the assembler's
-        compile decides (`legal`)."""
-        priced = self.registers(ba, config) if isinstance(registers, _Omitted) else registers
-        return priced is None or priced <= self.register_budget(config)
+        (`registers`) within `register_budget`; a launch stating none (a TPU's, the XLA program's) proposes
+        any. A proposal, not legality: the assembler's compile decides (`legal`)."""
+        return self.within(self.registers(ba, config), config)
+
+    def within(self, registers: int | None, config: Config) -> bool:
+        """Whether register estimate `registers` fits `config`'s `register_budget` (None fits any)."""
+        return registers is None or registers <= self.register_budget(config)
 
     def offering(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
         """The configs the launch offers the call `ba` on `target`, in its order, its refusals read: those
