@@ -74,6 +74,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, tracing
 from dew.objectives.base import (
     Aux,
+    Held,
     Initializer,
     Metric,
     Objective,
@@ -445,21 +446,19 @@ class Trainer(Generic[Loss, Effects]):
         ready_process()  # A key given here opens the backend as the run's does (`key`).
         key = self.key if key is None else request_key(key)
         if not self.host_master and jax_core.trace_state_clean():
-            # Outside any trace, one program, not each operation's (`drawn_once`): the moving state its
-            # buffers, the frozen tree the held arrays. This body's, not the bound override's, which then
-            # changes it once (row 8730). A state held on the host takes the arrays over as it is placed.
+            # Outside any trace one program of this body, the frozen tree the held arrays (`drawn_once`;
+            # rows 8682, 8730). A state held on the host takes the arrays over as it is placed.
             stated = self._step_key(self.objective, self._compiler)
             return drawn_once(self._fresh_state, initializer, key, lambda state: apart(state)[1],
-                              kept=stated and (stated, type(self), "fresh"))
+                              kept=stated and (stated, self._start_owner(), "fresh"))
         return self._fresh_state(initializer, key)
 
     def _fresh_state(self, initializer: Initializer, key: jax.Array) -> TrainState:
         """`initial_state`'s body, which an override reaches through the base alone (`super()`)."""
         init_key, run_key = jax.random.split(key)
         initialized = initializer(init_key)
-        # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
-        # mapping or a list) the objective's tree came in, so its placement, its updates, the
-        # collections a step writes back (`write_back`) and its restores share one structure.
+        # The state's trees as dicts of its own, whichever Flax container they came in, so its placement,
+        # updates, written-back collections (`write_back`) and restores share one structure.
         params = drawn_in(owned_dicts(unboxed(initialized)), self.param_dtype, self.objective)
         if "params" not in params:
             raise ValueError(
@@ -496,6 +495,11 @@ class Trainer(Generic[Loss, Effects]):
         """`state` with a stage-local run's layers back on `layers_N`, whole on every stage, every mirror
         alike: for a reader by layer name (an export), at the cost of every layer on every device."""
         return self._staging.stored(state)
+
+    def _start_owner(self) -> Hashable:
+        """A fresh state's kept trace's owner: the class, or the instance where it overrides `initial_state`,
+        which may read its own fields (row 8956: two instances of one subclass shared the first's)."""
+        return Held(self) if type(self).initial_state is not Trainer.initial_state else type(self)
 
     def _staged_start(self, initializer: Initializer | None = None, key: int | jax.Array | None = None
                       ) -> TrainState:
@@ -577,7 +581,7 @@ class Trainer(Generic[Loss, Effects]):
         setting the step reads; its links the candidate's key's (row 6022). None where a value states none of
         it: an objective that states no trace, a custom step, a device step or a setting compared by identity
         (`frozen_value`), a loss scale given built, stated links, or a run measuring its kernels' configs."""
-        from dew.objectives.base import UNKEYED, Held, frozen_value, stated_trace
+        from dew.objectives.base import UNKEYED, frozen_value, stated_trace
 
         stated = stated_trace(objective)
         if (stated is None or self.step is not None or self._scaled is None or compiler.stated_links
@@ -782,7 +786,7 @@ class Trainer(Generic[Loss, Effects]):
         with report.targeting(self.device_mesh):
             stated = self._step_key(self.objective, self._compiler)
             abstract, through, build = traced_start(self._staged_start, initializer, key,
-                                                    None if stated is None else (stated, type(self)))
+                                                    None if stated is None else (stated, self._start_owner()))
         checkpoints = self.checkpoints
         # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
         # another's: every process resumes from one step or none does.

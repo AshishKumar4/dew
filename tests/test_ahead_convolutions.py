@@ -116,4 +116,8 @@ def test_a_step_file_whose_start_alone_holds_a_convolution_is_compiled_on_the_ru
     assert handed.at_run
     here = jax.devices()[:1]
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
-    assert dataclasses.replace(handed, built=BuildTarget.of(here)).runnable(here) is None
+    on_here = dataclasses.replace(handed, built=BuildTarget.of(here))
+    assert on_here.runnable(here) is None
+    # Loaded direct, as a tool or a caller of `taken` loads it, it is refused alike (row 8957).
+    with pytest.raises(ValueError):
+        on_here.loaded()
