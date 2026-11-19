@@ -341,7 +341,7 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     # streamed step is no candidate, read from the device start's shapes (row 8336: a LoRA fit over an
     # unscanned decoder raised where its streamed start placed its frozen base).
     loops = None if start is None else frozen_loops(trainer, start.abstract.variables)
-    if loops is not None:
+    if start is not None and loops is not None:
         trainer.layout_choice = Choice(held=True, fits=False, device=None, streamed=None, refused=loops,
                                        streams=False)
         said(trainer.layout_choice)
