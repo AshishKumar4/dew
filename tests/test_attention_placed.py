@@ -180,7 +180,8 @@ def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy_and_rounds_tmem_re
     # 1-consumer d128 allocates 320 TMEM columns -> rounds to 512 -> residency 1 on B200 (row 9105).
     q128 = jax.ShapeDtypeStruct((1, 256, 1, 128), jnp.bfloat16)
     op = attention_mosaic.MosaicForward(scale=128 ** -0.5, keys=256, form="full")
-    ba = op.bind(q128, q128, q128, None, None, None, None, (), (), None)
+    ba = op.bind(q128, q128, q128, None, None, None, None, (), (), None,
+                 residuals=template.Kept.NONE, interpret=False)
     assert op.resident(ba, ROWS_TILES, target) == 1
 
 
