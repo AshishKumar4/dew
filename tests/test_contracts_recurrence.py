@@ -20,6 +20,7 @@ from contract_support import (
     orders,
 )
 from generation_support import interprets
+from map_judge import marked_seeds
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, scan
@@ -416,9 +417,27 @@ def test_the_template_rule_holds_its_orders(edge, taken):
                     without=outside(taken) + INTERPRETED_REMAT, draw=measured(edge, draw))
 
 
+EDGES_BEYOND = [edge for edge in EDGES if edge != "normal"]
+"""The edges whose cells measure no draws (`measured`): the normal domain's, which check 1 measures, are
+cells of their own, their declared seeds sharded across CI's map tasks (`check1_shards`): sized each run,
+a normal case took 382 to 720 s (rows 8414, 8488, 8525, 8552, 8553, 8558)."""
+
+
 @pytest.mark.parametrize("taken", list(ORDER_SETS))
-@pytest.mark.parametrize("edge", EDGES)
+@pytest.mark.parametrize("edge", EDGES_BEYOND)
 def test_the_selective_scan_holds_its_orders(edge, taken):
+    """`assert_selective_contract` at an edge of float32's range."""
+    assert_selective_contract(edge, taken)
+
+
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
+@pytest.mark.check1_shards(seeds=40, per_task=10)
+def test_the_selective_scan_holds_its_orders_over_normal_draws(taken, request):
+    """`assert_selective_contract` in the normal domain, check 1 over its declared draws."""
+    assert_selective_contract("normal", taken, seeds=marked_seeds(request))
+
+
+def assert_selective_contract(edge: str, taken: str, seeds: int | None = None) -> None:
     """Mamba's selective scan on the recurrence template (`selective.selective_scan`, a custom VJP over its
     forward and backward launches, interpreted off a GPU) as every caller reaches it: the scan's route with
     the template named (`recurrence_chunk.selective_scan`), whose products' wrapper takes every order through
@@ -447,7 +466,7 @@ def test_the_selective_scan_holds_its_orders(edge, taken):
 
     assert_contract(jax.jit(scanned), primals, direction, cotangent, f"the selective scan {edge}",
                     truth_fn=jax.jit(plain), plain_fn=jax.jit(plain),
-                    without=outside(taken) + INTERPRETED_REMAT, draw=measured(edge, draw))
+                    without=outside(taken) + INTERPRETED_REMAT, draw=measured(edge, draw), seeds=seeds)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -486,8 +505,19 @@ def test_the_chunked_op_holds_every_order(edge):
                     draw=measured(edge, draw))
 
 
-@pytest.mark.parametrize("edge", EDGES)
+@pytest.mark.parametrize("edge", EDGES_BEYOND)
 def test_the_decode_step_holds_every_order(edge):
+    """`assert_decode_contract` at an edge of float32's range."""
+    assert_decode_contract(edge)
+
+
+@pytest.mark.check1_shards(seeds=40, per_task=10)
+def test_the_decode_step_holds_every_order_over_normal_draws(request):
+    """`assert_decode_contract` in the normal domain, check 1 over its declared draws."""
+    assert_decode_contract("normal", seeds=marked_seeds(request))
+
+
+def assert_decode_contract(edge: str, seeds: int | None = None) -> None:
     """A decode token in one launch (`recurrence.step`, the launch differentiated through its reference by
     `generation.linear_tangent`; interpreted off a GPU), the gated delta rule with a decay a head and the
     skip: every order of its output and updated memory finite wherever float64 is a normal float32 and the
@@ -516,7 +546,7 @@ def test_the_decode_step_holds_every_order(edge):
 
     assert_contract(flattened(stepped), *draw(0), f"the decode step {edge}",
                     truth_fn=flattened(plain), plain_fn=flattened(plain), without=INTERPRETED_REMAT,
-                    draw=measured(edge, draw))
+                    draw=measured(edge, draw), seeds=seeds)
 
 
 def ssd_draw(seed: int, scale: float, rows: int = 1):
