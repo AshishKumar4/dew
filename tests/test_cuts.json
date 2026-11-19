@@ -956,9 +956,6 @@
 "tests/test_block_sft.py::test_official_sft_loss_and_every_parameter_gradient",
 "tests/test_block_sft.py::test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target"
 ],
-"tests/test_block_visibility.py": [
-"tests/test_block_visibility.py::test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names"
-],
 "tests/test_cache_opening.py": [
 "tests/test_cache_opening.py::test_a_stage_local_stores_cache_opens_a_layer_at_a_time_as_its_decode_opens_and_writes_it[memory]",
 "tests/test_cache_opening.py::test_each_familys_cache_opens_as_its_decode_opens_and_writes_it[multimodal_transformer+gemma3n]",
@@ -1115,9 +1112,6 @@
 "tests/test_compile_ahead.py::test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step",
 "tests/test_compile_ahead.py::test_an_ahead_plan_that_fits_no_device_reports_every_refused_program",
 "tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it"
-],
-"tests/test_config_cli.py": [
-"tests/test_config_cli.py::test_a_run_trainer_fit_trains_directly_says_why_no_record_rebuilds_it[as a run states them]"
 ],
 "tests/test_config_paths.py": [
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[diffusion]",
@@ -1512,9 +1506,6 @@
 "tests/test_decoder_remat.py::test_recomputed_pipeline_preserves_updates_and_sown_values[True-dense]",
 "tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[False-altup]",
 "tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[True-altup]"
-],
-"tests/test_decoding_strategies.py": [
-"tests/test_decoding_strategies.py::test_defaults_reproduce_the_plain_greedy_walk_when_no_component_is_given"
 ],
 "tests/test_deepest_rings.py": [
 "tests/test_deepest_rings.py::test_a_launch_at_its_deepest_ring_compiles_within_its_resources[attention backward 64-sm86]",
@@ -2031,9 +2022,6 @@
 "tests/test_inference.py::test_an_lm_run_over_a_sources_own_processor_reloads_that_processor[False]",
 "tests/test_inference.py::test_every_route_generates_through_the_same_packed_projections",
 "tests/test_inference.py::test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images"
-],
-"tests/test_inference_sampling.py": [
-"tests/test_inference_sampling.py::test_cached_generation_records_the_transformers_filtered_distribution[sampling0]"
 ],
 "tests/test_inference_tasks.py": [
 "tests/test_inference_tasks.py::test_decoding_fp32_masters_draws_what_a_bf16_storage_load_draws[diffusion-gemma-workflow]"
@@ -2642,6 +2630,9 @@
 ],
 "tests/test_mosaic_toolkit.py": [
 "tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm86-int8-unscaled]"
+],
+"tests/test_mtp.py": [
+"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[mean_stream_trunk]"
 ],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_site_is_on_par_with_its_reference[llama4]",
@@ -3335,9 +3326,6 @@
 "tests/test_rl_expert_balance.py": [
 "tests/test_rl_expert_balance.py::test_a_policy_run_moves_each_balancing_bias_by_its_pooled_load_once_per_committed_update[ppo]"
 ],
-"tests/test_rl_methods.py": [
-"tests/test_rl_methods.py::test_each_method_is_its_papers_objective[gmpo--]"
-],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
 "tests/test_router_statistics.py::test_all_padding_has_no_router_support_or_bias_effect[mtp-attention_mask-False]",
@@ -3899,9 +3887,6 @@
 "tests/test_trainer.py::test_a_generator_declared_to_replay_resumes_on_the_batches_the_whole_run_reads",
 "tests/test_trainer.py::test_a_share_of_a_run_with_no_planned_length_is_refused",
 "tests/test_trainer.py::test_an_explicit_state_starts_a_token_count_with_its_own_reader"
-],
-"tests/test_training_dtypes.py": [
-"tests/test_training_dtypes.py::test_x64_router_bias_storage_survives_updates_and_restart[bfloat16]"
 ],
 "tests/test_training_transactions.py": [
 "tests/test_training_transactions.py::test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima[whole]",
