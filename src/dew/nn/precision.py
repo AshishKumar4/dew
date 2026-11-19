@@ -1757,33 +1757,42 @@ def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) ->
 
 
 def _aligned_value(shape: tuple[tuple[int, ...], ...], axis, *flat: jax.Array) -> jax.Array:
-    """`aligned_sum` of its terms' factors in a row (`_regrouped`): its products summed band by band
-    (`_banded`), each band's sum a pair keeping its roundings (`_kept_sum`), then the bands' pairs, each at
-    its own binade, summed so band by band (`_merged`), rounded once and scaled back."""
-    products = []
-    for term in _regrouped(shape, flat):
+    """`aligned_sum` of its terms' factors in a row (`_regrouped`): held scaled (`_scaled_sum`), then scaled
+    back once."""
+    dtype, factors = flat[0].dtype, max(map(len, shape))
+    return _raised(*_scaled_sum(_regrouped(shape, flat), axis, dtype), dtype, factors)
+
+
+def _scaled_sum(terms, axis, dtype) -> tuple[jax.Array, jax.Array]:
+    """The aligned sum of `terms` (each its factors) held scaled, its sum and that sum's binade: each term's
+    product (its factors' significands times a power of two) summed over `axis` in its own shape band by
+    band (`_banded`), every band's pair at its binade, then all of them summed band by band (`_merged`). A
+    term reduced against a shared top broadcast to the value's shape was laid along another term's axis
+    (base review db30f3e80 F2)."""
+    factors, shaped = max(map(len, terms)), {}
+    for term in terms:
         significand, exponent = _binades(term[0])
         for factor in term[1:]:
             more, power = _binades(factor)
             significand, exponent = significand * more, exponent + power
-        products.append((significand, exponent))
-    dtype, factors = flat[0].dtype, max(map(len, shape))
-    totals = []
-    for pair, top in _banded(products, axis, dtype, factors):
-        for part in pair:
-            significand, exponent = _binades(part)
-            totals.append((significand, exponent + top))
-    return _raised(*_merged(totals, dtype), dtype, factors)
+        shaped.setdefault(significand.shape, []).append((significand, exponent))
+    if axis is None:
+        return _merged([product for products in shaped.values() for product in products], dtype, factors)
+    # The products of one shape banded together, each reduced in that shape.
+    totals = [(part, power + top) for products in shaped.values()
+              for pair, top in _banded(products, axis, dtype, factors) for part, power in map(_binades, pair)]
+    return _merged(totals, dtype, factors)
 
 
-def _merged(totals, dtype) -> tuple[jax.Array, jax.Array]:
+def _merged(totals, dtype, factors: int) -> tuple[jax.Array, jax.Array]:
     """`aligned_sum`'s bands' pairs (`totals`, each part a significand and binary exponent) summed: the
     largest band of them (`_band`) summed as a pair, which joins those it left in the next, so a lower
     band's total stays until the higher ones cancel (aligned at once, 2^-100 was dropped before 2^25 and
-    -2^25 cancelled, base review f5e6e678d F1); the sum rounded once and its binade."""
+    -2^25 cancelled, base review f5e6e678d F1), as many bands as `_banded` spans (each one at least a band
+    below the one before, or its pair joining the next); the sum rounded once and its binade."""
     held = [significand != 0 for significand, _ in totals]
     pair, top, taken = _band(totals, held, None, dtype)
-    for _ in totals[1:]:
+    for _ in range(min(len(totals), _bands(dtype, factors)) - 1):
         held = [kept & ~took for kept, took in zip(held, taken[-len(totals):], strict=True)]
         carried = [(significand, exponent + top) for significand, exponent in map(_binades, pair)]
         pair, top, taken = _band(carried + totals, [significand != 0 for significand, _ in carried] + held,
@@ -1850,16 +1859,21 @@ def _banded(products, axis, dtype, factors: int) -> list[tuple[tuple[jax.Array, 
     as many bands as span the largest binade a product of `factors` factors reaches down to below the dtype's
     least subnormal, so a band whose products cancel leaves the next band's sum, no term dropped beneath it;
     each band's sum's pair and its top."""
-    limits = jnp.finfo(dtype)
-    span = factors * limits.maxexp - (limits.minexp - limits.nmant - 1)
     held = [significand != 0 for significand, _ in products]
     bands = []
-    # Each band's top lies more than its width below the one before's.
-    for _ in range(-(-span // (_band_width(dtype) + 1))):
+    for _ in range(_bands(dtype, factors)):
         pair, top, taken = _band(products, held, axis, dtype)
         bands.append((pair, top))
         held = [kept & ~took for kept, took in zip(held, taken, strict=True)]
     return bands
+
+
+def _bands(dtype, factors: int) -> int:
+    """The bands that span the largest binade a product of `factors` factors reaches down to below the
+    dtype's least subnormal, each band's top more than its width below the one before's."""
+    limits = jnp.finfo(dtype)
+    span = factors * limits.maxexp - (limits.minexp - limits.nmant - 1)
+    return -(-span // (_band_width(dtype) + 1))
 
 
 def _raised(total, top, dtype, factors: int) -> jax.Array:
@@ -1932,14 +1946,19 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], axis, primals, tange
                         products, held = _transposed_term([factors[other] for other in term], spot, axis,
                                                           cotangent)
                         groups.setdefault(held, []).append(products)
-            # Summed over the axes the factor is broadcast along, then broadcast along those it is not
-            # found in (a reduced axis its term's other factors are broadcast along too).
-            summed = []
+            # Each group summed over the axes the factor is broadcast along, then broadcast along those it is
+            # not found in (a reduced axis its term's other factors are broadcast along too), every group held
+            # scaled until they are summed: rescaled apart, 3 2^127 and -2.5 2^127 were opposite infinities
+            # (base review db30f3e80 F1).
+            totals = []
             for held, group in groups.items():
                 along = [d for d, size in enumerate(held) if size == 1]
-                summed.append(jnp.broadcast_to(aligned_sum(group, tuple(along) if along else None), held)
-                              .reshape(factor.shape))
-            gradient = summed[0] if len(summed) == 1 else aligned_sum([(part,) for part in summed])
+                summed = _scaled_sum(group, tuple(along) if along else None, factor.dtype)
+                total, top = (jnp.broadcast_to(part, held).reshape(factor.shape) for part in summed)
+                significand, power = _binades(total)
+                totals.append((significand, power + top))
+            reach = max(len(products) for group in groups.values() for products in group)
+            gradient = _raised(*_merged(totals, factor.dtype, reach), factor.dtype, reach)
             gradients.append(gradient.astype(factor.dtype))
         return gradients
 
