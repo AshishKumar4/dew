@@ -893,8 +893,9 @@ def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitu
     value that may be zero meets one that may be infinite; a quotient unless both may be zero or both
     infinite; a root or a logarithm of a value at least 0; a maximum, a minimum, a selection, a negation, an
     absolute value, a power of an integer, an exponential, a logistic, a layout, a conversion and a maximum
-    or minimum along an axis of numbers; a sum along axes of numbers on one side of zero. It is finite where
-    it is a number made of finite operands (a quotient's divisor, and a negative power's operand, held away
+    or minimum along an axis of numbers; a sum along axes of numbers on one side of zero. A tanh, an erf and
+    a logistic of a number are finite (an infinity's is its side's limit). It is finite where it is a number
+    made of finite operands (a quotient's divisor, and a negative power's operand, held away
     from zero) and its own bound is under its dtype's largest power; a contraction, and a sum along axes of
     either side's values, is a number only so: its partial sums, in whatever order its mode takes them,
     overflow under no bound within the dtype, and past one two of them may be infinities of opposite sides.
@@ -1035,8 +1036,12 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
     if name == "dot_general":
         return Apart(None, 0, number=False, finite=finite)
     if name in BOUNDED:
-        # Finite of a finite operand, each of them; a sine of an infinity is no number.
-        return Apart(None, 0, first.finite, first.finite)
+        # Finite of a finite operand, each of them; a sine of an infinity is no number, but a tanh's and an
+        # erf's are their side's 1 (XLA clamps the operand before its polynomial), so of a number they are
+        # finite: a product that may overflow, which a window takes as its program proves it, bounds its
+        # tanh still (spec alignment, 8993).
+        held = first.number if name in ("tanh", "erf") else first.finite
+        return Apart(None, 0, held, held)
     if name in INTEGRAL:
         return Apart(None, 0, first.number, first.finite)
     if name in KEEPING_SIGN:
