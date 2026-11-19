@@ -432,31 +432,36 @@ def _ulp(magnitude: np.ndarray, dtype) -> np.ndarray:
 
 
 def assert_merges_no_ties(dew_fn, reference_fn, truth_fn, draw, label: str, *, seeds: int,
-                          along: int = 1) -> None:
+                          along: int = 1, rounded_fn=None) -> None:
     """A kernel's ties (docs/design/testing.md, fast and accurate forms: the accurate form's claim) over
     `seeds` draws, among a leaf's entries along `along` (an attention leaf's positions, `[B, S, H, D]`'s
     second axis), every other coordinate held: no group of them `dew_fn` returns equal that the reference
     keeps apart, its values (`reference_fn`'s) not all equal and their float64 truths (`truth_fn` on the
     inputs widened) spread past twice the reference's own error over the group (its largest distance from
     the truth: two entries each that far off may meet) and one ulp more, the ulp of the group's largest
-    magnitude in the leaf's dtype (each entry's rounding to its dtype moves it at most half its own ulp).
-    Entries of other rows (another batch, head or channel) are no pair the claim holds: equal by chance in a
-    leaf of many, they are no tie its computation made (row 6302's collisions across batches); and a pair
-    the reference holds apart by its own rounding alone, its truths nearer than that, is no pair it keeps
-    apart (keys an ulp apart: their float64 logits within one fp32 rounding, which a correctly rounded
-    logit merges, row 6302)."""
+    magnitude in the leaf's dtype (each entry's rounding to its dtype moves it at most half its own ulp);
+    and, where the site states the roundings any computation in its format makes (`rounded_fn`: the float64
+    truth with those intermediates each correctly rounded to the format, an attention's logits), whose
+    rounded truths spread past one ulp too. Entries of other rows (another batch, head or channel) are no
+    pair the claim holds: equal by chance in a leaf of many, they are no tie its computation made (row
+    6302's collisions across batches). A pair a correctly rounded computation merges is no pair the
+    reference keeps apart but by its own error: keys an ulp apart whose float64 logits round to one fp32
+    logit, which Dew's correctly rounded logits share and the reference's, 0.55 ulps off, split, their dV
+    6 ulps apart at the truth (row 6302)."""
     truth_of = jax.jit(truth_fn)
+    rounded_of = None if rounded_fn is None else jax.jit(rounded_fn)
     for seed in range(seeds):
         inputs = draw(seed)
         with jax.enable_x64(new_val=True):
             truth = jax.tree.leaves(truth_of(*widened(inputs)))
+            rounded = truth if rounded_of is None else jax.tree.leaves(rounded_of(*widened(inputs)))
         found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
         theirs_all = jax.tree.leaves(reference_fn(*inputs))
-        for (path, mine), theirs, exact in zip(found, theirs_all, truth, strict=True):
+        for (path, mine), theirs, exact, held in zip(found, theirs_all, truth, rounded, strict=True):
             dtype = np.asarray(mine).dtype
-            mine, theirs, exact = (_rows_along(np.asarray(x, np.float64), along)
-                                   for x in (mine, theirs, exact))
-            merged = [_merged(*row, dtype) for row in zip(mine, theirs, exact, strict=True)]
+            mine, theirs, exact, held = (_rows_along(np.asarray(x, np.float64), along)
+                                         for x in (mine, theirs, exact, held))
+            merged = [_merged(*row, dtype) for row in zip(mine, theirs, exact, held, strict=True)]
             widest = max((ulps for count, ulps in merged if count), default=0.0)
             count = sum(count for count, _ in merged)
             assert not count, (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {count} groups of equal "
@@ -471,20 +476,25 @@ def _rows_along(x: np.ndarray, along: int) -> np.ndarray:
     return np.moveaxis(x, along, -1).reshape(-1, x.shape[along])
 
 
-def _merged(mine: np.ndarray, theirs: np.ndarray, exact: np.ndarray, dtype) -> tuple[int, float]:
-    """A row's ties Dew merges that the reference keeps apart (`assert_merges_no_ties`): their count and the
-    widest's truths' spread in ulps."""
-    finite = np.isfinite(mine) & np.isfinite(theirs) & np.isfinite(exact)
+def _merged(mine: np.ndarray, theirs: np.ndarray, exact: np.ndarray, held: np.ndarray,
+            dtype) -> tuple[int, float]:
+    """A row's ties Dew merges that the reference keeps apart (`assert_merges_no_ties`), `held` its truths
+    with the format's own roundings (`rounded_fn`'s, else the truths): their count and the widest's truths'
+    spread in ulps."""
+    finite = np.isfinite(mine) & np.isfinite(theirs) & np.isfinite(exact) & np.isfinite(held)
     order = np.lexsort((exact[finite], mine[finite]))
-    tied, kept, true = (x[finite][order] for x in (mine, theirs, exact))
+    tied, kept, true, rounded = (x[finite][order] for x in (mine, theirs, exact, held))
     if not tied.size:
         return 0, 0.0
     starts = np.flatnonzero(np.concatenate([[True], tied[1:] != tied[:-1]]))
-    apart = np.maximum.reduceat(kept, starts) > np.minimum.reduceat(kept, starts)
-    spread = np.maximum.reduceat(true, starts) - np.minimum.reduceat(true, starts)
+
+    def spread(x):
+        return np.maximum.reduceat(x, starts) - np.minimum.reduceat(x, starts)
+
     ulp = _ulp(np.maximum.reduceat(np.abs(true), starts), dtype)
-    merged = apart & (spread > 2 * np.maximum.reduceat(np.abs(kept - true), starts) + ulp)
-    return int(merged.sum()), float(np.max(spread[merged] / ulp[merged], initial=0.0))
+    merged = ((spread(kept) > 0) & (spread(true) > 2 * np.maximum.reduceat(np.abs(kept - true), starts) + ulp)
+              & (spread(rounded) > ulp))
+    return int(merged.sum()), float(np.max(spread(true)[merged] / ulp[merged], initial=0.0))
 
 
 def dot_precisions(function, *arguments) -> list:
