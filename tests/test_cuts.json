@@ -1176,9 +1176,6 @@
 "tests/test_contracts_sampling.py": [
 "tests/test_contracts_sampling.py::test_a_transitions_quadratic_term_holds_every_order[near the least normal]"
 ],
-"tests/test_counted_passes.py": [
-"tests/test_counted_passes.py::test_a_run_whose_cadences_read_no_pass_compiles_as_before_and_a_counting_one_steps_its_batches"
-],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_cached_document_reads_its_own_context_without_it[the layer's attention]",
 "tests/test_cross_attention.py::test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it",
@@ -2727,6 +2724,9 @@
 "tests/test_norm_swiglu.py::test_rms_variants_and_every_gradient[True-False-float16-bfloat16]",
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float16-repeated]",
 "tests/test_norm_swiglu.py::test_stream_seam_takes_the_add_and_the_stream_cotangent[shape0-float32-False]"
+],
+"tests/test_online_loader.py": [
+"tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[indexed-processes-map]"
 ],
 "tests/test_optim.py": [
 "tests/test_optim.py::test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix[output-whole]",
