@@ -1183,7 +1183,7 @@ def _compiled(
         statistics=statistics,
         batch_tokens=staged.batch_tokens,
         device=device,
-        fields=_fixed_fields(train),
+        fields=_fixed_fields(original),
         widths=_bound_widths(original),
         tail=tail(train, build),
         order_records=ordered,
