@@ -77,9 +77,9 @@ def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving
     256 queries and 256 keys, the full call's and the causal's (each consumer's own key walk): every
     interleaving of its consumers and its producer's and issuer's warps explored (`ring_protocol.explore`),
     no deadlock and every barrier's phase whole and observed, every step's factor keeping its sums or moving
-    them (`moves`, the lazy walk's rare span). A step waits on the weighted values of the step before only
-    where its factor moves some row's sums (`placed.Tcgen05Placed.accumulating`), its weights' turn freed by
-    the product two steps back."""
+    them (`moves`, a step whose maximum moves, the rare span). A step waits on the weighted values of the
+    step before only where its factor moves some row's sums (`placed.Tcgen05Placed.accumulating`), its
+    weights' turn freed by the product two steps back."""
     from ring_protocol import explore, programs
 
     query, key = jnp.ones((1, 256, 1, 128), jnp.bfloat16), jnp.ones((1, 256, 1, 128), jnp.bfloat16)

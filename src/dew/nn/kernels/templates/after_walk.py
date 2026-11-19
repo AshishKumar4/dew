@@ -112,5 +112,5 @@ def verdicts(consumers: int) -> dict:
 
 
 rare = derivatives.marked(derivatives.Rare(), lambda verdict: verdict)
-"""A verdict a kernel's rare span runs by, marked so (`derivatives.Rare`): a decided walk's second, a lazy
-walk's move of its kept sums (`placed.Tcgen05Placed.accumulating`)."""
+"""A verdict a kernel's rare span runs by, marked so (`derivatives.Rare`): a decided walk's second, a
+step's move of its sums (`placed.Tcgen05Placed.accumulating`)."""

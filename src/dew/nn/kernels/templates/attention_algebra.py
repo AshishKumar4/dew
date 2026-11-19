@@ -24,7 +24,6 @@ nothing (spans, a score hook) guards its maxima and denominators against an empt
 
 import dataclasses
 import functools
-import math
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any, NamedTuple
 
@@ -1516,9 +1515,9 @@ class Taken:
 
     @property
     def moves(self) -> jax.Array | bool:
-        """Whether it moves any row's sums: some row's factor other than 1 or some row's scale changed (a
-        lazy walk's anchor kept leaves every factor exactly 1, `lazy_anchor`), so a mainloop holding its sums
-        apart (tensor memory) skips the pass over them where it moves none."""
+        """Whether it moves any row's sums: some row's factor other than 1 (its maximum moved) or some
+        row's scale changed, so a mainloop holding its sums apart (tensor memory) skips the pass over them
+        where it moves none."""
         moved = False if self.factor is None else jnp.any(self.factor != 1.0)
         return moved if self.held is None else moved | jnp.any(self.held.drop != 0)
 
@@ -2290,85 +2289,9 @@ def _softmax(spec: Forward, state: Partial, keys: Keys):
     return m, added.factor, added.terms, accumulated.values
 
 
-KEY_BINADES = 31
-"""The binades a call's key count stays below: its positions are int32."""
-
-
-def lazy_binades(natural: bool, *, compensated: bool, weights, bound: float = 1.0) -> int | None:
-    """The binades by which a tile's maximum may pass a row's kept one before the walk moves its anchor
-    (`lazy_anchor`); None where it moves on every larger maximum: the accurate form's (`natural`, its held
-    weights' select of `exp(x - b)` under `b >= x`) and a compensated walk's. A kept anchor leaves each
-    weight at most `2^binades` (a dropping call's times its multiplier `bound`): the least of the binades
-    above 1 its narrowed weights hold (`weights`' largest exponent, fp16's 15) and those the scaled walk's
-    bound leaves its keys (`BOUND_UNIT` less `KEY_BINADES`), each less the multiplier's (4 e^10 at a rate of
-    0.75 narrowed to fp16's infinity), none below 0. An unscaled walk's sums reach `walk_reach`."""
-    if natural or compensated:
-        return None
-    multiplied = math.ceil(math.log2(bound)) if bound > 1 else 0
-    return max(min(jnp.finfo(weights).maxexp - 1, BOUND_UNIT - 1 - KEY_BINADES) - multiplied, 0)
-
-
-def walk_reach(weights, drop: Dropout | None = None, *, natural: bool) -> float:
-    """The most a walk's weight reaches, which every host's bound on an unscaled walk's sums takes
-    (`may_scale`'s and `bounded_past`'s `amplified`: the template's, the decode's and Triton's walks alike):
-    a dropping call's largest multiplier (`Dropout.bound`) times a lazy walk's kept anchor's reach,
-    `2^binades` (`lazy_binades`, 1 where it anchors exactly), a kept anchor's tile whose maximum is past it
-    by the margin weighing its values up to it (two tiles at logits 0 and 112, values 2^110: the second's
-    sums 2^136 against a bound of 2^117 that took every weight at most 1; Triton's walk at 14 nats over
-    2^109 the same, the base review of a71e85d7a, F1)."""
-    multiplied = 1.0 if drop is None else drop.bound
-    binades = lazy_binades(natural, compensated=False, weights=weights, bound=multiplied)
-    return multiplied * (1.0 if binades is None else 2.0 ** binades)
-
-
-def lazy_margin(spec: Forward, weights, bound: float = 1.0) -> float | None:
-    """`lazy_binades` in the walk's logits' units (`Forward.unit`: binades where it folds to base 2,
-    raw products where it keeps them raw, `Forward.raw`, whose exponent scales their difference after it is
-    taken, else nats): a raw fold's margin of 32 binades kept an anchor 31 below a tile's raw maximum at a
-    scale of 1.92, weights of e^59.5 (the base review of 51158f2a9, F1). A kept anchor's factor is exactly
-    1, so a mainloop whose sums live apart (tcgen05's tensor memory) skips their rescale where no row's
-    anchor moved."""
-    binades = lazy_binades(spec.natural, compensated=spec.compensated, weights=weights, bound=bound)
-    if binades is None:
-        return None
-    return float(binades * LN2 / spec.unit)
-
-
-def lazy_anchor(margin: float | None, binade: float = 1.0) -> Callable | None:
-    """The walk's anchor (`forms.step`'s `anchor`): a row's maximum kept unless the tile's passes it by more
-    than `margin` (`lazy_margin`), then the tile's, or past `FAR_BINADES` (a `binade` each in the walk's
-    units) the tile's less the margin, rounded up toward it, so its factor is never below an every-maximum
-    walk's (moved to the tile's, tiles at 0, 22 and 105 nats and at 300, 322 and 406 flushed what an anchor
-    at 22 or 322 keeps, the base reviews of 13eba49bd and 9745e74f0, F1). Each distance is exact where close
-    (Sterbenz): the kept one plus the margin rounded at 2^29 kept an anchor that weighed fp16's infinity (the
-    base review of a71e85d7a, F2)."""
-    if margin is None:
-        return None
-    gap, far = np.float32(margin), np.float32(FAR_BINADES * binade)
-
-    def anchor(kept, exact):
-        below = exact - gap
-        below = jnp.where(exact - below > gap, toward(below, exact), below)
-        moved = jnp.where((exact - kept > far) & (exact - below <= gap), below, exact)
-        return jnp.where(exact - kept > gap, moved, kept)
-
-    return anchor
-
-
-def toward(x: jax.Array, y: jax.Array) -> jax.Array:
-    """fp32 `x` one place toward `y` (`nextafter` in bits, a kernel's own integers), `x` where they agree."""
-    bits = jax.lax.bitcast_convert_type(x, jnp.int32)
-    step = jnp.where((y > x) == (bits >= 0), 1, -1)
-    return jnp.where(x == y, x, jax.lax.bitcast_convert_type(bits + step, jnp.float32))
-
-
-FAR_BINADES = 64
-"""The binades past which a lazy anchor moves below a tile's maximum (`lazy_anchor`), a nearer one normal."""
-
-
 def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """The state after a tile `keys` by the derived forms: its logits (-inf where a query does not see a key,
-    `modify`'s) and values, its maximum (`lazy_anchor`), rescale and weights the forms'; the weighted values'
+    `modify`'s) and values, its maximum, rescale and weights the forms'; the weighted values'
     sums the mainloop's where it holds them (`Keys.accumulate`), every product the mainloop's (`Keys.dot`), a
     keys-first tile's (`Coords.keys_first`) `[Dv, bq]`. A compensated walk's (`Low`) takes its sums as the
     template's step does (`stepped`), a chunk of keys a product; a scaled walk's (`SCALED_WALK`) its rows'
@@ -2379,7 +2302,6 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     drop = keys.coords.drop
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     bound = 1.0 if drop is None else drop.bound
-    anchor = lazy_anchor(lazy_margin(spec, keys.values.dtype, bound), binade=LN2 / spec.unit)
     after: list[Partial] = []
 
     def own(states, parts):
@@ -2411,21 +2333,15 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
                               bound=bound, held=held)
             return stepped(state, state.m, added.factor, added.terms.sum(axis=axis), products, scale, held)
 
-        # The anchor the forms' step selects (`anchor`: of the kept maximum and the tile's), read only where a
-        # tile is scaled: its small weights' tier at the anchor its normal tier's weights take. At the tile's
-        # maximum, 10 past an anchor kept, a row's small weights fell e^-10 below their due (the base review
-        # of 319e49cee, F1).
-        def selected() -> jax.Array:
-            exact = peak(spec, state.m, keys.logits, keys.products, axis=axis)[0]
-            return exact if anchor is None else anchor(state.m, exact)
-
-        raised = raised_weights(spec, keys.logits, selected, keys.coords)
+        # The tile's maximum as the forms' step reaches it, read only where a tile is scaled.
+        raised = raised_weights(spec, keys.logits, lambda: peak(spec, state.m, keys.logits, keys.products,
+                                                                axis=axis)[0], keys.coords)
         after.append(scaled_step(state, scale, step, raised=raised, branched=held_by is None))
         return tuple(getattr(after[0], field) if field in ("acc", "total") else None for field in fields)
 
     derived = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
                          stepped=None if held_by is None and plain and state.scale is None and drop is None
-                         else own, anchor=anchor)
+                         else own)
     found = Partial(**dict(zip(fields, derived, strict=True)))
     return found if not after else found._replace(scale=after[0].scale, low=after[0].low)
 

@@ -194,7 +194,7 @@ class Tcgen05Placed(Tcgen05Rings):
         # step's factor in place a block of columns at a time where its product adds onto them (`declared`'s
         # `accumulate`) once the step before's weighted values are done, both published together
         # (`weighed`); the walk's first step rescales nothing (its sums are the issuer's first product's,
-        # fresh). A step whose factor moves no row (`Taken.moves`, a lazy walk's most) waits on no product
+        # fresh). A step whose factor moves no row (`Taken.moves`, no row's maximum moved) waits on no product
         # of the step before: its softmax runs under that step's weighted values, where waiting on them
         # before every step's weights held its chain behind them.
         del inline
@@ -209,7 +209,7 @@ class Tcgen05Placed(Tcgen05Rings):
             self.write(self._turns(WEIGHTS)[slots.turn], weights)
             if scale is not None and adds and not slots.first:
                 # A pass over the sums in tensor memory only where the step moves some row's (`Taken.moves`):
-                # a lazy walk keeps its anchor most steps (one warpgroup vote, `bar.red.or.pred`).
+                # most steps of a long row move none (one warpgroup vote, `bar.red.or.pred`).
                 def rescaled():
                     summed.wait(summed.turn(slots.n - 1))
                     _rescaled(self, acc, scale)

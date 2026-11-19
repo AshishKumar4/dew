@@ -534,14 +534,11 @@ def test_an_integer_parameter_keys_and_runs():
 
 
 @pytest.mark.parametrize("beside", ["alone", "nan head"])
-def test_a_lazy_triton_walk_past_its_kept_anchor_walks_scaled_on_par(beside):
-    """A bf16 Triton forward over two 64-key tiles, the second's logits 14 nats past the first's (within its
-    lazy walk's margin, so its anchor stays), over values of 2^109 to 2^110: on par with the reference
-    (check 1), finite. Its host's bound takes the lazy weights' reach (`algebra.walk_reach`), so the call
-    walks scaled; taking every weight at most 1 its unscaled walk's sums passed 2^135 (the base review of
-    a71e85d7a, F1). Beside a second head one of whose values is NaN (`nan head`), the first head's still is:
-    the bound takes finite magnitudes alone, where the NaN left the whole call unscaled and the first head
-    infinite (the base review of a648b3279, F5)."""
+def test_a_triton_walk_over_values_near_fp32s_largest_walks_scaled_on_par(beside):
+    """A bf16 Triton forward over two 64-key tiles, the second's logits 14 nats past the first's, over values
+    of 2^109 to 2^110: on par with the reference (check 1), finite. Beside a second head one of whose values
+    is NaN (`nan head`), the first head's still is: the host's bound takes finite magnitudes alone, where the
+    NaN left the whole call unscaled and the first head infinite (the base review of a648b3279, F5)."""
     spans = template.spans(128, 128, 1)
     pins = {attention_triton.TritonForward: PINNED[1]}
     heads = 1 if beside == "alone" else 2
@@ -565,7 +562,7 @@ def test_a_lazy_triton_walk_past_its_kept_anchor_walks_scaled_on_par(beside):
     def xla(query, key, value):
         return template.reference(query, key, value, spans)[:, :, :1]
 
-    assert_as_exact(jax.jit(ours), jax.jit(xla), draw, f"triton lazy walk's bound, {beside}", seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(xla), draw, f"triton walk's bound, {beside}", seeds=SEEDS)
 
 
 def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():

@@ -1162,14 +1162,14 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     # The values' tiles as the products read them: a quantized call's in the query's dtype (`_Codes`), an
     # fp32 call's its parts (`_Program.parted`).
-    weights = (q_smem.dtype if codes is not None
-               else _stream_dtype(views["values" if "values" in views else "keys"]))
-    values = functools.partial(_value_tile, program, (tiles.block_k, value_width), weights, turn)
+    values = functools.partial(_value_tile, program, (tiles.block_k, value_width),
+                               q_smem.dtype if codes is not None else _stream_dtype(
+                                   views["values" if "values" in views else "keys"]), turn)
     dot = functools.partial(_dot, family, interpret)
 
     def walk(spec: algebra.Forward, turns) -> tuple:
         start, merged = _started(program, spec, hooked, state_rows, value_width, training=training)
-        unit = _bound_unit(spec, weights, hooks.drop, decided)
+        unit = _bound_unit(spec, hooks.drop, decided)
 
         def scored(index, slots, product=None):
             return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
@@ -1245,14 +1245,13 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     _walks_stored(walk, store, spec, consumer, turn, decided=decided, past=past_walks, streamed=streamed)
 
 
-def _bound_unit(spec: algebra.Forward, weights, drop, decided: after_walk.Decided | None) -> float | None:
+def _bound_unit(spec: algebra.Forward, drop, decided: after_walk.Decided | None) -> float | None:
     """The unit a deciding launch's unscaled walk bounds its rows' sums at as the host's bound would
-    (`algebra.bounded_past`, its verdict's, `_walks_stored`): `2^-BOUND_UNIT` times the most a weight of
-    `weights` reaches (`algebra.walk_reach`, a dropping call's multiplier's); None where it decides nothing
-    or walks scaled."""
+    (`algebra.bounded_past`, its verdict's, `_walks_stored`): `2^-BOUND_UNIT` times the most a weight reaches
+    (a dropping call's multiplier, `drop`); None where it decides nothing or walks scaled."""
     if decided is None or spec.headroom:
         return None
-    return 2.0 ** -algebra.BOUND_UNIT * algebra.walk_reach(weights, drop, natural=spec.natural)
+    return 2.0 ** -algebra.BOUND_UNIT * (1.0 if drop is None else drop.bound)
 
 
 def _bounded(reached: jax.Array, logits: jax.Array, magnitudes: jax.Array, unit: float) -> jax.Array:

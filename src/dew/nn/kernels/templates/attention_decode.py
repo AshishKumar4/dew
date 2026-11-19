@@ -346,10 +346,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         if "plain" in work:
             return walked("plain")
         largest = _largest(value, table, sources, scales) if bounds is None else _held(bounds, table, sources)
-        # A lazy walk's weights reach its kept anchor's margin (`algebra.walk_reach`; a decode folds).
-        weights = query.dtype if scales is not None else value.dtype
-        may = algebra.bounded_past(largest, keys_axis=-1, initial=None if initial is None else initial.acc,
-                                   amplified=algebra.walk_reach(weights, natural=False))
+        may = algebra.bounded_past(largest, keys_axis=-1, initial=None if initial is None else initial.acc)
         return jax.lax.cond(may, lambda: walked("scaled"), lambda: walked("bounded"))
 
     return run, work
