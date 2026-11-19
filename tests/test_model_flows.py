@@ -557,3 +557,33 @@ def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
     with jax.default_device(compile_only_gpus("sm80", 1)[0]):
         assert gpu_flow.run_cells(cells) == []
     assert ran == list(range(5))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_walk_its_values_steer_runs_on_the_host_in_a_prepared_run(tmp_path, monkeypatch):
+    """A site sized by its truth's terms (`terms=True`) whose float64 truth takes a branch its values pick
+    (`lax.cond` on its operands), its terms' walk held by its prepare as one its run walks
+    (`reference_error._held_walk`), walks it in its run on the host's CPU, wherever the run's default device
+    is: a part's run compiles nothing on its GPU, whose lane requires every program's tuning recorded (the
+    deterministic picks theme), where the walk compiled its spans on the run's own device."""
+    import float64_terms
+
+    dew, reference, draw = _site()
+
+    def steered(a, b):
+        return jax.lax.cond(jnp.sum(a) > 0, reference, reference, a, b)
+
+    walked = []
+    evaluated = float64_terms.evaluated
+
+    def placed(*arguments, **options):
+        walked.append(float64_terms.PLACED.get())
+        return evaluated(*arguments, **options)
+
+    monkeypatch.setattr(float64_terms, "evaluated", placed)
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a steered product", seeds=8, truth_fn=steered, terms=True)
+    assert not walked
+    with compiled_truths(tmp_path, prepare=False, stamp="a"), jax.default_device(jax.devices()[1]):
+        assert_as_exact(dew, reference, draw, "a steered product", seeds=8, truth_fn=steered, terms=True)
+    assert walked and set(walked) == {jax.devices("cpu")[0]}

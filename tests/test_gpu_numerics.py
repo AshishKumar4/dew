@@ -13,8 +13,6 @@
 - A GPU reports its block, multiprocessors, clock and memory bandwidth (test_lowering).
 - A Gemma-sized vocabulary's chunked cross entropy is as exact as the whole logits, its float64 truth at
   the seeds it needs (test_chunked_cross_entropy).
-- A Dense layer's float64 terms on a GPU host are its inputs' placement's own, CPU or GPU, in either order
-  (test_float64_terms).
 """
 
 import functools
@@ -23,7 +21,6 @@ import jax.numpy as jnp
 import pytest
 import test_audio as audio
 import test_chunked_cross_entropy as chunked_cross_entropy
-import test_float64_terms as float64_terms_tests
 import test_fp8_base as fp8_base
 import test_lowering as lowering
 import test_moe_precision as moe_precision
@@ -44,7 +41,7 @@ OWN = "the GPU's own arithmetic, facts or placement, which a CPU does not have"
 
 
 def numerics_cells(tmp_path_factory) -> list[Cell]:
-    """The GPU's own arithmetic and driver facts, its encoders' compiles and a Dense layer's float64 terms."""
+    """The GPU's own arithmetic and driver facts and its encoders' compiles."""
     return [
         Cell("the GPU divides fp32 to the nearest float",
              precision_policy.the_gpu_divides_fp32_to_the_nearest_float, fault=OWN),
@@ -66,10 +63,6 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
              lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it, fault=OWN),
         Cell("a GPU reports its clock and memory bandwidth from its driver",
              lowering.a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver, fault=OWN),
-        Cell("a Dense layer's float64 terms are its placement's own on a GPU host",
-             isolated(tmp_path_factory)(
-                 float64_terms_tests.a_dense_layers_terms_are_its_placements_own_on_a_gpu_host, "placed"),
-             fault=OWN),
     ]
 
 

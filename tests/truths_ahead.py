@@ -17,7 +17,7 @@ A program the store does not hold for a draw's shapes or an arm's statement, or 
 `stamp` (the commit and JAX), is a red (`MissingTruth`), never one compiled in its place; a site its
 prepare did not reach, and an arm no statement holds, runs unprepared, every draw judged, recorded in the
 test's store (`unprepared`); a terms walk its values steer (a branch or loop it reads as it runs,
-`float64_terms.static`) is held as one, which its run walks on its device.
+`float64_terms.static`) is held as one, which its run walks on the host's CPU.
 
 A program takes its traced constants as arguments, held beside it (`held.pkl`): no executable serializes an
 array it closed over. The roles are a site's truth (`truth`: its float64 program, `arm_arithmetic.Truth`),
