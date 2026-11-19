@@ -1695,7 +1695,7 @@ def _held_registers(family: mosaic.Family, block_q: int, params: tuple, *, resid
     """The registers a forward walk holds across its steps in the accumulator's row layout: its query tile's
     score-hook parameters (`held_params`, a QUERY's vector in the dtype its kernel loads it) and its per-query
     rows, a training walk's (`residuals`, `TRAINING_ROWS`) or an inference fold walk's (`INFERENCE_ROWS`)."""
-    count = TRAINING_ROWS if residuals else 0 if natural else INFERENCE_ROWS
+    count = TRAINING_ROWS if residuals else 0 if natural or family.scalars_whole else INFERENCE_ROWS
     rows = count * family.row_registers(block_q, jnp.float32)
     return rows + sum(family.row_registers(block_q, dtype) for kind, dtype in params if kind is Kind.QUERY)
 
@@ -2045,7 +2045,9 @@ its sums and denominator take, and the reduction's partial and shuffled rows. Pr
 consumers at 64 x 128, width 128, priced 160 and spilled 48 bytes at their 168 (the base sync's training
 step's output walk, 2ee20e39c); ptxas's least spill-free cap ran 9 to 24 past the model at every width and
 key tile (FS-FOLD-CAUSAL, FS-FOLD-FULL). Its natural form takes none: its exponential's terms price it at or
-past ptxas's need without them (the same census: 160 where 152 held, 224 where 200)."""
+past ptxas's need without them (the same census: 160 where 152 held, 224 where 200); nor a family whose
+scalars are a measured whole (`Family.scalars_whole`, mma.sync's), which holds them: an A100's inference walk
+at width 128 held unnarrowed in 247 of its 255 (et-a100-infer3)."""
 
 
 STATISTICS = MappingProxyType({"peak": jnp.float32, "total": jnp.float32, "anchor": jnp.float32,
