@@ -146,17 +146,23 @@ def test_a_phased_run_with_a_theta_per_pass_keeps_its_rows_through_its_phases_an
     record states the choice and its saved run loads with its rows; and the choice without an implicit loop
     is refused before anything loads (row 7661)."""
     from dew.checkpoints import RUN_FILE
+    from dew.training.budget import Pause
 
     data = phased(tmp_path)
 
-    def per_pass(name: str, steps: int):
+    def per_pass(name: str, **trainer):
         return trained(dataclasses.replace(run(tmp_path, STEPS, data), loop_theta_per_pass=True), tmp_path,
-                       name, trainer={"steps": steps, "checkpoint_every": 1})[0]
+                       name, trainer={"steps": 4, "checkpoint_every": 1, **trainer})[0]
 
-    whole = per_pass("whole", 4)
+    whole = per_pass("whole")
     assert theta(whole).shape[0] == STEPS[-1] - 1 and np.any(theta(whole))
-    per_pass("stopped", 3)
-    resumed = per_pass("stopped", 4)
+    # Preempted at its third step, as a run stopped mid-schedule is: built for the whole run's four steps,
+    # it steps the whole run's programs (row 8407).
+    stopped = per_pass("stopped", stop=Pause(.75))
+    # It stops where it is resumed from, at its third step: a pause that rounded elsewhere fails here, not
+    # by a resume from another step.
+    assert int(stopped.step) == 3, int(stopped.step)
+    resumed = per_pass("stopped")
     for name, leaf in parameters(whole).items():
         np.testing.assert_array_equal(leaf, parameters(resumed)[name], err_msg=name)
     # The run's record states the choice (its data built in Python, which no record reads back).

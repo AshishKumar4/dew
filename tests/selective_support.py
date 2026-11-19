@@ -98,19 +98,29 @@ def starts_near_the_largest(case: str) -> jax.Array | None:
     return None if at is None else jnp.zeros((1, 128), bool).at[0, at].set(True)
 
 
-def rate_past_the_range(seed: int) -> tuple:
+RATES_PAST_THE_RANGE = ("vanishing decays", "a decay of e^-3")
+"""`rate_past_the_range`'s cases."""
+
+
+def rate_past_the_range(case: str, seed: int) -> tuple:
     """`seed`'s fp32 inputs `(x, dt, A, B, C, D, state)` of a selective scan whose rate passes float32's range
     in base 2, and its output's and final state's cotangents: one row of 50 tokens (a ragged chunk's, padded
-    with zero steps), 128 channels and 4 states, A = -3 2^126 (its `A log2(e)` past float32's largest, each
-    decay `exp(dt A)` zero), steps softplus of standard normals, inputs, B and C standard normal, no skip or
-    state entering, the cotangents standard normal (row 8491)."""
-    rng = np.random.default_rng([8491, seed])
+    with zero steps), 128 channels and 4 states, A = -3 2^126 (its `A log2(e)` past float32's largest),
+    inputs, B and C standard normal, no skip, the cotangents standard normal (row 8491). Vanishing decays:
+    steps softplus of standard normals, each decay `exp(dt A)` zero, no state entering. A decay of e^-3:
+    every step 2^-126, each decay e^-3, the state entering standard normal, which a clamp of the rate taken
+    to base 2 first would not give (row 8491's head review)."""
+    # The first case's draws as row 8491 drew them, each later case's a stream of its own.
+    index = RATES_PAST_THE_RANGE.index(case)
+    rng = np.random.default_rng([8491, seed, index] if index else [8491, seed])
     rows, length, channels, states = 1, 50, 128, 4
     x = rng.standard_normal((rows, length, channels))
     dt = np.logaddexp(0.0, rng.standard_normal((rows, length, channels)))
+    entering = np.zeros((rows, channels, states))
+    if case == "a decay of e^-3":
+        dt, entering = np.full_like(dt, 2.0 ** -126), rng.standard_normal(entering.shape)
     b, c = (rng.standard_normal((rows, length, states)) for _ in range(2))
-    inputs = (x, dt, np.full((channels, states), -3.0 * 2.0 ** 126), b, c, np.zeros(channels),
-              np.zeros((rows, channels, states)))
+    inputs = (x, dt, np.full((channels, states), -3.0 * 2.0 ** 126), b, c, np.zeros(channels), entering)
     shapes = ((rows, length, channels), (rows, channels, states))
     cotangents = tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32) for shape in shapes)
     return (*(jnp.asarray(t, jnp.float32) for t in inputs), cotangents)

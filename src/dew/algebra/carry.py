@@ -138,8 +138,9 @@ def _carried():
 
 CARRYING = _carrying()
 CARRIED = rules.armed(rules.Rules("carried", "reorders", _carried(), receipt="docs/design/algebra.md §6.9; "
-                                  "tests/test_algebra_scan.py; measurement M-DC-4 (the recurrence flows with "
-                                  "it and without, pending: row 6106)"))
+                                  "tests/test_algebra_scan.py; measured M-DC-4 (the recurrence flows' train "
+                                  "and decode programs with it and without, GH200 and A100: every cell "
+                                  "within 0.4% and its A/A)"))
 """The split's rules, never among the engine's sets (`rules.admitted`), which a receipt's arm may leave out
 (`rules.ARMS`): the split then extracts its traced forms."""
 

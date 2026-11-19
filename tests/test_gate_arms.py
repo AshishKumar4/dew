@@ -132,3 +132,25 @@ def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed(
     with jax.default_device("cpu"):
         on_a_cpu = arm_role("dew", without_ynn(scaled), "a scaled arm")
     assert on_a_gpu == plain != on_a_cpu
+
+
+def test_the_arms_arithmetic_is_that_of_where_their_calls_are_placed():
+    """Check 1 runs its arms in the arithmetic of where the context places their calls
+    (`arm_arithmetic.summed_as_run`): placed on the CPU lane, its fp32 sums (`FP32_SUMS`); placed on a GPU,
+    whatever the process's default backend, as a GPU tier part's prepare places them on its compile-only GPU,
+    the GPU's own, no preset (row 8580: keyed on the default backend, that prepare traced a cuBLASLt FP8
+    arm under the CPU's preset, which compiled it without its default fast accumulation)."""
+    from arm_arithmetic import summed_as_run
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.precision import FP32_SUMS
+
+    def preset():
+        with summed_as_run():
+            return jax.config.jax_default_matmul_precision
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        on_a_cpu = preset()
+    with jax.default_device(compile_only_gpus("sm90", 1)[0]):
+        on_a_gpu = preset()
+    assert on_a_cpu == FP32_SUMS and on_a_gpu == jax.config.jax_default_matmul_precision

@@ -42,7 +42,7 @@ from dew.objectives.base import Objective
 from dew.state import Accumulation, TrainState, apart, occupied, together
 from dew.telemetry.compiles import Compiles
 from dew.telemetry.instrumentation import StepFlops
-from dew.training._candidates import Stepping, _shaped, candidate_for, forget, lowered_for
+from dew.training._candidates import RunShape, Stepping, _shaped, candidate_for, forget, lowered_for
 from dew.training._lowering import Lowered, routed
 from dew.training.distributed import (
     link_figure,
@@ -370,10 +370,17 @@ def _microbatch_of(opened: Callable, batch: Batch, part: int, split: int) -> tup
     return model_batch(micro), tokens, micro.get(CLOSES_WINDOW), consumed
 
 
+def planned_over(batch: Batch, shape: RunShape) -> Hashable:
+    """What a step's plan is planned over beside the state: its batch's shapes and the run's shape (how its
+    batches are cut and counted, which every compile of its step reads)."""
+    return batch_signature(batch), shape
+
+
 class Unplaced(NamedTuple):
-    """A fresh run's first step planned before its state was placed (`StepCompiler.planned_unplaced`): the
-    signature of the batch it was planned over, its plan and what its compile found, and the record of its
-    rung (`keep_rung`), kept only once the devices hold it with the state placed (`admitted_placed`)."""
+    """A fresh run's first step planned before its state was placed (`StepCompiler.planned_unplaced`): what
+    it was planned over (`planned_over`: its batch's signature and the run's shape), its plan and what its
+    compile found, and the record of its rung (`keep_rung`), kept only once the devices hold it with the
+    state placed (`admitted_placed`)."""
 
     signature: Hashable
     planned: Planned
@@ -751,7 +758,8 @@ class StepCompiler[L, E]:
             return Compiled(stepping.shape.split, step=run)
         held, self._unplaced = self._unplaced, None
         mesh = settings.device_mesh
-        fit, headroom = (False, None) if held is None or held.signature != batch_signature(batch) else (
+        over = planned_over(batch, stepping.shape)
+        fit, headroom = (False, None) if held is None or held.signature != over else (
             admitted_placed(held.planned, mesh))
         probes, own = ([], 0) if held is None else held.probes()
         before = probes[own]["headroom"] if probes else None
@@ -793,10 +801,12 @@ class StepCompiler[L, E]:
         return dataclasses.replace(compiled, step=self.runner(stepping, kept, settings.device_mesh),
                                    planned=kept)
 
-    def holds_unplaced(self, batch: Batch) -> bool:
+    def holds_unplaced(self, batch: Batch, shape: RunShape) -> bool:
         """Whether a fresh run's first step was planned over `batch`'s shapes before its state was placed
-        (`planned_unplaced`), the plan its first compile takes."""
-        return self._unplaced is not None and self._unplaced.signature == batch_signature(batch)
+        (`planned_unplaced`), the plan its first compile takes, and under the run's `shape` as it stands:
+        a plan made before the run decided how its batches are cut (a ramp's, each batch read whole) is no
+        plan of its step."""
+        return self._unplaced is not None and self._unplaced.signature == planned_over(batch, shape)
 
     def anew(self) -> StepCompiler[L, E]:
         """A compiler of this one's objective, links, step compiled ahead and pass counts, nothing planned:
@@ -827,7 +837,7 @@ class StepCompiler[L, E]:
         except PlanRefused as refused:
             _log.info("the step fits no plan before its state is placed, planned once it is: %s", refused)
             return
-        self._unplaced = Unplaced(batch_signature(batch), planned, compiled, keep)
+        self._unplaced = Unplaced(planned_over(batch, stepping.shape), planned, compiled, keep)
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
              trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:

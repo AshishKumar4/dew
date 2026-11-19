@@ -93,7 +93,7 @@ class GptOssExperts(nn.Module):
         if weights.shape != indices.shape:
             raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
         parameters = (gate_up, gate_bias, down, down_bias)
-        # Each leaf's axes: a packed bank's three its own (`quantization.expert_leaf_axes`).
+        # Each leaf's axes: a packed bank's four its own (`quantization.expert_leaf_axes`).
         axes = tuple(leaf for parameter, named in zip(parameters, FUSED_EXPERT_AXES.values(), strict=True)
                      for leaf in quantization.expert_leaf_axes(parameter, named))
         slots = expert_dispatch(

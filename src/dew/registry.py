@@ -1724,30 +1724,21 @@ register = models.register
 an `nn.Module`, which a config's `{"class": "my_model"}` then builds. Every other kind registers through its
 own table, `mixers.register("my_mixer")`."""
 
-JsonDict = Annotated[
-    Mapping[str, object],
-    tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda args: json.loads(args[0]),
-        is_instance=lambda value: isinstance(value, dict),
-        str_from_instance=lambda value: [json.dumps(value)],
-    ),
-]
+_JSON_OBJECT = tyro.constructors.PrimitiveConstructorSpec(
+    nargs=1,
+    metavar="JSON",
+    instance_from_str=lambda args: json.loads(args[0]),
+    is_instance=lambda value: isinstance(value, dict),
+    str_from_instance=lambda value: [json.dumps(value)],
+)
+"""A command-line flag holding one JSON object, written as a single JSON string."""
+
+JsonDict = Annotated[Mapping[str, object], _JSON_OBJECT]
 """The fields a model is built from, written as a single JSON string on the
 command line. The registry knows which architecture takes which field and
 narrows each one where it builds it, so the values are read there."""
 
-JsonRecords = Annotated[
-    Mapping[str, JSON],
-    tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda args: json.loads(args[0]),
-        is_instance=lambda value: isinstance(value, dict),
-        str_from_instance=lambda value: [json.dumps(value)],
-    ),
-]
+JsonRecords = Annotated[Mapping[str, JSON], _JSON_OBJECT]
 """Records by name, written as a single JSON string on the command line and
 read back as the records they are (`JSON` entries, `_rebuilt`), never as the
 values they describe: a class's defaults as a run recorded them

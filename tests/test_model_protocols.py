@@ -109,7 +109,7 @@ def contracted(hidden: jax.Array, table: OutputTable, variables) -> jax.Array:
     return table.logits(hidden)
 
 
-def _cotangent(logits: jax.Array) -> jax.Array:
+def _cotangent(logits: jax.Array | jax.ShapeDtypeStruct) -> jax.Array:
     return jax.random.normal(jax.random.key(1), logits.shape, logits.dtype)
 
 
@@ -123,20 +123,16 @@ dtypes = pytest.mark.parametrize("dtype", DTYPES)
 
 
 @pytest.mark.parametrize("name", PATHS)
-def test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward(name):
+def test_a_token_models_reads_and_cache_invariance_match_its_forward(name):
     """A token model's `logits`, `logits_from_hidden` and `output_table` contraction agree bit for bit
-    with its forward (at both checkpoint dtypes for decoders), neither `logits` nor `hidden_states`
-    writes a `cache` or alters an allocated decode cache, and a decoder's gradients through `logits`
-    match its forward's."""
+    with its forward (at both checkpoint dtypes for decoders), and neither `logits` nor `hidden_states`
+    writes a `cache` or alters an allocated decode cache."""
     source, read = loaded(name, "float32"), reads(name, "float32")
     model, variables = source.model, source.variables
     if name in DECODERS:
         same(read.logits, model.apply(variables, read.tokens))
         bf16, bf16_read = loaded(name, "bfloat16"), reads(name, "bfloat16")
         same(bf16_read.logits, bf16.model.apply(bf16.variables, bf16_read.tokens))
-        cotangent = _cotangent(read.logits)
-        same(gradient(model, variables, read.tokens, cotangent, method="logits"),
-             gradient(model, variables, read.tokens, cotangent))
     same(model.apply(variables, read.hidden, method="logits_from_hidden"), read.logits)
     same(model.apply(variables, read.hidden, method="logits_from_hidden")
          if read.table is None else contracted(read.hidden, read.table, variables), read.logits)
@@ -151,6 +147,18 @@ def test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward(n
                                             method=method, mutable=True)
             same(written_c["cache"], cache)
             same(beside, without)
+
+@pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
+def test_a_decoders_gradients_through_its_logits_match_its_forwards(name):
+    """A decoder's gradients through `logits` match its forward's, bit for bit, each run eagerly as the
+    reads are: a test apart from its reads', so each runs its own eager programs (row 7665: together they
+    compiled 1,700 to 2,300 programs, 40 to 53 s of a cold run)."""
+    source, rows = loaded(name, "float32"), tokens(name, "float32")
+    model, variables = source.model, source.variables
+    cotangent = _cotangent(jax.eval_shape(lambda: model.apply(variables, rows, method="logits")))
+    same(gradient(model, variables, rows, cotangent, method="logits"),
+         gradient(model, variables, rows, cotangent))
+
 
 # DiffusionGemma: the clean read is the causal encoder over the shared tree.
 

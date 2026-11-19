@@ -190,6 +190,29 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     return compiled
 
 
+def layer_scope(**named: str) -> contextlib.ExitStack:
+    """The scope a run's step traces a layer in, which a per-shard cell's `context` takes (`Shard.context`),
+    three pieces in this order: the kernels `named` (`generation.chosen`), which pin the choice under test
+    and the routes beside it, as a cell names them; Dew's logical axis rules (`DEFAULT_RULES`), which map
+    the layer's declared parameter and activation axes onto the mesh, so its parameters are placed as a run
+    places them; and a run's layout (`placing`, every leaf split however small), which a product or a
+    dispatch reads to map itself over the mesh's shards. A cell whose layer declares axes and maps a
+    product or a dispatch over the mesh takes all three; one that places its operands by its specs alone
+    and maps nothing needs none."""
+    from flax import linen as nn
+
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.kernels import generation
+    from dew.nn.sharding import placing
+
+    stack = contextlib.ExitStack()
+    for context in (generation.chosen(**named), nn.logical_axis_rules(DEFAULT_RULES),
+                    placing(Layout(min_shard=1))):
+        stack.enter_context(context)
+    return stack
+
+
 @dataclass(frozen=True)
 class Shard:
     """A kernel's per-shard cell (testing.md: every Pallas or FFI kernel runs per shard): its layer's path

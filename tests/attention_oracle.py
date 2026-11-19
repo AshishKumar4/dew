@@ -137,7 +137,7 @@ def float64_weights(q, k, keep, sinks, softcap, *, anchored: bool = False, bias=
         logits = score(raw)
     if bias is not None:
         logits = logits + bias
-    keep = np.broadcast_to(keep, logits.shape)
+    keep = jnp.broadcast_to(keep, logits.shape)
     sees = keep.any(-1, keepdims=True)
     # A row that keeps no key softmaxes zeros instead of only -inf, whose
     # NaN would reach every gradient through the weights zeroed below.
@@ -172,13 +172,24 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
     them through its slope, as the cap's. With `sinks`, their gradients' terms
     are last: each sink a logit beside the keys whose value is zero, its
     gradient's terms its share's sizes, a logit's as above with no product,
-    their squares summed over the rows and queries of its head."""
+    their squares summed over the rows and queries of its head. Host arrays,
+    float64: `traced_attention_terms`'s, read back."""
     with jax.enable_x64(new_val=True):
-        q, k, v, dout = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent))
+        return [np.asarray(x) for x in traced_attention_terms(query, key, value, cotangent, keep, sinks=sinks,
+                                                             softcap=softcap, bias=bias, score=score)]
+
+
+def traced_attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None, bias=None,
+                           score=None):
+    """`attention_terms` as a program: its operands widened and its terms computed within it, so a trace
+    holds them (a site's terms program, `test_decision_packing.AttentionTerms`, row 7359), each float64
+    under the caller's x64."""
+    with jax.enable_x64(new_val=True):
+        q, k, v, dout = (jnp.asarray(x, jnp.float64) for x in (query, key, value, cotangent))
         heads, kv_heads, width = q.shape[2], k.shape[2], q.shape[3]
         group = jnp.arange(heads) // (heads // kv_heads)
-        sunk = None if sinks is None else jnp.asarray(np.asarray(sinks, np.float64))
-        shared = None if bias is None else jnp.asarray(np.asarray(bias, np.float64))
+        sunk = None if sinks is None else jnp.asarray(sinks, jnp.float64)
+        shared = None if bias is None else jnp.asarray(bias, jnp.float64)
         weights, raw = float64_weights(q, k, keep, sunk, softcap, bias=shared, score=score)
         keys, values = k[:, :, group], v[:, :, group]
         products = jnp.einsum('bqhd,bkhd->bhqk', dout, values)
@@ -209,7 +220,7 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
             share = 1 - weights.sum(-1, keepdims=True)
             sink_sizes = jnp.maximum(jnp.abs(share * delta), share * jnp.sqrt(delta_energy))
             squares = (*squares, (sink_sizes ** 2).sum(axis=(0, 2, 3)))
-        return [np.sqrt(np.asarray(x)) for x in squares]
+        return [jnp.sqrt(x) for x in squares]
 
 
 def exact_attention(q, k, v, s=None, *, softcap=None, keep=None, anchored: bool = False, **structure):

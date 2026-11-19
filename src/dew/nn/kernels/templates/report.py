@@ -1076,6 +1076,88 @@ class Untuned(RuntimeError):
         self.lowered = lowered
 
 
+class CompiledOnDevice(Untuned):
+    """A compile without a device for a device to run met a choice only the device makes (`at_run_time`):
+    the programs it names (`programs`; the compile's own where it names none) are not preparable at all, and
+    their run compiles each on its GPU, which picks every choice itself. Refused before XLA compiles, so no
+    executable leaving the choice to run time reaches the persistent cache under the key the run's own
+    compile reads. An `Untuned` by intent: each says a choice the device's own compile makes, where a
+    handler of either compiles the program on its device; one naming how to tune it catches this first."""
+
+    def __init__(self, lowered: jax.stages.Lowered, programs: Sequence[str] = ()):
+        super().__init__("a cuDNN convolution compiled without its GPU leaves its algorithm to run time "
+                         "(DEVICELESS_CONVOLUTION_PICKS): compiled on its GPU"
+                         + (f" ({', '.join(programs)})" if programs else ""), lowered)
+        self.programs = tuple(programs)
+
+
+DEVICELESS_CONVOLUTION_PICKS = False
+"""Whether this jaxlib's compile without a device (`deviceless`) can carry a cuDNN convolution's algorithm.
+It cannot: a compile-only GPU has no cuDNN to ask, so the convolution keeps algorithm -1, which cuDNN picks
+at run time, and on an A100 not the same each run (row 7941's UNet fp32 cell, two runs of one executable
+apart). XLA records no convolution's pick to read instead: on the A100 a device compile measuring among
+deterministic algorithms (deterministic ops off, autotuner at level 4) wrote nothing to its per-fusion
+autotune cache in UPDATE mode, and an empty autotune results dump, while every device compile, level 0 to 4,
+picked the same algorithms and ran bit for bit (jaxlib 0.12, UB-PICKS2-a100, 11-19). A jaxlib that stores
+them (row 8527) retires `at_run_time`'s refusal."""
+
+
+def at_run_time(lowered: jax.stages.Lowered) -> bool:
+    """Whether `lowered`, compiled for its target, leaves a choice to run time that its device's own compile
+    makes: a convolution, which XLA's GPU compiles to a cuDNN call, compiled for compile-only GPUs
+    (`DEVICELESS_CONVOLUTION_PICKS`). Read from its StableHLO before XLA compiles it."""
+    devices = target_devices(lowered)
+    if DEVICELESS_CONVOLUTION_PICKS or not devices or not deviceless(next(iter(devices))):
+        return False
+    return any_op(lowered, lambda op: op.name == "stablehlo.convolution")
+
+
+def any_op(lowered: jax.stages.Lowered, holds: Callable[[ir.Operation], bool]) -> bool:
+    """Whether an operation of `lowered`'s StableHLO `holds`, its walk stopped at the first."""
+    found = False
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        nonlocal found
+        found = holds(op)
+        return ir.WalkResult.INTERRUPT if found else ir.WalkResult.ADVANCE
+
+    module = lowered.compiler_ir("stablehlo")
+    assert module is not None, "a lowered program states its StableHLO module"
+    module.operation.walk(visit)
+    return found
+
+
+def left_at_run(compiled: jax.stages.Compiled) -> bool:
+    """Whether `compiled` holds a cuDNN convolution whose algorithm its compile left to run time (its backend
+    config's `algo_id` -1), as every compile without the GPU leaves it (`DEVICELESS_CONVOLUTION_PICKS`):
+    an executable compiled ahead that its load must not take (`dew.training.ahead.AheadOfTime.at_run`),
+    each module's instructions read through XLA's own schema (`jax.extend.xla.instructions`) and a call's
+    kind by the one table of custom call targets (`instrumentation.custom_call_kind`)."""
+    from jax.extend import xla
+
+    from dew.telemetry.instrumentation import custom_call_kind
+
+    executable = compiled.runtime_executable()
+    for module in [] if executable is None else executable.hlo_modules():
+        for read in xla.instructions(module):
+            proto = read.proto
+            if read.opcode != "custom-call" or custom_call_kind(proto.custom_call_target) != "convolution":
+                continue
+            config = json.loads(proto.backend_config or "{}")
+            if config.get("cudnn_conv_backend_config", {}).get("algorithm", {}).get("algo_id") == "-1":
+                return True
+    return False
+
+
+def target_devices(lowered: jax.stages.Lowered) -> Sequence | None:
+    """The GPUs `lowered` compiles for, None where it compiles for none."""
+    from jax._src.interpreters import pxla
+
+    lowering = lowered._lowering
+    devices = lowering._device_list if isinstance(lowering, pxla.MeshComputation) else None
+    return None if devices is None or next(iter(devices)).platform != "gpu" else devices
+
+
 def untuned(code: str, message: str) -> bool:
     """Whether XLA refused a deviceless compile for want of a tuned result (`UNTUNED`)."""
     return code == "NOT_FOUND" and any(said in message for said in UNTUNED)
@@ -1123,14 +1205,32 @@ def xla_compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
                  background: bool = False) -> jax.stages.Compiled:
     """`lowered` compiled by XLA under `options` for its target (`targeted`), in one of this process's
     compile slots (`compile_slots`, `background` where no step waits on it): Dew's one call of XLA's
-    compile, where an instruction no device run has tuned yet is said so (`Untuned`)."""
+    compile, where an instruction no device run has tuned yet is said so (`Untuned`), and a choice only the
+    device makes, for a device to run, is refused before XLA compiles (`CompiledOnDevice`)."""
+    devices = target_devices(lowered)
+    if devices is not None and not offline(devices) and at_run_time(lowered):
+        raise CompiledOnDevice(lowered)
+    compiled_with = targeted(lowered, options)
+    # Its options as JAX's persistent cache keys its compile by them (tests/cache_keys.py reads them),
+    # written only where the log is read.
+    _log.debug("a compile's options: %s", Said(compiled_with))
     try:
         with compile_slots().held(background=background):
-            return lowered.compile(targeted(lowered, options))
+            return lowered.compile(compiled_with)
     except jax.errors.JaxRuntimeError as error:
         if untuned(error.error_code_string, str(error)):
             raise Untuned(str(error), lowered) from error
         raise
+
+
+class Said:
+    """A compile's options as a log line writes them, made only where the line is written (`str`)."""
+
+    def __init__(self, options: jax.stages.CompilerOptions | None):
+        self.options = options
+
+    def __str__(self) -> str:
+        return json.dumps(sorted((self.options or {}).items()), default=str)
 
 
 CUB_NO_FALLBACK = 3
@@ -1180,6 +1280,13 @@ def offline(devices: Sequence) -> bool:
     return device is not None and device.platform == "gpu" and deviceless(device) and not _FOR_DEVICES.get()
 
 
+def compiled_as_here(devices: Sequence, *, tuned: bool, at_run: bool) -> bool:
+    """Whether a program compiled ahead runs as `devices`' own compile of it would: none of its choices left
+    to run time (`at_run`, `at_run_time`) and, where `devices`' compile tunes (`autotuned`), tuned. A
+    program that does not is compiled on `devices` in its place."""
+    return not at_run and (tuned or not autotuned(devices))
+
+
 def autotuned(devices: Sequence) -> bool:
     """Whether a program compiled for `devices` takes XLA's tuned choices, as `targeted` compiles it: for a
     device to run (not `offline`), where the run's XLA_FLAGS leaves the autotuner on. One read offline skips
@@ -1202,11 +1309,8 @@ def targeted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     device or for one alike, read from the program and its device alone, opening no backend. A run's own
     XLA_FLAGS setting keeps `options` as given. Every program compiled here takes it, a run's step and
     every program it compiles ahead alike."""
-    from jax._src.interpreters import pxla
-
-    lowering = lowered._lowering
-    devices = lowering._device_list if isinstance(lowering, pxla.MeshComputation) else None
-    if devices is None or next(iter(devices)).platform != "gpu":
+    devices = target_devices(lowered)
+    if devices is None:
         return options
     device = next(iter(devices))
     if (xla_flag("xla_gpu_enable_triton_gemm") is None
@@ -1238,32 +1342,27 @@ def triton_wrong(lowered: jax.stages.Lowered, target: generation.GpuTarget) -> b
     from dew.nn.precision import FP32_PRODUCTS, declares_fp32_products
     from dew.nn.programs import algorithm_arithmetic, dot_arithmetic
 
-    wrong = False
-
-    def visit(op: ir.Operation) -> ir.WalkResult:
-        nonlocal wrong
+    def wrong(op: ir.Operation) -> bool:
         if op.name != "stablehlo.dot_general":
-            return ir.WalkResult.ADVANCE
+            return False
         types = [ir.RankedTensorType(operand.type).element_type for operand in list(op.operands)[:2]]
         if any(isinstance(each, ir.IntegerType) and ir.IntegerType(each).width == 8 for each in types):
-            wrong = not target.int8_triton_gemm
-        elif all(isinstance(each, ir.F32Type) for each in types):
-            attributes = op.attributes
-            if "precision_config" in attributes:
-                # Each operand's precision as JAX's enum names it, the pair read as a run's precision is.
-                lhs, rhs = (jax.lax.Precision[stablehlo.PrecisionAttr(each).value]
-                            for each in ir.ArrayAttr(attributes["precision_config"]))
-                wrong = declares_fp32_products((lhs, rhs))
-            if not wrong and "algorithm" in attributes:
-                stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
-                wrong = any(stated == dot_arithmetic(name, jnp.float32, jnp.float32)
-                            for name in FP32_PRODUCTS)
-        return ir.WalkResult.INTERRUPT if wrong else ir.WalkResult.ADVANCE
+            return not target.int8_triton_gemm
+        if not all(isinstance(each, ir.F32Type) for each in types):
+            return False
+        attributes = op.attributes
+        if "precision_config" in attributes:
+            # Each operand's precision as JAX's enum names it, the pair read as a run's precision is.
+            lhs, rhs = (jax.lax.Precision[stablehlo.PrecisionAttr(each).value]
+                        for each in ir.ArrayAttr(attributes["precision_config"]))
+            if declares_fp32_products((lhs, rhs)):
+                return True
+        if "algorithm" in attributes:
+            stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
+            return any(stated == dot_arithmetic(name, jnp.float32, jnp.float32) for name in FP32_PRODUCTS)
+        return False
 
-    module = lowered.compiler_ir("stablehlo")
-    assert module is not None, "a lowered program states its StableHLO module"
-    module.operation.walk(visit)
-    return wrong
+    return any_op(lowered, wrong)
 
 
 def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]]

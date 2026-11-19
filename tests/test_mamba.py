@@ -17,6 +17,7 @@ from selective_support import (
     FAINT_BESIDE_THE_LARGEST,
     LONG_AXES,
     NEAR_THE_LARGEST,
+    RATES_PAST_THE_RANGE,
     faint_beside_the_largest,
     long_draw,
     near_the_largest,
@@ -206,20 +207,21 @@ def decayed(fn):
     return run
 
 
+@pytest.mark.parametrize('case', RATES_PAST_THE_RANGE)
 @pytest.mark.parametrize('chunk', [16, 64])
-def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk):
+def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk, case):
     """A scan whose rate `A log2(e)` passes float32's range over a ragged chunk (`rate_past_the_range`): its
     output, final state and its decay's step's and rate's gradients (`decayed`) on par from float64 with the
     recurrence a token at a time (`stepwise`, check 1), where the rate taken to base 2 before the step was
-    -inf and a padded token's zero step made its decay NaN (row 8491). Its B's and C's gradients there are
-    row 8563's."""
+    -inf and a padded token's zero step made its decay NaN (row 8491), and under steps of 2^-126 each decay
+    e^-3, which no clamp of that rate gives (row 8609). Its B's and C's gradients there are row 8563's."""
     def scan(x, dt, A, B, C, D, state):
         return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=chunk)
 
     exact = jax.jit(decayed(stepwise))
-    assert_as_exact(jax.jit(decayed(scan)), exact, rate_past_the_range,
-                    f"the chunked scan at a rate past float32's range, chunks of {chunk}", seeds=FEWEST_SEEDS,
-                    truth_fn=exact)
+    assert_as_exact(jax.jit(decayed(scan)), exact, functools.partial(rate_past_the_range, case),
+                    f"the chunked scan at a rate past float32's range, {case}, chunks of {chunk}",
+                    seeds=FEWEST_SEEDS, truth_fn=exact)
 
 
 def test_a_document_start_drops_the_state_entering_it():

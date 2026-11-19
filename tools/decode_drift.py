@@ -39,8 +39,7 @@ import numpy as np
 import dew
 from dew._accuracy import rms
 from dew.inference.serving import Server
-from dew.interop import Pretrained
-from dew.interop.pretrained import PretrainedDecoder
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.categorical import token_log_probs
 from dew.nn.inputs import ModelInputs
 from dew.nn.kernels.generation import chosen
@@ -167,10 +166,8 @@ def main() -> int:
         parser.error(f"--steps is whole blocks of {BLOCK}")
 
     task = greedy(dew.pipeline(args.model, dtype="bfloat16", param_dtype="bfloat16"))
-    loaded = Pretrained.load(args.model, dtype="bfloat16", param_dtype="bfloat16",
-                             attention_impl="reference")
-    if not isinstance(loaded, PretrainedDecoder):
-        parser.error(f"{args.model} loads {type(loaded).__name__}, not a decoder")
+    loaded = PretrainedDecoder.load(args.model, dtype="bfloat16", param_dtype="bfloat16",
+                                    attention_impl="reference")
     reference = greedy(loaded.text_generation())
     pad = task.sampling.pad
     true = truth(args.model)

@@ -1298,6 +1298,42 @@ def test_a_sum_of_products_rounded_once_cancels_a_product_made_in_its_program():
     np.testing.assert_array_equal(np.asarray(cancelled(t)), np.zeros(4096, np.float32))
 
 
+def test_a_sum_of_products_rounded_once_reaching_an_infinity_is_the_plain_sums():
+    """`summed_once` whose sum overflows float32, by its values or by a product, is the plain sum's
+    infinity, as `jnp.sum`'s is, and a finite sum beside it is its own: a residual past an infinity is
+    inf - inf, which added back would make it NaN (row 8453)."""
+    from dew.nn.precision import summed_once
+
+    largest = jnp.finfo(jnp.float32).max
+    values = jnp.asarray([largest, -largest, 1.0], jnp.float32)
+    summed = jax.jit(lambda values: summed_once((values, values)))(values)
+    np.testing.assert_array_equal(np.asarray(summed), np.asarray([np.inf, -np.inf, 2.0], np.float32))
+    scaled = jax.jit(lambda values: summed_once((values,), ((values, jnp.full_like(values, 2.0)),)))(values)
+    np.testing.assert_array_equal(np.asarray(scaled), np.asarray([np.inf, -np.inf, 3.0], np.float32))
+
+
+def test_a_sum_of_products_rounded_once_keeps_its_residuals_apart_from_its_running_value():
+    """`summed_once` carries each rounding's residual apart and adds them back at the end (Dot2): of
+    `M, 2^102, 2^102, -M` (`M` float32's largest) it is `2^103`, where residuals renormalized into the
+    running value as they come rounded it past `M` to an infinity, and of `-2^-24 + 1 * 2^-49 + t * t - fl(t
+    t)` (`t = 1 + 2^-12`) it is `2^-49`, where the residual a later one cancels was rounded away first (row
+    8453's review)."""
+    from dew.nn.precision import summed_once
+
+    largest, big = np.finfo(np.float32).max, np.float32(2.0 ** 102)
+    overflowing = jax.jit(lambda values: summed_once(tuple(values)))(
+        jnp.asarray([largest, big, big, -largest], jnp.float32))
+    assert float(overflowing) == 2.0 ** 103
+    t = np.float32(1 + 2.0 ** -12)
+
+    @jax.jit
+    def cancelled(t):
+        return summed_once((jnp.float32(-(2.0 ** -24)), -(t * t)), ((jnp.float32(1), jnp.float32(2.0 ** -49)),
+                                                                     (t, t)))
+
+    assert float(cancelled(jnp.asarray(t))) == 2.0 ** -49
+
+
 @pytest.mark.parametrize("shape", COMPENSATED_SHAPES)
 def test_a_compensated_primitive_under_jit_is_its_eager_arithmetic(shape):
     """`compensated_primitives_hold_under_jit` on the CPU (a GPU's in tests/test_gpu_numerics.py)."""

@@ -674,7 +674,9 @@ def pages_read(leaf: jax.Array, places: jax.Array, axis: int) -> jax.Array:
 def pages_written(leaf: jax.Array, places: jax.Array, values: jax.Array, axis: int) -> jax.Array:
     """The pool leaf with its pages at `places` along `axis` set to `values`, `[len(places), ...]` as
     `pages_read` reads them; a place past the pool dropped. An offloaded pool's (`KVCache.offloaded`) are
-    written a page at a time where it lies, a dropped place moving nothing."""
+    written a page at a time where it lies, each page copied to the host and written where its place is in
+    the pool (`host_memory.stored_at`'s `kept`, the form XLA:GPU's host offloading compiles), a dropped
+    place's copy written nowhere."""
     if not on_host(leaf):
         flat = jnp.moveaxis(values, 0, axis)
         return leaf.at[(*(slice(None),) * axis, places)].set(flat.astype(leaf.dtype), mode="drop")
@@ -682,8 +684,7 @@ def pages_written(leaf: jax.Array, places: jax.Array, values: jax.Array, axis: i
 
     def page(index: jax.Array, pool: jax.Array) -> jax.Array:
         place = places[index]
-        return jax.lax.cond(place <= last, lambda held: stored_at(held, values[index], place, axis),
-                            lambda held: held, pool)
+        return stored_at(pool, values[index], place, axis, kept=place <= last)
 
     return jax.lax.fori_loop(0, places.shape[0], page, leaf)
 
@@ -1653,35 +1654,23 @@ def regrouped_layout(layout: KVCache, prompts: int, width: int, prompt: int, new
 
 def _banked_page_copies(bank: jax.Array, own: jax.Array, parents: jax.Array) -> jax.Array:
     """An offloaded bank's pool `[layers, heads, pages, ...]` with each layer's pages `parents` `[layers,
-    rows]` copied to its pages `own`, a layer at a time and a page at a time where the bank lies: each
-    layer's pages read to the device before any of them is written (a row's own page may be another's
-    parent's; one layer's pages never another's), a page past the pool read and written as none."""
-    layers, count = own.shape
+    rows]` copied to its pages `own`, a layer at a time and a page at a time where the bank lies
+    (`host_memory.fetched_at`, `stored_at` at a layer and a page): each layer's pages read to the device
+    before any of them is written (a row's own page may be another's parent's; one layer's pages never
+    another's), a page past the pool read as its last and written as none, as `pages_read` and
+    `pages_written` take a pool's."""
+    layers = own.shape[0]
     last = bank.shape[2] - 1
-    extent = (1, bank.shape[1], 1, *bank.shape[3:])
-
-    def start(layer, page) -> tuple[jax.Array, ...]:
-        # Every index int32, as a slice's starts must share one dtype (`fetched_at`'s).
-        zero = jnp.zeros((), jnp.int32)
-        return (jnp.asarray(layer, jnp.int32), zero, jnp.minimum(jnp.asarray(page, jnp.int32), last),
-                *(zero,) * (bank.ndim - 3))
 
     def layer_copies(layer, pool: jax.Array) -> jax.Array:
-        def read(row, pages: jax.Array) -> jax.Array:
-            page = fetched(jax.lax.dynamic_slice(pool, start(layer, parents[layer, row]), extent))
-            return pages.at[row].set(page[0, :, 0])
-
-        held = jax.lax.fori_loop(0, count, read, jnp.zeros((count, bank.shape[1], *bank.shape[3:]),
-                                                           bank.dtype))
+        held = jax.lax.map(lambda page: fetched_at(pool, (layer, page), (0, 2)),
+                           jnp.minimum(parents[layer], last))
 
         def write(row, pool: jax.Array) -> jax.Array:
             target = own[layer, row]
-            page = placed_like(pool, held[row][None, :, None])
-            return jax.lax.cond(target <= last,
-                                lambda pool: jax.lax.dynamic_update_slice(pool, page, start(layer, target)),
-                                lambda pool: pool, pool)
+            return stored_at(pool, held[row], (layer, target), (0, 2), kept=target <= last)
 
-        return jax.lax.fori_loop(0, count, write, pool)
+        return jax.lax.fori_loop(0, own.shape[1], write, pool)
 
     return jax.lax.fori_loop(0, layers, layer_copies, bank)
 

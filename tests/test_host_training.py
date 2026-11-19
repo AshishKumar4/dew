@@ -1297,6 +1297,27 @@ def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_stat
     equal(trained.variables, expected.variables)
 
 
+
+def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout():
+    """A fresh LoRA fit whose frozen base is a decoder of a plain loop (scan_layers=False) on GPUs that
+    price the streamed step (the host's CPUs standing in for H100s): no host layout holds a plain loop's
+    stack in bank memory (`execution.unscanned`), so the streamed step is no candidate, said by name, and
+    the run trains in its device layout. Before, the chooser laid the streamed start out and its frozen
+    base's placement raised (rows 8336, 8358: test_dory's LoRA cell on every GPU tier)."""
+    from dew.lora import LoRA
+    from dew.training.ahead import stand_in_gpus
+
+    model = CausalTransformer(vocab_size=256, emb_features=64, num_layers=2, num_heads=2, mlp_features=128,
+                              max_seq_len=8, scan_layers=False)
+    variables = nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+    adapted = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables, key=2)
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+        trainer = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
+                                      variables=adapted.variables), STREAMING_ADAM, key=jax.random.key(6))
+        trainer.fit(streaming_data(), steps=1, log_every=100)
+    choice = trainer.layout_choice
+    assert not trainer.host_master and not choice.streams and choice.refused is not None, choice
+
 @pytest.mark.tpu(reason="a TPU v6e prices the streamed step by its stated host link (row 7908)")
 def test_a_tpu_that_holds_only_the_streamed_step_streams_on_par_with_its_device_plan():
     """A fresh bf16 fit on a v6e stated to hold the decoder's streamed step and not its device plan (its
@@ -1352,43 +1373,62 @@ def test_a_run_that_chose_to_stream_resumes_streamed_where_it_would_have_stood(t
     equal(trained.variables, expected.variables)
 
 
-def test_a_fit_its_devices_hold_both_ways_takes_the_cheaper_step_as_priced():
-    """A fresh bf16 fit on stand-in H100s that hold both its steps prices each (`streaming.Choice`: the
-    device plan's FLOPs over the H100's dense peak; the streamed step's FLOPs or its host link's transfers,
-    then its update on the host) and takes the one priced cheaper, and its steps are bit for bit those of a
-    run given that layout."""
+@pytest.mark.parametrize("host_rate", [1e6, 1e20], ids=["slow host", "fast host"])
+def test_a_fit_compiles_its_streamed_step_only_where_its_device_plan_is_dearer_than_its_update(host_rate):
+    """A fresh bf16 fit on stand-in H100s that hold its device plan weighs the streamed step only where the
+    device plan is priced dearer than the streamed step's update on the host alone (`StepPrice.host`, under
+    which no streamed step is priced): on a host whose memory moves 1 MB a second it keeps its devices'
+    layout without compiling the streamed step's host program (M-MC-26: 56 s of an H100's start), said why;
+    on one that moves 1e20 bytes a second it compiles and prices it. Either way it trains bit for bit as a
+    run given the layout it took."""
+    from dew.telemetry.compiles import Compiles
     from dew.training.ahead import stand_in_gpus
+    from dew.training.memory import host_memory_stated
 
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+    with (assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30),
+          host_memory_stated(host_rate)):
         chosen = streaming_decoder(dtype=jnp.bfloat16)
-        trained = chosen.fit(streaming_data(), steps=2, log_every=100)
+        with Compiles("whole") as streamed:
+            trained = chosen.fit(streaming_data(), steps=2, log_every=100)
         given = streaming_decoder(chosen.layout, dtype=jnp.bfloat16)
         expected = given.fit(streaming_data(), steps=2, log_every=100)
     choice = chosen.layout_choice
-    assert choice.device is not None and choice.streamed is not None, choice
-    assert choice.streams == (choice.streamed.seconds < choice.device.seconds), choice
-    assert chosen.host_master == choice.streams
+    assert choice.device is not None, choice
+    if host_rate < 1e9:
+        assert choice.streamed is None and choice.refused is not None and streamed.count == 0, choice
+    else:
+        assert choice.streamed is not None and streamed.count > 0, (choice, streamed.programs)
     equal(trained.variables, expected.variables)
 
 
-@pytest.mark.mesh(devices=4)
-def test_a_rollout_runs_streamed_price_counts_its_policys_copy_each_step():
-    """A fresh fit with a rollout on two stand-in H100s (CPU devices 2 and 3, its CPU companion this host's
-    first two), no longer kept off the streamed layout, prices its streamed step with the copy of its
-    weights its rollout samples from each step (`StepPrice.rollout`, in its plan's record); its device plan
-    copies nothing."""
+def streamed_priced(trainer: Trainer, batch):
+    """`trainer`'s streamed step over `batch`, priced (`streaming.streamed`), on this host's CPUs stood in
+    for H100s: what its layout choice weighs where its device plan is priced dearer than its update."""
+    from dew.distributed.batches import placed_abstract
+    from dew.training import streaming
+
+    trainer._laid_out(Layout(host=streaming.STREAMED))
+    start = trainer._started("never")
+    fits, price = streaming.streamed(trainer, start, placed_abstract(trainer.device_mesh, batch),
+                                     jnp.bfloat16, ())
+    assert fits and price is not None
+    return price
+
+
+def test_a_rollout_run_keeps_its_devices_layout_its_first_batch_pricing_no_step():
+    """A fresh fit whose rollout makes its steps' batches, on a stand-in H100 holding both plans, keeps its
+    devices' layout, said by name: its stream's first batch is the rollout's input, no step's, so the
+    streamed step is priced over no batch it would read."""
     from dew.training.ahead import stand_in_gpus
 
     def rollout(state, batch, key, *, objective):
         return batch
 
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices()[2:4], 80 * 2 ** 30):
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
         trainer = streaming_decoder(dtype=jnp.bfloat16, rollout=rollout)
-        trainer.device_mesh = trainer.mesh.build(jax.devices()[2:4])
         trainer.fit(streaming_data(), steps=1, log_every=100)
     choice = trainer.layout_choice
-    assert choice.streamed is not None and choice.device is not None, choice
-    assert choice.record()["streamed"]["rollout"] > 0 and choice.record()["device"]["rollout"] == 0, choice
+    assert not choice.streams and choice.streamed is None and choice.refused is not None, choice
 
 
 def memory_streamed_arguments(trainer: Trainer, state):
@@ -1411,14 +1451,27 @@ def streamed_program(trainer: Trainer, state, variables, step):
 
 @pytest.mark.distributed
 def test_a_streamed_step_one_process_cannot_compile_leaves_every_process_on_the_devices_plan(tmp_path):
-    """Two processes choosing a fresh run's layout, the streamed step's compile refused for memory on one
-    (as XLA refuses a step it cannot hold), agree that the devices do not hold it, as a plan's candidates
-    agree: neither waits on the other, and both keep the devices' plan."""
+    """Two processes choosing a fresh run's layout, both weighing the streamed step (their hosts' memory
+    stated fast), its compile refused for memory on one (as XLA refuses a step it cannot hold), agree that
+    the devices do not hold it, as a plan's candidates agree: neither waits on the other, and both keep the
+    devices' plan."""
     from test_multiprocess import run_pool
 
     reports = run_pool("streamed_refused", tmp_path / "pool", 2, timeout=900)
     assert [report["streams"] for report in reports] == [False, False], reports
     assert [report["choice"]["fits"] for report in reports] == [False, False], reports
+
+
+def test_processes_whose_hosts_price_the_update_apart_take_the_first_processs_decision(tmp_path):
+    """Two processes choosing a fresh run's layout whose hosts' memory rates differ (process 0's slow, so
+    the device plan is priced under its streamed update; process 1's fast) take process 0's decision: both
+    keep the devices' layout and neither compiles the streamed step's host program, as each takes the plan
+    it chooses."""
+    from test_multiprocess import run_pool
+
+    reports = run_pool("update_priced_apart", tmp_path / "pool", 2, timeout=900)
+    assert [(report["streams"], report["whole"]) for report in reports] == [(False, 0), (False, 0)], reports
+    assert all(report["choice"]["refused"] for report in reports), reports
 
 
 def test_a_phased_runs_two_prices_are_at_its_first_phases_pass_count():
@@ -1430,17 +1483,18 @@ def test_a_phased_runs_two_prices_are_at_its_first_phases_pass_count():
     from dew.training.ahead import stand_in_gpus
 
     tokens = np.random.default_rng(2).integers(0, 256, (jax.device_count() * 2, 17)).astype(np.int32)
-    choices = []
+    prices = []
     for steps, phases in ((3, (1, 3)), (1, None)):
         model = looped(steps=steps).clone(dtype=jnp.bfloat16)
         trainer = Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0), phase_passes=phases)
         with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
             trainer.fit(phased_loader(tokens), steps=1, log_every=100)
-        choices.append(trainer.layout_choice)
-    phased, single = choices
-    assert phased.device is not None and phased.streamed is not None, phased
-    assert (phased.device, phased.streamed.compute, phased.streamed.link) == (
-        single.device, single.streamed.compute, single.streamed.link), choices
+            # The streamed step at the phase the fit stands in, its first, as its choice prices it.
+            with trainer.phase_passes.scoped(trainer, trainer._compiler):
+                streamed = streamed_priced(trainer, {"text": tokens})
+        prices.append((trainer.layout_choice.device, streamed.compute, streamed.link))
+    phased, single = prices
+    assert phased[0] is not None and phased == single, prices
 
 
 def test_a_distillations_streamed_price_reads_its_teachers_banks():
@@ -1448,16 +1502,14 @@ def test_a_distillations_streamed_price_reads_its_teachers_banks():
     forward (`frozen_trees`' banks), which its price's link counts: above the same student's alone."""
     from dew.training.ahead import stand_in_gpus
 
-    rows = [{"text": np.arange(row, row + 9, dtype=np.int32) % 16} for row in range(16)]
+    rows = {"text": np.stack([np.arange(row, row + 9) % 16
+                              for row in range(jax.device_count())]).astype(np.int32)}
     links = []
     for objective in (distillation(dtype=jnp.bfloat16),
                       LMObjective(decoder(dtype=jnp.bfloat16), 8, head_chunks=1, ema_decay=None)):
         trainer = Trainer(objective, optax.sgd(.1), key=jax.random.key(5))
-        data = Memory(rows).repeat().batch(jax.device_count()).read("memory").loading(Loading(workers=0))
         with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
-            trainer.fit(data, steps=1, log_every=100)
-        assert trainer.layout_choice.streamed is not None, trainer.layout_choice
-        links.append(trainer.layout_choice.streamed.link)
+            links.append(streamed_priced(trainer, rows).link)
     distilled, alone = links
     assert distilled > alone, links
 
@@ -1691,12 +1743,10 @@ def test_a_lora_run_with_a_frozen_base_is_priced_streamed():
     objective = LMObjective(adapter.model, 8, head_chunks=1, ema_decay=None,
                             variables=jax.tree.map(np.asarray, adapter.variables))
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5))
-    rows = [{"text": np.arange(row, row + 9, dtype=np.int32) % 16} for row in range(16)]
-    data = Memory(rows).repeat().batch(jax.device_count()).read("memory").loading(Loading(workers=0))
+    rows = np.stack([np.arange(row, row + 9) % 16 for row in range(jax.device_count())]).astype(np.int32)
     with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
-        trainer.fit(data, steps=1, log_every=100)
-    choice = trainer.layout_choice
-    assert choice.refused is None and choice.streamed is not None and choice.streamed.link > 0, choice
+        price = streamed_priced(trainer, {"text": rows})
+    assert price.link > 0, price
 
 
 def test_a_part_stating_no_host_link_prices_no_streamed_step():

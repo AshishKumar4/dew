@@ -18,8 +18,7 @@ import torch
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, PreTrainedModel
 
 from dew._accuracy import distance
-from dew.interop import Pretrained
-from dew.interop.pretrained import PretrainedDecoder
+from dew.interop import PretrainedDecoder
 from dew.interop.processors import Processor
 from dew.sampling.text import Sampling
 
@@ -129,10 +128,10 @@ def checkpoint_runs(checkpoint, revision) -> Runs:
         wide = AutoModelForImageTextToText.from_config(
             config, dtype=torch.float64, attn_implementation='eager', experts_implementation='eager').eval()
         wide.load_state_dict(reference.state_dict())
-    loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=256,
-                             revision=revision)
-    if not isinstance(loaded, PretrainedDecoder) or loaded.processor is None:
-        raise ValueError(f"{checkpoint} loads {type(loaded).__name__}, not a decoder with its processor")
+    loaded = PretrainedDecoder.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=256,
+                                    revision=revision)
+    if loaded.processor is None:
+        raise ValueError(f"{checkpoint} loads a decoder without its processor")
     language = loaded.model.language_model.clone(precision=jax.lax.Precision.HIGHEST)
     model = loaded.model.clone(language_model=language, precision=jax.lax.Precision.HIGHEST)
     return Runs(AutoProcessor.from_pretrained(checkpoint, revision=revision), config.model_type, reference,
