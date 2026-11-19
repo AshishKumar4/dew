@@ -417,8 +417,9 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
     """A state that turns its key pairs (`Hooks.turns`, Mamba-3's rotating basis) through `chunk`'s portable
     math in `CHUNK`-token chunks against the same recurrence a token at a time: output, final memory and
     every operand's gradient, the turns' among them, from float64 (check 1). A turn's gradient is the
-    replay's, of the state entering its token and the cotangent leaving it (row 7419: a turn read as an
-    angle summed over a document cancelled across its tokens to 120 times the recurrence's error). Under
+    crossing form's (`templates.recurrence.turned.turn_gradient`), its pairs' scores' cotangents across each
+    token (row 7419: a turn read as an angle summed over a document cancelled across its tokens to 120 times
+    the recurrence's error; rows 7971, 7978). Under
     steep decays (`steep_draw`) a chunk's earlier document's writers lie past fp32's exponents from its last
     one's end, which the turns' gradient weighed by `exp` of their difference before it took them out, NaN
     (base review fbb1c2f71 F2); under vanishing decays (`vanishing_draw`, two of -2^127 in a chunk) its
