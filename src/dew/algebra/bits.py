@@ -798,10 +798,13 @@ def restored(pattern: jax.Array, dtype=jnp.float32) -> jax.Array:
     if jnp.finfo(dtype).bits > 32:
         # Widened from the rebased bits themselves where they hold a float32 subnormal (a pattern outside the
         # format's codes), which a flushing lane's cast would zero: its fraction times 2^-149, exact in a
-        # wider format. A narrower one casts the float32 as it casts any.
+        # wider format.
         fraction = (rebased & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** -149, dtype)
         tiny = jnp.where(rebased >> jnp.uint32(31) != 0, -fraction, fraction)
         normal = jnp.where(rebased & jnp.uint32(0x7F800000) == 0, tiny, normal.astype(dtype))
+    else:
+        # A format no wider than float32 casts the float32 as it casts any.
+        normal = normal.astype(dtype)
     mantissa = (pattern & jnp.uint32(0x7F)).astype(dtype) * jnp.asarray(2.0 ** -7, dtype)
     subnormal = jnp.where(sign != 0, -mantissa, mantissa)
     return jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
