@@ -213,6 +213,77 @@ def test_a_sum_its_platform_picks_carries_the_terms_of_the_branch_it_runs_where_
                                                                                      np.abs(written))
 
 
+PLACED_DENSE = """
+import json
+import sys
+import test_float64_terms as T
+values, terms = T.placed_terms(T.placed_programs(), sys.argv[1])
+print(json.dumps([leaf.tolist() for leaf in [*values, *terms]]))
+"""
+"""A fresh process's float64 terms of `placed_programs` at the placement its argument names, printed as
+JSON, whose floats are their shortest exact repr, so float64 reads back bit for bit (`fresh`)."""
+
+
+def placed_programs():
+    """A Dense layer's forward and its kernel and bias gradients under remat, whose bias spread its platform
+    picks between forms whose float64 values and terms agree, and `picked` under remat, whose forms' terms
+    tell the placement a branch was read for: each program with its inputs, on the host."""
+    from dew.nn.dense import Dense
+
+    rng = np.random.default_rng(7)
+    x, cotangent = rng.normal(size=(6, 8)), rng.normal(size=(6, 3))
+    layer = Dense(3, use_bias=True, dtype=jnp.float64, param_dtype=jnp.float64)
+    with jax.enable_x64(new_val=True):
+        variables = jax.tree.map(lambda leaf: rng.normal(size=leaf.shape),
+                                 jax.eval_shape(layer.init, jax.random.key(0), jnp.zeros((6, 8))))
+
+    @jax.checkpoint
+    def forward(variables, x):
+        return layer.apply(variables, x)
+
+    def step(variables, x, cotangent):
+        out, pullback = jax.vjp(forward, variables, x)
+        return out, pullback(cotangent)[0]["params"]
+
+    product = (rng.normal(size=(4, 8)), rng.normal(size=(8, 3)))
+    return [(step, (variables, x, cotangent)), (jax.checkpoint(picked), product)]
+
+
+def placed_terms(programs, platform: str):
+    """`float64_terms` of each of `programs` (`placed_programs`) from its inputs committed to `platform`'s
+    first device: their values' and terms' leaves, on the host."""
+    values, terms = [], []
+    with jax.enable_x64(new_val=True):
+        for program, inputs in programs:
+            value, term = float64_terms(program, *jax.device_put(inputs, jax.devices(platform)[0]))
+            values += [np.asarray(leaf) for leaf in jax.tree.leaves(value)]
+            terms += [np.asarray(leaf) for leaf in jax.tree.leaves(term)]
+    return values, terms
+
+
+def a_dense_layers_terms_are_its_placements_own_on_a_gpu_host(tmp_path):
+    """On a GPU host, `float64_terms` of a Dense layer's forward and gradients under remat, whose bias spread
+    its platform picks (`dew.nn.precision.spread`), and of a product whose form its platform picks
+    (`placed_programs`), the same programs evaluated from inputs committed to the CPU and then the GPU, and
+    fresh ones the other way, holds each placement's own values and terms: those a fresh process of this
+    checkout evaluating that placement alone holds, bit for bit, the CPU's one that sees no GPU
+    (`JAX_PLATFORMS=cpu`), so none of its branches can be the GPU's. A branch its platform picks is read
+    where the inputs are placed, not on the host's default device, and no compiled evaluation of one
+    placement is reused by the other (`evaluated_on`)."""
+    from process_support import fresh as evaluated_apart
+
+    # The CPU's process sees no GPU, so none of its branches can be the GPU's.
+    fresh = {platform: [np.asarray(leaf) for leaf in evaluated_apart(
+        PLACED_DENSE, platform, platforms="cpu" if platform == "cpu" else None)]
+        for platform in ("cpu", "gpu")}
+    for order in (("cpu", "gpu"), ("gpu", "cpu")):
+        programs = placed_programs()
+        for platform in order:
+            values, terms = placed_terms(programs, platform)
+            for found, want in zip([*values, *terms], fresh[platform], strict=True):
+                np.testing.assert_array_equal(found, want, err_msg=f"{platform} after {order}")
+
+
 def test_a_grouped_matmul_sums_each_groups_terms_as_a_dot_does():
     """An expert layer's grouped matmul (`jax.lax.ragged_dot`) and its kernel's gradient sum their
     rows' products within each group: their terms are each group's dense dot's, not their own

@@ -105,7 +105,8 @@ def float64_terms(fn, *args):
     branches and loops walked as their values pick. The operations and their
     order are the walk's, compiled where the walk dispatched each alone."""
     tree, values, squares = _termed(fn, args, power=2)
-    return tree.unflatten(values), tree.unflatten([np.sqrt(square) for square in squares])
+    root = jnp.sqrt if _tracing(args) else np.sqrt
+    return tree.unflatten(values), tree.unflatten([root(square) for square in squares])
 
 
 def float64_magnitudes(fn, *args):
@@ -144,9 +145,32 @@ def float64_signed_sums(fn, *args):
             tree.unflatten([negative for _, negative in pairs]))
 
 
+def _tracing(args) -> bool:
+    """Whether `args` are a trace's (`jax.core.Tracer`s): a program calling `float64_terms` traced whole, as
+    a site's terms program its prepare compiles (`reference_error._held_program`)."""
+    return any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(args))
+
+
 def _termed(fn, args, *, power: int):
     """`fn(*args)`'s outputs' tree, their values and each one's terms summed at `power` (`POWER`: their
-    squares, or their magnitudes), the evaluation `float64_terms` describes."""
+    squares, or their magnitudes), the evaluation `float64_terms` describes. Under a trace (`_tracing`: a
+    site's terms program traced whole) its compiled evaluation inlined into the trace, its outputs the
+    trace's own, nothing on the host: a program whose values steer it (`static` none) no trace holds, and is
+    refused there."""
+    if _tracing(args):
+        # Traced afresh, its constants this trace's, never a cached trace's (`traced`'s).
+        closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
+        if not static(closed.jaxpr):
+            raise TypeError("float64_terms: a program whose values steer it (a branch or loop they pick) is "
+                            "walked as it runs, which no trace holds")
+        token = POWER.set(power)
+        try:
+            with evaluated_on([]):
+                values, energies = _compiled(closed.jaxpr)(closed.consts, jax.tree.leaves(args))
+                return jax.tree.structure(shapes), values, [_or_size(energy, value) for energy, value
+                                                            in zip(energies, values, strict=True)]
+        finally:
+            POWER.reset(token)
     ran = running()
     steered = None if ran is None else ran[0].walked(ran[1], f"terms {power}", args)
     if ran is not None and steered is None:
@@ -979,5 +1003,5 @@ def _or_own(energy, value):
 def _or_size(energy, value):
     """An output's energy: the one its sums carried, else its own size's (`_sized`)."""
     if not jnp.issubdtype(jnp.result_type(value), jnp.inexact):
-        return np.zeros(np.shape(value))
+        return jnp.zeros(np.shape(value)) if isinstance(value, jax.core.Tracer) else np.zeros(np.shape(value))
     return _measured(value) if energy is None else energy

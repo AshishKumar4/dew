@@ -231,3 +231,24 @@ def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path
     with pytest.raises(CellsFailed) as raised:
         run_cells(flow)
     assert raised.value.labels == ["computes"]
+
+
+def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unrecorded(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare, a cell that compiled a site and then raised, checking what its prepare
+    gives in its programs' place (`ahead_arm`'s zeros), passes its prepare with nothing recorded, its run
+    judging it; only a cell that compiled nothing before it raised is deferred (row 8555: every such cell
+    was recorded deferred and its test named unprepared, falsely)."""
+    import jax
+    import numpy as np
+    import tier_wire
+    from reference_error import ahead_arm
+    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths
+
+    def checked():
+        made = ahead_arm(jax.jit(lambda x: x + 1.0), "a checked product")(np.zeros(3, np.float32))
+        assert np.asarray(made).tolist() == [1.0, 1.0, 1.0]
+
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        run_cells([Cell("checks its product", checked)])
+    assert not (tmp_path / DEFERRED).exists() and not (tmp_path / UNPREPARED).exists()

@@ -121,25 +121,38 @@ def _device() -> str:
     return jax.devices()[0].device_kind
 
 
-def _deferred(label: str, text: str, frames: list[tuple[str, int]]) -> bool:
-    """Whether a cell that raised is deferred to its run (`run_cells`): in a GPU tier part's prepare
-    (`tier_wire.preparing`, its store `truths_ahead.COMPILED`), where nothing computes, a cell computing past
-    the programs its prepare holds raises, and is recorded deferred there (`truths_ahead.DEFERRED`, where it
-    raised and why), its run computing and judging it with the flow's other cells served by the store, and
-    naming the test unprepared (tests/conftest.py): a flow's other cells' sites prepared, its failure in the
-    prepare turned the test red (rows 8505 and 8506)."""
-    import os
-
+def _begun() -> int | None:
+    """How many sites the store of a GPU tier part's prepare has begun (`truths_ahead.CompiledTruths.begun`),
+    read before a cell runs (`_deferred`); none outside one."""
     import tier_wire
     import truths_ahead
 
     store = truths_ahead.COMPILED.get()
-    if not tier_wire.preparing() or store is None or not store.prepare:
+    return len(store.begun) if tier_wire.preparing() and store is not None and store.prepare else None
+
+
+def _deferred(label: str, text: str, frames: list[tuple[str, int]], begun: int | None) -> bool:
+    """Whether a cell that raised is deferred to its run (`run_cells`): in a GPU tier part's prepare
+    (`begun`, its store's sites begun before the cell, `_begun`), where nothing computes. A cell that
+    compiled nothing into the store before it raised computed past the programs its prepare holds, and is
+    recorded deferred (`truths_ahead.DEFERRED`, where it raised and why), its run computing and judging it
+    with the flow's other cells served by the store and naming the test unprepared (tests/conftest.py); one
+    that compiled its programs and then raised checked what its prepare gives in their place (an
+    `ahead_arm`'s zeros: a later failure in its prepare judges nothing) and passes its prepare unrecorded,
+    its run judging it, the store's own records naming any site or arm it left unreached (row 8555: every
+    such cell was named unprepared, falsely)."""
+    import os
+
+    import truths_ahead
+
+    if begun is None:
         return False
-    test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
-    truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {text.splitlines()[-1][:400]}",
-                            truths_ahead.DEFERRED)
-    print(f"cell deferred to its run: {label}", flush=True)
+    store = truths_ahead.COMPILED.get()
+    if len(store.begun) == begun:
+        test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+        truths_ahead.unprepared(store.directory, test, frames[::-1],
+                                f"{label}: {text.splitlines()[-1][:400]}", truths_ahead.DEFERRED)
+        print(f"cell deferred to its run: {label}", flush=True)
     return True
 
 
@@ -159,6 +172,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 skipped.append(cell.label)
                 continue
             print(f"cell: {cell.label}", flush=True)
+            begun = _begun()
             try:
                 cell.run()
             except pytest.skip.Exception as skip:
@@ -169,7 +183,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 # `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end
                 # the flow: kept with its label, and raised with every other cell's after the last.
                 text, frames = _reported(error)
-                if _deferred(cell.label, text, frames):
+                if _deferred(cell.label, text, frames, begun):
                     deferred += 1
                 else:
                     failed.append((cell.label, text, frames))
