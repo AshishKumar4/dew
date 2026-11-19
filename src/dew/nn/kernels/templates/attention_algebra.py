@@ -104,19 +104,14 @@ class Forward:
     an element than the fold's contracted multiply-add, which a memory-bound walk (the decode kernel's,
     row 1955) does not feel."""
     dropped: float = 1.0
-    """A dropping call's multiplier `1 / (1 - rate)` (`Dropout.bound`); 1 where no call drops. Its walk's sums
-    hold its power of two `kept_power` alone, by which each kept key's weight is taken exactly before its
-    narrowing (`kept`), and its output and D take the rest, `dropped / kept_power`, once past the division
-    (`dropped_output`, `gradient.split_delta`): its weight times the whole multiplier rounded to the values'
-    dtype a weight apiece (4/3 to 1.3359 in bf16: an output near fp32's largest over equal keys passed
-    bf16's, row 8652), and its weight without it underflowed fp16 where the reference's, times it, holds (a
-    kept e^-18 at a rate of 1 - 2^-14, the base review of 56a716c95, F1)."""
+    """A dropping call's multiplier `1 / (1 - rate)` (`Dropout.bound`), 1 where no call drops: its sums hold
+    its power of two `kept_power`, each kept weight taken by it exactly before its narrowing (`kept`; the
+    whole multiplier rounded a weight apiece, 4/3 to 1.3359 in bf16, row 8652; none flushed fp16's e^-18 at
+    a rate of 1 - 2^-14, the base review of 56a716c95, F1), the rest past the division (`dropped_output`)."""
     kept_power: float = 1.0
     """The power of two of `dropped` its walk's sums hold (`kept_power`); 1 where no call drops."""
     whole: bool = False
-    """Whether a spans call's every query sees every key, known at trace time (`attention.KeySpans.whole`: a
-    full call's rows packed): its launches state their work as a full call's
-    (`attention_mosaic_program.walked_steps`, `reached`), its walks reading its spans as ever."""
+    """Whether a spans call's every query sees every key (`attention.KeySpans.whole`): priced as full."""
 
     @property
     def raw(self) -> bool:
@@ -1007,10 +1002,8 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Pa
     row of no key (a maximum of -inf: a padded row, a slice carrying no sink) resumes at the walk's start
     (`LEAST`), exact for every other."""
     m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
-    # A dropping call's sums hold its multiplier's power of two alone (`Forward.kept_power`), the state's the
-    # whole multiplier: the state's taken by the rest, below 2 but where the power is capped (fp16's past
-    # 2^15), so a state's small sums are kept (one of 2^-120 at a rate of 1 - 2^-32 divided by the whole
-    # multiplier flushed to 0, the base review of 56a716c95, F2).
+    # A dropping call's sums hold its multiplier's power of two (`Forward.kept_power`), a state's the whole
+    # multiplier: divided by it, 2^-120 at a rate of 1 - 2^-32 flushed (the base review of 56a716c95, F2).
     if spec.dropped != 1.0:
         acc = acc * np.float32(spec.kept_power / spec.dropped)
     if spec.base2:
@@ -1316,26 +1309,19 @@ def tile_parts(p: jax.Array, held: "Scaled | None", dtype, multiplier: jax.Array
 
 
 def kept(weights: jax.Array, multiplier: jax.Array | None, power: float = 1.0) -> jax.Array:
-    """`weights` where a dropout draw's `multiplier` keeps their keys, zero where it drops them, each kept
-    one taken exactly by `power` (a weight's, the multiplier's power of two its walk's sums hold,
-    `Forward.kept_power`; a value's, none); `weights` where no call drops."""
-    if multiplier is None:
-        return weights
+    """`weights` where a dropout draw's `multiplier` keeps their keys, zero where it drops them, each kept one
+    taken exactly by `power` (`Forward.kept_power`; a value's 1); `weights` where no call drops."""
     taken = weights if power == 1.0 else weights * np.float32(power)
-    return jnp.where(multiplier > 0, taken, 0.0)
+    return weights if multiplier is None else jnp.where(multiplier > 0, taken, 0.0)
 
 
 def kept_power(bound: float, weights) -> float:
-    """The power of two of a dropping call's multiplier `bound` (`Forward.kept_power`) its walk's sums hold,
-    its kept weights taken by it before their narrowing to `weights`' dtype: the largest at most `bound`, but
-    at most `2^min(maxexp - 1, BOUND_UNIT - 1 - KEY_BINADES)`, so a lazy walk's weights, at most
-    `2^lazy_binades` (which leaves the multiplier's binades), stay within the dtype's largest binade
-    (fp16's 2^15) and the scaled walk's bound's keys; 1 where the multiplier is below 2 or no call drops."""
-    if bound < 2.0:
-        return 1.0
-    # `frexp`'s exponent less one: the largest power of two at most `bound`, exactly.
-    exponent = math.frexp(bound)[1] - 1
-    return float(2.0 ** min(exponent, jnp.finfo(weights).maxexp - 1, BOUND_UNIT - 1 - KEY_BINADES))
+    """`Forward.kept_power` of a multiplier `bound` over weights narrowed to `weights`' dtype: the largest
+    power of two at most `bound` (`frexp`'s exponent less one), at most `2^min(maxexp - 1, BOUND_UNIT - 1 -
+    KEY_BINADES)`, so a lazy walk's weights (`lazy_binades`, which leaves the multiplier's binades) times it
+    stay within the dtype's largest binade (fp16's 2^15); 1 below 2."""
+    most = min(jnp.finfo(weights).maxexp - 1, BOUND_UNIT - 1 - KEY_BINADES)
+    return float(2.0 ** min(math.frexp(bound)[1] - 1, most))
 
 
 def drops_in_place(dtype, bound: float) -> bool:
@@ -1553,8 +1539,7 @@ def _split_tile(keys: Keys, p: jax.Array, dtype, anchor: Argmax, multiplier: jax
     the parts of their product with the values (`dtype`), the other keys' narrowed weights' sum `[bq]` (a
     function, which the step takes after the products) and the anchor's own weight, on a scaled tile
     (`held`) at their rows' scale in two tiers (`at_scale`); under dropout (the tile's draw's `multiplier`)
-    the other keys' dropped weights, each kept one taken by `power` (`kept`), the anchor's own weight
-    undropped (it is `own`)."""
+    the other keys' dropped weights kept at `power` (`kept`), the anchor's own weight undropped (`own`)."""
     at_anchor = keys.coords.k_pos == expand(anchor.key, keys.logits)
     small = None
     if held is not None:
@@ -1752,9 +1737,8 @@ def anchor_multipliers(drop: Dropout, anchors: jax.Array) -> jax.Array:
 
 
 def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array], power: float = 1.0) -> Partial:
-    """A training walk's state with its split sums joined, the anchor's term added back (`split_output`; a
-    dropping call's at the power of its multiplier its sums hold, `power`, `Forward.kept_power`), the
-    weighted values the output normalizes, at its rows' scale on the scaled walk."""
+    """A training walk's state with its split sums joined, the anchor's term added back (`split_output`, kept
+    at `power`, `kept`), the weighted values the output normalizes, at its rows' scale on the scaled walk."""
     split, arg, own, _ = carry
     return split._replace(acc=split_output(split.acc, kept(own, arg.multiplier, power), rows(arg.key)))
 
@@ -1778,9 +1762,8 @@ def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, 
 def split_term(own: jax.Array, moved: jax.Array, old_value: jax.Array,
                old_multiplier: jax.Array | None = None, power: float = 1.0) -> jax.Array:
     """The old anchor's term a training step's split sums join where the anchor moved (`moved` `[bq]`): its
-    weight `own` before the tile (under dropout zero where its draw `old_multiplier` drops it, else taken by
-    the power of its multiplier the sums hold, `power`, `kept`) times its value row `old_value` `[bq, Dv]`;
-    zero elsewhere."""
+    weight `own` before the tile (under dropout kept at `power` by its draw `old_multiplier`, `kept`) times
+    its value row `old_value` `[bq, Dv]`; zero elsewhere."""
     old = old_value.astype(jnp.float32)
     return jnp.where(expand(moved, old), expand(kept(own, old_multiplier, power), old) * old, 0.0)
 

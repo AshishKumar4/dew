@@ -384,8 +384,9 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
     (work,) = plans
     kernels = (equation for equation in programs.equations(traced.jaxpr)
                if equation.primitive in programs.NATIVE_KERNELS)
-    launches = [emission.work_of(kernel) for kernel in kernels]
-    if not launches or any(found is None for found in launches):
+    found = [emission.work_of(kernel) for kernel in kernels]
+    launches = [work for work in found if work is not None]
+    if not launches or len(launches) < len(found):
         # A launch whose work its emission does not count leaves the step's price unknown, never 0 (the base
         # review of 56a716c95, F3: a full step's spans launch priced none, and a step of no split Work()).
         return None
