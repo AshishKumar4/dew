@@ -1322,6 +1322,8 @@ def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout():
     the run trains in its device layout, or, its device plan refused too, is refused by that plan. Before,
     the chooser laid the streamed start out and its frozen base's placement raised (rows 8336, 8358:
     test_dory's LoRA cell on every GPU tier; row 8639)."""
+    from model_support import memory_limited_to
+
     from dew.lora import LoRA
     from dew.mesh import LayoutRefused
     from dew.training.ahead import stand_in_gpus
@@ -1344,6 +1346,14 @@ def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout():
                         split=3)
         with pytest.raises(LayoutRefused):
             split.fit(streaming_data(), steps=1, log_every=100)
+    # Its devices too small for its state between steps, which the given layout's placement refuses before
+    # any plan: refused so, the streamed step read ineligible from the objective's draw first, never the
+    # host layout's placement raising over the plain loop (row 8784).
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to(2 ** 18)):
+        small = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
+                                    variables=adapted.variables), STREAMING_ADAM, key=jax.random.key(6))
+        with pytest.raises(LayoutRefused):
+            small.fit(streaming_data(), steps=1, log_every=100)
 
 
 @pytest.mark.tpu(reason="a TPU v6e prices the streamed step by its stated host link (row 7908)")
