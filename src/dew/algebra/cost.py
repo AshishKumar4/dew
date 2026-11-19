@@ -113,7 +113,7 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         # float16 product is bfloat16, which NumPy's promotion refused, base review 0b8b7ed98 F1).
         mode, passes = _mode(params.get("precision"), *operands)
         return Work(shared_bytes=read, kernels=1.0,
-                    kept_bytes=kept(elements, product_dtype(params, operands).itemsize),
+                    kept_bytes=kept(elements, product_dtype(region, index).itemsize),
                     **{_MODES[mode]: 2.0 * elements * length * passes})
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1], held))
