@@ -336,7 +336,8 @@ def main() -> None:
     parser.add_argument("--only", choices=("gateway", "stops"), action="append",
                         help="the captures to run (default: both)")
     parser.add_argument("--python", action="append", default=[], metavar="ENGINE=PATH",
-                        help="run ENGINE (vllm or sglang) with this interpreter instead of a venv under --venvs")
+                        help=f"run ENGINE (one of {', '.join(ENGINE_PROVIDERS)}) with this interpreter instead "
+                             "of a venv under --venvs")
     args = parser.parse_args()
     args.venvs.mkdir(parents=True, exist_ok=True)
     given = dict(entry.split("=", 1) for entry in args.python)
