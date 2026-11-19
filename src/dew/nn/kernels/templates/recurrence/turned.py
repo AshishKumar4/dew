@@ -401,8 +401,14 @@ def turn_gradient(query, key, value, d_out, g, beta, state, d_final, starts, *, 
                                  held=held, group=group, chunk=chunk)
     (q, k, v, do, log, b, ids, teams, readers, writers, memories, leaving, passes), unlaid = walked
     own = _halves(q, k, v, do, log, b, ids, teams, scale=scale, group=group)
-    entered = _suffix(_crossed(readers, jnp.einsum('bhnkv,bhncv->bhnck', memories, do)), axis=-2)
-    terms = -_crossed(writers, jnp.einsum('bhnkv,bhncv->bhnck', leaving, v))
+    # A memory's contraction over the tokens that read it, a cotangent's over those that write it: a token
+    # of another document (its reader or writer zero) taken out before the products, where a discarded
+    # memory of 2^127 times its cotangent was inf and its zero reader made it NaN (base review d6c1b2c1a F2).
+    reading, writing = (jnp.any(side != 0, axis=-1, keepdims=True) for side in (readers, writers))
+    read_out = jnp.where(reading, do, 0.0)
+    written_in = jnp.where(writing, v, 0.0)
+    entered = _suffix(_crossed(readers, jnp.einsum('bhnkv,bhncv->bhnck', memories, read_out)), axis=-2)
+    terms = -_crossed(writers, jnp.einsum('bhnkv,bhncv->bhnck', leaving, written_in))
     left = _before(terms, axis=-2)
     through = jnp.sum(_crossed(jnp.swapaxes(leaving, -1, -2), jnp.swapaxes(passes * memories, -1, -2)),
                       axis=-2)

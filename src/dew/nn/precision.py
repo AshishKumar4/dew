@@ -1811,24 +1811,14 @@ def _aligned_directions(shape: tuple[tuple[int, ...], ...], axis, primals, tange
         def padded(x):
             return x.reshape((1,) * (rank - x.ndim) + x.shape)
 
-        def reduced(term):
-            # A term's shape after its sum over `axis` (each term over its own extent, as the value's).
-            extent = jnp.broadcast_shapes(*(padded(factors[at]).shape for at in term))
-            kept = () if axis is None else tuple(a % rank for a in np.atleast_1d(axis))
-            return tuple(1 if d in kept else size for d, size in enumerate(extent))
-
         gradients = []
         for place, factor in enumerate(factors):
-            # Each of the factor's places: the cotangent summed over the axes its term was broadcast across,
-            # times the term's other factors.
-            products = []
-            for term in shape:
-                summed_over = tuple(d for d, size in enumerate(reduced(term))
-                                    if size == 1 and cotangent.shape[d] != 1)
-                held = jnp.sum(cotangent, axis=summed_over, keepdims=True) if summed_over else cotangent
-                products += [(held, *(padded(factors[at]) for other, at in enumerate(term) if other != spot))
-                             for spot, at in enumerate(term) if at == place]
-            # Summed aligned over the axes the factor is broadcast across in its terms.
+            # Each of the factor's places: the cotangent times the term's other factors, summed aligned over
+            # the axes the factor is broadcast across (its term's, the cotangent's across a term broadcast
+            # into the value, and `axis`'s), the cotangent inside the products: summed first, 3 2^127 past
+            # float32's largest (base review d6c1b2c1a F1).
+            products = [(cotangent, *(padded(factors[at]) for other, at in enumerate(term) if other != spot))
+                        for term in shape for spot, at in enumerate(term) if at == place]
             axes = tuple(d for d, size in enumerate(padded(factor).shape) if size == 1)
             gradient = aligned_sum(products, axes or None)
             # A factor's axes its terms' others hold once take one gradient along them, broadcast.
