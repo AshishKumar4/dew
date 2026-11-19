@@ -543,8 +543,25 @@ def test_a_gemma4_moe_decoders_fsdp_cell_trains_as_on_one_device(case, steps, la
     assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path)
 
 
-@pytest.mark.parametrize(("case", "steps", "layout"), DIT_FSDP_CELLS, ids=cell_ids(DIT_FSDP_CELLS))
-@pytest.mark.check1_shards(seeds=8, per_task=4)
+CHECK1_SHARDS = {
+    "test_a_dits_fsdp_cells_train_as_on_one_device[simple_dit-1-step-fsdp]": {"seeds": 8, "per_task": 4},
+    "test_a_dits_fsdp_cells_train_as_on_one_device[simple_udit-2-steps-fsdp]": {"seeds": 8, "per_task": 4},
+    "test_a_dits_fsdp_cells_train_as_on_one_device[simple_mmdit-2-steps-fsdp]": {"seeds": 8, "per_task": 4},
+    "test_a_dits_fsdp_cells_train_as_on_one_device[hybrid_dit-2-steps-fsdp]": {"seeds": 8, "per_task": 4},
+}
+"""The DiTs' fsdp cells, each a check-1 site of its own whose seeds run as map tasks (`check1_shards`), by
+node id, a literal the CI plan reads as it reads a mark's (tools/armada/ci.py): one mark over the test's four
+cells had each task draw every cell, 255 to 280 s a task (armada, run IG-TIMING1)."""
+
+
+def dit_fsdp_cells() -> list:
+    """`DIT_FSDP_CELLS` as parameters, each marked from `CHECK1_SHARDS` by its node id."""
+    test = "test_a_dits_fsdp_cells_train_as_on_one_device"
+    return [pytest.param(*cell, id=name, marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{name}]"]))
+            for cell, name in zip(DIT_FSDP_CELLS, cell_ids(DIT_FSDP_CELLS), strict=True)]
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), dit_fsdp_cells())
 def test_a_dits_fsdp_cells_train_as_on_one_device(case, steps, layout, tmp_path):
     """`test_architecture_trains_on_every_layout_as_on_one_device` over the DiTs' fsdp cells, each arm's `fit`
     checked in the map task that draws its placed seed."""
