@@ -998,8 +998,11 @@ def test_even_twohot_bins_space_supports_evenly_and_dreamer_validates_bounds_and
     state = trainer.initial_state()
     rollout(state, {}, jax.random.key(1), objective=four_obj)
     rollout(state.replace(updates=jnp.int32(1)), {}, jax.random.key(2), objective=four_obj)
+    # The calls' states and keys made first: the window counts the rollout's compiles, not the test's own
+    # arithmetic's (each operation compiled where nothing before it ran it eagerly).
+    calls = [(state.replace(updates=jnp.int32(u)), jax.random.fold_in(jax.random.key(3), u))
+             for u in range(2, 6)]
     with Compiles(None) as midrun:
-        for u in range(2, 6):
-            rollout(state.replace(updates=jnp.int32(u)), {}, jax.random.fold_in(jax.random.key(3), u),
-                    objective=four_obj)
+        for at, key in calls:
+            rollout(at, {}, key, objective=four_obj)
     assert midrun.count == 0
