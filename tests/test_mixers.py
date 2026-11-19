@@ -393,8 +393,27 @@ def test_deepseek_v4s_projections_are_matrices_muon_steps(compressor):
         assert np.all(np.isfinite(np.asarray(leaf)))
 
 
-@pytest.mark.parametrize("compressor", sorted(COMPRESSED))
-@pytest.mark.check1_shards(seeds=256, per_task=64)
+CHECK1_SHARDS = {
+    "test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does[csa]": {"seeds": 256,
+                                                                                         "per_task": 64},
+    "test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does[csa2]": {"seeds": 256,
+                                                                                          "per_task": 64},
+    "test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does[hca]": {"seeds": 256,
+                                                                                         "per_task": 64},
+}
+"""Each compressor's packed row a check-1 site of its own whose seeds run as map tasks (`check1_shards`), by
+node id, a literal the CI plan reads as it reads a mark's (tools/armada/ci.py): one mark over the test's three
+had each task draw every compressor, 98 to 117 s a task (armada, run IG-TIMING2)."""
+
+
+def compressors() -> list:
+    """`COMPRESSED`'s compressors as parameters, each marked from `CHECK1_SHARDS` by its node id."""
+    test = "test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does"
+    return [pytest.param(name, id=name, marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{name}]"]))
+            for name in sorted(COMPRESSED)]
+
+
+@pytest.mark.parametrize("compressor", compressors())
 def test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does(compressor):
     """DeepSeek V4's compressed windows over a packed row (`document_windows`, ledger 2679): each
     document's windows pool its own real tokens from its first, rotate at its own places and are read by
