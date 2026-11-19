@@ -826,6 +826,90 @@ def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():
     assert cost.fused(generation.gpu_target("sm86")).unpriced(two)[-1] == 2
 
 
+@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
+def test_xlas_schedule_on_a_tpu_prices_what_its_kernels_keep_in_vmem(target_name):
+    """XLA's schedule on a TPU (`cost.fused`) prices the bytes its kernels move between the vector registers
+    and VMEM (`Work.kept_bytes`) at the TPU's VMEM rate (`GpuTarget.vmem_rate`, row 7283): a leaf read once,
+    a product's result and a reduction's written once and read once (a reduction's at a lane's four bytes),
+    a chunk form's product's too (`cost.product_work`). A GPU's XLA keeps them on chip at no price, and a TPU
+    no one measured leaves them work no rate prices."""
+    tpu = generation.TARGETS[target_name]
+
+    def kept(fn, *shapes):
+        with program.passes(target=target_name):
+            region = terms.region(jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.float32) for shape in shapes)))
+            graph, bundle, _ = program.graphed(region)
+            return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                                 cost_model=cost.model(region, cost.fused(tpu)))[1].work
+
+    product, summed = kept(jnp.dot, (64, 128), (128, 256)), kept(lambda x: jnp.sum(x, axis=-1), (64, 128))
+    assert product.kept_bytes == 4 * (64 * 128 + 128 * 256 + 2 * 64 * 256)
+    assert summed.kept_bytes == 4 * (64 * 128 + 2 * 64)
+    assert kept(lambda x: jnp.sum(x, axis=-1), (4, 0)).kept_bytes == 2 * 4 * 4
+    assert cost.product_work(64, 128, 256, count=3).kept_bytes == 3 * 2 * 64 * 256 * 4
+    # On-chip memory's unit (`templates.cost.units`' fourth): exact, one quotient beside a zero.
+    on_chip = 3
+    assert (kernel_cost.units(product, kernel_cost.rates(tpu, device=True))[0][on_chip]
+            == product.kept_bytes / tpu.vmem_rate)
+    hopper, unmeasured = (kernel_cost.rates(generation.TARGETS[name], device=True) for name in ("sm90", "v4"))
+    assert kernel_cost.units(product, hopper)[0][on_chip] == 0
+    assert product.kept_bytes in kernel_cost.units(product, unmeasured)[1]
+
+
+def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
+    """A scan's chunk form on a v5e (`linear_scan.derive` under XLA's schedule, as `scan` derives it) keeps
+    its products' results and a token step's state on chip (`Work.kept_bytes`), which the TPU's VMEM rate
+    prices (row 7283): derived where the v5e states no rate, those bytes are work no rate prices, and the
+    cheapest form's seconds are fewer by them."""
+    from dew.algebra import linear_scan
+
+    v5e = generation.TARGETS["v5e"]
+
+    def derived(target):
+        return linear_scan.derive(linear_scan.Extents(64, 128, 128, 1), corrects=False,
+                                  schedule=cost.fused(target), precision=None, saturation=algebra.SATURATION)
+
+    priced, unmeasured = derived(v5e), derived(dataclasses.replace(v5e, vmem_rate=None))
+    assert priced.price.work.kept_bytes > 0
+    assert unmeasured.price.work.kept_bytes in unmeasured.price.schedule.unpriced(unmeasured.price.work)
+    assert priced.price.value > unmeasured.price.value
+
+
+@pytest.mark.parametrize(("dtypes", "itemsize"), [(("bfloat16", "float16"), 2), (("float64", "float64"), 8)],
+                         ids=["bfloat16 by float16", "float64 traced under x64"])
+def test_a_product_is_priced_at_the_dtype_jax_gives_it(dtypes, itemsize):
+    """A `lax.dot_general`, no preferred type stated, priced at the dtype JAX makes it
+    (`terms.product_dtype`), its result kept on chip at that dtype's bytes beside its leaves'
+    (`Work.kept_bytes`): a bfloat16 by a float16 product bfloat16, whose NumPy promotion, refused, raised
+    there (base review 0b8b7ed98 F1, a crash pricing any program holding one); a float64 product traced
+    under x64 and priced outside it float64, not the float32 a dtype read outside x64 canonicalizes it to
+    (its head review)."""
+    def product(a, b):
+        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
+
+    with jax.enable_x64(new_val=True):
+        a, b = jnp.ones((2, 3), dtypes[0]), jnp.ones((3, 4), dtypes[1])
+        region = terms.region(jax.make_jaxpr(product)(a, b))
+    graph, bundle, _ = program.graphed(region)
+    work = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                         cost_model=cost.model(region, cost.fused(generation.TARGETS["v5e"])))[1].work
+    leaves = a.dtype.itemsize * 2 * 3 + b.dtype.itemsize * 3 * 4
+    assert work.kept_bytes == leaves + 2 * itemsize * (2 * 4)
+
+
+@pytest.mark.parametrize("apart", [0, 1, 4], ids=["as written", "a group of one", "apart from its group"])
+def test_a_token_loops_states_are_kept_each_token(apart):
+    """A scan's token loop keeps its state on chip each token, written and read (`Work.kept_bytes`, row
+    7283), and where a token reads apart from a group of more than one token's writes the state its group
+    entered beside it (`scan._looped`'s two carried states)."""
+    from dew.algebra import linear_scan
+
+    c, k, v = 16, 32, 64
+    work = linear_scan._work(linear_scan.Chunk.plain(linear_scan.Chunk.token("U")),
+                             linear_scan.Extents(c, k, v, 1, apart=apart), lambda value: (0, 0), None)
+    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * 4 * k * v
+
+
 def test_device_memory_is_priced_at_the_parts_measured_stream():
     """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.part`,
     tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer

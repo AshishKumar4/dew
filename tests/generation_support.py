@@ -36,6 +36,14 @@ SUMS_IN_IEEE = pytest.mark.skipif(
            "truncating each add, do not")
 
 
+def interprets() -> bool:
+    """Whether this process's kernels run interpreted as its run runs them: off a GPU, but not in a GPU tier
+    part's prepare, which states them as the node's GPU runs them (`here`), so the run reads its arms from
+    the store. Read at import off a GPU alone, a prepare on the node's CPU stated its arm interpreted and the
+    run's was one it never drew (row 8750's MissingTruth)."""
+    return not tier_wire.preparing() and jax.default_backend() != "gpu"
+
+
 def here() -> str:
     """This process's device generation as its kernels run: the node's GPU's in a GPU tier part's prepare
     (`model_flows.node_target`), whose default device, a compile-only GPU, states no generation of its own,

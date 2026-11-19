@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import COMPILES_ON_CPU, lowers
+from generation_support import COMPILES_ON_CPU, here, interprets, lowers
 from reference_error import (
     FEWEST_SEEDS,
     as_given,
@@ -49,8 +49,9 @@ from dew.parity_stages import REDRAW
 
 pytestmark = pytest.mark.kernel
 
-INTERPRETED = jax.default_backend() != "gpu"
-"""The template interprets off a GPU, by the wgmma bundle, whose rings and barriers the interpreter models."""
+INTERPRETED = interprets()
+"""The template interprets off a GPU, by the wgmma bundle, whose rings and barriers the interpreter models;
+a GPU tier part's prepare states it as the node's GPU runs it (`generation_support.interprets`)."""
 
 SHAPES = {"interpreted": (1, 70, 256, 16), "falcon-mamba-7b": (2, 2048, 8192, 16)}
 """Each case's rows, tokens, channels and states: a ragged chunk over two channel blocks, and Falcon Mamba
@@ -133,17 +134,18 @@ def test_a_rate_past_float32s_range_scans_as_the_recurrence_interpreted():
     template = functools.partial(selective.selective_scan, family=taken_family(jnp.float32),
                                  interpret=INTERPRETED)
     exact = jax.jit(with_gradients(stepwise))
-    assert_as_exact(jax.jit(with_gradients(template)), exact, rate_past_the_range,
+    assert_as_exact(jax.jit(with_gradients(template)), exact,
+                    functools.partial(rate_past_the_range, "vanishing decays"),
                     "the selective template at a rate past float32's range", seeds=FEWEST_SEEDS,
                     truth_fn=exact)
 
 
 def taken_family(dtype) -> mosaic.Family:
     """The bundle the template takes here (`Selective._fwd`'s): the interpreted target's off a GPU, the
-    device's on one, so no launch runs a family the host's multiprocessor does not (an A100 interpreting
-    wgmma's raised its consumers' registers past what it takes, the promotion tier's row 5413)."""
-    return bundles.of(generation.interpreted_target().generation if INTERPRETED
-                      else generation.device_generation(), dtype)
+    device's on one (a GPU tier part's prepare the node's, `generation_support.here`), so no launch runs a
+    family the host's multiprocessor does not (an A100 interpreting wgmma's raised its consumers' registers
+    past what it takes, the promotion tier's row 5413)."""
+    return bundles.of(generation.interpreted_target().generation if INTERPRETED else here(), dtype)
 
 
 def the_template_is_as_exact_as_its_reference(case: str, packed: bool, dtype=jnp.bfloat16,
@@ -280,7 +282,7 @@ def test_the_backward_repeats_its_state_gradients_bit_for_bit_where_reductions_a
     the same over repeated runs of one compiled step, B's and C's too, which the default's atomic adds sum
     in whatever order their programs run (row 4448's declared contract)."""
     shape = (1, 256, 512, 16)
-    family = bundles.of(generation.device_generation(), jnp.float32)
+    family = bundles.of(here(), jnp.float32)
     template = functools.partial(selective.selective_scan, family=family)
     inputs, starts, dy = draw(jnp.float32, 0, *shape, packed=False)
     step = jax.jit(with_gradients(scanned(template, starts)))

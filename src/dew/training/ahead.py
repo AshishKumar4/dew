@@ -700,16 +700,21 @@ class AheadPrograms:
 
     target: BuildTarget
     programs: dict[str, Executable]
-    kept: dict[str, KeptProgram] | None = None
-    """The programs a process compiled at Dew's compile point, each by its fingerprint (`KeptProgram`,
-    `keeping`): a process of their target runs each for a call that lowers to that program under those
-    options (`kept`); None for a file of named programs alone."""
-    tuned: bool = True
+    tuned: bool
     """Whether their compile took the GPU kind's tuned choices, as the device's own compile makes them
     (`report.autotuned`): one on a device, or for a node's topology within `report.for_devices`; a compile
     for a generation's canonical GPUs is XLA's untuned program (`compile_programs`), which `loaded`
     refuses where the process's own compile would tune (row 8422: untuned convolutions left cuDNN's runtime
-    heuristic to pick a non-deterministic algorithm)."""
+    heuristic to pick a non-deterministic algorithm). Stated by every constructor, and a file saved
+    without it refused at its load (row 8459)."""
+    at_run: tuple[str, ...]
+    """The programs leaving a choice to run time their device's own compile makes (`report.left_at_run`: a
+    convolution compiled without its GPU, as `compile_programs` reads one for its memory alone), which
+    `loaded` refuses on any GPU (row 8688)."""
+    kept: dict[str, KeptProgram] | None = None
+    """The programs a process compiled at Dew's compile point, each by its fingerprint (`KeptProgram`,
+    `keeping`): a process of their target runs each for a call that lowers to that program under those
+    options (`kept`); None for a file of named programs alone."""
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
@@ -719,6 +724,10 @@ class AheadPrograms:
     def load(path: str | Path) -> AheadPrograms:
         """The programs `save` wrote to `path`."""
         programs = _saved(path, AheadPrograms, "programs")
+        if "tuned" not in vars(programs) or "at_run" not in vars(programs):
+            raise ValueError(f"{path} holds programs compiled ahead before their files said whether XLA "
+                             "tuned them and which leave a choice to run time (`tuned`, `at_run`); compile "
+                             "them ahead again")
         _current(path, "programs", [*programs.programs.values(),
                                     *(each.executable for each in (programs.kept or {}).values())])
         return programs
@@ -728,16 +737,20 @@ class AheadPrograms:
         platform (`BuildTarget.own_devices`), the ones it was compiled for: each called with the arguments it
         was compiled for runs it. Refused, naming what differs, where those devices, this JAX, its XLA flags
         or its host are not the target they were built for, and where they would not run as this process's
-        own compile of them (`report.compiled_as_here`: untuned where it tunes; none leaves a choice to run
-        time, which `compile_programs` refuses); each is admitted as a compiled program is
-        (`dew.communicators.admit`)."""
+        own compile of them (`report.compiled_as_here`: untuned where it tunes, or a choice left to run time,
+        `at_run`); each is admitted as a compiled program is (`dew.communicators.admit`)."""
         devices = self.target.own_devices()[:self.target.devices]
         self.target.held(devices)
-        if not report.compiled_as_here(devices, tuned=self.tuned, at_run=False):
-            raise ValueError(f"these programs were compiled for {self.target.generation}'s canonical GPUs, "
-                             "untuned (XLA's defaults where a device's compile tunes its convolutions and "
-                             "GEMMs): compile them for this node's topology (compile_programs' topology, "
-                             "$DEW_NODE_TOPOLOGY), or run with the autotuner off (xla_gpu_autotune_level 0)")
+        if not report.compiled_as_here(devices, tuned=self.tuned, at_run=bool(self.at_run)):
+            raise ValueError(
+                f"programs {', '.join(self.at_run)} were compiled without their GPU and leave a "
+                "convolution's algorithm to run time (report.DEVICELESS_CONVOLUTION_PICKS): compile them on "
+                "this GPU"
+                if self.at_run else
+                f"these programs were compiled for {self.target.generation}'s canonical GPUs, untuned (XLA's "
+                "defaults where a device's compile tunes its convolutions and GEMMs): compile them for this "
+                "node's topology (compile_programs' topology, $DEW_NODE_TOPOLOGY), or run with the autotuner "
+                "off (xla_gpu_autotune_level 0)")
         return {name: program.loaded(devices) for name, program in self.programs.items()}
 
 
@@ -852,7 +865,8 @@ class Keeping:
                          reason)
         target = BuildTarget.of(jax.devices())
         cpu_stated(target, jax.devices())
-        programs = AheadPrograms(target, {}, dict(self.kept))
+        # Each compiled on this process's devices, which made its every choice itself.
+        programs = AheadPrograms(target, {}, tuned=True, at_run=(), kept=dict(self.kept))
         programs.save(path)
         return programs
 
@@ -1002,7 +1016,8 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
                              "constant of its program, which no executable serializes: pass it as an "
                              f"argument): {refused}") from refused
     need = programs_need(gpus[0], [(executable.memory, 0, 0) for executable in built.values()])
-    return AheadPrograms(BuildTarget.built(target, 1, need), built, tuned=tuned)
+    return AheadPrograms(BuildTarget.built(target, 1, need), built, tuned=tuned, at_run=tuple(
+        name for name, compiled in zip(programs, executables, strict=True) if report.left_at_run(compiled)))
 
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
