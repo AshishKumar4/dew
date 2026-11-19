@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from map_judge import marked_seeds
 from model_support import TINY_DECODER
 from test_decision_context import assert_packed_as_alone, windows_of
 from test_decision_letters_context import LABELS, QUESTIONS as LETTERED_QUESTIONS, STATES
@@ -196,11 +197,11 @@ def test_a_multimodal_backbones_row_in_streams_reads_as_its_text_decoders():
     np.testing.assert_array_equal(states(text_only=False), states(text_only=True))
 
 
-STREAM_SEEDS = {"joint": 16, "lettered": 128}
-"""Check 1's declared seeds for packed rows in two streams against each row alone, sized by `seeds_for`
-with the packed windows as `dew_fn`: 16 and 8 on 2026-10-30, the lettered rows' again at base 7853cfdf6
-(job 20261109062353-1a4d7ce5), whose 8 left the verdict's 40 Inconclusive (a pooled ratio's interval
-[0.901, 1.580])."""
+LETTERED_SEEDS = 128
+"""Check 1's declared seeds for packed lettered rows in two streams against each row alone, sized by
+`seeds_for` with the packed windows as `dew_fn`: 8 on 2026-10-30, again at base 7853cfdf6 (job
+20261109062353-1a4d7ce5), whose 8 left the verdict's 40 Inconclusive (a pooled ratio's interval [0.901,
+1.580]). The joint rows' 16 (`seeds_for`, 2026-10-30) are their mark's (`marked_seeds`)."""
 
 
 @pytest.mark.parametrize("layout", [
@@ -210,13 +211,14 @@ with the packed windows as `dew_fn`: 16 and 8 on 2026-10-30, the lettered rows' 
     pytest.param(JOINT, id="joint", marks=pytest.mark.check1_shards(seeds=16, per_task=16)),
     pytest.param(LETTERED, id="lettered"),
 ])
-def test_packed_rows_in_two_streams_decide_each_row_as_the_row_alone(layout):
+def test_packed_rows_in_two_streams_decide_each_row_as_the_row_alone(layout, request):
     """Rows in two streams, packed a window, decide each row's options as the row does in a window of its
     own, through the unmodified objective: each row's tokens read its own streams and no other row's, the
     real options' logits on par from float64 (check 1, over drawn parameters)."""
     name = "joint" if layout is JOINT else "lettered"
+    seeds = marked_seeds(request) if layout is JOINT else LETTERED_SEEDS
     assert_packed_as_alone(in_streams(layout, segments=3), in_streams(layout, segments=1), examples(layout),
-                           f"packed {name} rows in two streams", STREAM_SEEDS[name])
+                           f"packed {name} rows in two streams", seeds)
 
 
 def test_a_layouts_reads_name_only_its_streams_and_every_stream_reads_itself():
