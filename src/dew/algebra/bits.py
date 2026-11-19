@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX
+from dew.nn.float_bits import widened_exactly
 from dew.nn.kernels.templates.product import NVFP4
 from dew.nn.precision import correctly_rounded_divide
 
@@ -795,16 +796,9 @@ def restored(pattern: jax.Array, dtype=jnp.float32) -> jax.Array:
     sign = pattern & jnp.uint32(0x8000)
     rebased = (pattern << jnp.uint32(16)) + jnp.uint32(126 << 23)
     normal = jax.lax.bitcast_convert_type(rebased, jnp.float32)
-    if jnp.finfo(dtype).bits > 32:
-        # Widened from the rebased bits themselves where they hold a float32 subnormal (a pattern outside the
-        # format's codes), which a flushing lane's cast would zero: its fraction times 2^-149, exact in a
-        # wider format.
-        fraction = (rebased & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** -149, dtype)
-        tiny = jnp.where(rebased >> jnp.uint32(31) != 0, -fraction, fraction)
-        normal = jnp.where(rebased & jnp.uint32(0x7F800000) == 0, tiny, normal.astype(dtype))
-    else:
-        # A format no wider than float32 casts the float32 as it casts any.
-        normal = normal.astype(dtype)
+    # Widened exactly where wider than float32 (a float32 subnormal, a pattern outside the format's codes,
+    # from its bits, which a flushing lane's cast would zero); a format no wider cast as it casts any.
+    normal = widened_exactly(normal, dtype) if jnp.finfo(dtype).bits > 32 else normal.astype(dtype)
     mantissa = (pattern & jnp.uint32(0x7F)).astype(dtype) * jnp.asarray(2.0 ** -7, dtype)
     subnormal = jnp.where(sign != 0, -mantissa, mantissa)
     return jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)

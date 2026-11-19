@@ -928,7 +928,7 @@ def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at
 
 def _edge_floats() -> np.ndarray:
     """fp32's values across every binade (`test_precision_policy.edge_values`): a quotient's operands."""
-    from test_precision_policy import edge_values
+    from low_precision_support import edge_values
 
     return edge_values(np.float32)
 

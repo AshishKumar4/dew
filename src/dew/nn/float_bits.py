@@ -1,7 +1,8 @@
-"""A float's bits, read and set: its sign, exponent and significand (`float_bits`, `binade_of`), a power of
-two set in its exponent bits (`exact_power2`), and fp32 scaled by a power of two from its bits
-(`raised_exactly`, `lowered_rounded`), so a process whose float multiply flushes a subnormal (XLA's CPU)
-still reads and scales one. Integer arithmetic on a float's bits alone, which `dew.nn.precision`'s
+"""A float's bits, read and set: its raw fields (`raw_fields`), its sign, exponent and significand
+(`float_bits`, `binade_of`), a power of two set in its exponent bits (`exact_power2`), fp32 scaled by a power
+of two from its bits (`raised_exactly`, `lowered_rounded`) and a float widened exactly
+(`widened_exactly`), so a process whose float multiply or conversion flushes a subnormal (XLA's CPU) still
+reads, scales and widens one. Integer arithmetic on a float's bits alone, which `dew.nn.precision`'s
 arithmetic (`power2`, `aligned_sum`) and the kernel templates read."""
 
 from __future__ import annotations
@@ -44,6 +45,19 @@ TWO_FACTOR_REACH = two_factor_reach(jnp.float32)
 """`two_factor_reach` of float32, 252: a caller whose `k` stays within it states it for two factors."""
 
 
+def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """A float `x`'s bits as the unsigned integer of its width, and its raw fields in that type: its sign bit
+    in place, its biased exponent shifted down and its fraction, `(bits, sign, biased, fraction)`. The one
+    reader of a float's fields: a subnormal's normalization (`float_bits`) and a result's rounding
+    (`lowered_rounded`, `precision`'s division) are their callers'."""
+    limits = jnp.finfo(x.dtype)
+    word = jnp.dtype(f"uint{limits.bits}")
+    bits = jax.lax.bitcast_convert_type(x, word)
+    return (bits, bits & word.type(1 << (limits.bits - 1)),
+            (bits >> word.type(limits.nmant)) & word.type(2 * limits.maxexp - 1),
+            bits & word.type((1 << limits.nmant) - 1))
+
+
 def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
     """A float `x` (fp32 or float64) from its bits, each a signed integer of its width: its sign bit, its
     biased exponent, its fraction, its fraction normalized as a normal one's (a subnormal's leading bit moved
@@ -54,10 +68,7 @@ def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
     limits = jnp.finfo(x.dtype)
     signed = jnp.dtype(f"int{limits.bits}")
     bias, width = limits.maxexp - 1, limits.nmant
-    bits = jax.lax.bitcast_convert_type(x, signed)
-    biased = (bits >> width) & (2 * limits.maxexp - 1)
-    fraction = bits & ((1 << width) - 1)
-    sign = bits & np.array(-(1 << (limits.bits - 1)), signed)
+    _, sign, biased, fraction = (jax.lax.bitcast_convert_type(field, signed) for field in raw_fields(x))
     up = jnp.clip(width - (limits.bits - 1 - jax.lax.clz(fraction)), 0, width)
     normalized = jnp.where(biased > 0, fraction, (fraction << up) & ((1 << width) - 1))
     exponent = jnp.where(biased > 0, biased - bias, limits.minexp - up)
@@ -93,10 +104,8 @@ def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     float32 multiply or conversion flushes a subnormal result (XLA's CPU, per primitive, row 4023) still
     returns it, as an IEEE multiply by the power of two would. A finite `x` alone; an infinity or NaN
     returns as it is."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    sign = bits & np.uint32(0x80000000)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
+    _, sign, biased, fraction = raw_fields(x.astype(jnp.float32))
+    biased = biased.astype(jnp.int32)
     # A subnormal `x` holds its significand at the least normal's exponent, its leading bit none.
     held = jnp.maximum(biased, 1)
     significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
@@ -113,3 +122,17 @@ def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     lowered = jnp.where((target >= 1) & (biased > 0), normal, subnormal)
     rounded = jax.lax.bitcast_convert_type(lowered, jnp.float32)
     return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
+
+
+def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
+    """`x` in `dtype`, a float at least as wide, exactly: a subnormal `x` from its bits, its fraction times
+    the least subnormal's power, a normal value in `dtype`, so a process whose float conversion flushes a
+    subnormal operand (XLA's CPU, row 4023: float32's `2^-149` widened to zero) widens it; any other `x`
+    (an integer, a Python scalar, `x` of `dtype`) converted as `jnp.asarray` converts it."""
+    x, dtype = jnp.asarray(x), jax.dtypes.canonicalize_dtype(dtype)
+    if not jnp.issubdtype(x.dtype, jnp.floating) or x.dtype == dtype:
+        return jnp.asarray(x, dtype)
+    limits = jnp.finfo(x.dtype)
+    _, sign, biased, fraction = raw_fields(x)
+    tiny = fraction.astype(dtype) * jnp.asarray(2.0 ** (int(limits.minexp) - int(limits.nmant)), dtype)
+    return jnp.where(biased == 0, jnp.where(sign != 0, -tiny, tiny), x.astype(dtype))

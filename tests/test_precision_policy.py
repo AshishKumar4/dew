@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from low_precision_support import edge_values
 from reference_error import assert_as_exact, assert_fp32_reduction_bound, dot_precisions
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -16,7 +17,15 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dense import Dense
 from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
-from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, float_bits, lowered_rounded, raised_exactly
+from dew.nn.float_bits import (
+    TWO_FACTOR_REACH,
+    binade_of,
+    float_bits,
+    lowered_rounded,
+    raised_exactly,
+    raw_fields,
+    widened_exactly,
+)
 from dew.nn.kernels import generation
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
@@ -31,6 +40,7 @@ from dew.nn.precision import (
     compensated_add,
     compensated_difference,
     exact_products,
+    float64_sum,
     fp32_result_dot_general,
     two_product,
     two_sum,
@@ -1216,6 +1226,27 @@ def test_an_aligned_sum_of_fp32_terms_under_x64_keeps_fp32():
     np.testing.assert_array_equal(np.asarray(found), [3.0])
 
 
+def test_an_aligned_sum_of_mixed_factors_reads_a_subnormal_from_its_bits():
+    """`aligned_sum` of an fp32 subnormal times an fp64 factor, with x64 on: `2^-149 2^149` is fp64's 1 and
+    `-(0x007fffff) 2^-149 2^149` its `-(2^23 - 1)`, each factor widened from its bits, where cast to fp64
+    first XLA:CPU flushed the subnormal and the sum was 0 (row 8966)."""
+    with jax.enable_x64(new_val=True):
+        subnormal = jnp.asarray(np.asarray([1, 0x807FFFFF], np.uint32).view(np.float32))
+        found = aligned_sum([(subnormal, jnp.full((2,), 2.0 ** 149, jnp.float64))])
+    assert found.dtype == jnp.float64
+    np.testing.assert_array_equal(np.asarray(found), [1.0, -(2.0 ** 23 - 1)])
+
+
+def test_a_float64_sum_widens_its_subnormal_operands_exactly():
+    """`float64_sum`, Dew's wide CPU arithmetic's sum, of fp32 operands below the least normal: `2^-149 2^127`
+    and `(2^-126 - 2^-149) 2^127` taken in float64 and rounded once to fp32, `2^-22` and `2 - 2^-22`, where
+    widened by a cast XLA:CPU flushed them and each product was 0 (row 8966)."""
+    lhs = jnp.asarray(np.asarray([[1], [0x7FFFFF]], np.uint32).view(np.float32))
+    found = float64_sum(jnp.matmul, lhs, jnp.asarray([[2.0 ** 127]], jnp.float32), dtype=jnp.float32)
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), np.float32([[2.0 ** -22], [2.0 - 2.0 ** -22]]))
+
+
 def test_an_aligned_sum_of_three_factors_over_a_long_axis_is_its_exact_sum():
     """`aligned_sum([(x, x, x)], axis=0)` of 2^20 fp32 ones: 2^20, its digits as narrow as its count of limbs
     needs, where four million pieces were refused (base review 6c68b90ad F2)."""
@@ -1742,27 +1773,6 @@ def test_an_exact_product_at_a_dtypes_edge_keeps_its_residual(dtype, left, right
         assert Fraction(float(product)) + Fraction(float(residual)) == exact
 
 
-def edge_values(dtype) -> np.ndarray:
-    """A float format's values across every binade, of both signs, from their bits: zeros, subnormals of
-    every leading bit's place and the least and largest, the least normal and the largest, normals across
-    every exponent, and significands of ties to even at every shift (1.5, 3 and an ulp, a subnormal's 0b11
-    and 0b101 leads): every edge of a reading or a scaling of its bits."""
-    limits = np.finfo(dtype)
-    word = np.dtype(f"uint{limits.bits}")
-    width = limits.nmant
-    infinite = int(np.asarray(np.inf, dtype).view(word)[()])
-    one, three = (int(np.asarray(value, dtype).view(word)[()]) for value in (1.5, 3.0))
-    bits = np.concatenate([
-        np.arange(0, 1 << width, ((1 << width) // 2047) | 1, dtype=word),
-        np.arange(1 << width, infinite, ((infinite - (1 << width)) // 2047) | 1, dtype=word),
-        # A subnormal led by each bit's place, its lower bits mixed: every leading-bit position.
-        np.asarray([(1 << place) | ((1 << place) - 1) // 3 for place in range(width)], word),
-        np.asarray([0, 1, 2, 3, (1 << width) - 1, 1 << width, infinite - 1, 3 << (width - 1),
-                    5 << (width - 3), one, three + 1], word)])
-    values = bits.view(dtype)
-    return np.concatenate([values, -values])
-
-
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
                                    jnp.float8_e5m2, jnp.float6_e2m3fn, jnp.float6_e3m2fn, jnp.float4_e2m1fn])
 def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
@@ -1881,6 +1891,42 @@ def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach,
     np.testing.assert_array_equal(found[0], 0.0)
     past = np.asarray([[abs(value) > limits.max for value in row] for row in exact])
     assert np.all(np.isinf(found[past]))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
+                                   jnp.float8_e5m2])
+def test_a_floats_raw_fields_are_its_bits(dtype):
+    """`raw_fields` of a format's edge values of both signs, compiled: its bits as the unsigned integer of its
+    width, its sign bit in place, its biased exponent and its fraction, each NumPy's reading of the same
+    bits, and the three fields recompose the bits."""
+    with jax.enable_x64(new_val=dtype == np.float64):
+        values = edge_values(dtype)
+        bits, sign, biased, fraction = (np.asarray(field)
+                                        for field in jax.jit(raw_fields)(jnp.asarray(values)))
+    limits = jnp.finfo(dtype)
+    word = np.dtype(f"uint{limits.bits}")
+    expected = values.view(word)
+    assert {field.dtype for field in (bits, sign, biased, fraction)} == {word}
+    np.testing.assert_array_equal(bits, expected)
+    np.testing.assert_array_equal(sign, expected & word.type(1 << (limits.bits - 1)))
+    np.testing.assert_array_equal(biased, (expected >> limits.nmant) & word.type(2 * limits.maxexp - 1))
+    np.testing.assert_array_equal(sign | (biased << limits.nmant) | fraction, expected)
+
+
+@pytest.mark.parametrize(("source", "target"), [
+    (np.float32, np.float64), (jnp.bfloat16, np.float32), (np.float16, np.float32),
+    (jnp.float8_e4m3fn, np.float32), (np.float32, np.float32)],
+    ids=["fp32-float64", "bf16-fp32", "fp16-fp32", "e4m3-fp32", "fp32-fp32"])
+def test_a_float_widens_exactly_from_its_bits(source, target):
+    """`widened_exactly` of a format's edge values of both signs (its subnormals of every leading bit's place
+    among them) into a format at least as wide, compiled: NumPy's exact conversion bit for bit, a negative
+    zero's sign kept, where XLA:CPU's cast flushes a subnormal (row 8966)."""
+    with jax.enable_x64(new_val=target == np.float64):
+        values = edge_values(source)
+        found = np.asarray(jax.jit(lambda x: widened_exactly(x, target))(jnp.asarray(values)))
+    assert found.dtype == target
+    word = f"uint{np.finfo(target).bits}"
+    np.testing.assert_array_equal(found.view(word), values.astype(target).view(word))
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["fp32", "float64"])
