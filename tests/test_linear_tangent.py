@@ -99,3 +99,32 @@ def test_forward_over_reverse_differentiates_the_portable_pullback():
     x, index = jnp.arange(8.0), jnp.arange(8)
     tangent = jax.jvp(lambda x: jax.grad(summed)(x, index), (x,), (jnp.ones_like(x),))[1]
     np.testing.assert_array_equal(np.asarray(tangent), np.zeros(x.shape))
+
+
+def squared(x):
+    """`x` squared through a kernel whose derivative runs its forward held still (`nested` off): its forward
+    `x^2` saving `x`, its backward twice the saved `x` times the cotangent, its portable arithmetic `x^2`."""
+    return generation.linear_tangent(
+        lambda x: (jax.lax.stop_gradient(x * x), jax.lax.stop_gradient(x)),
+        lambda saved, operands, cotangent: (2 * saved * cotangent,),
+        lambda x: x * x, kind=KernelGlue(), nested=False)(x)
+
+
+@pytest.mark.parametrize("order", ["forward over reverse", "reverse over reverse"])
+def test_a_held_still_kernels_second_order_keeps_its_loss_curvature(order):
+    """The Hessian of `sum(squared(x)^2)` along a direction, its loss nonlinear in the kernel's output,
+    through a kernel whose derivative runs its forward held still (`nested` off): `12 x^2` times the
+    direction, the loss's curvature `J^T H J` with it, by `jax.jvp` of the gradient and by the gradient of
+    the gradient's product with the direction, where the output held still carried no tangent of its own and
+    both gave `4 x^2` (row 8648)."""
+    x, direction = jnp.arange(1.0, 9.0), jnp.ones(8)
+
+    def loss(x):
+        return jnp.sum(squared(x) ** 2)
+
+    if order == "forward over reverse":
+        found = jax.jvp(jax.grad(loss), (x,), (direction,))[1]
+    else:
+        found = jax.grad(lambda x: jnp.vdot(jax.grad(loss)(x), direction))(x)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray(12 * x ** 2))
+
