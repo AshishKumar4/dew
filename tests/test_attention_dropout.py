@@ -599,16 +599,16 @@ def test_a_mosaic_dropping_backwards_tiny_split_mean_keeps_its_query_gradient():
 
 
 def test_a_mosaic_dropping_backwards_kept_anchor_keeps_its_tiny_product():
-    """A bf16 Mosaic call interpreted for an H100 at logits -1 and 0, dropout at rate 1 - 2^-53 keeping only
-    the second key, the anchor, whose value is 2^-126 under a dO of 2^-40: the anchor's product with dO,
-    2^-166, is below fp32's least subnormal until its power of 2^53 joins it, so D takes the anchor's value
-    to the sums' power before the product (`attention_gradient.split_delta`): dQ's sign and size on par
-    with the reference's (check 1), where its product rounded to 0 first and dQ's second coordinate was
-    +6.96e-36 for -1.89e-35 (the base review of 6a57b66de, F1)."""
+    """A bf16 Mosaic call interpreted for an H100 at logits -0.5 and 0, dropout at rate 1 - 2^-53 keeping
+    only the anchor, whose value is 2^-126 under a dO of 2^-40. Its product 2^-166 needs the power of 2^53
+    before the contraction (`attention_gradient.split_delta`), or dQ's second coordinate is -6.86e-36
+    instead of +1.13e-35 (the base review of 6a57b66de, F1). In the score cotangents the anchor's
+    self-difference is exactly zero even though the tile's unscaled product rounds to zero, or the
+    anchor's key gradient has the wrong sign. Both gradients are on par with the reference (check 1)."""
     words = jnp.asarray([3181759654, 0], jnp.uint32)
     hooks, spans = hooked(words, 1, 1, 1.0 - 2.0 ** -53), template.spans(1, 2, 1)
     query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 1].set(1)
-    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 1].set(-1)
+    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 1].set(-0.5)
     value = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 1, 0, 0].set(2.0 ** -126)
     dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(2.0 ** -40)
     ours, reference = _mosaic_gradients(spans, hooks)
