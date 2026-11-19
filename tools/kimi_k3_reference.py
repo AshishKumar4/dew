@@ -59,7 +59,6 @@ import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import torch
@@ -176,8 +175,8 @@ def greedy(model: object, input_ids: torch.Tensor, attention_mask: torch.Tensor)
     """Four greedy tokens after each row, and the logits each decode step read."""
     from transformers.generation.utils import GenerateDecoderOnlyOutput, GenerationMixin
 
-    # GenerationMixin's generate (transformers 4.56.2), which the language model inherits.
-    generated = cast(GenerationMixin, model).generate(
+    assert isinstance(model, GenerationMixin)  # A causal language model (transformers 4.56.2).
+    generated = model.generate(
         input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=4, do_sample=False,
         eos_token_id=None, pad_token_id=0, output_logits=True, return_dict_in_generate=True)
     assert isinstance(generated, GenerateDecoderOnlyOutput) and generated.logits is not None  # As asked.

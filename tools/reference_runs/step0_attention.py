@@ -24,7 +24,7 @@ the torch side writes each backend's hidden states as bf16 bits to
 import argparse
 import json
 from pathlib import Path
-from typing import cast
+from typing import Any
 
 import numpy as np
 from common import window_rows, write_record
@@ -47,8 +47,9 @@ def torch_side(args) -> None:
 
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32,
                                                                   attn_implementation="sdpa")
-    # Its own `cuda` (PreTrainedModel's), read through Module's signature, which its functools.wraps hides.
-    model = cast(PreTrainedModel, cast(torch.nn.Module, model).cuda())
+    # Moved in place by its own `cuda` (PreTrainedModel's), whose functools.wraps hides its signature.
+    placed: Any = model
+    placed.cuda()
     bf16_residual(model)
     kept = {}
     model.model.norm.register_forward_hook(lambda module, inputs, output: kept.__setitem__("hidden", output))

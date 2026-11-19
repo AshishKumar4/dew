@@ -22,7 +22,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import cast
+from typing import Any
 
 COHORT = "torch-qwen35"
 """The reference releases this tool runs against (tools/reference_releases.py), and the environment
@@ -273,9 +273,9 @@ def load_backbone(smoke: bool):
         if not qwen.is_fast_path_available:
             raise RuntimeError("HF's FLA/causal-conv1d fast path is unavailable")
         backbone = qwen.Qwen3_5TextModel(config)
-        # Moved in place by its own `to` (PreTrainedModel's), read through Module's signature, which its
-        # functools.wraps hides.
-        cast(torch.nn.Module, backbone).to(device=device, dtype=torch.float32)
+        # Moved in place by its own `to` (PreTrainedModel's), whose functools.wraps hides its signature.
+        placed: Any = backbone
+        placed.to(device=device, dtype=torch.float32)
         index_path = hf_hub_download(MODEL, "model.safetensors.index.json", revision=REVISION)
         index = json.loads(Path(index_path).read_text())
         wanted = {"model.language_model." + key: parameter for key, parameter in backbone.named_parameters()}

@@ -12,7 +12,7 @@ import argparse
 import json
 import tempfile
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import jax
 import numpy as np
@@ -171,8 +171,8 @@ def build(base, directory, task):
                 meta["denoising_start"] = 0.5
         output = pipe(**kwargs, return_dict=True)
         assert isinstance(output, StableDiffusionXLPipelineOutput)  # return_dict=True.
-        # output_type="latent" returns the latents, a tensor the output's annotation (images) does not name.
-        final = cast(torch.Tensor, output.images)
+        final = output.images
+        assert isinstance(final, torch.Tensor)  # output_type="latent": the latents.
         decoded = pipe.vae.decode(final / pipe.vae.config.scaling_factor, return_dict=False)[0]
         arrays.update(final_latents=final.permute(0, 2, 3, 1).numpy(),
                       images=(decoded / 2 + 0.5).clamp(0, 1).permute(0, 2, 3, 1).numpy())

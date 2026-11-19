@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -169,10 +169,11 @@ def filtered(scores: torch.Tensor) -> torch.Tensor:
     """generate's sampling chain in its own order: temperature, top-k, top-p."""
     # A warper reads no input ids; transformers types its tensors by torch's legacy nominal classes, which no
     # tensor is at run time.
-    ids = cast(torch.LongTensor, torch.zeros((scores.shape[0], 0), dtype=torch.long))
+    ids: Any = torch.zeros((scores.shape[0], 0), dtype=torch.long)
     for warper in (TemperatureLogitsWarper(TEMPERATURE), TopKLogitsWarper(TOP_K),
                    TopPLogitsWarper(TOP_P)):
-        scores = warper(ids, cast(torch.FloatTensor, scores))
+        held: Any = scores
+        scores = warper(ids, held)
     return scores
 
 

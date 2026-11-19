@@ -32,7 +32,7 @@ What lands in tests/fixtures/lm_engine/:
 import json
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -43,8 +43,6 @@ from lm_engine.training.models import GPTBaseConfig
 from lm_engine.training.optimization.lr_scheduler import LinearScheduler, PowerScheduler
 from lm_engine.training.optimization.params_group import get_param_groups_with_names
 
-if TYPE_CHECKING:
-    from lm_engine.training.model_wrapper import ModelWrapper
 
 COHORT = "lm-engine"
 """The reference releases this tool runs against (tools/reference_releases.py), and the environment
@@ -139,8 +137,9 @@ def write_hybrid() -> None:
     groups_file = Path("configs/param-groups/mup.yml")
     groups = [ParamsGroup(**group) for group in yaml.safe_load(groups_file.read_text())]
     args = {"lr": 0.01, "betas": (0.9, 0.95), "eps": 1e-10, "weight_decay": 0.1}
-    # The stand-in for a ModelWrapper, with the attributes the grouping reads (`_Wrapped`).
-    named = get_param_groups_with_names(cast("ModelWrapper", _Wrapped(model)), args, groups)
+    # The stand-in for a ModelWrapper, with the attributes the grouping reads (`_Wrapped`): untyped.
+    wrapped: Any = _Wrapped(model)
+    named = get_param_groups_with_names(wrapped, args, groups)
     membership = {name: group.name for group in named.params_groups
                   for name in group.parameter_name_map}
     optimizer = torch.optim.AdamW(named.to_torch_compatible_params_groups(), **args)

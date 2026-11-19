@@ -66,7 +66,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import reference_worker
@@ -81,7 +81,7 @@ from _dew_torch.precision import float64, float64_twin
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 # NumPy alone, as the release's environment holds no JAX.
-from remote_code_draws import SITE_FORMS, SITES, FixtureConfig, draw, vocabulary
+from remote_code_draws import SITE_FORMS, SITES, draw, vocabulary
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 _PINNED = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" / "interop"
@@ -342,8 +342,9 @@ def media_tokenizer(config: dict, directory: Path) -> None:
     named = {config[field]: token for field, token in MEDIA_TOKENS.items() if config.get(field) is not None}
     ends = {"pad_token": config["pad_token_id"], "bos_token": config["bos_token_id"],
             "eos_token": config["eos_token_id"]}
-    # The fixture's config.json, which a site's draws read as their FixtureConfig.
-    words = {named.get(index, f"w{index}"): index for index in range(vocabulary(cast(FixtureConfig, config)))}
+    # The fixture's config.json, which a site's draws read as their FixtureConfig: untyped.
+    fixture: Any = config
+    words = {named.get(index, f"w{index}"): index for index in range(vocabulary(fixture))}
     tokenizer = Tokenizer(models.WordLevel(words, unk_token=f"w{config['pad_token_id']}"))
     tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
     fast = PreTrainedTokenizerFast(tokenizer_object=tokenizer, additional_special_tokens=list(named.values()),

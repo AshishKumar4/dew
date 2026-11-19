@@ -25,7 +25,7 @@ by check 1's rule, tests/reference_error.py):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
+from typing import Any
 
 import numpy as np
 
@@ -76,7 +76,8 @@ def verl_loss(arrays: dict[str, np.ndarray], dtype) -> tuple[float, np.ndarray]:
     policy, _ = compute_policy_loss_vanilla(tensor["old_log_probs"], current, tensor["advantages"],
                                             tensor["response_mask"], "token-mean", config, None)
     # verl annotates its log-probabilities FloatTensor, which names float32 alone, for any floating tensor.
-    logprob, reference = (cast(torch.FloatTensor, each) for each in (current, tensor["ref_log_probs"]))
+    logprob: Any = current
+    reference: Any = tensor["ref_log_probs"]
     kl = agg_loss(kl_penalty(logprob, reference, "k3"), tensor["response_mask"], "token-mean")
     loss = policy + BETA * kl
     loss.backward()

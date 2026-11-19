@@ -35,7 +35,7 @@ import struct
 import sys
 import types
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import requests
@@ -140,8 +140,10 @@ def tiny(*, mixed: bool = False) -> None:
     config._attn_implementation = "eager"
     config.architectures = ["Qwen3ForCausalLM"]
     ids = torch.tensor([[2, 8, 17, 5, 23, 9, 51, 43], [31, 16, 3, 19, 42, 11, 78, 39]], device="cuda")
-    # Its own `to` (PreTrainedModel's), read through Module's signature, which its functools.wraps hides.
-    model = cast(Qwen3ForCausalLM, cast(torch.nn.Module, Qwen3ForCausalLM(config)).to("cuda", dtype=torch.bfloat16))
+    model = Qwen3ForCausalLM(config)
+    # Moved in place by its own `to` (PreTrainedModel's), whose functools.wraps hides its signature: untyped.
+    placed: Any = model
+    placed.to("cuda", dtype=torch.bfloat16)
     model = model.eval()
     scheme = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
     if mixed:

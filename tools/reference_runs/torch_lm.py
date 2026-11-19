@@ -44,7 +44,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -202,7 +202,9 @@ def trunk(model) -> torch.nn.Module:
 
 def decoder_layers(model) -> torch.nn.ModuleList:
     """The trunk's layers (`trunk`), each a block of the stack."""
-    return cast(torch.nn.ModuleList, trunk(model).layers)
+    layers = trunk(model).layers
+    assert isinstance(layers, torch.nn.ModuleList)
+    return layers
 
 
 def final_norm(stack) -> torch.nn.Module:
@@ -219,8 +221,9 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
     if args.experts is not None:
         extra["experts_implementation"] = args.experts
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, **extra)
-    # Its own `to` (PreTrainedModel's), read through Module's signature, which its functools.wraps hides.
-    model = cast(PreTrainedModel, cast(torch.nn.Module, model).to(place.device))
+    # Moved in place by its own `to` (PreTrainedModel's), whose functools.wraps hides its signature.
+    placed: Any = model
+    placed.to(place.device)
     model.config.use_cache = False
     model.train()
     if args.precision == "autocast-bf16-residual":

@@ -29,15 +29,13 @@ checks its greedy path, so the path is the model's and not a rounding.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import Any
 
 import numpy as np
 import torch
 import transformers
 from numerics_reference import FIXTURES, NEW_TOKENS, decoder, prompts, teacher_forced
 
-if TYPE_CHECKING:
-    from transformers._typing import GenerativePreTrainedModel
 
 FAMILIES = ("llama-tiny", "qwen3-tiny")
 STOPS = (2, 4)
@@ -74,7 +72,7 @@ def write(name: str) -> None:
     model.generation_config.eos_token_id = None
     # generate takes its model as GenerationMixin's host protocol, which every model meets at runtime and
     # none in its static type.
-    generating = cast("GenerativePreTrainedModel", model)
+    generating: Any = model
     with np.load(directory / "generate.npz") as stored:
         greedy = stored["greedy_tokens"]
         # The fp32 decode's error on the committed greedy path, the rounding

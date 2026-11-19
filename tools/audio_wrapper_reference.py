@@ -20,7 +20,7 @@ Run with Transformers 5.16.1 and timm 1.0.29 / torchvision 0.29.0 on the path:
 import argparse
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -47,8 +47,6 @@ from transformers import (
 from transformers.models.gemma3n.modeling_gemma3n import Gemma3nForConditionalGeneration
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
 
-if TYPE_CHECKING:
-    from transformers._typing import GenerativePreTrainedModel
 
 SEED = 2718
 SPECIAL: dict[str, Any] = {"pad_token_id": 0, "bos_token_id": 2, "eos_token_id": 1}
@@ -137,9 +135,10 @@ def write(root: Path):
                               "token_type_ids", "mm_token_type_ids")}
         with torch.no_grad():
             logits = model(**forward, use_cache=False).logits
-            # generate takes its model as GenerationMixin's host protocol, which the model meets at runtime.
-            generated = cast("GenerativePreTrainedModel", model).generate(**forward, max_new_tokens=3,
-                                                                       do_sample=False)
+            # generate takes its model as GenerationMixin's host protocol, which the model meets at run
+            # time and no model class statically: read untyped.
+            generating: Any = model
+            generated = generating.generate(**forward, max_new_tokens=3, do_sample=False)
         save_file({name: value.contiguous().clone() for name, value in model.state_dict().items()},
                   str(directory / "model.safetensors"), metadata={"format": "pt"})
         (directory / "config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n")

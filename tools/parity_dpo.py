@@ -25,7 +25,7 @@ import dataclasses
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 
@@ -95,7 +95,8 @@ def trl_loss(arrays: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
               "attention_mask": torch.ones(arrays["input_ids"].shape, dtype=torch.long),
               "completion_mask": torch.tensor(arrays["completion_mask"], dtype=torch.long)}
     # The trainer's loss over a stand-in holding the fields it reads, not a DPOTrainer built whole.
-    loss = DPOTrainer._compute_loss(cast(DPOTrainer, trainer), Fixed(policy), inputs, return_outputs=False)
+    standing: Any = trainer
+    loss = DPOTrainer._compute_loss(standing, Fixed(policy), inputs, return_outputs=False)
     loss.backward()
     assert policy.grad is not None
     metrics = trainer._metrics["train"]

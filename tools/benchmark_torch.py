@@ -54,8 +54,7 @@ import math
 import os
 import sys
 import time
-from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any
 
 # Triton and gcc use the system temporary directory while torch.compile runs.
 # This workstation's /tmp is a quota-limited tmpfs. Keep compiler scratch and
@@ -594,7 +593,7 @@ class Unet(nn.Module):
         x = self.stem(x)
         downs = [x]
         for i, blocks in enumerate(self.down_blocks):
-            blocks = cast(nn.ModuleList, blocks)  # Each a ModuleList (__init__).
+            assert isinstance(blocks, nn.ModuleList)  # Each a ModuleList (__init__).
             for j, block in enumerate(blocks):
                 x = block(x, temb)
                 if j == len(blocks) - 1:
@@ -602,12 +601,14 @@ class Unet(nn.Module):
                 downs.append(x)
             if i < len(self.downsamples):
                 x = self.downsamples[i](x)
-        for res1, attn, res2 in cast(Iterable[nn.ModuleList], self.middle):  # Each a triple (__init__).
+        for triple in self.middle:
+            assert isinstance(triple, nn.ModuleList)  # Each a triple (__init__).
+            res1, attn, res2 = triple
             x = res1(x, temb)
             x = attn(x, textcontext) if not isinstance(attn, nn.Identity) else x
             x = res2(x, temb)
         for i, blocks in enumerate(self.up_blocks):
-            blocks = cast(nn.ModuleList, blocks)  # Each a ModuleList (__init__).
+            assert isinstance(blocks, nn.ModuleList)  # Each a ModuleList (__init__).
             for j, block in enumerate(blocks):
                 x = torch.cat([x, downs.pop()], dim=1)
                 x = block(x, temb)
