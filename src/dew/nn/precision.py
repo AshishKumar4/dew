@@ -1712,10 +1712,20 @@ def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Arr
     # (an AxisError, a ValueError, for one out of range or repeated), for its value and transpose alike
     # (rows 8837, 8974).
     ranks = [max(map(np.ndim, term)) for term in terms]
-    spec = tuple((axis if axis is None else tuple(sorted(normalize_axis_tuple(axis, rank))), laid)
+    spec = tuple((axis if axis is None else _normalized_axes(axis, rank), laid)
                  for rank, (axis, laid) in zip(ranks, spec, strict=True))
     # A compiled kernel's body bare, as Mosaic lowers no symbolic zeros' rule; an interpreted one declared.
     return (_aligned_value if interpreting() is False else _aligned)(tuple(shape), spec, *factors)
+
+
+def _normalized_axes(axis: int | Sequence[int], rank: int) -> tuple[int, ...]:
+    """`axis` of a term of `rank` as numpy normalizes it (`normalize_axis_tuple`), sorted: a ValueError for
+    one out of range or repeated, an axis past a C int's range one too, where numpy's conversion of it
+    raised an OverflowError (row 9086)."""
+    try:
+        return tuple(sorted(normalize_axis_tuple(axis, rank)))
+    except OverflowError as error:
+        raise ValueError(f"axis {axis} is out of bounds for a term of rank {rank}") from error
 
 
 def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
