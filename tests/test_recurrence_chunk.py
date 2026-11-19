@@ -583,19 +583,23 @@ def test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it(
     assert_finite_where_float64_is(operands, seeded, hooks)
 
 
-def test_a_live_spans_decay_that_underflows_reads_its_memory_as_the_recurrence():
-    """A two-token call of one document under log decays of -80 (each live, their span's `exp(-160)` zero in
-    float32), a NaN memory entering, unit queries, zero keys and values: its output NaN where the recurrence
-    a token at a time reads NaN, on the portable math, where the readout's select took a decay rounded to
-    zero for a document's start and read zero (row 8560's head review)."""
-    hooks = HOOKS[6]
-    (operands,) = draw(hooks, packed=False, seed=0, length=2)
-    names = [name for name in ('key', 'value') if getattr(operands, name) is not None]
-    operands = dataclasses.replace(operands, query=jnp.ones_like(operands.query),
-                                   log_decay=jnp.full_like(operands.log_decay, -80.0),
-                                   state=jnp.full_like(operands.state, jnp.nan),
-                                   starts=jnp.zeros(operands.value.shape[:2], bool),
-                                   **{name: jnp.zeros_like(getattr(operands, name)) for name in names})
+@pytest.mark.parametrize('where', ['entering', 'written'])
+def test_a_live_spans_decay_that_underflows_reads_as_the_recurrence(where):
+    """A three-token call of one document under log decays of -80 (each live, a span of two `exp(-160)`,
+    zero in float32) of a scalar write gate's recurrence, unit queries, a NaN in the memory entering or in
+    the first token's key: its output NaN where the recurrence a token at a time reads NaN, on the portable
+    math, where the readout and the pairs (`scan._paired`, `scan.spread`) took a decay rounded to zero for a
+    document's start and read zero (row 8560's head review, train 1079's review F1)."""
+    hooks = recurrence.Hooks(decay='scalar', delta=False, write_gate=True)
+    (operands,) = draw(hooks, packed=False, seed=0, length=3)
+    key, state = jnp.zeros_like(operands.key), jnp.zeros_like(operands.state)
+    if where == 'entering':
+        state = jnp.full_like(state, jnp.nan)
+    else:
+        key = key.at[:, 0].set(jnp.nan)
+    operands = dataclasses.replace(
+        operands, query=jnp.ones_like(operands.query), log_decay=jnp.full_like(operands.log_decay, -80.0),
+        state=state, key=key, starts=jnp.zeros(operands.value.shape[:2], bool))
     out, _ = chunk_on('xla', hooks, operands, chunk_size=CHUNK)
     reference, _ = token_by_token(hooks, operands)
     np.testing.assert_array_equal(np.isnan(np.asarray(out)), np.isnan(np.asarray(reference)))
