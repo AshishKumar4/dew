@@ -848,11 +848,6 @@ class Draw:
         """The multiplier a kept entry takes, `1 / (1 - rate)`, the largest an entry's weight takes."""
         return 1.0 / (1.0 - self.rate)
 
-    @property
-    def reach(self) -> float:
-        """The least power of two at or above `bound` (`reach_of`)."""
-        return reach_of(self.bound)
-
     def keep(self, queries: jax.Array, keys: jax.Array) -> jax.Array:
         """Whether the draw keeps the entries at `queries` and `keys` (indices that broadcast): the keep bits
         every mainloop and the reference share, each taking its own scale for a kept entry. Where the draw
@@ -954,19 +949,6 @@ class Dropout:
     def bound(self) -> float:
         """The multiplier a kept entry takes, every draw's (`Draw.bound`)."""
         return 1.0 / (1.0 - self.rate)
-
-    @property
-    def reach(self) -> float:
-        """The least power of two at or above `bound`, every draw's (`reach_of`)."""
-        return reach_of(self.bound)
-
-
-def reach_of(bound: float) -> float:
-    """The least power of two at or above a dropout multiplier `bound`, by which a walk's sums take a kept
-    weight (`attention_algebra.kept_power`), and so the most its bounds take one by (`frexp`'s exponent, less
-    one where `bound` is a power of two)."""
-    mantissa, exponent = math.frexp(bound)
-    return float(2.0 ** (exponent - 1 if mantissa == 0.5 else exponent))
 
 
 def coded(p: jax.Array, bound: float) -> jax.Array:

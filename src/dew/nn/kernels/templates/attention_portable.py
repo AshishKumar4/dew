@@ -226,7 +226,7 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
                            hooks.initial is not None, compensated=algebra.compensates(value.dtype),
                            prescale=power, rounds=hooks.rounds,
                            dropped=1.0 if hooks.drop is None else hooks.drop.bound,
-                           kept_power=1.0 if hooks.drop is None else algebra.kept_power(hooks.drop.reach,
+                           kept_power=1.0 if hooks.drop is None else algebra.kept_power(hooks.drop.bound,
                                                                                         value.dtype))
     # A quantized call's weights round at each row's maximum, which its training walk finds first
     # (`attention_program.walk`), its residuals let go where the call keeps none.
@@ -336,18 +336,15 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         others, own, others_total, prior = (part[row, head, rows] for part in sums)
         m = maxima
         if draw is not None:
-            # Dropout's D: each dropped product centred about its query's at the forward's anchor key, its
-            # heaviest, summed as the tiles' dP are (`interpreted_rows`).
+            # Dropout's D: each dropped product centred about its query's first visible tile's least one.
             def terms(j):
                 columns, seen, _, v_tile, logits, _ = formed(j)
                 products = gradient.dropped_products(interpreted_dot(do, v_tile.T),
                                                     draw(q_pos, columns[None, :]))
-                return gradient.below(logits, m, how), products, seen
+                return gradient.below(logits, m, how), products, seen, columns[None, :]
 
-            centre = gradient.dropped_products(interpreted_rows(anchor_rows, do)[:, None],
-                                               draw(q_pos, chosen[:, None]))[:, 0]
-            anchor, delta, chosen = gradient.dropout_centre(lo, hi, terms, keys, centre, state_total, mean0,
-                                                           most=keys // block_k)
+            anchor, delta, chosen = gradient.dropout_centre(lo, hi, terms, keys, block_q, state_total,
+                                                           mean0, most=keys // block_k)
         else:
             # The forward took the first pass (`gradient.split_delta`).
             anchor, delta, chosen = gradient.split_delta(others, own, others_total, prior, state_total,

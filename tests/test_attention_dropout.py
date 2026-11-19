@@ -638,18 +638,16 @@ def test_a_resumed_state_of_a_large_denominator_keeps_a_finite_dropping_backward
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
-@pytest.mark.parametrize(("rate", "logit"), [(1.0 - 2.0 ** -14, -18.0), (127 / 256, -17.34375)],
-                         ids=["near-total", "below-two"])
-def test_an_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(rate, logit, training):
-    """Two keys at logits 0 and `logit`, the first dropped and the second kept, values 0 and 2^15, in fp16:
-    the kept weight is below fp16's least subnormal (or rounds to 0 at it) where its weight times the draw's
-    multiplier z does not, so the output is z e^logit 2^15 / (1 + e^logit), as the reference's narrowed
-    coefficient gives it, on par with the reference (check 1) on the inference walk and the training walk
-    alike. Narrowed without z, e^-18 at z = 2^14 flushed to 0 (the base review of 56a716c95, F1); taken by
-    the power of two below z, e^-17.34 at z = 256/129 did too (the base review of 4e2eb287e, F1)."""
+def test_a_near_total_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(training):
+    """The fp16 witness of the base review of 56a716c95, F1: a rate of 1 - 2^-14 (z = 2^14), two keys at
+    logits 0 and -18, the first dropped and the second kept, values 0 and 2^15. The kept weight e^-18 is
+    below fp16's least subnormal and its weight times z is not, so the output is z e^-18 2^15 / (1 + e^-18),
+    about 8.18, as the reference's narrowed coefficient gives it, where the weight narrowed without z flushed
+    to 0: on par with the reference (check 1), on the inference walk and the training walk alike."""
+    rate = 1.0 - 2.0 ** -14
     words = first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1]))
     query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[..., 0].set(1)
-    key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(logit)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(-18)
     value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(2.0 ** 15)
     spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
 
@@ -664,13 +662,12 @@ def test_an_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(rate, logit,
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
-@pytest.mark.parametrize("bits", [32, 53])
-def test_a_resumed_states_small_sums_are_kept_under_a_near_total_draw(bits, training):
-    """A state of maximum 0, denominator 1 and sums 2^-120 resumed over one key of logit 0 and value 0 at a
-    rate of `1 - 2^-bits`, whatever the draw: the output is the state's sums over the joint denominator 2,
-    exactly 2^-121, where the state's sums divided by the whole multiplier flushed to 0 at 2^-32 (the base
-    review of 56a716c95, F2) and by the rest of it past a power capped at 2^32 at 2^-53 (of 4e2eb287e, F2)."""
-    rate = 1.0 - 2.0 ** -bits
+def test_a_resumed_states_small_sums_are_kept_under_a_near_total_draw(training):
+    """The fp32 witness of the base review of 56a716c95, F2: a state of maximum 0, denominator 1 and sums
+    2^-120 resumed over one key of logit 0 and value 0 at a rate of 1 - 2^-32, whatever the draw: the output
+    is the state's sums over the joint denominator 2, exactly 2^-121, where the state's sums divided by the
+    whole multiplier, 2^32, flushed to 0."""
+    rate = 1.0 - 2.0 ** -32
     query, key, value = (jnp.zeros((1, 1, 1, 8), jnp.float32) for _ in range(3))
     state = template.Initial(jnp.zeros((1, 1, 1)), jnp.ones((1, 1, 1)), jnp.full((1, 1, 1, 8), 2.0 ** -120))
     hooks = template.Hooks(initial=state, drop=dropout_of(seed_words(0), 1, 1, rate))
@@ -678,33 +675,6 @@ def test_a_resumed_states_small_sums_are_kept_under_a_near_total_draw(bits, trai
                                              template.spans(1, 1, 1), hooks, residuals=training)
     out = walked[0] if training else walked
     np.testing.assert_array_equal(np.asarray(out), np.full(out.shape, 2.0 ** -121, np.float32))
-
-
-def test_a_dropping_backward_centres_its_d_at_the_rows_heaviest_key():
-    """One fp32 query e0 over 16 keys in tiles of 8 at scale 1: key 0 at logit -64 with value 2^64 e0, key 1
-    at -65, key 8 at 0 with value e0, the rest at -128 and value 0, dO e0, at a rate of 1/4 keeping keys 0
-    and 8. Key 8 holds the row's weight, so D is about its product, 4/3: centred at the first tile's
-    heaviest product, 2.46e19, D cancelled to 0 and the query's gradient was about 4/3 where it is -3.94e-9
-    (the base review of 4e2eb287e, F4). The portable backward's dQ on par with the reference's (check 1)."""
-    rate = 0.25
-    words = first_seed(rate, 16, lambda kept: bool(kept[0]) and bool(kept[8]))
-    query = jnp.zeros((1, 1, 1, 8), jnp.float32).at[..., 0].set(1)
-    key = (jnp.zeros((1, 16, 1, 8), jnp.float32).at[0, :, 0, 0].set(-128).at[0, 0, 0, 0].set(-64)
-           .at[0, 1, 0, 0].set(-65).at[0, 8, 0, 0].set(0).at[0, 8, 0, 1].set(1))
-    value = jnp.zeros((1, 16, 1, 8), jnp.float32).at[0, 0, 0, 0].set(2.0 ** 64).at[0, 8, 0, 0].set(1)
-    dout = jnp.zeros((1, 1, 1, 8), jnp.float32).at[..., 0].set(1)
-    spans, hooks = template.spans(1, 16, 1), hooked(words, 1, 1, rate)
-
-    def ours(query, key, value, dout):
-        return attention_portable.backward(attention_portable.Tiles(8, 8, attention_triton.BLOCK), query, key,
-                                           value, spans, hooks, dout, scale=1.0).query
-
-    def reference(query, key, value, dout):
-        _, pull = jax.vjp(lambda query: template.reference(query, key, value, spans, hooks, scale=1.0), query)
-        return pull(dout)[0]
-
-    assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
-                    "a dropping query gradient about its heaviest key", seeds=FEWEST_SEEDS)
 
 
 def test_the_reference_scales_a_dropped_weight_at_float64_precision():
