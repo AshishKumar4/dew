@@ -56,7 +56,8 @@ def test_a_named_input_run_resumed_exactly_over_a_changed_plan_reads_no_record_b
 
     def fit(seed: int, steps: int):
         chain = compile(Pipeline(Memory(columns), name="xs").map(counted, identity="counted@1")
-                        .shuffle(seed=seed).repeat().batch(rows), read="streamed", loading=Loading(workers=0),
+                        .shuffle(seed=seed, window=16).repeat().batch(rows), read="streamed",
+                        loading=Loading(workers=0),
                         resume="exact")
         objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
         trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), data_resume="exact",
