@@ -1195,8 +1195,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             if certified is not None:
                 _certified_step(family, certified, index, state, row_smem)
             rows = algebra.exported(state)[1:]
-            rows = rows if unit is None else (*rows, _bounded(carry[-1], logits, largest(), unit))
-            return rows, (state.acc,)
+            return (rows if unit is None or largest is None
+                    else (*rows, _bounded(carry[-1], logits, largest(), unit))), (state.acc,)
 
         def inference(walk):
             # An inference walk through `walk(step, start, shapes, initial=)` (`_walk_of`): its sums the
@@ -1262,8 +1262,8 @@ def _bounded(reached: jax.Array, logits: jax.Array, magnitudes: jax.Array, unit:
     return reached + jnp.sum(seen * unit, axis=-1)
 
 
-def _merged_initial(spec: algebra.Forward, initial: algebra.Partial, state: algebra.Partial,
-                    bound: jax.Array | None) -> tuple[algebra.Partial, jax.Array | None]:
+def _merged_initial(spec: algebra.Forward, initial: algebra.Partial, state: algebra.Partial, bound
+                    ) -> tuple[algebra.Partial, jax.Array | None]:
     """A walk's `state` with the call's `initial` state merged in past it (`algebra.merge`), and its `bound`
     (`_bounded`'s, where it bounds) with the state's sums' largest at the bound's unit, as the host's takes
     them (`algebra.bounded_past`)."""
