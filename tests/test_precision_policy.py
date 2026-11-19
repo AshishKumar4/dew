@@ -1324,16 +1324,24 @@ def test_an_aligned_sums_second_order_keeps_its_losss_curvature(order):
 def test_an_aligned_sum_over_an_axis_a_mesh_splits_sums_it_shard_by_shard():
     """`aligned_sum([(x,)], axis=0)` of ones `[6, 2]` split over an Explicit two-device data axis: `[[6, 6]]`,
     and its gradient ones placed as `x` is, where its axis summed in halves sliced the split axis at three,
-    which two shards do not divide (base review 9e56c760b F1)."""
+    which two shards do not divide (base review 9e56c760b F1); and of a whole `x` of ones beside a split `y`
+    of twos, `x`'s gradient twos placed whole as `x` is, where it kept `y`'s split and JAX's accumulator
+    refused it (base review 8d59803fd F1)."""
     mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
     with jax.set_mesh(mesh):
         rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+        whole = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
         x = jax.device_put(jnp.ones((6, 2), jnp.float32), rows)
         value = jax.jit(lambda x: aligned_sum([(x,)], axis=0))(x)
         gradient = jax.jit(jax.grad(lambda x: jnp.sum(aligned_sum([(x,)], axis=0))))(x)
+        x = jax.device_put(jnp.ones((6, 2), jnp.float32), whole)
+        y = jax.device_put(jnp.full((6, 2), 2.0, jnp.float32), rows)
+        beside = jax.jit(jax.grad(lambda x, y: jnp.sum(aligned_sum([(x, y)], axis=0))))(x, y)
     np.testing.assert_array_equal(np.asarray(value), [[6.0, 6.0]])
     np.testing.assert_array_equal(np.asarray(gradient), np.ones((6, 2)))
     assert gradient.sharding.is_equivalent_to(rows, gradient.ndim)
+    np.testing.assert_array_equal(np.asarray(beside), np.full((6, 2), 2.0))
+    assert beside.sharding.is_equivalent_to(whole, beside.ndim)
 
 
 def test_an_aligned_sum_over_an_empty_axis_is_zero():
