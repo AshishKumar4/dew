@@ -516,13 +516,14 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
 
 def test_an_entry_writes_gradient_lowers_for_a_tpu():
     """A forked call's gradient with its documents' entry writes (`documents_on_the_kernel`), traced for an
-    assumed v5p on its mesh: it lowers on any host to Mosaic kernels, where the entry write's aligned sums
-    over its 16 keys summed each halving with an empty tail, a slice Mosaic refuses, a vector of no rows
-    (base review 68c63603f F1)."""
+    assumed v5p on its mesh under both default x32 and x64 (row 8807): it lowers on any host to Mosaic
+    kernels (`ssd_forward` and `ssd_backward`, row 8741), where the entry write's aligned sums over its 16
+    keys summed each halving with an empty tail, a slice Mosaic refuses, a vector of no rows (base review
+    68c63603f F1)."""
     from jax.sharding import AbstractDevice, AbstractMesh, AxisType
 
     from dew.nn.kernels.generation import TARGETS, assumed
-    from dew.nn.kernels.lowered import custom_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     operands, seeded = documents_draw(0)
 
@@ -531,9 +532,11 @@ def test_an_entry_writes_gradient_lowers_for_a_tpu():
 
     device = AbstractDevice(device_kind=TARGETS["v5p"].device_kind, num_cores=None, platform="tpu")
     mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
-    with assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(gradient).trace(operands, seeded).lower(lowering_platforms=("tpu",))
-    assert any(call.target == "tpu_custom_call" for call in custom_calls(lowered))
+    for x64 in (False, True):
+        with jax.enable_x64(x64), assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
+            lowered = jax.jit(gradient).trace(operands, seeded).lower(lowering_platforms=("tpu",))
+        names = {call.name for call in kernel_calls(lowered)}
+        assert {"ssd_forward", "ssd_backward"} <= names, (x64, names)
 
 
 @pytest.mark.tpu(reason="the recurrence matrix's TPU cells run on the TPU tier's own TPU")
