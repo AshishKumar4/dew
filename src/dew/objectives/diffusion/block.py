@@ -41,13 +41,7 @@ from dew.batch import (
     token_positions,
     valid_order,
 )
-from dew.inference.tasks import (
-    BlockGeneration,
-    BlockSettings,
-    recorded_files,
-    recorded_processor,
-    recorded_tokenizer,
-)
+from dew.inference.tasks import BlockGeneration, BlockSettings, processor_settings
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
 from dew.nn.inspection import INSPECTED, QK
@@ -269,9 +263,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         return BlockSettings(seq_len=self.sequence_length, max_new_tokens=self.canvas_size,
                              process=self._process(), pad_token_id=self.pad_token_id,
                              eos_token_ids=self.eos_token_ids,
-                             tokenizer=recorded_tokenizer(self.processor),
-                             tokenizer_files=recorded_files(self.processor),
-                             processor=recorded_processor(self.processor))
+                             **processor_settings(self.processor))
 
     def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
         """The shared text stack, as the training model declares it over `store`; none where it declares

@@ -17,6 +17,7 @@ import contextlib
 import dataclasses
 import functools
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -94,6 +95,8 @@ if TYPE_CHECKING:
     from dew.objectives.base import Objective
     from dew.quantization import Quantization
     from dew.registry import ModelConfig
+
+_log = logging.getLogger(__name__)
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Conversation = Sequence[Mapping[str, object]]
@@ -888,6 +891,11 @@ class TaskSettings:
     tokenizer_files: Mapping[str, str] | None = dataclasses.field(default=None, metadata={ADDED: True})
     """What the run tokenizer is: each of its files' hash (`recorded_files`), which the files a load finds
     where `tokenizer` says they are must hash to; None where a run recorded none, as runs before it."""
+    custom: Processor | None = dataclasses.field(default=None, metadata={ADDED: True})
+    """A processor of the user's own the record can rebuild (`recorded_custom`: a dataclass, or a class of
+    Dew's or a trusted package's, by its import path and fields), which a load builds again under the
+    packages it trusts, so the reloaded task takes the text and chat the live one took (row 9065); None for
+    a run tokenizer's or a source's, or one no record describes, which a run loads without, as before."""
 
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:
@@ -1064,13 +1072,44 @@ def recorded_processor(processor: Processor | None) -> SourceReference | None:
     return processor.source if isinstance(processor, SourceProcessor) else None
 
 
+def recorded_custom(processor: Processor | None) -> Processor | None:
+    """`processor` where it is the user's own and a run's record describes it (`dew.registry.to_record`: a
+    dataclass, a class of Dew's or a trusted package's, by its import path and constructor fields), which
+    `TaskSettings.custom` keeps; None for a run tokenizer's or a source's (`recorded_tokenizer`,
+    `recorded_processor`) and for one no record describes, which a run saves without, as before."""
+    from dew.interop.processors import Processor as SourceProcessor
+    from dew.registry import Unrecordable, to_record
+
+    if processor is None or isinstance(processor, RunProcessor | SourceProcessor):
+        return None
+    try:
+        to_record(processor, Processor | None)
+    except Unrecordable as error:
+        # A processor no record describes saves its run without it, as every custom one did: said once, as
+        # its reloaded task takes ids alone.
+        _log.warning("this run's saved task records no processor, so a reloaded task takes token ids alone: "
+                     "%s", error)
+        return None
+    return processor
+
+
+def processor_settings(processor: Processor | None) -> Mapping[str, object]:
+    """The task settings' fields that record a run's host `processor` (`TaskSettings`): where its run
+    tokenizer is and what it is, a source's processor, or a processor of the user's own (`recorded_custom`),
+    each None where it is not that: what every objective's `task_settings` records alike."""
+    return {"tokenizer": recorded_tokenizer(processor), "tokenizer_files": recorded_files(processor),
+            "processor": recorded_processor(processor), "custom": recorded_custom(processor)}
+
+
 def _saved_processor(settings: TaskSettings, config: ModelConfig, run: str) -> Processor | None:
     """Build the run's host processor: the checkpoint's own, reloaded from the
-    source it recorded beside `config`'s model, or its run tokenizer (`dew.data.text.tokenizer_for`, the
-    copy the run holds)."""
+    source it recorded beside `config`'s model, the user's own its record rebuilt (`TaskSettings.custom`),
+    or its run tokenizer (`dew.data.text.tokenizer_for`, the copy the run holds)."""
     from dew.data.text import tokenizer_for
     from dew.interop.pretrained import load_processor
 
+    if settings.custom is not None:
+        return settings.custom
     if settings.processor is not None:
         return load_processor(settings.processor, config.build())
     if settings.tokenizer is None:

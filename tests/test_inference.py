@@ -365,6 +365,81 @@ def test_an_lm_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
     np.testing.assert_array_equal(restored.lengths, expected)
 
 
+@dataclasses.dataclass(frozen=True)
+class PrefixedBytes:
+    """A processor of a user's own (row 9065): byte ids of its text with `prefix` before it, a dataclass a
+    run's record describes by its import path and its one field."""
+
+    prefix: str
+
+    @property
+    def _bytes(self) -> RunProcessor:
+        return RunProcessor(ByteTokenizer())
+
+    def __call__(self, text, *, images=None):
+        texts = [text] if isinstance(text, str) else list(text)
+        return self._bytes([self.prefix + each for each in texts], images=images)
+
+    def decode(self, tokens):
+        return self._bytes.decode(tokens)
+
+    def encode(self, text, *, specials):
+        return self._bytes.encode(self.prefix + text, specials=specials)
+
+    def spelling(self, ids):
+        return self._bytes.spelling(ids)
+
+    def chat(self, messages):
+        return self._bytes.chat(messages)
+
+    @property
+    def bos_id(self):
+        return self._bytes.bos_id
+
+
+def _tiny_lm(processor):
+    """A tiny byte-level decoder's LM objective over `processor`, its state as a trainer starts it."""
+    from dew.objectives.lm import LMObjective
+
+    model = ModelConfig("causal_transformer", {"vocab_size": 256, "emb_features": 16, "num_layers": 1,
+                                               "num_heads": 2, "head_dim": 8, "mlp_features": 32,
+                                               "max_seq_len": 16, "dtype": "float32",
+                                               "attention_impl": "reference"}).build()
+    objective = LMObjective(model, 8, ema_decay=None, processor=processor)
+    return objective, Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(0)).initial_state()
+
+
+def test_a_saved_runs_own_processor_reloads_and_reads_text_as_the_live_one(tmp_path):
+    """A run trained over a processor of its user's own that a record describes (a dataclass at module
+    level) saves it beside its model, and the task its saved run loads under the package it trusts holds an
+    equal processor, which reads text to the ids the live task's reads it to, where the run recorded none
+    and its task took ids alone (row 9065)."""
+    objective, state = _tiny_lm(PrefixedBytes("> "))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    task = TextGeneration.from_run(str(tmp_path / "run"), trust=(PrefixedBytes.__module__,))
+    assert task.processor == PrefixedBytes("> ")
+    live = objective.pipeline(state, ema=False)
+    np.testing.assert_array_equal(np.asarray(task.processor("hi").tokens),
+                                  np.asarray(live.processor("hi").tokens))
+
+
+def test_a_saved_runs_processor_no_record_describes_saves_without_it(tmp_path):
+    """A run over a processor no record describes (a class made inside a function, which no import path
+    names) saves without raising, its run loading its model with no processor, as every such run did
+    (row 9065)."""
+
+    class Opaque(PrefixedBytes):
+        pass
+
+    objective, state = _tiny_lm(Opaque("> "))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    assert TextGeneration.from_run(str(tmp_path / "run")).processor is None
+
+
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=None):
     """Two training steps of a tiny byte-level decoder, its checkpoints, whose
     record names the byte tokenizer it decodes through, and the `run.json` the
