@@ -30,20 +30,20 @@ def drawing() -> contextlib.AbstractContextManager[None]:
     return jax_config.threefry_rolled_lowering(new_val=True)
 
 
-def passed_through[Tree, Result](function: Callable[[Tree, jax.Array], Result],
-                                  picked: Callable[[Result], object] = lambda result: result
-                                  ) -> tuple[Callable[[Tree, jax.Array], Result], dict[int, int]]:
-    """`function` as a trace records which leaves of `picked` of its result (all of it where unstated)
-    are leaves of its first argument as they are, by reference (`Objective.held_variables`): each such
-    leaf's index among `picked`'s leaves, to the index of the argument's leaf it is, filled as it traces."""
+def passed_through[Tree, Built, Picked](function: Callable[[Tree, jax.Array], Built],
+                                         picked: Callable[[Built], Picked]
+                                         ) -> tuple[Callable[[Tree, jax.Array], Built], dict[int, int]]:
+    """`function` as a trace records which leaves of `picked` of what it builds are leaves of its first
+    argument as they are, by reference (`Objective.held_variables`): each such leaf's index among
+    `picked`'s leaves, to the index of the argument's leaf it is, filled as it traces."""
     through: dict[int, int] = {}
 
-    def traced(tree: Tree, key: jax.Array) -> Result:
-        result = function(tree, key)
+    def traced(tree: Tree, key: jax.Array) -> Built:
+        built = function(tree, key)
         inputs = {id(leaf): index for index, leaf in enumerate(jax.tree.leaves(tree))}
-        through.update({index: inputs[id(leaf)] for index, leaf in enumerate(jax.tree.leaves(picked(result)))
+        through.update({index: inputs[id(leaf)] for index, leaf in enumerate(jax.tree.leaves(picked(built)))
                         if id(leaf) in inputs})
-        return result
+        return built
 
     return traced, through
 
@@ -54,7 +54,7 @@ def drawn_once[Tree, Result](function: Callable[[Tree, jax.Array], Result], held
     where run eagerly each operation of a model's draw compiled alone (tens to hundreds a model, row 8682):
     traced once, its leaves that are `held`'s as they are (`passed_through`) those arrays themselves, no
     output of the program, which draws the rest from its replay (`dew.algebra.program.replaying`)."""
-    traced, through = passed_through(function)
+    traced, through = passed_through(function, lambda built: built)
     trace = owned_program(traced).trace(held, key)
     structure = jax.tree.structure(trace.out_info)
     replay = replaying(trace.jaxpr, structure, (), ())
