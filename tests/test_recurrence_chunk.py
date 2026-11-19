@@ -23,6 +23,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 from port_support import row_names_port
 from reference_error import (
     FEWEST_SEEDS,
+    as_given,
     assert_as_exact,
     assert_fp32_reduction_bound,
     assert_rounds_where_the_reference_does,
@@ -720,6 +721,75 @@ def test_a_turned_forked_calls_cancelling_entry_write_is_as_exact_as_each_docume
     largest term dropped the third before the two cancelled (base review 224fcf53a F1)."""
     assert_forked_on_par('xla', TURNED, cancelling_entries_draw,
                          f"xla {TURNED} a forked call's cancelling entry writes", seeds=160)
+
+
+def levels_entered_draw(seed: int):
+    """`entered_draw`'s forked call of the gated delta rule (`HOOKS[4]`) whose documents' entry writes are
+    `CANCELLING_LEVELS`' seven products on its keys' first dimension, each value column's scaled by a drawn
+    sign and one power of two a draw, under weights of another, signed so every memory a row's documents
+    enter is zero, one or two writes (its chain's last document's weight its middle one's negated); nothing
+    else written or decayed, and each token's memory's first row read by a unit query. Its cotangents are of
+    one power of two, signed: its output, last memory and entry writes' gradients each a sum float32 holds
+    exactly or rounds once, as float64's is (the write's terms a multiple of 2^103 below 2^154)."""
+    operands, _ = entered_draw(HOOKS[4], seed, entries=True)
+    rng = np.random.default_rng([8840, seed])
+    keys, values = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
+    entry_key = np.zeros((ROWS, len(DOCUMENTS[0]), len(keys), KEY_HEADS, KEY_WIDTH))
+    entry_key[..., 0] = keys[:, None]
+    columns = rng.choice([-1.0, 1.0], (VALUE_HEADS, VALUE_WIDTH)) * 2.0 ** -int(rng.integers(1, 9))
+    signs = rng.choice([-1.0, 1.0], (ROWS, len(DOCUMENTS[0]), VALUE_HEADS))
+    signs[1, 2] = -signs[1, 1]
+    query = np.zeros(operands.query.shape)
+    query[..., 0] = 1.0
+
+    def signed(shape, scale):
+        return rng.choice([-1.0, 1.0], shape) * scale
+
+    drawn = dataclasses.replace(
+        operands, query=hosted(query), key=jnp.zeros_like(operands.key), value=jnp.zeros_like(operands.value),
+        log_decay=jnp.zeros_like(operands.log_decay), beta=jnp.zeros_like(operands.beta),
+        state=jnp.zeros_like(operands.state), entry_key=hosted(entry_key),
+        entry_value=hosted(np.broadcast_to(values[:, None, None] * columns,
+                                           (ROWS, len(DOCUMENTS[0]), len(values), VALUE_HEADS, VALUE_WIDTH))),
+        entry_weight=hosted(signs * 2.0 ** -int(rng.integers(1, 9))))
+    scale = 2.0 ** -int(rng.integers(10, 16))
+    final = (ROWS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH)
+    return drawn, (hosted(signed(operands.value.shape, scale)), hosted(signed(final, scale)))
+
+
+def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact():
+    """A forked call through the portable math's walk (`chunk_on('xla', ...)`) whose documents' entry writes
+    are three levels cancelling beside float32's largest (`levels_entered_draw`): its output, the row's last
+    memory and its entry keys', values' and weights' gradients held by check 1 against each document a
+    sequence of its own the recurrence a token at a time in float64, rounded once (exact, so the walk must be:
+    a write summed in some order dropped -2^103 at a tie as 2^103 survived, inf, row 8757; row 8840)."""
+    hooks = HOOKS[4]
+
+    def leaves(walk):
+        def run(operands, seeded):
+            def entered(key, value, weight):
+                return walk(dataclasses.replace(operands, entry_key=key, entry_value=value,
+                                                entry_weight=weight))
+
+            out, pull = jax.vjp(entered, operands.entry_key, operands.entry_value, operands.entry_weight)
+            return dict(zip(('output', 'final', 'entry keys', 'entry values', 'entry weights'),
+                            (*out, *pull(seeded)), strict=True))
+
+        return run
+
+    def ours(operands):
+        out, final = chunk_on('xla', hooks, entering_documents(operands), chunk_size=CHUNK)
+        return out.astype(jnp.float32), final.astype(jnp.float32)
+
+    wide = jax.jit(leaves(functools.partial(document_by_document, hooks)))
+
+    def truth(operands, seeded):
+        with jax.enable_x64(new_val=True):
+            return wide(widened(operands), widened(seeded))
+
+    rounded = as_given(lambda operands, seeded: jax.tree.map(np.float32, truth(operands, seeded)))
+    assert_as_exact(jax.jit(leaves(ours)), rounded, levels_entered_draw,
+                    "xla a forked call's entry writes of cancelling levels", seeds=8, truth_fn=truth)
 
 
 @pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],
