@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from contract_support import EDGES, FORWARD_ORDERS, assert_contract, assert_drawn_contract, normal_draw
+from map_judge import marked_seeds
 
 from dew.nn import categorical, inspection
 from dew.nn.protocols import OutputTable
@@ -103,14 +104,26 @@ def test_the_label_terms_hold_every_order(edge):
                           plain_fn=plain)
 
 
-@pytest.mark.parametrize("head", ["whole", "tiled", "fused"])
-@pytest.mark.parametrize("edge", EDGES)
-def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge):
+@pytest.mark.parametrize(("edge", "head"), [
+    pytest.param("normal", "whole", id="normal-whole",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=256)),
+    pytest.param("normal", "tiled", id="normal-tiled"),
+    pytest.param("normal", "fused", id="normal-fused"),
+    pytest.param("near the largest", "whole", id="near the largest-whole"),
+    pytest.param("near the largest", "tiled", id="near the largest-tiled"),
+    pytest.param("near the largest", "fused", id="near the largest-fused"),
+    pytest.param("near the least normal", "whole", id="near the least normal-whole"),
+    pytest.param("near the least normal", "tiled", id="near the least normal-tiled"),
+    pytest.param("near the least normal", "fused", id="near the least normal-fused"),
+])
+def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge, request):
     """The LM head's three hand-written backwards (`chunked._whole_head`, `_bounded_head`, `_fused`): the
     head's per-token cross entropy and log partition of `hidden @ table.T`, whole, in tiles, or summed with
     its gradient taken in the forward. Every order, their own forward derivatives among them (a tangent that
     transposes to the hand-written backward, row 2690), finite wherever float64 is a normal float32 and
-    the plain formula, the whole logits' log-softmax, is."""
+    the plain formula, the whole logits' log-softmax, is. The whole head's orders on training's mesh are
+    drawn by CI's map tasks at their largest sized count, 512 (its second orders' sizing), 256 a task:
+    sized in one process they took 132 s alone and 300 s packed (row 8429)."""
     targets = jnp.asarray([[0, 3, 10, 2], [7, 1, 4, 9]], jnp.int32)
     weights = jnp.ones(targets.shape, jnp.float32)
 
@@ -141,8 +154,9 @@ def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge):
                 normal_draw((2705, seed), (2, 4, 8), (11, 8), scale=scale),
                 normal_draw((2706, seed), shape)[0])
 
+    sharded = request.node.get_closest_marker("check1_shards") is not None
     assert_drawn_contract(heads, inputs, EDGES[edge], f"the {head} LM head {edge}", truth_fn=plain,
-                          plain_fn=plain)
+                          plain_fn=plain, seeds=marked_seeds(request) if sharded else None)
 
 
 @pytest.mark.parametrize("edge", EDGES)
