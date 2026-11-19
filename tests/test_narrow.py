@@ -1,5 +1,7 @@
 """The narrow copies of the parameters the forward reads (`dew.training.narrow`)."""
+import contextlib
 import gc
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -621,6 +623,69 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     # Here what it places beside the step, its outputs and its batches, is under the state's bytes.
     placed, own = run.plan["placed"], run.plan["probes"][0]
     assert own["headroom"] == placed["headroom"] and own["beside"] < state, (own, placed, state)
+
+
+def test_a_fresh_plan_refused_with_its_copies_built_deletes_them_before_it_is_searched_again(monkeypatch):
+    """A fresh run's first step planned with its narrow copies before its state is placed, on devices whose
+    free bytes in all hold the step and its copies, and whose pool, the state and the copies on it, has no
+    block for its temporaries, nor growth to give one: the placed check builds the copies where they land
+    (`Building.fits`), is refused, and deletes them before the plan is searched again on the placed devices,
+    whose allocator then reads the copies' bytes free (row 8766; the cells above cover the bound and the
+    copies taken)."""
+    from model_support import allocating, device_buffers
+    from token_support import repeated_token_batch
+
+    from dew.data.dataset import Loader
+    from dew.nn.kernels import options
+    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.planning import PlanRefused
+
+    device = MeshSpec().build(jax.devices()[:1])
+
+    def built() -> Trainer:
+        objective, _ = _decoder(remat="full")
+        return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
+                       layout=Layout(min_shard=1, tolerance=1.0))
+
+    def streamed() -> Loader:
+        return Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+
+    narrow, _, _ = _trained(ADAM_3, copies=True, steps=1, remat="full", mesh=device)
+    copies = sorted(leaf.nbytes for leaf in jax.tree.leaves(narrow.compute))
+    del narrow
+    # The fresh plan's need with its copies, the state and its batches among it, and its temporaries, as a
+    # roomy allocator's run measured them.
+    free, limit = 2 ** 39, 2 ** 40
+    gc.collect()
+    allocating(monkeypatch, limit, limit, limit - free)
+    roomy = built()
+    with chosen(narrow_copies="on"):
+        roomy.fit(streamed(), steps=1)
+    probe = roomy.plan["probes"][0]
+    assert probe["narrow"] and probe["fits"] and copies, (probe, copies)
+    need, temporaries = free - probe["headroom"], probe["temp"]
+    del roomy
+    options.unhold()
+    # Free in all, the need and half the temporaries: the plan made before the state is placed holds. The
+    # pool's growth one byte short of the temporaries, and its blocks, the state and copies on it, the
+    # rest: half the temporaries and what is placed beside them, no block for them.
+    gc.collect()
+    allocating(monkeypatch, limit, limit - temporaries + 1, limit - need - temporaries // 2)
+    stats, buffers = jax.Device.memory_stats, []
+
+    def reading(device):
+        # The buffers on the device at each of its allocator's reads, as the read stands.
+        buffers.append(device_buffers(device))
+        return stats(device)
+    monkeypatch.setattr(jax.Device, "memory_stats", reading)
+    run = built()
+    with chosen(narrow_copies="on"), contextlib.suppress(PlanRefused):
+        run.fit(streamed(), steps=1)
+    # Between the judgement with the copies built and the search after it, the copies' buffers alone are
+    # gone, one a leaf, the state's left: the buffers each read's next no longer holds.
+    freed = [sorted(size for address, size in before.items() if address not in after)
+             for before, after in itertools.pairwise(buffers)]
+    assert copies in freed, (copies, [each for each in freed if each])
 
 
 def test_a_fresh_plan_its_placed_devices_refuse_records_no_rung(monkeypatch, tmp_path):
