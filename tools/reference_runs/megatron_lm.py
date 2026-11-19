@@ -296,7 +296,9 @@ def train_step(args: argparse.Namespace, place: Ranks, run: Run, step: int) -> t
         num_microbatches=layout.accumulation, seq_length=layout.seq, micro_batch_size=layout.micro,
         forward_only=False)
     assert reported is not None  # The last pipeline stage's losses, which this one stage is.
-    _, norm, _ = run.optimizer.step()
+    stepped = run.optimizer.step()
+    assert stepped is not None  # Its success, gradient norm and zero count, which a stepping optimizer gives.
+    _, norm, _ = stepped
     return torch.stack([entry["lm loss"] for entry in reported]).sum(dim=0), norm, None
 
 

@@ -103,6 +103,12 @@ def write_tokenizer(directory: Path):
     return fast
 
 
+def token_id(found) -> int:
+    """A special token's id, which the tiny tokenizer (`write_tokenizer`) defines as one int."""
+    assert isinstance(found, int)
+    return found
+
+
 def write_tiny(directory: Path) -> None:
     """A Laya checkpoint at toy size, in Laya's own layout."""
     from safetensors.torch import save_file
@@ -117,9 +123,9 @@ def write_tiny(directory: Path) -> None:
     encoder = ModernBertModel(ModernBertConfig(
         vocab_size=len(tokenizer), hidden_size=128, intermediate_size=96, num_hidden_layers=3,
         num_attention_heads=2, local_attention=8, max_position_embeddings=256, **GLOBAL_EVERY_THIRD,
-        pad_token_id=tokenizer.pad_token_id, cls_token_id=tokenizer.cls_token_id,
-        sep_token_id=tokenizer.sep_token_id, bos_token_id=tokenizer.cls_token_id,
-        eos_token_id=tokenizer.sep_token_id))
+        pad_token_id=token_id(tokenizer.pad_token_id), cls_token_id=token_id(tokenizer.cls_token_id),
+        sep_token_id=token_id(tokenizer.sep_token_id), bos_token_id=token_id(tokenizer.cls_token_id),
+        eos_token_id=token_id(tokenizer.sep_token_id)))
     model = common.DecisionModel(encoder, head_layers=2, n_act=2)
     scatter_weights(model, 1234)
     encoder.config.save_pretrained(directory / "encoder")

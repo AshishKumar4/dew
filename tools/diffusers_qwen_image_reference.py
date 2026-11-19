@@ -47,6 +47,7 @@ from __future__ import annotations
 import copy
 import json
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -261,7 +262,7 @@ def pipeline_walked(pipe, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.
     return arrays
 
 
-def record_seeds(record: dict, models: dict[str, torch.nn.Module], pipe) -> dict[str, np.ndarray]:
+def record_seeds(record: dict, models: Mapping[str, torch.nn.Module], pipe) -> dict[str, np.ndarray]:
     """Check 1's recordings over seeds (`record_case`), over tests/qwen_image_draws.py's draws of the
     fixture's `record`, in float32, the reference, and on the float64 twin (`float64_twin`, the pipeline's
     scheduler tables widened by `float64_scheduler`), the truth: each case's walk (`walked`) summarized,

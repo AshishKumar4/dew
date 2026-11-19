@@ -87,10 +87,12 @@ def build(base, directory, task):
         checker = StableDiffusionSafetyChecker(config)
         processor = CLIPImageProcessor(size={"shortest_edge": 8}, crop_size={"height": 8, "width": 8})
         text = CLIPTextModel.from_pretrained(base / "text_encoder", from_flax=True)
+        # DDIM, which the pipeline takes though its signature names a scheduler enum.
         pipe = StableDiffusionPipeline(
             vae=convert(AutoencoderKL, source.vae.config, params["vae"], vae=True), text_encoder=text,
             tokenizer=source.tokenizer, unet=convert(UNet2DConditionModel, source.unet.config, params["unet"]),
-            scheduler=ddim(source.scheduler.config), safety_checker=checker, feature_extractor=processor)
+            **dict[str, Any](scheduler=ddim(source.scheduler.config)), safety_checker=checker,
+            feature_extractor=processor)
         pipe.save_pretrained(directory, safe_serialization=True)
         pipe.set_progress_bar_config(disable=True)
         noise = np.asarray(jax.random.normal(jax.random.PRNGKey(17), (1, 4, 8, 8)))

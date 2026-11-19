@@ -326,8 +326,9 @@ def main() -> None:
             jnp.asarray(0.05 * rng.standard_normal(leaf.shape), jnp.bfloat16), np.float32), shapes["params"])
 
         tokenizer = AutoTokenizer.from_pretrained(clip)
-        encoder = CLIPTextEncoder(model=TorchCLIP(clip, "float32"), tokenizer=tokenizer, modelname=str(clip),
-                                  backend="jax")
+        # TorchCLIP stands in for the Flax CLIP model the encoder's signature names, called the same way.
+        encoder = CLIPTextEncoder(**dict[str, Any](model=TorchCLIP(clip, "float32")), tokenizer=tokenizer,
+                                  modelname=str(clip), backend="jax")
         serialized = DiffusionInputConfig(sample_data_key="image", sample_data_shape=(IMAGE, IMAGE, 3),
                                           conditions=[condition(encoder)]).serialize()
         step = root / "1"

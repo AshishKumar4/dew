@@ -181,14 +181,14 @@ def flaxdiff_side(args, images, total, attention):
     class FixedDraws(DiffusionObjective):
         """flaxdiff's `DiffusionObjective.loss`, the two draws read from the batch."""
 
-        def loss(self, variables, ema_params, batch, rng, step):
+        def loss(self, params, ema_params, batch, rng, step):
             data = (jnp.asarray(batch["image"], dtype=jnp.float32) - 127.5) / 127.5
             noise_level, noise = batch["t"], batch["noise"]
             rates = self.noise_schedule.get_rates(noise_level, get_coeff_shapes_tuple(data))
             noisy_data, c_in, expected_output = self.model_output_transform.forward_diffusion(
                 data, noise, rates)
             inputs = self.noise_schedule.transform_inputs(noisy_data * c_in, noise_level)
-            preds = self.model.apply(variables, *inputs, train=True, rngs={"dropout": rng})
+            preds = self.model.apply(params, *inputs, train=True, rngs={"dropout": rng})
             preds = self.model_output_transform.pred_transform(noisy_data, preds, rates)
             sample_losses = self.loss_fn(preds, expected_output)
             weights = self.noise_schedule.get_weights(noise_level, get_coeff_shapes_tuple(sample_losses))
@@ -212,11 +212,11 @@ def flaxdiff_side(args, images, total, attention):
     state = trainer.state
     init = Path(args.init)
     if not init.exists():
-        save_tree(init, jax.device_get(state.variables))
+        save_tree(init, jax.device_get(state.params))
     initial = load_tree(init)
     params = jax.device_put(initial, trainer.state_sharding.params)
     state = state.replace(
-        variables=params, ema_params=jax.device_put(initial, trainer.state_sharding.ema_params),
+        params=params, ema_params=jax.device_put(initial, trainer.state_sharding.ema_params),
         opt_state=jax.jit(optimizer.init, out_shardings=trainer.state_sharding.opt_state)(params))
     step_fn = trainer._define_train_step(args.batch)
     rng_state = trainer.rngstate

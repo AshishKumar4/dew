@@ -137,8 +137,9 @@ def write_seeded(scan, minimal, version, revision):
         exact_run = jax.jit(lambda arrays, chunk=chunk: mamba_ssd_xla(arrays, chunk))
 
         def draw(seed, shape=shape, dtype=dtype, documents=documents, narrow_dtype=narrow_dtype):
-            inputs = ssd_orbit(operands(np.random.default_rng(seed), *shape,
-                                        lambda value: torch.tensor(value, dtype=dtype).float().numpy(),
+            batch, tokens, heads, width, groups, state = shape
+            inputs = ssd_orbit(operands(np.random.default_rng(seed), batch, tokens, heads, width, groups,
+                                        state, lambda value: torch.tensor(value, dtype=dtype).float().numpy(),
                                         documents), seed)
             redrawn = mamba_ssd_draw(seed, shape, narrow_dtype, documents)
             assert inputs.keys() == redrawn.keys(), f"mamba_ssm seed {seed}: regenerated inputs differ"
@@ -217,7 +218,7 @@ def main() -> None:
         names = ("y", "final", "x", "dt", "A", "B", "C", "D", "h0")
         found = dict(zip(names, (y, final, *grads), strict=True))
         arrays.update({f"mamba.{key}": value.detach().float().cpu().numpy() for key, value in found.items()})
-        arrays.update(chunk=np.int32(chunk), dtype=np.asarray(str(dtype).removeprefix("torch.")))
+        arrays.update(chunk=np.asarray(chunk, np.int32), dtype=np.asarray(str(dtype).removeprefix("torch.")))
         stored.update({f"{name}.{key}": value for key, value in arrays.items()})
     np.savez_compressed(FIXTURE, precision=np.asarray("ieee"), version=np.asarray(__version__),
              device=np.asarray(torch.cuda.get_device_name()), **stored)

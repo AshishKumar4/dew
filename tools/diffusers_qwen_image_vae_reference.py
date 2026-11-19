@@ -54,13 +54,16 @@ SEED = 29
 
 def build(root: Path) -> dict[str, np.ndarray]:
     from diffusers.models.autoencoders.autoencoder_kl_qwenimage21 import AutoencoderKLQwenImage21
+    from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
     model, generator = drawn_wan_vae(AutoencoderKLQwenImage21, CONFIG, SEED, root / "vae")
     named = list(model.named_parameters())
 
     image = (torch.rand((BATCH, CONFIG["in_channels"], HEIGHT, WIDTH), generator=generator) * 2 - 1
              ).requires_grad_()
-    posterior = model.encode(image[:, :, None]).latent_dist
+    encoded = model.encode(image[:, :, None])
+    assert isinstance(encoded, AutoencoderKLOutput)  # return_dict's default.
+    posterior = encoded.latent_dist
     mean, std = posterior.mean[:, :, 0], posterior.std[:, :, 0]
     encoded = recorded_vjp("encode", {"probe_mean": mean, "probe_std": std}, {"image": image}, named,
                            generator)
