@@ -381,8 +381,8 @@ def _replayed(jaxpr: jcore.Jaxpr, region: Region, fused_gemm):
             operands = [read(atom) for atom in equation.invars]
             form = _form(equation)
             if form is not None:
-                made = [_product(form, operands, equation.params["precision"],
-                                 equation.params["preferred_element_type"] or jnp.result_type(*operands[:2]),
+                # At its traced result's dtype, the dot's own (JAX's rule, not a promotion of its operands').
+                made = [_product(form, operands, equation.params["precision"], equation.outvars[0].aval.dtype,
                                  fused_gemm)]
             elif _activation(equation, _shape(equation.outvars[0])):
                 # A gated product's arithmetic as an epilogue traces it, whatever route its span's body took.

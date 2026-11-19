@@ -875,6 +875,22 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     assert priced.price.value > unmeasured.price.value
 
 
+def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
+    """A `lax.dot_general` of a bfloat16 and a float16 matrix, no preferred type stated, a valid product JAX
+    makes bfloat16 (`terms.product_dtype`): priced, its result kept on chip at bfloat16's two bytes beside its
+    leaves' (`Work.kept_bytes`); NumPy's promotion of the pair, which it refuses, raised there (base review
+    0b8b7ed98 F1, a crash pricing any program holding one)."""
+    def mixed(a, b):
+        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
+
+    a, b = jnp.ones((2, 3), jnp.bfloat16), jnp.ones((3, 4), jnp.float16)
+    region = terms.region(jax.make_jaxpr(mixed)(a, b))
+    graph, bundle, _ = program.graphed(region)
+    work = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                         cost_model=cost.model(region, cost.fused(generation.TARGETS["v5e"])))[1].work
+    assert work.kept_bytes == 2 * (2 * 3 + 3 * 4) + 2 * 2 * (2 * 4)
+
+
 @pytest.mark.parametrize("apart", [0, 1, 4], ids=["as written", "a group of one", "apart from its group"])
 def test_a_token_loops_states_are_kept_each_token(apart):
     """A scan's token loop keeps its state on chip each token, written and read (`Work.kept_bytes`, row

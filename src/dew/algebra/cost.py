@@ -20,7 +20,7 @@ from egglog import DagCostModel, EGraph, get_callable_args
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import CONTRACTED, shape
-from dew.algebra.terms import EXPONENTIALS, RESCALE, Region, Term, integer, key, text
+from dew.algebra.terms import EXPONENTIALS, RESCALE, Region, Term, integer, key, product_dtype, text
 from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
@@ -109,12 +109,11 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         read = sum(math.prod(extent) * np.dtype(dtype).itemsize
                    for extent, dtype in zip((left, right), operands, strict=True))
         elements = math.prod(left[axis] for axis in batch) * free
-        # Its result at its preferred element type, else its operands' (`Work.kept_bytes`).
-        preferred = params.get("preferred_element_type")
-        itemsize = np.dtype(preferred if preferred is not None else np.result_type(
-            *(np.dtype(dtype) for dtype in operands))).itemsize
+        # Its result at the dtype the product makes (`terms.product_dtype`, JAX's own rule: a bfloat16 by a
+        # float16 product is bfloat16, which NumPy's promotion refused, base review 0b8b7ed98 F1).
         mode, passes = _mode(params.get("precision"), *operands)
-        return Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, itemsize),
+        return Work(shared_bytes=read, kernels=1.0,
+                    kept_bytes=kept(elements, product_dtype(params, operands).itemsize),
                     **{_MODES[mode]: 2.0 * elements * length * passes})
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1], held))

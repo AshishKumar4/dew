@@ -1241,6 +1241,22 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
     return None
 
 
+def product_dtype(params: Mapping, operands: tuple) -> np.dtype:
+    """The dtype a product (`Term.dot`) of operands of `operands`' dtypes at `params` makes: its preferred
+    element type where it states one, else JAX's own rule for a `lax.dot_general` of those dtypes (a
+    bfloat16 by a float16 product is bfloat16), the dtype its traced equation's result has: never another
+    library's promotion (NumPy's refuses that pair, base review 0b8b7ed98 F1)."""
+    preferred = params.get("preferred_element_type")
+    return np.dtype(preferred) if preferred is not None else _dot_dtype(*map(np.dtype, operands))
+
+
+@functools.cache
+def _dot_dtype(left: np.dtype, right: np.dtype) -> np.dtype:
+    """JAX's result dtype of a `lax.dot_general` of operands of `left` and `right` and no preferred type."""
+    shaped = (jax.ShapeDtypeStruct((1, 1), left), jax.ShapeDtypeStruct((1, 1), right))
+    return np.dtype(jax.eval_shape(jax.lax.dot, *shaped).dtype)
+
+
 def product_slack(region: Region, index: int) -> int | None:
     """The powers the product of `region`'s parameters `index` adds to its bound for its mode
     (`contraction_slack` at its operands' dtypes, `Region.products`); None where an operand's dtype is
