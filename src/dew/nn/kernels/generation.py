@@ -558,6 +558,12 @@ class GpuTarget:
     step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
     measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
     none was."""
+    vmem_rate: float | None = None
+    """A TPU's VMEM bytes a second, read and written by its vector unit: what XLA's path moves between its
+    vector registers and VMEM costs (`templates.cost.Work.kept_bytes`, `templates.cost.rates`), measured as a
+    Pallas chain's fixed cost an iteration of reading and writing one 2 MiB fp32 block (4 MiB an iteration)
+    beside its steps, on Colab's TPUs, two rounds each (rows 7201 and 7283, colab7062's rates2 and rates3);
+    None where none was, so those bytes are priced by no time there."""
     host_links: Mapping[str, float] = dataclasses.field(kw_only=True, hash=False)
     """Each part's link to its host's memory (by the device-kind prefixes `dense_peaks` keys), in bytes a
     second one way, its datasheet's peak: PCIe's x16 lanes or NVLink-C2C, whose sheets state both ways
@@ -894,7 +900,9 @@ TARGETS = {target.generation: target for target in (
     # (cloud.google.com/tpu/docs/v5e, /tpu/docs/system-architecture-tpu-vm); the clock is 197e12 / 131072,
     # derived from the peak, no stated clock. Its scoped VMEM and MXU rate are its family's (`_TPUS`).
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
-              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30, host_links={}),
+              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30,
+              # 0.65 us an iteration of 4 MiB (`vmem_rate`).
+              vmem_rate=6.5e12, host_links={}),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}},
               host_links={}),
     # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
@@ -902,7 +910,9 @@ TARGETS = {target.generation: target for target in (
     # link is "PCIe Gen5 x8 per chip" (the same page's system architecture): half a Gen5 x16's 64 GB/s each
     # way.
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}, multiprocessors=1,
-              clock_hz=918e12 / 524288, memory_bandwidth=1638e9, host_links={'TPU v6 lite': 32e9}),
+              clock_hz=918e12 / 524288, memory_bandwidth=1638e9,
+              # 0.28 us an iteration of 4 MiB (`vmem_rate`).
+              vmem_rate=1.5e13, host_links={'TPU v6 lite': 32e9}),
 )}
 
 
