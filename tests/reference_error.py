@@ -539,7 +539,11 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
           evaluated_on([])):
         for index, inputs in enumerate(shaped.values()):
             wide = widened(inputs)
-            if index == 0:
+            # A truth the gate runs as given has its value alone to read, held to float64 in its run on its
+            # first draw (`_drawn`): the prepare computes none (bible section 8; on its default device, a
+            # compile-only GPU, its eager operations raised "'Executable' object has no attribute
+            # 'local_devices'", row 4881's class).
+            if index == 0 and not _given(truth):
                 _of_float64(label, _truth_program(truth), inputs, _shaped_truth(truth, wide))
             _ahead(programs, held, label, truth, terms_fn, terms=terms, wide=wide)
         store.compile_site(label, programs, held)
@@ -804,16 +808,9 @@ def _held_walk(programs: dict, held: dict, fn, wide) -> None:
 
 
 def _shaped_truth(truth, wide):
-    """`truth` on widened inputs `wide` as `_of_float64` reads it, its leaves' dtypes and sizes: its value
-    where the gate runs it as it is (`_given`), computed on the host's CPU, else its shapes alone (a window
-    loop's on one window), no float64 computed."""
-    if _given(truth):
-        # On the host's CPU, its inputs as the gate hands them (NumPy's, which a torch truth reads as they
-        # are): a GPU part's prepare computes nothing on its default device, a compile-only GPU (an eager
-        # operation there raised "'Executable' object has no attribute 'local_devices'", and its test ran
-        # unprepared, row 4881's class).
-        with jax.default_device(jax.devices("cpu")[0]):
-            return truth(*wide)
+    """`truth` (a traced one, not one the gate runs as given) on widened inputs `wide` as `_of_float64` reads
+    it, its leaves' dtypes and sizes: its shapes alone (a window loop's on one window), no float64
+    computed."""
     if isinstance(truth, _Windowed):
         return jax.eval_shape(unrewritten(truth.fn), *jax.tree.map(lambda leaf: leaf[0], wide))
     return jax.eval_shape(unrewritten(truth), *wide)
@@ -1155,7 +1152,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         with summed_as_run():
             _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms, ran = _draw_truth(truth_and_terms, prepared_followed, followed, dew_fn, inputs)
-        if not at and running() is None:  # compiled ahead, its prepare held it (`_compile_site`)
+        # Compiled ahead, its prepare held it (`_compile_site`); a truth run as given, its run holds it here.
+        if not at and (running() is None or _given(truth_fn or reference_fn)):
             _of_float64(label, _truth_read(truth_fn or reference_fn, followed, ran), inputs, truth)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms

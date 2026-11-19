@@ -4,6 +4,7 @@ its reference arm the reference path alone, and its truth computes in float64; a
 computed by programs compiled ahead (`truths_ahead.compiled_truths`) judge as the truths a site computes
 itself, a missing or stale program refused."""
 
+import contextlib
 import dataclasses
 import functools
 import json
@@ -651,30 +652,37 @@ def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
     assert ran == list(range(5))
 
 
-@pytest.mark.mesh(devices=2)
-def test_a_truth_run_as_given_computes_on_the_host_in_a_prepare(tmp_path, monkeypatch):
-    """A site whose float64 truth the gate runs as given (`as_given`: host work, NumPy, torch) has its value
-    read in its prepare (`_shaped_truth`) on the host's CPU, its inputs NumPy's, wherever the store's
-    device is: a GPU part's prepare computes nothing on its default device, a compile-only GPU, where the
-    truth's eager operations raised "'Executable' object has no attribute 'local_devices'" and the test ran
-    unprepared (row 4881's class: a compensated primitive's site, the audio encoders' cells)."""
+def test_a_truth_run_as_given_computes_in_no_prepare_and_is_held_to_float64_in_its_run(tmp_path):
+    """A site whose float64 truth the gate runs as given (`as_given`: host work, NumPy, torch) has nothing
+    computed of it in its prepare, on no device: a GPU part's prepare computes no dense math on its node's
+    CPU (bible section 8), and on its default device, a compile-only GPU, the truth's eager operations
+    raised "'Executable' object has no attribute 'local_devices'" (row 4881's class); its run holds it to
+    float64 on its first draw (`_of_float64`), a float32 truth refused there."""
     from arm_forms import as_given
-    from truths_ahead import CompiledTruths
+    from reference_error import NarrowTruth
 
     dew, reference, draw = _site()
-    placed = []
+    called = []
 
     def truth(a, b):
-        # Where its eager operations run, and its inputs as the gate hands them (NumPy's, a torch truth's).
-        placed.append((jax.config.jax_default_device, {type(x) for x in (a, b)}))
+        called.append(None)
         return reference(a, b)
 
-    # The store's device another than the host's first, as a GPU part's compile-only GPU is.
-    monkeypatch.setattr(CompiledTruths, "device", lambda store: jax.devices()[1])
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(dew, reference, draw, "a product of a given truth", seeds=8, truth_fn=as_given(truth))
-    host = jax.devices("cpu")[0]
-    assert placed and all(device == host and kinds == {np.ndarray} for device, kinds in placed)
+    assert not called
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product of a given truth", seeds=8, truth_fn=as_given(truth))
+    assert called
+
+    def narrow(a, b):
+        return np.asarray(reference(a, b), np.float32)
+
+    for prepare in (True, False):
+        with (compiled_truths(tmp_path / "narrow", prepare=prepare, stamp="a"),
+              contextlib.nullcontext() if prepare else pytest.raises(NarrowTruth)):
+            assert_as_exact(dew, reference, draw, "a product of a narrow truth", seeds=8,
+                            truth_fn=as_given(narrow))
 
 
 @pytest.mark.mesh(devices=2)
