@@ -1437,17 +1437,15 @@ def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Cal
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *, kind: TangentKind,
                    live_cotangents: bool = False, zero_cotangents: bool = False,
                    primal: Callable | None = None, nested: bool = True,
-                   unread: tuple[int, ...] = ()) -> Callable:
+                   unread: tuple[int, ...] = (), traced: bool = False) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
     `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
     `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
     arrays); `backward(saved, operands, cotangent)` gives the operands' cotangents, a tuple; and
-    `portable(*operands)` gives the output.
-
-    The output's derivative is one custom JVP whose tangent is `portable`'s, evaluated as a
-    linear map that transposes to `backward` (`linear_map`): forward mode (`jax.jvp`,
-    `jax.linearize`) takes the portable tangent however a jit or a scan staged the call, and reverse
-    mode runs the backward kernel, through a vjp or through a jvp that a shard_map or a scan then
+    `portable(*operands)` gives the output. The output's derivative is one custom JVP whose tangent is
+    `portable`'s, evaluated as a linear map that transposes to `backward` (`linear_map`): forward mode
+    (`jax.jvp`, `jax.linearize`) takes the portable tangent however a jit or a scan staged the call, and
+    reverse mode runs the backward kernel, through a vjp or through a jvp that a shard_map or a scan then
     transposes. The forward and the backward are custom JVPs of their own whose tangents are
     `portable`'s and its pullback's, so a higher order (`jax.jvp` of `jax.grad`, `jax.grad` of
     `jax.jvp`) differentiates through XLA while each level's value comes from the kernels; what
@@ -1469,7 +1467,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     still (`_held_still`), not as a custom JVP of its own: a value it names (`checkpoint_name`) is a
     residual a remat policy can keep, and no order differentiates the kernels' forward, whose custom VJP
     takes none (what it saves reaches `pulled` alone, whose tangent reads the operands': a jvp of a
-    gradient through a named kernel reached Mosaic GPU's call, row 2655)."""
+    gradient through a named kernel reached Mosaic GPU's call, row 2655). With `traced`, orders past the
+    first differentiate `forward` and `backward` as written (row 8656: the turned rule's crossing form)."""
     import jax
     import jax.numpy as jnp
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
@@ -1503,13 +1502,12 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
 
-    pulled = contracted("test_an_embedding_lookup_holds_every_order")(
+    pulled = pulled_by if traced else contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,)))
-
-    still = _held_still(forward, portable, kind)
+    level = forward if traced else produced if nested else _held_still(forward, portable, kind)
 
     def bounded_jvp(primals, tangents):
-        output, saved = produced(*primals) if nested else still(*primals)
+        output, saved = level(*primals)
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
         directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)

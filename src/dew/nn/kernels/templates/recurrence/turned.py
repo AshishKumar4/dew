@@ -276,8 +276,8 @@ def _turned(launch, scale: float, group: int, held: int) -> Callable:
     `_turned_primal`'s, the frames' and the launch's own (the portable walk's token replay), so forward mode
     and every higher order run where the launch's derivative does, where a custom VJP alone refused a
     jvp of the portable math (row 8573). A call no derivative reaches runs `_turned_primal`, launching as
-    inference does, saving nothing (audit KPM-04); a derivative's forward runs held still (`nested` off), as
-    what it saves is the launch's pullback, a function no tangent carries."""
+    inference does, saving nothing (audit KPM-04); every order past the first differentiates the crossing
+    form as written (`traced`), its launches by their own rules."""
     from dew.nn.kernels import generation
 
     def forward(*operands):
@@ -294,7 +294,7 @@ def _turned(launch, scale: float, group: int, held: int) -> Callable:
 
     return contracted("test_a_turned_template_call_holds_every_order")(
         generation.linear_tangent(forward, backward, portable, kind=KernelGlue(), primal=portable,
-                                  nested=False))
+                                  traced=True))
 
 
 def _taken(x, index):
