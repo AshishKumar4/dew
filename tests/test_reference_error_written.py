@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from contract_support import normal_drawn
 from reference_error import GateFailure, assert_as_exact
 from truths_ahead import compiled_truths
 
@@ -88,11 +89,6 @@ def _product(x, w):
     return x @ w
 
 
-def _drawn_matrices(seed):
-    rng = np.random.default_rng([0x6909, seed])
-    return (rng.standard_normal((16, 32)).astype(np.float32), rng.standard_normal((32, 8)).astype(np.float32))
-
-
 def test_a_truth_jitted_with_compiler_options_of_its_own_runs_as_written(tmp_path):
     """A float64 truth its site passes as a jit of compiler options of its own runs as every truth does, its
     own function compiled as written (`arm_forms._own_function`): nested inside the gate's jit of options,
@@ -101,10 +97,10 @@ def test_a_truth_jitted_with_compiler_options_of_its_own_runs_as_written(tmp_pat
     from arm_forms import WITHOUT_YNN
 
     configured = jax.jit(_product, compiler_options=WITHOUT_YNN)
-    label = "a product beside its configured truth"
-    assert_as_exact(_product, _product, _drawn_matrices, label, seeds=8, truth_fn=configured)
+    label, draw = "a product beside its configured truth", normal_drawn(0x6909, (16, 32), (32, 8))
+    assert_as_exact(_product, _product, draw, label, seeds=8, truth_fn=configured)
     # Prepared and run from its store as a GPU tier part's (`truths_ahead.compiled_truths`) too.
     with compiled_truths(tmp_path, prepare=True, stamp="here"):
-        assert_as_exact(_product, _product, _drawn_matrices, label, seeds=8, truth_fn=configured)
+        assert_as_exact(_product, _product, draw, label, seeds=8, truth_fn=configured)
     with compiled_truths(tmp_path, prepare=False, stamp="here"):
-        assert_as_exact(_product, _product, _drawn_matrices, label, seeds=8, truth_fn=configured)
+        assert_as_exact(_product, _product, draw, label, seeds=8, truth_fn=configured)
