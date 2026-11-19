@@ -103,6 +103,12 @@ class Forward:
     keeps apart ties at the fold's size (`reaches`), so no walk walks again natural, for one more operation
     an element than the fold's contracted multiply-add, which a memory-bound walk (the decode kernel's,
     row 1955) does not feel."""
+    dropped: float = 1.0
+    """A dropping call's multiplier `1 / (1 - rate)` (`Dropout.bound`), which its walk's sums keep out and its
+    output and D take once (`finish`, `gradient.split_delta`): each kept key's weight exact in the product
+    (`kept`), where its weight times the multiplier rounded to the values' dtype a weight apiece (4/3 to
+    1.3359 in bf16: an output near fp32's largest over equal keys passed bf16's, row 8652); 1 where no
+    call drops."""
 
     @property
     def raw(self) -> bool:
@@ -993,6 +999,8 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Pa
     row of no key (a maximum of -inf: a padded row, a slice carrying no sink) resumes at the walk's start
     (`LEAST`), exact for every other."""
     m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
+    # A dropping call's sums held without its multiplier (`Forward.dropped`), which the state's are not.
+    acc = acc if spec.dropped == 1.0 else acc / np.float32(spec.dropped)
     if spec.base2:
         m = raw_maximum(m, spec.scale) if spec.raw else base2_maximum(m)
     m = jnp.maximum(m, LEAST)
@@ -1276,43 +1284,34 @@ def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | No
 
 
 def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p: jax.Array, *,
-           multiplier: jax.Array | None, chunk: int | None, bound: float, held: "Scaled | None" = None
+           multiplier: jax.Array | None, chunk: int | None, held: "Scaled | None" = None
            ) -> tuple[jax.Array, ...]:
     """Weights `p` times the tile's `value`s as the mainloop's `dot`, a `chunk` of keys at a time
     (`products_of`), as `tile_parts` gives them."""
-    return products_of(tile_parts(p, held, value.dtype, multiplier, bound), value, dot, chunk)
+    return products_of(tile_parts(p, held, value.dtype, multiplier), value, dot, chunk)
 
 
-def tile_parts(p: jax.Array, held: "Scaled | None", dtype, multiplier: jax.Array | None = None,
-               bound: float = 1.0, *, axis: int = -1) -> Parts:
+def tile_parts(p: jax.Array, held: "Scaled | None", dtype, multiplier: jax.Array | None = None, *,
+               axis: int = -1) -> Parts:
     """A tile's weights `p` (keys along `axis`) as the parts of their product with values of `dtype`:
-    narrowed; with a dropout `multiplier` (at most `bound`), the dropped weights `p * multiplier` as
-    `dropped_parts` narrows them; on a scaled tile (`held`) at their rows' scale in two tiers (`at_scale`,
-    `scaled_parts`). A 16-bit dtype's whose dropped weights take a scale of their own (`drops_in_place`) is
-    fp16's, whose walk holds no scale (`headroom`)."""
+    narrowed, under a dropout draw (`multiplier`) the kept keys' alone (`kept`: the call's multiplier its
+    output's, `Forward.dropped`); on a scaled tile (`held`) at their rows' scale in two tiers (`at_scale`,
+    `scaled_parts`)."""
     if held is None:
-        return (narrow(p, dtype),) if multiplier is None else dropped_parts(p * multiplier, dtype, bound)
+        return (narrow(kept(p, multiplier), dtype),)
     weights, small = at_scale(p, held, axis=axis)
-    if multiplier is not None:
-        weights, small = weights * multiplier, small * multiplier
-    return scaled_parts(weights, small, dtype)
+    return scaled_parts(kept(weights, multiplier), kept(small, multiplier), dtype)
 
 
-def dropped_parts(weights: jax.Array, dtype, bound: float) -> Parts:
-    """A forward's dropped weights `p * multiplier` (fp32, unnormalized, `p` at most 1 and the draw's
-    multiplier `bound`) narrowed for their product with values of `dtype`: as they are where `bound` is
-    within the dtype's range (`drops_in_place`), each as exact as the reference's (`attention.reference`
-    narrows the normalized `p / total * multiplier`, no larger), so a mainloop's sums take them in place;
-    else (fp16 past a rate of 1 - 2^-16) at the power-of-two scale `weights_parts` gives them, which their
-    product takes back."""
-    if drops_in_place(dtype, bound):
-        return (narrow(weights, dtype),)
-    return weights_parts(weights, dtype)
+def kept(weights: jax.Array, multiplier: jax.Array | None) -> jax.Array:
+    """`weights` where a dropout draw's `multiplier` keeps their keys, zero where it drops them: each kept
+    weight exact, the multiplier itself the output's (`Forward.dropped`); `weights` where no call drops."""
+    return weights if multiplier is None else jnp.where(multiplier > 0, weights, 0.0)
 
 
 def drops_in_place(dtype, bound: float) -> bool:
-    """Whether a forward's dropped weights, at most the draw's multiplier `bound`, narrow to `dtype` as they
-    are (`dropped_parts`): `bound` within its largest finite value."""
+    """Whether a backward's dropped weights, at most the draw's multiplier `bound`, narrow to `dtype` as they
+    are for dV's product (`value_parts`, `value_weights`): `bound` within its largest finite value."""
     return bound <= float(jnp.finfo(dtype).max)
 
 
@@ -1541,12 +1540,11 @@ def _split_tile(keys: Keys, p: jax.Array, dtype, anchor: Argmax, multiplier: jax
         # parts sum to them exactly): taken after the tile's products, which hold no row of it.
         summed = others.astype(jnp.float32).sum(axis=-1)
         return summed if small is None else summed + taken_back(small.sum(axis=-1), float(-SMALL_SHIFT))
-    drop = keys.coords.drop
-    if multiplier is None or drop is None:
+    if multiplier is None or keys.coords.drop is None:
         return (others, *lowered), rest, own_tile, anchor
-    dropped = jnp.where(at_anchor, 0.0, p) * multiplier
-    parts = (dropped_parts(dropped, dtype, drop.bound) if small is None
-             else scaled_parts(dropped, small * multiplier, dtype))
+    dropped = kept(jnp.where(at_anchor, 0.0, p), multiplier)
+    parts = ((narrow(dropped, dtype),) if small is None
+             else scaled_parts(dropped, kept(small, multiplier), dtype))
     return parts, rest, own_tile, anchor
 
 
@@ -1724,8 +1722,7 @@ def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array]) -> Partial:
     """A training walk's state with its split sums joined, the anchor's term added back (`split_output`),
     the weighted values the output normalizes, at its rows' scale on the scaled walk."""
     split, arg, own, _ = carry
-    anchored_own = own if arg.multiplier is None else own * arg.multiplier
-    return split._replace(acc=split_output(split.acc, anchored_own, rows(arg.key)))
+    return split._replace(acc=split_output(split.acc, kept(own, arg.multiplier), rows(arg.key)))
 
 
 def argmax(state: Argmax, logits: jax.Array, k_pos: jax.Array) -> Argmax:
@@ -1747,11 +1744,10 @@ def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, 
 def split_term(own: jax.Array, moved: jax.Array, old_value: jax.Array,
                old_multiplier: jax.Array | None = None) -> jax.Array:
     """The old anchor's term a training step's split sums join where the anchor moved (`moved` `[bq]`): its
-    weight `own` before the tile (under dropout times its draw's multiplier `old_multiplier`) times its value
-    row `old_value` `[bq, Dv]`; zero elsewhere."""
+    weight `own` before the tile (under dropout zero where its draw `old_multiplier` drops it, `kept`) times
+    its value row `old_value` `[bq, Dv]`; zero elsewhere."""
     old = old_value.astype(jnp.float32)
-    anchored = own if old_multiplier is None else own * old_multiplier
-    return jnp.where(expand(moved, old), expand(anchored, old) * old, 0.0)
+    return jnp.where(expand(moved, old), expand(kept(own, old_multiplier), old) * old, 0.0)
 
 
 def split_rows(own: jax.Array, others_total: jax.Array, alpha: jax.Array, moved: jax.Array, rest: jax.Array,
@@ -1903,11 +1899,18 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     if normalized:
         out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
     else:
-        out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
-                       held=held)
+        out = dropped_output(spec, quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)),
+                                            state.acc, state.total, held=held))
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
+
+
+def dropped_output(spec: Forward, out: jax.Array) -> jax.Array:
+    """A walk's output `out` (its sums over its denominator) times a dropping call's multiplier
+    (`Forward.dropped`), which its sums kept out: past the division, so it passes fp32's largest only where
+    the output does."""
+    return out if spec.dropped == 1.0 else out * np.float32(spec.dropped)
 
 
 def inverse(total: jax.Array) -> jax.Array:
@@ -2350,10 +2353,9 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     walk's (the state's `Low`) takes its sums as the template's step takes them (`stepped`): the tile's
     products a chunk of keys each, each addition's rounding kept; a scaled walk's (`SCALED_WALK`) its rows'
     scale from the forms' weights and the tile's values (`rescaled`), each tile at it where some row is
-    scaled (`scaled_step`). A dropping call's draw (`drawn`) multiplies the weights of the tile's product
-    alone, never its denominator's, so the template's product takes them (`tile_parts`): narrowed in place,
-    or past fp16's range (a multiplier of 2^16) at the power-of-two scale `dropped_parts` keeps them at,
-    where the forms' product would narrow them unnormalized."""
+    scaled (`scaled_step`). A dropping call's draw (`drawn`) keeps the weights of the tile's product alone,
+    never its denominator's, so the template's product takes them (`tile_parts`, `kept`), its multiplier the
+    output's (`Forward.dropped`)."""
     forms, tiles, fields = _step_forms(spec, keys)
     held_by, plain = keys.accumulate, state.low is None
     drop = keys.coords.drop
@@ -2379,7 +2381,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
                 total = (states[fields.index("total")] * added.factor + weighed if held is None
                          else denominator_after(states[fields.index("total")], added.factor, weighed, held))
                 parts = ((accumulated.weights,) if held is None and multiplier is None
-                         else tile_parts(added.terms, held, value.dtype, multiplier, bound, axis=axis))
+                         else tile_parts(added.terms, held, value.dtype, multiplier, axis=axis))
                 # The weighted values' sums taken by their factor, a row's (none where the forms state none),
                 # and a scaled tile's change of scale.
                 taken = Taken(keys.coords, accumulated.factor, held)
@@ -2388,7 +2390,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
             # The template's step over the forms' weights (the denominator's terms, before their narrowing
             # for the product) and rescale.
             products = _times(keys.dot, value, added.terms, multiplier=multiplier, chunk=chunk_of(spec),
-                              bound=bound, held=held)
+                              held=held)
             return stepped(state, state.m, added.factor, added.terms.sum(axis=axis), products, scale, held)
 
         # The anchor the forms' step selects (`anchor`: of the kept maximum and the tile's), read only where a

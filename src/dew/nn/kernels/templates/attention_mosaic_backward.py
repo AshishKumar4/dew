@@ -79,7 +79,8 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     # (`gradient.off_anchor_delta`).
     anchor, delta, chosen = gradient.split_delta(others, own, others_total, forward_total, state_total,
                                                 values, cotangent, key_index, shift,
-                                                rows=interpreted_rows if interpret else gradient.summed_rows)
+                                                rows=interpreted_rows if interpret else gradient.summed_rows,
+                                                dropped=1.0 if drop is None else drop.bound)
     # The family's swizzled tiles hold whole rows (`Family.column_unit`).
     query, key, value, dout = (_columns(array, family.column_unit(array.dtype))
                                for array in (query, key, value, dout))
