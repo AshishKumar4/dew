@@ -604,8 +604,8 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     if hooks.rounds is not None and (backward or hooks.drop is not None or hooks.initial is not None):
         return ROUNDED
     if hooks.drop is not None and not algebra.drops_in_place(dtype, hooks.drop.bound):
-        # The backward's dropped weights for dV's product past the dtype's largest would take scaled parts,
-        # which its sums in place do not take back (`mosaic.unscaled_part`).
+        # Dropped weights past the dtype's largest take scaled parts (`algebra.dropped_parts`), which the
+        # mainloop's sums in place do not take back (`mosaic.unscaled_part`).
         return Refusal('dropout_rate', f"the Mosaic dropping walk takes {jnp.dtype(dtype).name} weights "
                        f"within its range, not a multiplier of {hooks.drop.bound:g} (a rate of "
                        f"{hooks.drop.rate:g})")

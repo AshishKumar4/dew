@@ -625,15 +625,13 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         kv_of = jnp.arange(q.shape[2]) // (q.shape[2] // kv_heads)
         places = ((jnp.arange(batch)[:, None, None] * kv_heads + kv_of[None, :, None]) * keys_count + anchors)
         value_rows = jnp.take(jnp.swapaxes(v, 1, 2).reshape(-1, v.shape[-1]), places, axis=0)
-        # Under dropout the anchor's own weight where its draw keeps it, as `algebra.joined` takes it.
+        # Under dropout the anchor's own weight takes its draw's multiplier, as `algebra.joined` does.
         own = (split.own if hooks.drop is None
-               else algebra.kept(split.own, algebra.anchor_multipliers(hooks.drop, anchors)))
+               else split.own * algebra.anchor_multipliers(hooks.drop, anchors))
         acc = algebra.split_output(split.others, own, value_rows)
-        # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`), times a
-        # dropping call's multiplier past the division (`algebra.dropped_output`).
+        # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`).
         total = rows[1] if not form.headroom else algebra.power2(rows[1], -split.shift, reach=2 * 127)
         out = algebra.output_of(acc, total, guarded=form.guarded or hooks.initial is not None)
-        out = algebra.dropped_output(form, out)
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None
 
@@ -695,8 +693,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                            initial=hooks.initial is not None,
                            queries=(call.queries if call.query.shape[1] > call.queries or call.per_span > 1
                                     else None),
-                           prescale=power / taken, subtracted=subtracted, rounds=hooks.rounds,
-                           dropped=1.0 if hooks.drop is None else hooks.drop.bound)
+                           prescale=power / taken, subtracted=subtracted, rounds=hooks.rounds)
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     hooked = _hooked_of(hooks, call, unit)
     if scales is not None:

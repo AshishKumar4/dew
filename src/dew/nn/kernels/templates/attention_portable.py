@@ -224,8 +224,7 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None, scale, hooks.score_mod,
                            natural, hooks.rounds is None and algebra.headroom(value.dtype),
                            hooks.initial is not None, compensated=algebra.compensates(value.dtype),
-                           prescale=power, rounds=hooks.rounds,
-                           dropped=1.0 if hooks.drop is None else hooks.drop.bound)
+                           prescale=power, rounds=hooks.rounds)
     # A quantized call's weights round at each row's maximum, which its training walk finds first
     # (`attention_program.walk`), its residuals let go where the call keeps none.
     if not residuals and hooks.rounds is None:

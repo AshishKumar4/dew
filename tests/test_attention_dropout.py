@@ -414,8 +414,8 @@ def test_a_near_total_fp16_draw_keeps_its_one_kept_weight_finite_on_every_path(f
 
 def test_the_mosaic_dropping_walk_refuses_fp16_weights_past_fp16s_largest():
     """At the fp16 witness's rate, 1 - 2^-16, a kept weight's multiplier, 2^16, passes fp16's largest, which
-    the Mosaic dropping backward's dV sums in place take no scaled part of (`algebra.drops_in_place`): its
-    legality rule refuses an fp16 call there, forward and backward, and takes a bf16 one and an fp16 one at an
+    the Mosaic dropping walk's sums in place take no scaled part of (`algebra.dropped_parts`): its legality
+    rule refuses an fp16 call there, forward and backward, and takes a bf16 one and an fp16 one at an
     ordinary rate (the plain-JAX mainloop takes the witness, above)."""
     near_total = hooked(seed_words(0), ROWS, HEADS, 1.0 - 2.0 ** -16)
 
