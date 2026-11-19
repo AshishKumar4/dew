@@ -431,14 +431,20 @@ def _ulp(magnitude: np.ndarray, dtype) -> np.ndarray:
     return np.maximum(np.ldexp(1.0, exponent - 1 - info.nmant), float(info.smallest_subnormal))
 
 
-def assert_merges_no_ties(dew_fn, reference_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
+def assert_merges_no_ties(dew_fn, reference_fn, truth_fn, draw, label: str, *, seeds: int,
+                          along: int = 1) -> None:
     """A kernel's ties (docs/design/testing.md, fast and accurate forms: the accurate form's claim) over
-    `seeds` draws: no group of a leaf's entries `dew_fn` returns equal whose reference values
-    (`reference_fn`'s) the reference keeps apart, that is spread past twice the reference's own error over
-    the group (its largest distance from the float64 truth, `truth_fn` on the inputs widened: two entries
-    each that far off may meet) and one ulp more, the ulp of the group's largest magnitude in the leaf's
-    dtype (each entry's rounding to its dtype moves it at most half its own ulp, which is at most half
-    that one)."""
+    `seeds` draws, among a leaf's entries along `along` (an attention leaf's positions, `[B, S, H, D]`'s
+    second axis), every other coordinate held: no group of them `dew_fn` returns equal that the reference
+    keeps apart, its values (`reference_fn`'s) not all equal and their float64 truths (`truth_fn` on the
+    inputs widened) spread past twice the reference's own error over the group (its largest distance from
+    the truth: two entries each that far off may meet) and one ulp more, the ulp of the group's largest
+    magnitude in the leaf's dtype (each entry's rounding to its dtype moves it at most half its own ulp).
+    Entries of other rows (another batch, head or channel) are no pair the claim holds: equal by chance in a
+    leaf of many, they are no tie its computation made (row 6302's collisions across batches); and a pair
+    the reference holds apart by its own rounding alone, its truths nearer than that, is no pair it keeps
+    apart (keys an ulp apart: their float64 logits within one fp32 rounding, which a correctly rounded
+    logit merges, row 6302)."""
     truth_of = jax.jit(truth_fn)
     for seed in range(seeds):
         inputs = draw(seed)
@@ -448,18 +454,37 @@ def assert_merges_no_ties(dew_fn, reference_fn, truth_fn, draw, label: str, *, s
         theirs_all = jax.tree.leaves(reference_fn(*inputs))
         for (path, mine), theirs, exact in zip(found, theirs_all, truth, strict=True):
             dtype = np.asarray(mine).dtype
-            mine, theirs, exact = (np.asarray(x, np.float64).ravel() for x in (mine, theirs, exact))
-            finite = np.isfinite(mine) & np.isfinite(theirs) & np.isfinite(exact)
-            order = np.lexsort((theirs[finite], mine[finite]))
-            tied, kept, off = (x[finite][order] for x in (mine, theirs, np.abs(theirs - exact)))
-            starts = np.flatnonzero(np.concatenate([[True], tied[1:] != tied[:-1]]))
-            spread = np.maximum.reduceat(kept, starts) - np.minimum.reduceat(kept, starts)
-            largest = np.maximum.reduceat(np.abs(kept), starts)
-            ulp = _ulp(largest, dtype)
-            merged = spread > 2 * np.maximum.reduceat(off, starts) + ulp
-            assert not merged.any(), (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {int(merged.sum())} "
-                                      "groups of equal values the reference keeps apart, the widest "
-                                      f"{float(np.max(spread[merged] / ulp[merged])):.0f} ulps")
+            mine, theirs, exact = (_rows_along(np.asarray(x, np.float64), along)
+                                   for x in (mine, theirs, exact))
+            merged = [_merged(*row, dtype) for row in zip(mine, theirs, exact, strict=True)]
+            widest = max((ulps for count, ulps in merged if count), default=0.0)
+            count = sum(count for count, _ in merged)
+            assert not count, (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {count} groups of equal "
+                               f"values the reference keeps apart, the widest {widest:.0f} ulps")
+
+
+def _rows_along(x: np.ndarray, along: int) -> np.ndarray:
+    """`x`'s entries as rows along axis `along`, every other coordinate a row of its own (`[rows, along]`); a
+    leaf of no such axis one row."""
+    if x.ndim <= along:
+        return x.reshape(1, -1)
+    return np.moveaxis(x, along, -1).reshape(-1, x.shape[along])
+
+
+def _merged(mine: np.ndarray, theirs: np.ndarray, exact: np.ndarray, dtype) -> tuple[int, float]:
+    """A row's ties Dew merges that the reference keeps apart (`assert_merges_no_ties`): their count and the
+    widest's truths' spread in ulps."""
+    finite = np.isfinite(mine) & np.isfinite(theirs) & np.isfinite(exact)
+    order = np.lexsort((exact[finite], mine[finite]))
+    tied, kept, true = (x[finite][order] for x in (mine, theirs, exact))
+    if not tied.size:
+        return 0, 0.0
+    starts = np.flatnonzero(np.concatenate([[True], tied[1:] != tied[:-1]]))
+    apart = np.maximum.reduceat(kept, starts) > np.minimum.reduceat(kept, starts)
+    spread = np.maximum.reduceat(true, starts) - np.minimum.reduceat(true, starts)
+    ulp = _ulp(np.maximum.reduceat(np.abs(true), starts), dtype)
+    merged = apart & (spread > 2 * np.maximum.reduceat(np.abs(kept - true), starts) + ulp)
+    return int(merged.sum()), float(np.max(spread[merged] / ulp[merged], initial=0.0))
 
 
 def dot_precisions(function, *arguments) -> list:
