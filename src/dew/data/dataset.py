@@ -22,7 +22,6 @@ import itertools
 import json
 import logging
 import math
-import os
 import statistics
 import subprocess
 import sys
@@ -38,10 +37,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew import _position
+from dew import _cgroups as cgroups, _position
 from dew._records import JSON, boolean, integer, integers, json_value, listed, record, strings, text
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Draws, Phase, padded_rows
-from dew.data import cgroups
 from dew.mesh import LayoutRefused, batch_axes
 from dew.registry import from_record, to_record
 
@@ -387,10 +385,8 @@ class Host:
         import psutil
 
         group = cgroups.own(root) if cgroup is None else cgroup
-        cpus, memory = len(os.sched_getaffinity(0)), psutil.virtual_memory().available
+        cpus, memory = cgroups.usable_cpus(group, root), psutil.virtual_memory().available
         for level in cgroups.levels(group, root):
-            if (quota := cgroups.cpus(level)) is not None:
-                cpus = min(cpus, quota)
             limit, held = cgroups.memory(level), cgroups.memory_held(level)
             if limit is not None and held is not None:
                 memory = min(memory, max(0, limit - held))

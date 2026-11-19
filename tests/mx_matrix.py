@@ -46,16 +46,17 @@ FORMATS = {"mxfp8": ("mxfp8", formats.MxFp8, gemm.mxfp8_product, product.MXFP8.d
 """Each format's choice, operand form, product and the depths a scale covers."""
 
 
-def _blocks(groups: int) -> jnp.ndarray:
-    """`groups` groups' 128-row blocks, an empty group among several."""
-    return jnp.asarray([2] if groups == 1 else [1, 0, 2, 1], jnp.int32)
+def _blocks(groups: int) -> np.ndarray:
+    """`groups` groups' 128-row blocks, an empty group among several: NumPy's, formed on no device (a GPU
+    tier's prepare computes on none, its default a compile-only GPU's)."""
+    return np.asarray([2] if groups == 1 else [1, 0, 2, 1], np.int32)
 
 
 def _operands(case: dict[str, str], seed: int) -> tuple:
     """`case`'s rows and matrices, each block of its format's depths spread over magnitudes 2^-6 to 2^6."""
     groups, width = int(case["groups"]), int(case["width"])
     block = FORMATS[case["format"]][3]
-    rows = 128 * int(jnp.sum(_blocks(groups)))
+    rows = 128 * int(_blocks(groups).sum())
     rng = np.random.default_rng(seed)
     return spread(rng, (rows, DEPTH), block), spread(rng, (groups, width, DEPTH), block)
 

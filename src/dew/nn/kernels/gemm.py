@@ -52,7 +52,7 @@ from dew.nn.kernels.templates.gemm import mosaic_gpu, scattered
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
-from dew.nn.programs import read_by
+from dew.nn.programs import called, read_by
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -1479,10 +1479,25 @@ def _rounded_accumulator(kept: dict, count: int, epilogue, acc, sides) -> jax.Ar
     if not kept or count != 1:
         return None
     jaxpr = jax.make_jaxpr(lambda acc, *sides: _tupled(epilogue, acc, *sides))(acc, *sides).jaxpr
-    reading = [eqn for eqn in jaxpr.eqns if jaxpr.invars[0] in eqn.invars]
-    if len(reading) != 1 or reading[0].primitive is not jax.lax.convert_element_type_p:
+    rounded = _rounding(jaxpr, jaxpr.invars[0])
+    return next((value for at, value in kept.items() if jaxpr.outvars[at] is rounded), None)
+
+
+def _rounding(jaxpr, var):
+    """The value of `jaxpr` that is `var` rounded, where `var`'s one reader is that conversion, or a call
+    whose program's is (`dew.nn.programs.called`: an epilogue its fused consumer's derivative declares,
+    `fused_gemm._declared`), its output then the call's; None otherwise."""
+    reading = [eqn for eqn in jaxpr.eqns if var in eqn.invars]
+    if len(reading) != 1:
         return None
-    return next((value for at, value in kept.items() if jaxpr.outvars[at] is reading[0].outvars[0]), None)
+    (eqn,) = reading
+    if eqn.primitive is jax.lax.convert_element_type_p:
+        return eqn.outvars[0]
+    body = called(eqn)
+    if body is None or eqn.invars.count(var) != 1:
+        return None
+    inner = _rounding(body, body.invars[eqn.invars.index(var)])
+    return eqn.outvars[body.outvars.index(inner)] if inner in body.outvars else None
 
 
 def _reads_accumulators(vjp: tuple, count: int) -> bool:

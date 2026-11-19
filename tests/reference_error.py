@@ -760,7 +760,7 @@ def _ahead(programs: dict, held: dict, label: str, truth, terms_fn, *, terms, wi
     shapes), unless the gate runs it as given or replays it (`_given`); its own terms program's
     (`_SiteTerms`), or the float64 walk of its truth its rows may be sized by (`terms`, unless False: the walk
     a site's first draw decides on, `_cancelling_terms`), where the walk is static: one that takes a branch
-    or loop its values pick is read as it runs, so its run walks it on its own device where it needs it
+    or loop its values pick is read as it runs, so its run walks it on the host's CPU where it needs it
     (`float64_terms._termed`). Each traced as written, its constants arguments held beside it."""
     if isinstance(truth, _Windowed):
         # Its truth window by window; its terms on the whole draw, as its run reads them: a site's own

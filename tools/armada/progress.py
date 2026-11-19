@@ -76,7 +76,7 @@ def task_peak(host: types.ModuleType) -> int | None:
     """This task's resident peak in bytes so far: its cgroup's (cgroup v2's memory.peak, which every process
     the task started counts in, a test's ranks with it), each of its tests' bound above (row 6003: a test's
     four ranks peaked at 7.17 GiB, packed beside another on a medium), read by Dew's one cgroup reader
-    through `host` (tools/armada/host.py: src/dew/data/cgroups.py, its root DEW_CGROUP_ROOT's where set),
+    through `host` (tools/armada/host.py: src/dew/_cgroups.py, its root DEW_CGROUP_ROOT's where set),
     which a task's pytest imports (tools/armada on its path) and ci.py loads. None where the task's cgroup
     states no peak."""
     reader = host.cgroups()

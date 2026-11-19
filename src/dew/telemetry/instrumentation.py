@@ -1127,9 +1127,16 @@ def step_flops(compiled: jax.stages.Compiled) -> StepFlops | None:
     The forward a remat recomputes counts once in `model` and twice in
     `hardware`, because the card runs it twice. None comes back when the
     module contains a loop whose length neither XLA states nor its counter
-    gives, since the count would then be the body's, not the run's.
+    gives, since the count would then be the body's, not the run's. Counted once an executable, as
+    `compiled_memory` reads its analysis: a trainer's refits read their kept step's (PF03: its module walked
+    again at each fit, 0.17 s of a four-process pool fit's planning).
     """
-    return hlo_flops(compiled)
+    if compiled not in _COUNTED:
+        _COUNTED[compiled] = hlo_flops(compiled)
+    return _COUNTED[compiled]
+
+
+_COUNTED: weakref.WeakKeyDictionary[jax.stages.Compiled, StepFlops | None] = weakref.WeakKeyDictionary()
 
 
 def compiled_flops(compiled: jax.stages.Compiled) -> float | None:

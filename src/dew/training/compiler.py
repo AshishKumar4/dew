@@ -42,7 +42,7 @@ from dew.objectives.base import Objective
 from dew.state import Accumulation, TrainState, apart, occupied, together
 from dew.telemetry.compiles import Compiles
 from dew.telemetry.instrumentation import StepFlops
-from dew.training._candidates import Stepping, _shaped, candidate_for, lowered_for
+from dew.training._candidates import Stepping, _shaped, candidate_for, forget, lowered_for
 from dew.training._lowering import Lowered, routed
 from dew.training.distributed import (
     link_figure,
@@ -1166,11 +1166,14 @@ class StepCompiler[L, E]:
             trials = Trials(state, batch, owned=False) if trials is None else trials
             run = self.runner(stepping, planned, mesh)
             relower = functools.partial(lower, planned.split, planned.at.narrow, planned.at.ns_group)
-            asked = search.compiled_key(planned.candidate.lowered, planned.options)
+            unguided = planned.candidate.lowered
+            asked = search.compiled_key(unguided, planned.options)
             planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
             # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
-            # AutoPGLE: the one the run steps, the unguided one freed with the search.
+            # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
+            # for a refit.
             hold(asked, planned.executable)
+            forget(unguided)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)

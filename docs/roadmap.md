@@ -10,7 +10,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
 - finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
-- Wrong result found by the contract draws. [8428]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -96,13 +95,11 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
+- A ratio's transpose sums landed quotients along an axis its denominator varies over. [8292]
 - The merge law's derivative programs nearly doubled since the base review's fixes. [8427]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
 - The merge law's placed sum keeps two bands of a term's span, not three. [8061]
-- A ratio's transpose sums landed quotients along an axis its denominator varies over. [8292]
-- Tests/reference_error.py:1455 refuses to prepare a check-1 site with a library arm. [8468]
-- Tests/reference_error.py _arm_program (arm_arithmetic.py:193) traces a site's arm nested in make_jaxpr, so an arm that is a jit of its own compiler_options…. [8469]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]

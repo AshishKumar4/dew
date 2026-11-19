@@ -36,6 +36,7 @@ from typing import Annotated, TextIO
 
 import tyro
 
+from dew import _cgroups as cgroups
 from dew._cleanup import exit_code, groups_ended, signal_group, start, stop
 from dew._cli import tpu_setup
 from dew._cli.gcloud import emit
@@ -50,7 +51,6 @@ from dew._pool import (
     visible_gpus,
 )
 from dew.clusters import LOCAL_DEVICES, SCHEDULERS, Launched, Scheduler, detected_environment
-from dew.data import cgroups
 
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 """What an `--env` name may be: it lands unquoted in the remote shell line."""

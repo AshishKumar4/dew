@@ -77,7 +77,7 @@ def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_befo
     (own / "memory.max").write_text(f"{3 * 2**30}\n")
     membership = tmp_path / "cgroup"
     membership.write_text("1:name=systemd:/elsewhere\n0::/session\n")
-    reader = Path(__file__).resolve().parents[1] / "src" / "dew" / "data" / "cgroups.py"
+    reader = Path(__file__).resolve().parents[1] / "src" / "dew" / "_cgroups.py"
     program = (
         "import importlib.util, sys\n"
         f"spec = importlib.util.spec_from_file_location('cgroups', {str(reader)!r})\n"

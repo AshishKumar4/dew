@@ -149,7 +149,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post112 and, on Linux x86_64 and aarch64, its own jaxlib build
+- Dew requires its JAX build 0.12.0.1.post113 and, on Linux x86_64 and aarch64, its own jaxlib build
   0.12.0.1.post111, with its CUDA and PJRT plugins 0.12.0.1.post111 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
@@ -182,7 +182,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   traced work count reads a program holding one; Mosaic GPU names the provider that assembles a kernel's PTX; a
   deviceless capture with no CUDA plugin raises `NoCudaPlugin`; and Triton's pipeliner sizes a load's buffers by
   each wgmma reader's stage, where a wgmma a stage after a register use was one buffer short and the next copy
-  overwrote a tile it still read. Elsewhere jaxlib stays the stock 0.12.0.1.
+  overwrote a tile it still read. The Pallas fuser gives every unary elementwise primitive and the optimization
+  barrier its block-spec rules, so a GEMM's SwiGLU or GELU epilogue fuses into it. Elsewhere jaxlib stays the stock
+  0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes
