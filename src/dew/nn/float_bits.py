@@ -30,6 +30,7 @@ def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax
         return power.astype(dtype)
     word = jnp.dtype(f"int{limits.bits}")
     bias = int(np.asarray(1.0, dtype).view(f"uint{limits.bits}")) >> limits.nmant
+    # Two's complement at the word's width: E8M0's biased exponents past 127 wrap negative, their bits kept.
     biased = n.astype(word) + word.type(bias)
     bits = jax.lax.shift_left(biased, jnp.full_like(biased, limits.nmant))
     return jax.lax.bitcast_convert_type(bits, dtype)
