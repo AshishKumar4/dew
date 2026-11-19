@@ -14,7 +14,7 @@ from reference_error import assert_as_exact, widened
 from token_support import token_rows
 
 from dew.distributed.batches import shard_batch
-from dew.nn.backbones.layer_names import layer_index
+from dew.nn.backbones.layer_names import group_layers
 from dew.nn.kernels.generation import compile_only_gpus
 from dew.nn.kernels.options import program
 from dew.objectives.lm import LMObjective
@@ -207,10 +207,13 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype, 
         return run
 
     def layer_leaves(tree) -> list:
-        # The leaves stored a layer apart (`layers_<i>`, `layer_index`), which the walk stacks.
-        return [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
-                if any(isinstance(key, jax.tree_util.DictKey) and isinstance(key.key, str)
-                       and layer_index(key.key) is not None for key in path)]
+        # The layers' leaves: under a layer's own tree (`layers_<i>`) or a run's stacked one
+        # (`layers_<a>_<b>`, a staged start's `stages/<run>`), `group_layers`'s names.
+        leaves = [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
+                  if any(isinstance(key, jax.tree_util.DictKey) and isinstance(key.key, str)
+                         and group_layers(key.key) is not None for key in path)]
+        assert leaves, jax.tree_util.tree_structure(tree)
+        return leaves
 
     def held(leaves) -> int:
         return sum(int(np.prod(leaf.shape)) * np.dtype(leaf.dtype).itemsize for leaf in leaves)
