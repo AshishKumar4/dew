@@ -1178,8 +1178,8 @@ def _edge_values(dtype) -> np.ndarray:
     return np.concatenate([values, -values])
 
 
-@pytest.mark.parametrize(("dtype", "reach"),
-                         [(jnp.float32, None), (jnp.float32, 2 * 126), (jnp.float64, None), (jnp.bfloat16, None)])
+@pytest.mark.parametrize(("dtype", "reach"), [
+    (jnp.float32, None), (jnp.float32, 2 * 126), (jnp.float64, None), (jnp.bfloat16, None)])
 def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach):
     """`dew.nn.precision.power2` (the one owner of scaling by a power of two: a kernel template's, a scaled
     value's, an aligned sum's) scales by powers of two exactly wherever the result is a normal value of its
