@@ -1073,15 +1073,20 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     rest. The fields past the capability and shared memory only steer XLA's own fusions, never a Triton
     kernel's code. From Hopper on, its capability states the architecture-specific features (sm_90a,
     sm_100a, sm_120a), which Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain
-    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
+    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120'). Its
+    device memory `memory` where a build states it, else the least of the target's parts (`GpuTarget.memory`),
+    never none: XLA's memory-driven passes compiled a recurrence's gradient for a GPU of 0 bytes to values
+    O(1) wrong (a GH200 running a step compiled ahead for compile-only sm90 GPUs of no stated memory, row
+    8768)."""
     generation = target.generation
     version = capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
     clock, bandwidth = target.clock_hz, target.memory_bandwidth
+    memory = target.memory if memory is None else memory
     # Its fp32 lanes, two FLOPs a clock each (a fused multiply-add), as its architecture states them.
     fp32 = target.architecture.vector_per_clock
     if (version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None
-            or fp32 is None):
+            or fp32 is None or memory is None):
         raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
     major, minor = version
     multiprocessor = target.multiprocessor
@@ -1097,7 +1102,7 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
   memory_bandwidth: {int(bandwidth)}
-  device_memory_size: {0 if memory is None else memory}
+  device_memory_size: {memory}
   clock_rate_ghz: {clock / 1e9}
   shared_memory_per_block_optin: {shared}
   cuda_compute_capability {{
@@ -1124,8 +1129,9 @@ def compile_only_gpus(generation: str, count: int = 1, memory: int | None = None
     `dew._devices.STATED_GPUS`), as the GPU's own allocator states it, at `share`, the pool's share in the
     run that loads their programs: Dew's own (`DEW_SHARE`, a constant) where none is given, never this
     process's (`pool_share`). Devices of two shares are two (each its record), however alike otherwise.
-    Absent `memory`, the devices state no memory: a step is compiled ahead for them only where it is
-    stated (`compile_ahead`)."""
+    Absent `memory`, the devices state no memory to an admission (a step is compiled ahead for them only where
+    it is stated, `compile_ahead`), and XLA compiles for the least of the generation's parts
+    (`target_config`)."""
     from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu
 
     if memory is not None:
@@ -1626,7 +1632,7 @@ def unbroadcast(cotangent, shape: tuple[int, ...]):
 
 
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None,
-               zero_cotangents: bool = False):
+               zero_cotangents: bool = False, traced_tangent: bool = False):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
@@ -1634,7 +1640,10 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
     `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
     derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
     avals like it), which `apply` is then traced for only where forward mode runs it. With `zero_cotangents`,
-    a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros."""
+    a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros. With
+    `traced_tangent`, its tangent is one jvp of `apply` in the residuals and moving leaves a tangent reaches,
+    the others held as constants: an `apply` whose own derivative sums both in one (an aligned sum's, whose
+    two parts added overflowed to inf - inf, and a zero direction met an infinite factor, NaN; row 8757)."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
@@ -1644,7 +1653,8 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
         traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
         out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
-    return _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents)(residuals, moving)
+    primitive = _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents, traced_tangent)
+    return primitive(residuals, moving)
 
 
 @functools.cache
@@ -1665,6 +1675,30 @@ def _linear_primitive() -> type:
         """`tangents` with each symbolic zero an array of its tangent type: float0's for an integer leaf."""
         return jax.tree.map(hijax.instantiate_zeros, tangents, is_leaf=zero)
 
+    def nothing(out_aval):
+        """A tangent of `out_aval`'s type no direction reaches: its symbolic zeros."""
+        return jax.tree.map(lambda aval: hijax.Zero(aval.to_tangent_aval()), out_aval)
+
+    def held_jvp(apply, primals, tangents, out_aval):
+        """`apply(*primals)`'s tangent in the leaves `tangents` reaches (neither None nor a symbolic zero,
+        paired by the primals' structure, which raises where theirs differs), the others held as constants:
+        a zero tangent's leaf beside an infinite one was a 0 inf, NaN (row 8757)."""
+        flat, tree = jax.tree.flatten(primals)
+        directions = tree.flatten_up_to(tangents)
+        live = [index for index, direction in enumerate(directions)
+                if direction is not None and not zero(direction)]
+        if not live:
+            return nothing(out_aval)
+
+        def moved(*held):
+            leaves = list(flat)
+            for index, leaf in zip(live, held, strict=True):
+                leaves[index] = leaf
+            return apply(*jax.tree.unflatten(tree, leaves))
+
+        return jax.jvp(moved, tuple(flat[index] for index in live),
+                       tuple(directions[index] for index in live))[1]
+
     def unbatched(cotangent):
         """An unbatched operand's cotangent: its batch's sum."""
         if cotangent.dtype == jax.dtypes.float0:
@@ -1675,12 +1709,14 @@ def _linear_primitive() -> type:
         apply: Callable
         pullback: Callable
         zero_cotangents: bool
-        """`linear_map`'s two functions and whether its pullback takes None for a zero cotangent, `params`
-        that `HiPrim` makes attributes."""
+        traced_tangent: bool
+        """`linear_map`'s two functions, whether its pullback takes None for a zero cotangent and whether its
+        tangent is one jvp of `apply` (`held_jvp`), `params` that `HiPrim` makes attributes."""
 
-        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False):
+        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False, traced_tangent=False):
             self.in_avals, self.out_aval = in_avals, out_aval
-            self.params = {"apply": apply, "pullback": pullback, "zero_cotangents": zero_cotangents}
+            self.params = {"apply": apply, "pullback": pullback, "zero_cotangents": zero_cotangents,
+                           "traced_tangent": traced_tangent}
             super().__init__()
 
         def expand(self, *args):
@@ -1702,16 +1738,20 @@ def _linear_primitive() -> type:
         def jvp(self, primals, tangents):
             residuals, moving = primals
             d_residuals, d_moving = tangents
+            if self.traced_tangent:
+                return self(residuals, moving), held_jvp(self.apply, primals, tangents, self.out_aval)
             terms = []
             if not all_zero(d_moving):
                 terms.append(self(residuals, instantiated(d_moving)))
             if not all_zero(d_residuals):
-                terms.append(jax.jvp(lambda held: self.apply(held, moving), (residuals,),
-                                     (instantiated(d_residuals),))[1])
+                # The residuals' own, the moving leaves held still (base review 0c6ef9c11 F2).
+                held = (d_residuals, jax.tree.map(lambda _: None, moving))
+                terms.append(held_jvp(self.apply, primals, held, self.out_aval))
             if not terms:
-                return self(residuals, moving), jax.tree.map(
-                    lambda aval: hijax.Zero(aval.to_tangent_aval()), self.out_aval)
-            return self(residuals, moving), jax.tree.map(lambda *parts: sum(parts), *terms)
+                return self(residuals, moving), nothing(self.out_aval)
+            # Added only where two parts are: a lone part's sign kept (`0 + -0.0` is positive zero).
+            return self(residuals, moving), jax.tree.map(lambda *parts: functools.reduce(jnp.add, parts),
+                                                         *terms)
 
         lin, linearized = hijax.linearize_from_jvp
         vjp_fwd, vjp_bwd_retval = hijax.vjp_from_jvp
@@ -1733,7 +1773,8 @@ def _linear_primitive() -> type:
                     unbatched(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
                     for leaf, axis in zip(leaves, axes, strict=True)])
 
-            return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents),
+            return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents,
+                               traced_tangent=self.traced_tangent),
                     jax.tree.map(lambda _: 0, self.out_aval))
 
     return Linear

@@ -14,7 +14,7 @@ import dataclasses
 import functools
 import math
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -164,117 +164,50 @@ _COPIES = frozenset({gpu.copy_gmem_to_smem_p, gpu.copy_smem_to_gmem_p})
 """Copies between device and shared memory (`_copied`)."""
 
 def _folded(equation, values: list) -> list:
-    """`equation` over its concrete integer and boolean scalar operands, each at its own dtype, as its
-    primitive computes it on the GPU (`scalar_evaluated`): a width's wrap, a quotient's truncation and a
-    remainder's sign the program's own; unknown where it computes none."""
-    operands = [np.asarray(value, dtype=atom.aval.dtype)[()] for value, atom in zip(values, equation.invars,
-                                                                                      strict=True)]
+    """`equation` over its concrete integer and boolean scalar operands, each at its atom's dtype, as its
+    primitive computes it on the GPU (`programs.scalar_folded`): a width's wrap, a quotient's truncation and a
+    remainder's sign the program's own; unknown where it computes none, a quotient or remainder by zero or of
+    the least integer by -1 among them, which the GPU leaves undefined (LLVM's `sdiv` and `srem`, which Mosaic
+    GPU's integer division lowers to), and where Mosaic GPU types it otherwise than XLA (`_typed_alike`)."""
+    if not _typed_alike(equation):
+        return [None]
+    operands = [np.asarray(value, dtype=atom.aval.dtype)[()]
+                for value, atom in zip(values, equation.invars, strict=True)]
+    if equation.primitive in (lax.div_p, lax.rem_p) and _undefined(*operands):
+        return [None]
+    if equation.primitive in _SHIFTS and not 0 <= int(operands[1]) < np.iinfo(operands[0].dtype).bits:
+        # Poison where Mosaic GPU computes it (MLIR's `shli`, `shrsi`, `shrui`), XLA's saturating fold apart.
+        return [None]
     (out,) = equation.outvars
-    return [scalar_evaluated(equation.primitive, operands, equation.params, out.aval.dtype)]
+    return [programs.scalar_folded(equation.primitive, operands, equation.params, out.aval.dtype)]
 
 
-def scalar_evaluated(primitive, operands: Sequence, params: Mapping, dtype) -> np.generic | None:
-    """An elementwise `primitive`'s output, of `dtype`, over concrete integer and boolean scalar `operands`,
-    as `lax` and the GPU compute it exactly, in this host's own integers (`_SCALAR`): a width's wrap, a
-    quotient truncated and a remainder of its dividend's sign, a shift past the width, a product at the
-    output dtype it names. No program is compiled to fold one: evaluated by binding the primitive, each
-    kernel's index arithmetic compiled a one-primitive program a process (18 beside a 4B step's first trace,
-    row 8612). None for a primitive outside the arithmetic a warpgroup's index flows through
-    (`SCALAR_EVALUATED`), a parameter it does not read (`_READ`), a floating or complex operand or output,
-    whose IEEE semantics no warpgroup's index arithmetic reads and this host's CPU computes otherwise than a
-    GPU (its subnormals flushed), and a quotient or remainder the GPU leaves undefined (`_undefined`)."""
-    if (primitive not in SCALAR_EVALUATED
-            or any(value is not None for name, value in params.items() if name not in _READ)
-            or not all(_integral(np.result_type(value)) for value in operands) or not _integral(dtype)
-            or (primitive in (lax.div_p, lax.rem_p) and _undefined(*operands))):
-        return None
-    held = np.result_type(operands[0])
-    return np.dtype(dtype).type(_wrapped(_SCALAR[primitive](held, *map(int, operands)), dtype))
+_SHIFTS = frozenset({lax.shift_left_p, lax.shift_right_logical_p, lax.shift_right_arithmetic_p})
+"""The shifts, which Mosaic GPU lowers to MLIR's own (`shli`, `shrsi`, `shrui`): poison by an amount past the
+operand's width (base review bb25f261d F1)."""
 
 
-def _wrapped(value: int, dtype) -> int | bool:
-    """`value` as `dtype` holds it: a boolean's truth, an integer's two's complement at its width."""
-    dtype = np.dtype(dtype)
-    if dtype == np.bool_:
-        return value != 0
-    limits = jnp.iinfo(dtype)
-    value &= (1 << limits.bits) - 1
-    return value - (1 << limits.bits) if value > limits.max else value
+def _typed_alike(equation) -> bool:
+    """Whether `equation`'s operands hold one type (a select's arms, its predicate apart) and it states no
+    output dtype apart from it: where Mosaic GPU's lowerings compute it as XLA does. Mosaic GPU types any
+    other by rules of its own (Lane at its first operand's type whatever dtype it states, a select at its
+    true arm's, a weak literal materialized at its partner's), which the fold declines rather than restates
+    (base reviews 117cc9088 F2 and 7e470364e F1-F3)."""
+    operands = equation.invars[1:] if equation.primitive is lax.select_n_p else equation.invars
+    types = {np.dtype(atom.aval.dtype) for atom in operands}
+    stated = equation.params.get("out_dtype")
+    return len(types) <= 1 and (stated is None or {np.dtype(stated)} == types)
 
 
-def _quotient(dividend: int, divisor: int) -> int:
-    """An integer quotient truncated toward zero."""
-    quotient = abs(dividend) // abs(divisor)
-    return quotient if (dividend < 0) == (divisor < 0) else -quotient
+def _undefined(dividend: np.generic | np.ndarray, divisor: np.generic | np.ndarray) -> bool:
+    """Whether an integer quotient or remainder is undefined where a Mosaic GPU kernel computes it, its
+    division lowered to MLIR's `divsi` and `remsi` (LLVM's `sdiv` and `srem`) or `divui` and `remui`: by
+    zero, or a signed least integer by -1. The host's XLA guards both and defines them
+    (`programs.scalar_folded` folds them its way), so a kernel's fold refuses them here."""
+    if divisor == 0:
+        return True
+    return divisor == -1 and dividend == jnp.iinfo(dividend.dtype).min
 
-
-def _shifted(primitive, held, value: int, amount: int) -> int:
-    """`value`, of `held`'s width, shifted by `amount`, read unsigned: past the width a left or logical
-    shift leaves nothing and an arithmetic one its sign, which it reads of the value as signed (an
-    unsigned value's too)."""
-    bits = jnp.iinfo(held).bits
-    amount &= (1 << bits) - 1
-    signed = value & ((1 << bits) - 1)
-    signed -= (1 << bits) if signed >> (bits - 1) else 0
-    if primitive is lax.shift_right_arithmetic_p:
-        return signed >> min(amount, bits - 1)
-    if amount >= bits:
-        return 0
-    if primitive is lax.shift_left_p:
-        return value << amount
-    return (value & ((1 << bits) - 1)) >> amount
-
-
-_SCALAR: dict = {
-    lax.add_p: lambda held, a, b: a + b,
-    lax.sub_p: lambda held, a, b: a - b,
-    lax.mul_p: lambda held, a, b: a * b,
-    lax.neg_p: lambda held, a: -a,
-    lax.div_p: lambda held, a, b: _quotient(a, b),
-    lax.rem_p: lambda held, a, b: a - b * _quotient(a, b),
-    lax.max_p: lambda held, a, b: max(a, b),
-    lax.min_p: lambda held, a, b: min(a, b),
-    lax.clamp_p: lambda held, low, a, high: min(max(a, low), high),
-    lax.lt_p: lambda held, a, b: a < b,
-    lax.le_p: lambda held, a, b: a <= b,
-    lax.gt_p: lambda held, a, b: a > b,
-    lax.ge_p: lambda held, a, b: a >= b,
-    lax.eq_p: lambda held, a, b: a == b,
-    lax.ne_p: lambda held, a, b: a != b,
-    lax.and_p: lambda held, a, b: a & b,
-    lax.or_p: lambda held, a, b: a | b,
-    lax.xor_p: lambda held, a, b: a ^ b,
-    lax.not_p: lambda held, a: not a if held == np.bool_ else ~a,
-    lax.shift_left_p: functools.partial(_shifted, lax.shift_left_p),
-    lax.shift_right_arithmetic_p: functools.partial(_shifted, lax.shift_right_arithmetic_p),
-    lax.shift_right_logical_p: functools.partial(_shifted, lax.shift_right_logical_p),
-    lax.convert_element_type_p: lambda held, a: a,
-}
-"""Each of `SCALAR_EVALUATED`'s primitives over its operands as Python's integers (a boolean's 0 or 1), the
-dtype they are held at first: its result before `scalar_evaluated` wraps it to the output's dtype."""
-
-
-def _integral(dtype) -> bool:
-    """Whether `dtype` is an integer or boolean one (JAX's 4-bit integers among them)."""
-    return jnp.issubdtype(dtype, jnp.integer) or jnp.issubdtype(dtype, jnp.bool_)
-
-
-def _undefined(dividend, divisor) -> bool:
-    """Whether an integer quotient or remainder is undefined where the GPU computes it (LLVM's `sdiv` and
-    `srem`, which Mosaic GPU's integer division lowers to), though this host's XLA defines one: by zero, or
-    the least integer by -1."""
-    dtype = np.result_type(dividend)
-    return divisor == 0 or (dtype != np.bool_ and dividend == jnp.iinfo(dtype).min and divisor == -1)
-
-
-SCALAR_EVALUATED = frozenset(_SCALAR)
-"""The elementwise primitives a warpgroup's index arithmetic flows through, which `scalar_evaluated`
-computes over concrete integer and boolean scalars."""
-
-_READ = frozenset({"new_dtype", "out_dtype", "weak_type", "sharding"})
-"""The parameters `scalar_evaluated` evaluates with (a conversion's target, a product's output dtype) or that
-state nothing of a scalar's value (its weak type, its placement): a primitive given any other one set is
-computed by none."""
 
 _TRANSFORMS = ("acc_transforms_tree", "a_transforms_tree", "b_transforms_tree", "barrier_transforms_tree",
                "a_scale_transforms_tree", "b_scale_transforms_tree", "a_sparse_metadata_transforms_tree")
@@ -458,7 +391,7 @@ class _Counting:
         unknown = [None] * len(equation.outvars)
         if primitive is lax.axis_index_p:
             return [self.place(params["axis_name"])]
-        if (primitive in SCALAR_EVALUATED and values
+        if (primitive in programs.SCALAR_FOLDED and values
                 and all(_scalar(value) for value in values)):
             if primitive is lax.convert_element_type_p:
                 self.add(Work(conversions=1))
@@ -690,7 +623,7 @@ def _scalar(value) -> bool:
     """Whether `value` is a concrete integer or boolean scalar, what a warpgroup's index arithmetic holds:
     a Python integer or boolean, or a NumPy scalar of an integer or boolean dtype (JAX's 4-bit integers among
     them). A float is none: its predicate's branches are unknown, each counted
-    (`scalar_evaluated`)."""
+    (`programs.scalar_folded`)."""
     return isinstance(value, int) or (isinstance(value, np.generic) and any(
         jnp.issubdtype(value.dtype, kind) for kind in (jnp.integer, jnp.bool_)))
 

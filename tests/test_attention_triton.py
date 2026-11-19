@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import interprets
 from reference_error import assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import (
     CASES,
@@ -27,7 +28,7 @@ from dew.nn.kernels.templates import (
     attention_triton,
 )
 
-ON_GPU = jax.default_backend() == "gpu"
+ON_GPU = not interprets()
 SEEDS = 8
 """The forward's declared draws (check 1), sized by `seeds_for`."""
 
@@ -95,7 +96,7 @@ def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 
 def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> template.Hooks:
     """The hooks `names` asks for: a softcap and ALiBi as one score_mod, sinks as the initial state, an
     output gate."""
-    slopes = jnp.asarray(alibi_slopes(4))
+    slopes = jnp.asarray(alibi_slopes(4), jnp.float32)
 
     def score_mod(s, q_pos, k_pos, *params):
         if "softcap" in names:
@@ -113,7 +114,7 @@ def hooks_for(names: frozenset, queries: int, value_width: int, gate=None) -> te
         (template.Param(slopes, template.Kind.HEAD),) if "alibi" in names else (),
         template.sinks(SINKS, ROWS, queries, value_width) if "sinks" in names else None,
         output_mod if "gate" in names else None,
-        (template.Param(gate, template.Kind.OUTPUT),) if "gate" in names else ())
+        (template.Param(jnp.asarray(gate), template.Kind.OUTPUT),) if "gate" in names else ())
 
 
 HOOKS = {"none": frozenset(), "softcap": frozenset({"softcap"}), "sinks": frozenset({"sinks"}),
@@ -124,8 +125,8 @@ FORMS = ("full", "causal", "causal-window", "two-sided-window", "causal-chunk", 
          "causal-documents-window", "cross-causal", "cross-causal-lengths-starts", "lengths-starts")
 
 
-def gate_of(queries: int, value_width: int) -> jax.Array:
-    return jax.random.normal(jax.random.key(99), (ROWS, queries, 4, value_width), jnp.float32)
+def gate_of(queries: int, value_width: int) -> np.ndarray:
+    return np.random.default_rng(99).standard_normal((ROWS, queries, 4, value_width)).astype(np.float32)
 
 
 def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, **options):
@@ -140,18 +141,13 @@ def check_each(case: dict, names: frozenset, dtype, configs, *, residuals: bool 
     `names`, at the site's declared seeds, its exponent `natural` or the fold: one check of every config,
     each its own leaves, so each draw's reference and its float64 truth are computed once for all."""
     queries, keys = geometry(case)
-    spans = template.spans(queries, keys, ROWS, **arguments(case))
-    hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
-
+    gate = gate_of(queries, value_width) if "gate" in names else None
     # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), the
     # query's taken by its scale's power of two (`template.prescale`), taken to the reference's natural ones
     # as the algebra takes them (`algebra.Forward.naturalized`).
     power, scale = template.prescale(dtype, width, width ** -0.5)
-    spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=scale,
-                           score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None,
-                           prescale=power)
 
-    def at(config, query, key, value):
+    def at(config, query, key, value, spans, hooks, spec):
         if mainloop == "portable":
             tiles = attention_portable.Tiles(config.block_q, config.block_k, attention_triton.BLOCK)
             out = attention_portable.xla_mainloop(tiles, query, key, value, spans, hooks, residuals=residuals,
@@ -166,10 +162,19 @@ def check_each(case: dict, names: frozenset, dtype, configs, *, residuals: bool 
             return out
         return out[0], spec.naturalized(out[1]) if spec.raw else out[1], out[2]
 
+    def setup():
+        return (template.spans(queries, keys, ROWS, **arguments(case)),
+                hooks_for(names, queries, value_width, gate))
+
     def ours(query, key, value):
-        return {str(config): at(config, query, key, value) for config in configs}
+        spans, hooks = setup()
+        spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=scale,
+                               score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None,
+                               prescale=power)
+        return {str(config): at(config, query, key, value, spans, hooks, spec) for config in configs}
 
     def xla(query, key, value):
+        spans, hooks = setup()
         return dict.fromkeys(map(str, configs), template.reference(query, key, value, spans, hooks,
                                                                    residuals=residuals))
 
@@ -396,7 +401,6 @@ def check_backward_each(case: dict, names: tuple, dtype, configs, *, width: int 
     `accurate` or the fast form. One check of every pair, each its own leaves, so each draw's reference and
     its float64 truth are computed once for all."""
     queries, keys = geometry(case)
-    spans = template.spans(queries, keys, ROWS, **arguments(case))
     score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, value_width)
     draw_qkv = drawing(queries, keys, dtype, width, value_width)
 
@@ -409,7 +413,7 @@ def check_backward_each(case: dict, names: tuple, dtype, configs, *, width: int 
         return template.Hooks(score_mod, tuple(template.Param(value, kind)
                                                for value, kind in zip(params, kinds, strict=True)), initial)
 
-    def at(config, dkv_config, query, key, value, dout, params, initial):
+    def at(config, dkv_config, spans, query, key, value, dout, params, initial):
         if mainloop == "portable":
             tiles = attention_portable.Tiles(config.block_q, config.block_k, attention_triton.BLOCK)
             grads = attention_portable.backward(tiles, query, key, value, spans, hooked(params, initial),
@@ -420,16 +424,18 @@ def check_backward_each(case: dict, names: tuple, dtype, configs, *, width: int 
                                                   natural=natural, accurate=accurate, interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
-    def ours(*arguments):
-        return {str(pair): at(*pair, *arguments) for pair in configs}
+    def ours(*inputs):
+        spans = template.spans(queries, keys, ROWS, **arguments(case))
+        return {str(pair): at(*pair, spans, *inputs) for pair in configs}
 
     def xla(query, key, value, dout, params, initial):
+        spans = template.spans(queries, keys, ROWS, **arguments(case))
+
         def attend(query, key, value, params, initial):
             return template.reference(query, key, value, spans, hooked(params, initial))
 
         _, pull = jax.vjp(attend, query, key, value, params, initial)
         return dict.fromkeys(map(str, configs), pull(dout.astype(query.dtype)))
-
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
                     f"{mainloop} backward {case} {names} {jnp.dtype(dtype).name} {list(configs)} "
                     f"{width}/{value_width} natural {natural} accurate {accurate}",
@@ -508,9 +514,6 @@ def test_an_integer_parameter_keys_and_runs():
     runs, forward and backward, on par with the reference arithmetic from float64."""
     case = CASES["causal-window"]
     queries, keys = geometry(case)
-    spans = template.spans(queries, keys, ROWS, **arguments(case))
-    buckets = jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32), (ROWS, 4, keys))
-    hooks = template.Hooks(bucketed, (template.Param(buckets, template.Kind.KEY),))
     draw_qkv = drawing(queries, keys, jnp.float32)
 
     def draw(seed):
@@ -520,13 +523,20 @@ def test_an_integer_parameter_keys_and_runs():
     pins = {attention_triton.TritonForward: PINNED[1],
             attention_triton.TritonBackward: joint(PINNED[0])}
 
+    def setup():
+        spans = template.spans(queries, keys, ROWS, **arguments(case))
+        buckets = jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32), (ROWS, 4, keys))
+        return spans, template.Hooks(bucketed, (template.Param(buckets, template.Kind.KEY),))
+
     def ours(query, key, value, dout):
+        spans, hooks = setup()
         with tuning.pinned(pins):
             out = attention_triton.forward(query, key, value, spans, hooks, interpret=not ON_GPU)
             grads = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=not ON_GPU)
         return out, grads.query, grads.key, grads.value
 
     def xla(query, key, value, dout):
+        spans, hooks = setup()
         out, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
         return out, *pull(dout)
 
@@ -538,7 +548,6 @@ def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():
     that width and runs on par with the reference arithmetic from float64."""
     case = CASES["causal-window"]
     queries, keys = geometry(case)
-    spans = template.spans(queries, keys, ROWS, **arguments(case))
 
     def output_mod(o):
         return o * jnp.arange(32, dtype=o.dtype)
@@ -547,10 +556,12 @@ def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():
     pins = {attention_triton.TritonForward: PINNED[1]}
 
     def ours(query, key, value):
+        spans = template.spans(queries, keys, ROWS, **arguments(case))
         with tuning.pinned(pins):
             return attention_triton.forward(query, key, value, spans, hooks, interpret=not ON_GPU)
 
     def xla(query, key, value):
+        spans = template.spans(queries, keys, ROWS, **arguments(case))
         return template.reference(query, key, value, spans, hooks)
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), drawing(queries, keys, jnp.float32), "triton output width",
