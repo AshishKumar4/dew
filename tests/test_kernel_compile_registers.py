@@ -42,3 +42,30 @@ def _assembled_record(kernel: str, read) -> dict:
     return {"name": kernel, "generation": "sm90", "limit": 232448, "tmem_limit": 0,
             "kernels": [{"kernel": kernel, "shared": 1024, "tmem": 0, "registers": read.registers,
                          "spilled": read.spilled, "losses": read.losses, "unread": []}]}
+
+
+@pytest.mark.parametrize(("gpus", "installed", "generation", "judged"), [
+    (None, ["cuda12"], "sm90", ("cuda13", "cuda12")),
+    (None, ["cuda12"], "sm100", ("cuda13",)),
+    (("580.65", (8, 0)), ["cuda12"], "sm80", ("cuda12",)),
+    (("580.65", (8, 0)), ["cuda13"], "sm90", ("cuda13",)),
+])
+def test_the_gate_judges_every_build_on_a_host_with_no_gpu_and_a_gpu_environments_own_on_one(
+        monkeypatch, gpus, installed, generation, judged):
+    """The kernel-compile environment, on a host with no GPU, judges a generation's kernels under every CUDA
+    build its GPUs run, whatever plugin it holds; a GPU node's environment under the build its CUDA plugin is
+    alone, as it holds no other build's ptxas (row 8769: an A100's cuda12 environment asked CUDA 13's)."""
+    monkeypatch.setattr(kc, "nvidia_gpus", lambda: gpus)
+    monkeypatch.setattr(kc, "cuda_builds", lambda: installed)
+    kc.judged_builds.cache_clear()
+    assert kc.judged_builds(generation) == judged
+
+
+def test_a_gpu_environment_none_of_whose_builds_a_generation_runs_is_refused(monkeypatch):
+    """A generation whose GPUs run no build this GPU environment installs (a B200's cuda13 on a cuda12
+    node) is refused, never judged under no assembler."""
+    monkeypatch.setattr(kc, "nvidia_gpus", lambda: ("580.65", (8, 0)))
+    monkeypatch.setattr(kc, "cuda_builds", lambda: ["cuda12"])
+    kc.judged_builds.cache_clear()
+    with pytest.raises(RuntimeError, match="sm100's GPUs run JAX's cuda13 build"):
+        kc.judged_builds("sm100")

@@ -39,7 +39,7 @@ from sharded import collective_axes
 
 from dew import _cache
 from dew._builds import generation_builds
-from dew._devices import cuda_builds
+from dew._devices import cuda_builds, nvidia_gpus
 from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, compile_only_gpus, gpu_target
 from dew.nn.kernels.lowered import kernel_calls, triton_kernels
@@ -717,11 +717,31 @@ def ptxas_of(build: str) -> Path:
 
 
 def assemblers(generation: str) -> tuple[Path, ...]:
-    """The ptxas of each CUDA build a GPU of `generation` runs (`generation_builds`, newest first), the gate
-    judging its kernels under every one (`_compiled_reports`): a B200 runs
-    the cuda13 build alone, whose PTX compiler held kernels 12.9 spilled 4 to 16 bytes of and spilled kernels
-    12.9 held (rows 5671, 5759 and 5761)."""
-    return tuple(ptxas_of(build) for build in generation_builds(generation))
+    """The ptxas of each CUDA build this environment judges a GPU of `generation` under (`judged_builds`,
+    newest first), the gate judging its kernels under every one (`_compiled_reports`): a B200 runs the cuda13
+    build alone, whose PTX compiler held kernels 12.9 spilled 4 to 16 bytes of and spilled kernels 12.9 held
+    (rows 5671, 5759 and 5761)."""
+    return tuple(ptxas_of(build) for build in judged_builds(generation))
+
+
+@functools.cache
+def judged_builds(generation: str) -> tuple[str, ...]:
+    """The CUDA builds this environment judges a GPU of `generation` under: on a host with no GPU (the
+    kernel-compile environment, holding each build's nvcc: locks/cpu.txt), every build the generation runs
+    (`generation_builds`); on a host with one, the builds of the CUDA plugin its environment installs among
+    them, as a GPU node's environment holds its own build's toolchain alone (its cuda12 lock has no CUDA 13
+    ptxas, which would become its CUDA root: rows 4162, 8769). A generation none of whose builds this GPU
+    environment holds is refused, never judged under none. Asked once a generation, as nvidia-smi answers in
+    seconds."""
+    builds = generation_builds(generation)
+    if nvidia_gpus() is None:
+        return builds
+    own = tuple(build for build in builds if build in cuda_builds())
+    if not own:
+        raise RuntimeError(f"{generation}'s GPUs run JAX's {', '.join(builds)} build, which this GPU host's "
+                           f"environment ({', '.join(cuda_builds()) or 'no CUDA plugin'}) does not install: "
+                           "its kernels are judged in the kernel-compile environment")
+    return own
 
 RAISED = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 (\d+);")
 """A raise's registers (`setmaxnreg.inc`'s), as a kernel record states them (`raised`)."""
