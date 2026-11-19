@@ -284,11 +284,16 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
         assert BuildTarget.of(jax.devices()[:1]) == own
     for name, text in (("here.py", HERE), ("build.py", BUILD), ("run.py", RUN), ("refused.py", REFUSED)):
         (tmp_path / name).write_text(text)
-    # Every process the autotuner on, the lane's level 0 alone left out and every other flag kept, so the
-    # build and the run agree on their compile options (row 8457: at level 0 nothing tuned, so a node's
-    # compile never met an untuned choice and its file never said one).
+    # Every process the autotuner on and measuring, the lane's level 0 and deterministic ops left out (under
+    # which XLA measures nothing and keeps no picks), every other flag kept, so the build and the run agree
+    # on their compile options; and one store of picks, which here's compile writes and the build reads
+    # (row 8457: at level 0 nothing tuned, so a node's compile never met an untuned choice and its file
+    # never said one).
     environment = environment_of(tmp_path)
-    environment["XLA_FLAGS"] = without_flags(environment.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level")
+    picks = "--xla_gpu_per_fusion_autotune_cache_dir"
+    environment["XLA_FLAGS"] = " ".join((without_flags(
+        environment.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level", "--xla_gpu_deterministic_ops", picks),
+        f"{picks}={tmp_path / 'picks'}"))
     arrays = {name: [np.asarray(array) for array in drawn] for name, drawn in arguments(generation).items()}
     (tmp_path / "arguments.pkl").write_bytes(pickle.dumps(arrays))
     # Compiled first on this GPU, which tunes them and leaves its choices beside the compilation cache the
