@@ -1626,7 +1626,7 @@ def unbroadcast(cotangent, shape: tuple[int, ...]):
 
 
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None,
-               zero_cotangents: bool = False):
+               zero_cotangents: bool = False, traced_tangent: bool = False):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
@@ -1634,7 +1634,10 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
     `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
     derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
     avals like it), which `apply` is then traced for only where forward mode runs it. With `zero_cotangents`,
-    a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros."""
+    a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros. With
+    `traced_tangent`, its tangent is one jvp of `apply` in the residuals and moving leaves a tangent reaches,
+    the others held as constants: an `apply` whose own derivative sums both in one (an aligned sum's, whose
+    two parts added overflowed to inf - inf, and a zero direction met an infinite factor, NaN; row 8757)."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
@@ -1644,7 +1647,8 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
         traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
         out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
-    return _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents)(residuals, moving)
+    primitive = _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents, traced_tangent)
+    return primitive(residuals, moving)
 
 
 @functools.cache
@@ -1665,6 +1669,30 @@ def _linear_primitive() -> type:
         """`tangents` with each symbolic zero an array of its tangent type: float0's for an integer leaf."""
         return jax.tree.map(hijax.instantiate_zeros, tangents, is_leaf=zero)
 
+    def nothing(out_aval):
+        """A tangent of `out_aval`'s type no direction reaches: its symbolic zeros."""
+        return jax.tree.map(lambda aval: hijax.Zero(aval.to_tangent_aval()), out_aval)
+
+    def held_jvp(apply, primals, tangents, out_aval):
+        """`apply(*primals)`'s tangent in the leaves `tangents` reaches (neither None nor a symbolic zero,
+        paired by the primals' structure, which raises where theirs differs), the others held as constants:
+        a zero tangent's leaf beside an infinite one was a 0 inf, NaN (row 8757)."""
+        flat, tree = jax.tree.flatten(primals)
+        directions = tree.flatten_up_to(tangents)
+        live = [index for index, direction in enumerate(directions)
+                if direction is not None and not zero(direction)]
+        if not live:
+            return nothing(out_aval)
+
+        def moved(*held):
+            leaves = list(flat)
+            for index, leaf in zip(live, held, strict=True):
+                leaves[index] = leaf
+            return apply(*jax.tree.unflatten(tree, leaves))
+
+        return jax.jvp(moved, tuple(flat[index] for index in live),
+                       tuple(directions[index] for index in live))[1]
+
     def unbatched(cotangent):
         """An unbatched operand's cotangent: its batch's sum."""
         if cotangent.dtype == jax.dtypes.float0:
@@ -1675,12 +1703,14 @@ def _linear_primitive() -> type:
         apply: Callable
         pullback: Callable
         zero_cotangents: bool
-        """`linear_map`'s two functions and whether its pullback takes None for a zero cotangent, `params`
-        that `HiPrim` makes attributes."""
+        traced_tangent: bool
+        """`linear_map`'s two functions, whether its pullback takes None for a zero cotangent and whether its
+        tangent is one jvp of `apply` (`held_jvp`), `params` that `HiPrim` makes attributes."""
 
-        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False):
+        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False, traced_tangent=False):
             self.in_avals, self.out_aval = in_avals, out_aval
-            self.params = {"apply": apply, "pullback": pullback, "zero_cotangents": zero_cotangents}
+            self.params = {"apply": apply, "pullback": pullback, "zero_cotangents": zero_cotangents,
+                           "traced_tangent": traced_tangent}
             super().__init__()
 
         def expand(self, *args):
@@ -1702,29 +1732,20 @@ def _linear_primitive() -> type:
         def jvp(self, primals, tangents):
             residuals, moving = primals
             d_residuals, d_moving = tangents
+            if self.traced_tangent:
+                return self(residuals, moving), held_jvp(self.apply, primals, tangents, self.out_aval)
             terms = []
             if not all_zero(d_moving):
                 terms.append(self(residuals, instantiated(d_moving)))
             if not all_zero(d_residuals):
-                # Only the residuals a tangent reaches move, the others held as constants: a zero tangent of
-                # an infinite residual was a 0 inf, NaN (base review 0c6ef9c11 F2).
-                flat, tree = jax.tree.flatten(residuals)
-                # Paired by the residuals' structure, which raises where the tangents' differs.
-                directions = tree.flatten_up_to(d_residuals)
-                live = [index for index, direction in enumerate(directions) if not zero(direction)]
-
-                def moved(*held):
-                    leaves = list(flat)
-                    for index, leaf in zip(live, held, strict=True):
-                        leaves[index] = leaf
-                    return self.apply(jax.tree.unflatten(tree, leaves), moving)
-
-                terms.append(jax.jvp(moved, tuple(flat[index] for index in live),
-                                     tuple(directions[index] for index in live))[1])
+                # The residuals' own, the moving leaves held still (base review 0c6ef9c11 F2).
+                held = (d_residuals, jax.tree.map(lambda _: None, moving))
+                terms.append(held_jvp(self.apply, primals, held, self.out_aval))
             if not terms:
-                return self(residuals, moving), jax.tree.map(
-                    lambda aval: hijax.Zero(aval.to_tangent_aval()), self.out_aval)
-            return self(residuals, moving), jax.tree.map(lambda *parts: sum(parts), *terms)
+                return self(residuals, moving), nothing(self.out_aval)
+            # Added only where two parts are: a lone part's sign kept (`0 + -0.0` is positive zero).
+            return self(residuals, moving), jax.tree.map(lambda *parts: functools.reduce(jnp.add, parts),
+                                                         *terms)
 
         lin, linearized = hijax.linearize_from_jvp
         vjp_fwd, vjp_bwd_retval = hijax.vjp_from_jvp
@@ -1746,7 +1767,8 @@ def _linear_primitive() -> type:
                     unbatched(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
                     for leaf, axis in zip(leaves, axes, strict=True)])
 
-            return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents),
+            return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents,
+                               traced_tangent=self.traced_tangent),
                     jax.tree.map(lambda _: 0, self.out_aval))
 
     return Linear
