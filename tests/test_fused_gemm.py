@@ -11,6 +11,7 @@ import pytest
 from generation_support import INTERPRETS
 from reference_error import assert_as_exact
 from test_algebra import traces_cheaper
+from test_algebra_program import _scaled_twice
 
 import dew
 from dew import algebra
@@ -91,12 +92,9 @@ def test_an_explicit_epilogue_is_rewritten_by_the_algebra_pass_as_an_inferred_on
     alignment 2026-11-19 PM, ALGEBRA-6); with the pass off, as written."""
     sizes = jnp.asarray([96, 40], jnp.int32)
 
-    def scaled(acc, a, b):
-        capped = jnp.tanh(acc)
-        return capped * jnp.tanh(a) + capped * jnp.tanh(b)
-
     def explicit(x, w, a, b):
-        return gemm.gemm(x, w, sizes, epilogue=scaled,
+        # The consumer the pass rewrites (test_algebra_program's score hook), on the product's tile.
+        return gemm.gemm(x, w, sizes, epilogue=lambda acc, a, b: _scaled_twice(acc, None, None, a, b),
                          epilogue_operands=((a, ("columns",)), (b, ("columns",))), out_dtype=jnp.float32,
                          interpret_on_cpu=True)
 

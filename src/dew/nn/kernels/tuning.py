@@ -154,6 +154,41 @@ class Unreadable(ValueError):
     its config's, or JSON this module did not write. `_read` keeps such an entry as it is."""
 
 
+@dataclasses.dataclass(frozen=True)
+class Prepared:
+    """A template hook as every launch takes it (`KernelOp.prepared`; docs/design/algebra.md §2's template
+    hooks): its `source`, a function of a tile and its side tiles, and what runs, `run`, its program
+    rewritten by the algebra pass where it is traced, or a form its consumer derived from a program the
+    pass already rewrote (`prepared_as`). Equal, hashed, keyed (`program`, `_held_key`) and stored
+    (`encoded`) as its source, so an op holding it compares, keys and stores as it did."""
+
+    source: Callable
+    run: Callable = dataclasses.field(compare=False, repr=False)
+
+    def __call__(self, *args, **kwargs):
+        return self.run(*args, **kwargs)
+
+
+def prepared(hook):
+    """`hook` as every template launch takes it, explicit or inferred (`KernelOp.prepared`): rewritten once
+    by the algebra pass where it is traced (`dew.algebra.rewritten`), so a launch given a hook directly runs
+    the form an inferred one does; a prepared hook as it is; None as None. A derivative a caller declares
+    for a hook (a GEMM prologue's `prologue_jvp`) stays the caller's, never prepared: the rewritten form
+    computes the hook's own function (`rewritten`'s contract), which that derivative differentiates."""
+    if hook is None or isinstance(hook, Prepared):
+        return hook
+    from dew import algebra
+
+    return Prepared(hook, algebra.rewritten(hook))
+
+
+def prepared_as(hook: Callable) -> Prepared:
+    """`hook`, a form its consumer derived from a program the algebra pass already rewrote (`fused_gemm`'s
+    tiled stages and their declared derivatives), taken as prepared: a second pass would cost its saturation
+    again and could read through the derivative the form declares."""
+    return hook if isinstance(hook, Prepared) else Prepared(hook, hook)
+
+
 def encoded(value: object) -> JSON:
     """`value`, an op's field, a launch's argument or a config, as JSON `decoded` rebuilds equal: a
     scalar, None or string as itself, a list element by element, and every other kind its `_KINDS` entry
@@ -1014,41 +1049,6 @@ def holdable(value: Hashable | jax.Array) -> bool:
     # Any other callable object (a hook class's instance) may hold an array its call reads, which no check
     # sees; a class is a value.
     return isinstance(value, type) or not callable(value)
-
-
-@dataclasses.dataclass(frozen=True)
-class Prepared:
-    """A template hook as every launch takes it (`KernelOp.prepared`; docs/design/algebra.md §2's template
-    hooks): its `source`, a function of a tile and its side tiles, and what runs, `run`, its program
-    rewritten by the algebra pass where it is traced, or a form its consumer derived from a program the
-    pass already rewrote (`prepared_as`). Equal, hashed, keyed (`program`, `_held_key`) and stored
-    (`encoded`) as its source, so an op holding it compares, keys and stores as it did."""
-
-    source: Callable
-    run: Callable = dataclasses.field(compare=False, repr=False)
-
-    def __call__(self, *args, **kwargs):
-        return self.run(*args, **kwargs)
-
-
-def prepared(hook):
-    """`hook` as every template launch takes it, explicit or inferred (`KernelOp.prepared`): rewritten once
-    by the algebra pass where it is traced (`dew.algebra.rewritten`), so a launch given a hook directly runs
-    the form an inferred one does; a prepared hook as it is; None as None. A derivative a caller declares
-    for a hook (a GEMM prologue's `prologue_jvp`) stays the caller's, never prepared: the rewritten form
-    computes the hook's own function (`rewritten`'s contract), which that derivative differentiates."""
-    if hook is None or isinstance(hook, Prepared):
-        return hook
-    from dew import algebra
-
-    return Prepared(hook, algebra.rewritten(hook))
-
-
-def prepared_as(hook: Callable) -> Prepared:
-    """`hook`, a form its consumer derived from a program the algebra pass already rewrote (`fused_gemm`'s
-    tiled stages and their declared derivatives), taken as prepared: a second pass would cost its saturation
-    again and could read through the derivative the form declares."""
-    return hook if isinstance(hook, Prepared) else Prepared(hook, hook)
 
 
 def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
