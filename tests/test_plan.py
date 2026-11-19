@@ -1348,7 +1348,7 @@ remat at their own head, each read as asked (`climbed`): no other rung's need is
     pytest.param("decoder", "cpu", id="decoder-cpu"),
     pytest.param("decoder", "h100", id="decoder-h100"),
     pytest.param("delta-scanned", "h100", id="delta-scanned-h100",
-                 marks=pytest.mark.shards(units=18, per_task=3)),
+                 marks=pytest.mark.shards(units=18, per_task=2)),
 ])
 def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(monkeypatch, shape, target,
                                                                                     request):
@@ -1362,8 +1362,8 @@ def test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits(
     What a rung keeps orders its residuals, not XLA's peak (the scanned delta decoder needed more recomputing
     its scans and convolutions too than not), so a search that passed over a rung for one seen to miss
     settled a heavier plan than one that fits. The scanned delta decoder's walk of its 18 places runs over
-    CI's map tasks, 3 a task: compiled in one it took 262 to 350 s of a train's task (row 8438), 6 a task
-    469 s, its judge 168 s after (row 8524)."""
+    CI's map tasks, 2 a task: compiled in one it took 262 to 350 s of a train's task (row 8438), 6 a task
+    469 s, its judge 168 s after (row 8524), 3 a task 299 s for its first, the heaviest (row 8557)."""
     fields, batch, room_of = CENSUS[shape]
     with row_names_port("gated_delta_rule", "fla"):
         climb = climbed(monkeypatch, target, fields, batch, room_of, request)
