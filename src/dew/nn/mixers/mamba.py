@@ -61,7 +61,7 @@ from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
 from dew.nn.sharding import rows_like
-from dew.nn.ssm import affine_spans
+from dew.nn.ssm import affine_states
 
 CHUNK_SIZE = 64
 """Tokens per associative scan. Each chunk materialises its `[B, C, D, N]`
@@ -110,9 +110,8 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         decay = recurrence_algebra.selective_decay(dt_c[..., None], A * recurrence_algebra.LOG2_E,
                                                    1.0 - reset_c[..., None, None].astype(work))
         write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
-        # The reference's `combine_fn` (modeling_mamba.py:231-234).
-        decays, writes = jax.lax.associative_scan(affine_spans, (decay, write), axis=1)
-        states = decays * h[:, None] + writes
+        # The reference's `combine_fn` (modeling_mamba.py:231-234), from the state entering the chunk.
+        states = affine_states(decay, write, h, axis=1)
         read = recurrence_algebra.portable_einsum('bcdn,bcn->bcd', states, C_c)
         return states[:, -1], read
 

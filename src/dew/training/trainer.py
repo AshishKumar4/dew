@@ -268,13 +268,11 @@ def signature_digest(signature: Hashable) -> str:
 
 
 def _custom_step_refusal(step, record: bool, inspection, rollout: Rollout | None,
-                         sampled: SampledPasses | None, layout: Layout) -> None:
-    """Refuse what a custom step cannot serve (records of its Steps, an inspection of its update), and beside
-    per-microbatch pass counts a rollout (sampling at the cap, row 8272) or a host state (row 8400)."""
+                         sampled: SampledPasses | None) -> None:
+    """Refuse what a custom step cannot serve (records of its Steps, an inspection of its update), and a
+    rollout beside per-microbatch pass counts, sampling at the cap what each trains at its own (row 8272)."""
     if rollout is not None and sampled is not None:
         raise ValueError("a rollout samples one policy a step, not sampled_passes' count a microbatch")
-    if sampled is not None and "variables" in layout.host:
-        raise ValueError("sampled_passes runs each count at its cap's plan where the devices hold the state")
     if step is not None and (record or inspection is not None):
         raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach, and "
                          "commits no update an inspection reads: build Step(record=True), report its arrays")
@@ -379,7 +377,7 @@ class Trainer(Generic[Loss, Effects]):
         self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
-        _custom_step_refusal(step, record, inspection, rollout, sampled_passes, layout)
+        _custom_step_refusal(step, record, inspection, rollout, sampled_passes)
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
@@ -546,7 +544,10 @@ class Trainer(Generic[Loss, Effects]):
         2777): the one construction of a trainer's layout, given or chosen (`streaming.laid_start`). A step
         reads its batch whole where the layout or the run asks (`read_whole`), else in the split stated,
         which a phase planned afresh plans under (`_compiled_for`; None where the planner chooses), until a
-        pooling window or the first plan decides; what was derived of a layout before is derived again."""
+        pooling window or the first plan decides; what was derived of a layout before is derived again; a
+        host state beside per-microbatch pass counts refused, however the layout came (rows 8400, 8440)."""
+        if self.phase_passes.sampled is not None and "variables" in layout.host:
+            raise ValueError("sampled_passes runs each count at its cap's plan where devices hold the state")
         self.layout = self.objective.placement(layout)
         whole = read_whole(self.accumulation, self.split, self.step, self.layout, self.rollout, self.mesh)
         self._shape = dataclasses.replace(self._shape, split=1 if whole is not None else self.split)
@@ -1045,8 +1046,8 @@ class Trainer(Generic[Loss, Effects]):
         (`dew.nn.sharding.tracing`) with the axes the modules declared (`_declared`) and the links of the
         axes the step measured, none by default. An abstract mesh is a GPU's this process lacks
         (`_candidates.lowered_for`)."""
-        on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
-        with on, tracing(self.layout, self.layout.axis_rules, self.microbatches,
+        from dew.training.execution import on_mesh
+        with on_mesh(mesh), tracing(self.layout, self.layout.axis_rules, self.microbatches,
                          {} if links is None else links, self._declared()) as schedule:
             yield schedule
 

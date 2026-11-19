@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors
-from reference_runs import assert_arms_as_recorded
+from recorded_runs import assert_arms_as_recorded
 
 from dew.interop import Pretrained
 from dew.interop.safetensors_io import read_weights

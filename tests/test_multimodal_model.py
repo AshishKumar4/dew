@@ -33,6 +33,7 @@ from multimodal_families import (
     text_rows,
 )
 from one_draw import assert_as_exact_as_the_reference
+from recorded_runs import assert_arms_as_recorded
 from recorded_truths import assert_truths_as_recorded
 from reference_error import (
     GateFailure,
@@ -43,7 +44,6 @@ from reference_error import (
     recording as read_recording,
     widened,
 )
-from reference_runs import assert_arms_as_recorded
 from safetensors.numpy import load_file
 
 from dew.batch import VALIDITY_FIELD, coordinates
@@ -687,6 +687,10 @@ def test_source_trained_export_and_frozen_buffers_match_reference(family_source,
 SEEDS = {"gemma3": 256, "llama4": 512}
 """Each drawn site's declared seeds (multimodal_families.DRAWN), sized by `seeds_for` paired as its recording
 confirmed them."""
+SLIP_SEEDS = {"gemma3": 256, "llama4": 64}
+"""The seeds a site's slip draws (`test_a_drawn_sites_slip_fails_its_check`): a slip needs only the seeds
+that decide it, and fewer than that raise Inconclusive, which the test refuses; llama4's two slips are
+decided at 32 on armada (row 6960), 64 holding them with room."""
 
 
 def drawing(family: str):
@@ -800,7 +804,7 @@ def test_a_drawn_sites_slip_fails_its_check(family, slipped):
         # The slip is the narrow arm's alone: the truth stays the recorded one's (`dew`'s float64 run).
         assert_arms_as_recorded(
             (recording, draw, lambda dtype, inputs: (dew if dtype == jnp.float64 else slip)(dtype, inputs),
-             leaves), f"multimodal-{family}", SEEDS[family], f"{family} slipped {slipped}")
+             leaves), f"multimodal-{family}", SLIP_SEEDS[family], f"{family} slipped {slipped}")
     assert not isinstance(failed.value, Inconclusive)
 
 

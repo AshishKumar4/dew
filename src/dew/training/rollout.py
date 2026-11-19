@@ -4,11 +4,13 @@ shows what it and the validation metrics report."""
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
@@ -121,7 +123,10 @@ def rolled_out[LossT, EffectsT](rollout: Rollout | None, state: TrainState, batc
     consumed = _Consumed(batch)
     further = {"further": consumed.reading(run.further(interval))} if _draws_further(rollout) else {}
     with run.held():
-        made = carried(rollout(state, _unread(batch), key, **further, objective=objective), batch, consumed)
+        policy, key, held = on_devices(state, key, mesh)
+        with admitted(mesh, held):
+            made = carried(rollout(policy, _unread(batch), key, **further, objective=objective), batch,
+                           consumed)
         prepared = marked(made)
         # The count the rollout's batch consumes is what it read, as `ConsumedCount`s count it.
         batch = shard_batch(mesh, prepared if CONSUMED_COUNT not in made else {
@@ -129,6 +134,125 @@ def rolled_out[LossT, EffectsT](rollout: Rollout | None, state: TrainState, batc
     interval.rollout_seconds += time.perf_counter() - began
     # Placed, as a step's read batch is closed: what the stream's end leaves goes to the pool's first row.
     return run.closing(interval, batch, examples) if closes else (batch, None)
+
+
+GIB = 2 ** 30
+
+type Held = Mapping[Hashable, tuple[int, int]]
+"""Each device's bytes, by the device (a `jax.Device`, which JAX states no type of), of the run's weights a
+rollout's policy reads there (`policy_bytes`): the copy of the host's, and the rest it holds."""
+
+
+def on_devices(state: TrainState, key: jax.Array, mesh: Mesh
+               ) -> tuple[TrainState, jax.Array, Held]:
+    """`state` and its rollout's `key` as the rollout's policy reads them on `mesh`, the devices the run's
+    step runs on: each leaf of its weights (its variables, its EMA's) and the key held on other
+    devices (a host run's, `Layout(host=("variables",))`, on its CPU companion) copied there, placed as a
+    device run places it (its partition spec, `execution.spec_on`), once a call; every leaf `mesh`'s devices
+    hold already (a frozen tree beside the accelerator, a device run's whole state) as it is. With each
+    device's bytes of the weights it holds in its own memory, the copy's and the rest's. A copy the room
+    its devices' allocators leave beside the rest cannot hold is refused by name before it is made
+    (`refuse_past`)."""
+    from dew.distributed.host import transfer
+    from dew.training.execution import spec_on
+
+    devices = set(mesh.devices.flat)
+    weights = (state.variables, state.ema)
+    counted = policy_bytes(weights, jax.tree.map(lambda leaf: leaf.sharding, weights), mesh)
+    refuse_past(counted, made=False)
+
+    def placed(leaf):
+        return leaf if leaf.sharding.device_set <= devices else transfer(leaf, spec_on(mesh)(leaf))
+
+    variables, ema = jax.tree.map(placed, weights)
+    return dataclasses.replace(state, variables=variables, ema=ema), placed(key), counted
+
+
+def policy_bytes(weights, shardings, mesh: Mesh) -> Held:
+    """Each of `mesh`'s devices' bytes, in its own memory, of `weights` (arrays or shapes, each placed by
+    `shardings`' leaf) as a rollout's policy reads them there (`on_devices`): of the leaves held on other
+    devices, copied onto it by their partition spec (`execution.spec_on`), and of the rest, as they sit. The
+    one count the copy is admitted by and its step's price reads (`streaming.streamed`)."""
+    from dew.training.execution import spec_on
+
+    devices = set(mesh.devices.flat)
+    held = {device: [0, 0] for device in devices}
+    for leaf, sharding in zip(jax.tree.leaves(weights), jax.tree.leaves(shardings), strict=True):
+        copied = not sharding.device_set <= devices
+        shaped = jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
+        target = spec_on(mesh)(shaped) if copied else sharding
+        if target.memory_kind in (None, "device"):
+            shard = int(np.prod(target.shard_shape(leaf.shape))) * jnp.dtype(leaf.dtype).itemsize
+            for device in target.device_set & devices:
+                held[device][0 if copied else 1] += shard
+    return {device: (copy, rest) for device, (copy, rest) in held.items()}
+
+
+def refuse_past(held: Held, *, made: bool, own: int = 0,
+                what: str = "") -> None:
+    """Refuse, by name, what a rollout's policy holds on each device of `held` (`on_devices`: the copy of
+    the run's host-held weights it reads there, `made` or to be made, beside the rest of the run's the
+    device holds) and `own` bytes more for `what`, past the room its allocator leaves
+    (`dew._devices.device_memory`: a stated GPU's limit with those resident, an attached one's own in use);
+    nothing where no copy is made, the run's weights the devices' whole, or the device states no limit (a
+    CPU's)."""
+    from dew._devices import device_memory
+
+    for device, (copy, rest) in held.items():
+        if not copy:
+            continue
+        stated = device_memory(device, rest + copy if made else rest)
+        limit, used = stated.get("bytes_limit"), stated.get("bytes_in_use")
+        if limit is None or used is None:
+            continue
+        holding = used - copy if made else used
+        if holding + copy + own > limit:
+            beside = f" and {own / GIB:.2f} GiB for {what}" if own else ""
+            raise ValueError(
+                f"a rollout's policy needs the {copy / GIB:.2f} GiB copy of the run's host-held weights on "
+                f"{device}{beside}, beside the {holding / GIB:.2f} GiB the device holds of the run (its "
+                f"frozen trees), past the {limit / GIB:.2f} GiB its allocator holds: a run that keeps its "
+                "variables on the host (Layout(host=('variables',))) samples from a copy of them on its "
+                "devices")
+
+
+@contextlib.contextmanager
+def admitted(mesh: Mesh, held: Held):
+    """Within the block, a rollout's call, each program Dew's compile point runs on `mesh`'s devices
+    (`options.running`: its policy's generation among them, compiled at the call or before) is admitted,
+    once an executable, beside what each device holds of the run's weights (`held`, `on_devices`): its own
+    bytes, its outputs and temporaries as XLA analyses them (a generation's KV cache and activations), past
+    the room its allocator leaves refused by name before it runs (`refuse_past`)."""
+    from dew.nn.kernels.options import running
+    from dew.telemetry.instrumentation import compiled_memory
+
+    if not any(copy for copy, _ in held.values()):
+        yield
+        return
+    devices = set(mesh.devices.flat)
+    # Each executable admitted, held so its id names it alone.
+    seen: dict[int, jax.stages.Compiled] = {}
+
+    @contextlib.contextmanager
+    def heard(program, executable, args, kwargs):
+        if id(executable) not in seen:
+            admit(program, executable)
+            seen[id(executable)] = executable
+        yield
+
+    def admit(program, executable) -> None:
+        memory = compiled_memory(executable)
+        placed = {device for sharding in (*jax.tree.leaves(executable.input_shardings),
+                                          *jax.tree.leaves(executable.output_shardings))
+                  for device in sharding.device_set} & devices
+        if memory is not None and placed:
+            refuse_past({device: held[device] for device in placed}, made=True,
+                        own=memory.output - memory.alias + memory.temp,
+                        what=f"its program {program.called} (its outputs and temporaries: a generation's KV "
+                        "cache and activations)")
+
+    with running(heard):
+        yield
 
 
 READ = (EXAMPLES_CONSUMED, CONSUMED_COUNT, CLOSES_WINDOW, PHASE)

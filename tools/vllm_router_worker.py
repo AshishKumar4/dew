@@ -21,6 +21,7 @@ token's
 weight of every expert, its chosen experts' weights scattered by their ids, zero elsewhere.
 """
 
+import ast
 import contextlib
 import sys
 import types
@@ -37,6 +38,8 @@ def grouped_topk():
     """vLLM's `grouped_topk` at `COMMIT`, its body unchanged, on the torch path."""
     local = github(REPO, COMMIT, PATH, DIGEST)
     [function] = selected(local.read_text(), {"grouped_topk"}, filename=str(local))
+    if not isinstance(function, ast.FunctionDef):
+        raise ValueError(f"{PATH} at {COMMIT} defines grouped_topk as no function")
     function.decorator_list = []
     namespace = {
         "torch": torch,

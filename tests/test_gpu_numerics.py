@@ -52,6 +52,9 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
              precision_policy.divides_as_ieee_division_at_its_edges, fault=OWN),
         Cell("a correctly rounded division is IEEE division's on a GPU dividing approximately",
              precision_policy.divides_as_ieee_division_on_an_approximate_divider, fault=OWN),
+        *(Cell(f"a compensated primitive under jit is its eager arithmetic on a GPU: {shape}",
+               functools.partial(precision_policy.compensated_primitives_hold_under_jit, shape), fault=OWN)
+          for shape in precision_policy.COMPENSATED_SHAPES),
         Cell("a frozen FP8 site's products take no FP8 GEMM whose sum is narrower",
              when(fp8_base.FP8_CORES, "this GPU has no FP8 tensor cores", isolated(tmp_path_factory)(
                  fp8_base.a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower, "fp8")), fault=OWN),

@@ -10,6 +10,7 @@ import dataclasses
 import functools
 import json
 from pathlib import Path
+from typing import Any
 
 import jax
 import numpy as np
@@ -97,8 +98,11 @@ class Runs:
     def continued(self, batch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dew's greedy continuation of `batch` by CONTINUATION tokens, the reference's, and the reference's
         logits at each of its steps."""
+        # transformers types `generate`'s model as a protocol its own models meet only at runtime (their
+        # quantizer, set as they load), so it is called as the loaded model holds it.
+        model: Any = self.reference_model
         with torch.no_grad():
-            generated = self.reference_model.generate(
+            generated = model.generate(
                 **tensors(batch), max_new_tokens=CONTINUATION, do_sample=False, eos_token_id=None,
                 output_logits=True, return_dict_in_generate=True)
         inputs = self.host.from_hf(dict(batch))

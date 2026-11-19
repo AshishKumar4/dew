@@ -1289,7 +1289,7 @@ def test_a_recording_judged_is_held_to_dews_own_run_of_the_same_weights(tmp_path
     `assert_as_exact_as_recorded`'s `judged`) is the arm check 1 judges, Dew's own run its reference, its
     seeds sized with the two in those places: a library that sums nearer float64 than Dew's run is on par,
     where Dew's run judged against it is not, and an export read one part in ten thousand off is over."""
-    from reference_runs import assert_as_exact_as_recorded
+    from recorded_runs import assert_as_exact_as_recorded
     from tool_support import load
 
     def draw(seed):

@@ -34,6 +34,7 @@ from dew.nn.kernels.generation import gpu_target
 from dew.nn.protocols import ComputesIn
 from dew.telemetry.instrumentation import step_flops
 from dew.training._fit import Start, closes_window
+from dew.training.diloco import DILOCO_ON_HOST
 from dew.training.distributed import microbatch_shapes
 from dew.training.execution import HostExecution, frozen_trees, stack_sites
 from dew.training.memory import (
@@ -48,7 +49,7 @@ from dew.training.memory import (
 )
 from dew.training.model_flops import model_batch
 from dew.training.planning import PlanRefused, Rung
-from dew.training.profiling import pgle_runs
+from dew.training.rollout import policy_bytes
 from dew.training.transaction import loss_arguments
 
 _log = logging.getLogger(__name__)
@@ -96,26 +97,29 @@ NOT_BUILT = 7908
 
 def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
     """Why `trainer`'s run cannot stream its parameters from the host, None where it can. What the streamed
-    step cannot be: a layout the run states (`stated`), a custom step, which owns its execution, or a process
-    holding no CPU companion of the devices, which JAX makes only before it initializes. And what it is not
-    built for yet (`NOT_BUILT`): a rollout, DiLoCo, a step compiled `ahead`,
-    a lowering for another target, AutoPGLE, a pass count drawn per microbatch, and a part whose table
-    states no host link to price it by (`GpuTarget.host_links`: a TPU's). Read before any plan is built."""
+    step cannot be: a layout the run states (`stated`), a custom step, which owns its execution, a run
+    lowering for another target (`lower_for`), whose steps this host prices on no devices of that target
+    (a stated host layout lowers, `StepCompiler._lowered_host`), or a process holding no CPU companion of
+    the devices, which JAX makes only before it initializes. And what it is not
+    built for yet (`NOT_BUILT`; DiLoCo's groups by row `DILOCO_ON_HOST`): DiLoCo, a step compiled `ahead`,
+    a pass count drawn per microbatch, and a part whose table
+    states no host link to price it by (`GpuTarget.host_links`: a TPU's but v6e's). Read before any plan
+    is built."""
     unbuilt = (
-        (trainer.rollout is not None, "a rollout"),
-        (trainer.diloco is not None, "DiLoCo's groups"),
-        (ahead, "a step compiled ahead"),
-        (trainer.lower_for is not None, "a lowering for another target"),
-        (pgle_runs() > 0, "AutoPGLE"),
-        (trainer.phase_passes.sampled is not None, "a pass count drawn per microbatch (sampled_passes)"),
+        (trainer.diloco is not None, "DiLoCo's groups", DILOCO_ON_HOST),
+        (ahead, "a step compiled ahead", NOT_BUILT),
+        (trainer.phase_passes.sampled is not None, "a pass count drawn per microbatch (sampled_passes)",
+         NOT_BUILT),
     )
     if stated:
         return "the run states its layout"
     if trainer.step is not None:
         return "a custom step owns its execution"
-    for refused, what in unbuilt:
+    if trainer.lower_for is not None:
+        return "the run lowers its step for another target, whose devices price no plan here"
+    for refused, what, row in unbuilt:
         if refused:
-            return f"the streamed step is not built for {what} yet (row {NOT_BUILT})"
+            return f"the streamed step is not built for {what} yet (row {row})"
     target = gpu_target()
     if target.host_link_rate is None:
         return (f"the streamed step is not priced on {target.device_kind} yet: no host-link rate is stated "
@@ -189,8 +193,14 @@ def streamed(trainer, start: Start, batch, dtype, device_steps: tuple) -> tuple[
                   for device in local_devices(companion))
     try:
         flops = step_flops(compiled)
+        # A rollout samples from a copy of the host's weights, its variables' and its EMA's, made once a
+        # step before it (`dew.training.rollout.on_devices`), each device's as the copy counts them.
+        copied = 0 if trainer.rollout is None else max(copy for copy, _ in policy_bytes(
+            (abstract.variables, abstract.ema), (start.shardings.variables, start.shardings.ema),
+            mesh).values())
         price = streamed_price(None if flops is None else split * flops, gpu_target(), dtype,
-                               split * parameters, updated, host_memory_rate(), read_once=split * averaged)
+                               split * parameters, updated, host_memory_rate(), read_once=split * averaged,
+                               copied=copied)
     except Unpriced:
         price = None
     return fits, price
