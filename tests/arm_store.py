@@ -3,7 +3,6 @@ prepare) and run from it (`_stored_arms`): each arm's program traced as its run 
 gate compiles it (`arm_forms._compiled`), its references' twins as written (`arm_forms._written_twin`) held
 apart."""
 
-import contextlib
 import dataclasses
 import functools
 import itertools
@@ -85,16 +84,15 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
             inputs.setdefault(named("arms", ordered), ordered)
     programs: dict = {}
     held: dict = {}
-    # The arithmetic arms run in on the store's devices: a GPU's own (`summed_as_run`'s, read on the CPU
-    # lane alone), whatever the host the prepare runs on.
-    arithmetic = summed_as_run if store.target is None else contextlib.nullcontext
-    with store.tracing(), arithmetic():
+    # The arithmetic arms run in on the store's devices (`summed_as_run`, read where the store places its
+    # calls: a GPU's own on a target's compile-only GPU, whatever the host the prepare runs on).
+    with store.tracing(), summed_as_run():
         for role, fn, reference in named_arms.values():
             for drawn in inputs.values():
                 _arm_program(programs, held, role, fn, drawn, reference=reference, written=written)
     if programs:
         compiled = _arm_compile(compile, as_written(store.device().platform) if written else None)
-        with arithmetic():
+        with summed_as_run():
             try:
                 store.compile_site(armed(label, written), programs, held, compiled=compiled, arms=True)
             except report.CompiledOnDevice as refused:
