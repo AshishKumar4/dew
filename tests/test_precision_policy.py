@@ -1413,6 +1413,15 @@ def test_an_aligned_sum_over_one_long_axis_lowers(length):
     assert lowered.out_info.shape == (1,)
 
 
+def test_an_aligned_sums_tangent_leaks_no_tracer():
+    """The tangent and the gradient of `aligned_sum([(a, b)])` under `jax.checking_leaks`: no tracer kept,
+    where its tangent's map, a primitive's static parameter, closed over its traced value (row 8757)."""
+    one = jnp.float32(1.0)
+    with jax.checking_leaks():
+        jax.jvp(lambda a: aligned_sum([(a, one)]), (one,), (one,))
+        jax.grad(lambda a: aligned_sum([(a, one)]))(one)
+
+
 def test_an_aligned_sum_over_an_empty_axis_is_positive_zero():
     """`aligned_sum` over an empty fp32 axis: positive zero, IEEE's sum of no terms, where a sum of none
     counted as of negative zeros alone, negative zero (base review 6c68b90ad F4)."""
