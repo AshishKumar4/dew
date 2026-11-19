@@ -1494,19 +1494,27 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
     return over, unresolved
 
 
-def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True,
-            ratio_rule=_at_parity) -> tuple[list[Finding], list[Finding], int]:
+def needs_second_stage(draws: _Draws, label: str, *, ratio_rule=_at_parity) -> bool:
+    """Whether a site's first-stage `draws` against one reference draw check 1's second stage
+    (`_staged`): any of its leaves not passing."""
+    return any(_judgement(draws, label, (LOWER_TAIL, UPPER_TAIL), ratio_rule=ratio_rule))
+
+
+def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True, ratio_rule=_at_parity,
+            further: bool | None = None) -> tuple[list[Finding], list[Finding], int]:
     """Check 1's two pre-declared stages over `drawn(start, stop)`, the draws of seeds start to stop: at
     `seeds`, a site whose every leaf passes (`_judgement`: its ratio by `ratio_rule`, its rows and values)
     passes; any leaf that does not draws the second stage, REDRAW times as many further seeds, and every
     leaf is judged again over all of them, that verdict final. Its findings, the leaves left inconclusive
-    and the stage reached. With `two_stage` false, the procedure before it, for comparison: tails
-    PREVIOUS_TAILS, the interval as it is, only a leaf whose ratio is over PARITY drawing again."""
+    and the stage reached. `further`, where given, is the site's own decision over every reference it
+    compares (`check1_judge._verdicts`): each judged on the range any of them draws. With `two_stage` false,
+    the procedure before it, for comparison: tails PREVIOUS_TAILS, the interval as it is, only a leaf whose
+    ratio is over PARITY drawing again."""
     tails = (LOWER_TAIL, UPPER_TAIL) if two_stage else PREVIOUS_TAILS
     draws = drawn(0, seeds)
-    if two_stage:
-        further = any(_judgement(draws, label, tails, ratio_rule=ratio_rule))
-    else:
+    if further is None and two_stage:
+        further = needs_second_stage(draws, label, ratio_rule=ratio_rule)
+    elif further is None:
         further = any(not _exact(draws.theirs[:, index]) and _judged(draws, index, tails)[0] > PARITY
                       for index in range(len(draws.names)))
     if further:

@@ -15,6 +15,7 @@ import re
 
 import jax
 import pytest
+from generation_support import here, runnable
 from kernel_matrix import CELLS
 from model_flows import FLOWS, flow_flags, flow_named
 from sharded import Shard, assert_kernel_runs_per_shard, interprets
@@ -73,14 +74,19 @@ def cells(test: str) -> list:
             for label, shard in stated(module, choice, kernel).items()]
 
 
+@pytest.mark.kernel
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize(("module", "choice", "kernel", "label"), cells("test_a_kernel_runs_per_shard"))
 def test_a_kernel_runs_per_shard(module, choice, kernel, label):
-    """One kernel's per-shard cell where this process's devices run it (`sharded.interprets` on the CPU's,
-    its generation's own on a GPU's or a TPU's), skipped where they do not."""
+    """One kernel's per-shard cell where this process's devices run it (`sharded.interprets` on the CPU's;
+    on a GPU's, a GPU generation's cell this GPU runs, `generation_support.runnable`; on a TPU's, its own
+    generation's), skipped where they do not; a kernel's test (`kernel`), so the native tiers, which select
+    their GPU's and their TPU's kernel tests, run it on its own devices (spec alignment, 9002: marked for a
+    mesh alone it ran on no native device, and on one it took any GPU's cell for this one's)."""
     shard = stated(module, choice, kernel)[label]
     platform = jax.default_backend()
-    held = (shard.target.startswith("sm") if platform == "gpu" else not shard.target.startswith("sm")
+    gpu_cell = shard.target.startswith("sm")
+    held = (gpu_cell and runnable(shard.target) if platform == "gpu" else shard.target == here()
             if platform == "tpu" else interprets(choice, kernel, shard))
     if not held:
         pytest.skip(f"{choice} {kernel} runs as {shard.target} on its own devices, not on this {platform}")

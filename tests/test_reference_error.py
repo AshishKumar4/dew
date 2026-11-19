@@ -664,16 +664,34 @@ def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
     recording of too few seeds."""
     from reference_error import _drawn, seeds_for
 
-    from dew.parity import seeds_resolving
+    from dew.parity import SIZING_FROM, seeds_resolving
 
     count = seeds_for(_product, _draw, "product")
-    [draws] = _drawn(_product, _product, _draw, range(4 * count))
+    [draws] = _drawn(_product, _product, _draw, range(SIZING_FROM, SIZING_FROM + 4 * count))
     assert seeds_resolving(draws.theirs, draws.names, "product") == count
     with pytest.raises(AssertionError):
         seeds_resolving(draws.theirs[:count], draws.names, "product", start=count)
     # Past its ceiling it refuses, as seeds_for does, however many seeds are recorded.
     with pytest.raises(AssertionError):
         seeds_resolving(draws.theirs, draws.names, "product", most=count // 2)
+
+
+def test_a_reference_sized_against_itself_draws_none_of_a_verdicts_seeds():
+    """A reference sized against itself (`seeds_for` with no Dew arm) draws from SIZING_FROM on, as a paired
+    sizing does: from seed 0 its count was chosen on the verdict's own inputs, its four blocks overlapping
+    the whole first stage (spec alignment, 9005)."""
+    from reference_error import seeds_for
+
+    from dew.parity import SIZING_FROM
+
+    drawn = []
+
+    def draw(seed):
+        drawn.append(seed)
+        return _draw(seed)
+
+    seeds_for(_product, draw, "product")
+    assert min(drawn) >= SIZING_FROM
 
 
 def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
@@ -1116,6 +1134,27 @@ def test_check_one_decides_at_its_second_stage_what_its_first_leaves_inconclusiv
     logged = [json.loads(line) for line in log.read_text().splitlines()]
     assert [(entry["label"], entry["stage"], entry["verdict"]) for entry in logged] == [
         ("second stage", 2, "pass"), ("first stage", 1, "pass")]
+
+
+def test_a_site_draws_its_second_stage_for_every_reference_it_compares(tmp_path, monkeypatch):
+    """Dew's squared error 2.6 on even seeds and 0.1 on odd ones against a reference of the same errors (its
+    ratio 1 at every seed, a pass at the first stage) and a further one of error 1 (inconclusive over 8
+    seeds): the further reference draws the second stage, and the site draws it for both, each judged on
+    the 40 seeds, where the first comparison stopped at its 8 and its added rows went unjudged (spec
+    alignment, 9006)."""
+    from check1_judge import STAGES_LOG
+
+    dew, reference, errors, truth = _set_errors(2.6, 0.1)
+
+    @as_given
+    def alike(x, mine, theirs):
+        return {"y": x + mine}
+
+    log = tmp_path / "stages.jsonl"
+    monkeypatch.setenv(STAGES_LOG, str(log))
+    assert_as_exact(dew, alike, errors, "staged together", seeds=8, truth_fn=truth,
+                    also={"constant": reference})
+    assert [json.loads(line)["stage"] for line in log.read_text().splitlines()] == [2, 2]
 
 
 def test_a_leafs_interval_is_widened_to_hold_its_ratio():

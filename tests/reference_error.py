@@ -264,12 +264,18 @@ def _truth_read(truth_fn, followed, result):
     return _truth_program(as_given(bound) if _given(followed.truth) else bound)
 
 
-def _own_truth(prepared, followed, result, inputs, truth):
-    """An arm's result and its truth on `inputs`: at a site of followed roundings (`result` a `Rounded`)
-    its judged leaves and the truth of its own decisions (`_followed_truth`), else the two as given."""
-    if not isinstance(result, Rounded):
-        return result, truth
-    return result.judged, _followed_truth(prepared, followed, result, inputs)
+def _own_truth(prepared, followed, result, inputs, truth, *, recorded: bool):
+    """An arm's result and its truth on `inputs`: at a site of followed roundings (`prepared`, its truth as
+    the gate runs it) its judged leaves and the truth of its own decisions (`_followed_truth`), each live
+    arm's a `Rounded` (a reference or a further arm returning bare leaves would be held to Dew's truth with
+    no decision of its own: spec alignment, 8999); a recording's (`recorded`) its recorded decisions where it
+    holds them, else its leaves held to Dew's; at any other site the two as given."""
+    if isinstance(result, Rounded):
+        return result.judged, _followed_truth(prepared, followed, result, inputs)
+    if prepared is not None and not recorded:
+        raise AssertionError("a live arm at a site of followed roundings returns its judged leaves and its "
+                             "roundings' decisions (`Rounded`)")
+    return result, truth
 
 
 def _truth_program(fn, device=None):
@@ -696,14 +702,15 @@ class _Whole:
         return self.fn(*leaves)
 
 
-def _paired_most(reference_fn, most: int = MOST_SEEDS) -> int | None:
-    """The most seeds a paired sizing of `reference_fn` takes (`seeds_for`'s, its draws from SIZING_FROM to
-    twice it, `parity._sized_count`): `most`, a recording's pilots' half where it holds fewer; None for a
-    recording without pilots, which no sizing takes (`_qualified`), its count its recording's."""
+def _paired_most(reference_fn, most: int = MOST_SEEDS, *, paired: bool = True) -> int | None:
+    """The most seeds a sizing of `reference_fn` takes (`seeds_for`'s, its draws from SIZING_FROM on,
+    `parity._sized_count`: twice it paired, four times it of the reference compared with itself): `most`, a
+    recording's pilots' share where it holds fewer; None for a recording without pilots, which no sizing
+    takes (`_qualified`), its count its recording's."""
     if not getattr(reference_fn, "recorded", False):
         return most
     pilots = getattr(reference_fn, "pilots", None)
-    return None if pilots is None else min(most, len(pilots) // 2)
+    return None if pilots is None else min(most, len(pilots) // (2 if paired else 4))
 
 
 def _sizing_seeds(reference_fn) -> range:
@@ -1222,7 +1229,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                     if not at and arm is not dew_fn and mine_at is ordered[0][0]:
                         _of_its_inputs(label, _arm_name(arm, reference_fn, library_fn, at_arm), arm, here,
                                        other)
-                other, true_here = _own_truth(prepared_followed, followed, other, here, true_here)
+                other, true_here = _own_truth(prepared_followed, followed, other, here, true_here,
+                                              recorded=getattr(arm, "recorded", False))
                 shared = true_here is truth
                 if weighed is not None:
                     terms_here = weighed[id(true_here)].ones
@@ -1456,9 +1464,11 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     terms = terms if followed is None else _followed_site(label, truth_fn, orders, library_fn, terms,
                                                           conditioning, examples)
     # Its verdict the plain pair's, the one a qualification run sizes (`_qualified`, and the sizing draws a
-    # prepare compiles its arms at, `_compile_site`): no library arm, further reference, terms of its own or
-    # weighed check beside Dew and its reference.
-    plain = not (library_fn or also or terms or conditioning)
+    # prepare compiles its arms at, `_compile_site`): no library arm, further reference, terms program of its
+    # own or weighed check beside Dew and its reference. The gate's own terms (`terms=True`, its truth's walk)
+    # are the plain pair's still: sizing reads no terms, so such a site sized nothing and never went stale
+    # (spec alignment, 9044).
+    plain = not (library_fn or also or callable(terms) or conditioning)
     store = COMPILED.get()
     if store is not None and conditioning is not None:
         raise ValueError(f"{label}: a weighed site reads its reference's own rounding at its truth's inputs, "
@@ -1778,15 +1788,15 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     whose sizes vary across draws together: their ratio resolves in fewer draws than each alone does, or
     where each alone, heavy-tailed across draws, never does, and the verdict judges that same paired
     ratio, so a paired count is the one its verdict needs (docs/design/testing.md states how it was
-    validated). The width asked of it is PARITY
-    either way. Paired sizing holds out its draws only where `draw` keys an independent stream by the
+    validated). The width asked of it is PARITY either way, and either mode draws from SIZING_FROM on, no
+    verdict's inputs. A sizing holds out its draws only where `draw` keys an independent stream by the
     whole seed: a draw that enumerates finitely or by a modulus (`(arange(n) + seed) % vocab`) repeats a
     verdict's inputs at SIZING_FROM and needs a pilot stream of its own first. A recorded reference
     (`indexed_recording`), which holds its recorded seeds alone, is refused, its site keeping its
     recorded count, unless its recording holds pilot draws of their own from SIZING_FROM on, the
     reference and its truth on the inputs Dew's arm takes live (`recorded_pilots`, or a summarized
-    recording's pilots, `indexed_recording`): its paired sizing then takes those pilots alone,
-    up to as many as are held. Fails past `most`, where the site needs larger inputs or fewer shared
+    recording's pilots, `indexed_recording`): its sizing then takes those pilots alone, up to as many as
+    are held. Fails past `most`, where the site needs larger inputs or fewer shared
     factors, not more seeds.
 
     Each draw is evaluated once however many doublings the sizing takes: a count's draws are its
@@ -1800,13 +1810,12 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     if COMPILED.get() is not None:
         raise ValueError(f"{label}: a sizing draws seeds past a prepared site's, whose truths' programs no "
                          "prepare compiled")
-    if dew_fn is not None:
-        held = _paired_most(reference_fn, most)
-        if held is None:
-            raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
-                             f"sizing's from SIZING_FROM; its site keeps its recorded count")
-        most = held
     paired = dew_fn is not None
+    held = _paired_most(reference_fn, most, paired=paired)
+    if held is None:
+        raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a sizing's "
+                         f"from SIZING_FROM; its site keeps its recorded count")
+    most = held
     if arms is None:
         _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
     # A weighed site (`assert_as_exact`'s `conditioning`) is sized as it is judged, weighed, its heavy
@@ -1817,7 +1826,10 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
                             else _arms(dew_fn if paired else reference_fn, reference_fn))
     dew_fn = dew_fn if paired else None
     truth_fn = _truth_program(truth_fn)
-    first = 0 if dew_fn is None else SIZING_FROM
+    # Both modes from SIZING_FROM, the draws no verdict takes: the reference compared with itself from seed 0
+    # chose its count by the verdict's own inputs, its confirming blocks overlapping at least the whole first
+    # stage (spec alignment, 9005).
+    first = SIZING_FROM
 
     def drawn(start_at: int, stop: int):
         return _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + start_at, first + stop),

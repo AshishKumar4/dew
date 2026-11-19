@@ -94,6 +94,11 @@ MOVES = ("all-gather", "all-to-all", "collective-permute")
 """The collectives that move an operand's entries between devices, which a kernel running per shard
 needs none of: a reduction (all-reduce, reduce-scatter) is a gradient's sum, not a move."""
 
+REDUCTIONS = ("all-reduce", "reduce-scatter")
+"""The collectives that sum across devices: a cell declares each it intends with the mesh axes it sums
+over (`split_checked`'s `reductions`), so one on an axis it does not intend fails however the outputs read
+(spec alignment, 9001)."""
+
 
 def tpu_mesh(**axes: int) -> jax.sharding.Mesh:
     """A mesh of `axes` over the first of this process's devices, its axes left to the partitioner as
@@ -141,30 +146,38 @@ def split_executable(run, args, specs, mesh: jax.sharding.Mesh):
         return run.lower(*placed_on(args, specs, mesh)).compile()
 
 
-def split_checked(fn, draw, specs, mesh, *, moves=(), donate=()):
+def split_checked(fn, draw, specs, mesh, *, moves=(), reductions=(), donate=()):
     """`fn` jitted as the gate compiles a Dew arm (`without_ynn`), and its split executable on `draw(0)`'s
     arguments placed by `specs` (`split_executable`), its compiled step holding no collective that moves
-    entries between devices (`MOVES`) beyond `moves`, and no copy or transpose at a kernel call's edge
-    (`boundary_copies`): `assert_runs_per_shard`'s compile-time half."""
+    entries between devices (`MOVES`) beyond `moves`, no reduction (`REDUCTIONS`) but those `reductions`
+    declares, each `(op, axes)` over the mesh axes it sums along (`collective_axes`: a reduction on an axis
+    no cell intends, a sum the per-shard program should not take, fails, where every reduction passed
+    whole), and no copy or transpose at a kernel call's edge (`boundary_copies`): `assert_runs_per_shard`'s
+    compile-time half."""
     run = without_ynn(fn, donate_argnums=donate)
     compiled = split_executable(run, draw(0), specs, mesh)
     text = compiled.as_text()
     moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]
     assert not moved, f"the step moves operands between devices: {moved}"
+    declared = {(op, frozenset(axes)) for op, axes in reductions}
+    summed = sorted((op, sorted(axes)) for op, axes in collective_axes(compiled, mesh)
+                    if op in REDUCTIONS and (op, axes) not in declared)
+    assert not summed, f"the step sums across devices where no reduction is declared: {summed}"
     copies = boundary_copies(text)
     assert not copies, f"XLA re-lays out arrays at the kernel's boundary: {copies}"
     return run, compiled
 
 
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
-                          donate=(), arm=None, also=None, checked=None):
+                          reductions=(), donate=(), arm=None, also=None, checked=None):
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
     by `specs` (PartitionSpecs) is on par with `fn` on one device over the site's declared `seeds`
     (check 1, `assert_as_exact`), both measured from `truth_fn`, the float64 tree of `fn`'s outputs on
     the arguments widened; its compiled step, every draw's one program, holds no collective that moves
     entries between devices (`MOVES`) beyond the ops `moves` names (a sequence split's intended
-    exchange), which XLA, unable to split an opaque call, would otherwise insert to replicate it; and no
-    copy or transpose at a kernel call's edge (`boundary_copies`). `donate` names the arguments `fn`
+    exchange), which XLA, unable to split an opaque call, would otherwise insert to replicate it; no sum
+    across devices but the `reductions` it declares, each over its axes (a gradient's over the batch); and
+    no copy or transpose at a kernel call's edge (`boundary_copies`). `donate` names the arguments `fn`
     takes in place, as its callers donate them (a kernel that aliases its state into its output): a
     call that keeps them would make XLA copy each before the kernel overwrites it. Every arm is Dew's
     program, compiled here as the gate compiles two Dew arms (`without_ynn`) and run as given: the
@@ -176,7 +189,8 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     `(label, arm)`, is that second arm, compiled alike and compared with the same split runs (each draw's
     split run once, `assert_as_exact`'s further references). `checked`, when given, is `split_checked`'s
     pair already made (a caller reading the split lowering's own records)."""
-    run, compiled = checked or split_checked(fn, draw, specs, mesh, moves=moves, donate=donate)
+    run, compiled = checked or split_checked(fn, draw, specs, mesh, moves=moves, reductions=reductions,
+                                             donate=donate)
     def kept(args):
         # A donated argument is consumed; the draw's own array goes on to the other arm and the truth.
         return [jnp.copy(arg) if index in donate else arg for index, arg in enumerate(args)]
@@ -254,6 +268,12 @@ def interprets(choice: str, kernel: str, shard: Shard) -> bool:
     return kernel in {found.kernel for found in routes if found.choice == choice}
 
 
+def _names(spec: PartitionSpec) -> set[str]:
+    """The mesh axes a PartitionSpec splits along."""
+    return {name for axes in spec if axes is not None
+            for name in ((axes,) if isinstance(axes, str) else axes)}
+
+
 def assert_kernel_runs_per_shard(choice: str, kernel: str, shard: Shard) -> None:
     """`kernel`, `choice`'s, runs per shard (`assert_runs_per_shard`) on two devices of a run's mesh
     splitting `shard.split` (`MeshSpec`, its other axes one device each), its choice named
@@ -267,16 +287,23 @@ def assert_kernel_runs_per_shard(choice: str, kernel: str, shard: Shard) -> None
     # The data axis takes the devices the others leave (`MeshSpec`).
     mesh = MeshSpec(**({} if shard.split == "data" else {shard.split: 2})).build(jax.devices()[:2])
     specs = shard.specs(mesh)
-    named = {name for spec in jax.tree.leaves(specs, is_leaf=lambda leaf: isinstance(leaf, PartitionSpec))
-             for axes in spec if axes is not None for name in ((axes,) if isinstance(axes, str) else axes)}
+    named = set().union(*(_names(spec) for spec in jax.tree.leaves(
+        specs, is_leaf=lambda leaf: isinstance(leaf, PartitionSpec))))
     assert shard.split in named and mesh.shape[shard.split] > 1, (shard.split, sorted(named), mesh.shape)
+    # A cell's call returns its operands' gradients: an operand whole along the split (its spec naming no
+    # `split`) has its gradient summed over the split's devices, the one reduction a cell intends, on that
+    # axis alone (`split_checked`'s `reductions`).
+    whole = any(shard.split not in _names(spec) for spec in jax.tree.leaves(
+        specs, is_leaf=lambda leaf: isinstance(leaf, PartitionSpec)))
+    reductions = tuple((op, (shard.split,)) for op in REDUCTIONS) if whole else ()
     from generation_support import here
 
     target = (generation.assumed(shard.target, interpreted=True) if here() == "cpu"
               else contextlib.nullcontext())
     with target, generation.chosen(**{choice: kernel}), shard.context():
         with generation.routes() as routes:
-            checked = split_checked(shard.call, shard.draw, specs, mesh, moves=shard.moves)
+            checked = split_checked(shard.call, shard.draw, specs, mesh, moves=shard.moves,
+                                    reductions=reductions)
         taken = {found.kernel for found in routes if found.choice == choice}
         assert kernel in taken, (choice, kernel, sorted(taken))
         assert_runs_per_shard(shard.call, shard.draw, specs, mesh, f"{choice} {kernel} per shard over "

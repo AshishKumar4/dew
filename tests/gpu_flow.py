@@ -104,6 +104,15 @@ def _reported(error: BaseException) -> tuple[str, list[tuple[str, int]]]:
     return text, [(frame.filename, frame.lineno or 0) for frame in frames]
 
 
+def _raised(error: BaseException) -> str:
+    """What `error` is in one line: its type and its message's first line, as `traceback` reports them, none
+    of the notes a library appends after it (JAX's line that it removed its internal frames, which a record
+    of a deferred cell held alone where it took the report's last line: 45 GEMM certificate cells on a
+    GH200 tier)."""
+    message = str(error).splitlines()
+    return type(error).__name__ + (f": {message[0]}" if message else "")
+
+
 REPORTED: list[dict] = []
 """The counts of each outermost flow run since the last test's report took them (`run_cells`), which
 tests/conftest.py reports as the test's JUnit property `cells`: a flow none of whose cells ran is
@@ -131,7 +140,8 @@ def _begun() -> frozenset[str] | None:
     return frozenset(store.tried) if tier_wire.preparing() and store is not None and store.prepare else None
 
 
-def _deferred(label: str, text: str, frames: list[tuple[str, int]], begun: frozenset[str] | None) -> bool:
+def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
+              begun: frozenset[str] | None) -> bool:
     """Whether a cell that raised is deferred to its run (`run_cells`): in a GPU tier part's prepare
     (`begun`, its store's sites tried before the cell, `_begun`), where nothing computes. A cell that tried
     no site before it raised, or one its check's prepare did not finish whole (a trace or a compile that
@@ -152,8 +162,8 @@ def _deferred(label: str, text: str, frames: list[tuple[str, int]], begun: froze
     new = store.tried - begun
     if not new or not new <= store.done:
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
-        truths_ahead.unprepared(store.directory, test, frames[::-1],
-                                f"{label}: {text.splitlines()[-1][:400]}", truths_ahead.DEFERRED)
+        truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {_raised(error)[:400]}",
+                                truths_ahead.DEFERRED)
         print(f"cell deferred to its run: {label}", flush=True)
     return True
 
@@ -185,7 +195,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 # `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end
                 # the flow: kept with its label, and raised with every other cell's after the last.
                 text, frames = _reported(error)
-                if _deferred(cell.label, text, frames, begun):
+                if _deferred(cell.label, error, frames, begun):
                     deferred += 1
                 else:
                     failed.append((cell.label, text, frames))
