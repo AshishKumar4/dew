@@ -144,6 +144,23 @@ def token_corpus(directory: Path, records: int, seq_len: int, rows: int | None =
 
 
 @pytest.mark.distributed
+def test_a_pool_agrees_a_steps_fit_on_each_processs_own_read_and_a_failed_read_ends_every_check(tmp_path):
+    """Each process reads its own devices' headroom for a step over both processes' devices and the pool
+    answers alike in the same round (`memory.step_fits`): the step fits where every process's holds, a
+    process reading none holding, a refused compile none; and a process whose read fails ends every
+    process's check with its error, its peer naming it, where its peer had waited in an exchange it never
+    reached (row 8767: the read came before the agreement)."""
+    script = Path(__file__).with_name("step_fits_worker.py")
+    reports = run_pool("step_fits", tmp_path / "pool", 2, script=script)
+    # Each: the pool's answer, whether this process's headroom holds, whether it read none.
+    assert [[report[name] for name in ("roomy", "tight", "unread", "refused")] for report in reports] == [
+        [[True, True, False], [False, True, False], [True, True, False], [False, True, False]],
+        [[True, True, False], [False, False, False], [True, False, True], [False, False, True]]], reports
+    assert [report["failed"] for report in reports] == [
+        ["PeerFailure", "a step's fit", 1], ["RuntimeError", "the allocator's statistics could not be read"]]
+
+
+@pytest.mark.distributed
 
 def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
     """Each process places its share of the rows, so a batch as placed is

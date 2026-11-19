@@ -433,3 +433,25 @@ def test_a_layout_move_counts_nothing_as_a_slice_does(move):
     role = _emitted(move, jax.ShapeDtypeStruct((1, 128), jnp.float32)).roles[0]
     assert role.fixed == Work(), role.fixed
 
+
+def test_an_async_smem_to_tmem_copy_charges_shared_bytes_from_its_source_without_device_bytes():
+    """`plgpu.async_copy_smem_to_tmem` charges `Work.shared_bytes` from its transformed SMEM source and
+    leaves `device_bytes` at 0 (row 9106)."""
+    def body(out_gmem, smem, tmem):
+        del out_gmem
+        plgpu.async_copy_smem_to_tmem(smem, tmem)
+
+    def sliced_body(out_gmem, smem, tmem):
+        del out_gmem
+        plgpu.async_copy_smem_to_tmem(smem.at[:, pl.ds(0, 64)], tmem)
+
+    full = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
+                        scratch_types=[plgpu.SMEM((128, 256), jnp.bfloat16),
+                                       plgpu.TMEM((128, 256), jnp.bfloat16, packed=True)])
+    sliced = plgpu.kernel(sliced_body, out_type=_ROW, num_threads=1, thread_name="wg",
+                          scratch_types=[plgpu.SMEM((128, 256), jnp.bfloat16),
+                                         plgpu.TMEM((128, 64), jnp.bfloat16, packed=True)])
+    full_work = emission.emitted(jax.make_jaxpr(full)(), 1, "wg").roles[0].fixed
+    sliced_work = emission.emitted(jax.make_jaxpr(sliced)(), 1, "wg").roles[0].fixed
+    assert full_work.shared_bytes == 128 * 256 * 2 and full_work.device_bytes == 0
+    assert sliced_work.shared_bytes == 128 * 64 * 2 and sliced_work.device_bytes == 0

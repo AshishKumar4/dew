@@ -16,6 +16,8 @@ public call."""
 
 
 import functools
+from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +39,59 @@ CANCELLING_LEVELS = ((2.0 ** 26, 2.0 ** 127), (2.0, 2.0 ** 127), (1.0, -(2.0 ** 
 summing to the largest: three levels cancelling beside it, which floats summed in some order lose (one
 dropping -2^103 at a tie as 2^103 survives summed to inf, row 8757). Each a multiple of 2^103 below 2^154, so
 float64 sums them, and any power of two times them, exactly in any order."""
+
+
+class Entries(NamedTuple):
+    """A forked call's entry writes of `CANCELLING_LEVELS` (`cancelling_entries`): keys `[R, D, 7, Hk, K]`,
+    values `[R, D, 7, H, V]` and weights `[R, D, H]`, and `signed(shape)`, a cotangent of that shape of one
+    power of two a draw, each element's sign drawn."""
+
+    key: np.ndarray
+    value: np.ndarray
+    weight: np.ndarray
+    signed: Callable[[tuple[int, ...]], np.ndarray]
+
+
+def cancelling_entries(seed: int, rows: int, documents: int, key_heads: int, keys: int, heads: int,
+                       values: int) -> Entries:
+    """Entry writes of `CANCELLING_LEVELS`' seven products on their keys' first dimension for a forked call
+    of `rows` rows of `documents` documents each over the forked tests' table (a row whose later documents
+    enter its first's final, a row a chain), as its route and its oracle read them alike: each value column
+    scaled by a drawn sign and a power of two of 2^-28 to 2^-33 a draw, so even a row's three writes' terms
+    sum inside float32's range, as the gates' sums must (testing.md's derivative contracts), their ties
+    kept; weights of another, signed so every memory a document enters is zero, one or two writes (the
+    chain's last weight its middle one's negated); and cotangents (`Entries.signed`) of one power of two a
+    draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds once, as float64's."""
+    rng = np.random.default_rng([8840, seed])
+    factors, levels = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
+    key = np.zeros((rows, documents, len(factors), key_heads, keys), np.float32)
+    key[..., 0] = factors[:, None]
+    columns = rng.choice([-1.0, 1.0], (heads, values)) * 2.0 ** -int(rng.integers(28, 34))
+    value = np.broadcast_to(levels[:, None, None] * columns, (rows, documents, len(levels), heads, values))
+    signs = rng.choice([-1.0, 1.0], (rows, documents, heads))
+    signs[1, 2] = -signs[1, 1]
+    scale = 2.0 ** -int(rng.integers(10, 15))
+
+    def signed(shape):
+        return (rng.choice([-1.0, 1.0], shape) * scale).astype(np.float32)
+
+    weight = signs * 2.0 ** -int(rng.integers(0, 4))
+    return Entries(key, value.astype(np.float32), weight.astype(np.float32), signed)
+
+
+def exactly_rounded(truth_fn) -> Callable:
+    """`truth_fn`'s float64 truth rounded once to float32, an arm run as given (`arm_forms.as_given`),
+    computed where and as check 1 computes a truth (`on_float64_device`, `widened`: a TPU's on its host, whose
+    float64 it emulates): the reference of draws whose truth float32 holds exactly or rounds once, which Dew
+    must equal."""
+    from arm_forms import as_given
+
+    def rounded(*inputs):
+        with jax.enable_x64(new_val=True), on_float64_device():
+            truth = truth_fn(*widened(inputs))
+        return jax.tree.map(lambda leaf: np.asarray(leaf, np.float32), truth)
+
+    return as_given(rounded)
 
 
 class LessFinite(AssertionError):

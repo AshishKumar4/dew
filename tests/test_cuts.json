@@ -880,10 +880,10 @@
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm120-128]",
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm86-128]",
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm86-64]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_over_every_call_form[causal-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_over_the_core_s_other_call_forms[cross-block-causal-window]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[gate-bfloat16-natural]",
-"tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-causal-Tiles(block_q=64, block_k=32, warps=4, stages=2)]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two[80-48-triton]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_over_the_core_s_other_call_forms[causal-window-valid]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[all-float32-natural]",
+"tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-causal-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
 "tests/test_attention_triton.py::test_the_plain_backward_is_on_par_over_runs[runs-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]"
 ],
 "tests/test_attention_witness.py": [
