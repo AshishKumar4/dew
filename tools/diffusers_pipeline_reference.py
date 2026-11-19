@@ -17,15 +17,19 @@ import flax_precision
 import jax
 import jax.numpy as jnp
 import numpy as np
-from diffusers import (
-    FlaxAutoencoderKL,
-    FlaxDDIMScheduler,
+from diffusers.models.unets.unet_2d_condition_flax import FlaxUNet2DConditionModel
+from diffusers.models.vae_flax import FlaxAutoencoderKL
+from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion import FlaxStableDiffusionPipeline
+from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_img2img import (
     FlaxStableDiffusionImg2ImgPipeline,
-    FlaxStableDiffusionInpaintPipeline,
-    FlaxStableDiffusionPipeline,
-    FlaxStableDiffusionXLPipeline,
-    FlaxUNet2DConditionModel,
 )
+from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion_inpaint import (
+    FlaxStableDiffusionInpaintPipeline,
+)
+from diffusers.pipelines.stable_diffusion_xl.pipeline_flax_stable_diffusion_xl import (
+    FlaxStableDiffusionXLPipeline,
+)
+from diffusers.schedulers.scheduling_ddim_flax import FlaxDDIMScheduler
 from PIL import Image
 from reference_releases import require
 from transformers import CLIPTextConfig, CLIPTokenizer, FlaxCLIPTextModel, FlaxCLIPTextModelWithProjection
@@ -124,7 +128,7 @@ def build(directory, task):
                                      "time_ids": jnp.asarray([[32, 32, 0, 0, 32, 32]])}
         arrays["prediction"] = unet.apply({"params": params["unet"]}, noise, jnp.asarray([10]),
             encoder_hidden_states=arrays["hidden"], added_cond_kwargs=added).sample.transpose(0, 2, 3, 1)
-    np.savez_compressed(directory / "reference.npz", **arrays)
+    np.savez_compressed(directory / "reference.npz", allow_pickle=False, **arrays)
     print(json.dumps({"task": task, "directory": str(directory), "reference": pins["diffusers"],
                       "transformers": pins["transformers"], "backend": jax.default_backend(),
                       "images_sum": float(np.asarray(output.images).sum())}))

@@ -145,7 +145,7 @@ def write_hybrid() -> None:
             dump[f"step{step}/param:{name}"] = parameter.detach().numpy().astype(np.float32)
     dump["base_rates"] = np.asarray(rates)
     dump["groups"] = np.asarray(json.dumps(membership))
-    np.savez_compressed(OUT / "hybrid.npz", **dump)
+    np.savez_compressed(OUT / "hybrid.npz", allow_pickle=False, **dump)
     print("hybrid: lm", lm.item(), "aux", float(out.aux_loss))
 
 

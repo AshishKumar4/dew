@@ -86,7 +86,7 @@ SEED = 31
 
 
 def build(config: dict, root: Path) -> dict[str, np.ndarray]:
-    from diffusers import AutoencoderDC
+    from diffusers.models.autoencoders.autoencoder_dc import AutoencoderDC
 
     torch.manual_seed(SEED)
     generator = torch.Generator().manual_seed(SEED)
@@ -163,7 +163,7 @@ def main(destination: str, variants: list[str]) -> None:
     releases = json.loads(held.read_text()).get("releases", {}) if held.exists() else {}
     for name in variants:
         arrays = build(CONFIGS[name], root / name)
-        np.savez_compressed(root / name / "reference.npz", **arrays)
+        np.savez_compressed(root / name / "reference.npz", allow_pickle=False, **arrays)
         releases[name] = release
     record = {"releases": releases, "configs": CONFIGS, "batch": BATCH, "height": HEIGHT, "width": WIDTH,
               "small": SMALL, "seed": SEED}

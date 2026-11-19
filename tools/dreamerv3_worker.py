@@ -116,6 +116,7 @@ if __name__ == "__main__":
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
     if sys.argv[2:3] == ["--layout"]:
         shapes = SITES[sys.argv[1]]()[1]()
-        np.savez(sys.argv[3], **{path: np.asarray(shape) for path, shape in shapes.items()})
+        np.savez(sys.argv[3], allow_pickle=False,
+                 **{path: np.asarray(shape) for path, shape in shapes.items()})
     else:
         serve(lambda cases: answered(cases, functools.partial(applying, sys.argv[1])))

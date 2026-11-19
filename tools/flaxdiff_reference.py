@@ -107,8 +107,8 @@ def main(argv=None) -> None:
          "jax_version": jax.__version__}, indent=1) + "\n")
     arrays = {f"params/{name}": np.asarray(leaf)
               for name, leaf in flatten_dict(params["params"], sep="/").items()}
-    np.savez(out / "reference.npz", **arrays, fourier_table=table, x=x, temb=temb, text=text,
-             text_mask=mask, output=output)
+    np.savez(out / "reference.npz", allow_pickle=False, **arrays, fourier_table=table, x=x, temb=temb,
+             text=text, text_mask=mask, output=output)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import sysconfig
 import tomllib
 import types
 from collections.abc import Iterable, Mapping
@@ -188,11 +189,11 @@ def common() -> bytes:
 
 
 def key(path: Path, requirements: Iterable[str], shared: bytes) -> str:
-    """Tool `path`'s verdict's key: `shared` (`common`), its environment (its requirements, or Dew's lock
-    where it names none) and the code of its `closure`, each file by its path and bytes."""
+    """Tool `path`'s verdict's key: `shared` (`common`), its environment (its requirements, and Dew's lock,
+    whose environment every one reads beneath its own: `made`) and the code of its `closure`, each file by its
+    path and bytes."""
     digest = hashlib.sha256(shared)
-    held = list(requirements)
-    digest.update(json.dumps(held).encode() if held else (ROOT / "locks" / "cpu.txt").read_bytes())
+    digest.update(json.dumps(list(requirements)).encode() + (ROOT / "locks" / "cpu.txt").read_bytes())
     for each in closure(path):
         digest.update(each.relative_to(ROOT).as_posix().encode() + each.read_bytes())
     return digest.hexdigest()
@@ -211,12 +212,12 @@ published."""
 
 
 def made(requirements: list[str]) -> Path:
-    """The interpreter of the environment holding exactly `requirements`, made once under `ENVIRONMENTS` by
-    their digest (a torch from its CPU index, a CUDA extension's build skipped, as pyright reads only its
-    Python); a failed install raises CalledProcessError. A repository pin (`SOURCE`) is never built: it is
-    fetched at its commit beside the environment and put on its path by a .pth file, as its site puts the
-    checkout on its worker's path, which pyright reads as the environment's own; its own dependencies are
-    the cohort's other pins."""
+    """The interpreter of the environment holding `requirements` over Dew's own, made once under
+    `ENVIRONMENTS` by their digest (a torch from its CPU index, a CUDA extension's build skipped, as pyright
+    reads only its Python); a failed install raises CalledProcessError. A repository pin (`SOURCE`) is never
+    built: it is fetched at its commit beside the environment and put on its path by a .pth file, as its
+    site puts the checkout on its worker's path, which pyright reads as the environment's own; its own
+    dependencies are the cohort's other pins."""
     where = ROOT / ENVIRONMENTS / hashlib.sha256(json.dumps(requirements).encode()).hexdigest()[:16]
     python = where / "bin" / "python"
     if (where / "made").is_file():
@@ -233,6 +234,9 @@ def made(requirements: list[str]) -> Path:
     purelib = "import sysconfig; print(sysconfig.get_paths()['purelib'])"
     site = subprocess.run([str(python), "-c", purelib], capture_output=True, text=True,
                           check=True).stdout.strip()
+    # Dew's environment beneath its own (a .pth is read after the environment's own packages): a reference
+    # tool runs Dew's side and the reference's in one file, each in its own interpreter, and imports both.
+    Path(site, "_tool_types_dew.pth").write_text(f"{sysconfig.get_paths()['purelib']}\n")
     for source in filter(None, map(SOURCE.match, requirements)):
         checkout = where / "sources" / source["name"]
         subprocess.run(["git", "init", "--quiet", str(checkout)], check=True)

@@ -16,19 +16,23 @@ from pathlib import Path
 import jax
 import numpy as np
 import torch
-from diffusers import (
-    AutoencoderKL,
-    DDIMScheduler,
-    FlaxStableDiffusionPipeline,
-    FlaxStableDiffusionXLPipeline,
-    FlaxUNet2DConditionModel,
-    StableDiffusionPipeline,
-    StableDiffusionXLImg2ImgPipeline,
-    StableDiffusionXLInpaintPipeline,
-    UNet2DConditionModel,
-)
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.models.modeling_pytorch_flax_utils import load_flax_checkpoint_in_pytorch_model
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+from diffusers.models.unets.unet_2d_condition_flax import FlaxUNet2DConditionModel
+from diffusers.pipelines.stable_diffusion.pipeline_flax_stable_diffusion import FlaxStableDiffusionPipeline
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
+from diffusers.pipelines.stable_diffusion_xl.pipeline_flax_stable_diffusion_xl import (
+    FlaxStableDiffusionXLPipeline,
+)
+from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import (
+    StableDiffusionXLImg2ImgPipeline,
+)
+from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_inpaint import (
+    StableDiffusionXLInpaintPipeline,
+)
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from flax import serialization
 from flax.traverse_util import flatten_dict, unflatten_dict
 from PIL import Image
@@ -144,7 +148,7 @@ def build(base, directory, task):
         decoded = pipe.vae.decode(final / pipe.vae.config.scaling_factor, return_dict=False)[0]
         arrays.update(final_latents=final.permute(0, 2, 3, 1).numpy(),
                       images=(decoded / 2 + 0.5).clamp(0, 1).permute(0, 2, 3, 1).numpy())
-    np.savez_compressed(directory / "reference.npz", **arrays)
+    np.savez_compressed(directory / "reference.npz", allow_pickle=False, **arrays)
     (directory / "reference.json").write_text(json.dumps(meta))
     print(task, "saved official PyTorch pipeline; latent sum", float(final.sum()))
 
