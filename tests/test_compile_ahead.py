@@ -141,6 +141,35 @@ def capacity_gib(room: int) -> str:
     return str(memory_limited_to(room) / 2**30)
 
 
+def test_a_background_compile_takes_no_slot_a_step_waits_for():
+    """One compile slot (`report.CompileSlots`), held: a background compile (a start's program, `options
+    .compiling`) and a step's then wait for it, and when it frees the step's takes it first, the background
+    one only once no step's waits."""
+    import threading
+    import time
+
+    from dew.nn.kernels.templates.report import CompileSlots
+
+    slots, order = CompileSlots(1), []
+
+    def compile_(name, background):
+        with slots.held(background=background):
+            order.append(name)
+
+    with slots.held(background=False):
+        waiting = [threading.Thread(target=compile_, args=(name, name == "start"))
+                   for name in ("start", "step")]
+        for thread in waiting:
+            thread.start()
+        # The step's compile waiting before the slot frees: its order is the slots', not the threads'.
+        deadline = time.monotonic() + 10
+        while not slots._waiting and time.monotonic() < deadline:
+            time.sleep(0.01)
+    for thread in waiting:
+        thread.join(timeout=10)
+    assert order == ["step", "start"], order
+
+
 def test_a_program_compiled_ahead_runs_in_place_of_compiling():
     """A program compiled ahead over its arguments' shapes runs where a call of it lowers that program
     (`dew.nn.kernels.options.taking`, by its digest): the call compiles nothing and answers as the program
@@ -188,10 +217,10 @@ begun, ended = threading.Event(), threading.Event()
 compiled = report.attempted
 
 
-def attempted(lowered, held):
+def attempted(lowered, held, **given):
     begun.set()
     try:
-        return compiled(lowered, held)
+        return compiled(lowered, held, **given)
     finally:
         ended.set()
 
