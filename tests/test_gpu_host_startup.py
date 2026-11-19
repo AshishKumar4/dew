@@ -16,7 +16,6 @@ pytestmark = pytest.mark.gpu(reason="the host step's accelerator runs on the GPU
 COMMON = """
 import logging
 import re
-import threading
 
 import jax.numpy as jnp
 import numpy as np
@@ -29,7 +28,8 @@ TOKENS = np.stack([np.arange(row, row + 9) % 256 for row in range(1)]).astype(np
 class Keyed(logging.Handler):
     \"\"\"Each program JAX keys its persistent cache by, as it logs them: its module's name, whether the cache
     held it, and the hash of each part of its key (the computation, the backend's version, the compile
-    options, the accelerator's config, ...), gathered by the thread that keyed it.\"\"\"
+    options, the accelerator's config, ...), gathered by the thread that keyed it. Its records are taken one
+    at a time under the handler's own lock (`logging.Handler.handle`), which `emit` runs within.\"\"\"
 
     PART = re.compile(r"get_cache_key hash of serialized (.+): ([0-9a-f]+)$")
     READ = re.compile(r"(Persistent compilation cache hit|PERSISTENT COMPILATION CACHE MISS) for '(.+)' "
@@ -37,15 +37,14 @@ class Keyed(logging.Handler):
 
     def __init__(self):
         super().__init__(logging.DEBUG)
-        self.programs, self.parts, self.lock = [], {}, threading.Lock()
+        self.programs, self.parts = [], {}
 
     def emit(self, record):
         message, thread = record.getMessage(), record.thread
-        with self.lock:
-            if part := self.PART.match(message):
-                self.parts.setdefault(thread, {})[part[1]] = part[2]
-            elif read := self.READ.match(message):
-                self.programs.append([read[2], read[1].startswith("Persistent"), self.parts.pop(thread, {})])
+        if part := self.PART.match(message):
+            self.parts.setdefault(thread, {})[part[1]] = part[2]
+        elif read := self.READ.match(message):
+            self.programs.append([read[2], read[1].startswith("Persistent"), self.parts.pop(thread, {})])
 
 
 KEYED = Keyed()

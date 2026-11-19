@@ -94,16 +94,15 @@ def unaligned_widths_run_on_the_template(depth: int, width: int, *, interpret: b
     itself too (tests/test_gpu_gemm.py's cell), where a TMA family runs a product's last step and column
     tile partial (`mosaic_gpu.partial_runs`), its loads past the call zero-filled, interpreted padded to
     whole tiles (`grouped_matmul._Mosaic._aligned`), as the kernel gradient is everywhere."""
+    from reference_error import ahead_arm
+
     sizes = [70, 0, 129, 57]
     starts = np.cumsum([0, *sizes])
-    keys = jax.random.split(jax.random.key(4), 3)
-
-    def ints(key, shape):
-        return jax.random.randint(key, shape, -1, 2).astype(jnp.bfloat16)
-
-    x, w, dy = ints(keys[0], (sum(sizes), depth)), ints(keys[1], (len(sizes), depth, width)), ints(
-        keys[2], (sum(sizes), width))
-    group_sizes = jnp.asarray(sizes, jnp.int32)
+    # NumPy's, as a site's draws are: a GPU tier's prepare computes on no device.
+    rng = np.random.default_rng(4)
+    x, w, dy = (rng.integers(-1, 2, shape).astype(jnp.bfloat16)
+                for shape in ((sum(sizes), depth), (len(sizes), depth, width), (sum(sizes), width)))
+    group_sizes = np.asarray(sizes, np.int32)
     options = {"out_dtype": jnp.float32, "precision": "default", "interpret_on_cpu": interpret}
 
     def grouped(lhs, matrices):
@@ -111,18 +110,21 @@ def unaligned_widths_run_on_the_template(depth: int, width: int, *, interpret: b
                                for g, (a, b) in enumerate(itertools.pairwise(starts))])
 
     calls = {
-        "grouped forward": (lambda: gemm.gemm(x, w, group_sizes, **options), grouped(x, w)),
-        "grouped input gradient": (lambda: gemm.gemm(dy, w, group_sizes, transpose_rhs=True, **options),
-                                   grouped(dy, jnp.swapaxes(w, 1, 2))),
-        "grouped kernel gradient": (lambda: gemm.gemm_t(x, dy, group_sizes, **options), np.stack(
+        "grouped forward": (lambda x, w, dy: gemm.gemm(x, w, group_sizes, **options), grouped(x, w)),
+        "grouped input gradient": (
+            lambda x, w, dy: gemm.gemm(dy, w, group_sizes, transpose_rhs=True, **options),
+            grouped(dy, np.swapaxes(w, 1, 2))),
+        "grouped kernel gradient": (lambda x, w, dy: gemm.gemm_t(x, dy, group_sizes, **options), np.stack(
             [np.asarray(x[a:b], np.float32).T @ np.asarray(dy[a:b], np.float32)
              for a, b in itertools.pairwise(starts)])),
-        "dense forward": (lambda: gemm.gemm(x, w[0], None, **options),
+        "dense forward": (lambda x, w, dy: gemm.gemm(x, w[0], None, **options),
                           np.asarray(x, np.float32) @ np.asarray(w[0], np.float32)),
     }
-    # Every product one program, traced and compiled once (bible §8), each one's launch the template's.
+    # Every product one program, traced and compiled once, in a tier's prepare (bible §8, `ahead_arm`), each
+    # one's launch the template's.
+    products = jax.jit(lambda x, w, dy: tuple(call(x, w, dy) for call, _ in calls.values()))
     with generation.chosen(grouped_matmul="mosaic"), generation.routes() as routes:
-        got = jax.jit(lambda: tuple(call() for call, _ in calls.values()))()
+        got = ahead_arm(products, f"unaligned widths {depth}x{width}")(x, w, dy)
     launched = [route.kernel for route in routes if route.choice == "grouped_matmul"]
     assert len(launched) >= len(calls) and set(launched) == {"mosaic"}, launched
     for (name, (_, expected)), value in zip(calls.items(), got, strict=True):
