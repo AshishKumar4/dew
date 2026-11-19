@@ -583,6 +583,24 @@ def test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it(
     assert_finite_where_float64_is(operands, seeded, hooks)
 
 
+def test_a_live_spans_decay_that_underflows_reads_its_memory_as_the_recurrence():
+    """A two-token call of one document under log decays of -80 (each live, their span's `exp(-160)` zero in
+    float32), a NaN memory entering, unit queries, zero keys and values: its output NaN where the recurrence
+    a token at a time reads NaN, on the portable math, where the readout's select took a decay rounded to
+    zero for a document's start and read zero (row 8560's head review)."""
+    hooks = HOOKS[6]
+    (operands,) = draw(hooks, packed=False, seed=0, length=2)
+    names = [name for name in ('key', 'value') if getattr(operands, name) is not None]
+    operands = dataclasses.replace(operands, query=jnp.ones_like(operands.query),
+                                   log_decay=jnp.full_like(operands.log_decay, -80.0),
+                                   state=jnp.full_like(operands.state, jnp.nan),
+                                   starts=jnp.zeros(operands.value.shape[:2], bool),
+                                   **{name: jnp.zeros_like(getattr(operands, name)) for name in names})
+    out, _ = chunk_on('xla', hooks, operands, chunk_size=CHUNK)
+    reference, _ = token_by_token(hooks, operands)
+    np.testing.assert_array_equal(np.isnan(np.asarray(out)), np.isnan(np.asarray(reference)))
+
+
 def test_a_turned_calls_cotangent_near_the_largest_across_documents_keeps_every_gradient_finite():
     """Two one-token turned documents, zero queries, keys, turns and log decays, unit write gates, values of
     two and output cotangents of 2^127: its output and every gradient finite wherever float64's is a normal
