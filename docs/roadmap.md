@@ -92,6 +92,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
+- Objective.init and Trainer.initial_state, called outside a trace, run the model's draw eagerly, so every operation compiles alone. [8682]
+- step_fits reads each device's allocator (step_headroom, Device.memory_stats) before its agreement. [8767]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 
@@ -137,5 +139,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
+- A GPU node's run of a kernel-marked CPU-suite cell fails for want of CUDA 13's ptxas. [8769]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
