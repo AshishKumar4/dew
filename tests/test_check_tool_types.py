@@ -35,7 +35,8 @@ def gate(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(("declared", "cohorts"), [
     ('COHORTS = "torch"', ("torch",)), ('COHORTS = ["transformers", "torch"]', ("torch", "transformers")),
-    ('COHORTS: dict = {"a": "torch", "b": ["transformers"]}', ("torch", "transformers")), ("X = 1", None)])
+    ('COHORTS: dict = {"a": "torch", "b": ["transformers"]}', ("torch", "transformers")),
+    ('COHORT = "torch"', ("torch",)), ("X = 1", None)])
 def test_a_tools_cohorts_are_read_from_its_module_level_cohorts(gate, tmp_path, declared, cohorts) -> None:
     (tmp_path / "tools" / "t.py").write_text(f"import os\n{declared}\n")
     assert gate.cohorts_of(tmp_path / "tools" / "t.py") == cohorts

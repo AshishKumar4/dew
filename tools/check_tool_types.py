@@ -73,7 +73,7 @@ def cohorts_of(path: Path) -> tuple[str, ...] | None:
             targets, expression = [node.target], node.value
         else:
             continue
-        if any(isinstance(target, ast.Name) and target.id == "COHORTS" for target in targets):
+        if any(isinstance(target, ast.Name) and target.id in ("COHORT", "COHORTS") for target in targets):
             value = ast.literal_eval(expression)
             values = value.values() if isinstance(value, dict) else [value]
             return tuple(sorted({name for each in values
@@ -100,7 +100,7 @@ def environment_of(path: Path, pins: Mapping[str, Mapping[str, str]]) -> tuple[s
     raises ValueError, naming them."""
     header = header_of(path)
     if header is not None:
-        return f"script:{path.as_posix()}", sorted(header.get("dependencies", []))
+        return f"script:{path.relative_to(ROOT).as_posix()}", sorted(header.get("dependencies", []))
     cohorts = cohorts_of(path)
     if not cohorts:
         return DEW, []
