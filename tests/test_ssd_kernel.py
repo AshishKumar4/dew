@@ -451,27 +451,28 @@ def test_documents_entering_their_own_states_scan_as_each_alone():
 
 def levels_documents_draw(seed: int):
     """`documents_draw`'s forked call whose documents' entry writes are `CANCELLING_LEVELS`' seven products on
-    the state's first key, each value column's scaled by a drawn sign and one power of two a draw, under
-    weights of another, signed so every state a row's documents enter is zero, one or two writes (its chain's
-    last document's weight its middle one's negated); no input, no decay, and each step's state's first key
-    read by a unit reader. Its cotangents are of one power of two, signed: its output, last state and entry
-    writes' gradients each a sum float32 holds exactly or rounds once, as float64's is."""
+    the state's first key, each value column's scaled by a drawn sign and a power of two of 2^-28 to 2^-33 a
+    draw, so even a row's three writes' terms sum inside float32's range, as the gate's sums must, their ties
+    kept; under weights of another, signed so every state a row's documents enter is zero, one or two writes
+    (its chain's last document's weight its middle one's negated); no input, no decay, and each step's
+    state's first key read by a unit reader. Its cotangents are of one power of two, signed: its output, last
+    state and entry writes' gradients each a sum float32 holds exactly or rounds once, as float64's is."""
     (x, b, c, a, given, key, value, weight), (out, last) = documents_draw(seed)
     rng = np.random.default_rng([8840, seed, 2])
     keys, values = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
     rows, documents, _, heads, width = value.shape
     entry_key = np.zeros((rows, documents, len(keys), heads, key.shape[-1]))
     entry_key[..., 0] = keys[:, None]
-    columns = rng.choice([-1.0, 1.0], (heads, width)) * 2.0 ** -int(rng.integers(1, 9))
+    columns = rng.choice([-1.0, 1.0], (heads, width)) * 2.0 ** -int(rng.integers(28, 34))
     signs = rng.choice([-1.0, 1.0], weight.shape)
     signs[1, 2] = -signs[1, 1]
-    scale = 2.0 ** -int(rng.integers(10, 16))
+    scale = 2.0 ** -int(rng.integers(10, 15))
     reader = jnp.zeros_like(c).at[..., 0].set(1.0)
     operands = (jnp.zeros_like(x), jnp.zeros_like(b), reader, jnp.zeros_like(a), jnp.zeros_like(given),
                 jnp.asarray(entry_key, jnp.float32),
                 jnp.asarray(np.broadcast_to(values[:, None, None] * columns,
                                             (rows, documents, len(values), heads, width)), jnp.float32),
-                jnp.asarray(signs * 2.0 ** -int(rng.integers(1, 9)), jnp.float32))
+                jnp.asarray(signs * 2.0 ** -int(rng.integers(0, 4)), jnp.float32))
     return operands, tuple(jnp.asarray(rng.choice([-1.0, 1.0], t.shape) * scale, jnp.float32)
                            for t in (out, last))
 
@@ -480,8 +481,8 @@ def test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel():
     """The TPU kernel over a forked call whose documents' entry writes are three levels cancelling beside
     float32's largest (`levels_documents_draw`): its output, the row's last state and its entry keys',
     values' and weights' gradients held by check 1 against each document scanned alone a step at a time in
-    float64, rounded once (exact, so the kernel must be: a write summed in some order dropped -2^103 at a tie
-    as 2^103 survived, inf, row 8757; row 8840)."""
+    float64, rounded once (exact, so the kernel must be: a write summed in some order dropped a level at its
+    tie as its negative survived, an ulp here and inf at float32's largest, row 8757; row 8840)."""
     def leaves(scan):
         def run(operands, seeded):
             output, *gradients = with_gradients(scan)(*operands, seeded)
@@ -496,7 +497,7 @@ def test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel():
             return wide(*jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded)))
 
     rounded = as_given(lambda operands, seeded: jax.tree.map(np.float32, truth(operands, seeded)))
-    assert_as_exact(without_ynn(leaves(documents_on_the_kernel)), rounded, levels_documents_draw,
+    assert_as_exact(leaves(documents_on_the_kernel), rounded, levels_documents_draw,
                     "the TPU kernel's forked call's entry writes of cancelling levels", seeds=8,
                     truth_fn=truth)
 
