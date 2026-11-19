@@ -28,7 +28,7 @@ def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path
 
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.templates import report
-    from dew.training.ahead import compile_programs
+    from dew.training.ahead import AheadPrograms, BuildTarget, compile_programs
 
     serialized = tmp_path / "topology.bin"
     serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
@@ -65,6 +65,18 @@ def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path
     read = compile_programs({"conv": (convolved, [image, kernel]),
                              "dot": (lambda x, y: x @ y, [square, square])}, "sm80", memory_only=True)
     assert read.at_run == ("conv",)
+    # Saved and loaded, as a process of their target takes them, at the autotuner's level 0 (where an
+    # untuned file is taken): the file holding the convolution is refused, its product alone's is loaded
+    # (row 8785). This host's own target stands for the GPU's.
+    here = BuildTarget.of(jax.devices()[:1])
+    for name, at_run, loads in (("conv", ("conv",), False), ("dot", (), True)):
+        dataclasses.replace(read, target=here, programs={}, at_run=at_run).save(tmp_path / f"{name}.dew-aot")
+        handed = AheadPrograms.load(tmp_path / f"{name}.dew-aot")
+        if loads:
+            assert handed.loaded() == {}
+        else:
+            with pytest.raises(ValueError):
+                handed.loaded()
 
 
 class ConvolvedStart(LMObjective):
