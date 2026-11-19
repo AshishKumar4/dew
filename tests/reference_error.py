@@ -802,12 +802,12 @@ def _shaped_truth(truth, wide):
     where the gate runs it as it is (`_given`), computed on the host's CPU, else its shapes alone (a window
     loop's on one window), no float64 computed."""
     if _given(truth):
-        # On the host's CPU, its inputs placed there: a GPU part's prepare computes nothing on its default
-        # device, a compile-only GPU (an eager operation there raised "'Executable' object has no attribute
-        # 'local_devices'", and its test ran unprepared, row 4881's class).
-        host = jax.devices("cpu")[0]
-        with jax.default_device(host):
-            return truth(*jax.device_put(wide, host))
+        # On the host's CPU, its inputs as the gate hands them (NumPy's, which a torch truth reads as they
+        # are): a GPU part's prepare computes nothing on its default device, a compile-only GPU (an eager
+        # operation there raised "'Executable' object has no attribute 'local_devices'", and its test ran
+        # unprepared, row 4881's class).
+        with jax.default_device(jax.devices("cpu")[0]):
+            return truth(*wide)
     if isinstance(truth, _Windowed):
         return jax.eval_shape(unrewritten(truth.fn), *jax.tree.map(lambda leaf: leaf[0], wide))
     return jax.eval_shape(unrewritten(truth), *wide)

@@ -124,10 +124,10 @@ def _device() -> str:
 def _deferred(label: str, text: str, frames: list[tuple[str, int]]) -> bool:
     """Whether a cell that raised is deferred to its run (`run_cells`): in a GPU tier part's prepare
     (`tier_wire.preparing`, its store `truths_ahead.COMPILED`), where nothing computes, a cell computing past
-    the programs its prepare holds raises, and is recorded unprepared there (`truths_ahead.unprepared`, where
-    it raised and why), as a test computing before its first site is (tests/conftest.py), its run computing
-    and judging it: a flow's other cells' sites prepared, its failure in the prepare turned the test red
-    (rows 8505 and 8506)."""
+    the programs its prepare holds raises, and is recorded deferred there (`truths_ahead.DEFERRED`, where it
+    raised and why), its run computing and judging it with the flow's other cells served by the store, and
+    naming the test unprepared (tests/conftest.py): a flow's other cells' sites prepared, its failure in the
+    prepare turned the test red (rows 8505 and 8506)."""
     import os
 
     import tier_wire
@@ -137,7 +137,8 @@ def _deferred(label: str, text: str, frames: list[tuple[str, int]]) -> bool:
     if not tier_wire.preparing() or store is None or not store.prepare:
         return False
     test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
-    truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {text.splitlines()[-1][:400]}")
+    truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {text.splitlines()[-1][:400]}",
+                            truths_ahead.DEFERRED)
     print(f"cell deferred to its run: {label}", flush=True)
     return True
 

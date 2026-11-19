@@ -211,11 +211,11 @@ def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_pa
 
 def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path, monkeypatch):
     """In a GPU tier part's prepare (`tier_wire.preparing`, its store open), a cell that raises, computing
-    where nothing computes, is recorded unprepared, where it raised (`truths_ahead.UNPREPARED`), and the flow
+    where nothing computes, is recorded deferred, where it raised (`truths_ahead.DEFERRED`), and the flow
     passes its prepare, its other cells run; outside a prepare the same cell fails its flow (rows 8505 and
     8506: such a cell beside a flow's prepared sites turned its test red in the prepare)."""
     import tier_wire
-    from truths_ahead import UNPREPARED, compiled_truths
+    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths
 
     def computing():
         raise AttributeError("'jaxlib._jax.Executable' object has no attribute 'local_devices'")
@@ -225,7 +225,8 @@ def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path
     monkeypatch.setenv(tier_wire.PREPARE, "1")
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
         run_cells(flow)
-    assert ran == ["prepared"] and (tmp_path / UNPREPARED).is_file()
+    # Recorded deferred, never unprepared, which would take the test's run off its store (tests/conftest.py).
+    assert ran == ["prepared"] and (tmp_path / DEFERRED).is_file() and not (tmp_path / UNPREPARED).exists()
     monkeypatch.delenv(tier_wire.PREPARE)
     with pytest.raises(CellsFailed) as raised:
         run_cells(flow)

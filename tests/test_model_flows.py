@@ -654,7 +654,7 @@ def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
 @pytest.mark.mesh(devices=2)
 def test_a_truth_run_as_given_computes_on_the_host_in_a_prepare(tmp_path, monkeypatch):
     """A site whose float64 truth the gate runs as given (`as_given`: host work, NumPy, torch) has its value
-    read in its prepare (`_shaped_truth`) on the host's CPU, its inputs placed there, wherever the store's
+    read in its prepare (`_shaped_truth`) on the host's CPU, its inputs NumPy's, wherever the store's
     device is: a GPU part's prepare computes nothing on its default device, a compile-only GPU, where the
     truth's eager operations raised "'Executable' object has no attribute 'local_devices'" and the test ran
     unprepared (row 4881's class: a compensated primitive's site, the audio encoders' cells)."""
@@ -665,9 +665,8 @@ def test_a_truth_run_as_given_computes_on_the_host_in_a_prepare(tmp_path, monkey
     placed = []
 
     def truth(a, b):
-        # Where its eager operations run, and where its inputs are (NumPy's, unplaced, none).
-        placed.append((jax.config.jax_default_device,
-                       {device for x in (a, b) for device in getattr(x, "devices", set)()}))
+        # Where its eager operations run, and its inputs as the gate hands them (NumPy's, a torch truth's).
+        placed.append((jax.config.jax_default_device, {type(x) for x in (a, b)}))
         return reference(a, b)
 
     # The store's device another than the host's first, as a GPU part's compile-only GPU is.
@@ -675,7 +674,7 @@ def test_a_truth_run_as_given_computes_on_the_host_in_a_prepare(tmp_path, monkey
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(dew, reference, draw, "a product of a given truth", seeds=8, truth_fn=as_given(truth))
     host = jax.devices("cpu")[0]
-    assert placed and all(device == host and on == {host} for device, on in placed)
+    assert placed and all(device == host and kinds == {np.ndarray} for device, kinds in placed)
 
 
 @pytest.mark.mesh(devices=2)
@@ -683,8 +682,9 @@ def test_a_host_placed_arm_is_prepared_and_run_on_the_host(tmp_path, monkeypatch
     """A site-free arm placed on the host's CPU (`ahead_arm(host=True)`: a GPU host's CPU-placed computation,
     row 8376's) is traced in its prepare placed on the host's CPU, whatever the store's device (a GPU part's
     compile-only GPU), and compiled for it; its run, in a process listing another device first as a GPU's
-    does, computes it from that program, tracing none, the same values as computing it."""
-    from truths_ahead import CompiledTruths
+    does, computes it from that program, tracing none, the same values as computing it; the memory a store
+    files for its devices (`truths_ahead.compiled_memory`) holds none of it."""
+    from truths_ahead import CompiledTruths, compiled_memory
 
     traced = []
 
@@ -697,8 +697,11 @@ def test_a_host_placed_arm_is_prepared_and_run_on_the_host(tmp_path, monkeypatch
     monkeypatch.setattr(CompiledTruths, "device", lambda store: jax.devices()[1])
     with compiled_truths(tmp_path, prepare=True, stamp="a"):
         ahead_arm(jax.jit(scaled), "a host-placed product", host=True)(a, b)
-    # Traced, and retraced where its compile lowers it, on the host's CPU alone.
-    assert traced and set(traced) == {host}
+        # Traced, and retraced where its compile lowers it, on the host's CPU alone.
+        assert traced and set(traced) == {host}
+        ahead_arm(jax.jit(lambda a, b: a * b), "a device product")(a, b)
+    # The store's needs its devices' programs' alone: none of the host's arm (the review).
+    assert len(compiled_memory(tmp_path, arms=True)) == 1
     traced.clear()
     listed = jax.devices
     monkeypatch.setattr(jax, "devices", lambda backend=None: listed(backend) if backend else listed()[1:])

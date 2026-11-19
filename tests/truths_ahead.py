@@ -66,6 +66,10 @@ UNPREPARED = "unprepared.json"
 first reason, the GPU tier's list of unprepared tests read from these alone (a ledger row each, the
 tier's)."""
 
+DEFERRED = "deferred.json"
+"""A test's record, in its store, of a GPU flow's cell its prepare deferred to its run (`unprepared`'s, as
+`UNPREPARED`'s), which its run serves from the store beside it and then records unprepared."""
+
 
 def named(role: str, inputs) -> str:
     """A program's name in its site's store: its `role` and its inputs' tree, shapes, dtypes and weak types,
@@ -155,7 +159,7 @@ class CompiledTruths:
         memory = {name: executable.memory._asdict() for name, executable in built.programs.items()
                   if executable.memory is not None}
         (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
-                                             "arms": arms}))
+                                             "arms": arms, "host": host}))
 
     def _compiled(self, programs: Mapping[str, tuple[Callable, Sequence]], compiled: Callable | None,
                   host: bool = False):
@@ -233,9 +237,11 @@ def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, in
     """Every program of a store's sites (`compiled_truths`, prepared), its truths' or, with `arms`, its
     arms' (`CompiledTruths.compile_site`), as its compile analysed its memory
     (`dew.telemetry.instrumentation.CompiledMemory`, as its fields name it), its sites' record's; none for
-    a program whose backend stated none."""
+    a program whose backend stated none, nor for one compiled for the host's CPU (`compile_site`'s `host`),
+    which holds none of the devices' memory."""
     records = (json.loads(site.read_text()) for site in Path(directory).glob(f"*/{SITE}"))
-    return [memory for record in records if record.get("arms", False) == arms
+    return [memory for record in records
+            if record.get("arms", False) == arms and not record.get("host", False)
             for memory in record.get("memory", {}).values()]
 
 
@@ -367,12 +373,15 @@ def running() -> tuple[CompiledTruths, str] | None:
     return store, label
 
 
-def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str) -> None:
+def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str,
+               record: str = UNPREPARED) -> None:
     """The one writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
     compiling a site or an arm on its devices with every site judged: its node id, where (`frames`, innermost
     first, `(file, line)`: the first of the test's own file, else the test's file), and the first reason it
-    gives, a record already written kept (a prepare's, before its run's)."""
-    record = directory / UNPREPARED
+    gives, a record already written kept (a prepare's, before its run's). Under `DEFERRED`, a GPU flow's cell
+    its prepare deferred to its run (`gpu_flow.run_cells`), which its run's store still serves, and which
+    the run names unprepared (tests/conftest.py's `compiled_ahead`)."""
+    record = directory / record
     if record.exists():
         return
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
