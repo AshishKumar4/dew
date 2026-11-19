@@ -60,6 +60,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
+from dew import _cgroups
 from dew._cleanup import exit_code, groups_ended, process_group, signal_group
 from dew._files import inside
 from dew._records import JSON, finite
@@ -556,14 +557,16 @@ _DEFAULT_LIMITS = SandboxLimits()
 class SandboxFleet:
     """Runs programs on `workers` sandboxed workers at once.
 
-    `runner` defaults to a `ProcessRunner` and `workers` to the CPU count.
+    `runner` defaults to a `ProcessRunner` and `workers` to the CPUs this process may use, its affinity and
+    container quota (`dew._cgroups.usable_cpus`), read where the fleet is built.
     Use it as a context manager, or call `close`, which waits for the
     running programs and cancels the queued ones. `submit` returns a future
     at once, and programs wait in a queue while every worker is busy.
     """
 
     def __init__(self, runner: Runner = _DEFAULT_RUNNER, *, limits: SandboxLimits = _DEFAULT_LIMITS,
-                 workers: int = os.cpu_count() or 1):
+                 workers: int | None = None):
+        workers = _cgroups.usable_cpus() if workers is None else workers
         if type(workers) is not int or workers < 1:
             raise ValueError("a fleet needs at least one worker")
         self.runner, self.limits = runner, limits

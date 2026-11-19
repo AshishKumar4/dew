@@ -875,6 +875,24 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     assert priced.price.value > unmeasured.price.value
 
 
+def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
+    """A `lax.dot_general` of a bfloat16 and a float16 matrix, no preferred type stated, priced at the dtype
+    JAX makes it (`terms.product_dtype`, its traced result's, which the region records as its stated type),
+    its result kept on chip at two bytes an element beside its leaves' (`Work.kept_bytes`); NumPy's
+    promotion of the pair, which it refuses, raised there (base review 0b8b7ed98 F1). A bare product heads no
+    rewrite window, so `dew.jit` alone never prices it (`test_algebra_fusion`'s witness holds its value)."""
+    def product(a, b):
+        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
+
+    a, b = jnp.ones((2, 3), jnp.bfloat16), jnp.ones((3, 4), jnp.float16)
+    region = terms.region(jax.make_jaxpr(product)(a, b))
+    graph, bundle, _ = program.graphed(region)
+    work = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                         cost_model=cost.model(region, cost.fused(generation.TARGETS["v5e"])))[1].work
+    made = jax.eval_shape(product, a, b).dtype.itemsize
+    assert work.kept_bytes == 2 * (2 * 3 + 3 * 4) + 2 * made * (2 * 4)
+
+
 @pytest.mark.parametrize("apart", [0, 1, 4], ids=["as written", "a group of one", "apart from its group"])
 def test_a_token_loops_states_are_kept_each_token(apart):
     """A scan's token loop keeps its state on chip each token, written and read (`Work.kept_bytes`, row
@@ -885,7 +903,7 @@ def test_a_token_loops_states_are_kept_each_token(apart):
     c, k, v = 16, 32, 64
     work = linear_scan._work(linear_scan.Chunk.plain(linear_scan.Chunk.token("U")),
                              linear_scan.Extents(c, k, v, 1, apart=apart), lambda value: (0, 0), None)
-    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * cost.LANE_BYTES * k * v
+    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * 4 * k * v
 
 
 def test_device_memory_is_priced_at_the_parts_measured_stream():
