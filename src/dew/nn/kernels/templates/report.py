@@ -1109,11 +1109,16 @@ def at_run_time(lowered: jax.stages.Lowered) -> bool:
     devices = target_devices(lowered)
     if DEVICELESS_CONVOLUTION_PICKS or not devices or not deviceless(next(iter(devices))):
         return False
+    return any_op(lowered, lambda op: op.name == "stablehlo.convolution")
+
+
+def any_op(lowered: jax.stages.Lowered, holds: Callable[[ir.Operation], bool]) -> bool:
+    """Whether an operation of `lowered`'s StableHLO `holds`, its walk stopped at the first."""
     found = False
 
     def visit(op: ir.Operation) -> ir.WalkResult:
         nonlocal found
-        found = op.name == "stablehlo.convolution"
+        found = holds(op)
         return ir.WalkResult.INTERRUPT if found else ir.WalkResult.ADVANCE
 
     module = lowered.compiler_ir("stablehlo")
@@ -1301,32 +1306,27 @@ def triton_wrong(lowered: jax.stages.Lowered, target: generation.GpuTarget) -> b
     from dew.nn.precision import FP32_PRODUCTS, declares_fp32_products
     from dew.nn.programs import algorithm_arithmetic, dot_arithmetic
 
-    wrong = False
-
-    def visit(op: ir.Operation) -> ir.WalkResult:
-        nonlocal wrong
+    def wrong(op: ir.Operation) -> bool:
         if op.name != "stablehlo.dot_general":
-            return ir.WalkResult.ADVANCE
+            return False
         types = [ir.RankedTensorType(operand.type).element_type for operand in list(op.operands)[:2]]
         if any(isinstance(each, ir.IntegerType) and ir.IntegerType(each).width == 8 for each in types):
-            wrong = not target.int8_triton_gemm
-        elif all(isinstance(each, ir.F32Type) for each in types):
-            attributes = op.attributes
-            if "precision_config" in attributes:
-                # Each operand's precision as JAX's enum names it, the pair read as a run's precision is.
-                lhs, rhs = (jax.lax.Precision[stablehlo.PrecisionAttr(each).value]
-                            for each in ir.ArrayAttr(attributes["precision_config"]))
-                wrong = declares_fp32_products((lhs, rhs))
-            if not wrong and "algorithm" in attributes:
-                stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
-                wrong = any(stated == dot_arithmetic(name, jnp.float32, jnp.float32)
-                            for name in FP32_PRODUCTS)
-        return ir.WalkResult.INTERRUPT if wrong else ir.WalkResult.ADVANCE
+            return not target.int8_triton_gemm
+        if not all(isinstance(each, ir.F32Type) for each in types):
+            return False
+        attributes = op.attributes
+        if "precision_config" in attributes:
+            # Each operand's precision as JAX's enum names it, the pair read as a run's precision is.
+            lhs, rhs = (jax.lax.Precision[stablehlo.PrecisionAttr(each).value]
+                        for each in ir.ArrayAttr(attributes["precision_config"]))
+            if declares_fp32_products((lhs, rhs)):
+                return True
+        if "algorithm" in attributes:
+            stated = algorithm_arithmetic(stablehlo.DotAlgorithm(attributes["algorithm"]))
+            return any(stated == dot_arithmetic(name, jnp.float32, jnp.float32) for name in FP32_PRODUCTS)
+        return False
 
-    module = lowered.compiler_ir("stablehlo")
-    assert module is not None, "a lowered program states its StableHLO module"
-    module.operation.walk(visit)
-    return wrong
+    return any_op(lowered, wrong)
 
 
 def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]]
