@@ -1265,6 +1265,19 @@ def test_an_aligned_sum_in_a_tpu_kernel_lowers_for_a_tpu(x64):
     assert any(found.target == "tpu_custom_call" for found in custom_calls(lowered))
 
 
+def test_an_aligned_sums_tangent_over_four_factors_and_2_28_terms_traces():
+    """The tangent of `aligned_sum([(x, x, x, x)], axis=0)` along `x` for fp32 `x` of 2^28 terms, lowered:
+    its four terms' 2^30 products take digits the integers hold beside their carries, each term carried as
+    it is added, where one sum of all 2^30 was refused (base review 5a5cb5c98 F2, row 8757)."""
+    x = jax.ShapeDtypeStruct((2 ** 28,), jnp.float32)
+
+    def tangent(x):
+        return jax.jvp(lambda x: aligned_sum([(x, x, x, x)], axis=0), (x,), (x,))[1]
+
+    lowered = jax.jit(tangent).trace(x).lower()
+    assert lowered.out_info.shape == (1,)
+
+
 def test_an_aligned_sum_over_an_empty_axis_is_positive_zero():
     """`aligned_sum` over an empty fp32 axis: positive zero, IEEE's sum of no terms, where a sum of none
     counted as of negative zeros alone, negative zero (base review 6c68b90ad F4)."""
