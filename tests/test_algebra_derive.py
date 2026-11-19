@@ -271,15 +271,57 @@ def unnormalized(q, k, v, rows, keys):
     return jnp.sum(jnp.exp(s - jnp.max(s, axis=-1)[:, None]), axis=-1)
 
 
-def test_an_anchor_of_an_output_its_sums_scale_is_refused():
-    """A declaration whose output is a sum its maximum weighs (`unnormalized`) is refused a moved anchor at
-    its step (`derive.Refused`): an anchor 1 below the maximum finished `1 + e` where it is `1 + e^-1` (the
-    base review of 9745e74f0, F2); attention's ratio of two such sums takes one (above)."""
-    forms = derive.derive(declared(unnormalized), accurate=False, saturation=SATURATION)
+def guarded_backwards(q, k, v, rows, keys):
+    """Attention over a denominator guarded the wrong way round, `where(S == 0, S, 1)`: 1 wherever it holds
+    weight, so the output is the weighted values' sum, which an anchor scales."""
+    del rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    p = jnp.exp(s - jnp.max(s, axis=-1)[:, None])
+    total = jnp.sum(p, axis=-1)
+    return (p @ v) / jnp.where(total == 0, total, 1.0)[:, None]
+
+
+def guarded_signed(q, k, v, rows, keys):
+    """A weighted values' sum over a signed sum of them guarded where positive, `where(S > 0, S, 1)`: 1
+    where the signed sum is negative, which an anchor then scales the numerator past."""
+    del rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    p = jnp.exp(s - jnp.max(s, axis=-1)[:, None])
+    summed = p @ v
+    signed = summed[:, 0]
+    return summed / jnp.where(signed > 0, signed, 1.0)[:, None]
+
+
+def guarded(q, k, v, rows, keys):
+    """Attention over its weights' sum guarded where zero, `where(S == 0, 1, S)` (`softmax_of`'s)."""
+    del rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    p = jnp.exp(s - jnp.max(s, axis=-1)[:, None])
+    total = jnp.sum(p, axis=-1)
+    return (p @ v) / jnp.where(total == 0, 1.0, total)[:, None]
+
+
+@pytest.mark.parametrize("function", [unnormalized, guarded_backwards, guarded_signed],
+                         ids=["a sum", "a guard backwards", "a signed guard"])
+def test_an_anchor_of_an_output_its_sums_scale_is_refused(function):
+    """A declaration whose output its sums' anchor scales is refused a moved anchor at its step
+    (`derive.Refused`): a sum its maximum weighs (an anchor 1 below the maximum finished `1 + e` where it is
+    `1 + e^-1`, the base review of 9745e74f0, F2), a guard taken the wrong way round, and a guard of a signed
+    sum (the review of de9fbec82's `_anchored`, F1, F2)."""
+    forms = derive.derive(declared(function), accurate=False, saturation=SATURATION)
     values = operands(*draw(0))
     tile = tile_of(values, 0)
     with pytest.raises(derive.Refused):
         forms.step(forms.init(shaped(tile)), tile, anchor=lambda old, exact: exact - 1)
+
+
+def test_a_guarded_attention_at_a_lazy_anchor_computes_the_declared_function():
+    """Attention over its weights' sum guarded where zero (`guarded`, `softmax_of`'s) takes a lazy anchor and,
+    finished, is on par with the whole-operand function (check 1): the guard of a sum of weights alone is read
+    at that sum's degree (`derive._selected_degree`)."""
+    forms = derive.derive(declared(guarded), accurate=False, saturation=SATURATION)
+    assert_as_exact(jax.jit(lazy_whole(forms)), jax.jit(whole(guarded)), near_peaks,
+                    "guarded attention at a lazy anchor", seeds=16)
 
 
 def test_a_declaration_closing_over_a_typed_key_derives():
