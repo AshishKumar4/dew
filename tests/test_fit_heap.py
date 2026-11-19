@@ -97,9 +97,10 @@ def test_a_compile_mid_fit_collects_before_the_steps_after_it():
     from dew.data.pipeline import Pipeline
 
     rng = np.random.default_rng(0)
-    x = rng.normal(size=(64, 3)).astype(np.float32)
-    loader = ramped(compile(Pipeline(Memory({"x": x, "y": 2 * x[:, :2]})).repeat().batch(8),
-                            loading=Loading(workers=0)), Ramp(start=4, increment=4, samples=8))
+    x = rng.normal(size=(128, 3)).astype(np.float32)
+    # Its rows a multiple of the devices' at every stage: eight, then sixteen.
+    loader = ramped(compile(Pipeline(Memory({"x": x, "y": 2 * x[:, :2]})).repeat().batch(16),
+                            loading=Loading(workers=0)), Ramp(start=8, increment=8, samples=16))
     tracker = Reported()
     trainer = make_trainer(tracker=tracker)
     tracker.events = events = []

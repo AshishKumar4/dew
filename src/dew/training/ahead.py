@@ -747,7 +747,7 @@ class AheadPrograms:
         return {name: program.loaded(devices) for name, program in self.programs.items()}
 
 
-def _saved[Saved](path: str | Path, kind: type[Saved], what: str) -> Saved:
+def _saved[Saved: (AheadOfTime, AheadPrograms)](path: str | Path, kind: type[Saved], what: str) -> Saved:
     """What a `save` of `kind` wrote to `path`, refused where it is not one (`what` it holds), or where it
     was saved by a Dew whose `kind` held fewer fields than this one's (a pickle restores those it held
     alone, and a field's class default would stand in for what it never said: rows 8459, 8759)."""
