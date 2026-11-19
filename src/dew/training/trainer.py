@@ -2301,16 +2301,17 @@ class Trainer(Generic[Loss, Effects]):
             # A process whose reader changed a field or a shape would compile
             # a program whose collectives its peers' never meet.
             agreed_same("training batch layout", lambda: batch_layout(batch))
-            began = time.perf_counter()
+            began, held = time.perf_counter(), sys.getallocatedblocks()
             with region("compile"), run.held():
                 compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
             seconds = time.perf_counter() - began
-            # Python's collector walks its whole heap at a full collection, which CPython 3.12 runs once the
-            # objects made since the last outnumber a quarter of those it kept: a compile makes millions
-            # (its traces, its lowered programs' Python side), so the first full collection after it walked
-            # them all inside the loop, 0.75 to 0.9 s at a step of the 4B (row 6739). Collected
-            # here, where the step is compiled, each later one waits for the run to make a quarter as many.
-            gc.collect()
+            # A full collection walks the whole heap; CPython 3.12 runs one once the objects made since
+            # outnumber a quarter of those kept (Modules/gcmodule.c: long_lived_pending < long_lived_total / 4
+            # skips it). A compile makes millions, so the first after it walked them in the loop, 0.75-0.9 s
+            # at a 4B step (row 6739); collected here unless the compile made fewer (a program held already:
+            # a warm 3-step fit's collection took 0.48 s of 0.72).
+            if sys.getallocatedblocks() - held > held // 4:
+                gc.collect()
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
             run.signatures[signature] = signature_digest(signature)
