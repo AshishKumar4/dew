@@ -516,7 +516,7 @@ def _filled(self: _Interpreter, body: gathered.Filled, values, located) -> None:
 
 INLINED: dict[type, Callable] = {gathered.Initialized: _initialized, gathered.Waited: _waited,
                                  gathered.Gathers: _gathers, gathered.Filled: _filled,
-                                 across.LaneZero: _unsynchronized}
+                                 across.LaneZero: _unsynchronized, across.ScaleSmem: _unsynchronized}
 """Each inlined body a checked kernel takes (`plgpu.inline_mgpu`'s function, by its type), as the `Event`s
 its fields and its operands state: the arrivals a phase of the barriers a gathered ring initializes, its
 parity waits at a turn's rotation, and its load warps' gathers. A body of no synchronization (a fence, a
