@@ -335,7 +335,7 @@ def compiled_ahead(request):
         yield
         return
     import model_flows
-    from truths_ahead import UNPREPARED, compiled_truths
+    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths, reasoned
 
     if not tier_wire.preparing():
         record = store / UNPREPARED
@@ -346,6 +346,12 @@ def compiled_ahead(request):
             return
         with compiled_truths(store, prepare=False, stamp=model_flows.stamp()):
             yield
+        # A flow's cells its prepare deferred (`gpu_flow.run_cells`) ran unprepared beside its served ones,
+        # each named.
+        if (store / DEFERRED).exists():
+            deferred = json.loads((store / DEFERRED).read_text())
+            for reason in deferred["reasons"]:
+                reasoned(record, deferred["test"], reason["where"], reason["error"])
         if record.exists():
             # A site its prepare did not reach, or an arm no statement names, ran unprepared
             # (`truths_ahead.running`).

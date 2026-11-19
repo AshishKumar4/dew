@@ -111,3 +111,24 @@ def test_a_prepared_sites_arms_report_the_routes_their_unprepared_run_reports(tm
     unprepared = reported()
     reported(prepare=True)
     assert unprepared and reported(prepare=False) == unprepared, unprepared
+
+
+def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed():
+    """`arm_forms.without_ynn` takes XLA:CPU's options (WITHOUT_YNN) where the context places its calls on a
+    CPU, and none where it places them on a GPU, whatever the process's default backend: a GPU tier part's
+    prepare, a CPU process placing on its compile-only GPU, builds the arm its run on the GPU builds, which
+    the gate's statement names alike (`truths_ahead.arm_role`); keyed on the default backend, the prepare's
+    arm held YNNPACK's options and its run's none, and the run found no program (MissingTruth, the review of
+    row 8075's conversion)."""
+    from arm_forms import without_ynn
+    from truths_ahead import arm_role
+
+    def scaled(x):
+        return x * 2.0
+
+    plain = arm_role("dew", jax.jit(scaled), "a scaled arm")
+    with jax.default_device("gpu"):
+        on_a_gpu = arm_role("dew", without_ynn(scaled), "a scaled arm")
+    with jax.default_device("cpu"):
+        on_a_cpu = arm_role("dew", without_ynn(scaled), "a scaled arm")
+    assert on_a_gpu == plain != on_a_cpu

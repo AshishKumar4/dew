@@ -704,12 +704,18 @@ def _stored_arms(store: CompiledTruths, label: str, dew_fn, reference_fn, also: 
 def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str):
     """A site's arm `role` (`given_fn` as the site passed it, `arm` as compiled) whose every call is its
     draw's program its prepare compiled into `store` (`_ahead_arm`), named as its prepare named it; one no
-    statement holds runs unprepared, named, and one that holds no program as it is (`_stored_arms`)."""
+    statement holds, or whose site's arms its prepare did not finish (its truths written, a failure before
+    its arms': a flow's cell its prepare deferred, `gpu_flow.run_cells`), runs unprepared, named, and one
+    that holds no program as it is (`_stored_arms`)."""
     if not _holds_program(given_fn):
         return arm
     named_role = arm_role(role, given_fn, label)
     if named_role is None:
         store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
+        return arm
+    if not store.holds(armed(label)):
+        store.unprepared(f"{label}: its {role} arm ran unprepared: its prepare wrote the site's truths and "
+                         "compiled none of its arms")
         return arm
     return _ahead_arm(given_fn, arm, functools.partial(store.ran, armed(label)), named_role)
 
@@ -799,10 +805,15 @@ def _held_walk(programs: dict, held: dict, fn, wide) -> None:
 
 def _shaped_truth(truth, wide):
     """`truth` on widened inputs `wide` as `_of_float64` reads it, its leaves' dtypes and sizes: its value
-    where the gate runs it as it is (`_given`), else its shapes alone (a window loop's on one window), no
-    float64 computed."""
+    where the gate runs it as it is (`_given`), computed on the host's CPU, else its shapes alone (a window
+    loop's on one window), no float64 computed."""
     if _given(truth):
-        return truth(*wide)
+        # On the host's CPU, its inputs as the gate hands them (NumPy's, which a torch truth reads as they
+        # are): a GPU part's prepare computes nothing on its default device, a compile-only GPU (an eager
+        # operation there raised "'Executable' object has no attribute 'local_devices'", and its test ran
+        # unprepared, row 4881's class).
+        with jax.default_device(jax.devices("cpu")[0]):
+            return truth(*wide)
     if isinstance(truth, _Windowed):
         return jax.eval_shape(unrewritten(truth.fn), *jax.tree.map(lambda leaf: leaf[0], wide))
     return jax.eval_shape(unrewritten(truth), *wide)
@@ -1876,38 +1887,49 @@ def declared_seeds(path) -> dict[str, int]:
             if name.endswith(".seeds")}
 
 
-def ahead_arm(fn: Callable, label: str) -> Callable:
+def ahead_arm(fn: Callable, label: str, *, host: bool = False) -> Callable:
     """`fn` (a function of arrays: a test's computation with no check-1 site, a bitwise check's kernel run on
     the GPU) as an arm with no site, through the arms' own path: within a GPU tier part's prepare (`COMPILED`,
     a store that prepares) its call is traced and compiled at its inputs' shapes as a site's arms are
     (`_arm_program` in the store's `tracing`, `_arm_compile`, held under `armed(label)` by Dew's statement of
     it, `arm_role`) and gives zeros of its outputs' shapes, nothing computing there (a test's later failure
     in its prepare, past its stored program, judges nothing); in its run its call is that executable
-    (`CompiledTruths.ran`), tracing, lowering and compiling none; outside a part, `fn` itself. One no
-    statement holds, or one its prepare did not reach, runs unprepared, recorded and named (`unprepared`,
-    as `running` records a site). One call a label: a second in one prepare is refused, as a second site
-    of one label is (`compile_site`). Its inputs are host arrays, NumPy's: a prepare's default device
-    computes nothing, not even their placement (bible §8)."""
+    (`CompiledTruths.ran`), tracing, lowering and compiling none; outside a part, `fn` itself. With `host`,
+    its call is placed on the host's CPU, its program traced and compiled for it and run there (a GPU host's
+    CPU-placed computation, row 8376's). One no statement holds, or one its prepare did not reach, runs
+    unprepared, recorded and named (`unprepared`, as `running` records a site). One call a label: a second in
+    one prepare is refused, as a second site of one label is (`compile_site`). Its inputs are host arrays,
+    NumPy's: a prepare's default device computes nothing, not even their placement (bible §8)."""
+    def unprepared(*inputs):
+        if not host:
+            return fn(*inputs)
+        cpu = jax.devices("cpu")[0]
+        with jax.default_device(cpu):
+            return fn(*jax.device_put(inputs, cpu))
+
     def called(*inputs):
         store = COMPILED.get()
         if store is None:
-            return fn(*inputs)
+            return unprepared(*inputs)
         role = arm_role("dew", fn, label)
         if role is None:
             store.unprepared(f"{label}: its arm has no statement of what it computes")
-            return fn(*inputs)
+            return unprepared(*inputs)
         if store.prepare:
             programs: dict = {}
             held: dict = {}
-            with store.tracing():
-                shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
-            store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True), arms=True)
+            # A host-placed arm traced, and retraced where its compile lowers it, on the host's CPU.
+            with jax.default_device(jax.devices("cpu")[0]) if host else contextlib.nullcontext():
+                with contextlib.nullcontext() if host else store.tracing():
+                    shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
+                store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True),
+                                   arms=True, host=host)
             # Zeros of the shapes its own trace gave, in the store's tracing: a jit of its own compiler
             # options traced again inside another, `eval_shape`'s, was refused.
             return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)
         if not store.holds(armed(label)):
             store.unprepared(f"{label}: its prepare did not reach this arm")
-            return fn(*inputs)
+            return unprepared(*inputs)
         return store.ran(armed(label), role, inputs)
 
     return called

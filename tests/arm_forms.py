@@ -159,17 +159,21 @@ def switched_off() -> dict:
 
 
 def without_ynn(fn, **jit_options):
-    """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
-    (`jax.default_backend()`), and plain `jax.jit` elsewhere: how the gate compiles both arms of a
+    """`fn` jitted with WITHOUT_YNN on the CPU lane, where the context places a call
+    (`generation.placed_platform`: a GPU tier part's prepare, a CPU process, places on its compile-only
+    GPU, and its run on the GPU, so both build one arm, which their statements name alike), and plain
+    `jax.jit` elsewhere: how the gate compiles both arms of a
     check 1 between two Dew paths (`_arms`), such as an interpreted kernel and the XLA program it
     replaces, so that the two run the same kind of code on any host. A program Dew's users run compiles
     with the fusions, as they do. On the CPU lane its compiler options refuse to be nested in another
     jit, differentiated through or batched, so the gate compiles an arm whole; a site passes its arms
     as functions and never calls this. A caller's own compiler options take precedence over
     WITHOUT_YNN's; `fn` already compiled so is returned as it is."""
+    from dew.nn.kernels.generation import placed_platform
+
     if getattr(fn, "without_ynn", False):
         return fn
-    if jax.default_backend() == "cpu":
+    if placed_platform() == "cpu":
         jit_options["compiler_options"] = {**switched_off(), **(jit_options.get("compiler_options") or {})}
     compiled = jax.jit(fn, **jit_options)
     compiled.without_ynn = True
@@ -401,7 +405,9 @@ def _ynn_decided(label: str, arms, inputs) -> None:
     pairings = {arm.pairing for arm in _paired_arms(arms)}
     if not pairings or all(pairing.decided for pairing in pairings):
         return
-    if jax.default_backend() != "cpu":
+    from dew.nn.kernels.generation import placed_platform
+
+    if placed_platform() != "cpu":
         # YNNPACK's fusions are XLA:CPU's: elsewhere an arm compiles one way (`without_ynn`), and a compile
         # ahead to decide them would be its second.
         for pairing in pairings:
@@ -431,12 +437,14 @@ def _mode_of(arms) -> str | None:
 
 
 def _with_ynn_off(fn):
-    """`fn` run with Dew's compile seam holding WITHOUT_YNN open on the CPU lane (`dew_programs`)."""
+    """`fn` run with Dew's compile seam holding WITHOUT_YNN open on the CPU lane, where the context places
+    the call (`dew_programs`, `generation.placed_platform`)."""
+    from dew.nn.kernels.generation import placed_platform
     from dew.nn.kernels.options import compiled_with
 
     @functools.wraps(fn)
     def run(*inputs, **options):
-        with compiled_with(switched_off() if jax.default_backend() == "cpu" else {}):
+        with compiled_with(switched_off() if placed_platform() == "cpu" else {}):
             return fn(*inputs, **options)
     return run
 

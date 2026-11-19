@@ -652,6 +652,142 @@ def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_truth_run_as_given_computes_on_the_host_in_a_prepare(tmp_path, monkeypatch):
+    """A site whose float64 truth the gate runs as given (`as_given`: host work, NumPy, torch) has its value
+    read in its prepare (`_shaped_truth`) on the host's CPU, its inputs NumPy's, wherever the store's
+    device is: a GPU part's prepare computes nothing on its default device, a compile-only GPU, where the
+    truth's eager operations raised "'Executable' object has no attribute 'local_devices'" and the test ran
+    unprepared (row 4881's class: a compensated primitive's site, the audio encoders' cells)."""
+    from arm_forms import as_given
+    from truths_ahead import CompiledTruths
+
+    dew, reference, draw = _site()
+    placed = []
+
+    def truth(a, b):
+        # Where its eager operations run, and its inputs as the gate hands them (NumPy's, a torch truth's).
+        placed.append((jax.config.jax_default_device, {type(x) for x in (a, b)}))
+        return reference(a, b)
+
+    # The store's device another than the host's first, as a GPU part's compile-only GPU is.
+    monkeypatch.setattr(CompiledTruths, "device", lambda store: jax.devices()[1])
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product of a given truth", seeds=8, truth_fn=as_given(truth))
+    host = jax.devices("cpu")[0]
+    assert placed and all(device == host and kinds == {np.ndarray} for device, kinds in placed)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_host_placed_arm_is_prepared_and_run_on_the_host(tmp_path, monkeypatch):
+    """A site-free arm placed on the host's CPU (`ahead_arm(host=True)`: a GPU host's CPU-placed computation,
+    row 8376's) is traced in its prepare placed on the host's CPU, whatever the store's device (a GPU part's
+    compile-only GPU), and compiled for it; its run, in a process listing another device first as a GPU's
+    does, computes it from that program, tracing none, the same values as computing it; the memory a store
+    files for its devices (`truths_ahead.compiled_memory`) holds none of it."""
+    from truths_ahead import CompiledTruths, compiled_memory
+
+    traced = []
+
+    def scaled(a, b):
+        traced.append(jax.config.jax_default_device)
+        return a * b + 1.0
+
+    a, b = (np.arange(6, dtype=np.float32).reshape(2, 3) + offset for offset in (1.0, 0.5))
+    host = jax.devices("cpu")[0]
+    monkeypatch.setattr(CompiledTruths, "device", lambda store: jax.devices()[1])
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        ahead_arm(jax.jit(scaled), "a host-placed product", host=True)(a, b)
+        # Traced, and retraced where its compile lowers it, on the host's CPU alone.
+        assert traced and set(traced) == {host}
+        ahead_arm(jax.jit(lambda a, b: a * b), "a device product")(a, b)
+    # The store's needs its devices' programs' alone: none of the host's arm (the review).
+    assert len(compiled_memory(tmp_path, arms=True)) == 1
+    traced.clear()
+    listed = jax.devices
+    monkeypatch.setattr(jax, "devices", lambda backend=None: listed(backend) if backend else listed()[1:])
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        ran = ahead_arm(jax.jit(scaled), "a host-placed product", host=True)(a, b)
+    assert not traced and np.asarray(ran).tolist() == (a * b + 1.0).tolist()
+
+
+CHILD_ARM = """
+import json
+import jax
+import numpy as np
+from reference_error import ahead_arm
+from test_model_flows import CHILD_TRACED, child_scaled
+from truths_ahead import of_the_parent
+
+a = np.arange(6, dtype=np.float32)
+with of_the_parent():
+    made = ahead_arm(jax.jit(child_scaled), "a child's product")(a, a)
+print(json.dumps({"traced": len(CHILD_TRACED), "made": np.asarray(made).tolist()}))
+"""
+"""A child process's site-free arm (`test_a_child_process_prepares_and_runs_from_its_tests_store`), a function
+of this module, which its statement names (`truths_ahead.arm_role`)."""
+
+CHILD_TRACED: list[None] = []
+"""Each trace of `child_scaled` in its process."""
+
+
+def child_scaled(a, b):
+    """A child process's arm (`CHILD_ARM`), its traces counted."""
+    CHILD_TRACED.append(None)
+    return a * b + 1.0
+
+
+def test_a_child_process_prepares_and_runs_from_its_tests_store(tmp_path):
+    """A computation that needs a process of its own (a backend option set once a process: the approximate
+    divider's), run in a child of its test, opens its test's store (`truths_ahead.for_a_child`,
+    `of_the_parent`): in the test's prepare it traces and compiles its arm into that store, giving zeros;
+    in the test's run it computes the arm from that program, tracing none, its sites the test's, none of
+    them unprepared."""
+    from process_support import fresh
+    from truths_ahead import for_a_child
+
+    a = np.arange(6, dtype=np.float32)
+    with compiled_truths(tmp_path, prepare=True, stamp="a"):
+        prepared = fresh(CHILD_ARM, variables=for_a_child())
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        ran = fresh(CHILD_ARM, variables=for_a_child())
+    assert prepared["traced"] and prepared["made"] == [0.0] * 6
+    assert ran == {"traced": 0, "made": (a * a + 1.0).tolist()} and not (tmp_path / UNPREPARED).exists()
+
+
+def test_a_site_whose_prepare_ended_before_its_arms_runs_them_unprepared(tmp_path, monkeypatch):
+    """A site whose prepare wrote its truths and then failed before its arms' (a flow's cell its prepare
+    deferred, `gpu_flow.run_cells`, its store still serving the run) runs its arms unprepared in its run,
+    recorded, judging the site as one computing its own does, where its run found no program
+    (`MissingTruth`, the review)."""
+    import reference_error
+
+    dew, reference, draw = _site()
+    with compiled_truths(tmp_path, prepare=True, stamp="a"), monkeypatch.context() as failing:
+        def ended(*arguments, **options):
+            raise RuntimeError("the prepare ended before the site's arms")
+
+        failing.setattr(reference_error, "_compile_arms", ended)
+        with pytest.raises(RuntimeError):
+            assert_as_exact(dew, reference, draw, "a product whose arms went unprepared", seeds=8)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        assert_as_exact(dew, reference, draw, "a product whose arms went unprepared", seeds=8)
+    assert (tmp_path / UNPREPARED).is_file()
+
+
+def test_a_tests_unprepared_record_names_every_reason(tmp_path):
+    """A test's record that it ran unprepared (`truths_ahead.UNPREPARED`) holds every reason it gave, each
+    once, its first's its own: two site-free arms no prepare reached, the first called twice, are two
+    reasons, where the record kept the first alone and hid the rest (Main: their count shows a tier
+    drifting from its prepares)."""
+    a = np.arange(6, dtype=np.float32)
+    with compiled_truths(tmp_path, prepare=False, stamp="a"):
+        for label in ("an unreached product", "an unreached product", "another unreached product"):
+            ahead_arm(jax.jit(lambda x: x * 2.0), label)(a)
+    record = json.loads((tmp_path / UNPREPARED).read_text())
+    assert len(record["reasons"]) == 2 and record["reasons"][0]["error"] == record["error"]
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_walk_its_values_steer_runs_on_the_host_in_a_prepared_run(tmp_path, monkeypatch):
     """A site sized by its truth's terms (`terms=True`) whose float64 truth takes a branch its values pick
     (`lax.cond` on its operands), its terms' walk held by its prepare as one its run walks

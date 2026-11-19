@@ -121,15 +121,38 @@ def _device() -> str:
     return jax.devices()[0].device_kind
 
 
+def _deferred(label: str, text: str, frames: list[tuple[str, int]]) -> bool:
+    """Whether a cell that raised is deferred to its run (`run_cells`): in a GPU tier part's prepare
+    (`tier_wire.preparing`, its store `truths_ahead.COMPILED`), where nothing computes, a cell computing past
+    the programs its prepare holds raises, and is recorded deferred there (`truths_ahead.DEFERRED`, where it
+    raised and why), its run computing and judging it with the flow's other cells served by the store, and
+    naming the test unprepared (tests/conftest.py): a flow's other cells' sites prepared, its failure in the
+    prepare turned the test red (rows 8505 and 8506)."""
+    import os
+
+    import tier_wire
+    import truths_ahead
+
+    store = truths_ahead.COMPILED.get()
+    if not tier_wire.preparing() or store is None or not store.prepare:
+        return False
+    test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+    truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {text.splitlines()[-1][:400]}",
+                            truths_ahead.DEFERRED)
+    print(f"cell deferred to its run: {label}", flush=True)
+    return True
+
+
 def run_cells(cells: Iterable[Cell]) -> list[str]:
     """Run every cell in order (`Cell`): each label printed first; every failure kept and raised together
-    after the last; the cells this device cannot run, or that skip themselves, reported skipped, their
+    after the last, but in a GPU tier part's prepare, where a cell that computes is deferred to its run
+    (`_deferred`); the cells this device cannot run, or that skip themselves, reported skipped, their
     labels returned; an outermost flow's counts reported (`REPORTED`)."""
     global _depth
     _depth += 1
     failed: list[tuple[str, str, list[tuple[str, int]]]] = []
     skipped: list[str] = []
-    passed = 0
+    passed = deferred = 0
     try:
         for cell in cells:
             if cell.generation is not None and not (lowers_as if cell.mosaic else runnable)(cell.generation):
@@ -145,7 +168,11 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 # A cell's failure is any exception, pytest's own among them (`pytest.fail`, and a
                 # `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end
                 # the flow: kept with its label, and raised with every other cell's after the last.
-                failed.append((cell.label, *_reported(error)))
+                text, frames = _reported(error)
+                if _deferred(cell.label, text, frames):
+                    deferred += 1
+                else:
+                    failed.append((cell.label, text, frames))
             else:
                 passed += 1
     finally:
@@ -157,7 +184,8 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     print(f"cells: {passed} passed, {len(failed)} failed, {len(skipped)} skipped on this device", flush=True)
     if failed:
         raise CellsFailed(failed)
-    if not passed:
+    # A flow whose cells its prepare deferred runs them in its run, never skipped for its prepare's skip.
+    if not passed and not deferred:
         pytest.skip(f"no cell runs on this device ({len(skipped)} skipped)")
     return skipped
 
