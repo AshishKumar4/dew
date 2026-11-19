@@ -1000,11 +1000,10 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     if identifier is None and (found := assumption()) is not None and found.target is not None:
         return found.target
     if identifier is None:
-        import jax
-        device = jax.local_devices()[0]
+        device = placed_device()
         real = device.platform == 'gpu' and assumption() is None
         if real and gpu_placed():
-            _one_kind(jax.devices())
+            _one_kind(_run_devices())
         return _resolved(device, device_generation(), real)
     if identifier in TARGETS:
         return TARGETS[identifier]
@@ -1203,8 +1202,9 @@ def _driver_facts(ordinal: int, read: Callable[[int, int], int | None]) -> tuple
 
 def _one_kind(devices) -> None:
     """Refuse a run whose processes read their facts from GPUs of different kinds: every process traces
-    the same program, so the kernel choices each makes from its first GPU's facts (`gpu_target`) must be
-    the same, which first GPUs of one kind give. A process's other GPUs take no part."""
+    the same program, so the kernel choices each makes from the first GPU it places a call on
+    (`gpu_target`, `placed_device`) must be the same, which first GPUs of one kind give. A process's other
+    GPUs take no part."""
     first = {}
     for device in sorted(devices, key=lambda device: device.id):
         first.setdefault(device.process_index, device.device_kind)
@@ -1275,7 +1275,7 @@ def device_generation() -> str:
         return found.generation
     if (platform := placed_platform()) != jax.default_backend():
         return platform
-    return _generation(jax.local_devices()[0])
+    return _generation(placed_device())
 
 
 def _generation(device) -> str:
@@ -1327,18 +1327,16 @@ class GpuFacts:
 
 def gpu_facts(part: str | None = None) -> GpuFacts:
     """The facts Dew's kernels read of a GPU (`GpuFacts`), read from the target they resolve, never a copy
-    of it: this process's GPU's where `part` is None, what its driver reports of itself (multiprocessors,
-    shared memory, clocks and L2, `runtime_facts`), or, within `assumed`, the assumed part's; else a named
-    part's, by generation ('sm90'), device kind ('NVIDIA H100 80GB HBM3') or alias ('a100'). Raises
-    `ValueError` for a process whose device is not a GPU and for a part Dew knows nothing of."""
+    of it: the GPU a call is placed on where `part` is None (`placed_device`), what its driver reports of
+    itself (multiprocessors, shared memory, clocks and L2, `runtime_facts`), or, within `assumed`, the
+    assumed part's; else a named part's, by generation ('sm90'), device kind ('NVIDIA H100 80GB HBM3') or
+    alias ('a100'). Raises `ValueError` for a call placed on no GPU and for a part Dew knows nothing of."""
     from types import MappingProxyType
-
-    import jax
 
     from dew.nn.kernels.templates import bundles
 
-    if part is None and assumption() is None and jax.local_devices()[0].platform != 'gpu':
-        raise ValueError(f"this process's device is a {jax.local_devices()[0].platform}, not a GPU; "
+    if part is None and assumption() is None and (placed := placed_device()).platform != 'gpu':
+        raise ValueError(f"the device a call is placed on is a {placed.platform}, not a GPU; "
                          f"name a part to read its facts")
     target = gpu_target(part)
     if capability(target.generation) is None:
@@ -1922,16 +1920,43 @@ def device_memory() -> int | None:
 
 
 def placed_devices() -> list:
-    """This process's devices the context places a call on, as `placed_platform` reads the context: the
-    default device where no mesh is set and one is (`jax.default_device`), else the local devices of the
-    placed platform."""
-    import jax
+    """This process's devices the context places a call on, as `placed_platform` reads the context: a set
+    mesh's own (`jax.set_mesh`), in its order; else the default device where one is (`jax.default_device`);
+    else the local devices of the placed platform."""
+    return list(_placed())
 
+
+def placed_device():
+    """The device a call's target and generation are read from (`gpu_target`, `device_generation`): the
+    first its context places it on (`placed_devices`), so a call on a second local GPU reads that GPU's
+    instruction family and resources."""
+    return _placed()[0]
+
+
+def _placed() -> Sequence:
+    """`placed_devices`, as the context holds them: a set mesh's own devices of this process are its cached
+    list, which a trace's tens of thousands of target reads take without a copy."""
+    import jax
+    from jax._src import mesh as mesh_lib
+
+    mesh = mesh_lib.get_concrete_mesh()
+    if mesh is not None and not mesh.empty and mesh.local_devices:
+        return mesh.local_devices
     device = jax.config.jax_default_device
     if (jax.sharding.get_abstract_mesh().abstract_device is None and device is not None
             and not isinstance(device, str)):
         return [device]
     return jax.local_devices(backend=placed_platform())
+
+
+def _run_devices():
+    """The devices of every process a call runs on, whose first in each process the kind guard reads
+    (`_one_kind`): a set mesh's, else the run's."""
+    import jax
+    from jax._src import mesh as mesh_lib
+
+    mesh = mesh_lib.get_concrete_mesh()
+    return mesh.devices.flat if mesh is not None and not mesh.empty else jax.devices()
 
 
 def backend() -> str:
