@@ -104,7 +104,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A ratio's transpose sums landed quotients along an axis its denominator varies over. [8292]
 - The merge law's derivative programs nearly doubled since the base review's fixes. [8427]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
-- Tests: a check1_shards site's map tasks draw every staged unit up front (ci.py marked_sites: staged(declared) by PARITY_STAGES), where an unsharded site stops…. [8561]
 - Bit-level synthesis in dew.algebra. [3733]
 - The merge law's placed sum keeps two bands of a term's span, not three. [8061]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
