@@ -140,10 +140,12 @@ def prepare_split_whole_steps(objective, rate: float, run_key: jax.Array, templa
     whole_step = whole_trainer.compile(whole_start, template)
     # The split start holding the window its step builds, once (its first call's): a call per seed over it
     # steps alone, building none (an eval_shape of the objective's batch statistics each, row 7849). A step
-    # a window long leaves its window committed, empty, which the start takes.
+    # a window long leaves its window committed, holding no microbatch (`Accumulation.fill` 0), whose next
+    # first microbatch replaces what it left; the start takes it.
     stepped = split_step(jax.tree.map(jnp.copy, split_start), filled_template)[0]
-    left = [leaf for leaf in jax.tree.leaves(stepped.accumulation) if np.any(np.asarray(leaf))]
-    assert int(stepped.window_size) == 2 and not left, "a step a window long left rows in its window"
+    window, size = stepped.accumulation, stepped.window_size
+    assert window is not None and window.fill is not None and size is not None
+    assert (int(size), int(window.fill)) == (2, 0), "a step a window long left its window uncommitted"
     split_start = split_start.replace(accumulation=stepped.accumulation, window_size=stepped.window_size)
     update_key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(split_start.key, EXAMPLE_STREAM),
                                                        0), 0)
