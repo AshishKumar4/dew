@@ -884,10 +884,9 @@ class _Order:
             self.committing[(thread, position)] = list(self.committed[thread])
         elif kind in ("store", "product"):
             self.asynchronous(thread, position, event, clock)
-            if kind == "store" and event.argument:
-                self.groups[thread] += 1
+            self.groups[thread] += commits_group(event)
         elif kind == "store_group":
-            self.groups[thread] += 1
+            self.groups[thread] += commits_group(event)
         elif kind == "product_wait":
             self.retired(thread, "product", int(event.argument), clock)
         elif kind == "store_wait":
@@ -921,6 +920,13 @@ class _Order:
         for entry in mine[:max(len(mine) - kept, 0)]:
             self.reads.append((entry[1], dict(clock), entry[2]))
             self.pending[thread].remove(entry)
+
+
+def commits_group(event: Event) -> bool:
+    """Whether `event` commits its thread's open store group: a TMA store committing it (`commit_group`) or
+    an explicit commit (`commit_smem_to_gmem_group`), the one statement a store wait's retirement counts and
+    a test of a program's groups reads."""
+    return (event.kind == "store" and bool(event.argument)) or event.kind == "store_group"
 
 
 def _overlaps(one: tuple, other: tuple) -> bool:
