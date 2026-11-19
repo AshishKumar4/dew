@@ -142,8 +142,8 @@ def prepare_split_whole_steps(objective, rate: float, run_key: jax.Array, templa
     # steps alone, building none (an eval_shape of the objective's batch statistics each, row 7849). A step
     # a window long leaves its window committed, empty, which the start takes.
     stepped = split_step(jax.tree.map(jnp.copy, split_start), filled_template)[0]
-    assert int(stepped.window_size) == 2 and not any(
-        np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(stepped.accumulation)), "a window left rows in it"
+    left = [leaf for leaf in jax.tree.leaves(stepped.accumulation) if np.any(np.asarray(leaf))]
+    assert int(stepped.window_size) == 2 and not left, "a step a window long left rows in its window"
     split_start = split_start.replace(accumulation=stepped.accumulation, window_size=stepped.window_size)
     update_key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(split_start.key, EXAMPLE_STREAM),
                                                        0), 0)
