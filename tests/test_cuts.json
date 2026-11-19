@@ -21,6 +21,12 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
+"tests/test_algebra_fuzz.py": [
+"tests/test_algebra_fuzz.py::test_a_rewritten_program_is_on_par_with_the_program"
+],
+"tests/test_algebra_laws.py": [
+"tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[True-False-True]"
+],
 "tests/test_algebra_scan.py": [
 "tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[gated_delta-before]",
 "tests/test_algebra_scan.py::test_a_turned_scans_adjoint_is_the_token_scans_gradient[apart-ranks]",
@@ -1051,9 +1057,6 @@
 "tests/test_checkpoint_averaging.py": [
 "tests/test_checkpoint_averaging.py::test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read_where_it_keeps_one[stages]"
 ],
-"tests/test_checkpoint_ranking.py": [
-"tests/test_checkpoint_ranking.py::test_an_aggregate_reads_a_summary_where_it_is_formed"
-],
 "tests/test_chunk_adaptation.py": [
 "tests/test_chunk_adaptation.py::test_a_chain_steps_each_level_as_equation_71_at_its_own_window[1-3-documents]",
 "tests/test_chunk_adaptation.py::test_a_damped_chain_steps_each_level_as_the_literal_loop[documents]",
@@ -1161,7 +1164,7 @@
 "tests/test_contracts_recurrence.py::test_the_chunked_op_holds_every_order[normal]",
 "tests/test_contracts_recurrence.py::test_the_decode_step_holds_every_order[near the least normal]",
 "tests/test_contracts_recurrence.py::test_the_decode_step_holds_every_order[normal]",
-"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_gdn-jvp of grad]",
+"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_gdn-second jvp]",
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_gdn-first orders]",
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_gdn-second jvp]",
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_kda-grad of grad]",
@@ -1330,9 +1333,6 @@
 "tests/test_decision_packing.py::test_a_reader_tokenizes_each_text_of_its_rows_once[joint]",
 "tests/test_decision_packing.py::test_single_option_questions_fit_the_packing_bounds[1]",
 "tests/test_decision_packing.py::test_single_option_questions_fit_the_packing_bounds[2]"
-],
-"tests/test_decision_readout.py": [
-"tests/test_decision_readout.py::test_a_slot_heads_scores_are_the_releases_law_with_its_query_and_key_trained"
 ],
 "tests/test_decision_recipe.py": [
 "tests/test_decision_recipe.py::test_a_checkpoint_declaring_block_attention_trains_and_serves_a_fresh_heads_rows_in_blocks",
@@ -2307,6 +2307,12 @@
 "tests/test_linear_attention.py::test_the_fused_step_compiles_within_each_gpus_resources[sm90]",
 "tests/test_linear_attention.py::test_the_masked_conv_matches_the_token_scan[False-a paused row beside a full one]",
 "tests/test_linear_attention.py::test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound"
+],
+"tests/test_live_bridge.py": [
+"tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
+],
+"tests/test_llama4.py": [
+"tests/test_llama4.py::test_a_paged_cache_draws_what_the_dense_cache_draws[paged]"
 ],
 "tests/test_lm_objective.py": [
 "tests/test_lm_objective.py::test_evaluation_correctness_is_the_same_full_forward_argmax",
@@ -3362,6 +3368,9 @@
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-sliding-tiny-native]",
 "tests/test_remote_code_releases.py::test_an_export_opens_through_its_releases_own_code_as_the_release_does[mimo-v2-tiny-saved]"
 ],
+"tests/test_ring_protocol.py": [
+"tests/test_ring_protocol.py::test_the_ring_familys_walk_holds_every_property_in_every_interleaving[stages3-consumers2-tiles(3,)-inflight0-stepped]"
+],
 "tests/test_rl_contracts.py": [
 "tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[DPOObjective]",
 "tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[GRPOObjective]"
@@ -3737,9 +3746,6 @@
 "tests/test_ssd_kernel.py": [
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk-resets]"
 ],
-"tests/test_stage_blocks.py": [
-"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[hybrid_dit-fsdp2_stage2]"
-],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
 "tests/test_stage_local.py::test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one",
@@ -3824,9 +3830,6 @@
 "tests/test_supervised.py::test_batch_statistics_update_as_the_model_trains_and_reload_from_its_checkpoint",
 "tests/test_supervised.py::test_the_autoencoders_evidence_bound_falls_over_independent_runs",
 "tests/test_supervised.py::test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name"
-],
-"tests/test_text_data.py": [
-"tests/test_text_data.py::test_data_export_leaves_every_file_it_did_not_create[False]"
 ],
 "tests/test_text_rollout_contract.py": [
 "tests/test_text_rollout_contract.py::test_every_registered_mixer_draws_padded_rows_as_their_unpadded_full_forwards_score[gated_delta_net]",
@@ -3977,9 +3980,6 @@
 ],
 "tests/test_wan_vae.py": [
 "tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
-],
-"tests/test_weighed_check.py": [
-"tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",

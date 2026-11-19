@@ -96,11 +96,11 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
+- A ratio's transpose sums landed quotients along an axis its denominator varies over. [8292]
 - The merge law's derivative programs nearly doubled since the base review's fixes. [8427]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Bit-level synthesis in dew.algebra. [3733]
 - The merge law's placed sum keeps two bands of a term's span, not three. [8061]
-- A ratio's transpose sums landed quotients along an axis its denominator varies over. [8292]
 - Tests/reference_error.py:1455 refuses to prepare a check-1 site with a library arm. [8468]
 - Tests/reference_error.py _arm_program (arm_arithmetic.py:193) traces a site's arm nested in make_jaxpr, so an arm that is a jit of its own compiler_options…. [8469]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
