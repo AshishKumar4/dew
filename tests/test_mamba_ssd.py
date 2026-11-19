@@ -206,13 +206,15 @@ def the_template_is_as_exact_as_mamba_ssm():
         stored, case, seeds, inputs_of=lambda seed: mamba_ssd_draw(seed, shape, dtype, documents),
         truth_fn=jax.jit(lambda inputs: mamba_ssd_xla(inputs, chunk)))
 
-    def run(index, arrays):
-        del index
+    def run(arrays):
         with generation.chosen(ssd="mosaic_gpu"):
             return mamba_ssd_xla(arrays, chunk, dtype)
 
-    assert_as_exact(jax.jit(run), as_given(reference), draw, f"the template against mamba_ssm, {case}",
-                    seeds=seeds, truth_fn=as_given(truth))
+    # Dew's arm compiled once here and run as given, its truth the recording's as the gate holds it: a
+    # prepare that ran the truth as given called its compiled program's own method (row 8497).
+    compiled = jax.jit(run)
+    assert_as_exact(as_given(lambda index, inputs: compiled(inputs)), reference, draw,
+                    f"the template against mamba_ssm, {case}", seeds=seeds, truth_fn=truth)
 
 
 def test_a_packed_calls_skip_gradient_on_the_template_is_as_exact_as_on_mamba_ssms_port():

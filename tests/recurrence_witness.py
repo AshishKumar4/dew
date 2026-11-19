@@ -26,8 +26,10 @@ Each enclosure is `interval_certificates`' outward interval arithmetic under the
 module adds each log decay's base-2 prefix within `EXPONENT_BOUND` of its exact value (XLA's compensated
 scan, `recurrence_algebra.prefix`), then the kernel's own roundings of its differences."""
 
+import contextlib
 import dataclasses
 import functools
+import hashlib
 import math
 from typing import Literal, NamedTuple
 
@@ -502,12 +504,11 @@ def interpreted_lane() -> Lane:
     a step off some powers of two, 2^71 among them, which check 2's exact cases admit no lane breaking, so
     its reach is the witness's own measure, not `certified.lane`'s) and whether it flushes (`certified.lane`),
     a 16-bit call."""
-    import jax
     import jax.numpy as jnp
     from certified import lane
 
-    return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes,
-                mainloop.block_of(mainloop.issued()[0]))
+    return Lane(exp2_reach(lambda x: launched(jnp.exp2, (np.asarray(x, np.float32),), "XLA's exp2")[0]),
+                lane().flushes, mainloop.block_of(mainloop.issued()[0]))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -586,6 +587,27 @@ class Run:
                     point(self.entered(n, head)) if carry is None else carry)
 
 
+def launched(fn, operands: tuple, role: str):
+    """`fn` over `operands` as a GPU tier runs it, compiled in its prepare and executed in its run
+    (`reference_error.ahead_arm`, a label a program: the role, the device assumed and a digest of the
+    operands), and the launches its trace takes (`tuning.seen`), traced alone, which computes nothing, in the
+    store's target where a run executes a prepared program, so they are the executed program's: its prepare
+    computed every launch eagerly on a compile-only device (row 8497)."""
+    import jax
+    from reference_error import ahead_arm
+    from truths_ahead import COMPILED
+
+    from dew.nn.kernels import generation, tuning
+
+    digest = hashlib.sha1(b"".join(np.ascontiguousarray(x).tobytes() for x in jax.tree.leaves(operands)))
+    label = f"recurrence witness, {role}, {generation.assumption()}, {digest.hexdigest()[:16]}"
+    store = COMPILED.get()
+    with (store.tracing() if store is not None and not store.prepare else contextlib.nullcontext(),
+          tuning.seen() as launches):
+        jax.jit(fn).trace(*operands)
+    return ahead_arm(jax.jit(fn), label)(*operands), launches
+
+
 def _route_forward(route, operands: tuple, walked: bool) -> tuple:
     """The forward of `route` over `operands` as a training step runs it, the template's (`chosen`):
     `(output, final memory, tiles, trained)`. The training forward, the primal of the route's VJP, where
@@ -594,16 +616,12 @@ def _route_forward(route, operands: tuple, walked: bool) -> tuple:
     not train (an fp32 call's backward on an A100's registers, 264 to 328 a thread)."""
     import jax
 
-    from dew.nn.kernels import tuning
-
-    with tuning.seen() as launches:
-        o, final = jax.jit(route)(*operands)
+    (o, final), launches = launched(route, operands, "inference forward")
     [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
                         zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
     trained = template.MOSAIC.trains(bound, template.Mosaic.launched())
     if not walked and trained:
-        with tuning.seen() as launches:
-            o, final = jax.jit(lambda *x: jax.vjp(route, *x)[0])(*operands)
+        (o, final), launches = launched(lambda *x: jax.vjp(route, *x)[0], operands, "training forward")
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
     return o, final, tiles, trained
@@ -717,10 +735,10 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         chunk = tiles.chunk
 
         def kept(*x, starts=starts):
-            return jax.jit(lambda *x: chunk_forward.kept_forward(
+            return launched(lambda *x: chunk_forward.kept_forward(
                 *x, tiles=tiles, starts=starts, max_segments=max_segments, scale=scale,
                 delta=delta, rounded=rounded, family=family, keeps=not walked,
-                interpret=generation.backend() != "gpu"))(*x)
+                interpret=generation.backend() != "gpu"), x, f"kept forward of {x[0].shape[1]} tokens")[0]
 
         kept_o, kept_final, (a, (w, h, c, _)) = kept(*operands)
         for native, own in ((o, kept_o), (final, kept_final)):
@@ -926,8 +944,10 @@ def draw(seed: int, regime: str, *, length: int = 192, heads: int = 1, width: in
     beta = 0.0 if regime == "decay" else 1 / (1 + np.exp(-rng.normal(size=shape)))
     h0 = 0.3 * rng.normal(size=(1, heads, width, width))
     dtype = jnp.bfloat16 if dtype is None else dtype
-    return (jnp.asarray(q, dtype), jnp.asarray(k, dtype), jnp.asarray(v, dtype), jnp.asarray(g, jnp.float32),
-            jnp.asarray(np.broadcast_to(beta, shape), dtype), jnp.asarray(h0, jnp.float32))
+    # NumPy's (ml_dtypes' 16-bit types), as a site's draws are: a GPU tier's prepare computes on no device,
+    # not even their placement (row 8497).
+    return (np.asarray(q, dtype), np.asarray(k, dtype), np.asarray(v, dtype), np.asarray(g, np.float32),
+            np.asarray(np.broadcast_to(beta, shape), dtype), np.asarray(h0, np.float32))
 
 
 def shifted_refusals(operands: tuple, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -1295,25 +1315,26 @@ class BackRun(NamedTuple):
 
 
 def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda prepared: (),
-                       run: Run | None = None) -> tuple:
+                       named: str = "", run: Run | None = None) -> tuple:
     """The fast backward of a call over one row (`draw`'s `operands`; under the `delta` rule, or without it
     the SSD's route's under the run's fast forms), run as a training step runs it (the route's VJP), and the
     same build's `mainloop_backward.kept_backward` at the forward's kept values, checked to give the step's
     gradients bit for bit: its forward's run (`recorded`), the output and final memory gradients `seed`
     draws, the launches' outputs as stored (`Kept`, its prepared run left in the program) and `extras` of
-    that prepared run, as the program returns them. `run` is the forward's recording where taken already."""
+    that prepared run, as the program returns them (`named` the program's name beside them). `run` is the
+    forward's recording where taken already."""
     import jax
     import jax.numpy as jnp
 
-    from dew.nn.kernels import generation, recurrence_chunk, tuning
+    from dew.nn.kernels import generation, recurrence_chunk
     from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
 
     q, k, v, _, _, h0 = operands
     dtype = jnp.result_type(q, k, v)
     run = recorded(*operands, delta=delta) if run is None else run
     rng = np.random.default_rng([2084, seed])
-    do = jnp.asarray(rng.standard_normal(v.shape), dtype)
-    dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
+    do = np.asarray(rng.standard_normal(v.shape), dtype)
+    dfinal = np.asarray(rng.standard_normal(h0.shape), np.float32)
     scale, rounded = run.scale, route_rounding(delta, dtype)
     family = mainloop.issued(dtype)[0]
     interpret = generation.backend() != "gpu"
@@ -1325,8 +1346,8 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
         return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=1.0)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
-        with tuning.seen() as launches:
-            native = jax.jit(lambda *x: jax.vjp(route, *x)[1]((do, dfinal)))(*operands)
+        native, launches = launched(lambda *x: jax.vjp(route, *x)[1]((do, dfinal)), operands,
+                                    f"training backward of seed {seed}")
         [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
                    if isinstance(op, template.Mosaic)]
 
@@ -1339,7 +1360,7 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
             # The prepared run stays inside the program; the witness reads its records from `Run`.
             return grads, saved._replace(run=None), extras(saved.run)
 
-        grads, saved, extra = jax.jit(kept)(*operands)
+        (grads, saved, extra), _ = launched(kept, operands, f"kept backward of seed {seed}{named}")
     for mine, theirs in zip(grads[:6], native, strict=True):
         assert np.array_equal(np.asarray(mine).view(np.uint8), np.asarray(theirs).view(np.uint8)), \
             "the certify build is the production program"
@@ -1593,7 +1614,8 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> BackRun:
     `key_backward.KeyKept`): its records and its forward's stored intra scores and gated keys, `[N, H, ...]`
     float64."""
     run, do, dfinal, saved, (scores, gated_keys) = _captured_backward(
-        operands, seed, delta=True, extras=lambda prepared: (prepared.scores, prepared.keys))
+        operands, seed, delta=True, extras=lambda prepared: (prepared.scores, prepared.keys),
+        named=", its scores and gated keys")
     _, _, heads, value_width = do.shape
     key_width, chunk = operands[1].shape[-1], run.chunk
     laid = np.shape(saved.dh)[0] // (heads * key_width)
