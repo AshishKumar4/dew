@@ -69,15 +69,17 @@ def test_the_forward_on_tcgen05s_rows_at_two_consumers_holds_check_1_interpreted
                    value_width=64, tiles=ROWS_PAIR_TILES, target=generation.gpu_target("sm100"))
 
 
+@pytest.mark.parametrize("moves", [False, True], ids=["kept", "moved"])
 @pytest.mark.parametrize("call", ["full", "causal"])
 @pytest.mark.parametrize("tiles", [ROWS_TILES, ROWS_PAIR_TILES], ids=["one", "two"])
-def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving(tiles, call):
+def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving(tiles, call, moves):
     """The forward's launch on a B200's tcgen05 rows at one consumer and two, traced as a B200 builds it over
     256 queries and 256 keys, the full call's and the causal's (each consumer's own key walk): every
     interleaving of its consumers and its producer's and issuer's warps explored (`ring_protocol.explore`),
-    no deadlock and every barrier's phase whole and observed. A step waits on the weighted values of the
-    step before only where its factor moves some row's sums (`placed.Tcgen05Placed.accumulating`), its
-    weights' turn freed by the product two steps back."""
+    no deadlock and every barrier's phase whole and observed, every step's factor keeping its sums or moving
+    them (`moves`, the lazy walk's rare span). A step waits on the weighted values of the step before only
+    where its factor moves some row's sums (`placed.Tcgen05Placed.accumulating`), its weights' turn freed by
+    the product two steps back."""
     from ring_protocol import explore, programs
 
     query, key = jnp.ones((1, 256, 1, 128), jnp.bfloat16), jnp.ones((1, 256, 1, 128), jnp.bfloat16)
@@ -87,7 +89,7 @@ def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving
         with generation.assumed("sm100"), _pinned(tiles):
             return attention_mosaic.forward(query, key, key, spans, interpret=False)
 
-    threads, arrivals = programs(forward, query, key, threads=tiles.consumers + 1)
+    threads, arrivals = programs(forward, query, key, threads=tiles.consumers + 1, rare=moves)
     assert explore(threads, arrivals) > 0
 
 

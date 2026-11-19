@@ -14,7 +14,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import handoffs, mosaic, resources, swizzling
+from dew.nn.kernels.templates import after_walk, handoffs, mosaic, resources, swizzling
 from dew.nn.kernels.templates.mosaic_sm100 import (
     TMEM,
     Accumulator,
@@ -214,7 +214,7 @@ class Tcgen05Placed(Tcgen05Rings):
                     summed.wait(summed.turn(slots.n - 1))
                     _rescaled(self, acc, scale)
 
-                pl.when(scale.moves)(rescaled)
+                pl.when(after_walk.rare(scale.moves))(rescaled)
             weighed.published(weighed.turn(slots.n))
             return acc
 
