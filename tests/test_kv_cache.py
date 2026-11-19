@@ -829,9 +829,9 @@ def test_an_offloaded_banks_regrouped_page_copies_lower_with_the_bank_in_host_me
 
 def test_an_offloaded_pools_page_writes_lower_with_the_pool_in_host_memory():
     """`pages_written` over a pool in host memory (`KVCache.offloaded`'s) compiles for an A100
-    (`compile_programs`), a place past the pool writing nothing, its result in host memory: the places in the
-    pool alone written, each unconditionally (`host_memory.stored_at`), where XLA:GPU's host offloading reads
-    the copy to the host, which it refuses inside a conditional's branch (row 8507)."""
+    (`compile_programs`), a place past the pool writing nothing, its result in host memory: each page copied
+    to the host before the choice to write it (`host_memory.stored_at`'s `kept`), the form XLA:GPU's host
+    offloading compiles (row 8507)."""
     from dew.training.ahead import compile_programs
 
     def written(pool, places, values):

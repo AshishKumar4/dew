@@ -674,22 +674,19 @@ def pages_read(leaf: jax.Array, places: jax.Array, axis: int) -> jax.Array:
 def pages_written(leaf: jax.Array, places: jax.Array, values: jax.Array, axis: int) -> jax.Array:
     """The pool leaf with its pages at `places` along `axis` set to `values`, `[len(places), ...]` as
     `pages_read` reads them; a place past the pool dropped. An offloaded pool's (`KVCache.offloaded`) are
-    written a page at a time where it lies, a dropped place moving nothing."""
+    written a page at a time where it lies, each page copied to the host and written where its place is in
+    the pool (`host_memory.stored_at`'s `kept`, the form XLA:GPU's host offloading compiles), a dropped
+    place's copy written nowhere."""
     if not on_host(leaf):
         flat = jnp.moveaxis(values, 0, axis)
         return leaf.at[(*(slice(None),) * axis, places)].set(flat.astype(leaf.dtype), mode="drop")
     last = leaf.shape[axis] - 1
 
-    # The places in the pool alone, in their order, each written unconditionally where the pool lies (a write
-    # in a conditional's branch XLA:GPU's host offloading refuses, `host_memory.stored_at`).
-    written = places <= last
-    order = jnp.argsort(~written, stable=True)
-
     def page(index: jax.Array, pool: jax.Array) -> jax.Array:
-        at = order[index]
-        return stored_at(pool, values[at], places[at], axis)
+        place = places[index]
+        return stored_at(pool, values[index], place, axis, kept=place <= last)
 
-    return jax.lax.fori_loop(0, jnp.sum(written), page, leaf)
+    return jax.lax.fori_loop(0, places.shape[0], page, leaf)
 
 
 def offloaded(cache: Mapping[str, object], layout: KVCache) -> Mapping[str, object]:
@@ -1669,15 +1666,11 @@ def _banked_page_copies(bank: jax.Array, own: jax.Array, parents: jax.Array) -> 
         held = jax.lax.map(lambda page: fetched_at(pool, (layer, page), (0, 2)),
                            jnp.minimum(parents[layer], last))
 
-        # The layer's pages in the pool alone, in their order (`pages_written`'s).
-        written = own[layer] <= last
-        order = jnp.argsort(~written, stable=True)
+        def write(row, pool: jax.Array) -> jax.Array:
+            target = own[layer, row]
+            return stored_at(pool, held[row], (layer, target), (0, 2), kept=target <= last)
 
-        def write(index, pool: jax.Array) -> jax.Array:
-            row = order[index]
-            return stored_at(pool, held[row], (layer, own[layer, row]), (0, 2))
-
-        return jax.lax.fori_loop(0, jnp.sum(written), write, pool)
+        return jax.lax.fori_loop(0, own.shape[1], write, pool)
 
     return jax.lax.fori_loop(0, layers, layer_copies, bank)
 

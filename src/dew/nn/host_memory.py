@@ -76,13 +76,19 @@ def placed_like(leaf: jax.Array, value: jax.Array) -> jax.Array:
 
 
 def stored_at(bank: jax.Array, value: jax.Array, index: Index | tuple[Index, ...],
-              axis: int | tuple[int, ...] = 0) -> jax.Array:
+              axis: int | tuple[int, ...] = 0, *, kept: jax.Array | None = None) -> jax.Array:
     """`bank` with `value` its entry `index` along `axis` (or along each of several axes), where `bank` lies
     (`fetched_at`'s inverse): the axes restored in device memory, the entry copied to the bank's memory and
-    written there. A write it makes is taken unconditionally: XLA:GPU's host offloading reads no copy to the
-    host made inside a conditional's branch, and refuses the bank as a host parameter, so a caller that
-    writes some entries alone loops over those (`kv_cache.pages_written`)."""
+    written there; where `kept` is given (a scalar), written only where it holds, the entry copied first
+    whatever it says. That is the one form XLA:GPU's host offloading compiles for a bank in host memory
+    that a loop writes: a copy to the host made inside a conditional's branch, or a write taken
+    unconditionally in a loop's body or unrolled, or a loop whose count the writes kept set, each refuses
+    the bank as a host parameter ("not in host memory space"; armada probes on an A100's compile at
+    c27860888)."""
     axes, indices = _entry(index, axis)
     held, starts = _placed(bank.ndim, axes, indices)
     entry = placed_like(bank, jnp.expand_dims(value.astype(bank.dtype), held))
-    return jax.lax.dynamic_update_slice(bank, entry, starts)
+    if kept is None:
+        return jax.lax.dynamic_update_slice(bank, entry, starts)
+    return jax.lax.cond(kept, lambda bank: jax.lax.dynamic_update_slice(bank, entry, starts),
+                        lambda bank: bank, bank)
