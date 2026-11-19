@@ -46,7 +46,8 @@ def affine_states(decay, write, entering, axis: int):
     if write.shape[0] <= 2 * UNROLLED:
         return jnp.moveaxis(_tokens(decay, write, entering), 0, axis)
     # The first and last blocks straight-line, the interior a scan of blocks: the first's states set the
-    # carry's dtype, and no scan's last carry meets a cotangent (its transpose's zero times an infinity).
+    # carry's dtype, and the scan's last carry is live in the straight-line last block, so its transpose
+    # forms no forced zero cotangent for it to meet an infinity with.
     first = _tokens(decay[:UNROLLED], write[:UNROLLED], entering)
     blocks = (write.shape[0] - UNROLLED - 1) // UNROLLED
     end = UNROLLED * (blocks + 1)
