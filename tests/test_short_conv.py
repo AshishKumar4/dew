@@ -147,13 +147,17 @@ def truth(x, weights, shift, valid, parts, grads, activation=True, segments=None
 
 
 def row_truth(x, weights, parts, grads, segments):
-    """`truth`'s pieces and gradients of `x` and the taps, on the host, a row at a time: each row's pieces and
-    input gradient its own, the taps' gradient the rows' summed in float64; a row's float64 conv the device
-    holds at once, not the batch's."""
-    rows = [jax.device_get(truth(x[i:i + 1], weights, None, None, parts,
-                                 tuple(grad[i:i + 1] for grad in grads),
-                                 segments=None if segments is None else segments[i:i + 1]))
-            for i in range(x.shape[0])]
+    """`truth`'s pieces and gradients of `x` and the taps, on the host's CPU, a row at a time: each row's
+    pieces and input gradient its own, the taps' gradient the rows' summed in float64. On a GPU, a 9B's
+    float64 rows beside its arms filled a tier process's share (4.09 GiB, its pad 192 MiB short; run
+    JS-8497-alone-cb07e38b5-sm90; row 6755's theme)."""
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        rows = [jax.device_get(truth(*jax.device_put((x[i:i + 1], weights), cpu), None, None, parts,
+                                     jax.device_put(tuple(grad[i:i + 1] for grad in grads), cpu),
+                                     segments=None if segments is None else jax.device_put(
+                                         segments[i:i + 1], cpu)))
+                for i in range(x.shape[0])]
     pieces = tuple(np.concatenate([row[0][k] for row in rows]) for k in range(len(rows[0][0])))
     dx = np.concatenate([row[1][0] for row in rows])
     dtaps = functools.reduce(np.add, (np.asarray(row[1][1], np.float64) for row in rows))
