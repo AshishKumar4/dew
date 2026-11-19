@@ -149,9 +149,10 @@ def test_an_initial_state_from_another_initializer_draws_that_initializer():
     objective = LMObjective(model, seq_len=8)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
 
-    def shifted(key):
-        return jax.tree.map(lambda leaf: leaf + 1, objective.init(key))
+    def sevens(key):
+        return jax.tree.map(lambda leaf: jnp.full_like(leaf, 7.0), objective.init(key))
 
     own = jax.tree.leaves(trainer.initial_state().variables["params"])
-    other = jax.tree.leaves(trainer.initial_state(Partial(shifted)).variables["params"])
-    assert all(jnp.array_equal(b, a + 1) for a, b in zip(own, other, strict=True))
+    other = jax.tree.leaves(trainer.initial_state(Partial(sevens)).variables["params"])
+    assert not all(bool(jnp.all(leaf == 7.0)) for leaf in own)
+    assert all(bool(jnp.all(leaf == 7.0)) for leaf in other)
