@@ -961,7 +961,7 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     `apart` by groups of that many tokens pairs no two of one group (`j // apart < i // apart`: a gram's own
     token, a group of one; a readout's group, `Scan.group`). A pair is out where its decay is crossed
     (`_crossed`), not where it rounds to zero: a live pair's that underflows reads a NaN as the recurrence
-    does (train 1079's review F1)."""
+    does (train 1079's review F1), and any other product as zero (`_underflowed_out`)."""
     joined = between
     if apart:
         rows, columns = (jnp.arange(between.shape[axis])[index] // apart
@@ -972,9 +972,18 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     if between.shape[-1] == 1:
         # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
         # decay's derivative would read it.
-        return jnp.where(active, issue(role, left, right.T), 0.0) * joined[..., 0]
+        return _underflowed_out(jnp.where(active, issue(role, left, right.T), 0.0), joined) * joined[..., 0]
     # The factors read the reference's own decay (1, on the diagonal a strict pairing excludes).
     return jnp.where(active, _factored(left, right, between, joined, issue, role), 0.0)
+
+
+def _underflowed_out(products, between):
+    """`products` `[C, C]` zero where every decay of their pair (`between` `[C, C, K]`) is zero but a NaN:
+    the recurrence decays a term as it enters, so a live pair's decay that underflows (`_crossed`'s positive
+    zero) weighs its product to zero, which formed before that decay may overflow, infinity times zero (a
+    query's and a key's 2^70 under decays of exp(-160), head review of 512810acf F7); a NaN in a factor reads
+    NaN as the recurrence's (train 1079's review F1)."""
+    return jnp.where(jnp.all(between == 0, axis=-1) & ~jnp.isnan(products), 0.0, products)
 
 
 def _factored(left, right, between, joined, issue: Callable, role: str):
@@ -1024,7 +1033,7 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
 
     issue = issue or _issued
     active = jnp.any(~_crossed(between), axis=-1)
-    reads = jnp.where(active, issue("scores", readers, values.T), 0.0)
+    reads = _underflowed_out(jnp.where(active, issue("scores", readers, values.T), 0.0), between)
     if weights is not None:
         reads = reads * weights
     if between.shape[-1] == 1:
