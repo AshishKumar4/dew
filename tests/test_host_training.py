@@ -295,7 +295,7 @@ def test_a_projecting_decoders_host_steps_run_on_its_startups_programs_alone():
     objective = _CountedProjection(model, 8, head_chunks=1, ema_decay=None)
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(3), layout=HOST)
     assert int(three_steps(trainer, 16).updates) == 3
-    assert len(objective.reads) < 3
+    assert 0 < len(objective.reads) < 3
 
 
 def test_an_inspecting_host_runs_sampled_and_unsampled_steps_compile_nothing():

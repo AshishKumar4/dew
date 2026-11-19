@@ -459,12 +459,9 @@ class AheadOfTime:
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
-        if ("starts" not in vars(step) or "counts" not in vars(step) or "at_run" not in vars(step)
-                or "autotuned" not in record(step.plan, "plan")):
-            raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
-                             "programs (`starts`), a sampled pass count's other counts' steps (`counts`) and "
-                             "said whether XLA tuned them and left a choice to run time (`autotuned`, "
-                             "`at_run`); compile it ahead again")
+        if "autotuned" not in record(step.plan, "plan"):
+            raise ValueError(f"{path} holds a step compiled ahead before its plan said whether XLA tuned it "
+                             "(`autotuned`); compile it ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         counted = [program.executable for held in step.counts.values() for program in held
                    if program is not None]
@@ -724,10 +721,6 @@ class AheadPrograms:
     def load(path: str | Path) -> AheadPrograms:
         """The programs `save` wrote to `path`."""
         programs = _saved(path, AheadPrograms, "programs")
-        if "tuned" not in vars(programs) or "at_run" not in vars(programs):
-            raise ValueError(f"{path} holds programs compiled ahead before their files said whether XLA "
-                             "tuned them and which leave a choice to run time (`tuned`, `at_run`); compile "
-                             "them ahead again")
         _current(path, "programs", [*programs.programs.values(),
                                     *(each.executable for each in (programs.kept or {}).values())])
         return programs
@@ -755,10 +748,16 @@ class AheadPrograms:
 
 
 def _saved[Saved](path: str | Path, kind: type[Saved], what: str) -> Saved:
-    """What a `save` of `kind` wrote to `path`, refused where it is not one (`what` it holds)."""
+    """What a `save` of `kind` wrote to `path`, refused where it is not one (`what` it holds), or where it
+    was saved by a Dew whose `kind` held fewer fields than this one's (a pickle restores those it held
+    alone, and a field's class default would stand in for what it never said: rows 8459, 8759)."""
     loaded = pickle.loads(Path(path).read_bytes())
     if not isinstance(loaded, kind):
         raise ValueError(f"{path} holds no {what} compiled ahead of time")
+    missing = [field.name for field in dataclasses.fields(kind) if field.name not in vars(loaded)]
+    if missing:
+        raise ValueError(f"{path} holds {what} compiled ahead by an earlier Dew, before its files held "
+                         f"{', '.join(missing)}: compile it ahead again")
     return loaded
 
 

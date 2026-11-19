@@ -106,9 +106,9 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
     `dew.training.rollout.on_devices`), or a process holding no CPU companion of the devices, which JAX
     makes only before it initializes. And what it is not
     built for yet (`NOT_BUILT`; DiLoCo's groups by row `DILOCO_ON_HOST`): DiLoCo, a step compiled `ahead`,
-    a pass count drawn per microbatch, and a part whose table
-    states no host link to price it by (`GpuTarget.host_links`: a TPU's but v6e's). Read before any plan
-    is built."""
+    a pass count drawn per microbatch, a part whose table
+    states no host link to price it by (`GpuTarget.host_links`: a TPU's but v6e's), and a frozen stack a
+    plain loop runs (`frozen_loops`). Read before any plan is built."""
     unbuilt = (
         (trainer.diloco is not None, "DiLoCo's groups", DILOCO_ON_HOST),
         (ahead, "a step compiled ahead", NOT_BUILT),
@@ -135,7 +135,10 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
         companion_mesh(trainer.device_mesh)
     except ValueError as missing:
         return f"the process holds no CPU companion of its devices: {missing}"
-    return None
+    # A frozen stack a plain loop runs, which no host layout holds in bank memory (`unscanned`), read from
+    # the objective's draw's shapes (row 8336: a LoRA fit over an unscanned decoder raised where its
+    # streamed start placed its frozen base; row 8765: one site refuses by name).
+    return frozen_loops(trainer, trainer.objective.drawn_shapes())
 
 
 def frozen_loops(trainer, variables) -> str | None:
@@ -344,25 +347,11 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     phases = trainer.phase_passes
     active = phases.objective_for(phases.at(first))
     rung = Rung.of(active, xla_defaults=False, narrow=True)
-    # A frozen stack a plain loop runs, which no host layout holds in bank memory (`unscanned`): the
-    # streamed step is no candidate, read from the device start's shapes before its plan (row 8336: a LoRA
-    # fit over an unscanned decoder raised where its streamed start placed its frozen base). Where the device
-    # plan is refused too, no layout runs: its refusal, said with why the streamed step was not considered
-    # (row 8639).
-    start, loops = None, None
     try:
         start = trainer._started(resume)
-        loops = frozen_loops(trainer, start.abstract.variables)
         trainer._planned_unplaced(start, batch)
-    except LayoutRefused as refused:
-        if loops is not None:
-            raise LayoutRefused(f"{refused}; the streamed step is not considered: {loops}") from refused
+    except LayoutRefused:
         start = None
-    if start is not None and loops is not None:
-        trainer.layout_choice = Choice(held=True, fits=False, device=None, streamed=None, refused=loops,
-                                       streams=False)
-        said(trainer.layout_choice)
-        return start
     plan = trainer._compiler.unplaced if start is not None else None
     trainer._laid_out(dataclasses.replace(given, host=STREAMED))
     # The device plan's climb and plans undone: the streamed step is priced at the objective's own rung.

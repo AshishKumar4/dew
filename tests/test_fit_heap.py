@@ -82,3 +82,49 @@ def test_no_full_collection_runs_among_a_fits_steps_and_a_held_steps_fit_forces_
     assert ("collection", 2) in grown[:first_step], grown
     assert ("collection", 2) not in grown[first_step:], grown
     del made
+
+
+def test_a_compile_mid_fit_collects_before_the_steps_after_it():
+    """A ramped fit compiles its step again where its ramp's full batch begins: objects made among the first
+    stage's steps, more than a quarter of the heap the last full collection left, are collected at that
+    compile, before the steps after it, none of the collector's own full collections among those either
+    (row 8760: only a fit's first compile collected, so they waited for the collector among the steps)."""
+    import numpy as np
+
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.data.dataset import Ramp, ramped
+    from dew.data.pipeline import Pipeline
+
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(64, 3)).astype(np.float32)
+    loader = ramped(compile(Pipeline(Memory({"x": x, "y": 2 * x[:, :2]})).repeat().batch(8),
+                            loading=Loading(workers=0)), Ramp(start=4, increment=4, samples=8))
+    tracker = Reported()
+    trainer = make_trainer(tracker=tracker)
+    tracker.events = events = []
+    made: list[list[int]] = []
+
+    def stepped(state):
+        events.append(("step", 0))
+        if not made:
+            gc.disable()  # Made pending, none collected while made.
+            try:
+                made.extend([index] for index in range(sys.getallocatedblocks() // 2))
+            finally:
+                gc.enable()
+
+    def collecting(phase, info):
+        if phase == "start":
+            events.append(("collection", info["generation"]))
+
+    gc.callbacks.append(collecting)
+    try:
+        trainer.fit(loader, steps=4, log_every=1, observe=Observe(1, stepped))
+    finally:
+        gc.callbacks.remove(collecting)
+    compiled = [index for index, event in enumerate(events) if event[0] == "compiled"]
+    assert len(compiled) == 2, events
+    first_step = events.index(("step", 0))
+    assert ("collection", 2) in events[first_step:compiled[1]], events
+    assert ("collection", 2) not in events[compiled[1]:], events
