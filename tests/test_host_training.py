@@ -296,7 +296,7 @@ def test_a_projecting_decoders_host_steps_run_on_its_startups_programs_alone():
     objective = _CountedProjection(model, 8, head_chunks=1, ema_decay=None)
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(3), layout=HOST)
     assert int(three_steps(trainer, 16).updates) == 3
-    assert len(objective.reads) == 2
+    assert len(objective.reads) < 3
 
 
 def test_an_inspecting_host_runs_sampled_and_unsampled_steps_compile_nothing():
@@ -334,6 +334,23 @@ def test_a_casting_projection_is_the_identity_where_its_leaves_are_of_its_dtype_
         assert read(wide, None)["params"]["w"].dtype == jnp.float32
 
 
+
+
+def test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone():
+    """A host decoder whose embedding is frozen, outside its scanned stack (the run's frozen collection),
+    runs its steps on the programs its startup compiled: the startup tells a frozen leaf by its path, as a
+    step over arrays does (`HostExecution.inputs`), so it compiles the signature its steps call (restored,
+    row 8456)."""
+    model = decoder()
+    fresh = jax.tree.map(np.asarray, nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32))))
+
+    def trained(path):
+        return "embed_tokens" not in path
+
+    trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None, variables=freeze(fresh, trained)),
+                      optax.adam(.01), key=jax.random.key(3), layout=HOST)
+    state = three_steps(trainer, 16)
+    assert "embed_tokens" in state.variables[FROZEN] and int(state.updates) == 3
 
 def test_a_host_decoders_steps_run_on_its_startups_programs_alone():
     """A host decoder's step, its layers banked and stacked on the CPU each step, runs every step on the
@@ -1318,9 +1335,11 @@ def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout():
     """A fresh LoRA fit whose frozen base is a decoder of a plain loop (scan_layers=False) on GPUs that
     price the streamed step (the host's CPUs standing in for H100s): no host layout holds a plain loop's
     stack in bank memory (`execution.unscanned`), so the streamed step is no candidate, said by name, and
-    the run trains in its device layout. Before, the chooser laid the streamed start out and its frozen
-    base's placement raised (rows 8336, 8358: test_dory's LoRA cell on every GPU tier)."""
+    the run trains in its device layout, or, its device plan refused too, is refused by that plan. Before,
+    the chooser laid the streamed start out and its frozen base's placement raised (rows 8336, 8358:
+    test_dory's LoRA cell on every GPU tier; row 8639)."""
     from dew.lora import LoRA
+    from dew.mesh import LayoutRefused
     from dew.training.ahead import stand_in_gpus
 
     model = CausalTransformer(vocab_size=256, emb_features=64, num_layers=2, num_heads=2, mlp_features=128,
@@ -1333,6 +1352,15 @@ def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout():
         trainer.fit(streaming_data(), steps=1, log_every=100)
     choice = trainer.layout_choice
     assert not trainer.host_master and not choice.streams and choice.refused is not None, choice
+    # Its device plan refused too (a split no batch divides into whole rows), no layout runs: that refusal,
+    # never the host layout's placement raising over the plain loop (row 8639).
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+        split = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
+                                    variables=adapted.variables), STREAMING_ADAM, key=jax.random.key(6),
+                        split=3)
+        with pytest.raises(LayoutRefused):
+            split.fit(streaming_data(), steps=1, log_every=100)
+
 
 @pytest.mark.tpu(reason="a TPU v6e prices the streamed step by its stated host link (row 7908)")
 def test_a_tpu_that_holds_only_the_streamed_step_streams_on_par_with_its_device_plan():

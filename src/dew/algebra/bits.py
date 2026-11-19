@@ -755,7 +755,7 @@ def scales_decoded(codes: jax.Array) -> jax.Array:
 NVFP4_OWED = 2.0 ** 8
 """The factor an NVFP4 tile's decode (`nvfp4_decoded`) owes its values, which the epilogue's fp32 scale takes:
 a prologue restores each code to float32 from the form's decode (`code 2^-126`, `NVFP4_BFLOAT16`,
-`_restored`), multiplies it by its block scale over 2^8 and narrows the product to bfloat16, exact and
+`nvfp4_codes`), multiplies it by its block scale over 2^8 and narrows the product to bfloat16, exact and
 within bfloat16's range, so the tile is the values over 2^8."""
 
 
@@ -764,31 +764,45 @@ def nvfp4_decoded(words: jax.Array, scales: jax.Array) -> jax.Array:
     exactly: `words` `[depth / 8, columns]` uint32, each the stored (`BitForm.prepared`) word of a column's
     eight consecutive codes along the depth, and `scales` `[depth / 16, columns]` float8_e4m3fn, one for
     each sixteen (`product.NVFP4.depth`, the format's one statement of its block); `[depth, columns]`: the
-    code restored from its decode (`_restored`) times its scale over 2^8 in float32, exact (at most six
+    code restored from its decode (`nvfp4_codes`) times its scale over 2^8 in float32, exact (at most six
     significant bits) and within bfloat16's normal range, as a GPU's prologue forms it in one multiply per
     value (`NVFP4_OWED`), a GEMM operand prologue's per stage (the template's matrix-operand hook,
     algebra.md 7.4)."""
-    codes = _restored(NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T)
+    codes = nvfp4_codes(words)
     owed = scales_decoded(jax.lax.bitcast_convert_type(scales, jnp.uint8)) * np.float32(1 / NVFP4_OWED)
     return (codes * jnp.repeat(owed, NVFP4.depth, axis=0)).astype(jnp.bfloat16)
 
 
-def _restored(decoded: jax.Array) -> jax.Array:
-    """A decode's bfloat16 values (`NVFP4_BFLOAT16_FORM.values`, each `code 2^-126`) times 2^126, in float32
-    (`restored`)."""
-    return restored(jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32))
+def nvfp4_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
+    """The E2M1 codes of NVFP4's stored words (`words` `[depth / 8, columns]` uint32, each the stored word of
+    a column's eight consecutive codes along the depth), `[depth, columns]` in `dtype` (float32 by default; a
+    float64 truth's float64): the form's decode (`NVFP4_BFLOAT16_FORM`, each code times 2^-126 as a
+    bfloat16) read as its lanes' bits and restored (`restored`). The portable decode's (`nvfp4_decoded`) and
+    a truth's codes alike."""
+    pattern = NVFP4_BFLOAT16_FORM.values(words.T, jnp.uint16).T.astype(jnp.uint32)
+    return restored(pattern, dtype)
 
 
-def restored(pattern: jax.Array) -> jax.Array:
+def restored(pattern: jax.Array, dtype=jnp.float32) -> jax.Array:
     """The NVFP4 form's decoded value (`NVFP4_BFLOAT16_FORM`: each code times 2^-126 as a bfloat16) of each of
-    `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in float32 by integer
-    arithmetic: a subnormal (a code of 0 or 0.5) as its mantissa's integer times 2^-7 with its sign, every
-    other value's exponent raised by 126 (its bits moved to a float32's high half), so no lane that flushes
-    subnormals (XLA:CPU's, a GPU's) zeroes a code of 0.5. The one definition of the decoded value: the
-    portable decode's (`nvfp4_decoded`) and the native staged decode's, whatever lanes each extracts."""
+    `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in `dtype` (float32 by
+    default; a float64 truth's float64) by integer arithmetic: a subnormal (a code of 0 or 0.5) as its
+    mantissa's integer times 2^-7 with its sign, every other value's exponent raised by 126 (its bits moved to
+    a float32's high half, then cast, a format wider than float32's taking its subnormals exactly), so no
+    lane that flushes subnormals (XLA:CPU's, a GPU's) zeroes a code of 0.5. The one definition of the decoded
+    value: the portable decode's (`nvfp4_decoded`), the native staged decode's, whatever lanes each extracts,
+    and a truth's."""
     sign = pattern & jnp.uint32(0x8000)
-    normal = jax.lax.bitcast_convert_type((pattern << jnp.uint32(16)) + jnp.uint32(126 << 23), jnp.float32)
-    mantissa = (pattern & jnp.uint32(0x7F)).astype(jnp.float32) * jnp.float32(2.0 ** -7)
+    rebased = (pattern << jnp.uint32(16)) + jnp.uint32(126 << 23)
+    normal = jax.lax.bitcast_convert_type(rebased, jnp.float32)
+    if jnp.finfo(dtype).bits > 32:
+        # Widened from the rebased bits themselves where they hold a float32 subnormal (a pattern outside the
+        # format's codes), which a flushing lane's cast would zero: its fraction times 2^-149, exact in a
+        # wider format. A narrower one casts the float32 as it casts any.
+        fraction = (rebased & jnp.uint32(0x7FFFFF)).astype(dtype) * jnp.asarray(2.0 ** -149, dtype)
+        tiny = jnp.where(rebased >> jnp.uint32(31) != 0, -fraction, fraction)
+        normal = jnp.where(rebased & jnp.uint32(0x7F800000) == 0, tiny, normal.astype(dtype))
+    mantissa = (pattern & jnp.uint32(0x7F)).astype(dtype) * jnp.asarray(2.0 ** -7, dtype)
     subnormal = jnp.where(sign != 0, -mantissa, mantissa)
     return jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
 

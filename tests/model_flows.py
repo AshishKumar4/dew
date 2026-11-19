@@ -380,20 +380,12 @@ def exact_banks(taken) -> dict:
 
 def exact_codes(words: jax.Array, dtype) -> jax.Array:
     """The E2M1 values of an NVFP4 matrix's stored words (`[..., depth / 8, width]`, `NvFp4`'s staged order)
-    in `dtype`, in the depths' own order: the stored form's decode (`bits.NVFP4_BFLOAT16_FORM`, each code
-    times 2^-126 as a bfloat16's bits) restored to the code as `bits.restored` restores it, by integer
-    arithmetic and casts, its one product (a subnormal's mantissa times 2^-7) in `dtype`."""
+    in `dtype`, in the depths' own order (`bits.nvfp4_codes`, the portable decode's codes)."""
     from dew.algebra import bits
     from dew.nn.kernels.formats import staged_rows
 
     def one(words: jax.Array) -> jax.Array:
-        decoded = bits.NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T
-        pattern = jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32)
-        normal = jax.lax.bitcast_convert_type((pattern << jnp.uint32(16)) + jnp.uint32(126 << 23),
-                                              jnp.float32).astype(dtype)
-        mantissa = (pattern & jnp.uint32(0x7F)).astype(dtype) * jnp.asarray(2.0 ** -7, dtype)
-        subnormal = jnp.where(pattern & jnp.uint32(0x8000) != 0, -mantissa, mantissa)
-        codes = jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
+        codes = bits.nvfp4_codes(words, dtype)
         return codes[np.argsort(staged_rows(codes.shape[0]))]
 
     for _ in range(words.ndim - 2):
@@ -726,13 +718,13 @@ def held_reference(flow: ModelFlow, found: list) -> None:
 def _compiled(flow: ModelFlow, named: Mapping[str, tuple[Callable, list]], arm: str, target):
     """The arm's programs of `named` (`programs_of`) compiled for `target` (`compile_programs`), one a call so
     each program's routes are its own, each program's routes by its kind (`ModelFlow.kinds`), and the names
-    of those its compile refuses to prepare (`report.CompiledOnDevice`: a convolution, whose algorithm only
-    its GPU picks), which its run compiles on its GPU (`loaded`): their routes traced all the same. None of
-    the programs where every one is refused."""
+    of those its compile refuses to prepare, each with the refusal's reason (`report.CompiledOnDevice`: a
+    convolution, whose algorithm only its GPU picks), which its run compiles on its GPU (`loaded`): their
+    routes traced all the same. None of the programs where every one is refused."""
     from dew.nn.kernels.templates.report import CompiledOnDevice
     from dew.training.ahead import AheadPrograms, compile_programs
 
-    compiled, found, on_device = {}, {}, []
+    compiled, found, on_device = {}, {}, {}
     for kind in flow.kinds:
         name = f"{kind} {arm}"
         with generation.routes() as found[kind]:
@@ -741,17 +733,18 @@ def _compiled(flow: ModelFlow, named: Mapping[str, tuple[Callable, list]], arm: 
                 compiled[kind] = compile_programs({name: named[name]}, target.generation,
                                                   target.multiprocessors, topology=os.environ[TOPOLOGY])
             except CompiledOnDevice as refused:
-                on_device.extend(refused.programs or (name,))
+                on_device.update(dict.fromkeys(refused.programs or (name,), str(refused)))
     if not compiled:
         return None, found, on_device
     return AheadPrograms(next(iter(compiled.values())).target, {
         name: program for each in compiled.values() for name, program in each.programs.items()},
-        tuned=all(each.tuned for each in compiled.values())), found, on_device
+        tuned=all(each.tuned for each in compiled.values()),
+        at_run=tuple(name for each in compiled.values() for name in each.at_run)), found, on_device
 
 
 ON_DEVICE = "on_device.json"
 """A flow's file in its store naming the programs its prepare could not prepare (`report.CompiledOnDevice`),
-each arm's, and why, which its run compiles on its GPU (`loaded`)."""
+each arm's, by the refusal's reason, which its run compiles on its GPU and names (`loaded`)."""
 
 
 def prepare(flow: ModelFlow) -> bool:
@@ -779,10 +772,7 @@ def prepare(flow: ModelFlow) -> bool:
         (directory / f"{arm}.programs").unlink(missing_ok=True)
         if programs is not None:
             programs.save(directory / f"{arm}.programs")
-    (directory / ON_DEVICE).write_text(json.dumps({
-        "programs": [*on_device, *refused], "stamp": stamp(),
-        "why": "a cuDNN convolution compiled without its GPU leaves its algorithm to run time "
-               "(report.DEVICELESS_CONVOLUTION_PICKS)"}))
+    (directory / ON_DEVICE).write_text(json.dumps({"programs": {**on_device, **refused}, "stamp": stamp()}))
     for kind in flow.kinds:
         judge(flow, {}, kind, target)
     programs = need(dew, reference, directory / "truths")
@@ -840,6 +830,8 @@ def loaded(flow: ModelFlow) -> dict[str, Callable]:
     the draw's inputs whose results are fetched to the host, as check 1 holds an arm's (`reference_error`):
     no arm's outputs stay on the GPU while the next program runs, which the flow's needs count none of
     (`need`)."""
+    from truths_ahead import AT_RUN
+
     from dew.training.ahead import AheadPrograms
 
     directory = store_of(flow)
@@ -848,13 +840,15 @@ def loaded(flow: ModelFlow) -> dict[str, Callable]:
         name: program for arm in ("dew", "reference") if (directory / f"{arm}.programs").exists()
         for name, program in AheadPrograms.load(directory / f"{arm}.programs").loaded().items()}
     # Each program its prepare could not prepare compiled on this GPU as it first runs, under this process's
-    # flags, traced as its prepare traced it (the reference arm under its reference kernels), said.
+    # flags, traced as its prepare traced it (the reference arm under its reference kernels), named in the
+    # run's summary as its prepare declared (`truths_ahead.AT_RUN`), in the flow's truths' store, as an at-run
+    # site's truths are (the store a flow's run opens names its records, tests/conftest.py's).
     named = programs_of(flow) if on_device else {}
-    for name in on_device:
-        kernels = reference_kernels() if name.endswith(" reference") else {}
-        held[name] = jax.jit(functools.partial(_traced_under, named[name][0], kernels))
-    if on_device:
-        print(f"{flow.name}: compiled on this GPU, its prepare unable to: {', '.join(on_device)}")
+    with compiled_truths(directory / "truths", prepare=False, stamp=stamp()) as truths:
+        for name, why in on_device.items():
+            kernels = reference_kernels() if name.endswith(" reference") else {}
+            held[name] = jax.jit(functools.partial(_traced_under, named[name][0], kernels))
+            truths.unprepared(f"{flow.name} {name}: {why}", AT_RUN)
     return {name: as_given(lambda params, *inputs, program=program: jax.device_get(
                 program(*jax.tree.leaves(params), *inputs))) for name, program in held.items()}
 

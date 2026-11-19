@@ -558,6 +558,12 @@ class GpuTarget:
     step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
     measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
     none was."""
+    vmem_rate: float | None = None
+    """A TPU's VMEM bytes a second, read and written by its vector unit: what XLA's path moves between its
+    vector registers and VMEM costs (`templates.cost.Work.kept_bytes`, `templates.cost.rates`), measured as a
+    Pallas chain's fixed cost an iteration of reading and writing one 2 MiB fp32 block (4 MiB an iteration)
+    beside its steps, on Colab's TPUs, two rounds each (rows 7201 and 7283, colab7062's rates2 and rates3);
+    None where none was, so those bytes are priced by no time there."""
     host_links: Mapping[str, float] = dataclasses.field(kw_only=True, hash=False)
     """Each part's link to its host's memory (by the device-kind prefixes `dense_peaks` keys), in bytes a
     second one way, its datasheet's peak: PCIe's x16 lanes or NVLink-C2C, whose sheets state both ways
@@ -894,7 +900,9 @@ TARGETS = {target.generation: target for target in (
     # (cloud.google.com/tpu/docs/v5e, /tpu/docs/system-architecture-tpu-vm); the clock is 197e12 / 131072,
     # derived from the peak, no stated clock. Its scoped VMEM and MXU rate are its family's (`_TPUS`).
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
-              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30, host_links={}),
+              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30,
+              # 0.65 us an iteration of 4 MiB (`vmem_rate`).
+              vmem_rate=6.5e12, host_links={}),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}},
               host_links={}),
     # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
@@ -902,7 +910,9 @@ TARGETS = {target.generation: target for target in (
     # link is "PCIe Gen5 x8 per chip" (the same page's system architecture): half a Gen5 x16's 64 GB/s each
     # way.
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}, multiprocessors=1,
-              clock_hz=918e12 / 524288, memory_bandwidth=1638e9, host_links={'TPU v6 lite': 32e9}),
+              clock_hz=918e12 / 524288, memory_bandwidth=1638e9,
+              # 0.28 us an iteration of 4 MiB (`vmem_rate`).
+              vmem_rate=1.5e13, host_links={'TPU v6 lite': 32e9}),
 )}
 
 
@@ -1408,28 +1418,53 @@ def route(choice: Choice, *, kernel: str, preferred: str | None = None, refusal:
     return found
 
 
+def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Callable:
+    """`linear_tangent`'s forward without `nested`: run on its operands held still (`stop_gradient`), its
+    output alone taking `portable`'s tangent where an outer order differentiates it, what it saves none:
+    held still whole, a second order lost its loss's curvature, `J^T H J` (row 8648)."""
+    import jax
+
+    from dew.nn.derivatives import contracted, declared_tangent
+
+    def tangent(primals, tangents):
+        # The output's own tangent is zero: it is computed from operands held still. Its value the attached
+        # output again, so a third order takes its tangent too (8573's head review: 32 where 48).
+        output, *operands = primals
+        return attached(output, *operands), jax.jvp(portable, tuple(operands), tuple(tangents[1:]))[1]
+
+    def holding(output, *operands):
+        del operands
+        return output
+
+    attached = contracted("test_an_embedding_lookup_holds_every_order")(
+        declared_tangent(kind, holding, tangent))
+
+    def run(*operands):
+        output, saved = forward(*jax.lax.stop_gradient(operands))
+        return attached(output, *operands), saved
+
+    return run
+
+
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *, kind: TangentKind,
                    live_cotangents: bool = False, zero_cotangents: bool = False,
                    primal: Callable | None = None, nested: bool = True,
-                   unread: tuple[int, ...] = ()) -> Callable:
+                   unread: tuple[int, ...] = (), traced: bool = False) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
     `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
     `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
     arrays); `backward(saved, operands, cotangent)` gives the operands' cotangents, a tuple; and
-    `portable(*operands)` gives the output.
-
-    The output's derivative is one custom JVP whose tangent is `portable`'s, evaluated as a
-    linear map that transposes to `backward` (`linear_map`): forward mode (`jax.jvp`,
-    `jax.linearize`) takes the portable tangent however a jit or a scan staged the call, and reverse
-    mode runs the backward kernel, through a vjp or through a jvp that a shard_map or a scan then
+    `portable(*operands)` gives the output. The output's derivative is one custom JVP whose tangent is
+    `portable`'s, evaluated as a linear map that transposes to `backward` (`linear_map`): forward mode
+    (`jax.jvp`, `jax.linearize`) takes the portable tangent however a jit or a scan staged the call, and
+    reverse mode runs the backward kernel, through a vjp or through a jvp that a shard_map or a scan then
     transposes. The forward and the backward are custom JVPs of their own whose tangents are
     `portable`'s and its pullback's, so a higher order (`jax.jvp` of `jax.grad`, `jax.grad` of
     `jax.jvp`) differentiates through XLA while each level's value comes from the kernels; what
     `saved` holds is a function of the operands, whose tangents carry it. This composes with
-    `jax.vmap` of a gradient, the gradient of a `jax.vmap` and forward over reverse. Each of the three is
-    declared as the caller's `kind` (`dew.nn.derivatives.declared_tangent`): a kernel's glue (`KernelGlue`),
-    a rule its numerics need as written (`Protected`), or one written to restructure algebra (`Algebra`),
-    which is what the algebra pass reads of it.
+    `jax.vmap` of a gradient, the gradient of a `jax.vmap` and forward over reverse. Each is declared as
+    the caller's `kind` (`dew.nn.derivatives.declared_tangent`), which the algebra pass reads: a kernel's
+    glue (`KernelGlue`), a rule its numerics need as written (`Protected`) or algebra's own (`Algebra`).
 
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
@@ -1439,13 +1474,13 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     operands at `unread` positions, which no derivative reads (`portable` and `backward` alike: a value only
     the forward multiplies, `gemm`'s `applied`), are no residual of the derivative: it holds each as an empty
     array of its dtype, so a remat policy that saves the other operands recomputes nothing to form it.
-    `primal(*operands)` gives the output where no derivative is taken (a kernel
-    that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
-    it is on its operands held still (`stop_gradient`), not as a custom JVP of its own: a value it names
-    (`checkpoint_name`) is a residual a remat policy can keep, and no order differentiates the kernels'
-    forward, whose custom VJP takes none (what it saves reaches `pulled` alone, whose tangent reads the
-    operands': run as it was, a jvp of a gradient through a named kernel reached Mosaic GPU's call, which
-    no JAX rule differentiates, row 2655)."""
+    `primal(*operands)` gives the output where no derivative is taken (a kernel that saves nothing),
+    `forward`'s where None. Without `nested`, a derivative's level runs `forward` on its operands held
+    still (`_held_still`), not as a custom JVP of its own: a value it names (`checkpoint_name`) is a
+    residual a remat policy can keep, and no order differentiates the kernels' forward, whose custom VJP
+    takes none (what it saves reaches `pulled` alone, whose tangent reads the operands': a jvp of a
+    gradient through a named kernel reached Mosaic GPU's call, row 2655). With `traced`, orders past the
+    first differentiate `forward` and `backward` as written (row 8656: the turned rule's crossing form)."""
     import jax
     import jax.numpy as jnp
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
@@ -1468,7 +1503,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         return backward(*arguments)
 
     def pulled_jvp(live, primals, tangents):
-        _, operands, cotangent = primals
+        saved, operands, cotangent = primals
         _, doperands, dcotangent = tangents
 
         def pullback(operands, cotangent):
@@ -1477,13 +1512,15 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             # `live` indexes the operands' leaves, as the reverse pass's `backward` takes them.
             return whole if live is None else tuple(jax.tree.leaves(whole)[index] for index in live)
 
-        return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
+        return (pulled(saved, operands, cotangent, live),
+                jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1])
 
-    pulled = contracted("test_an_embedding_lookup_holds_every_order")(
+    pulled = pulled_by if traced else contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,)))
+    level = forward if traced else produced if nested else _held_still(forward, portable, kind)
 
     def bounded_jvp(primals, tangents):
-        output, saved = produced(*primals) if nested else forward(*jax.lax.stop_gradient(primals))
+        output, saved = level(*primals)
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
         directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)

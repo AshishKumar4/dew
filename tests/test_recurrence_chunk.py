@@ -447,6 +447,57 @@ def vanishing_entered_draw(seed: int):
     return vanishing(operands), seeded
 
 
+def turned_entered_draw(seed: int):
+    """`entered_draw`'s turned operands with entry writes, its cotangents, and a direction of its turns,
+    standard normal."""
+    operands, seeded = entered_draw(TURNED, seed, entries=True)
+    key = jax.random.fold_in(jax.random.key(seed), 8573)
+    return operands, jax.random.normal(key, operands.turn.shape, operands.turn.dtype), seeded
+
+
+def turn_curvature(fn):
+    """`fn(operands)`'s outputs against their cotangents, its turns' gradient's derivative along a direction
+    of the turns (`jax.jvp` of `jax.grad`): the turns' block of its Hessian, which a forked call's load
+    rotations (`Forked.turning`) reach."""
+    def run(operands, direction, seeded):
+        def gradient(turn):
+            def loss(turn):
+                out, final = fn(dataclasses.replace(operands, turn=turn))
+                return jnp.sum(out * seeded[0]) + jnp.sum(final * seeded[1])
+
+            return jax.grad(loss)(turn)
+
+        return jax.jvp(gradient, (operands.turn,), (direction,))[1]
+
+    return run
+
+
+def test_a_turned_forked_calls_turn_curvature_is_as_exact_as_each_document_alone():
+    """A turned forked call's turns' block of its Hessian along a drawn direction (`turn_curvature`), its
+    documents entering their table slots with entry writes (`turned_entered_draw`): on par from float64 with
+    each document alone through the same op (check 1, the recurrence a token at a time in float64 the
+    truth): a forked call's second order, which its custom VJP refused (row 8573), and which through the
+    portable pullback lost each document's load rotation's part (its head review)."""
+    def ours(operands):
+        return chunk_on('xla', TURNED, entering_documents(operands), chunk_size=CHUNK)
+
+    def own(hooks, piece):
+        return chunk_on('xla', hooks, piece, chunk_size=CHUNK)
+
+    def alone(operands):
+        return document_by_document(TURNED, operands, own)
+
+    exact = jax.jit(turn_curvature(lambda operands: document_by_document(TURNED, operands)))
+
+    def truth(*inputs):
+        with jax.enable_x64(new_val=True):
+            return exact(*jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), inputs))
+
+    assert_as_exact(jax.jit(turn_curvature(ours)), jax.jit(turn_curvature(alone)), turned_entered_draw,
+                    f"xla {TURNED} a forked call's turn curvature", seeds=32, truth_fn=truth)
+
+
+
 def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recurrence():
     """A turned call's turns' gradient differentiated along its queries (`jvp` of `grad`), a third of its
     queries zero, packed: on par from float64 with the recurrence a token at a time's (check 1), where the

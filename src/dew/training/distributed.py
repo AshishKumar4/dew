@@ -627,6 +627,24 @@ def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
     return holding(_TRACED_STARTS, (kept, held_context(), leaves), made, KEPT_STARTS)
 
 
+def built_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
+                key: jax.Array) -> TrainState:
+    """`initial_state(initializer, key)` for a caller outside any trace, built by one program: its trace
+    (`traced_start`) replayed and compiled whole, where run eagerly each operation of the model's draw
+    compiled alone (tens to hundreds a model, row 8682). The frozen leaves its init passes through as they
+    are (`through`) are the initializer's arrays themselves, as an eager build returns them, not the
+    program's copies of them."""
+    _, through, build = traced_start(initial_state, initializer, key)
+    state = owned_program(build)(initializer, key)
+    if not through:
+        return state
+    moving, frozen = apart(state)
+    leaves, structure = jax.tree.flatten(frozen)
+    given = jax.tree.leaves(initializer)
+    return together(moving, jax.tree.unflatten(structure, [
+        given[through[index]] if index in through else leaf for index, leaf in enumerate(leaves)]))
+
+
 def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, abstract: TrainState,
                  shardings: Placement[TrainState], mesh: Mesh) -> TrainState:
     """A fresh state on `mesh`, built by `initial_state` from the objective's held tree (`placed_held`).

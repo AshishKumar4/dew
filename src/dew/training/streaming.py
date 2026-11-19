@@ -350,15 +350,20 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     phases = trainer.phase_passes
     active = phases.objective_for(phases.at(first))
     rung = Rung.of(active, xla_defaults=False, narrow=True)
+    # A frozen stack a plain loop runs, which no host layout holds in bank memory (`unscanned`): the
+    # streamed step is no candidate, read from the device start's shapes before its plan (row 8336: a LoRA
+    # fit over an unscanned decoder raised where its streamed start placed its frozen base). Where the device
+    # plan is refused too, no layout runs: its refusal, said with why the streamed step was not considered
+    # (row 8639).
+    start, loops = None, None
     try:
         start = trainer._started(resume)
+        loops = frozen_loops(trainer, start.abstract.variables)
         trainer._planned_unplaced(start, batch)
-    except LayoutRefused:
+    except LayoutRefused as refused:
+        if loops is not None:
+            raise LayoutRefused(f"{refused}; the streamed step is not considered: {loops}") from refused
         start = None
-    # A frozen stack a plain loop runs, which no host layout holds in bank memory (`unscanned`): the
-    # streamed step is no candidate, read from the device start's shapes (row 8336: a LoRA fit over an
-    # unscanned decoder raised where its streamed start placed its frozen base).
-    loops = None if start is None else frozen_loops(trainer, start.abstract.variables)
     if start is not None and loops is not None:
         trainer.layout_choice = Choice(held=True, fits=False, device=None, streamed=None, refused=loops,
                                        streams=False)
