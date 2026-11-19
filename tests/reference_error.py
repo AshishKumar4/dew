@@ -306,7 +306,7 @@ def _truth_program(fn, device=None):
     if fn is None or _given(fn):
         return unrewritten(fn)
     if getattr(fn, "dew_programs", False):
-        return unrewritten(_with_options(fn, as_written()))
+        return unrewritten(_with_options(fn, as_written))
     return Truth(_own_function(fn), device)
 
 
@@ -550,7 +550,9 @@ def _compile_site(store: CompiledTruths, dew_fn, reference_fn, draw, label: str,
     recording) has no program."""
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
                            library_row=None, library_leaves=(), also=also, terms=terms)
-    truth = truth_fn if truth_fn is not None else reference_fn
+    # A jit's own function (`arm_forms._own_function`), as its run compiles it: one of compiler options of its
+    # own nests in no trace of the prepare's.
+    truth = _own_function(truth_fn if truth_fn is not None else reference_fn)
     shaped = {}
     for seed in range(staged_units(seeds)):
         inputs = drawn_on_the_host(draw, seed)
@@ -1406,15 +1408,16 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
                 store.unprepared(f"{label}: its prepare did not reach this site")
         # An accuracy claim's bound sized too (`arm_forms._bounded`), Dew paired with the reference as written
         # (`_written_twin`; a store's, its prepare's twin at the sizing draws' shapes), the larger declared.
-        twin = None if arms is None or not _bounded(reference_fn) else (arms[0], _stored_arm(
-            store, label, reference_fn, _written_twin(dew_fn, reference_fn), _written_role(None),
-            written=True))
+        pairs = {False: arms}
+        if _bounded(reference_fn):
+            pairs[True] = _written_pair(store, label, dew_fn, reference_fn, draw, arms)
+            pairs[False] = arms or pairs[True][2]
         token = COMPILED.set(None)
         try:
             sized = {written: seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
                                         orders=orders, examples=examples, followed=followed,
-                                        arms=twin if written else arms, written=written)
-                     for written in (False, True)[:1 + _bounded(reference_fn)]}
+                                        arms=pair if pair is None else pair[:2], written=written)
+                     for written, pair in pairs.items()}
         finally:
             COMPILED.reset(token)
         record["sized"], record["sized as written"] = max(sized.values()), sized.get(True)
@@ -1423,6 +1426,22 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
     if (sized := record.get("sized", 0)) > seeds:
         raise StaleSeeds(f"{label}: this site sizes {sized} seeds here and declares {seeds}: its count was "
                          f"sized on other arithmetic or another host level; declare what it sizes now")
+
+
+def _written_pair(store, label: str, dew_fn, reference_fn, draw, arms):
+    """A qualification run's pair of Dew and its reference as written (`_qualified`), and beside it the pair
+    compiled alike: a store's prepared arms and twin where `arms` are its (`_stored_arm`), else both compiled
+    here, their CPU mode decided once over all three arms (`_ynn_decided`) on a sizing draw, as the verdict
+    decides it over all of them, so neither sizing takes another arithmetic than its verdict's.
+    `(dew, twin, (dew, reference))`."""
+    twin = _written_twin(dew_fn, reference_fn)
+    if arms is not None:
+        return arms[0], _stored_arm(store, label, reference_fn, twin, _written_role(None), written=True), arms
+    _refuse_numpy_arms(draw, dew_fn, reference_fn)
+    alike = _arms_with(dew_fn, reference_fn, [], label)[:2]
+    with summed_as_run():
+        _ynn_decided(label, [*alike, twin], draw(SIZING_FROM))
+    return alike[0], twin, alike
 
 
 def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,

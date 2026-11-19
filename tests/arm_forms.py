@@ -12,7 +12,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import Unrewritten, as_written, unrewritten
+from arm_arithmetic import Unrewritten, Written, as_written, unrewritten
 from check1_judge import SWITCHED
 from check1_wire import CENSUS
 
@@ -301,17 +301,18 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False, written: bo
     fn = _own_function(fn) if written else fn
     if _given(fn) or getattr(fn, "without_ynn", False):
         return run(fn)
-    options = as_written() if written else {}
+    # As written for the platform each call runs on (`arm_arithmetic.Written`), read where it runs.
+    options = as_written if written else dict
     if getattr(fn, "dew_programs", False):
-        plain = _with_options(fn, options)
+        plain = _with_options(fn, options) if written else fn
         return run(plain) if compile is jax.jit else _Paired(
-            pairing, run(_with_options(fn, {**_switched_off_here(), **options})), run(plain))
+            pairing, run(_with_options(fn, lambda: {**_switched_off_here(), **options()})), run(plain))
     if isinstance(fn, _Windowed):
         return _Windowed(_compiled(fn.fn, compile, pairing, reference=reference, written=written))
-    if compile is jax.jit:
-        return run(jax.jit(fn, compiler_options=options or None))
-    return _Paired(pairing, run(compile(fn, compiler_options=options or None)),
-                   run(jax.jit(fn, compiler_options=options or None)))
+    if written:
+        return run(Written(fn)) if compile is jax.jit else _Paired(pairing, run(Written(fn, compile)),
+                                                                   run(Written(fn)))
+    return run(compile(fn)) if compile is jax.jit else _Paired(pairing, run(compile(fn)), run(jax.jit(fn)))
 
 
 def _own_function(fn):
@@ -462,18 +463,15 @@ def _switched_off_here() -> dict:
     return switched_off() if placed_platform() == "cpu" else {}
 
 
-def _with_options(fn, compiler_options: dict):
-    """`fn`, an arm that runs Dew's own programs (`dew_programs`), run with Dew's compile seam adding
-    `compiler_options` to every program it compiles (`compiled_with`), read at each call; `fn` itself where
-    they are none."""
+def _with_options(fn, compiler_options: Callable[[], dict]):
+    """`fn`, an arm that runs Dew's own programs (`dew_programs`), run with Dew's compile seam adding the
+    compiler options `compiler_options()` gives at each call (where the call is placed) to every program it
+    compiles (`compiled_with`)."""
     from dew.nn.kernels.options import compiled_with
-
-    if not compiler_options:
-        return fn
 
     @functools.wraps(fn)
     def run(*inputs, **options):
-        with compiled_with(compiler_options):
+        with compiled_with(compiler_options()):
             return fn(*inputs, **options)
     return run
 

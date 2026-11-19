@@ -3,6 +3,7 @@
 computes on (`float64_host`), its inputs (`widened`) and its compiled program (`Truth`)."""
 
 import contextlib
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -242,41 +243,57 @@ class Unrewritten:
         return staged
 
 
+class Written:
+    """`fn` compiled by `compile` (`jax.jit`, or an arm's pairing's: `arm_forms.without_ynn`) as written
+    (`as_written`) for the platform each call runs on (`_platform_of`: where its inputs lie, a GPU-committed
+    draw's under a CPU default included), once a platform: a truth's program (`Truth`) and an accuracy
+    claim's reference as written (`arm_forms._written_twin`), the one rule both take. Its `lower` and `trace`
+    are the program an uncommitted call runs, for the platform the context places a call on."""
+
+    def __init__(self, fn, compile: Callable = jax.jit):
+        self.fn, self.compile, self._made = fn, compile, {}
+
+    def program(self, platform: str):
+        if platform not in self._made:
+            self._made[platform] = self.compile(self.fn, compiler_options=as_written(platform))
+        return self._made[platform]
+
+    def __call__(self, *inputs, **options):
+        return self.program(_platform_of(inputs))(*inputs, **options)
+
+    @property
+    def placed(self):
+        """Its program for the platform the context places a call on (`generation.placed_platform`)."""
+        from dew.nn.kernels.generation import placed_platform
+
+        return self.program(placed_platform())
+
+    def lower(self, *inputs, **options):
+        return self.placed.lower(*inputs, **options)
+
+    @property
+    def trace(self):
+        return self.placed.trace
+
+
 class Truth:
-    """A check's float64 truth as the gate runs it (`reference_error._truth_program`): its own function jitted
-    as written (`as_written`) for the platform its call runs on (`_platform_of`: where its inputs lie, a
-    GPU-committed draw's under a CPU default included; the platform the context places a call on where none
-    is committed), once a platform, which every site of it shares, run unrewritten (`unrewritten`), compiled
-    from its first call and never run eagerly, so a seed's truth is the same whichever seed a process draws
-    first (a map task's, DRAWS) and a large truth pays no eager run. A truth that does host work on its
-    values (NumPy, torch, a fetch to the host) states it, `as_given`, and the gate runs it so; unstated, its
-    trace fails at its first seed, naming it (ledger 3198). On `device` where one is named (a GPU run's
-    sizing, whose truths its host computes as a prepare's do, the GPU's memory left to the arms)."""
+    """A check's float64 truth as the gate runs it (`reference_error._truth_program`): its own function
+    compiled as written for the platform its call runs on (`Written`), which every site of it shares, run
+    unrewritten (`unrewritten`), compiled from its first call and never run eagerly, so a seed's truth is
+    the same whichever seed a process draws first (a map task's, DRAWS) and a large truth pays no eager run.
+    A truth that does host work on its values (NumPy, torch, a fetch to the host) states it, `as_given`, and
+    the gate runs it so; unstated, its trace fails at its first seed, naming it (ledger 3198). On `device`
+    where one is named (a GPU run's sizing, whose truths its host computes as a prepare's do, the GPU's memory
+    left to the arms): a truth rewritten into another value makes every ratio meaningless."""
 
     def __init__(self, fn, device=None):
-        self.fn, self.device, self._runs = fn, device, {}
-
-    def _run(self, platform: str):
-        # As written (`as_written`) on the platform it computes on: a truth rewritten into another value
-        # makes every ratio meaningless.
-        if platform not in self._runs:
-            self._runs[platform] = unrewritten(jax.jit(self.fn, compiler_options=as_written(platform)))
-        return self._runs[platform]
+        self.fn, self.device, self.run = fn, device, unrewritten(Written(fn))
 
     def __call__(self, *inputs):
         # On `device` where one is named: a GPU run's sizing computes its truths on the host, as a prepare
         # does; a process whose float64 is its host's (`float64_host`) computes them there.
         device = self.device or float64_host()
-        placed = inputs if device is None else jax.device_put(inputs, device)
-        return self._run(_platform_of(placed))(*placed)
-
-    @property
-    def run(self):
-        """Its program for the platform the context places a call on, the one an uncommitted call runs."""
-        from dew.nn.kernels.generation import placed_platform
-
-        device = self.device or float64_host()
-        return self._run(placed_platform() if device is None else device.platform)
+        return self.run(*(inputs if device is None else jax.device_put(inputs, device)))
 
     @property
     def trace(self):

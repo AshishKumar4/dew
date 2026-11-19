@@ -332,8 +332,10 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
 
     forward = jax.jit(plain.apply)
 
+    # The full passes at the shapes the decode's steps compute, one token each from an empty cache: the same
+    # model, one of Dew's own paths (`dew_path`), an invariance claim.
+    @dew_path
     def passes(variables, drawn, _):
-        # The full passes at the shapes the decode's steps compute, one token each from an empty cache.
         return stepped_outputs(lambda length: forward(variables, drawn[:, :length]), LENGTH, 1)
 
     assert_as_exact(jax.jit(decoded(plain)), passes, draw,
