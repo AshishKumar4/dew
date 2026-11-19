@@ -1621,6 +1621,10 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
                            truth_program)
     narrow_leaves: list[str] = []
     compiled = _arms_with(dew_fn, reference_fn, list(also.values()), label)
+    # Its truth, where it names none its reference's arm as compiled here, resolved before the store's
+    # programs take the arms' place: a reference arm read from the store is its own program at its own
+    # inputs alone, which a truth its run computes (its truths at run, `truths_ahead.running`) never is.
+    truth_program = truth_program if truth_program is not None else compiled[1]
     # The arms read from the store wherever its prepare reached the site, its truths' at run or not.
     if (ahead := reading()) is None:
         _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),

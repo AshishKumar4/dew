@@ -328,6 +328,17 @@ def _sites_store(item) -> Path | None:
     return Path(os.environ[tier_wire.TRUTHS]) / "sites" / digest
 
 
+def _named_records(request, directory: Path) -> None:
+    """A store's records of what its test's run compiled on its GPU, into this run's summary: as its prepare
+    declared (`truths_ahead.AT_RUN`), and unprepared, a site its prepare did not reach or an arm no statement
+    names (`truths_ahead.UNPREPARED`, `truths_ahead.running`)."""
+    from truths_ahead import AT_RUN, UNPREPARED
+
+    for name, key in ((AT_RUN, AT_RUN_SITES), (UNPREPARED, UNPREPARED_RUN)):
+        if (directory / name).exists():
+            request.config.stash.setdefault(key, []).append(json.loads((directory / name).read_text()))
+
+
 @pytest.fixture(autouse=True)
 def compiled_ahead(request):
     """A GPU tier part's test's check-1 sites on the part's store of programs compiled ahead
@@ -342,11 +353,21 @@ def compiled_ahead(request):
     a part with a store, nothing."""
     store = _sites_store(request.node)
     if store is None:
+        if tier_wire.TRUTHS in os.environ and not tier_wire.preparing():
+            # A flow's run, which opens its own stores (tests/model_flows.py): each it read named as a
+            # test's own is.
+            import truths_ahead
+
+            first = len(truths_ahead.READ)
+            yield
+            for directory in dict.fromkeys(truths_ahead.READ[first:]):
+                _named_records(request, directory)
+            return
         # Outside a part's store the gate's modules stay unloaded (a test outside the gate loads none).
         yield
         return
     import model_flows
-    from truths_ahead import AT_RUN, DEFERRED, UNPREPARED, compiled_truths, reasoned
+    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths, reasoned
 
     if not tier_wire.preparing():
         record = store / UNPREPARED
@@ -357,18 +378,13 @@ def compiled_ahead(request):
             return
         with compiled_truths(store, prepare=False, stamp=model_flows.stamp()):
             yield
-        if (store / AT_RUN).exists():
-            request.config.stash.setdefault(AT_RUN_SITES, []).append(json.loads((store / AT_RUN).read_text()))
         # A flow's cells its prepare deferred (`gpu_flow.run_cells`) ran unprepared beside its served ones,
         # each named.
         if (store / DEFERRED).exists():
             deferred = json.loads((store / DEFERRED).read_text())
             for reason in deferred["reasons"]:
                 reasoned(record, deferred["test"], reason["where"], reason["error"])
-        if record.exists():
-            # A site its prepare did not reach, or an arm no statement names, ran unprepared
-            # (`truths_ahead.running`).
-            request.config.stash.setdefault(UNPREPARED_RUN, []).append(json.loads(record.read_text()))
+        _named_records(request, store)
         return
 
     from truths_ahead import prepared
