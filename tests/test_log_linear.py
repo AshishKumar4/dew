@@ -82,15 +82,18 @@ def test_the_masked_form_is_as_exact_as_flas_level_by_level(packed):
                          length=LENGTH, seeds=SEEDS[packed])
 
 
-@pytest.mark.parametrize("read", ["overflowing", "a NaN"])
+@pytest.mark.parametrize("read", ["overflowing", "overflowing at a level of zero weight", "a NaN"])
 def test_a_live_span_that_underflows_reads_as_the_recurrence(read):
     """Three tokens of one document within a block under log decays `[0, -80, -80]`, each live, its first
     and last tokens' span `exp(-160)` zero in float32 (`scan.spread`'s pairs): a key's and the last query's
     2^70, whose score overflows before that decay weighs it, read finite with every gradient, as float64's
-    are, where infinity times the zero decay was NaN (head review of 512810acf F7); and a NaN in the first
-    key read NaN at every token, as the recurrence a token at a time reads it, where a decay rounded to zero
-    took the pair for a document's start (train 1079's review F1)."""
+    are, where infinity times the zero decay was NaN (head review of 512810acf F7), the last token's levels
+    weighed zero too, where the weight met the infinity first (head review of bd4031d41 F1); and a NaN in
+    the first key read NaN at every token, as the recurrence a token at a time reads it, where a decay
+    rounded to zero took the pair for a document's start (train 1079's review F1)."""
     weights = jnp.ones((1, 3, 1, levels(3)), jnp.float32)
+    if read == "overflowing at a level of zero weight":
+        weights = weights.at[0, 2].set(0.0)
     g = jnp.asarray([[[0.0], [-80.0], [-80.0]]], jnp.float32)
     value = jnp.ones((1, 3, 1, 1), jnp.float32)
     if read == "a NaN":
