@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import scan
-from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
+from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.precision import at_least_fp32, compensated_add
 
 TWO_PI = (np.float32(2 * np.pi), np.float32(2 * np.pi - float(np.float32(2 * np.pi))))
@@ -123,8 +123,8 @@ def call(launch: Callable, query, key, value, g, beta, state, skip, turn, starts
         # A forked call's documents begin at their first slots (`documents`' `firsts`), whatever `starts` it
         # gave (base review fbb1c2f71 F4: a call giving its firsts alone read as one document).
         starts = _first_tokens(documents[0], value.shape[1])
-    return _turned(launch, scale, group, held, query, key, value, g, beta, state, skip, entry, turn, starts,
-                   documents)
+    rule = _turned(launch, scale, group, held)
+    return rule(query, key, value, g, beta, state, skip, entry, turn, starts, documents)
 
 
 def _first_tokens(firsts, length: int) -> jax.Array:
@@ -262,11 +262,32 @@ def _turned_backward(launch, scale, group, held, residuals, cotangents):
             d_turn.astype(turn_kind.dtype), None, None)
 
 
-_turned = contracted("test_a_turned_template_call_holds_every_order")(
-    declared_derivative(KernelGlue(), _turned_primal, _turned_forward, _turned_backward,
-                        nondiff_argnums=(0, 1, 2, 3)))
-"""`call`'s rule: the template's launches opaque within (`KernelGlue`), its turns' gradient the crossing
-form's."""
+def _turned(launch, scale: float, group: int, held: int) -> Callable:
+    """`call`'s rule over `launch` (`generation.linear_tangent`): its reverse mode the crossing form's
+    (`_turned_forward`, `_turned_backward`), the launches opaque within (`KernelGlue`), and its tangent
+    `_turned_primal`'s, the frames' and the launch's own (the portable walk's token replay), so forward mode
+    and every higher order run where the launch's derivative does, where a custom VJP alone refused a
+    jvp of the portable math (row 8573). A call no derivative reaches runs `_turned_primal`, launching as
+    inference does, saving nothing (audit KPM-04); a derivative's forward runs held still (`nested` off), as
+    what it saves is the launch's pullback, a function no tangent carries."""
+    from dew.nn.kernels import generation
+
+    def forward(*operands):
+        return _turned_forward(launch, scale, group, held, *operands)
+
+    def backward(saved, operands, cotangent):
+        # The marks' (starts, documents') cotangents none, as their leaves: `linear_tangent` reads the
+        # cotangents leaf by leaf beside the operands'.
+        *cotangents, _, _ = _turned_backward(launch, scale, group, held, saved, cotangent)
+        marks = jax.tree.map(lambda mark: np.zeros(np.shape(mark), jax.dtypes.float0), operands[-2:])
+        return (*cotangents, *marks)
+
+    def portable(*operands):
+        return _turned_primal(launch, scale, group, held, *operands)
+
+    return contracted("test_a_turned_template_call_holds_every_order")(
+        generation.linear_tangent(forward, backward, portable, kind=KernelGlue(), primal=portable,
+                                  nested=False))
 
 
 def _taken(x, index):
