@@ -803,7 +803,12 @@ class Issuer[Accumulator](abc.ABC):
 
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
-    indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
+    indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128. A
+    pre-lowering prior, which certification overrules (`report.certified`): the count a lowering holds is
+    not derived from the traced kernel, whose shared-memory tile addresses and loop carries predicted the
+    lowered peak's scalars no better than a family's constant over 260 sm80 GEMM and recurrence kernels
+    (FS-DERIVED-HELD2-sm80, row 8377: correlation 0.49 and 0.39; a recurrence's peak 4 to 97 scalars, two to
+    five times its traced count, the lowering's shared-memory addresses and swizzles)."""
 
     scalars_whole: bool = True
     """Whether `held_registers` is a measured whole of a consumer thread's scalars, its addresses, indices
