@@ -9,7 +9,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import unflatten_dict
-from reference_runs import assert_as_exact_as_recorded
+from recorded_runs import assert_as_exact_as_recorded
 
 from dew.objectives.rl.dreamer import ConvDecoder, ConvEncoder
 

@@ -58,6 +58,15 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     # The suite's locked PEFT, which tests/test_lora_peft.py and tests/test_lora.py run in the test.
     "peft": {"peft": "0.21.2", "transformers": tested("transformers"), "torch": "2.14.0"},
     "verl": {"verl": "0.9.0"},
+    # The serving engines Dew's serving bench runs in-process (tools/serving_vllm_engine.py,
+    # tools/serving_sglang_engine.py), each in its own interpreter, as the fleet builds them
+    # (tools/gateway_capture.py's PACKAGES).
+    "vllm": {"vllm": "0.30.0"},
+    "sglang": {"sglang": "0.5.20"},
+    # ModelOpt's NVFP4 codec checkpoints' reader (tools/modelopt_worker.py, tools/venv_reference.py's sites).
+    "modelopt": {"nvidia-modelopt": "0.47.0"},
+    # MiMo Audio's mel reference (tools/torchaudio_mel_worker.py, tools/venv_reference.py's mimo-mel site).
+    "torchaudio": {"torchaudio": "2.11.0"},
 }
 """Each cohort's pins: the distribution and the public release of it, a local
 build label (`+cpu`) aside. The default cohorts' releases are the test extra's

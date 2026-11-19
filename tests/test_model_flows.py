@@ -222,6 +222,30 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     assert (filed["unit"], filed["programs"]) == ("a selective scan's unit", stated)
 
 
+def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monkeypatch):
+    """A flow whose programs hold convolutions (the UNet denoiser's), prepared over a compile-only A100's
+    topology, prepares none of them: a convolution compiled without its GPU leaves its algorithm to run
+    time (`report.CompiledOnDevice`), so its store names each program its run compiles on its GPU
+    (`model_flows.ON_DEVICE`) and holds none of them, its truths compiled all the same."""
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = store / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(tier_wire.TRUTHS, str(store / "tier"))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    monkeypatch.setenv(tier_wire.UNIT, "a UNet's unit")
+    flow = model_flows.flow_named("UNet denoiser fp32")
+    assert model_flows.prepared_apart(flow) is not None
+    held = model_flows.store_of(flow)
+    on_device = json.loads((held / model_flows.ON_DEVICE).read_text())["programs"]
+    assert sorted(on_device) == sorted(f"{kind} {arm}" for kind in flow.kinds for arm in ("dew", "reference"))
+    assert not (held / "dew.programs").exists() and not (held / "reference.programs").exists()
+    assert len(list((held / "truths").iterdir())) == len(flow.kinds)
+
+
 def _site(salt: int = 5461):
     """A bf16 product against its fp32 reference, by seed (of the stream `salt` names): a check-1 site small
     enough to prepare, then judge."""

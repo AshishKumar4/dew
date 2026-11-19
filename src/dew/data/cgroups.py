@@ -6,6 +6,8 @@ sizes automatic loading by it (row 4161)."""
 from __future__ import annotations
 
 import math
+import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -37,6 +39,31 @@ def cpus(level: Path) -> int | None:
         return None
     limit, period = quota.read_text().split()
     return None if limit == "max" else math.ceil(int(limit) / int(period))
+
+
+def allowed_cpus() -> int:
+    """The CPUs the operating system lets this process run on: its affinity where the OS keeps one
+    (`os.process_cpu_count` from Python 3.13, `sched_getaffinity` on Linux before it), else every CPU the
+    machine has (macOS and Windows on Python 3.12)."""
+    if sys.version_info >= (3, 13):
+        counted = os.process_cpu_count()
+    elif sys.platform.startswith("linux"):
+        counted = len(os.sched_getaffinity(0))
+    else:
+        counted = os.cpu_count()
+    return max(1, counted or 1)
+
+
+def usable_cpus(group: Path | None = None, root: Path = ROOT) -> int:
+    """The CPUs this process may use: those it is allowed (`allowed_cpus`), bound by every CPU quota of its
+    cgroup (`group`, its own by default, `own`) and each ancestor up to `root` (a container's limit on a
+    parent binds an unlimited child). The one reading of it a data host's sizing (`dew.data.dataset.Host`)
+    and a compile pool take; a host with no cgroup v2 states no quota."""
+    usable = allowed_cpus()
+    for level in levels(own(root) if group is None else group, root):
+        if (quota := cpus(level)) is not None:
+            usable = min(usable, quota)
+    return usable
 
 
 def memory(level: Path) -> int | None:

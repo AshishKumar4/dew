@@ -151,7 +151,12 @@ def an_adapted_projections_training_step_is_on_par(case: tuple[str, ...]) -> Non
     on par with them apart (check 1): the output and the gradients of the factors and the input, from the
     projection in float64. The routes it records run `low_rank` `fused` and every other choice at XLA."""
     combination = dict(zip(AXES["low_rank"], case, strict=True))
-    model, variables = _adapted(combination)
+    # Its frozen base formed on the host's CPU and held as NumPy's, as a site's draws are
+    # (`reference_error.drawn_on_the_host`): a GPU tier's prepare computes on no other device (its default a
+    # compile-only GPU's, row 8022).
+    with jax.default_device(jax.devices("cpu")[0]):
+        model, variables = _adapted(combination)
+    variables = jax.device_get(variables)
     truth = _truth(combination, variables)
     draw = _drawn(combination, variables)
     with generation.routes() as routes:

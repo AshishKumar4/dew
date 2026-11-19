@@ -8,7 +8,7 @@ from jax import lax
 
 from dew.diffusion.schedules import expand
 from dew.diffusion.schedules.common import ancestral_variance
-from dew.nn.precision import divided
+from dew.nn.precision import divided, summed_once
 from dew.nn.programs import on_host
 
 from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator, _unit_noise
@@ -270,7 +270,10 @@ class MultiStepDPM:
             dx_2 = (eps - last_eps) / (sigma_t - last_sigma)
             dx_2_last = (last_eps - older_eps) / (last_sigma - older_sigma)
             dx_3 = (dx_2 - dx_2_last) / (0.5 * ((sigma_t + last_sigma) - (last_sigma + older_sigma)))
-            return x + eps * dt + 0.5 * dx_2 * dt ** 2 + divided(dx_3 * dt ** 3, 6)
+            # `x + eps * dt + 0.5 * dx_2 * dt ** 2 + dx_3 * dt ** 3 / 6` rounded once (`summed_once`), as
+            # near its exact value as FlaxDiff's sum with its products contracted into its additions, whatever
+            # `divided`'s lowering leaves XLA to fuse around it (row 7979).
+            return summed_once((x, divided(dx_3 * dt ** 3, 6)), ((eps, dt), (0.5 * dx_2, dt ** 2)))
 
         next_x = lax.switch(jnp.minimum(count, 2), [first, second, third], None)
         return next_x, (eps, sigma_t, last_eps, last_sigma, count + 1)

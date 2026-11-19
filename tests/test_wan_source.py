@@ -45,8 +45,8 @@ from interop_support import (
     source_transformer,
     torch_arms,
 )
+from recorded_runs import assert_arms_as_recorded
 from reference_error import as_given, assert_as_exact
-from reference_runs import assert_arms_as_recorded
 
 from dew.interop.diffusion import component_tensors, read_transformer, wan_fields, wan_path
 from dew.nn.backbones.wan import WanTransformer

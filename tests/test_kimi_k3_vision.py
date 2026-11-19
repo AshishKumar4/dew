@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_runs import assert_as_exact_as_recorded
+from recorded_runs import assert_as_exact_as_recorded
 
 from dew.interop import Pretrained
 from dew.nn.multimodal import MultimodalTransformer

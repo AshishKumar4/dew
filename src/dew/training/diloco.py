@@ -35,6 +35,10 @@ from dew.nn.precision import at_least_fp32
 from dew.state import REPLICA_FIELDS, Replicas, ReplicaState, TrainState
 from dew.training.transaction import cleared, example_groups, window_dropped
 
+DILOCO_ON_HOST = 8471
+"""The ledger row of DiLoCo on a run that keeps its variables on the host (`DiLoCo.admits`,
+`dew.training.streaming.refusal`)."""
+
 
 @dataclasses.dataclass(frozen=True)
 class DiLoCo:
@@ -65,7 +69,9 @@ class DiLoCo:
         no single tape holds of several groups' own draws."""
         if host:
             raise ValueError(f"DiLoCo keeps each group's state on its devices; this layout keeps "
-                             f"{list(host)} on the host, which places and steps the outer model's alone")
+                             f"{list(host)} on the host, which places and steps the outer model's alone. A "
+                             "model no group's devices hold runs DiLoCo with each group streamed from its "
+                             f"host, one host step a group, not built (row {DILOCO_ON_HOST})")
         if record:
             raise ValueError("a DiLoCo run's groups draw their own; no one record of a step's examples "
                              "holds them")
