@@ -44,10 +44,11 @@ paired with the kernels' arm on armada: the most any of its 16-bit geometries to
 
 def training_draw(length: int, parts, dtype, seed: int):
     """A training shape's draw of two rows by seed: the projection, the taps and the pieces' cotangents
-    (`operands`, `cotangents`). Two rows: a row's tokens are the distances' terms, and the 0.8b's eight held
-    28 GiB of an H100 at the float64 truth."""
+    (`operands`, `cotangents`), on the host, so the gate widens them there for the truth (`row_truth`) and
+    the arms take them to the device each call. Two rows: a row's tokens are the distances' terms, and the
+    0.8b's eight held 28 GiB of an H100 at the float64 truth."""
     x, weights, _, _ = operands(2, length, parts, dtype=dtype, seed=[1724, seed])
-    return x, weights, cotangents(x, parts, dtype, seed=[1725, seed])
+    return jax.device_get((x, weights, cotangents(x, parts, dtype, seed=[1725, seed])))
 
 
 def operands(batch, length, parts, *, taps=4, dtype=jnp.bfloat16, bias=False, valid=False, seed=0):
@@ -153,7 +154,8 @@ def row_truth(x, weights, parts, grads, segments):
     JS-8497-alone-cb07e38b5-sm90; row 6755's theme)."""
     cpu = jax.devices("cpu")[0]
     with jax.default_device(cpu):
-        rows = [jax.device_get(truth(*jax.device_put((x[i:i + 1], weights), cpu), None, None, parts,
+        weights = jax.device_put(weights, cpu)
+        rows = [jax.device_get(truth(jax.device_put(x[i:i + 1], cpu), weights, None, None, parts,
                                      jax.device_put(tuple(grad[i:i + 1] for grad in grads), cpu),
                                      segments=None if segments is None else jax.device_put(
                                          segments[i:i + 1], cpu)))
