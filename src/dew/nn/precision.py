@@ -765,11 +765,10 @@ def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike, 
 
 def _widened(operands, counts: int = 0) -> list[jax.Array]:
     """`operands` as the float64 operands of their float32 product: each converted to the dtype they
-    multiply in (`products_dtype`), as the product converts them, then widened exactly (`widened_exactly`: a
-    subnormal from its bits, which XLA:CPU's conversion flushes, row 8966)."""
+    multiply in (`products_dtype`), as the product converts them, then widened exactly."""
     multiplied = operands[:len(operands) - counts]
     dtype = products_dtype(*multiplied)
-    widened = [widened_exactly(operand.astype(dtype), jnp.float64) for operand in multiplied]
+    widened = [operand.astype(dtype).astype(jnp.float64) for operand in multiplied]
     return widened + list(operands[len(multiplied):])
 
 

@@ -55,8 +55,10 @@ def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array
     limits = jnp.finfo(x.dtype)
     word = jnp.dtype(f"uint{limits.bits}")
     bits = jax.lax.bitcast_convert_type(x, word)
+    # The exponent's field by its width (`nexp`): a format with no infinity (E4M3) holds finite values in
+    # its top binade, past IEEE's `maxexp`.
     return (bits, bits & word.type(1 << (limits.bits - 1)),
-            (bits >> word.type(limits.nmant)) & word.type(2 * limits.maxexp - 1),
+            (bits >> word.type(limits.nmant)) & word.type((1 << limits.nexp) - 1),
             bits & word.type((1 << limits.nmant) - 1))
 
 
@@ -127,14 +129,30 @@ def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
 
 
 def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
-    """`x` in `dtype`, a float at least as wide, exactly: a subnormal `x` from its bits, its fraction times
-    the least subnormal's power, a normal value in `dtype`, so a process whose float conversion flushes a
-    subnormal operand (XLA's CPU, row 4023: float32's `2^-149` widened to zero) widens it; any other `x`
-    (an integer, a Python scalar, `x` of `dtype`) converted as `jnp.asarray` converts it."""
+    """`x` in `dtype`, a float format holding every value of `x`'s, exactly: a subnormal `x` set in
+    `dtype`'s bits from its own (its leading bit its normal exponent where `dtype` holds one, else its
+    fraction on `dtype`'s subnormal grid), a normal one converted, so a process whose float conversion
+    flushes a subnormal operand (XLA's CPU, row 4023: float32's `2^-149` widened to zero, row 8966) widens
+    it; any other `x` (an integer, a Python scalar, `x` of `dtype`) converted as `jnp.asarray` converts it.
+    Its select reads `x`'s bits, so a function JAX transposes (a product's linear map) takes no `x` it
+    widens."""
     x, dtype = jnp.asarray(x), jax.dtypes.canonicalize_dtype(dtype)
-    if not jnp.issubdtype(x.dtype, jnp.floating) or x.dtype == dtype:
+    # A format of no fraction (E8M0) has no subnormal: its biased exponent 0 a power.
+    if not jnp.issubdtype(x.dtype, jnp.floating) or x.dtype == dtype or jnp.finfo(x.dtype).nmant == 0:
         return jnp.asarray(x, dtype)
-    limits = jnp.finfo(x.dtype)
+    source, target = jnp.finfo(x.dtype), jnp.finfo(dtype)
+    word = jnp.dtype(f"uint{target.bits}")
     _, sign, biased, fraction = raw_fields(x)
-    tiny = fraction.astype(dtype) * jnp.asarray(2.0 ** (int(limits.minexp) - int(limits.nmant)), dtype)
-    return jnp.where(biased == 0, jnp.where(sign != 0, -tiny, tiny), x.astype(dtype))
+    # The leading bit's place, and the value's binary exponent: `fraction 2^(minexp - nmant)`.
+    lead = (source.bits - 1) - jax.lax.clz(fraction).astype(jnp.int32)
+    least = int(source.minexp) - int(source.nmant)
+    exponent = least + lead
+    fraction = fraction.astype(word)
+    rest = fraction & ((word.type(1) << jnp.maximum(lead, 0).astype(word)) - word.type(1))
+    normal = (((exponent + (1 << (target.nexp - 1)) - 1).astype(word) << word.type(target.nmant))
+              | (rest << (int(target.nmant) - lead).astype(word)))
+    tiny = fraction << word.type(least - (int(target.minexp) - int(target.nmant)))
+    held = jnp.where(fraction == 0, word.type(0), jnp.where(exponent >= target.minexp, normal, tiny))
+    signed = sign.astype(word) << word.type(target.bits - source.bits)
+    subnormal = jax.lax.bitcast_convert_type(signed | held, dtype)
+    return jnp.where(biased == 0, subnormal, x.astype(dtype))

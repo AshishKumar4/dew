@@ -48,6 +48,6 @@ def edge_values(dtype) -> np.ndarray:
         # A subnormal led by each bit's place, its lower bits mixed: every leading-bit position.
         np.asarray([(1 << place) | ((1 << place) - 1) // 3 for place in range(width)], word),
         np.asarray([0, 1, 2, 3, (1 << width) - 1, 1 << width, infinite - 1, 3 << (width - 1),
-                    5 << (width - 3), one, three + 1], word)])
+                    *([5 << (width - 3)] if width >= 3 else []), one, three + 1], word)])
     values = bits.view(dtype)
     return np.concatenate([values, -values])
