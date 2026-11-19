@@ -483,11 +483,14 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     the one owner of scaling by a power of two (`scalar_power2` a Mosaic kernel's scalar `k`). A backend that
     flushes subnormals flushes a subnormal `x` first (`raised_exactly` raises one from its bits).
 
-    Past `two_factor_reach`, each factor takes as much of what is left of `k` as the normal exponents hold,
-    the remainder applied first, so on a backend that keeps subnormals a result below the least normal
-    rounds once, at the last factor. Within it, a caller stating its `reach` takes `k`'s two halves, each
-    built as its product takes it, one integer tile live, not two (row 2519's register measurements), a
-    subnormal result rounded at each half."""
+    Past `two_factor_reach`, `x` takes `2^o 2^(k - 2o) 2^o`, its own reverse: `o` zero where `k` is a normal
+    exponent, else `k`'s half held within the normal exponents, at least half of `-minexp` (float32's 63),
+    past `nmant`. So on a backend that keeps subnormals a result below the least normal rounds once, at the
+    last factor (the product before it is normal wherever the result rounds to no zero), and so does its
+    pullback, which applies the same factors in reverse before it sums a broadcast operand's cotangent
+    (base review 44e282c4f F1).
+    Within it, a caller stating its `reach` takes `k`'s two halves, each built as its product takes it, one
+    integer tile live, not two (row 2519's register measurements), a subnormal result rounded at each half."""
     # Held at least in float32: an 8-bit float promotes implicitly to nothing.
     dtype = at_least_fp32(jnp.asarray(x).dtype)
     x = jnp.asarray(x, dtype)
@@ -495,6 +498,9 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     least, largest = limits.minexp, limits.maxexp - 1
     held = (largest + 1) - (least - limits.nmant) + 2 if reach is None else min(
         reach, (largest + 1) - (least - limits.nmant) + 2)
+    # A Python integer held before it converts: one past float32's range raised in its host conversion.
+    if isinstance(k, int):
+        k = min(max(k, -held), held)
     # Held as float32, which holds every exponent within the bound exactly: no narrow integer `k` wraps.
     k = jnp.clip(jnp.asarray(k, jnp.float32), -held, held)
     if held <= two_factor_reach(dtype):
@@ -503,15 +509,12 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
         half = (k * np.float32(0.5)).astype(jnp.int32)
         return (x * exact_power2(half, dtype)
                 * exact_power2((k - half.astype(jnp.float32)).astype(jnp.int32), dtype))
-    k = k.astype(jnp.int32)
-    parts = []
-    for _ in range(math.ceil(held / -least)):
-        parts.append(jnp.clip(k, least, largest))
-        k = k - parts[-1]
-    # The remainder first: a factor past the normal range would round a partial product the next rounds again.
-    for part in reversed(parts):
-        x = x * exact_power2(part, dtype)
-    return x
+    # The middle `k - 2o` within `nmant + 4` of zero wherever `o` is held: `held` is at most three times
+    # `-minexp`.
+    outer = jnp.where(jnp.abs(k) <= -least, 0,
+                      jnp.clip((k * np.float32(0.5)).astype(jnp.int32), least, -least))
+    side = exact_power2(outer, dtype)
+    return x * side * exact_power2(k.astype(jnp.int32) - 2 * outer, dtype) * side
 
 
 def scalar_power2(x: jax.Array, k: jax.Array) -> jax.Array:

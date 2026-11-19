@@ -1783,16 +1783,36 @@ def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
 
 
 def power2_rounds_a_subnormal_result_once():
-    """`dew.nn.precision.power2` by greedy factors rounds a result below the least normal once, at its last
+    """`dew.nn.precision.power2` by equal parts rounds a result below the least normal once, at its last
     factor, on a device that keeps subnormals (a GPU's XLA, whose fp32 arithmetic keeps them where XLA:CPU's
     flushes them): `(0.5 + 2^-24) 2^-149` is `2^-149`, where a whole factor first rounded the partial product
-    to `2^-127` and the remainder's then rounded its tie to zero (base review 54bb1f61a F2). A GPU numerics
-    cell (tests/test_gpu_numerics.py)."""
+    to `2^-127` and the remainder's then rounded its tie to zero (base review 54bb1f61a F2). Its pullback
+    applies the factors in reverse and rounds once too, a broadcast operand's cotangent summed after each
+    term is scaled: the cotangent `0.5 + 2^-24` to `1` by `2^-149` is `2^-149`, and to a scalar by two such
+    terms `2^-148`, where the remainder applied last rounded it to zero (base review 44e282c4f F1). A GPU
+    numerics cell (tests/test_gpu_numerics.py)."""
     from dew.nn.precision import power2
 
     found = np.asarray(jax.jit(power2)(jnp.float32(0.5 + 2.0 ** -24), jnp.int32(-149)))
     # Its one correctly rounded answer, the least subnormal's bits.
     assert found.dtype == np.float32 and found.view(np.uint32) == 1, found.view(np.uint32)
+    cotangent = jnp.float32(0.5 + 2.0 ** -24)
+    for exponent, bits in ((jnp.int32(-149), 1), (jnp.full((2,), -149, jnp.int32), 2)):
+        _, pullback = jax.vjp(lambda x, exponent=exponent: power2(x, exponent), jnp.float32(1.0))
+        (pulled,) = jax.jit(pullback)(jnp.broadcast_to(cotangent, exponent.shape))
+        pulled = np.asarray(pulled)
+        assert pulled.dtype == np.float32 and pulled.view(np.uint32) == bits, pulled.view(np.uint32)
+
+
+def test_a_python_integer_exponent_past_float32_saturates():
+    """`dew.nn.precision.power2` holds a Python integer exponent within its reach before converting it:
+    `2^(±10^400)` of `1` is infinite and zero, where `10^400` raised in its host conversion to float32 (base
+    review 44e282c4f F2)."""
+    from dew.nn.precision import power2
+
+    found = [np.asarray(power2(np.float32(1.0), sign * 10 ** 400)) for sign in (1, -1)]
+    assert [value.dtype for value in found] == [np.float32] * 2
+    assert np.isposinf(found[0]) and found[1] == 0, found
 
 
 def test_an_exact_power_of_two_in_a_python_float_is_jaxs_float():
@@ -1827,7 +1847,7 @@ def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach,
     value's, an aligned sum's) scales by powers of two exactly wherever the operand and the result are
     normal values of its format (`x`'s, at least float32), compiled (where XLA computes `exp2` as an inexact
     `exp` and fuses a product of them into one `exp`, past the format), at every integral exponent its type
-    holds past the format's range both ways against exact rational scaling, greedy factors by default and a
+    holds past the format's range both ways against exact rational scaling, equal parts by default and a
     stated reach's two halves within it, operands at both ends of the normal range among them, an 8-bit
     float's in float32 (`at_least_fp32`, which no implicit promotion reaches; base review a7c5428ef F1); zero
     stays zero, and a result past the format is infinite."""
