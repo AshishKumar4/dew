@@ -815,7 +815,10 @@ grouped 256-wide heads, whose backward on an H100 adds its dQ and dK/dV into acc
 
 def _stack_temp(layers: int) -> int:
     """The temporaries of a training step of `layers` checkpointed layers (each a grouped causal attention
-    through the template, then a wide MLP), compiled for a compile-only H100."""
+    through the template, then a wide MLP), compiled for a compile-only H100 stating 128 MiB, below the step's
+    need, so XLA's scheduler holds the least it can and the temporaries are its buffers' lifetimes alone (an
+    H100's 80 GB lets it overlap the layers, 244 MB at two; a compile-only GPU stated 0 bytes before row
+    8768)."""
     batch, tokens, heads, groups, width, hidden = STACK
 
     def layer(x, weights):
@@ -835,7 +838,8 @@ def _stack_temp(layers: int) -> int:
            jax.ShapeDtypeStruct((heads * width, hidden), jnp.bfloat16),
            jax.ShapeDtypeStruct((hidden, heads * width), jnp.bfloat16))
     with generation.assumed("sm90"):
-        compiled = lowered_for(jax.grad(loss, argnums=(0, 1)), (x, (one,) * layers), "sm90").compile()
+        compiled = lowered_for(jax.grad(loss, argnums=(0, 1)), (x, (one,) * layers), "sm90",
+                               memory=2**27).compile()
     return compiled.memory_analysis().temp_size_in_bytes
 
 
