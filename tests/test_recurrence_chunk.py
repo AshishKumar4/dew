@@ -513,27 +513,28 @@ def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
         assert not wrong.any(), (jax.tree_util.keystr(path), int(wrong.sum()))
 
 
-def test_a_turned_forked_calls_cancelling_entry_write_keeps_every_gradient_finite():
-    """A turned forked call whose documents' entry writes cancel (two terms of one key `(2^80, 0, ...)`,
-    values of 2^80 and -2^80, a weight of one: each write zero): its output and every gradient finite
-    wherever float64's is a normal float32, where the turns' gradient formed the write's terms one at a time
-    and summed them, inf - inf (base review 2354cbaf7 F1), and the weight's gradient summed `aligned_sum`'s
-    terms' plainly (row 8501); `chunked_launch.entry_write` sums them aligned, its derivatives too."""
-    operands, seeded = entered_draw(TURNED, 0, entries=True)
-    key = jnp.zeros_like(operands.entry_key).at[..., 0].set(2.0 ** 80)
-    value = jnp.zeros_like(operands.entry_value).at[:, :, 0].set(2.0 ** 80).at[:, :, 1].set(-(2.0 ** 80))
-    operands = dataclasses.replace(operands, entry_key=key, entry_value=value,
-                                   entry_weight=jnp.ones_like(operands.entry_weight))
-    ours = jax.jit(with_gradients(lambda given: chunk_on('xla', TURNED, entering_documents(given),
-                                                         chunk_size=CHUNK)))(operands, seeded)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
-        exact = jax.jit(with_gradients(lambda given: document_by_document(TURNED, given)))(*wide)
-    leaves = jax.tree_util.tree_leaves_with_path(ours)
-    for (path, made), truth in zip(leaves, jax.tree.leaves(exact), strict=True):
-        held = normal_float32(np.asarray(truth))
-        wrong = held & ~np.isfinite(np.asarray(made))
-        assert not wrong.any(), (jax.tree_util.keystr(path), int(wrong.sum()))
+def cancelling_entries_draw(seed: int):
+    """`entered_draw`'s turned forked call, each document's entry write of three terms: two of one key
+    `(2^80, 0, ...)` under values of `2^47 u` and `-2^47 u` (`u` drawn in [1, 1.9]), their products 2^127
+    times `u` and cancelling, and a drawn third, more than float32's exponent range below them."""
+    operands, seeded = entered_draw(TURNED, seed, entries=True)
+    rng = np.random.default_rng([8501, seed])
+    key, value = operands.entry_key, operands.entry_value
+    big = jnp.zeros_like(key[:, :, :1]).at[..., 0].set(2.0 ** 80)
+    u = jnp.asarray(2.0 ** 47 * rng.uniform(1.0, 1.9, value[:, :, :1].shape), value.dtype)
+    return dataclasses.replace(operands, entry_key=jnp.concatenate([big, big, key[:, :, :1]], axis=2),
+                               entry_value=jnp.concatenate([u, -u, value[:, :, :1]], axis=2)), seeded
+
+
+def test_a_turned_forked_calls_cancelling_entry_write_is_as_exact_as_each_document_alone():
+    """A turned forked call whose documents' entry writes take two terms of 2^127 that cancel beside a third
+    more than float32's exponent range below them (`cancelling_entries_draw`): its output, the row's last
+    memory and every gradient on par with each document alone (`assert_forked_on_par`, check 1), where the
+    turns' gradient formed the write's terms one at a time and summed them, inf - inf (base review 2354cbaf7
+    F1), the weight's gradient summed `aligned_sum`'s terms plainly (row 8501), and the write aligned to its
+    largest term dropped the third before the two cancelled (base review 224fcf53a F1)."""
+    assert_forked_on_par('xla', TURNED, cancelling_entries_draw,
+                         f"xla {TURNED} a forked call's cancelling entry writes", seeds=160)
 
 
 @pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],

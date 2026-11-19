@@ -1145,9 +1145,15 @@ ALIGNED_CASES = {
     "in range though its terms are not": ([(1 + 2.0 ** -20, 2.0 ** 70, 2.0 ** 70),
                                            (-1.0, 2.0 ** 70, 2.0 ** 70)], 2.0 ** 120),
     "past the largest": ([(1.0, 2.0 ** 70, 2.0 ** 70), (1.0, 2.0 ** 70, 2.0 ** 70)], float("inf")),
+    "a unit below cancelling terms": ([(2.0 ** 100, 2.0 ** 27, 1.0), (2.0 ** 100, -(2.0 ** 27), 1.0),
+                                       (1.0, 1.0, 1.0)], 1.0),
+    "a term past the normals below cancelling terms": ([(2.0 ** 100, 2.0 ** 60, 2.0 ** 60),
+                                                        (-(2.0 ** 100), 2.0 ** 60, 2.0 ** 60),
+                                                        (2.0 ** -50, 2.0 ** -50, 2.0 ** -20)], 2.0 ** -120),
 }
 """`aligned_sum`'s cases: three-factor terms whose products leave fp32's range, and their sum, exact in any
-order of summing (two terms, their sum a float32)."""
+order of summing (their sum a float32): a term more than float32's exponent range below the largest kept,
+where the largest cancel (base review 224fcf53a F1)."""
 
 
 @pytest.mark.parametrize("case", list(ALIGNED_CASES))
@@ -1223,6 +1229,23 @@ def test_an_aligned_sums_derivatives_hold_a_cancelling_shared_factors_range():
     np.testing.assert_array_equal(np.asarray(tangent, np.float64), exact_tangent)
     for found, expected in zip(gradients, exact, strict=True):
         np.testing.assert_array_equal(np.asarray(found, np.float64), expected)
+
+
+@pytest.mark.parametrize("small", [1.0, 2.0 ** -100], ids=["a unit", "2^-100"])
+def test_an_aligned_sums_derivatives_keep_a_small_term_below_cancelling_ones(small):
+    """`aligned_sum([(w, a), (w, -a), (w, small)])` of `a` 2^127 at `w` zero along one: its tangent and `w`'s
+    gradient `small`, and at `w` one its value `small`, float64's, where aligned to the largest term, `small`
+    more than float32's exponent range below it, was dropped before the largest cancelled, zero (base review
+    224fcf53a F1)."""
+    terms = [jnp.float32(2.0 ** 127), jnp.float32(-(2.0 ** 127)), jnp.float32(small)]
+
+    def summed(w):
+        return aligned_sum([(w, term) for term in terms])
+
+    _, tangent = jax.jvp(summed, (jnp.float32(0.0),), (jnp.float32(1.0),))
+    assert float(tangent) == small
+    assert float(jax.grad(summed)(jnp.float32(0.0))) == small
+    assert float(summed(jnp.float32(1.0))) == small
 
 
 def test_an_aligned_sums_gradient_scales_a_cotangent_before_its_broadcast_sum():

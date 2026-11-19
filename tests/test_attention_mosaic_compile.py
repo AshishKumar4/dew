@@ -848,6 +848,7 @@ def test_a_refused_launch_states_its_model_beside_the_assemblers_registers():
     assert all(miss.modelled is not None and miss.stepped for miss in missed), missed
 
 
+@COMPILES_ON_CPU
 def test_a_ladder_that_spills_throughout_certifies_its_ends_alone():
     """The accurate backward under an alibi hook 64 wide on an H100, whose dQ spills at every query block the
     derivation offers (row 7938): certification refuses each of them, as it would certifying every rung,
