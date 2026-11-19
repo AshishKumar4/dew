@@ -1320,6 +1320,28 @@ def test_an_aligned_sum_over_2_31_less_2_terms_lowers():
     assert lowered.out_info.shape == (1,)
 
 
+def test_an_aligned_sums_tangent_keeps_the_values_placement():
+    """The tangent along a scalar `x` of `aligned_sum([(x,), (v,)])` beside a constant `v` of `[10, 20]`
+    split over an Explicit two-device data axis: `[1, 1]` placed as `v`'s value is, where the moving term
+    alone broadcast whole and JAX refused its placement (base review c439a41f3 F1, row 8757)."""
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        split = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+        v = jax.device_put(jnp.asarray([10.0, 20.0], jnp.float32), split)
+        tangent = jax.jvp(lambda x: aligned_sum([(x,), (v,)]), (jnp.float32(1.0),), (jnp.float32(1.0),))[1]
+    np.testing.assert_array_equal(np.asarray(tangent), [1.0, 1.0])
+    assert tangent.sharding.is_equivalent_to(split, tangent.ndim)
+
+
+def test_an_aligned_sum_over_two_terms_of_2_30_lowers():
+    """`aligned_sum([(x,), (y,)], axis=0)` of fp32 `x` of 2^30 terms and `y` of `2^30 - 1`, lowered: one-bit
+    digits whose partial sums and carry, in `[-n, n - 1]`, int32 holds, where a looser carry bound refused
+    them (base review c439a41f3 F2, row 8757)."""
+    x, y = (jax.ShapeDtypeStruct((length,), jnp.float32) for length in (2 ** 30, 2 ** 30 - 1))
+    lowered = jax.jit(lambda x, y: aligned_sum([(x,), (y,)], axis=0)).trace(x, y).lower()
+    assert lowered.out_info.shape == (1,)
+
+
 def test_an_aligned_sum_over_2_30_terms_lowers():
     """`aligned_sum([(x,)], axis=0)` over 2^30 fp32 terms, lowered: one-bit digits whose partial sum the
     integers hold, the carry apart, where it was refused (base review ee7d1e761 F2, row 8757)."""
