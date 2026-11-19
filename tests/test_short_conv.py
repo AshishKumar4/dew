@@ -47,8 +47,9 @@ def training_draw(length: int, parts, dtype, seed: int):
     (`operands`, `cotangents`), on the host, so the gate widens them there for the truth (`row_truth`) and
     the arms take them to the device each call. Two rows: a row's tokens are the distances' terms, and the
     0.8b's eight held 28 GiB of an H100 at the float64 truth."""
-    x, weights, _, _ = operands(2, length, parts, dtype=dtype, seed=[1724, seed])
-    return jax.device_get((x, weights, cotangents(x, parts, dtype, seed=[1725, seed])))
+    with jax.default_device(jax.devices("cpu")[0]):
+        x, weights, _, _ = operands(2, length, parts, dtype=dtype, seed=[1724, seed])
+        return jax.device_get((x, weights, cotangents(x, parts, dtype, seed=[1725, seed])))
 
 
 def operands(batch, length, parts, *, taps=4, dtype=jnp.bfloat16, bias=False, valid=False, seed=0):
