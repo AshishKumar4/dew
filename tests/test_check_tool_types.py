@@ -24,7 +24,8 @@ def gate(tmp_path, monkeypatch):
     files = {"src/dew/__init__.py": "", "src/dew/shared.py": "from dew import deep\n",
              "src/dew/deep.py": "X = 1\n", "tools/helper.py": "import json\n",
              "tools/tool.py": "import helper\nfrom dew.shared import deep\n",
-             "tools/runs/__init__.py": "", "tools/runs/a.py": "from . import b\n", "tools/runs/b.py": "Y = 2\n",
+             "tools/runs/__init__.py": "", "tools/runs/a.py": "from . import b\n",
+             "tools/runs/b.py": "Y = 2\n",
              "tools/other.py": "Z = 3\n", "locks/cpu.txt": "jax==1\n"}
     for name, text in files.items():
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
@@ -41,8 +42,9 @@ def test_a_tools_cohorts_are_read_from_its_module_level_cohorts(gate, tmp_path, 
 
 
 def test_a_tools_environment_is_its_cohorts_pins_its_headers_or_dews(gate, tmp_path) -> None:
-    """A tool's environment holds its cohorts' pins; a PEP 723 header's dependencies where it has one (`uv run`
-    reads only that); Dew's own where it names neither; and none where its cohorts pin a distribution twice."""
+    """A tool's environment holds its cohorts' pins; a PEP 723 header's dependencies where it has one
+    (`uv run` reads only that); Dew's own where it names neither; and none where its cohorts pin a
+    distribution twice."""
     tools = tmp_path / "tools"
     (tools / "paired.py").write_text('COHORTS = ["torch", "transformers"]\n')
     (tools / "script.py").write_text('# /// script\n# requires-python = ">=3.12"\n'
