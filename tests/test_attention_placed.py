@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 from test_attention_mosaic import (
     CALLS,
@@ -49,6 +49,48 @@ def test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted(call, natural, w
     reference (check 1)."""
     _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=natural, interpret=True, width=width,
                    value_width=width, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
+
+
+ROWS_PAIR_TILES = attention_mosaic.Tiles(128, 64, 2, 2, family="tcgen05.rows")
+"""tcgen05's rows at two consumers: two query tiles of 128 rows a program over its one key walk, their
+products issued in turn (FlashAttention 4's two softmax warpgroups), each turn's weights over its logits."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("tokens", [192, 320])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_forward_on_tcgen05s_rows_at_two_consumers_holds_check_1_interpreted(call, tokens):
+    """The forward on a B200's tcgen05 rows at two consumers (`ROWS_PAIR_TILES`: the issuer serving each
+    consumer's logits and weighted values in turn on one key and value slot a step, a causal walk's later
+    query tile walking more of the program's keys than its partner, `placed.issuing`'s `reaches`), its
+    query tiles padded, under the interpreter, which models tensor memory and its turns' weights over their
+    logits: on par with the reference (check 1)."""
+    _check_forward(call, jnp.bfloat16, (1, tokens, 2, 1), natural=False, interpret=True, width=64,
+                   value_width=64, tiles=ROWS_PAIR_TILES, target=generation.gpu_target("sm100"))
+
+
+@pytest.mark.parametrize("moves", [False, True], ids=["kept", "moved"])
+@pytest.mark.parametrize("call", ["full", "causal"])
+@pytest.mark.parametrize("tiles", [ROWS_TILES, ROWS_PAIR_TILES], ids=["one", "two"])
+def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving(tiles, call, moves):
+    """The forward's launch on a B200's tcgen05 rows at one consumer and two, traced as a B200 builds it over
+    256 queries and 256 keys, the full call's and the causal's (each consumer's own key walk): every
+    interleaving of its consumers and its producer's and issuer's warps explored (`ring_protocol.explore`),
+    no deadlock and every barrier's phase whole and observed, every step's factor keeping its sums or moving
+    them (`moves`, a step whose maximum moves, the rare span). A step waits on the weighted values of the
+    step before only where its factor moves some row's sums (`placed.Tcgen05Placed.accumulating`), its
+    weights' turn freed by the product two steps back."""
+    from ring_protocol import explore, programs
+
+    query, key = jnp.ones((1, 256, 1, 128), jnp.bfloat16), jnp.ones((1, 256, 1, 128), jnp.bfloat16)
+    spans = template.spans(256, 256, 1, **CALLS[call])
+
+    def forward(query, key):
+        with generation.assumed("sm100"), _pinned(tiles):
+            return attention_mosaic.forward(query, key, key, spans, interpret=False)
+
+    threads, arrivals = programs(forward, query, key, threads=tiles.consumers + 1, rare=moves)
+    assert explore(threads, arrivals) > 0
 
 
 @INTERPRETS
@@ -272,6 +314,30 @@ def test_the_walked_backward_at_width_256_holds_check_1_interpreted(call):
                  pins=(None, tiles), target=generation.gpu_target("sm100"))
 
 
+@pytest.mark.parametrize("name", ["sm100", "sm90"])
+def test_a_tcgen05_devices_backward_derives_its_walked_launches(name):
+    """Qwen3-8B's heads (32 query heads over 8, width 128, 2 x 4096 causal bf16) derive their backward on a
+    B200 as the walked placements take it (`MosaicBackward.derived` is `walked`'s config, its dK/dV keys
+    first on tcgen05: M-ET-74's 0.18 of the mma.sync two launches' time, row 6918), where an H100, whose
+    walks place on no role, derives its own and has no walked config."""
+    tokens, heads, kv_heads, width = 4096, 32, 8, 128
+    spans = template.spans(tokens, tokens, 2, causal=True)
+    query = jax.ShapeDtypeStruct((2, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, tokens, kv_heads, width), jnp.bfloat16)
+    with generation.assumed(name):
+        residuals = jax.eval_shape(lambda q, k, v: attention_mosaic.forward(
+            q, k, v, spans, residuals=template.Kept.SPLIT), query, key, key)[1:]
+        op, args = attention_mosaic._backward_call(query, key, key, spans, None, query, tuple(residuals),
+                                                   scale=None, natural=attention_mosaic.NATURAL,
+                                                   accurate=False)
+        ba, target = op.bind(*args, interpret=False), generation.gpu_target()
+        walked, derived = op.walked(ba, target), op.derived(ba, target)
+    if name == "sm100":
+        assert walked is not None and derived == walked and derived.dkv_family == "tcgen05.keys", derived
+    else:
+        assert walked is None and derived is not None, (walked, derived)
+
+
 @pytest.mark.parametrize("form", ["two launches", "fused", "walked dq"])
 def test_the_walked_backward_states_each_product_its_issuers_walk(form):
     """A bf16 call's backward over 256 queries and keys, every pair reached, with its dK/dV keys first on a
@@ -319,3 +385,64 @@ def test_a_walked_placement_takes_only_the_launch_it_is_written_for(pin):
         ba, target = op.bind(*args, interpret=False), generation.gpu_target()
         assert op.legal(ba, KEYS_TILES["two launches"], target)
         assert not op.legal(ba, pin, target)
+
+
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_interleaving(call):
+    """The fused keys-first dK/dV launch on a B200 (`KEYS_TILES["fused"]` at width 64: each compute
+    warpgroup's step's dQ filled a slot at a time into its ring, which its reducer warp's TMA adds read, a
+    slot's fill and free a barrier's phase each, `attention_mosaic_dkv._PlacedDq`), traced as a B200 builds
+    it over 128 keys and two query steps, the full call's and the causal's (whose program walks fewer):
+    every interleaving of its compute warpgroups, its load, issuer and two reducer warps and its copies'
+    landings explored (`ring_protocol.explore`), no deadlock, every barrier's phase whole and observed, and
+    no slot written while an add still reads it. Two query steps, each its dQ's chunks through the two slots
+    (three's and four's interleavings passed the checker's bound once its stores' groups and fills were
+    events)."""
+    from ring_protocol import explore, programs
+
+    tokens, width = 128, 64
+    query = jnp.ones((1, tokens, 1, width), jnp.bfloat16)
+    key = jnp.ones((1, 128, 1, width), jnp.bfloat16)
+    spans = template.spans(tokens, 128, 1, **CALLS[call])
+    with generation.assumed("sm100"):
+        _, *residuals = jax.eval_shape(lambda q, k, v: attention_mosaic.forward(
+            q, k, v, spans, None, residuals=template.Kept.SPLIT), query, key, key)
+
+    def backward(query, key, dout, residuals):
+        with generation.assumed("sm100"), _pinned(backward=KEYS_TILES["fused"]):
+            return attention_mosaic.backward(query, key, key, spans, None, dout, residuals=residuals,
+                                             accurate=False, interpret=False)
+
+    residuals = jax.tree.map(lambda shaped: jnp.zeros(shaped.shape, shaped.dtype), tuple(residuals))
+    threads, arrivals = programs(backward, query, key, query, residuals, threads=3)
+    assert explore(threads, arrivals) > 0
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+def test_a_fused_walk_and_its_dq_reducer_compile_spill_free_on_a_b200(width):
+    """The fused keys-first backward (`KEYS_TILES["fused"]`: its dQ rings drained by their reducer warps' TMA
+    adds, `attention_mosaic_dkv._PlacedDq`) at widths 64 and 128 over 512 causal tokens, four query heads
+    over two, compiled by ptxas for a compile-only B200: its launch lowers, the reducer's barrier waits,
+    adds and arrivals among it, and spills nothing (`mosaic_failures`)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    tokens = 512
+    spans = template.spans(tokens, tokens, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, tokens, 4, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, 2, width), jnp.bfloat16)
+
+    def trained(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.SPLIT)
+
+    def step(query, key, value, dout):
+        _, *residuals = trained(query, key, value)
+        return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=tuple(residuals),
+                                         accurate=False)
+
+    with generation.assumed("sm100"), _pinned(backward=KEYS_TILES["fused"]):
+        case = KernelCase("fused", lambda: (step, (query, key, key, query)))
+        found = compile_mosaic_kernels([case], "sm100")
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)

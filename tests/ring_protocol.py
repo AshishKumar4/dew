@@ -66,7 +66,8 @@ import numpy as np
 from jax._src.state import discharge
 from jax.extend import core as jcore
 
-from dew.nn.kernels.templates import gathered
+from dew.nn import derivatives
+from dew.nn.kernels.templates import across, gathered
 from dew.nn.programs import called
 
 THREAD_AXIS = "wg"
@@ -107,8 +108,8 @@ class _Interpreter:
     program of its own (`warps`), its warp's index along the warps' axis (`warp`); and the arrivals a phase
     each barrier its inlined bodies initialize takes (`initialized`, by name)."""
 
-    def __init__(self, thread: int):
-        self.thread, self.events, self.refs, self.allocated = thread, [], 0, []
+    def __init__(self, thread: int, rare: bool = False):
+        self.thread, self.events, self.refs, self.allocated, self.rare = thread, [], 0, [], rare
         self.warp, self.warps, self.initialized = None, [], {}
 
     def programs(self) -> list[list[Event]]:
@@ -143,6 +144,10 @@ class _Interpreter:
         if name == "layout_cast":
             # A register layout's statement (`plgpu.layout_cast`), its value its operand's.
             return [values[0]]
+        if name == "marked_call" and isinstance(params["kind"], derivatives.Rare):
+            # A rare span's verdict (a decided walk's, `derivatives.Rare`): the run's own (`programs`'
+            # `rare`), each program's alike.
+            return [np.bool_(self.rare)]
         if name == "mpmd_map":
             return self.warped(equation, values)
         if name == "inline_mgpu":
@@ -281,7 +286,11 @@ def _located(ref, transforms) -> tuple:
             if index is None:
                 return (ref.name, *found) if found else (ref.name, None)
             if not hasattr(index, "start"):
-                found.append(int(np.asarray(index)))
+                # An array of several indices (a gathered tile's rows) names no one entry: the location stops
+                # at the prefix known.
+                if (one := _one_value(index)) is None:
+                    return (ref.name, *found) if found else (ref.name, None)
+                found.append(one)
                 continue
             # A slice: the axes from it on whole, the next transform indexes them; else its one entry, if it
             # takes one, the location's last.
@@ -292,6 +301,16 @@ def _located(ref, transforms) -> tuple:
                 found.append(int(np.asarray(index.start)))
             return (ref.name, *found) if found else (ref.name, None)
     return (ref.name, *found) if found else (ref.name, None)
+
+
+def _one_value(index) -> int | None:
+    """An indexer's index where it names one entry of its axis (a value, an array of one value broadcast
+    beside a gathered index, or a one-entry slice), else None (a slice of more, or an array of several
+    indices: a gathered tile's rows)."""
+    if hasattr(index, "start"):
+        return int(np.asarray(index.start)) if index.size == 1 and index.start is not None else None
+    values = None if index is None else np.unique(np.asarray(index))
+    return None if values is None or values.size != 1 else int(values[0])
 
 
 def _governing(value, what: str):
@@ -483,6 +502,11 @@ def _gathers(self: _Interpreter, body: gathered.Gathers, values, located) -> Non
         self.emit("copy", (*slot, tile), barrier)
 
 
+def _unsynchronized(self: _Interpreter, body, values, located) -> None:
+    """A body of no synchronization: a register's move between lanes (`across.LaneZero`, a shuffle)."""
+    del self, body, values, located
+
+
 def _filled(self: _Interpreter, body: gathered.Filled, values, located) -> None:
     """A load warp's fill of its next step's entries (`gathered.Filled`, where the walk has a next step):
     one asynchronous write of the parity it fills, its tiles' all, a cp.async group the next step awaits."""
@@ -491,28 +515,30 @@ def _filled(self: _Interpreter, body: gathered.Filled, values, located) -> None:
 
 
 INLINED: dict[type, Callable] = {gathered.Initialized: _initialized, gathered.Waited: _waited,
-                                 gathered.Gathers: _gathers, gathered.Filled: _filled}
+                                 gathered.Gathers: _gathers, gathered.Filled: _filled,
+                                 across.LaneZero: _unsynchronized}
 """Each inlined body a checked kernel takes (`plgpu.inline_mgpu`'s function, by its type), as the `Event`s
 its fields and its operands state: the arrivals a phase of the barriers a gathered ring initializes, its
 parity waits at a turn's rotation, and its load warps' gathers. A body of no synchronization (a fence, a
 register form) takes a reader that emits nothing, its reason beside it; one of no type here is refused."""
 
 
-def programs(kernel: Callable, *operands, threads: int, launch: int = 0,
+def programs(kernel: Callable, *operands, threads: int, launch: int = 0, rare: bool = False,
              known: Callable[[int, Any], np.ndarray | None] = lambda index, aval: None
              ) -> tuple[list[list[Event]], dict[str, int]]:
     """Each program of `kernel`'s `launch`-th Mosaic GPU launch (one the toolkit built, `mosaic.kernel`, in
     the order its trace makes them: a chained input gradient's flagged walk, then its bounded one) over
-    `operands`, of its `threads` warpgroups: a warpgroup's events, or where it runs warp roles, each of its
-    warps' in turn (`_Interpreter.programs`), by warpgroup index; and each barrier's arrivals a phase, by
-    name: a barrier allocation's, or a shared `uint64`'s its inlined initialization states
-    (`gathered.Initialized`). `known(index, aval)`, a global operand's value where the caller states it (a
-    bounded walk's flags, which decide the tiles it walks), else None: its reads give it."""
+    `operands`, of its `threads` warpgroups, its rare spans taken where `rare` (`derivatives.Rare`: a decided
+    walk's second): a warpgroup's events, or where it runs warp roles, each of its warps' in turn
+    (`_Interpreter.programs`), by warpgroup index; and each barrier's arrivals a phase, by name: a barrier
+    allocation's, or a shared `uint64`'s its inlined initialization states (`gathered.Initialized`).
+    `known(index, aval)`, a global operand's value where the caller states it (a bounded walk's flags, which
+    decide the tiles it walks), else None: its reads give it."""
     closed = jax.make_jaxpr(kernel)(*operands)
     body = list(_bodies(closed.jaxpr))[launch]
     found, arrivals = [], {}
     for thread in range(threads):
-        interpreter = _Interpreter(thread)
+        interpreter = _Interpreter(thread, rare)
         interpreter.run(body.jaxpr, body.consts, [
             Ref(f"gmem{index}", barrier=False, num_arrivals=0, value=known(index, variable.aval.inner_aval))
             for index, variable in enumerate(body.jaxpr.invars)])

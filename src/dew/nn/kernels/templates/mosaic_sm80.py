@@ -386,10 +386,15 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         mosaic.synced(interpret=False)
         return loaded
 
-    def relay_bytes(self, rows: int, depth: int) -> int:
+    @property
+    def rows_whole(self) -> bool:
         # Its warps along a tile's rows alone (four of them) hold whole rows of the accumulator and the
-        # operand alike; fewer split the accumulator's columns among warps, which no register cast crosses.
-        return 0 if self.m_warps == 4 else rows * depth * self.dtype.itemsize
+        # operand alike; fewer split the accumulator's columns among warps.
+        return self.m_warps == 4
+
+    def relay_bytes(self, rows: int, depth: int) -> int:
+        # No register cast crosses the warps a row's columns are split among.
+        return 0 if self.rows_whole else rows * depth * self.dtype.itemsize
 
     def relaying(self, tile) -> Self:
         # A plain tile (`swizzling.plain`).
@@ -590,11 +595,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               prefetched: Callable | None = None, registers: int | None = None,
+               prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
         # Its one warpgroup its consumer, no producer beside it, and no cluster; its kernels' default
-        # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
+        # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`), where it
+        # `reduces`.
         # Its programs read a table from global memory as any operand, and no producer runs beside them.
         del reducing_warpgroups, scalars, producer, moves  # one warpgroup: no roles to move registers between
         _one(consumers, clustered=cluster > 1)
@@ -602,6 +608,9 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                 name=name or self.name,
                                 out_type=outputs.structs(out_type), grid=grid, grid_names=grid_names,
                                 compiler_params=plgpu.CompilerParams(approx_math=approx_math,
+                                                                     reduction_scratch_bytes=(
+                                                                         self.reduction_scratch if reduces
+                                                                         else 0),
                                                                      min_blocks_per_sm=resident,
                                                                      metadata=report.launch_metadata()),
                                 interpret=bodies.interpreted(interpret),
@@ -649,8 +658,9 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         del shape, dtype
         return swizzling.UNSWIZZLED
 
-    def stream(self, streams, views, lo, hi) -> None:
-        del streams, views, lo, hi
+    def stream(self, streams, views, lo, hi, *, again=None) -> None:
+        # No producer role: a decided walk's consumers feed their second pass themselves.
+        del streams, views, lo, hi, again
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,

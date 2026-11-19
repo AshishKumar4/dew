@@ -43,6 +43,7 @@ from dew.nn import derivatives
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import (
     across,
+    after_walk,
     bodies,
     emission,
     handoffs,
@@ -641,6 +642,11 @@ class Issuer[Accumulator](abc.ABC):
         del rows, depth
         return 0
 
+    @property
+    def rows_whole(self) -> bool:
+        """Whether each warp of a consumer holds whole rows of its tiles, a row's reduction its own."""
+        return True
+
     def row_shifted(self, tile, shift, *, period: int, interpret: bool) -> jax.Array:
         """`tile` (a register tile in the accumulator's layout, `tile_of`'s) with each row `i` holding row
         `i - shift`'s values within its `period`-row group, any value where that row leaves the group (a
@@ -1020,12 +1026,12 @@ class Issuer[Accumulator](abc.ABC):
         del declared, slots
         return inline
 
-    def issuing(self, streams, products: Sequence[Product], lo, hi, *, first, lefts: Mapping,
-                ready) -> None:
+    def issuing(self, streams, products: Sequence[Product], lo, hi, *, first, lefts: Sequence[Mapping],
+                ready: Sequence, reaches: Sequence[tuple] | None = None) -> None:
         """The issuing role's walk of steps `lo` to `hi` (the streams' steps counted from `first`): each of
         `products` issued as its consumer's walk reads it (`places_on_role`), its left operands the program's
-        tiles `lefts` names, once `ready` (the query's load) is done."""
-        del streams, products, lo, hi, first, lefts, ready
+        tiles `lefts` names (one a consumer) once `ready` are done, each consumer's at its `reaches`."""
+        del streams, products, lo, hi, first, lefts, ready, reaches
         raise NotImplementedError(f"{self.name}'s consumers issue their own products")
 
     def product_columns(self, products: tuple | None) -> int:
@@ -1335,10 +1341,10 @@ class Issuer[Accumulator](abc.ABC):
         an fp32 tile's registers. A value narrower than the accumulator layout's rows is read in four warps of
         a quarter of its rows each, whose column vector is the accumulator's (`swizzling.rows_read`): a
         32-wide value is no 64-row tile of an H100's mma.sync, wgmma or tcgen05 layout (IG-FINAL3-h100's
-        cast)."""
+        cast). A value no finite number weighs nothing (`attention_algebra.magnitudes`)."""
         layout = swizzling.rows_read(self.layout, tile.shape[1])
         values = plgpu.load(tile.transpose((1, 0)), layout=layout, optimized=False)
-        return jnp.max(jnp.abs(values), axis=0).astype(jnp.float32)
+        return jnp.max(jnp.where(jnp.abs(values) < jnp.inf, jnp.abs(values), 0), axis=0).astype(jnp.float32)
 
     column_scratch: int
     """The fp32 entries of shared memory a consumer's `column_sums` takes: a reduction across the warps
@@ -1502,6 +1508,9 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
+    stages_over_rings: bool = False
+    """Whether a program's tiles past its walks may take its rings' slots (`after_walk.over_rings_scoped`)."""
+
     ring_slots: int | None = None
     """The slots each stream's ring holds whatever stages a launch asks (`streams`), where it fixes them (a
     TPU core's two); None where the ring is the launch's stages."""
@@ -1546,7 +1555,7 @@ class Transport[Allocated, Opened](abc.ABC):
                cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               prefetched: Callable | None = None, registers: int | None = None,
+               prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
@@ -1566,30 +1575,16 @@ class Transport[Allocated, Opened](abc.ABC):
         tracing it (`resources.register_model`, its
         producer lowered to `producer` where the family has one, `roles`, and its residency bounded by the
         `shared` bytes it stages where stated; `report.Launch.kernels`), which the compile point checks its
-        kernel against; and whether its program moves registers between its roles where the launch states
-        it (`moves`; else its model decides, `resources.moves_registers`)."""
+        kernel against; whether its program moves registers between its roles where the launch states
+        it (`moves`; else its model decides, `resources.moves_registers`); its scratch where it `reduces`."""
 
-    def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
+    def scoped(self, body, *allocations, streams, after_walks: tuple = (), over_rings: bool = False):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
-        (`streams`), and what it returns. With `after_walks`, allocations no walk reads, `body` takes
-        `after` too: `after(fn)` runs `fn(*refs)` of them once a role's walks have ended, in a scope of their
-        own where the family scopes its walks apart (`walks_scoped`: the walks' slots reused, as
-        `resources.Scope.after` counts them), the program's otherwise."""
+        (`streams`), and what it returns; with `after_walks`, allocations no walk reads, `body` takes `after`
+        too (`after_walk.scoped`: over its rings' slots where the launch asks it, `over_rings`)."""
         if not after_walks:
             return self.program_scoped(body, *allocations, streams=streams)
-        if self.walks_scoped:
-            # The after-walks scope is the program's own kind (`program_scoped`: collective where its
-            # consumers share one).
-            def after(fn):
-                return self.program_scoped(lambda *refs, streams: fn(*refs), *after_walks, streams=streams)
-
-            return self.program_scoped(functools.partial(body, after=after), *allocations, streams=streams)
-        held = len(allocations)
-
-        def program(*refs, streams):
-            return body(*refs[:held], streams=streams, after=lambda fn: fn(*refs[held:]))
-
-        return self.program_scoped(program, *allocations, *after_walks, streams=streams)
+        return after_walk.scoped(self, body, allocations, streams, after_walks, over_rings=over_rings)
 
     @abc.abstractmethod
     def program_scoped(self, body, *allocations, streams):
@@ -1603,16 +1598,16 @@ class Transport[Allocated, Opened](abc.ABC):
         (setmaxnreg's least where None: a launch states more where its producer's issue loop holds more)."""
 
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
-                  exclusive: bool = False, issuer: Callable | None = None):
-        """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)` on its compute
-        roles, `producer()` on its producer's where it has one, and `issuer()` on its issuing role where its
-        products are issued on one (`Issuer.places_on_role`), each a branch of one switch where `exclusive`
-        (`handoffs.Schedule.run`); the consumers' value where they are its every warpgroup."""
+                  exclusive: bool = False, issuer: Callable | None = None, reducer: Callable | None = None):
+        """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)`, `producer()`,
+        `issuer()` where it issues on a role (`Issuer.places_on_role`) and `reducer(index)` on a warp a
+        consumer (`handoffs.REDUCER`), each a branch of one switch where `exclusive`; the consumers' value."""
         schedule = self.roles(consumers, floor)
+        schedule = schedule if reducer is None else schedule.joined(handoffs.REDUCER, consumers)
         # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
-        bodies = {"consumer": consumer, "producer": lambda index: producer()}
-        if issuer is not None:
-            bodies["issuer"] = lambda index: issuer()
+        units = {"producer": producer, "issuer": issuer}
+        bodies = {"consumer": consumer, "reducer": reducer, **{name: lambda index, body=body: body()
+                                                               for name, body in units.items()}}
         return schedule.run(exclusive=exclusive, **{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
@@ -1652,17 +1647,19 @@ class Transport[Allocated, Opened](abc.ABC):
         return streams
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0) -> R:
         """Consumer `wg`'s walk of its own steps `own` (`lo`, `hi`) among its program's `streamed` ones,
         `walk(streams, lo, hi, first)` its walk of steps `lo` to `hi` counted from `first`: on a layout with a
         producer, the steps before and after its own passed (`passed`, `between()` after each), which its
         partners read; on one whose consumers feed their rings (`ConsumerFed.walk_own`), every streamed step
-        over its own feed (`fed`), a step none of its own masked by its step. Returns `walk`'s value."""
+        over its own feed (`fed`), a step none of its own masked by its step, `counted` turns past the rings'
+        first (`after_walk.Decided`'s second pass). Returns `walk`'s value."""
         del views, wg
         lo, hi = own
-        self.passed(streams, streamed[0], lo, first=streamed[0], between=between)
-        walked = walk(streams, lo, hi, streamed[0])
-        self.passed(streams, hi, streamed[1], first=streamed[0], between=between)
+        first = streamed[0] - counted
+        self.passed(streams, streamed[0], lo, first=first, between=between)
+        walked = walk(streams, lo, hi, first)
+        self.passed(streams, hi, streamed[1], first=first, between=between)
         return walked
 
     def run(self, allocated: Allocated, walk: Walk, interpret: bool, *, floor: int | None = None,
@@ -1727,9 +1724,17 @@ class Transport[Allocated, Opened](abc.ABC):
         return {name: ring.acquire(ring.turn(0)) for name, ring in held.items()}
 
     @abc.abstractmethod
-    def stream(self, streams, views: dict, lo, hi) -> None:
+    def stream(self, streams, views: dict, lo, hi, *, again: "after_walk.Decided | None" = None) -> None:
         """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one
-        (`streamed`)."""
+        (`streamed`); with `again`, once more where its consumers take their walk again, turns running on."""
+
+    def uniform(self, value: jax.Array) -> jax.Array:
+        """`value`, a scalar every lane holds alike, read warp-uniform (`across.uniform`, row 7898)."""
+        return value if bodies.interpreting() else across.uniform(value)
+
+    def decided_scratch(self, consumers: int) -> dict:
+        """A decided walk's verdicts' allocations (`after_walk.Decided`), none where one consumer feeds."""
+        return {} if consumers == 1 and self.feeds_itself else after_walk.verdicts(consumers)
 
     @abc.abstractmethod
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
@@ -2122,19 +2127,18 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
             # own value, both stayed live through the merge (267 registers at a 128 x 256 dW tile, EM-probe2).
             pl.when(last == 1)(lambda: combined(read(opening, first)))
 
-    def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):
-        """`Transport.scoped`, and with `products`, `(consumers, widths, lefts)`, the issuer's product scratch
-        (`product_scratch`) scoped beside `allocations`, `body` traced within it (`products_in`), where the
-        issuer keeps any; `product_held` its account."""
+    def scoped(self, body, *allocations, streams, products: tuple | None = None, **after):
+        """`Transport.scoped` (`after`), and with `products`, `(consumers, widths, lefts)`, the issuer's
+        product scratch beside `allocations`, `body` within it (`products_in`; `product_held` its account)."""
         scratch = () if products is None else self.product_scratch(*products)
         if not scratch:
-            return super().scoped(body, *allocations, streams=streams, after_walks=after_walks)
+            return super().scoped(body, *allocations, streams=streams, **after)
 
         def within(*refs, **named):
             with self.products_in(refs[-1]):
                 return body(*refs[:-1], **named)
 
-        return super().scoped(within, *allocations, scratch, streams=streams, after_walks=after_walks)
+        return super().scoped(within, *allocations, scratch, streams=streams, **after)
 
 
 class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
@@ -2168,7 +2172,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               prefetched: Callable | None = None, registers: int | None = None,
+               prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None,
                moves: bool | None = None) -> Callable:
         # Its programs read a table from global memory as any operand.
@@ -2184,7 +2188,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                                                            programs=resident, shared=shared, moves=moves)),
                       # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
-                      reduction_scratch=(self.reduction_scratch
+                      reduction_scratch=((self.reduction_scratch if reduces else 0)
                                          + self.warpgroup_reduction_scratch * reducing_warpgroups))
 
     def program_scoped(self, body, *allocations, streams):
@@ -2237,13 +2241,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # Its once streams held apart, one deep, beside its rings.
         return self.opened(allocated, views), views, self.opened(once, once_views)
 
-    def stream(self, streams, views: dict, lo, hi) -> None:
+    def stream(self, streams, views: dict, lo, hi, *, again: "after_walk.Decided | None" = None) -> None:
         rings = tuple(streams.values())
 
         def tiles(index):
             return tuple(ring.viewed(views[name], index) for name, ring in zip(streams, rings, strict=True))
 
         streamed(rings, tiles, lo, hi)
+        if again is not None:
+            pl.when(again.taken())(lambda: streamed(rings, tiles, lo, hi, counted=hi - lo))
 
     def output_staging(self, outputs: tuple, consumers: int) -> list:
         # Each consumer's share of each output in two chunk buffers, not the whole tile (`output_staging`).

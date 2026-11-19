@@ -6,7 +6,6 @@ is `dew.distributed.placement`'s."""
 from __future__ import annotations
 
 import collections
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -20,7 +19,6 @@ from typing import Any, Concatenate, Protocol
 import jax
 import numpy as np
 from flax import linen as nn
-from jax._src import config as jax_config
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P, Sharding
 
 from dew._cache import holding
@@ -53,6 +51,7 @@ from dew.nn.kernels.options import (
 )
 from dew.nn.sharding import microbatched
 from dew.objectives.base import Held, Initializer
+from dew.objectives.drawn import drawing, passed_through
 from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
 
@@ -439,22 +438,6 @@ def taking_over[Held, Result](program: OuterProgram, taken: Held, kept: Held
     return taken_over
 
 
-def drawing() -> contextlib.AbstractContextManager[None]:
-    """Where a fresh state's program is lowered, wherever it is (`placed_start`, `start_compiled`,
-    `start_compiling`): on a GPU, JAX's threefry draws as rolled loops over their rounds
-    (`jax_threefry_rolled_lowering`, Dew's JAX build's from post100), in place of each draw's twenty rounds
-    unrolled. The draws are the same bits; the program is what an init is, a draw for nearly every leaf, and
-    unrolled it is mostly hash arithmetic whose code generation is its compile: a 142M DiT's start compiled
-    on a GH200 in 23.8 s, 4.9 s rolled, and placed its state in 26.7 s where it now takes 7.6 s (a 4x1024
-    MoE decoder's, 26.5 s and 5.4 s; placed in 41.5 s and 20.2 s; M-MC-13, row 6740).
-    Rolled, a draw's rounds no longer fuse into the leaf it makes, which costs one round's state a leaf,
-    partitioned as the leaf is (a 1 GB draw over eight GPUs held one shard of temporaries, and no
-    collective, where JAX's threefry kernel, unpartitioned, held 6.44 GB). The setting is in JAX's trace
-    context and jit key, so every site of the program enters it alike; a step, whose draws fuse into what
-    reads them, keeps JAX's default."""
-    return jax_config.threefry_rolled_lowering(new_val=True)
-
-
 def _held_leaves(tree) -> list:
     """One of the held tree's two trees as its places' leaves, None where the other holds the leaf."""
     return jax.tree.leaves(tree, is_leaf=lambda leaf: leaf is None)
@@ -605,16 +588,7 @@ def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
     same shapes in this process is read (`_cache.holding`): a trainer's refit traces its start once
     (PF03)."""
     def made() -> tuple[TrainState, dict[int, int], Callable[[Initializer, jax.Array], TrainState]]:
-        through: dict[int, int] = {}
-
-        def traced(initializer: Initializer, key: jax.Array) -> TrainState:
-            state = initial_state(initializer, key)
-            inputs = {id(leaf): index for index, leaf in enumerate(jax.tree.leaves(initializer))}
-            frozen = jax.tree.leaves(apart(state)[1])
-            through.update({index: inputs[id(leaf)] for index, leaf in enumerate(frozen)
-                            if id(leaf) in inputs})
-            return state
-
+        traced, through = passed_through(initial_state, lambda state: apart(state)[1])
         trace = owned_program(traced).trace(initializer, key)
         abstract = trace.out_info
         return abstract, through, replaying(trace.jaxpr, jax.tree.structure(abstract), (), ())
@@ -625,24 +599,6 @@ def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], 
     # a key held past its trainer would keep alive.
     leaves = abstract_signature(jax.tree.leaves((initializer, key)))
     return holding(_TRACED_STARTS, (kept, held_context(), leaves), made, KEPT_STARTS)
-
-
-def built_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                key: jax.Array) -> TrainState:
-    """`initial_state(initializer, key)` for a caller outside any trace, built by one program: its trace
-    (`traced_start`) replayed and compiled whole, where run eagerly each operation of the model's draw
-    compiled alone (tens to hundreds a model, row 8682). The frozen leaves its init passes through as they
-    are (`through`) are the initializer's arrays themselves, as an eager build returns them, not the
-    program's copies of them."""
-    _, through, build = traced_start(initial_state, initializer, key)
-    state = owned_program(build)(initializer, key)
-    if not through:
-        return state
-    moving, frozen = apart(state)
-    leaves, structure = jax.tree.flatten(frozen)
-    given = jax.tree.leaves(initializer)
-    return together(moving, jax.tree.unflatten(structure, [
-        given[through[index]] if index in through else leaf for index, leaf in enumerate(leaves)]))
 
 
 def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, abstract: TrainState,
@@ -662,6 +618,7 @@ def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, ab
     where, structure = start.frozen
     placed = jax.tree.leaves(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
                                           is_leaf=lambda leaf: leaf is None))
+
     drawn = dict(zip(start.built, made, strict=True))
 
     def leaf(index: int) -> jax.Array:

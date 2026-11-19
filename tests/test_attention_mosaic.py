@@ -903,6 +903,96 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
                    drop=True)
 
 
+def _rising_draw(dtype, rise: float, value: float):
+    """Draws of a full call's operands, one batch row and head, 256 queries over 128 keys 64 wide: every
+    query's first coordinate 1, the first 64 keys' first coordinate 0 and the last 64's `rise` (their
+    logits that much above the first tile's, times the call's scale), every other coordinate drawn within
+    1/64, values `value` times a draw in [1, 2) and the cotangent 0, in `dtype`."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        small = [jax.random.uniform(stream, shape, jnp.float32, -1 / 64, 1 / 64)
+                 for stream, shape in zip(streams[:2], ((1, 256, 1, 64), (1, 128, 1, 64)), strict=True)]
+        query = small[0].at[..., 0].set(1).astype(dtype)
+        key = small[1].at[..., 0].set(0).at[:, 64:, :, 0].set(rise).astype(dtype)
+        values = value * jax.random.uniform(streams[2], (1, 128, 1, 64), jnp.float32, 1, 2)
+        return query, key, values.astype(dtype), jnp.zeros_like(query)
+
+    return draw
+
+
+def _second_review_draw(rise: float, noise: float):
+    """Draws of a bf16 call `[1, 128, 1, 64]`: each query's first coordinate 8, the last 64 keys' first
+    `rise` (the first 64's 0), every other coordinate within `noise`, values 2^119 to 2^120 (the base review
+    of 51158f2a9's probes, drawn)."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query, key = (jax.random.uniform(stream, (1, 128, 1, 64), jnp.float32, -noise, noise)
+                      for stream in streams[:2])
+        query = query.at[..., 0].set(8).astype(jnp.bfloat16)
+        key = key.at[..., 0].set(0).at[:, 64:, :, 0].set(rise).astype(jnp.bfloat16)
+        value = 2.0 ** 119 * jax.random.uniform(streams[2], (1, 128, 1, 64), jnp.float32, 1, 2)
+        return query, key, value.astype(jnp.bfloat16), jnp.zeros_like(query)
+
+    return draw
+
+
+@INTERPRETS
+@pytest.mark.parametrize("probe", ["raw", "initial"])
+def test_a_scaled_or_resumed_forward_near_fp32s_largest_is_on_par_interpreted(probe):
+    """A bf16 forward on wgmma, interpreted (the base review of 51158f2a9's probes): `raw`, a scaled raw fold
+    (`subtracted`, at a scale of 0.24 its prescale leaves 1.92) whose second key tile's raw products pass the
+    first's by 31 over values near 2^120; `initial`, a call resumed from a state of total 1 and sums 2^127 at
+    a maximum of 0, whose walk stays finite and whose merge with it does not, the merge before the decided
+    walk's verdict reads the sums. On par with the reference (check 1), finite where it is."""
+    spans = template.spans(128, 128, 1)
+    tiles = attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA)
+    hooks, options = None, {"scale": 0.24, "subtracted": True, "scaled": True}
+    if probe == "initial":
+        hooks = template.Hooks(initial=template.Initial(jnp.zeros((1, 1, 128)), jnp.ones((1, 1, 128)),
+                                                        jnp.full((1, 1, 128, 64), 2.0 ** 127)))
+        options = {"scale": 0.125}
+
+    def ours(query, key, value, dout):
+        del dout
+        with _device(interpret=True, target=generation.gpu_target("sm90")), _pinned(tiles):
+            return attention_mosaic.forward(query, key, value, spans, hooks, natural=False, interpret=True,
+                                            **options)
+
+    def reference(query, key, value, dout):
+        del dout
+        return template.reference(query, key, value, spans, hooks, scale=options["scale"])
+
+    # The raw probe's logits exact, its tiles' raw maxima 31 apart.
+    draw = _second_review_draw(31.0, 0.0) if probe == "raw" else _second_review_draw(1.0, 1 / 64)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"a forward's {probe} probe", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_a_deciding_forward_whose_finite_sums_cancelled_walks_scaled_interpreted():
+    """A bf16 inference forward on wgmma deciding its scaled walk itself (`after_walk.Decided`), interpreted:
+    each query over keys of logits 0, 0 and -100 (the rest masked) whose values are 2^127 and -2^127 in the
+    first coordinate and 2^126 in the second. Its unscaled sums cancel to finite ones, but the third key's
+    weight, e^-100 beside a bound past 2^127, is the scaled walk's to keep: its verdict reads its own bound,
+    the host's (`algebra.bounded_past`), where its sums' finiteness alone dropped an output near 1.58e-6 (the
+    base review of b872d1849, F4). On par with the reference (check 1)."""
+    spans = template.spans(64, 64, 1, lengths=jnp.full((1,), 3, jnp.int32))
+    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family=WGMMA)
+
+    def ours(query, key, value):
+        with _device(interpret=True, target=generation.gpu_target("sm90")), _pinned(tiles):
+            return attention_mosaic.forward(query, key, value, spans, natural=True, interpret=True, scale=1.0)
+
+    def draw(seed: int):
+        query = jnp.zeros((1, 64, 1, 64), jnp.bfloat16).at[..., 0].set(1)
+        key = jnp.zeros((1, 64, 1, 64), jnp.bfloat16).at[0, 2, 0, 0].set(-100)
+        value = (jnp.zeros((1, 64, 1, 64), jnp.float32).at[0, 0, 0, 0].set(2.0 ** 127)
+                 .at[0, 1, 0, 0].set(-2.0 ** 127).at[0, 2, 0, 1].set(2.0 ** 126)).astype(jnp.bfloat16)
+        return query, key, value
+
+    assert_as_exact(jax.jit(ours), jax.jit(lambda q, k, v: template.reference(q, k, v, spans, scale=1.0)),
+                    draw, "a deciding walk's cancelled sums", seeds=SEEDS)
+
+
 @INTERPRETS
 @on_each_family_for(("form", "dtype"),
                     [*((form, jnp.bfloat16) for form in (*HOOKED_FORMS, "fused")), ("derived", jnp.float16)],
@@ -1764,14 +1854,16 @@ def test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted(call, training
                    value_width=width, tiles=tiles, training=training, target=generation.gpu_target("sm100"))
 
 
+@pytest.mark.parametrize("rare", [False, True], ids=["common", "rare"])
 @pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
 @pytest.mark.parametrize("consumers", [2, 3])
-def test_the_forwards_schedule_holds_every_property_in_every_interleaving(consumers, training):
-    """The forward's launch on wgmma at `consumers` a program over 192 queries and 128 keys, traced as an
-    H100 builds it: every interleaving of its warpgroups and its loads' landings explored
-    (`ring_protocol.explore`), no deadlock and every barrier's phase whole. Its consumers' schedule turns
-    balance at any count (row 4840: at three the third made one fewer, and its partners' last turn waited
-    on a phase that never completed, the interpreted hang)."""
+def test_the_forwards_schedule_holds_every_property_in_every_interleaving(consumers, training, rare):
+    """The forward's launch on wgmma at `consumers` a program over 192 queries and 128 keys, traced as an H100
+    builds it: every interleaving of its warpgroups and its loads' landings explored
+    (`ring_protocol.explore`), no deadlock and every barrier's phase whole, its decided walk's second taken
+    (`rare`, the producer streaming the steps again, `after_walk.Decided`) or not. Its consumers' schedule
+    turns balance at any count (row 4840: at three the third made one fewer, and its partners' last turn
+    waited on a phase that never completed, the interpreted hang)."""
     from ring_protocol import explore, programs
 
     query, key = jnp.ones((1, 192, 1, 64), jnp.bfloat16), jnp.ones((1, 128, 1, 64), jnp.bfloat16)
@@ -1782,7 +1874,7 @@ def test_the_forwards_schedule_holds_every_property_in_every_interleaving(consum
         with generation.assumed("sm90"), tuning.pinned({attention_mosaic.MosaicForward: tiles}):
             return attention_mosaic.forward(query, key, key, spans, residuals=training, interpret=False)
 
-    threads, arrivals = programs(forward, query, key, threads=consumers + 1)
+    threads, arrivals = programs(forward, query, key, threads=consumers + 1, rare=rare)
     assert explore(threads, arrivals) > 0
 
 

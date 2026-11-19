@@ -513,15 +513,22 @@ class _Counting:
             return self.cond(params["branches"], values)
         elif (region := _REGIONS.get(primitive)) is not None:
             return region(self, equation, values) or unknown
-        elif primitive is derivatives.marked_call_p and isinstance(params["kind"], derivatives.WalkStep):
-            if self.loops:
-                self.loops[-1].marks += 1
-            return self.run(params["call_jaxpr"], values)
+        elif primitive is derivatives.marked_call_p and isinstance(params["kind"], _MARKS):
+            return self.marked(params, values)
         elif (inner := programs.called(equation)) is not None:
             return self.run(inner, values)
         elif primitive not in _FREE:
             raise Unpriced(f"no rule prices {primitive} in a kernel's body")
         return unknown
+
+    def marked(self, params, values: list) -> list:
+        """A marked span a count reads by its kind: a rare span's verdict as its common value, False
+        (`derivatives.Rare`), a walk's step counted by its loop and run (`derivatives.WalkStep`)."""
+        if isinstance(params["kind"], derivatives.Rare):
+            return [np.False_]
+        if self.loops:
+            self.loops[-1].marks += 1
+        return self.run(params["call_jaxpr"], values)
 
     def place(self, name) -> int | None:
         """The concrete index along axis `name`: its warp's among its warpgroup's warps (`warp`), its
@@ -668,6 +675,9 @@ def _placed(primitive, values: list):
     return place.compared(primitive, other) if place is values[0] else None
 
 
+_MARKS = (derivatives.Rare, derivatives.WalkStep)
+"""The marked spans a count reads by their kind (`_Counting.marked`)."""
+
 _REGIONS = {pallas.run_scoped_p: _Counting.scoped, lax.while_p: _Counting.loop, lax.scan_p: _Counting.scanned,
             mpmd.mpmd_map_p: _Counting.warps}
 """The regions a kernel's body counts within it, each by its method: its outputs' concrete values, or none
@@ -724,25 +734,53 @@ def _filled(jaxpr: jax_core.Jaxpr, stated: Stated) -> jax_core.Jaxpr:
     rule's, `plgpu.kernel`'s) rewritten around it."""
     def rewritten(equation):
         if equation.primitive in (mpmd.mpmd_map_p, pallas_call.pallas_call_p):
-            return equation.replace(params={**equation.params, "cost_estimate": _estimate(equation, stated)})
+            work = _WORKS[_body(equation)] = launch_work(equation, stated)
+            return equation.replace(params={**equation.params, "cost_estimate": _estimate(work)})
         return equation.replace(params={name: _filled(value, stated) if isinstance(value, jax_core.Jaxpr)
                                         else value for name, value in equation.params.items()})
 
     return jaxpr.replace(eqns=[rewritten(equation) for equation in jaxpr.eqns])
 
 
-def _estimate(kernel, stated: Stated) -> pl.CostEstimate:
-    """A kernel equation's cost from its body's emission: its tensor work (every precision's FLOPs) and its
-    exponentials, a step's `stated.steps` times and the rest each program's (`Emitted.issued`), and the
-    bytes it states."""
+def launch_work(kernel, stated: Stated) -> Work:
+    """A kernel equation's work from its body's emission, a launch's: each unit's, a step's `stated.steps`
+    times and the rest each program's (`Emitted.issued`), the bytes it states its device's, its span the
+    steps one of its programs walks, and one kernel. Its cost estimate's (`_estimate`) and a step's price
+    (`work_of`, `attention_decode.priced_step`) alike."""
     if kernel.primitive is mpmd.mpmd_map_p:
-        (mesh,), (body,) = kernel.params["meshes"], kernel.params["jaxprs"]
-        counted, programs = emitted(body, mesh.num_threads or 1, mesh.thread_name), math.prod(mesh.grid)
+        (mesh,) = kernel.params["meshes"]
+        counted = emitted(_body(kernel), mesh.num_threads or 1, mesh.thread_name)
+        programs = math.prod(mesh.grid)
     else:
-        body, programs = kernel.params["jaxpr"], math.prod(kernel.params["grid_mapping"].grid)
-        counted = emitted(body, 1, None)
-    return pl.CostEstimate(
-        flops=int(counted.issued(lambda work: work.flops + work.tf32_flops + work.fp8_flops, stated.steps,
-                                 programs)),
-        transcendentals=int(counted.issued(lambda work: work.exponentials, stated.steps, programs)),
-        bytes_accessed=stated.bytes_accessed)
+        counted, programs = emitted(_body(kernel), 1, None), math.prod(kernel.params["grid_mapping"].grid)
+
+    def issued(field: str) -> float:
+        return counted.issued(lambda work: getattr(work, field), stated.steps, programs)
+
+    return Work(flops=issued("flops"), operations=issued("operations"), exponentials=issued("exponentials"),
+                conversions=issued("conversions"), device_bytes=stated.bytes_accessed,
+                shared_bytes=issued("shared_bytes"), tf32_flops=issued("tf32_flops"),
+                span=stated.steps / programs, fp8_flops=issued("fp8_flops"), kernels=1)
+
+
+def _estimate(work: Work) -> pl.CostEstimate:
+    """A kernel's cost estimate from its launch's work (`launch_work`): its tensor work (every precision's
+    FLOPs), its exponentials and the bytes it states."""
+    return pl.CostEstimate(flops=int(work.flops + work.tf32_flops + work.fp8_flops),
+                           transcendentals=int(work.exponentials), bytes_accessed=int(work.device_bytes))
+
+
+_WORKS: "weakref.WeakKeyDictionary[jax_core.Jaxpr, Work]" = weakref.WeakKeyDictionary()
+"""Each costed launch's work (`launch_work`) by its kernel's body, as `_filled` counted it: a program a
+launch's lowering cache holds (`tuning.lowered_once`) answers with the body it traced once."""
+
+
+def _body(kernel) -> jax_core.Jaxpr:
+    """A kernel equation's body: its `mpmd_map`'s one jaxpr or its `pallas_call`'s."""
+    return kernel.params["jaxprs"][0] if kernel.primitive is mpmd.mpmd_map_p else kernel.params["jaxpr"]
+
+
+def work_of(kernel) -> Work | None:
+    """A kernel equation's work as its costed launch counted it (`launch_work`), None where no costed launch
+    counted it (a launch whose cost its emission does not count, `costed`)."""
+    return _WORKS.get(_body(kernel))

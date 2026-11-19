@@ -24,6 +24,7 @@ from dew.nn.kernels.templates import (
     mosaic_sm100,
     outputs,
     placed,
+    rings,
     stacked,
     stores,
     swizzling,
@@ -109,10 +110,15 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
                                 "douts": ((block_q, value_width), dtype)}
     if config.fused:
         # A fused launch's (`_dkv_step`'s `add_dq`): each consumer's score cotangents staged for dQ's
-        # product, their transpose its left operand, and its dQ tile's stage for the add.
-        scoped += [family.staged_memory((consumers, block_k, rows), dtype),
-                   family.staged_memory((consumers, rows, out_width if family.places_on_role else width),
-                                        jnp.float32)]
+        # product, their transpose its left operand, and its dQ tile's stage for the add; a placed walk's
+        # a ring of `REDUCED` slots of half a stage's columns each, a barrier a slot for its fill (the
+        # compute warpgroup's arrival) and one for its free (the reducer's), `_PlacedDq`.
+        scoped.append(family.staged_memory((consumers, block_k, rows), dtype))
+        if family.places_on_role:
+            scoped += [family.staged_memory((consumers, REDUCED, rows, out_width // REDUCED), jnp.float32),
+                       *(plgpu.Barrier(num_arrivals=1, num_barriers=consumers * REDUCED) for _ in range(2))]
+        else:
+            scoped.append(family.staged_memory((consumers, rows, width), jnp.float32))
     if config.staged_logits:
         # One slot's queries taken by the power, which the first consumer stages for every consumer's share,
         # and the two turns that order its writes against their products' reads (`_staged_logits`): the
@@ -273,15 +279,25 @@ def _placed_step(walk: _Backward, rows_of, coords_of, dq_added, index, slots, ca
         plgpu.commit_smem()
     family.given(slots)
     if dq_added is not None:
-        dq_added.added(family.dq_read(slots), q_first, slots.turn)
+        dq_added.added(family.dq_read(slots), q_first, slots)
     return carry, accumulators
+
+
+REDUCED = 2
+"""The slots of each compute warpgroup's ring of a placed fused walk's dQ (`_PlacedDq`): it writes one while
+the reducer's add reads the other (`stores.OUTPUT_BUFFERS`'s two), each half the one stage's columns it
+replaces, so the launch's shared memory is unchanged."""
 
 
 @dataclasses.dataclass(frozen=True)
 class _PlacedDq:
     """A fused keys-first walk's dQ (`_placed_step`'s `dq_added`): each compute warpgroup's stage of its
-    step's score cotangents (`staged(turn)`, `[bk, bq]`), and its step's dQ halves added into the call's at a
-    query tile (`added(halves, first query, turn)`) through its output stage, a stage of columns at a time."""
+    step's score cotangents (`staged(turn)`, `[bk, bq]`) and its ring of `REDUCED` dQ slots, which it fills
+    a slot's columns of its step's dQ at a time (`added`) and the launch's reducer adds into the call's at
+    the step's query tile (`reduced`, `handoffs.REDUCER`), each slot's fill and its free a barrier's phase
+    (the ring's `filled`, the warpgroup's arrival, and `emptied`, the reducer's, once its add has read the
+    slot). A compute warpgroup waits on no add of its own: Dew's dK/dV on a B200 spent its compute
+    warpgroups' time waiting on their own adds' reads before each next chunk's write (row 8283)."""
 
     walk: _Backward
     dq_ref: Any
@@ -291,17 +307,96 @@ class _PlacedDq:
     def staged(self, turn: int):
         return self.stages[0].at[turn]
 
-    def added(self, halves: tuple, q_first, turn: int) -> None:
+    def pieces(self) -> tuple[tuple[int, int], ...]:
+        """A step's dQ a slot's columns at a time, in turn, each its first column and its count: its halves'
+        (`dq_halves`), each a slot's columns at a time (`mosaic.column_chunks`), which divide them."""
+        columns, found, first = self.stages[1].shape[-1], [], 0
+        for half in dq_halves(self.dq_ref.shape[-1]):
+            found += [(first + at, columns) for at in range(0, half, columns)]
+            first += half
+        return tuple(found)
+
+    def _turn(self, role, ordinal, piece: int):
+        """Piece `piece` of a compute warpgroup's (`role`'s) `ordinal`-th step's turn of its ring, and its
+        barrier's index among the ring's (each warpgroup's `REDUCED` in turn)."""
+        turn = rings.Turn.of(ordinal * len(self.pieces()) + piece, REDUCED)
+        return turn, role * REDUCED + turn.slot
+
+    def _view(self, q_first, turn: int = 0):
         row, head = self.place
-        family, rows = self.walk.program.family, self.walk.program.tiles.block_q
-        view = self.dq_ref.at[turn if self.walk.interpret else 0, row, pl.ds(q_first, rows), head]
-        first = 0
-        for half in halves:
-            columns = half.shape[1]
-            # A stage's columns at a time (`Family.added`'s chunks).
-            family.added(half, view.at[:, pl.ds(first, columns)], self.walk.interpret,
-                         smem=self.stages[1].at[turn])
-            first += columns
+        return self.dq_ref.at[turn, row, pl.ds(q_first, self.walk.program.tiles.block_q), head]
+
+    def added(self, halves: tuple, q_first, slots) -> None:
+        """A compute warpgroup's step's dQ `halves` (`slots`' turn its role, its ordinal among its steps the
+        walk's over the turns) written into its ring a slot at a time, each slot once the reducer's add has
+        read its last fill (`emptied`), its writes fenced for the add's read and the fill published
+        (`filled`); interpreted, added into its own copy of the call's (`Family.added`, no reducer)."""
+        family, (stage, filled, emptied) = self.walk.program.family, self.stages[1:]
+        if self.walk.interpret:
+            first = 0
+            for half in halves:
+                columns = half.shape[1]
+                family.added(half, self._view(q_first, slots.turn).at[:, pl.ds(first, columns)],
+                             interpret=True, smem=stage.at[slots.turn, 0])
+                first += columns
+            return
+        ordinal = slots.n // placed.TURNS
+        written = [piece for half in halves for _, piece in mosaic.column_chunks(half, stage.shape[-1])]
+        for index, piece in enumerate(written):
+            turn, at = self._turn(slots.turn, ordinal, index)
+            before = rings.Turn.of(turn.counter - REDUCED, REDUCED)
+            pl.when(turn.counter >= REDUCED)(lambda before=before, at=at: plgpu.barrier_wait(
+                emptied.at[at], phase=before.rotation))
+            stage.at[slots.turn, turn.slot][...] = piece
+            plgpu.commit_smem()
+            plgpu.barrier_arrive(filled.at[at])
+
+    def reduced(self, lo, hi, role: int) -> None:
+        """A compute warpgroup's (`role`'s) reducer: the adds of its steps among the walk's `lo` to `hi` (step
+        `n` the warpgroup's of its turn, `placed.TURNS`), each piece once filled (`filled`), each slot freed
+        once the add after it is issued and its own read done (`emptied`), two adds reading at once; its last
+        freed and its adds done before the program ends. A reducer a role: one serving both took each
+        role's whole step in turn, the other's filling waiting on it. Interpreted, nothing (`added`)."""
+        if self.walk.interpret:
+            return
+        stage, filled, emptied = self.stages[1:]
+        block_q, pieces = self.walk.program.tiles.block_q, self.pieces()
+
+        def freed(last) -> None:
+            # The add before the one just issued read: its slot free (the walk's first has none before it).
+            pl.when(last >= 0)(lambda: plgpu.barrier_arrive(emptied.at[last]))
+
+        def step(ordinal, last):
+            view = self._view((lo + role + placed.TURNS * ordinal) * block_q)
+            for index, (first, columns) in enumerate(pieces):
+                turn, at = self._turn(role, ordinal, index)
+                plgpu.barrier_wait(filled.at[at], phase=turn.rotation)
+                plgpu.copy_smem_to_gmem(stage.at[role, turn.slot], view.at[:, pl.ds(first, columns)],
+                                        reduction_op="add")
+                plgpu.wait_smem_to_gmem(1, wait_read_only=True)
+                freed(last)
+                last = jnp.asarray(at, jnp.int32)
+            return last
+
+        steps = lax.div(jnp.maximum(hi - lo - role, 0) + placed.TURNS - 1, placed.TURNS)
+        last = lax.fori_loop(0, steps, step, jnp.int32(-1))
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+        freed(last)
+        plgpu.wait_smem_to_gmem(0)
+
+    def drained(self, lo, hi, role: int) -> None:
+        """A compute warpgroup's (`role`'s) last `REDUCED` fills of its ring read by the reducer's adds
+        (`emptied`), its walk's steps `lo` to `hi` the walk's in turn: no slot's free left unobserved, and
+        no scope after the walk written over a slot an add still reads."""
+        if self.walk.interpret:
+            return
+        emptied = self.stages[3]
+        steps = lax.div(jnp.maximum(hi - lo - role, 0) + placed.TURNS - 1, placed.TURNS)
+        fills = steps * len(self.pieces())
+        for back in range(REDUCED, 0, -1):
+            turn = rings.Turn.of(fills - back, REDUCED)
+            pl.when(fills >= back)(lambda turn=turn: plgpu.barrier_wait(
+                emptied.at[role * REDUCED + turn.slot], phase=turn.rotation))
 
 
 def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows: tuple, dtypes: tuple, *,
@@ -598,13 +693,11 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     each); a later share's program writes no hook gradient."""
     _, queries, heads, width = query.shape
     kv_heads, value_width = key.shape[2], value.shape[-1]
-    program, consumers, kinds = walk.program, walk.consumers, walk.kinds
-    family = program.family
+    program, consumers, kinds, family = walk.program, walk.consumers, walk.kinds, walk.program.family
     block_q, block_k = program.tiles.block_q, program.tiles.block_k
     split, placing = split_queries(family), family.places_on_role
     pair, count = holders(family, consumers) * block_k, block_q // consumers if split else block_q
-    q_steps = queries // block_q
-    stages = min(program.tiles.stages, q_steps)
+    q_steps, stages = queries // block_q, min(program.tiles.stages, queries // block_q)
     graded, buffers, groups = _graded(score_params, kinds, shares, query.shape, key.shape[1],
                                       adds_vectors=family.adds_vectors)
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
@@ -622,11 +715,9 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         dq_ref, dk_ref, dv_ref = outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
-        relayed = family.relay_bytes(block_k, count) > 0
-        relay, rest = (rest[-1:], rest[:-1]) if relayed else ([], rest)
-        tile_stage, rest = (rest[-1], rest[:-1]) if tiled else (None, rest)
-        fused = 2 if walk.fused else 0
-        fused_stages, logits_stages = rest[:fused], rest[fused:]
+        relay, tile_stage, fused_stages, logits_stages = _held_stages(
+            rest, relayed=family.relay_bytes(block_k, count) > 0, tiled=tiled,
+            fused=(4 if placing else 2) if walk.fused else 0)
         row, head = family.program_index("batch"), family.program_index("heads")
 
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
@@ -636,6 +727,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                               for index in range(holders(family, consumers))])
 
         rows_of = functools.partial(_statistics_of, family, stat_refs, (row, head))
+        ring = _PlacedDq(walk, dq_ref, tuple(fused_stages), (row, head)) if placing and walk.fused else None
 
         def consumer(index):
             holder = 0 if split or placing else index
@@ -663,6 +755,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                 lambda streams, lo, hi, counted: family.walk(
                     streams, ((step, lo, hi),), tuple(family.zeros((block_k,)) for _ in key_refs),
                     tuple((block_k, share) for _, share in shares), walk.interpret, first=counted))
+            if ring is not None:
+                ring.drained(lo, hi, index)
             if stage is not None:
                 # The read turn's last phase, past the walk's last product, observed.
                 family.turn(stage[2], consumers, arrive=False)
@@ -682,7 +776,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         return scheduled_roles(family, consumers, consumer, functools.partial(
             family.stream, streams, views, *streamed), functools.partial(
             _keys_first_issued, walk, streams, reached, first=streamed[0],
-            resident=(k_smem, v_smem, k_loaded, v_loaded), staged=fused_stages, shares=shares))
+            resident=(k_smem, v_smem, k_loaded, v_loaded), staged=fused_stages, shares=shares),
+            reducer=None if ring is None else lambda role: ring.reduced(*reached()[:2], role))
 
     scoped, rings, after = _dkv_allocations(family, program.tiles, width, value_width, query.dtype,
                                             stages=stages, columns=program.tiles.columns, tiled=tiled,
@@ -704,6 +799,15 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     return _dkv_launched(walk, launch, operands, graded, buffers, groups)
+
+
+def _held_stages(rest: list, *, relayed: bool, tiled: bool, fused: int) -> tuple:
+    """A dK/dV program's stages past its resident blocks and output stages, as `_dkv_allocations` lays them:
+    its consumers' relay tiles where `relayed` and its tile gradients' stage where `tiled` (the last), a
+    fused launch's `fused` stages and barriers (its placed walk's dQ ring, `_PlacedDq`), then its logits'."""
+    relay, rest = (rest[-1:], rest[:-1]) if relayed else ([], rest)
+    tile_stage, rest = (rest[-1], rest[:-1]) if tiled else (None, rest)
+    return relay, tile_stage, rest[:fused], rest[fused:]
 
 
 def _block_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: tuple, place: tuple,
@@ -739,7 +843,7 @@ def _keys_first_issued(walk: _Backward, streams, reached: Callable, walked: plac
     k_smem, v_smem, k_loaded, v_loaded = resident
     lefts = {"keys": k_smem.at[0], "values": v_smem.at[0], **({"staged": staged[0]} if walk.fused else {})}
     walked.issuing(streams, KEYS_FIRST + (FUSED_DQ if walk.fused else ()), *reached()[:2], first=first,
-                   lefts=lefts, ready=(k_loaded.at[0], v_loaded.at[0]),
+                   lefts=(lefts,), ready=(k_loaded.at[0], v_loaded.at[0]),
                    shares={placed.DK: shares[0], placed.DV: shares[1]})
 
 

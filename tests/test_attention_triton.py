@@ -533,6 +533,38 @@ def test_an_integer_parameter_keys_and_runs():
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw, "triton integer parameter", seeds=SEEDS)
 
 
+@pytest.mark.parametrize("beside", ["alone", "nan head"])
+def test_a_triton_walk_over_values_near_fp32s_largest_walks_scaled_on_par(beside):
+    """A bf16 Triton forward over two 64-key tiles, the second's logits 14 nats past the first's, over values
+    of 2^109 to 2^110: on par with the reference (check 1), finite. Beside a second head one of whose values
+    is NaN (`nan head`), the first head's still is: the host's bound takes finite magnitudes alone, where the
+    NaN left the whole call unscaled and the first head infinite (the base review of a648b3279, F5)."""
+    spans = template.spans(128, 128, 1)
+    pins = {attention_triton.TritonForward: PINNED[1]}
+    heads = 1 if beside == "alone" else 2
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.uniform(streams[0], (1, 128, heads, 64), jnp.float32, -1 / 64, 1 / 64)
+        key = jax.random.uniform(streams[1], (1, 128, heads, 64), jnp.float32, -1 / 64, 1 / 64)
+        # The logits natural at the call's scale of 1/8: the second tile's 14 above the first's.
+        query = query.at[..., 0].set(8).astype(jnp.bfloat16)
+        key = key.at[..., 0].set(0).at[:, 64:, :, 0].set(14).astype(jnp.bfloat16)
+        value = 2.0 ** 109 * jax.random.uniform(streams[2], (1, 128, heads, 64), jnp.float32, 1, 2)
+        if heads > 1:
+            value = value.at[0, 5, 1, 3].set(jnp.nan)
+        return query, key, value.astype(jnp.bfloat16)
+
+    def ours(query, key, value):
+        with tuning.pinned(pins):
+            return attention_triton.forward(query, key, value, spans, None, interpret=not ON_GPU)[:, :, :1]
+
+    def xla(query, key, value):
+        return template.reference(query, key, value, spans)[:, :, :1]
+
+    assert_as_exact(jax.jit(ours), jax.jit(xla), draw, f"triton walk's bound, {beside}", seeds=SEEDS)
+
+
 def test_an_output_hook_of_the_call_s_own_width_keys_and_runs():
     """An output hook scaling each of the call's 32 value features by its own factor keys its launch at
     that width and runs on par with the reference arithmetic from float64."""

@@ -97,6 +97,8 @@ class Forward:
     walked_keys: int | None = None
     approximate: bool = True
     rounds: float | None = None
+    whole: bool = False
+    """Whether a spans call's every query sees every key (`attention.KeySpans.whole`): priced as full."""
     subtracted: bool = False
     """Whether the fold (`base2`) takes its exponent as the accurate form's raw one does (`raw`), a difference
     of the raw products scaled after it is taken, `exp2((s - m) * scale * log2(e))`: no logit the reference
@@ -187,12 +189,15 @@ class Forward:
             return power2(half, k, reach=TWO_FACTOR_REACH) * half
         return natural_exp(x, self.scale if self.raw else 1.0, offset=k)
 
+    @property
+    def unit(self) -> float:
+        """A logit's unit in nats: the scale for raw products, ln 2 folded to base 2, else 1."""
+        return self.scale if self.raw else LN2 if self.base2 else 1.0
+
     def naturalized(self, m: jax.Array) -> jax.Array:
-        """A maximum in the logits' units taken to natural ones: from base 2 folded, from raw products
-        raw."""
-        if self.raw:
-            return m * self.scale
-        return m * LN2 if self.base2 else m
+        """A maximum in the logits' units taken to natural ones (`unit`): from base 2 folded, from raw
+        products raw; natural ones as they are."""
+        return m * self.unit if self.raw or self.base2 else m
 
 
 class Recompute(NamedTuple):
@@ -1298,9 +1303,14 @@ def chunk_of(spec: Forward) -> int | None:
     return CHUNK if spec.compensated else None
 
 
-def magnitudes(value: jax.Array) -> jax.Array:
-    """Each key's values' largest magnitude, `[bk]` of a tile's `[bk, Dv]`, fp32 (`weighed_reach`)."""
-    return jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1)
+def magnitudes(value: jax.Array, *, axis: int = -1) -> jax.Array:
+    """Each key's values' largest finite magnitude over `axis` (its columns), `[bk]` of a tile's `[bk, Dv]`,
+    fp32 (`weighed_reach`): a value that is no finite number weighs nothing in a row's bound, its column's
+    sums no finite number at any scale, where its magnitude made every column's bound infinite and left the
+    row unscaled (a dropping call over values near fp32's largest, one of a dropped key's infinite: its kept
+    key's sums passed fp32's largest where the output is finite, row 8652)."""
+    held = jnp.abs(value)
+    return jnp.max(jnp.where(finite(held), held, 0), axis=axis).astype(jnp.float32)
 
 
 def weighed_reach(keys: Keys, value: jax.Array, p: jax.Array, *, axis: int = -1) -> jax.Array:
@@ -1424,8 +1434,8 @@ def may_scale(value: jax.Array, *, keys_axis: int, initial: jax.Array | None = N
     (`resumed`), so where the largest such sum of any key head is below `2^(HEADROOM - 1)` (a binade for the
     bound's own rounding) no row's is past `2^HEADROOM`, and the unscaled walk is the scaled one bit for bit:
     a call there launches its mainloop's unscaled kernels, one pass over its values before them."""
-    # Each key's largest. A call of no keys or rows reads no value: its bound is 0.
-    largest = jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1, initial=0)
+    # Each key's largest finite one (`magnitudes`). A call of no keys or rows reads no value: its bound is 0.
+    largest = magnitudes(value) if value.shape[-1] else jnp.zeros(value.shape[:-1], jnp.float32)
     return bounded_past(largest, keys_axis=keys_axis, initial=initial, amplified=amplified)
 
 
@@ -1435,19 +1445,41 @@ def bounded_past(largest: jax.Array, *, keys_axis: int, initial: jax.Array | Non
     its keys along `keys_axis`) are given: a cache's, which states each written key's as it writes it
     (`attention_decode.attend`'s `bounds`), so a call over it reads no value to choose its kernel."""
     unit = np.float32(2.0 ** -BOUND_UNIT)
+
+    def held(x: jax.Array) -> jax.Array:
+        # A magnitude that is no finite number bounds nothing (`magnitudes`): one head's NaN left every
+        # head's bound NaN, no head scaled (the base review of a648b3279, F5).
+        x = jnp.abs(x.astype(jnp.float32))
+        return jnp.where(finite(x), x, 0.0)
+
     # Each key's largest at the bound's unit, summed over the keys: a key head's bound.
-    bound = jnp.max(jnp.sum(largest.astype(jnp.float32) * unit, axis=keys_axis), initial=0)
+    bound = jnp.max(jnp.sum(held(largest) * unit, axis=keys_axis), initial=0)
     bound = bound * np.float32(amplified)
     if initial is not None:
-        bound = bound + jnp.max(jnp.abs(initial.astype(jnp.float32)), initial=0) * unit
+        bound = bound + jnp.max(held(initial), initial=0) * unit
     return bound >= np.float32(2.0 ** (HEADROOM - 1 - BOUND_UNIT))
 
 
-def _queries_taken(coords: Coords, factor: jax.Array | None, held: Scaled | None, acc):
-    """`carry_factor` on a mainloop's own sums `acc` (`Keys.accumulate`'s `scale`), each query's factor
-    (none where None) and its change of scale broadcast over its sums as the mainloop holds them."""
-    taken = acc if factor is None else coords.queries(factor, acc) * acc
-    return taken if held is None else power2(taken, coords.queries(held.drop, acc))
+@dataclasses.dataclass(frozen=True)
+class Taken:
+    """`carry_factor` on a mainloop's own sums (`Keys.accumulate`'s `scale`, called on them): each query's
+    factor (none where None) and its change of scale (`held`) broadcast over its sums as the mainloop holds
+    them, its factor stated beside the call that applies it."""
+    coords: Coords
+    factor: jax.Array | None
+    held: Scaled | None
+
+    def __call__(self, acc):
+        taken = acc if self.factor is None else self.coords.queries(self.factor, acc) * acc
+        return taken if self.held is None else power2(taken, self.coords.queries(self.held.drop, acc))
+
+    @property
+    def moves(self) -> jax.Array | bool:
+        """Whether it moves any row's sums: some row's factor other than 1 (its maximum moved) or some
+        row's scale changed, so a mainloop holding its sums apart (tensor memory) skips the pass over them
+        where it moves none."""
+        moved = False if self.factor is None else jnp.any(self.factor != 1.0)
+        return moved if self.held is None else moved | jnp.any(self.held.drop != 0)
 
 
 Gathered = Callable[[jax.Array], jax.Array]
@@ -1580,7 +1612,7 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
         if keys.accumulate is None:
             acc = power2(state.acc, expand(drop, state.acc)) + summed_products(parts, value, keys.dot)
         else:
-            rescale = functools.partial(_queries_taken, keys.coords, None, held)
+            rescale = Taken(keys.coords, None, held)
             acc = keys.accumulate(state.acc, rescale, parts, value)
         total = power2(state.total, drop) + power2(p.sum(axis=-1), -held.exponent, reach=TWO_FACTOR_REACH)
         return (Partial(acc, state.m, total, scale), anchor, power2(own, drop) + own_tile,
@@ -2210,18 +2242,13 @@ def _softmax(spec: Forward, state: Partial, keys: Keys):
 
 
 def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
-    """The state after a tile `keys` by the derived forms: the tile's logits (-inf where a query does not see
-    a key, as `modify` writes them) and values, its maximum, rescale and weights the forms'; the weighted
-    values' sums the mainloop's own where it holds them (`Keys.accumulate`, the state's `acc` in its form),
-    every product the mainloop's (`Keys.dot`). A tile held keys first (`Coords.keys_first`, a decode
-    program's `K Qᵀ`) takes its sums so: the mainloop's, `[Dv, bq]`, its queries their columns. A compensated
-    walk's (the state's `Low`) takes its sums as the template's step takes them (`stepped`): the tile's
-    products a chunk of keys each, each addition's rounding kept; a scaled walk's (`SCALED_WALK`) its rows'
-    scale from the forms' weights and the tile's values (`rescaled`), each tile at it where some row is
-    scaled (`scaled_step`). A dropping call's draw (`drawn`) multiplies the weights of the tile's product
-    alone, never its denominator's, so the template's product takes them (`tile_parts`): narrowed in place,
-    or past fp16's range (a multiplier of 2^16) at the power-of-two scale `dropped_parts` keeps them at,
-    where the forms' product would narrow them unnormalized."""
+    """The state after a tile `keys` by the derived forms: its logits (-inf where a query does not see a key,
+    `modify`'s) and values, its maximum, rescale and weights the forms'; the weighted values'
+    sums the mainloop's where it holds them (`Keys.accumulate`), every product the mainloop's (`Keys.dot`), a
+    keys-first tile's (`Coords.keys_first`) `[Dv, bq]`. A compensated walk's (`Low`) takes its sums as the
+    template's step does (`stepped`), a chunk of keys a product; a scaled walk's (`SCALED_WALK`) its rows'
+    scale (`rescaled`, `scaled_step`). A dropping call's draw (`drawn`) takes the product's weights alone,
+    never the denominator's (`tile_parts`)."""
     forms, tiles, fields = _step_forms(spec, keys)
     held_by, plain = keys.accumulate, state.low is None
     drop = keys.coords.drop
@@ -2249,7 +2276,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
                          else tile_parts(added.terms, held, value.dtype, multiplier, bound, axis=axis))
                 # The weighted values' sums taken by their factor, a row's (none where the forms state none),
                 # and a scaled tile's change of scale.
-                taken = functools.partial(_queries_taken, keys.coords, accumulated.factor, held)
+                taken = Taken(keys.coords, accumulated.factor, held)
                 acc = held_by(states[fields.index("acc")], taken, parts, value)
                 return Partial(acc, state.m, total, scale)
             # The template's step over the forms' weights (the denominator's terms, before their narrowing

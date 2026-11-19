@@ -240,7 +240,7 @@ def _queries_first_issued(streams, reached: Callable, walked: placed.Tcgen05Walk
     (`resident`, their tiles and their loads' barriers) their lefts once in, dQ's `share` of its columns."""
     q_smem, do_smem, q_loaded, do_loaded = resident
     walked.issuing(streams, QUERIES_FIRST, *reached()[:2], first=first,
-                   lefts={"queries": q_smem.at[0], "douts": do_smem.at[0]},
+                   lefts=({"queries": q_smem.at[0], "douts": do_smem.at[0]},),
                    ready=(q_loaded.at[0], do_loaded.at[0]), shares={placed.DQ: share})
 
 
