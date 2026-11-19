@@ -206,20 +206,28 @@ type Kept = Callable[["OuterProgram", jax.stages.Lowered, jax.stages.Compiled], 
 """What hears each program the compile point compiles (`keeping`): the program, the lowering it compiled
 (its last relowering's, past a spill) and its executable."""
 
-_KEEPING: contextvars.ContextVar[Kept | None] = _cache.untraced(
-    contextvars.ContextVar("dew_keeping_programs", default=None))
+_KEEPING: contextvars.ContextVar[tuple[Kept, ...]] = _cache.untraced(
+    contextvars.ContextVar("dew_keeping_programs", default=()))
 
 
 @contextlib.contextmanager
 def keeping(kept: Kept) -> Iterator[None]:
     """Within the block, `kept` hears each executable Dew's compile point compiles (`OuterProgram.compiled`,
     `compiled_together`), with its lowering, on the thread that keeps it: what a save of a process's
-    programs reads (`dew.training.ahead.keeping`). One taken, compiled elsewhere, is not heard."""
-    token = _KEEPING.set(kept)
+    programs reads (`dew.training.ahead.keeping`). One taken, compiled elsewhere, is not heard. A block
+    within another is heard by both, the outer first (`_heard`): a run's programs kept within a save of its
+    process's are kept by each."""
+    token = _KEEPING.set((*_KEEPING.get(), kept))
     try:
         yield
     finally:
         _KEEPING.reset(token)
+
+
+def _heard(program: OuterProgram, lowered: jax.stages.Lowered, executable: jax.stages.Compiled) -> None:
+    """`executable`, `program`'s compile of `lowered`, heard by every `keeping` block this thread is in."""
+    for kept in _KEEPING.get():
+        kept(program, lowered, executable)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -501,9 +509,8 @@ def compiled_together() -> Iterator[None]:
     for call, executable in zip(held, executables, strict=True):
         call.program._keep(call.key, call.pending, executable, call.relowered)
     # Heard once every compile is settled, so a listener that raises leaves no call waiting.
-    if (kept := _KEEPING.get()) is not None:
-        for call, executable in zip(held, executables, strict=True):
-            kept(call.program, call.relowered[-1][1] if call.relowered else call.lowered, executable)
+    for call, executable in zip(held, executables, strict=True):
+        _heard(call.program, call.relowered[-1][1] if call.relowered else call.lowered, executable)
 
 _PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_passing", default=False)
 """Whether an `OuterProgram`'s trace, which the algebra pass reads whole, encloses the current call."""
@@ -937,8 +944,7 @@ class OuterProgram:
         if (collected := _COLLECTED.get()) is not None and (
                 digest := stated_digest(lowered, self.options)) is not None:
             collected[digest] = executable
-        if (kept := _KEEPING.get()) is not None:
-            kept(self, lowered, executable)
+        _heard(self, lowered, executable)
         if (spent := _SPENT.get()) is not None:
             placed = [*jax.tree.leaves(executable.input_shardings),
                       *jax.tree.leaves(executable.output_shardings)]

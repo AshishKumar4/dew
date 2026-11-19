@@ -22,6 +22,7 @@ from collections.abc import Iterator
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh
 
 from dew._coordination import agreed_same, broadcast_from_process_zero
 from dew._records import JSON, listed, record, text
@@ -35,13 +36,14 @@ from dew.nn.protocols import ComputesIn
 from dew.telemetry.instrumentation import step_flops
 from dew.training._fit import Start, closes_window
 from dew.training.diloco import DILOCO_ON_HOST
-from dew.training.distributed import microbatch_shapes
+from dew.training.distributed import marked, microbatch_shapes
 from dew.training.execution import HostExecution, frozen_trees, stack_sites, unscanned
 from dew.training.memory import (
     StepPrice,
     Unpriced,
     device_price,
     host_memory_rate,
+    host_update_seconds,
     layer_gathers,
     local_devices,
     step_fits,
@@ -49,7 +51,6 @@ from dew.training.memory import (
 )
 from dew.training.model_flops import model_batch
 from dew.training.planning import PlanRefused, Rung
-from dew.training.rollout import policy_bytes
 from dew.training.transaction import loss_arguments
 
 _log = logging.getLogger(__name__)
@@ -99,8 +100,11 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
     """Why `trainer`'s run cannot stream its parameters from the host, None where it can. What the streamed
     step cannot be: a layout the run states (`stated`), a custom step, which owns its execution, a run
     lowering for another target (`lower_for`), whose steps this host prices on no devices of that target
-    (a stated host layout lowers, `StepCompiler._lowered_host`), or a process holding no CPU companion of
-    the devices, which JAX makes only before it initializes. And what it is not
+    (a stated host layout lowers, `StepCompiler._lowered_host`), a run whose rollout makes its steps'
+    batches (`Trainer(rollout=)`), whose stream's first batch is the rollout's input, no step's, so no step
+    is priced before a rollout runs (a stated host layout samples from a device copy of its weights,
+    `dew.training.rollout.on_devices`), or a process holding no CPU companion of the devices, which JAX
+    makes only before it initializes. And what it is not
     built for yet (`NOT_BUILT`; DiLoCo's groups by row `DILOCO_ON_HOST`): DiLoCo, a step compiled `ahead`,
     a pass count drawn per microbatch, and a part whose table
     states no host link to price it by (`GpuTarget.host_links`: a TPU's but v6e's). Read before any plan
@@ -117,6 +121,9 @@ def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
         return "a custom step owns its execution"
     if trainer.lower_for is not None:
         return "the run lowers its step for another target, whose devices price no plan here"
+    if trainer.rollout is not None:
+        return ("the run's rollout makes its steps' batches, which its stream's first batch is none of: no "
+                "step is priced before a rollout runs")
     for refused, what, row in unbuilt:
         if refused:
             return f"the streamed step is not built for {what} yet (row {row})"
@@ -193,26 +200,26 @@ def streamed(trainer, start: Start, batch, dtype, device_steps: tuple) -> tuple[
     banked = [frozen, *(tree for path, tree, _ in frozen_trees(rest, execution.sites) if path != (FROZEN,))]
     averaged = max(_shard_bytes(here.ema, device, memory=None)
                    + _shard_bytes(banked, device, memory="pinned_host") for device in devices)
-    # The update, on the host's CPUs: each of this process's companion devices reads and writes its shards
-    # of the parameters, the optimizer's state and the averaged weights, and reads the gradient's.
-    weights, held = abstract.variables["params"], start.shardings.variables["params"]
-    updated = sum(_shard_bytes((weights, abstract.opt_state, abstract.ema), device,
-                               (held, start.shardings.opt_state, start.shardings.ema), memory=None)
-                  + _shard_bytes(weights, device, held, memory=None)
-                  for device in local_devices(companion))
     try:
         flops = step_flops(compiled)
-        # A rollout samples from a copy of the host's weights, its variables' and its EMA's, made once a
-        # step before it (`dew.training.rollout.on_devices`), each device's as the copy counts them.
-        copied = 0 if trainer.rollout is None else max(copy for copy, _ in policy_bytes(
-            (abstract.variables, abstract.ema), (start.shardings.variables, start.shardings.ema),
-            mesh).values())
         price = streamed_price(None if flops is None else split * flops, gpu_target(), dtype,
-                               split * parameters, updated, host_memory_rate(), read_once=split * averaged,
-                               copied=copied)
+                               split * parameters, host_updated(start, companion), host_memory_rate(),
+                               read_once=split * averaged)
     except Unpriced:
         price = None
     return fits, price
+
+
+def host_updated(start: Start, companion: Mesh) -> int:
+    """The bytes a streamed step's update reads and writes on this process's host (`streamed_price`'s
+    `updated`): each of its CPU companion's devices its shards of the parameters, the optimizer's state and
+    the averaged weights, read and written, and the gradient's, read, `start` laid out streamed."""
+    abstract = start.abstract
+    weights, held = abstract.variables["params"], start.shardings.variables["params"]
+    return sum(_shard_bytes((weights, abstract.opt_state, abstract.ema), device,
+                            (held, start.shardings.opt_state, start.shardings.ema), memory=None)
+               + _shard_bytes(weights, device, held, memory=None)
+               for device in local_devices(companion))
 
 
 def _shard_bytes(tree, device, placement=None, *, memory: str | None = "device") -> int:
@@ -324,7 +331,12 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     given = trainer._given_layout
     trainer._laid_out(given)
     first = run.primed[2] if run.primed is not None else trainer._primed_first(run, dataset)
-    placed = split_fields(placed_abstract(trainer.device_mesh, first))[0]
+    # As the loop hands its step the batch, counted on the host and its rows marked (`FitRun.marked`), so
+    # the run's first compile takes the plan made here (`StepCompiler.holds_unplaced`), where it planned
+    # and compiled its step again (M-MC-26: 196 s of an H100's 375 s to its first step).
+    partition = run.primed[0] if run.primed is not None else trainer._stream_partition()
+    placed = split_fields(placed_abstract(trainer.device_mesh,
+                                          marked(partition, trainer._counted_batch)(first)))[0]
     batch = closes_window(placed, trainer._shape.examples)
     # The step's phase the first batch's, as the run's first compile takes it (`Trainer._compiled_fresh`),
     # and its objective, at that phase's pass count, as it stands before the device plan's search climbs
@@ -358,11 +370,21 @@ def laid_start(trainer, run, dataset, resume) -> Start:
         device = None if plan is None else priced(plan, dtype)
     except Unpriced:
         device = None
-    with phases.scoped(trainer, trainer._compiler):
-        fits, price = streamed(trainer, laid, model_batch(batch), dtype, trainer._shape.device)
     held = plan is not None
-    trainer.layout_choice = Choice(held, fits, device, price, None,
-                                   streams=broadcast_from_process_zero(chosen(held, fits, device, price)))
+    # The streamed step is never priced under its update on the host (`host_update_seconds`): a device plan
+    # priced no dearer than that is the cheaper whatever the streamed step compiles to, so it compiles
+    # nothing (M-MC-26: the whole host program, 56 s of an H100's start, for a device plan of 1.8 s against
+    # an update of 4.5 s). Every process decides as the first does, as each takes the plan it chooses.
+    update = host_update_seconds(host_updated(laid, companion_mesh(trainer.device_mesh)), host_memory_rate())
+    if broadcast_from_process_zero(device is not None and device.seconds <= update):
+        trainer.layout_choice = Choice(held, fits=False, device=device, streamed=None, refused=(
+            f"the device plan's step is priced no dearer than the streamed step's update on the host alone "
+            f"({update:.3g} s)"), streams=False)
+    else:
+        with phases.scoped(trainer, trainer._compiler):
+            fits, price = streamed(trainer, laid, model_batch(batch), dtype, trainer._shape.device)
+        trainer.layout_choice = Choice(held, fits, device, price, None,
+                                       streams=broadcast_from_process_zero(chosen(held, fits, device, price)))
     said(trainer.layout_choice)
     if trainer.layout_choice.streams:
         return laid

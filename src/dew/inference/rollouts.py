@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +45,8 @@ from dew.sampling.decoding import EndOfSequence, StopStrings
 from dew.sampling.text import Generation, Sampling
 
 from .clients import (
+    ENGINE_PROVIDERS,
+    EngineProvider,
     OpenAICompletion,
     _engine_stops,
     decode_routed_experts,
@@ -635,13 +637,13 @@ class SafetensorsReload:
     source: Pretrained
     directory: Path
     engines: tuple[str, ...]
-    engine: Literal["vllm", "sglang"]
+    engine: EngineProvider
     dtype: str = "bfloat16"
     timeout: float = 600.0
 
     def __post_init__(self) -> None:
-        if self.engine not in ("vllm", "sglang"):
-            raise ValueError("engine must be vllm or sglang")
+        if self.engine not in ENGINE_PROVIDERS:
+            raise ValueError(f"engine must be one of {', '.join(ENGINE_PROVIDERS)}")
 
     def write(self, variables: Variables) -> None:
         """Write `variables` into `directory`, replacing each file atomically.
@@ -806,7 +808,7 @@ class Publication:
 
 
 # The request field that makes each engine return the sampled ids themselves.
-_RETURN_IDS: dict[str, dict[str, JSON]] = {"vllm": {"return_tokens_as_token_ids": True},
+_RETURN_IDS: dict[EngineProvider, dict[str, JSON]] = {"vllm": {"return_tokens_as_token_ids": True},
                                            "sglang": {"return_token_ids": True}}
 
 
@@ -885,9 +887,9 @@ class OpenAIRolloutServer(_RequestServer):
                  version: int = 0, workers: int = 64, processed_logprobs: bool = False,
                  routing: bool = False, decode: Callable[[Sequence[int]], str] | None = None):
         engine = completion.provider
-        if engine not in _RETURN_IDS:
-            raise ValueError("token rollouts need provider='vllm' or 'sglang': ids, seeds and EOS controls "
-                             "are engine request fields")
+        if engine == "openai":
+            raise ValueError(f"token rollouts need a provider of {', '.join(ENGINE_PROVIDERS)}: ids, seeds "
+                             "and EOS controls are engine request fields")
         if engine == "vllm" and replace(sampling, temperature=1.0).transforms():
             raise ValueError("a filtering Sampling trains on the kept ids of every draw, which vLLM returns "
                              "only on its token route; use VLLMGenerateServer")

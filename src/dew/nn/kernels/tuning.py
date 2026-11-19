@@ -1011,11 +1011,7 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
     def read(parameter) -> Hashable:
         # A parameter as the algebra pass keys it, an object no structural key reads by its type alone: the
-        # same in every process (`terms.opaque`). A mesh (a call's `ctx_mesh`) by its axes, not the kind of
-        # device it was made of, which a step compiled ahead for one GPU and the run on another of its target
-        # share no name of.
-        if isinstance(parameter, jax.sharding.AbstractMesh):
-            parameter = parameter.update(abstract_device=None)
+        # same in every process (`terms.opaque`).
         return opaque(parameter_key(parameter))
 
     def constants(values) -> None:

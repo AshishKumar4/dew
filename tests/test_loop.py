@@ -433,8 +433,13 @@ def test_an_implicit_loop_at_zero_theta_computes_the_decoder_it_loops(steps):
                     seeds=IMPLICIT_SEEDS[steps], truth_fn=decoder(jnp.float64))
     variables, ids, cotangent = draw(0)
     assert not np.any(np.asarray(variables["params"]["loop_theta"]))
-    _, pull = jax.vjp(lambda params: looped.apply({"params": params}, ids), variables["params"])
-    assert np.any(np.asarray(pull(cotangent)[0]["loop_theta"]) != 0)
+
+    # One program: run eagerly, the loop's pullback compiled 650 programs, 18 s of a cold run (row 7666).
+    @jax.jit
+    def pulled(params, ids, cotangent):
+        return jax.vjp(lambda params: looped.apply({"params": params}, ids), params)[1](cotangent)[0]
+
+    assert np.any(np.asarray(pulled(variables["params"], ids, cotangent)["loop_theta"]) != 0)
 
 
 def _theta_method(module, ids):
@@ -557,8 +562,10 @@ def test_a_loaded_decoder_gains_an_implicit_loop_at_zero_theta():
 
 EXIT_SEEDS = {"whole stack": 128, "a block before a coda": 256, "a block before a coda with a z-loss": 256,
               "a block before a coda exiting at a threshold": 256, "the last pass trained": 256,
-              "a saturated gate": 128}
-"""Check 1's declared seeds for the exit objective against its formula, sized by `seeds_for` on armada."""
+              "a saturated gate": 512}
+"""Check 1's declared seeds for the exit objective against its formula, sized by `seeds_for` on armada, its
+formula compiled alike and as written: the saturated gate's as-written check resolves Gated DeltaNet's
+decay parameters (A_log, dt_bias) at 32 rows only over 512 seeds, at 4 or 16 rows not within them."""
 
 
 def _unrolled_passes(module, ids):
@@ -587,14 +594,17 @@ def _unrolled_passes(module, ids):
     return logits, gates
 
 
-@pytest.mark.parametrize("name, layers, loop, z_loss, shift", [
-    ("whole stack", (0, 4), {}, 0.0, 0.0), ("a block before a coda", (1, 3), {}, 0.0, 0.0),
-    ("a block before a coda with a z-loss", (1, 3), {}, 1e-2, 0.0),
-    ("a block before a coda exiting at a threshold", (1, 3), {"exit_threshold": 0.5}, 0.0, 0.0),
-    ("the last pass trained", (1, 3), {"backprop_steps": 1}, 0.0, 0.0),
-    ("a saturated gate", (1, 3), {}, 0.0, 30.0)],
+@pytest.mark.parametrize("name, layers, loop, z_loss, shift, spread, rows", [
+    ("whole stack", (0, 4), {}, 0.0, 0.0, 4.0, 4), ("a block before a coda", (1, 3), {}, 0.0, 0.0, 4.0, 4),
+    ("a block before a coda with a z-loss", (1, 3), {}, 1e-2, 0.0, 4.0, 4),
+    ("a block before a coda exiting at a threshold", (1, 3), {"exit_threshold": 0.5}, 0.0, 0.0, 4.0, 4),
+    ("the last pass trained", (1, 3), {"backprop_steps": 1}, 0.0, 0.0, 4.0, 4),
+    # Its 512 seeds at 32 rows (184 s whole on armada) drawn as map tasks of 64 (`check1_shards`).
+    pytest.param("a saturated gate", (1, 3), {}, 0.0, 30.0, 0.5, 32, id="saturated",
+                 marks=pytest.mark.check1_shards(seeds=512, per_task=64))],
     ids=["whole stack", "coda", "z-loss", "threshold", "the last trained", "saturated"])
-def test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy(name, layers, loop, z_loss, shift):
+def test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy(name, layers, loop, z_loss, shift,
+                                                                           spread, rows):
     """A two-pass Qwen 3.5 with an exit gate (`Loop.exit_gate`, its block the whole stack or one before a
     coda, each pass's coda its own) trained under Ouro's objective (`LMObjective.exit_entropy`): its loss
     and every parameter's gradient, the gate's and the passes' states' through it, on par with the formula
@@ -603,7 +613,9 @@ def test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy(name,
     pass's z-loss where one is asked, by check 1 against the formula in float64. A threshold chooses no
     pass the objective scores, the last pass scored as it is; the passes the cut holds back pass no
     gradient back through their exits; and a gate whose hazard rounds to one in float32 (its bias moved
-    by `shift`) leaves every gradient finite."""
+    by `shift`) leaves every gradient finite. Each draw's gate logits spread by `spread` over its `rows`
+    token rows: a saturated gate weighs each token's gradient by its hazard's complement, e^-logit, so at
+    the others' spread one token would carry the gate's every draw, which no count of draws settles."""
     from dew.batch import TEXT_KEY
     from dew.objectives.base import Step
     from dew.objectives.lm import LMObjective
@@ -612,11 +624,13 @@ def test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy(name,
     looped = _qwen35().with_passes(2, layers, exit_gate=True, **loop)
     objective = LMObjective(looped, length, exit_entropy=beta, z_loss=z_loss, token_accuracy=False)
     step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
-    drawn = model_draw(looped, (4, length + 1), looped.vocab_size)
+    drawn = model_draw(looped, (rows, length + 1), looped.vocab_size)
 
     def draw(seed):
         variables, ids = drawn(seed)
-        gate = np.random.default_rng([0xE817, seed]).normal(0, 0.5, (looped.emb_features + 1,))
+        # Each feature's weight at the spread over the features: a normed state's logit spreads by `spread`.
+        gate = np.random.default_rng([0xE817, seed]).normal(0, spread / np.sqrt(looped.emb_features),
+                                                            (looped.emb_features + 1,))
         drawn_gate = {"kernel": jnp.asarray(gate[:-1, None], jnp.float32),
                       "bias": jnp.asarray(gate[-1:] + shift, jnp.float32)}
         params = {**variables["params"], "early_exit_gate": drawn_gate}

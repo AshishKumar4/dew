@@ -15,7 +15,6 @@ What the route serves is read from the fused MLP's own selector: the layer trace
 generation with it named, the route its choice reports the `fused` kernel.
 """
 
-import contextlib
 
 import generation_support
 import jax
@@ -122,13 +121,9 @@ def per_shard(choice: str, kernel: str) -> dict:
     whole, its three products fused (`kernel`, interpreted on the CPU's devices), its other choices as every
     cell names them (`NAMED`): the output and every gradient on par with one device's from the layer in
     float64."""
-    from flax import linen as nn
     from jax.sharding import PartitionSpec
-    from sharded import Shard
+    from sharded import Shard, layer_scope
 
-    from dew.distributed.placement import Layout
-    from dew.mesh import DEFAULT_RULES
-    from dew.nn.sharding import placing
 
     del choice, kernel
     case = dict(zip(AXES["gated_mlp"], next(case for case in CASES if case[0] == "sm90"), strict=True))
@@ -140,14 +135,6 @@ def per_shard(choice: str, kernel: str) -> dict:
         with generation.chosen(grouped_matmul="xla", gated_mlp="apart"):
             return with_gradients(layer.clone(dtype=jnp.float64).apply)(*operands)
 
-    def scope():
-        # The trainer's step traces under its layout (`placing`), which a product's map reads.
-        stack = contextlib.ExitStack()
-        for context in (generation.chosen(**NAMED), nn.logical_axis_rules(DEFAULT_RULES),
-                        placing(Layout(min_shard=1))):
-            stack.enter_context(context)
-        return stack
-
     return {"data": Shard(with_gradients(layer.apply), draw,
                           lambda mesh: [PartitionSpec(), PartitionSpec("data"), PartitionSpec("data")],
-                          truth, SEEDS, "data", context=scope)}
+                          truth, SEEDS, "data", context=lambda: layer_scope(**NAMED))}

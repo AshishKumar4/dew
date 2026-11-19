@@ -212,7 +212,8 @@ def test_each_side_trains_on_its_own_loss(runs):
                 return total.total
             gamma = task.r1_weight
             return sum(aux.metrics[key] * (gamma if key == "r1" else 1) for key in name) * total.mass
-        return jax.grad(loss)(params["params"])
+        # One program a part, not each of the model's operations dispatched alone (332 compiles, row 7664).
+        return jax.jit(jax.grad(loss))(params["params"])
 
     everything = part(None)
     critic, student = part(("discriminator", "r1")), part(("generator", "distillation"))

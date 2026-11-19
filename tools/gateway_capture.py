@@ -39,21 +39,24 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import argparse
 import contextlib
-import functools
 import json
 import subprocess
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING
 
 import httpx
 
 from dew._cleanup import owned_group
 from dew._records import JSON
+from dew.inference.clients import ENGINE_PROVIDERS, EngineProvider
 from dew.interop.gateway import Gateway
+
+if TYPE_CHECKING:
+    from dew.data.text import HFTokenizer
 
 MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 ENGINE, GATEWAY, PROXY = "http://127.0.0.1:8011", "http://127.0.0.1:9090", ("127.0.0.1", 8012)
@@ -156,99 +159,78 @@ def capture_gateway(name: str, bin: Path, gateway_bin: Path, venvs: Path, out: P
         (out / f"{name}_overflow_trace.json").write_text(json.dumps(compact(traces["overflow"][0])))
 
 
-Engine = Literal["vllm", "sglang"]
-"""An engine the captures run, as `OpenAICompletion` names its provider."""
+def _recorded(exchanges: list[dict[str, JSON]]) -> type[BaseHTTPRequestHandler]:
+    """Return a handler that forwards each request to the engine and keeps its path, its body and the
+    engine's answer in `exchanges`."""
+
+    class Recorded(BaseHTTPRequestHandler):
+        def _forward(self, method: str) -> None:
+            raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            sent = {"Content-Type": self.headers.get("Content-Type", "application/json")}
+            answer = httpx.request(method, ENGINE + self.path, content=raw, timeout=900, headers=sent)
+            kind = answer.headers.get("Content-Type", "application/json")
+            # A streamed answer is kept as the server-sent events it was, a whole one as its JSON.
+            streamed = kind.startswith("text/event-stream")
+            exchanges.append({"path": self.path, "request": json.loads(raw) if raw else None,
+                              "status": answer.status_code,
+                              **({"stream": answer.text} if streamed else {"response": answer.json()})})
+            self.send_response(answer.status_code)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(answer.content)))
+            self.end_headers()
+            self.wfile.write(answer.content)
+
+        def do_GET(self):
+            self._forward("GET")
+
+        def do_POST(self):
+            self._forward("POST")
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    return Recorded
 
 
-class _Proxy(ThreadingHTTPServer):
-    """Serve the rollout server's requests to the engine, keeping each exchange `_Recorded` forwards."""
+def _policy() -> tuple[HFTokenizer, list[int], list[int]]:
+    """Return the model's tokenizer, the capture's one-message chat prompt as the model's template renders
+    it with the generation prompt, and the model's EOS ids from its generation config and its tokenizer,
+    both read from the one snapshot the tokenizer pinned."""
+    from dew.data.chat import Conversation, render_prompt
+    from dew.data.text import HFTokenizer
+    from dew.interop.generation_config import eos_ids, read_generation_config
 
-    exchanges: list[dict[str, JSON]]
-
-
-class _Recorded(BaseHTTPRequestHandler):
-    """Forwards each request to the engine and logs its path, body and the engine's answer in `exchanges`."""
-
-    def _forward(self, method: str) -> None:
-        proxy = self.server
-        assert isinstance(proxy, _Proxy), "a request the capture's proxy serves"
-        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        answer = httpx.request(method, ENGINE + self.path, content=raw, timeout=900,
-                               headers={"Content-Type": self.headers.get("Content-Type", "application/json")})
-        kind = answer.headers.get("Content-Type", "application/json")
-        # A streamed answer is kept as the server-sent events it was, a whole one as its JSON.
-        streamed = kind.startswith("text/event-stream")
-        proxy.exchanges.append({"path": self.path, "request": json.loads(raw) if raw else None,
-                                "status": answer.status_code,
-                                **({"stream": answer.text} if streamed else {"response": answer.json()})})
-        self.send_response(answer.status_code)
-        self.send_header("Content-Type", kind)
-        self.send_header("Content-Length", str(len(answer.content)))
-        self.end_headers()
-        self.wfile.write(answer.content)
-
-    def do_GET(self):
-        self._forward("GET")
-
-    def do_POST(self):
-        self._forward("POST")
-
-    def log_message(self, format: str, *args: object) -> None:
-        pass
+    vocabulary = HFTokenizer(MODEL)
+    message = Conversation.parse([{"role": "user", "content": "Say hello."}])
+    prompt = render_prompt(vocabulary.tokenizer, message, "gateway capture")
+    generation = read_generation_config(Path(vocabulary.pinned.directory))
+    eos = vocabulary.eos_id
+    if eos is None:
+        raise ValueError(f"{MODEL}'s tokenizer names no EOS, which the captures stop at")
+    return vocabulary, prompt, sorted({*eos_ids({}, generation), eos})
 
 
-def _chat_prompt(tokenizer) -> list[int]:
-    """The chat template's ids of the capture's one message, as a list: Transformers 5 answers a
-    BatchEncoding unless told not to."""
-    ids = tokenizer.apply_chat_template([{"role": "user", "content": "Say hello."}],
-                                        add_generation_prompt=True, tokenize=True, return_dict=False)
-    prompt = [token for token in ids if isinstance(token, int)]
-    assert len(prompt) == len(ids), "a chat template's tokenized prompt is its ids"
-    return prompt
-
-
-def _native_eos(tokenizer, listed) -> list[int]:
-    """The model's end-of-sequence ids: its generation config's (`listed`, one or a list) and its
-    tokenizer's."""
-    eos = tokenizer.eos_token_id
-    assert isinstance(eos, int), "the tokenizer names one end-of-sequence token"
-    return sorted({*(int(token) for token in (listed if isinstance(listed, list) else [listed])), eos})
-
-
-def _decoded(tokenizer, ids: Sequence[int]) -> str:
-    """Decode one sequence of token ids to its text."""
-    text = tokenizer.decode(list(ids))
-    assert isinstance(text, str)
-    return text
-
-
-def capture_stops(name: Engine, bin: Path, out: Path) -> None:
+def capture_stops(name: EngineProvider, bin: Path, out: Path) -> None:
     import openai
-    from huggingface_hub import hf_hub_download
 
-    from dew.data.text import load_tokenizer
     from dew.inference import OpenAICompletion, OpenAIRolloutServer
     from dew.sampling import Sampling
 
-    tokenizer = load_tokenizer(MODEL)
-    prompt = _chat_prompt(tokenizer)
-    generation = json.loads(Path(hf_hub_download(MODEL, "generation_config.json")).read_text())
-    native = _native_eos(tokenizer, generation["eos_token_id"])
-    decoded = functools.partial(_decoded, tokenizer)
+    vocabulary, prompt, native = _policy()
 
     def published(variables, version):
         raise AssertionError("no weights are pushed while capturing")
 
-    proxy = _Proxy(PROXY, _Recorded)
-    proxy.exchanges = []
+    exchanges: list[dict[str, JSON]] = []
+    proxy = ThreadingHTTPServer(PROXY, _recorded(exchanges))
     threading.Thread(target=proxy.serve_forever, daemon=True).start()
     client = openai.OpenAI(base_url=f"http://{PROXY[0]}:{PROXY[1]}/v1", api_key="capture", max_retries=0)
     completion = OpenAICompletion(MODEL, client, provider=name)
 
     def draw(eos: int | None, seed: int, stop: str | None = None) -> dict:
-        proxy.exchanges.clear()
+        exchanges.clear()
         sampling = Sampling(temperature=1.0, eos_token_ids=eos, stop=() if stop is None else (stop,))
-        server = OpenAIRolloutServer(completion, sampling, published, decode=decoded)
+        server = OpenAIRolloutServer(completion, sampling, published, decode=vocabulary.decode)
         try:
             drawn = server.submit(prompt, STOPS_BUDGET, key=seed).result()
             outcome = {"tokens": list(drawn.tokens), "terminated": drawn.terminated}
@@ -257,16 +239,16 @@ def capture_stops(name: Engine, bin: Path, out: Path) -> None:
         finally:
             server.close()
         return {"eos": eos, "seed": seed, **({} if stop is None else {"stop": stop}),
-                "exchanges": list(proxy.exchanges), **outcome}
+                "exchanges": list(exchanges), **outcome}
 
     def raw(seed: int, stop: str) -> dict:
         """The engine's own answer, through the proxy, to a draw from the same seed that stops at the
         string `stop`: which ids it returns and how it says the string matched."""
-        proxy.exchanges.clear()
+        exchanges.clear()
         httpx.post(f"http://{PROXY[0]}:{PROXY[1]}/v1/completions", timeout=900, json={
             "model": MODEL, "prompt": [list(prompt)], "max_tokens": STOPS_BUDGET, "temperature": 1.0,
             "seed": seed, "logprobs": 0, "stop": [stop], **RETURN_IDS[name]})
-        return {"stop": stop, "seed": seed, "exchanges": list(proxy.exchanges)}
+        return {"stop": stop, "seed": seed, "exchanges": list(exchanges)}
 
     def released(seed: int, stop: int) -> dict:
         """A streamed draw straight to SGLang under a long budget, stopped at `stop`: how many ids the
@@ -313,7 +295,7 @@ def capture_stops(name: Engine, bin: Path, out: Path) -> None:
                 raise RuntimeError(f"{name} drew no token past its EOS in 16 seeds")
             draws = [unstopped, draw(native[0], seed), draw(later[0], seed)]
             # A stop string the same seed's answer reaches a few tokens in.
-            pieces = [decoded([token]).strip() for token in unstopped["tokens"][2:after]]
+            pieces = [vocabulary.decode([token]).strip() for token in unstopped["tokens"][2:after]]
             stop = next((piece for piece in pieces if piece), None)
             if stop is not None:
                 stopped.append(raw(seed, stop))
@@ -354,15 +336,15 @@ def main() -> None:
     parser.add_argument("--only", choices=("gateway", "stops"), action="append",
                         help="the captures to run (default: both)")
     parser.add_argument("--python", action="append", default=[], metavar="ENGINE=PATH",
-                        help="run ENGINE (vllm or sglang) with this interpreter instead of a venv under --venvs")
+                        help=f"run ENGINE (one of {', '.join(ENGINE_PROVIDERS)}) with this interpreter instead "
+                             "of a venv under --venvs")
     args = parser.parse_args()
     args.venvs.mkdir(parents=True, exist_ok=True)
     given = dict(entry.split("=", 1) for entry in args.python)
-    if not set(given) <= {"vllm", "sglang"}:
-        parser.error("--python names vllm or sglang")
+    if not set(given) <= set(ENGINE_PROVIDERS):
+        parser.error(f"--python names one of {', '.join(ENGINE_PROVIDERS)}")
     captures = args.only or ["gateway", "stops"]
-    engines: tuple[Engine, ...] = ("sglang", "vllm")
-    for name in engines:
+    for name in ENGINE_PROVIDERS:
         bin = Path(given[name]).parent if name in given else venv(args.venvs, name)
         if "gateway" in captures:
             capture_gateway(name, bin, venv(args.venvs, "gateway"), args.venvs, args.out)
