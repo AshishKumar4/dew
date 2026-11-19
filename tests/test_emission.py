@@ -160,9 +160,10 @@ def test_a_switch_on_the_warpgroups_role_counts_each_warpgroups_branch_alone():
     (lambda wg: (wg + 127).astype(jnp.int8) < 0, [0, 128]),
     # A logical shift of -1 by 31 is 1; of 0, 0.
     (lambda wg: lax.shift_right_logical(wg - 1, 31) == 1, [128, 0]),
-    # A shift past the width is 0, an arithmetic one's of a negative value -1.
+    # A shift past the width is poison where Mosaic GPU computes it (MLIR's `shli` and `shrsi`), whatever
+    # XLA's saturating fold would give: unknown, both branches at every warpgroup (base review bb25f261d F1).
     (lambda wg: lax.shift_left(wg + 1, 32) == 0, [128, 128]),
-    (lambda wg: lax.shift_right_arithmetic(wg - 1, 40) == -1, [128, 0]),
+    (lambda wg: lax.shift_right_arithmetic(wg - 1, 40) == -1, [128, 128]),
     # A float predicate is no warpgroup arithmetic the fold computes: both branches at every warpgroup.
     (lambda wg: wg.astype(jnp.float32) == jnp.float32(0), [128, 128]),
     # A quotient by zero is undefined on the GPU (LLVM's `sdiv`): unknown, both branches at every warpgroup,
@@ -212,8 +213,8 @@ def test_a_switch_on_the_warpgroups_role_counts_each_warpgroups_branch_alone():
         "stated-boolean-products"])
 def test_scalar_arithmetic_on_the_warpgroup_folds_as_the_program_computes_it(predicate, exponentials):
     """A conditional on integer arithmetic over the warpgroup's index (a quotient by either sign, a
-    remainder, a narrower integer's wrap, shifts within and past the width) counts the branch each
-    warpgroup's program takes, folded as `lax` computes it at its own dtype, where Python's arithmetic floored
+    remainder, a narrower integer's wrap, shifts within the width) counts the branch each warpgroup's program
+    takes, folded as `lax` computes it at its own dtype, where Python's arithmetic floored
     an integer quotient (base review 951e3f9e7 F3); a float predicate, which no warpgroup's index arithmetic
     is, counts both branches at every warpgroup, never one dropped: the fold computes integers and booleans
     alone, where IEEE semantics' edges (subnormals, signed zeros, float64, a complex value) were where its
