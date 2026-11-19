@@ -615,8 +615,12 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     with chosen(narrow_copies='on'), Compiles("step") as steps:
         run.fit(stream, steps=2)
     assert run.plan["narrow"] is True and steps.count == 1
-    # What it placed beside the step's temporaries counts the state it was planned before placing.
-    assert run.plan["probes"][0]["beside"] >= state
+    # Its own probe records the placed judgement whole: the headroom the placed devices hold and the bytes
+    # that judgement placed beside the step, not the unplaced search's charge of the state it planned
+    # before placing, which the placed step holds among its arguments (row 8962).
+    # Here what it places beside the step, its outputs and its batches, is under the state's bytes.
+    placed, own = run.plan["placed"], run.plan["probes"][0]
+    assert own["headroom"] == placed["headroom"] and own["beside"] < state, (own, placed, state)
 
 
 def test_a_fresh_plan_its_placed_devices_refuse_records_no_rung(monkeypatch, tmp_path):
