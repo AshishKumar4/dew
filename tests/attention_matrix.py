@@ -134,13 +134,13 @@ def _backward_op(case: dict[str, str]):
     return op, op.bind(*args, interpret=False), generation.gpu_target()
 
 
-def _routed(call: tuple[tuple[str, str], ...], certified: bool):
+def _routed(call: tuple[tuple[str, str], ...], certified: bool, need_two: bool):
     """What the Mosaic backward does with a call (`case` but its launch), under the call's generation:
-    whether it declines it, and else its config and the two launches' pin (`FED`) where that is legal. Its
-    derivation's offer, or where `certified` the one a run takes (`KernelOp.taken`: its derived config, or
-    the next where that one spills as the GPU assembles it alone, on a compile-only GPU of the generation;
-    declined where none holds, as its route then takes another mainloop before the call, `Template.holds`),
-    the pin only where it holds there too."""
+    whether it declines it, and else its config and (only when `need_two` and `config.fused`) the two
+    launches' pin (`FED`) where legal and certified. Its derivation's offer, or where `certified` the one a
+    run takes (`KernelOp.taken`: its derived config, or the next where that one spills as the GPU assembles
+    it alone, on a compile-only GPU of the generation; declined where none holds, as its route then takes
+    another mainloop before the call, `Template.holds`)."""
     case = dict(call)
     certifying = (report.certifying(generation.compile_only_gpus(case["generation"])[0]) if certified
                   else contextlib.nullcontext())
@@ -151,16 +151,20 @@ def _routed(call: tuple[tuple[str, str], ...], certified: bool):
         config = op.taken(ba) if certified else op.derived(ba, target)
         if config is None and certified:
             return True, None, None
-        two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1,
-                                             family=WGMMA, **FED)
-        held = op.legal(ba, two, target) and (not certified or report.certified(op, ba, two) == ())
-        return False, config, two if held else None
+        two = None
+        if need_two and config is not None and config.fused:
+            candidate = attention_mosaic.BackwardTiles(
+                64, 64, 2, 1, columns=2 if case["width"] == "256" else 1, family=WGMMA, **FED)
+            if (op.legal(ba, candidate, target)
+                    and (not certified or report.certified(op, ba, candidate) == ())):
+                two = candidate
+        return False, config, two
 
 
 @functools.cache
-def _route(call: tuple[tuple[str, str], ...]):
+def _route(call: tuple[tuple[str, str], ...], need_two: bool):
     """The derivation's offer for a call (`_routed`)."""
-    return _routed(call, certified=False)
+    return _routed(call, certified=False, need_two=need_two)
 
 
 _CERTIFYING: dict[str, concurrent.futures.ProcessPoolExecutor] = {}
@@ -169,13 +173,14 @@ compiles a module once a process, for one architecture."""
 
 
 @functools.cache
-def _certified_route(call: tuple[tuple[str, str], ...]):
+def _certified_route(call: tuple[tuple[str, str], ...], need_two: bool):
     """A call's route as a run takes it (`_routed`), certified in its generation's own process."""
     name = dict(call)["generation"]
     if name not in _CERTIFYING:
         _CERTIFYING[name] = concurrent.futures.ProcessPoolExecutor(
             max_workers=1, mp_context=multiprocessing.get_context("spawn"))
-    return _CERTIFYING[name].submit(functools.partial(_routed, certified=True), call).result()
+    return _CERTIFYING[name].submit(
+        functools.partial(_routed, certified=True, need_two=need_two), call).result()
 
 
 def pin_of(case: dict[str, str], *, certified: bool = False) -> attention_mosaic.BackwardTiles | None:
@@ -183,14 +188,15 @@ def pin_of(case: dict[str, str], *, certified: bool = False) -> attention_mosaic
     None where another mainloop runs its backward; raises where the route serves no such form. Its route's
     derivation's offer (`_route`), or as a run takes it where `certified` (`_certified_route`)."""
     call = tuple((axis, value) for axis, value in case.items() if axis != "launch")
-    declined, derived, two = (_certified_route if certified else _route)(call)
+    need_two = case["launch"] == "two"
+    declined, derived, two = (_certified_route if certified else _route)(call, need_two)
     if declined:
-        if case["launch"] != "two":
+        if not need_two:
             raise ValueError(f"the Mosaic backward declines {case}: no form but another mainloop's")
         return None
     if derived is None:
         raise ValueError(f"the Mosaic backward derives no config for {case}")
-    if case["launch"] == "two":
+    if need_two:
         config = derived if not derived.fused else two
     elif derived.fused and derived.shared_keys == (case["launch"] == "shared-keys"):
         config = derived

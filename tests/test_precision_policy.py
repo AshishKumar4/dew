@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from contract_support import CANCELLING_LEVELS, MOST
+from low_precision_support import edge_values
 from reference_error import assert_as_exact, assert_fp32_reduction_bound, dot_precisions
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -17,7 +18,14 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dense import Dense
 from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
-from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, float_bits, lowered_rounded, raised_exactly
+from dew.nn.float_bits import (
+    TWO_FACTOR_REACH,
+    binade_of,
+    float_bits,
+    lowered_rounded,
+    raised_exactly,
+    raw_fields,
+)
 from dew.nn.kernels import generation
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
@@ -1792,27 +1800,6 @@ def test_an_exact_product_at_a_dtypes_edge_keeps_its_residual(dtype, left, right
         assert Fraction(float(product)) + Fraction(float(residual)) == exact
 
 
-def edge_values(dtype) -> np.ndarray:
-    """A float format's values across every binade, of both signs, from their bits: zeros, subnormals of
-    every leading bit's place and the least and largest, the least normal and the largest, normals across
-    every exponent, and significands of ties to even at every shift (1.5, 3 and an ulp, a subnormal's 0b11
-    and 0b101 leads): every edge of a reading or a scaling of its bits."""
-    limits = np.finfo(dtype)
-    word = np.dtype(f"uint{limits.bits}")
-    width = limits.nmant
-    infinite = int(np.asarray(np.inf, dtype).view(word)[()])
-    one, three = (int(np.asarray(value, dtype).view(word)[()]) for value in (1.5, 3.0))
-    bits = np.concatenate([
-        np.arange(0, 1 << width, ((1 << width) // 2047) | 1, dtype=word),
-        np.arange(1 << width, infinite, ((infinite - (1 << width)) // 2047) | 1, dtype=word),
-        # A subnormal led by each bit's place, its lower bits mixed: every leading-bit position.
-        np.asarray([(1 << place) | ((1 << place) - 1) // 3 for place in range(width)], word),
-        np.asarray([0, 1, 2, 3, (1 << width) - 1, 1 << width, infinite - 1, 3 << (width - 1),
-                    5 << (width - 3), one, three + 1], word)])
-    values = bits.view(dtype)
-    return np.concatenate([values, -values])
-
-
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
                                    jnp.float8_e5m2, jnp.float6_e2m3fn, jnp.float6_e3m2fn, jnp.float4_e2m1fn])
 def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
@@ -1839,6 +1826,20 @@ def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
                                       err_msg=str(exponent))
 
 
+def test_an_exact_power_of_two_in_e8m0_is_every_biased_exponent():
+    """`exact_power2` in E8M0 (an MX block's scale) is `2^n` at every exponent from its least, `2^-127`, its
+    biased exponent 0 a power and no zero, to its largest, `2^127`, compiled, bit for bit the byte MXFP8's
+    encode wrote as `n + 127` (row 8832)."""
+    from dew.nn.float_bits import exact_power2
+
+    exponents = np.arange(-127, 128)
+    found = np.asarray(jax.jit(lambda n: exact_power2(n, jnp.float8_e8m0fnu))(
+        jnp.asarray(exponents, jnp.int32)))
+    assert found.dtype == jnp.float8_e8m0fnu
+    np.testing.assert_array_equal(found.view(np.uint8), (exponents + 127).astype(np.uint8))
+    np.testing.assert_array_equal(found.astype(np.float64), np.exp2(exponents.astype(np.float64)))
+
+
 def power2_rounds_a_subnormal_result_once():
     """`dew.nn.precision.power2` by `2^o 2^(k-2o) 2^o` rounds a result below the least normal once, at its
     last factor, on a device that keeps subnormals (a GPU's XLA, whose fp32 arithmetic keeps them where
@@ -1847,18 +1848,24 @@ def power2_rounds_a_subnormal_result_once():
     Its pullback applies the factors in reverse and rounds once too, a broadcast operand's cotangent summed
     after each term is scaled: the cotangent `0.5 + 2^-24` to `1` by `2^-149` is `2^-149`, and to a scalar by
     two such terms `2^-148`, where the remainder applied last rounded it to zero (base review 44e282c4f F1).
-    A GPU numerics cell (tests/test_gpu_numerics.py)."""
+    A GPU numerics cell (tests/test_gpu_numerics.py), one program prepared as an arm is in a GPU tier part
+    (`ahead_arm`, base review 85b5535a6 F4)."""
+    from reference_error import ahead_arm
+
     from dew.nn.precision import power2
 
-    found = np.asarray(jax.jit(power2)(jnp.float32(0.5 + 2.0 ** -24), jnp.int32(-149)))
-    # Its one correctly rounded answer, the least subnormal's bits.
-    assert found.dtype == np.float32 and found.view(np.uint32) == 1, found.view(np.uint32)
-    cotangent = jnp.float32(0.5 + 2.0 ** -24)
-    for exponent, bits in ((jnp.int32(-149), 1), (jnp.full((2,), -149, jnp.int32), 2)):
-        _, pullback = jax.vjp(lambda x, exponent=exponent: power2(x, exponent), jnp.float32(1.0))
-        (pulled,) = jax.jit(pullback)(jnp.broadcast_to(cotangent, exponent.shape))
-        pulled = np.asarray(pulled)
-        assert pulled.dtype == np.float32 and pulled.view(np.uint32) == bits, pulled.view(np.uint32)
+    def scaled(x, one, cotangent, exponents):
+        pulled = [jax.vjp(lambda y, k=k: power2(y, k), one)[1](jnp.broadcast_to(cotangent, k.shape))[0]
+                  for k in (exponents[0], exponents)]
+        return power2(x, exponents[0]), *pulled
+
+    tiny = np.float32(0.5 + 2.0 ** -24)
+    found = ahead_arm(jax.jit(scaled), "a power of two's scaling and its pullback")(
+        tiny, np.float32(1.0), tiny, np.full((2,), -149, np.int32))
+    # Each one correctly rounded answer: the least subnormal's bits, twice it summed.
+    for value, bits in zip(found, (1, 1, 2), strict=True):
+        value = np.asarray(value)
+        assert value.dtype == np.float32 and value.view(np.uint32) == bits, value.view(np.uint32)
 
 
 def test_a_python_integer_exponent_past_float32_saturates():
@@ -1931,6 +1938,39 @@ def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach,
     np.testing.assert_array_equal(found[0], 0.0)
     past = np.asarray([[abs(value) > limits.max for value in row] for row in exact])
     assert np.all(np.isinf(found[past]))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
+                                   jnp.float8_e5m2])
+def test_a_floats_raw_fields_are_its_bits(dtype):
+    """`raw_fields` of a format's edge values of both signs, compiled: its bits as the unsigned integer of its
+    width, its sign bit in place, its biased exponent and its fraction, each NumPy's reading of the same
+    bits, and the three fields recompose the bits."""
+    with jax.enable_x64(new_val=dtype == np.float64):
+        values = edge_values(dtype)
+        bits, sign, biased, fraction = (np.asarray(field)
+                                        for field in jax.jit(raw_fields)(jnp.asarray(values)))
+    limits = jnp.finfo(dtype)
+    word = np.dtype(f"uint{limits.bits}")
+    expected = values.view(word)
+    assert {field.dtype for field in (bits, sign, biased, fraction)} == {word}
+    np.testing.assert_array_equal(bits, expected)
+    np.testing.assert_array_equal(sign, expected & word.type(1 << (limits.bits - 1)))
+    # The exponent field's own width (`nexp`): E4M3's top binade holds finite values.
+    np.testing.assert_array_equal(biased, (expected >> limits.nmant) & word.type((1 << limits.nexp) - 1))
+    np.testing.assert_array_equal(sign | (biased << limits.nmant) | fraction, expected)
+
+
+def test_e8m0s_raw_fields_hold_no_sign():
+    """`raw_fields` of E8M0 (an MX block's scale, unsigned, no fraction): no sign bit, every bit its biased
+    exponent, where the sign's mask read its top exponent bit (base review ed11c8e4e F3)."""
+    codes = np.arange(255, dtype=np.uint8)
+    bits, sign, biased, fraction = (np.asarray(field) for field in jax.jit(raw_fields)(
+        jnp.asarray(codes.view(jnp.float8_e8m0fnu))))
+    np.testing.assert_array_equal(bits, codes)
+    np.testing.assert_array_equal(sign, 0)
+    np.testing.assert_array_equal(biased, codes)
+    np.testing.assert_array_equal(fraction, 0)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["fp32", "float64"])

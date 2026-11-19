@@ -1073,15 +1073,20 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     rest. The fields past the capability and shared memory only steer XLA's own fusions, never a Triton
     kernel's code. From Hopper on, its capability states the architecture-specific features (sm_90a,
     sm_100a, sm_120a), which Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain
-    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
+    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120'). Its
+    device memory `memory` where a build states it, else the least of the target's parts (`GpuTarget.memory`),
+    never none: XLA's memory-driven passes compiled a recurrence's gradient for a GPU of 0 bytes to values
+    O(1) wrong (a GH200 running a step compiled ahead for compile-only sm90 GPUs of no stated memory, row
+    8768)."""
     generation = target.generation
     version = capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
     clock, bandwidth = target.clock_hz, target.memory_bandwidth
+    memory = target.memory if memory is None else memory
     # Its fp32 lanes, two FLOPs a clock each (a fused multiply-add), as its architecture states them.
     fp32 = target.architecture.vector_per_clock
     if (version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None
-            or fp32 is None):
+            or fp32 is None or memory is None):
         raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
     major, minor = version
     multiprocessor = target.multiprocessor
@@ -1097,7 +1102,7 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
   memory_bandwidth: {int(bandwidth)}
-  device_memory_size: {0 if memory is None else memory}
+  device_memory_size: {memory}
   clock_rate_ghz: {clock / 1e9}
   shared_memory_per_block_optin: {shared}
   cuda_compute_capability {{
@@ -1124,8 +1129,9 @@ def compile_only_gpus(generation: str, count: int = 1, memory: int | None = None
     `dew._devices.STATED_GPUS`), as the GPU's own allocator states it, at `share`, the pool's share in the
     run that loads their programs: Dew's own (`DEW_SHARE`, a constant) where none is given, never this
     process's (`pool_share`). Devices of two shares are two (each its record), however alike otherwise.
-    Absent `memory`, the devices state no memory: a step is compiled ahead for them only where it is
-    stated (`compile_ahead`)."""
+    Absent `memory`, the devices state no memory to an admission (a step is compiled ahead for them only where
+    it is stated, `compile_ahead`), and XLA compiles for the least of the generation's parts
+    (`target_config`)."""
     from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu
 
     if memory is not None:

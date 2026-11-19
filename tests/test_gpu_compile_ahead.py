@@ -433,3 +433,92 @@ def test_a_fresh_state_placed_on_a_gpu_is_bitwise_its_draws_under_jaxs_default_l
     drawn = jax.jit(lambda key: trainer.initial_state(None, key))(trainer.key)
     for mine, theirs in zip(jax.tree.leaves(placed.variables), jax.tree.leaves(drawn.variables), strict=True):
         assert np.array_equal(np.asarray(mine), np.asarray(theirs))
+
+
+def test_a_certification_compiles_alike_on_this_gpu_and_a_compile_only_one_of_its_generation(monkeypatch):
+    """A launch's certification, its kernels compiled alone to be read and run nowhere (`report.certified`),
+    compiles under the same options on this GPU as on a compile-only GPU of its generation, so a run reads a
+    deviceless build's certifications from the cache they share: the run's took a CUB sort's choice off
+    its key (`xla_gpu_deviceless_cub_mode`) and the build's did not, and a GH200 run of a step built on a
+    compile-only H100 compiled five of its certifications again (row 8372, M-MC-27-3e)."""
+    import jax.numpy as jnp
+
+    from dew.nn.kernels.generation import compile_only_gpus, device_generation
+    from dew.nn.kernels.templates import attention as template, attention_mosaic, report
+
+    stated: list = []
+    compile_ = jax.stages.Lowered.compile
+
+    def recorded(lowered, compiler_options=None, *args, **kwargs):
+        # A certification's own program (`report.named`'s `certified_` name), the options JAX compiles it
+        # under.
+        if "certified_" in lowered._lowering.stablehlo().operation.attributes["sym_name"].value:
+            stated.append(compiler_options)
+        return compile_(lowered, compiler_options, *args, **kwargs)
+
+    monkeypatch.setattr(jax.stages.Lowered, "compile", recorded)
+    tokens, heads, kv_heads, width = 640, 4, 2, 128
+    spans = template.spans(tokens, tokens, 1, causal=True)
+
+    def certified(device) -> list:
+        stated.clear()
+        placed = jax.sharding.NamedSharding(jax.sharding.Mesh([device], ("x",)), jax.sharding.PartitionSpec())
+        query = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.bfloat16, sharding=placed)
+        key = jax.ShapeDtypeStruct((1, tokens, kv_heads, width), jnp.bfloat16, sharding=placed)
+        with report.certifying(device):
+            jax.jit(lambda q, k, v: attention_mosaic.forward(q, k, v, spans, None)).lower(query, key, key)
+        return list(stated)
+
+    def options(device) -> set[str]:
+        # Each distinct set of options a certification compiled under (its launches may differ between the
+        # two parts' derivations, which read their prices).
+        return {json.dumps(each, sort_keys=True) for each in certified(device)}
+
+    here = options(jax.devices("gpu")[0])
+    assert here and here == options(compile_only_gpus(device_generation())[0]), here
+
+
+@pytest.mark.users_process
+def test_a_program_compiled_ahead_for_compile_only_gpus_of_no_stated_memory_computes_as_compiled_here():
+    """Dew's portable recurrence gradient (test_recurrence_stability's scalar delta at aligned keys), compiled
+    ahead for a compile-only GPU of this one's generation and size that states no memory, as a tier's
+    prepare compiles (`compile_programs`), loaded here, computes bit for bit what its compile on this GPU
+    computes, one program under one set of options (`report.targeted`): XLA's memory-driven passes compiled
+    it for a GPU of 0 bytes to values O(1) off, a key's gradient 5.44 off where it is 41.8 (row 8768,
+    DC-p15-ahead-ab-gh200)."""
+    import functools
+
+    import test_recurrence_stability as stability
+    from arm_arithmetic import summed_as_run
+    from reference_error import _arm_program, with_gradients
+    from truths_ahead import named
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import Executable
+
+    hooks = stability.PORTABLE_SITES["scalar delta"]
+    dew = with_gradients(stability.restarting(functools.partial(
+        stability.chunk_on, "xla", hooks, chunk_size=stability.CHUNK, **stability.bounded("aligned keys")),
+        "aligned keys"))
+    inputs = stability.cotangents(hooks, "aligned keys", 0)
+    leaves = jax.tree.leaves(inputs)
+    with summed_as_run():
+        programs, held = {}, {}
+        _arm_program(programs, held, "dew", dew, inputs, reference=False)
+        function, shapes = programs[named("dew", inputs)]
+        here = jax.jit(function).lower(*leaves)
+        expected = jax.device_get(here.compile(compiler_options=report.targeted(here, None))(*leaves))
+        target = generation.built_target(generation.gpu_target().generation,
+                                         generation.gpu_target().multiprocessors)
+        (gpu,) = generation.compile_only_gpus(target.generation, 1, multiprocessors=target.multiprocessors)
+        mesh = jax.sharding.Mesh(np.asarray([gpu]), ("devices",))
+        placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        with (generation.assumed(target, portable=True), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
+              report.certifying(gpu)):
+            lowered = jax.jit(function, out_shardings=placed).lower(
+                *(jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes))
+            ahead = lowered.compile(compiler_options=report.targeted(lowered, None))
+        got = jax.device_get(Executable.of(ahead).loaded(jax.devices()[:1])(*leaves))
+    for value, wanted in zip(jax.tree.leaves(got), jax.tree.leaves(expected), strict=True):
+        np.testing.assert_array_equal(np.asarray(value), np.asarray(wanted))

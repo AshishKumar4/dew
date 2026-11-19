@@ -1346,9 +1346,10 @@ def targeted(python: str, arguments: list[str], report: Path, tests: Sequence[st
     as a CI task runs them (`session.pytest_run`, `selection`, `site_environment`): a lane's targeted run
     (tmp/run_tests.py) and the gangs select as CI does, and an option of their own (a `-m` after CI's)
     chooses instead. A file's group sets aside its sites as CI's does (`selected`), which run in their own
-    tasks alone (2026-11-02: a targeted group ran a site's every seed itself, 2233 s against CI's 8)."""
-    site = session.SITE.fullmatch(split)
-    run = session.selected(session.pytest_run(python, report), network=False, site=site is not None)
+    tasks alone (2026-11-02: a targeted group ran a site's every seed itself, 2233 s against CI's 8); a node
+    id named with no split runs what it names, a site too (row 8963: it selected nothing)."""
+    site, named = session.SITE.fullmatch(split), any("::" in each for each in arguments) and not split
+    run = session.selected(session.pytest_run(python, report), network=False, site=site is not None or named)
     return subprocess.run([*run, *arguments, *session.selection(list(tests), split)],
                           env=session.pytest_environment(site_environment(site)), check=False).returncode
 
