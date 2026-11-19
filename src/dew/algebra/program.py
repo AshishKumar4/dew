@@ -425,9 +425,9 @@ def _placed(window: jcore.Jaxpr, traced: jcore.Jaxpr, kept: list) -> dict[int, l
             first[place] = spot
             frontier += [producer[atom] for atom in traced.eqns[place].invars
                          if not isinstance(atom, jcore.Literal) and atom in producer]
-    renamed = {**dict(zip(traced.invars, window.invars, strict=True)), **named}
+    renamed: dict[jcore.Var, jcore.Var] = {**dict(zip(traced.invars, window.invars, strict=True)), **named}
 
-    def renaming(atom):
+    def renaming(atom: jcore.Var | jcore.Literal) -> jcore.Var | jcore.Literal:
         return atom if isinstance(atom, jcore.Literal) else renamed.get(atom, atom)
 
     spliced: dict[int, list[jcore.JaxprEqn]] = {made_at: [] for _, _, made_at, _ in kept}
@@ -435,7 +435,7 @@ def _placed(window: jcore.Jaxpr, traced: jcore.Jaxpr, kept: list) -> dict[int, l
         if place in first:
             spliced[kept[first[place]][2]].append(
                 equation.replace(invars=[renaming(atom) for atom in equation.invars],
-                                 outvars=[renaming(var) for var in equation.outvars]))
+                                 outvars=[renamed.get(var, var) for var in equation.outvars]))
     return {**spliced, **aliases}
 
 
@@ -951,14 +951,15 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     # numerics, the kernel choices a call names and the launches the compiles refused), so a body rewritten
     # under one choice is none of another's (spec alignment, 8994).
     key = (_deriving(accurate, saturation), kernels, fusion.choice_context() if kernels else None)
-    body = rewrites.get(key)
-    reused = body is not None and generation.still(body.reads)
-    if not reused:
+    held = rewrites.get(key)
+    reused = held is not None and generation.still(held.reads)
+    if held is None or not reused:
         with (generation.routes(alone=True) as routes, tuning.seen() as seen, generation.recording() as reads,
               kernel_report.recording() as recorded):
             made = _rewritten(closed, accurate, saturation, kernels)
-        body = rewrites[key] = _Body(None if made is closed else made, tuple(routes), seen.held(), reads,
+        held = rewrites[key] = _Body(None if made is closed else made, tuple(routes), seen.held(), reads,
                                      tuple(recorded.rewritten))
+    body = held
     # Its routes, launches and facts reported where it is written, as its rewrite reported them, and on a
     # reuse its regions' reports too, so a report around the program holds the body's however often it is
     # written (`fusion._traced`'s, a region's).
