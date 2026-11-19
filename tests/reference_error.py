@@ -714,7 +714,8 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str):
         store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
         return arm
     if not store.holds(armed(label)):
-        store.unprepared(f"{label}: its prepare compiled none of its arms")
+        store.unprepared(f"{label}: its {role} arm ran unprepared: its prepare wrote the site's truths and "
+                         "compiled none of its arms")
         return arm
     return _ahead_arm(given_fn, arm, functools.partial(store.ran, armed(label)), named_role)
 
