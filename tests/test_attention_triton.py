@@ -824,11 +824,12 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
 
     from dew.nn.kernels.templates import report
 
-    queries, heads = 512, 4
-    spans = template.spans(queries, queries, 1, causal=True)
-    score_mod, kinds, draw = score_hooks(hooks, queries, queries, width, rows=1, heads=heads)
+    score_mod, kinds, draw, shape, backward, score_kinds, target, arrays, launches = _staged_setup(
+        generation_name, dtype, width, hooks, config, step=step)
+    if not all(op.takes(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches):
+        return {}
+    spans = template.spans(shape.shape[1], shape.shape[1], 1, causal=True)
     params, initial = jax.eval_shape(lambda: draw(0))
-    shape = jax.ShapeDtypeStruct((1, queries, heads, width), dtype)
 
     def hooked(params, initial):
         return template.Hooks(score_mod, tuple(map(template.Param, params, kinds)), initial)
@@ -845,14 +846,6 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
         def call(query, key, value, params, initial):
             return attention_triton.forward(query, key, value, spans, hooked(params, initial))
         operands = (shape,) * 3 + (params, initial)
-    backward = attention_triton.BackwardTiles(config.block_q, config.block_k, config.warps, config.stages,
-                                              config.warps, config.stages)
-    score_kinds = tuple(kinds)
-    target = generation.TARGETS[generation_name]
-    arrays = {"query": shape, "value": shape, "query_ids": None,
-              "residuals": template.Kept.SPLIT if step else template.Kept.NONE}
-    if not _staged_takes(generation_name, dtype, width, hooks, config, step=step):
-        return {}
     pins = {attention_triton.TritonForward: config, attention_triton.TritonBackward: backward}
     record: dict = {}
     with tempfile.TemporaryDirectory(prefix="dew-staged-") as directory, tuning.pinned(pins):
@@ -877,14 +870,12 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     return staged
 
 
-def _staged_takes(generation_name: str, dtype, width: int, hooks: tuple, config: attention_triton.Tiles,
-                  *, step: bool) -> bool:
-    """Whether `config` is legal for `_staged_launches`' forward (and backward when `step`) on
-    `generation_name`, reusing `op.takes`."""
-    import tokamax
-
-    _, kinds, _ = score_hooks(hooks, 512, 512, width)
-    shape = jax.ShapeDtypeStruct((1, 512, 4, width), dtype)
+def _staged_setup(generation_name: str, dtype, width: int, hooks: tuple, config: attention_triton.Tiles,
+                  *, step: bool):
+    """Shared bound arguments, target, tiles and launches for `_staged_launches` and `_staged_takes`."""
+    queries, heads = 512, 4
+    score_mod, kinds, draw = score_hooks(hooks, queries, queries, width, rows=1, heads=heads)
+    shape = jax.ShapeDtypeStruct((1, queries, heads, width), dtype)
     backward = attention_triton.BackwardTiles(config.block_q, config.block_k, config.warps, config.stages,
                                               config.warps, config.stages)
     score_kinds = tuple(kinds)
@@ -894,6 +885,17 @@ def _staged_takes(generation_name: str, dtype, width: int, hooks: tuple, config:
     launches = [(attention_triton.TritonForward(score_kinds=score_kinds), config)]
     if step:
         launches.append((attention_triton.TritonBackward(score_kinds=score_kinds), backward))
+    return score_mod, kinds, draw, shape, backward, score_kinds, target, arrays, launches
+
+
+def _staged_takes(generation_name: str, dtype, width: int, hooks: tuple, config: attention_triton.Tiles,
+                  *, step: bool) -> bool:
+    """Whether `config` is legal for `_staged_launches`' forward (and backward when `step`) on
+    `generation_name`, reusing `op.takes`."""
+    import tokamax
+
+    _, _, _, _, _, _, target, arrays, launches = _staged_setup(
+        generation_name, dtype, width, hooks, config, step=step)
     return all(op.takes(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches)
 
 
