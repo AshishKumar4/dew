@@ -386,6 +386,12 @@ class TrainerConfig:
     from the GPU's facts (row 4837).
     """
 
+    def stated_layout(self) -> Layout | None:
+        """The layout the run's trainer is given (`Trainer`'s `layout`): its own where the config states one,
+        None where it leaves the default, which a config cannot tell from `Layout()` written out, so a
+        config's run lays out as the layout chooser decides (`dew.training.streaming.laid_start`)."""
+        return None if self.layout == Layout() else self.layout
+
     def accumulating(self, dataset: Loader) -> Self:
         """This config with the accumulation its token budget sets over `dataset`'s token batches, every
         phase's alike (`Loader.token_batches`): `update_tokens` a whole number of them. Raises ValueError for

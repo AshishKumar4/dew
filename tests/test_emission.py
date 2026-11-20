@@ -165,6 +165,9 @@ SCALAR_PREDICATES = [
     # XLA's saturating fold would give: unknown, both branches at every warpgroup (base review bb25f261d F1).
     (lambda wg: lax.shift_left(wg + 1, 32) == 0, [128, 128]),
     (lambda wg: lax.shift_right_arithmetic(wg - 1, 40) == -1, [128, 128]),
+    # A 4-bit integer's shift within its width folds at its own width (ml_dtypes' int4, which NumPy's
+    # iinfo refuses): 1 << 1 is 2 at the first warpgroup, 2 << 1 is 4 at the second.
+    (lambda wg: lax.shift_left((wg + 1).astype(jnp.int4), jnp.int4(1)) == jnp.int4(4), [0, 128]),
     # A float predicate is no warpgroup arithmetic the fold computes: both branches at every warpgroup.
     (lambda wg: wg.astype(jnp.float32) == jnp.float32(0), [128, 128]),
     # A quotient by zero is undefined on the GPU (LLVM's `sdiv`): unknown, both branches at every warpgroup,
@@ -210,7 +213,8 @@ SCALAR_PREDICATES = [
 programs prices where its row is exponentiated as it holds (`emission.emitted`)."""
 
 SCALAR_IDS = ["truncated-quotient", "negative-divisor", "remainder-sign", "int8-wrap", "logical-shift",
-        "shift-past-width", "arithmetic-shift-past-width", "float-unknown", "quotient-by-zero-unknown",
+        "shift-past-width", "arithmetic-shift-past-width", "int4-shift", "float-unknown",
+        "quotient-by-zero-unknown",
         "remainder-by-zero-unknown", "unsigned-quotient-by-zero-unknown",
         "least-quotient-by-minus-one-unknown", "least-remainder-by-minus-one-unknown",
         "min-at-another-signedness", "max-at-its-own-dtype", "max-converted-narrower",
@@ -254,6 +258,7 @@ def _known(predicate) -> list[bool | None]:
 
 
 @pytest.mark.gpu(reason="runs each predicate on the warpgroups of this GPU")
+@pytest.mark.generations("sm90", "sm100")
 @pytest.mark.parametrize("predicate, exponentials", SCALAR_PREDICATES, ids=SCALAR_IDS)
 def test_a_folds_known_predicate_is_the_one_each_warpgroup_computes(predicate, exponentials):
     """Each predicate the fold knows at a warpgroup (`_known`: its branch alone priced, or the other's alone)

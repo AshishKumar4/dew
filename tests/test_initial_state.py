@@ -93,7 +93,8 @@ def test_an_objectives_init_outside_a_trace_is_one_program_its_held_arrays_kept(
 def test_two_instances_of_an_overriding_trainer_each_build_their_own_state():
     """Two instances of one Trainer subclass whose `initial_state` reads the instance's own field each build
     their own state, placed as a fit places it and eagerly, not the first instance's kept trace (row 8956:
-    the kept trace was keyed by the class, so the second instance replayed the first's offset)."""
+    the kept trace was keyed by the class, so the second instance replayed the first's offset); the eager
+    draw of the base's body, which reads none of their fields, is one for both (row 8985)."""
 
     class Offset(Trainer):
         def __init__(self, *args, offset, **kwargs):
@@ -111,4 +112,47 @@ def test_two_instances_of_an_overriding_trainer_each_build_their_own_state():
     objective, optimizer = LMObjective(model, seq_len=8), optax.adam(1e-3)
     trainers = [Offset(objective, optimizer, key=jax.random.key(0), offset=offset) for offset in (1, 2)]
     assert [int(trainer.place()[0].step) for trainer in trainers] == [1, 2]
-    assert [int(trainer.initial_state().step) for trainer in trainers] == [1, 2]
+    assert int(trainers[0].initial_state().step) == 1
+    # The base's draw reads no field of theirs, so the second reads the first's draw, compiling none
+    # (row 8985), and adds its own offset.
+    with Compiles(None) as second:
+        assert int(trainers[1].initial_state().step) == 2
+    assert second.count == 0, second.count
+
+
+def test_a_kept_draw_over_trees_alike_under_other_keys_draws_each_tree_its_own():
+    """Two held trees of leaves alike, shapes and dtypes, under other keys are two kept draws
+    (`dew.objectives.drawn.held_signature`): each call builds its own tree from its own values, where keyed
+    by the leaves alone the second replayed the first's structure over its values (row 8989)."""
+    from dew.objectives.drawn import WHOLE, drawn_once
+
+    def doubled(tree, key):
+        return jax.tree.map(lambda leaf: 2 * leaf, tree)
+
+    first = {"a": jnp.full(3, 1.0), "b": jnp.full(3, 0.0)}
+    second = {"c": jnp.full(3, 5.0), "d": jnp.full(3, 7.0)}
+    key = jax.random.key(0)
+    assert sorted(drawn_once(doubled, first, key, WHOLE, kept="doubled")) == ["a", "b"]
+    drawn = drawn_once(doubled, second, key, WHOLE, kept="doubled")
+    assert sorted(drawn) == ["c", "d"], drawn
+    assert float(drawn["c"][0]) == 10.0 and float(drawn["d"][0]) == 14.0, drawn
+
+
+def test_an_initial_state_from_another_initializer_draws_that_initializer():
+    """A state built from an initializer other than the objective's own, of the same leaves (none), draws
+    that initializer, where the eager draw kept by the class replayed the objective's own, which its key
+    states and the other's function is not part of (row 9092)."""
+    from jax.tree_util import Partial
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=8)
+    objective = LMObjective(model, seq_len=8)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
+
+    def sevens(key):
+        return jax.tree.map(lambda leaf: jnp.full_like(leaf, 7.0), objective.init(key))
+
+    own = jax.tree.leaves(trainer.initial_state().variables["params"])
+    other = jax.tree.leaves(trainer.initial_state(Partial(sevens)).variables["params"])
+    assert not all(bool(jnp.all(leaf == 7.0)) for leaf in own)
+    assert all(bool(jnp.all(leaf == 7.0)) for leaf in other)

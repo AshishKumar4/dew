@@ -92,6 +92,8 @@ def test_rollout_seconds_logs_only_with_a_rollout():
     ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert len(ticks) == 2
     assert all(tick["train/rollout_seconds"] >= 0.0 for tick in ticks)
+    # Its weights on the devices, its rollouts copy none of them (`train/rollout_copied_gib`, a host run's).
+    assert all("train/rollout_copied_gib" not in tick for tick in ticks)
 
     tracking = RecordingTracker()
     frozen_trainer(tracker=tracking).fit(dataset(), steps=2, log_every=1)

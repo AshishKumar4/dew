@@ -293,9 +293,9 @@ def second_beside_the_largest(seed: int) -> tuple:
                                                         direction))
 
 
-LONG_AXES = (65, 128, 130, 194)
-"""`long_draw`'s lengths: one past a block, two blocks, past two with a remainder, and a block scanned
-between a first and a last."""
+LONG_AXES = (65, 128, 130, 192, 194)
+"""`long_draw`'s lengths: one past a block, two blocks, past two with a remainder, three (a full last block
+after a scanned one), and a block scanned between a first and a last."""
 
 
 def long_draw(length: int, seed: int) -> tuple:

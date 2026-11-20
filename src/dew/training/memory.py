@@ -704,20 +704,16 @@ class LiveSet:
         return LiveSet(scaled, unknown)
 
 
-def pooled_headroom(headroom: int | None) -> int | None:
-    """The pool's headroom, the same on every process: the tightest any process states of its own devices
-    (`headroom`, a compile's measure), which reads only its own devices' memory;
-    a process that states none does not affect it, and None where none states one."""
-    from dew._coordination import from_every_process
+def fits_everywhere(read: Callable[[], int | None]) -> tuple[bool, int | None]:
+    """Whether every process's headroom, which each `read`s of its own devices alone (a compile's measure),
+    is non-negative, with the same answer on every process, and this process's: a process that reads none
+    (None) holds it, so a pool where none reads one fits. The read and its answer are one agreement
+    (`agreed_count`): a process whose read fails ends every process's check with its error, none of them
+    left in an exchange the failing one never reaches (row 8767)."""
+    from dew._coordination import agreed_count
 
-    return min((value for value in from_every_process(headroom) if value is not None), default=None)
-
-
-def fits_everywhere(headroom: int | None) -> bool:
-    """Whether every process's headroom is non-negative, with the same answer on every process
-    (`pooled_headroom`): a pool where no process states one fits."""
-    pooled = pooled_headroom(headroom)
-    return pooled is None or pooled >= 0
+    headroom, holding = agreed_count("a step's fit", read, lambda headroom: headroom is None or headroom >= 0)
+    return holding == jax.process_count(), headroom
 
 
 def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
@@ -732,9 +728,9 @@ def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
     (`available`).
     """
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    headroom = None if executable is None else step_headroom(executable, local, held=held, built=built,
-                                                             placed=placed)
-    return fits_everywhere(-1 if executable is None else headroom), headroom
+    if executable is None:
+        return fits_everywhere(lambda: -1)[0], None
+    return fits_everywhere(lambda: step_headroom(executable, local, held=held, built=built, placed=placed))
 
 
 def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
@@ -877,20 +873,19 @@ def device_price(flops, target, dtype) -> StepPrice:
     return StepPrice(flops.hardware / dense_rate(target, dtype))
 
 
-def streamed_price(flops, target, dtype, parameters: int, updated: int, host_rate: float, *,
-                   read_once: int = 0) -> StepPrice:
+def streamed_price(flops, target, dtype, parameters: int, update: float, *, read_once: int = 0) -> StepPrice:
     """A step that streams its `parameters` bytes, a device's shards, from the host each step
     (`Layout(host=("variables",))`): its device's program's FLOPs (`device_price`); over the link, every
     layer's rows fetched for the forward and again for the backward, which recomputes the forward from
     them, and the gradient back (three times the parameters' bytes), and `read_once` bytes more the forward
-    reads and nothing differentiates (an EMA reference's weights); on the host, the update reading and
-    writing its process's `updated` bytes (its parameters, their gradient and the optimizer's state) at
-    `host_rate` (`host_memory_rate`, `host_update_seconds`)."""
+    reads and nothing differentiates (an EMA reference's weights); on the host, its `update` seconds, the
+    update reading and writing its process's bytes (its parameters, their gradient and the optimizer's
+    state) at its host's memory rate (`host_update_seconds`, `host_memory_rate`)."""
     link = target.host_link_rate
     if link is None:
         raise Unpriced(f"no host-link rate stated for {target.device_kind} (`GpuTarget.host_links`)")
     return dataclasses.replace(device_price(flops, target, dtype), link=(3 * parameters + read_once) / link,
-                               host=host_update_seconds(updated, host_rate))
+                               host=update)
 
 
 def host_update_seconds(updated: int, host_rate: float) -> float:

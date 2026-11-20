@@ -165,3 +165,23 @@ def test_the_decay_takes_the_same_tangent_forward_as_backward():
 
     assert_as_exact(paired(between), paired(plain_between), draw, "the decays' tangent paired",
                     seeds=PAIRING_SEEDS)
+
+
+def test_a_per_key_spreads_factored_pair_keeps_a_result_its_whole_decay_loses():
+    """`scan.spread` under a decay a key dimension: a reader at a sub-chunk's first token
+    (`recurrence_algebra.SUB`) and a write of keys 2^120 two tokens earlier, in the sub-chunk before, under
+    base-2 log decays of -80 a token and dimension there: its read through the factors to and from the
+    sub-chunk's reference, about 2^-80 each, exactly the write decayed by one and then the other, near 2^-40,
+    where the pair's whole decay, 2^-160, is zero in float32 and a select on it read zero (head review of
+    4bc3f5016 F1)."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    chunk, width = 2 * SUB, 2
+    readers, values = np.zeros((chunk, 1), np.float32), np.zeros((chunk, 1), np.float32)
+    keys, exponents = np.zeros((chunk, width), np.float32), np.zeros((chunk, width), np.float32)
+    readers[SUB], values[SUB - 2], keys[SUB - 2] = 1.0, 1.0, 2.0 ** 120
+    exponents[SUB - 1:SUB + 1] = -80.0
+    between = scan.between(exponents, base2=True)
+    found = np.asarray(scan.spread(readers, values, keys, between))
+    factors = np.asarray(between[SUB - 1, SUB - 2]), np.asarray(between[SUB, SUB - 1])
+    np.testing.assert_array_equal(found[SUB], keys[SUB - 2] * factors[0] * factors[1])

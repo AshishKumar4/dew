@@ -505,6 +505,29 @@ def test_a_log_its_reader_reads_late_ends_where_the_loop_saw_its_step_done():
     assert not interval.finished and not interval.watched
 
 
+
+def test_a_logs_finiteness_verdict_stops_the_loop_whatever_an_older_report_holds():
+    """A read whose steps were not finite stops the loop at the next tick (`LogWriter.raise_failure`), its
+    verdict delivered apart from reporting: an older log's report a slow tracker holds does not hold it
+    back, nor does the loop step past more than one unchecked interval (row 9022: the verdict sat behind
+    the older report while the loop dispatched on)."""
+    from dew.training.interval import LogWriter
+
+    writer, held = LogWriter(), threading.Event()
+
+    def stopped():
+        raise RuntimeError("not finite")
+
+    try:
+        writer.submit(lambda: 1, lambda value: held.wait(), lambda: True)
+        writer.submit(stopped, lambda value: None, lambda: True)
+        writer.submit(lambda: 3, lambda value: None, lambda: True)
+        with pytest.raises(RuntimeError):
+            writer.raise_failure(wait=False)
+    finally:
+        held.set()
+        writer.close()
+
 class TickGatedTracker(RecordingTracker):
     """Marks each step's tick, so an input can start a batch's delay only
     when the loop is about to ask for it: the loop reads a step's log once
