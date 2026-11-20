@@ -270,17 +270,18 @@ def test_a_split_merged_with_a_subnormal_initial_mass_keeps_its_output():
     assert float(out.reshape(())) == 1.0
 
 
+@pytest.mark.parametrize("run", ["jitted", "op by op"])
 @pytest.mark.parametrize("form", sorted(SPECS))
-def test_a_padded_merge_and_its_derivatives_are_on_par(form):
+def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
     """The padded merge's finished output, its state's mass, the output's gradient and that gradient's
     derivative along a direction on par with the plain merge's (`_plain_state`, JAX's differentiation of it,
-    independent of the law) against float64 (check 1), jitted and op by op (`as_given`), the reference run
-    op by op."""
+    independent of the law) against float64 (check 1), jitted or op by op (`as_given`), each a case (both
+    in one took 225 s over the two forms), the reference run op by op."""
     spec, ours, _ = _merges(form)
     reference = as_given(state_orders(_plain_state(spec)))
     orders = state_orders(finished_state(ours, spec))
-    for program, run in ((jax.jit(orders), "jitted"), (as_given(orders), "op by op")):
-        assert_as_exact(program, reference, _drawn, f"a padded merge, {form}, {run}", seeds=MERGE_SEEDS)
+    program = jax.jit(orders) if run == "jitted" else as_given(orders)
+    assert_as_exact(program, reference, _drawn, f"a padded merge, {form}, {run}", seeds=MERGE_SEEDS)
 
 
 @COMPILES_ON_CPU
