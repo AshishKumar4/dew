@@ -959,20 +959,33 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     float32's largest (a future corrected write's), whose product by a zero decay is NaN in every query's
     gradient the pair reads (the chunked op's reverse mode, near the largest) and in the decays'. A pairing
     `apart` by groups of that many tokens pairs no two of one group (`j // apart < i // apart`: a gram's own
-    token, a group of one; a readout's group, `Scan.group`)."""
+    token, a group of one; a readout's group, `Scan.group`). A pair is out where its decay is crossed
+    (`_crossed`), not where it rounds to zero: a live pair's that underflows reads a NaN as the recurrence
+    does (train 1079's review F1), and any other product as zero (`_underflowed_out`)."""
     joined = between
     if apart:
         rows, columns = (jnp.arange(between.shape[axis])[index] // apart
                          for axis, index in ((0, (slice(None), None)), (1, (None, slice(None)))))
-        joined = jnp.where((rows > columns)[:, :, None], between, 0.0)
-    active = jnp.any(joined != 0, axis=-1)
+        joined = jnp.where((rows > columns)[:, :, None], between, -0.0)
+    active = jnp.any(~_crossed(joined), axis=-1)
     issue = issue or _issued
     if between.shape[-1] == 1:
         # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
         # decay's derivative would read it.
-        return jnp.where(active, issue(role, left, right.T), 0.0) * joined[..., 0]
+        return _underflowed_out(jnp.where(active, issue(role, left, right.T), 0.0), joined) * joined[..., 0]
     # The factors read the reference's own decay (1, on the diagonal a strict pairing excludes).
     return jnp.where(active, _factored(left, right, between, joined, issue, role), 0.0)
+
+
+def _underflowed_out(products, between):
+    """A scalar decay's pair `products` `[C, C]` zero where their decay (`between` `[C, C, 1]`) is zero but a
+    NaN, which that decay multiplies after them: a live pair's decay that underflows (`_crossed`'s positive
+    zero) weighs its product to zero, which, formed before that decay, may overflow, infinity times zero (a
+    query's and a key's 2^70 under decays of exp(-160), head review of 512810acf F7); a NaN in a factor reads
+    NaN as the recurrence's (train 1079's review F1). A per-key decay's pairs apply their factors apart
+    (`_factored`, `spread`'s sub-chunks), each at most 1, whose product keeps a result its whole decay
+    loses."""
+    return jnp.where(jnp.all(between == 0, axis=-1) & ~jnp.isnan(products), 0.0, products)
 
 
 def _factored(left, right, between, joined, issue: Callable, role: str):
@@ -1021,11 +1034,14 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
     from dew.nn.kernels import recurrence_algebra
 
     issue = issue or _issued
-    active = jnp.any(between != 0, axis=-1)
+    active, scalar = jnp.any(~_crossed(between), axis=-1), between.shape[-1] == 1
     reads = jnp.where(active, issue("scores", readers, values.T), 0.0)
+    if scalar:
+        # Out before a weight multiplies it: an overflowing product times a level's zero weight is NaN.
+        reads = _underflowed_out(reads, between)
     if weights is not None:
         reads = reads * weights
-    if between.shape[-1] == 1:
+    if scalar:
         return issue("apply", reads * between[..., 0], keys)
     count = keys.shape[0]
     sub = recurrence_algebra.SUB
@@ -1251,8 +1267,9 @@ def _decays_value(exponents, base2: bool) -> _Decays:
 
 
 def _crossed(decay: jax.Array) -> jax.Array:
-    """Where a chunk's decay (`_decays_value`'s) spans a vanished token, a document's start: negative zero,
-    which a live span's decay that underflows (positive zero) is not."""
+    """Where a chunk's decay (`_decays_value`'s) is cut: a span through a vanished token (a document's start,
+    or a decay that alone underflows), or a pair's future, negative zero, which a live span's decay that
+    underflows (positive zero) is not: the one reading the readout's select and the pairs' take."""
     # The sign bit read as the integer of its width's: `jnp.signbit` shifts by a constant, which a checked
     # `shard_map` refuses beside a varying decay.
     bits = jax.lax.bitcast_convert_type(decay, jnp.dtype(f"int{jnp.finfo(decay.dtype).bits}"))

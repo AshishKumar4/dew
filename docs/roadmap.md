@@ -39,7 +39,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests/test_gemm_gather.py:200-242 (the strided-table gathers kernel) duplicates tests/test_ring_protocol.py:382-424's gathered walk fixture. [8679]
 - A launch's certification traces it a second time. [8720]
 - Pallas Mosaic GPU lowering cache, certification against the step. [8793]
-- The recurrence suite's wall: every case within CI's group target. [8835]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]

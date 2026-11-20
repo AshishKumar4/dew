@@ -578,6 +578,27 @@ def test_a_turned_documents_discarded_memory_keeps_every_gradient_finite():
     assert_finite_where_float64_is(operands, seeded)
 
 
+@pytest.mark.parametrize("values_first", [False, True], ids=["keys first", "values first"])
+def test_an_entry_write_of_no_terms_is_zero(values_first):
+    """A document's entry write (`chunked_launch.entry_write`) of rank zero, keys `[2, 0, 3]` and values `[2,
+    0, 4]` (or `[2, 4, 0]` laid values first) under a weight `[2, 1, 1]`: zeros `[2, 3, 4]` (`[2, 4, 3]`),
+    the memory it enters unchanged, and its weight's gradient zero, where its aligned sum of no terms raised
+    (row 8967)."""
+    from dew.nn.kernels.chunked_launch import entry_write
+
+    key = jnp.zeros((2, 0, 3), jnp.float32)
+    value = jnp.zeros((2, 4, 0) if values_first else (2, 0, 4), jnp.float32)
+    weight = jnp.ones((2, 1, 1), jnp.float32)
+
+    def written(weight):
+        return entry_write(key, value, weight, values_first=values_first)
+
+    shape = (2, 4, 3) if values_first else (2, 3, 4)
+    np.testing.assert_array_equal(np.asarray(written(weight)), np.zeros(shape))
+    gradient = jax.grad(lambda weight: jnp.sum(written(weight)))(weight)
+    np.testing.assert_array_equal(np.asarray(gradient), np.zeros((2, 1, 1)))
+
+
 @pytest.mark.parametrize('hooks', [*HOOKS, TURNED], ids=str)
 def test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it(hooks):
     """A one-token call whose token begins a document, its memory entering 2^127 in every entry (discarded),
@@ -595,19 +616,23 @@ def test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it(
     assert_finite_where_float64_is(operands, seeded, hooks)
 
 
-def test_a_live_spans_decay_that_underflows_reads_its_memory_as_the_recurrence():
-    """A two-token call of one document under log decays of -80 (each live, their span's `exp(-160)` zero in
-    float32), a NaN memory entering, unit queries, zero keys and values: its output NaN where the recurrence
-    a token at a time reads NaN, on the portable math, where the readout's select took a decay rounded to
-    zero for a document's start and read zero (row 8560's head review)."""
-    hooks = HOOKS[6]
-    (operands,) = draw(hooks, packed=False, seed=0, length=2)
-    names = [name for name in ('key', 'value') if getattr(operands, name) is not None]
-    operands = dataclasses.replace(operands, query=jnp.ones_like(operands.query),
-                                   log_decay=jnp.full_like(operands.log_decay, -80.0),
-                                   state=jnp.full_like(operands.state, jnp.nan),
-                                   starts=jnp.zeros(operands.value.shape[:2], bool),
-                                   **{name: jnp.zeros_like(getattr(operands, name)) for name in names})
+@pytest.mark.parametrize('where', ['entering', 'written'])
+def test_a_live_spans_decay_that_underflows_reads_as_the_recurrence(where):
+    """A three-token call of one document under log decays of -80 (each live, a span of two `exp(-160)`,
+    zero in float32) of a scalar write gate's recurrence, unit queries, a NaN in the memory entering or in
+    the first token's key: its output NaN where the recurrence a token at a time reads NaN, on the portable
+    math, where the readout and the pairs (`scan._paired`, `scan.spread`) took a decay rounded to zero for a
+    document's start and read zero (row 8560's head review, train 1079's review F1)."""
+    hooks = recurrence.Hooks(decay='scalar', delta=False, write_gate=True)
+    (operands,) = draw(hooks, packed=False, seed=0, length=3)
+    key, state = jnp.zeros_like(operands.key), jnp.zeros_like(operands.state)
+    if where == 'entering':
+        state = jnp.full_like(state, jnp.nan)
+    else:
+        key = key.at[:, 0].set(jnp.nan)
+    operands = dataclasses.replace(
+        operands, query=jnp.ones_like(operands.query), log_decay=jnp.full_like(operands.log_decay, -80.0),
+        state=state, key=key, starts=jnp.zeros(operands.value.shape[:2], bool))
     out, _ = chunk_on('xla', hooks, operands, chunk_size=CHUNK)
     reference, _ = token_by_token(hooks, operands)
     np.testing.assert_array_equal(np.isnan(np.asarray(out)), np.isnan(np.asarray(reference)))
@@ -1166,6 +1191,27 @@ def test_the_templates_documents_adding_a_slot_are_as_exact_as_each_alone_interp
     interpreted off a GPU (`the_templates_forked_documents_are_as_exact_as_each_alone`); a turned call's
     documents add none (refused, row 8284)."""
     the_templates_forked_documents_are_as_exact_as_each_alone(hooks, added=True)
+
+
+@pytest.mark.parametrize('hooks', FORKED_TEMPLATE, ids=str)
+def test_a_forked_call_of_entry_writes_of_no_terms_lowers_on_the_template(hooks):
+    """A forked call whose documents' entry writes take no terms (`Chunk.entry_key` `[B, D, 0, H, K]`),
+    through the public chunked op on the template, its gradient lowered for an H100: each chunk's write
+    zero (`chunked_launch.entry_write`, row 8967), where its documents' terms flattened by an inferred
+    extent of no elements refused the call (`ForkedChunks.entries`, head review of 512810acf F3)."""
+    operands = entering_documents(narrowed_draw(hooks, 0)[0])
+    rows, documents, value_heads = operands.value.shape[0], len(DOCUMENTS[0]), operands.value.shape[2]
+    operands = dataclasses.replace(
+        operands, entry_key=jnp.zeros((rows, documents, 0, *operands.key.shape[2:])),
+        entry_value=jnp.zeros((rows, documents, 0, *operands.value.shape[2:])),
+        entry_weight=jnp.ones((rows, documents, value_heads)))
+
+    def loss(given):
+        out, final = chunk_on('mosaic_gpu', hooks, given)
+        return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
+
+    with generation.assumed('sm90'):
+        jax.jit(jax.grad(loss, allow_int=True)).trace(operands).lower(lowering_platforms=('cuda',))
 
 
 def test_a_turned_forked_call_adding_a_slot_is_refused():

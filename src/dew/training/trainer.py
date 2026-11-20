@@ -198,7 +198,6 @@ from dew.training.transaction import (
     batch_statistics_shapes,
     checked,
     compact_qk,
-    finite_flags,
     loss_scale,
     pooled_by_mean,
     refuse_unpassed_progress,
@@ -222,34 +221,6 @@ Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
 
 _DEFAULT_MESH = MeshSpec()
-_DEFAULT_LAYOUT = Layout()
-
-
-def first_non_finite(state: TrainState) -> str | None:
-    """The first leaf of `state`'s checked trees (`transaction.checked`: the parameters, every optimizer
-    leaf and the averages, and under DiLoCo each replica's inner copy of them) holding a value that is not
-    finite, by its path; None where none does. Read wherever the leaves are placed, one compiled check a
-    placement (`transaction.finite_flags`), the same on every process."""
-    trees = {**checked(state), **({} if state.inner is None else
-                                  {f"inner.{name}": tree for name, tree in checked(state.inner).items()})}
-    leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
-              for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
-              if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
-    finite = finite_flags([leaf for _, leaf in leaves])
-    return next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
-
-
-def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | None]) -> None:
-    """Refuse to save a `state` holding a value that is not finite (`first_non_finite`), on any tier: no
-    checkpoint is written and none rotated out, and the run stops, naming the step and the first such leaf,
-    so the checkpoint a resume finds is the last finite one (`latest`, read only to say so) (training.md,
-    checkpoints and resume)."""
-    first = first_non_finite(state)
-    if first is not None:
-        kept = latest()
-        said = "no checkpoint" if kept is None else f"the latest checkpoint, step {kept}"
-        raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so no checkpoint of it "
-                           f"is written and {said} is the one a resume finds")
 
 
 def _closer(stream: Iterator[Batch]) -> Callable[[], None] | None:
@@ -303,7 +274,7 @@ class Trainer(Generic[Loss, Effects]):
         *,
         key: int | jax.Array,
         mesh: MeshSpec | Mesh = _DEFAULT_MESH,
-        layout: Layout = _DEFAULT_LAYOUT,
+        layout: Layout | None = None,
         microbatches: int | None = None,
         accumulation: int = 1,
         split: int | None = None,
@@ -392,7 +363,7 @@ class Trainer(Generic[Loss, Effects]):
         # The later data phases' steps of the fit in progress, planned off its loop (`LaterPlans`).
         self._later: LaterPlans | None = None
         if diloco is not None:
-            diloco.admits(layout.host, record)
+            diloco.admits(() if layout is None else layout.host, record)
         # Where the fit ladder stands and the links its traces read (`StepCompiler`), and what the last
         # compile found (`Compiled`), which `plan`, `memory`, `executable`, `step_flops` and `links` read.
         # A step compiled ahead is taken once the process is readied (`_handed_ahead`): constructing a trainer
@@ -408,9 +379,10 @@ class Trainer(Generic[Loss, Effects]):
         self._refusal: str | None = None
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
-        # How the run's batches are cut and counted (`RunShape`), its split the layout's (`_laid_out`).
-        self._shape, self._given_layout = RunShape(split=split), layout
-        self._laid_out(layout)
+        # The run's batches' cut (`RunShape`); a layout stated is kept, `Layout()` too (row 9016).
+        self._shape, self._layout_stated = RunShape(split=split), layout is not None
+        self._given_layout = Layout() if layout is None else layout
+        self._laid_out(self._given_layout)
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -438,18 +410,18 @@ class Trainer(Generic[Loss, Effects]):
 
         Both inputs default to the run's own, and `place` passes them explicitly so that what it compiles
         takes them as arguments. A held checkpoint then reaches the device as an argument instead of a
-        constant embedded in the executable. Passing None means "use the configured input", which is what a
-        call without arguments does. This is the only implementation of the state, so a subclass overrides it
-        here and every path sees the override.
+        constant embedded in the executable. This is the only implementation of the state, so a subclass
+        overrides it here and every path sees the override.
         """
         initializer = self.objective.initializer if initializer is None else initializer
         from dew.nn.inputs import request_key
         ready_process()  # A key given here opens the backend as the run's does (`key`).
         key = self.key if key is None else request_key(key)
         if not self.host_master and jax_core.trace_state_clean():
-            # Outside any trace one program of this body, which reads no override's field, so kept by the
-            # class (row 8985), its frozen tree the held arrays (`drawn_once`; rows 8682, 8730).
-            stated = self._step_key(self.objective, self._compiler)
+            # One program of this body (`drawn_once`), kept by the class only over the objective's own
+            # initializer, the one its key states (rows 8985, 9092).
+            own = jax.tree.structure(initializer) == jax.tree.structure(self.objective.initializer)
+            stated = self._step_key(self.objective, self._compiler) if own else None
             return drawn_once(self._fresh_state, initializer, key, HELD_APART,
                               kept=stated and (stated, type(self), "fresh"))
         return self._fresh_state(initializer, key)
@@ -2359,10 +2331,6 @@ class Trainer(Generic[Loss, Effects]):
                              *, weights_only: bool = False) -> Envelope:
         """What a checkpoint of `state` holds on every tier, each tier's save adding its own metadata: one
         envelope a persistent and a local save submit (row 4126)."""
-        # No tier writes a non-finite state (`refuse_non_finite`): a local copy is the one a restarted node
-        # reads first, its step the latest of both tiers.
-        refuse_non_finite(state, int(run.current), lambda: None if self.checkpoints is None
-                          else self.checkpoints.latest)
         control, share = {**run.stop_control, **interval.token_control}, DataPartition.of(self.device_mesh)
         return {"state": self._staging.saved(state), "saved": position, "share": share, "control": control,
                 # The rung beside the layout's host fields, which a resume lays out alike (`resumed_layout`).
