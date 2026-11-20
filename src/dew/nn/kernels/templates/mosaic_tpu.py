@@ -206,7 +206,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     copies_tiled_rows = True
 
-    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
+                  joined: tuple = ()) -> int:
         raise NotImplementedError("a TPU core budgets no registers: its values spill to VMEM")
 
     def column_unit(self, dtype) -> int:
@@ -235,7 +236,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None, tmem: int = 0,
-               moves: bool | None = None) -> Callable:
+               moves: bool | None = None, joined: tuple = ()) -> Callable:
+        mosaic.runs_alone(self, joined)
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster, and no
         # view prefetched ahead of a wait (a GPU's dependent launch); its compiler holds its values, no
         # register budget (`budgets_registers`).

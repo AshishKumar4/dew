@@ -88,7 +88,9 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     loader = 0
     """The consumer that issues the loads."""
 
-    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
+                  joined: tuple = ()) -> int:
+        mosaic.runs_alone(self, joined)
         return resources.entry_registers(consumers, programs)
 
 
