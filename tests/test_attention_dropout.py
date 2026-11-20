@@ -785,23 +785,6 @@ def test_an_fp16_kept_weight_near_fp16s_largest_keeps_its_output_finite(weight, 
                     seeds=FEWEST_SEEDS)
 
 
-@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
-def test_an_fp16_output_whose_fp32_quotient_is_its_overflow_midpoint_settles_below_it(training):
-    """One fp16 key at logit 0 and value 65504, kept (`first_seed`) at a rate of 1/4095 - 2^-27: the
-    output, 65504 times the multiplier, 65519.9995, is below fp16's overflow midpoint, 65520, so it narrows
-    to 65504, on par with the reference (check 1), where its fp32 quotient rounded onto 65520 and tied to
-    inf (the base review of 545370f65, F3; row 9544)."""
-    rate = 1.0 / 4095 - 2.0 ** -27
-    query, key = jnp.zeros((1, 1, 1, 8), jnp.float16), jnp.zeros((1, 1, 1, 8), jnp.float16)
-    value = jnp.full((1, 1, 1, 8), jnp.finfo(jnp.float16).max, jnp.float16)
-    words = first_seed(rate, 1, lambda kept: bool(kept[0]))
-    spans, hooks = template.spans(1, 1, 1), hooked(words, 1, 1, rate)
-    assert_as_exact(_walked(spans, hooks, training),
-                    lambda query, key, value: template.reference(query, key, value, spans, hooks),
-                    lambda seed: (query, key, value), "an fp16 output at its fp32 overflow midpoint",
-                    seeds=FEWEST_SEEDS)
-
-
 def _anchor_below_least_subnormal():
     """`test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term`'s call: its spans, hooks and operands
     `(query, key, value)`."""

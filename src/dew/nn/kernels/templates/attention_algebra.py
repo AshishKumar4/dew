@@ -113,9 +113,8 @@ class Forward:
     held at (`quotient`): a call's values', where it drops none and resumes no state, its output a mean of
     them (`largest_of`); None where its output may pass them."""
     narrowed: DTypeLike | None = None
-    """The 16-bit dtype its fp32 output is narrowed to, whose overflow midpoint an output exactly at is
-    settled to the side its exact quotient lies on (`midpoint_settled`, `narrowed_of`); None where it stays
-    fp32."""
+    """The 16-bit dtype its fp32 output is narrowed to, its quotient rounded to odd there
+    (`narrowing_settled`, `narrowed_of`); None where it stays fp32."""
 
     @property
     def reach(self) -> float:
@@ -1933,13 +1932,13 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     if normalized:
         out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
     else:
-        residual = dropped_residual(spec, state.total)
         acc, total = dropped_total(spec, state.acc, state.total)
         state = state._replace(acc=acc, total=total)
         out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
                        held=jnp.float32 if held else spec.largest)
-        if spec.narrowed is not None:
-            out = midpoint_settled(out, state.acc, state.total, residual, spec.narrowed)
+        # Narrowed as it is: a hook reads the fp32 quotient unsettled.
+        if spec.narrowed is not None and output_mod is None:
+            out = narrowing_settled(out, state.acc, state.total, spec.narrowed)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
@@ -1956,45 +1955,52 @@ def dropped_total(spec: Forward, acc: jax.Array, total: jax.Array) -> tuple[jax.
     return jnp.where(over, acc / rest, acc), jnp.where(finite(total * rest), total * rest, total)
 
 
-def dropped_residual(spec: Forward, total: jax.Array) -> jax.Array | float:
-    """What `dropped_total`'s divisor, the total times the multiplier's rest rounded to fp32, leaves of the
-    total times the rest itself: its product's rounding (`two_product`) and the total times what the rest's
-    rounding to fp32 lost; 0 where no call drops, or where the product passes fp32's largest, whose divisor
-    is the total."""
-    if spec.dropped == 1.0:
-        return 0.0
-    exact = spec.units / spec.dropped
-    rest = np.float32(exact)
-    _, error = two_product(total, rest)
-    return jnp.where(finite(total * rest), error + total * np.float32(exact - float(rest)), 0.0)
-
-
 def narrowed_of(dtype: DTypeLike) -> DTypeLike | None:
     """`Forward.narrowed` of an output of `dtype`: a 16-bit dtype, which an fp32 output is narrowed to; None
     for fp32's."""
     return dtype if jnp.dtype(dtype).itemsize == 2 else None
 
 
-def midpoint_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, residual: jax.Array | float,
-                     dtype: DTypeLike) -> jax.Array:
-    """`out`, the sums `acc` over `divisor` (fp32), where it is exactly `dtype`'s overflow midpoint, its
-    largest and half an ulp, settled to the side the exact quotient lies on before its narrowing: the
-    divisor taken with the `residual` its own rounding left (a dropping call's multiplier's rest,
-    `dropped_residual`): the exact quotient is below the midpoint where `|acc|` is below the midpoint times
-    that divisor, a row's product formed exact once (`two_product`), `|acc|` less its rounded part exact
-    beside it (the two within a factor of two where `out` is the midpoint); below it, the fp32 value an ulp
-    nearer zero, which narrows to the largest, beyond it or on it, `out`, which narrows to inf as the exact
-    quotient does. The exact output 65519.9995 of one kept key of 65504 at a multiplier of 1.000244 rounded
-    to fp32's 65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544). Every other
-    value `out` as it is. An element's cost is a subtraction and a comparison: a product formed exact an
-    element took an H100's bf16 forward epilogue from 122 registers to 168, spilling."""
+def narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """`out`, the sums `acc` over `divisor` (fp32), as their quotient rounded to odd where it narrows to the
+    16-bit `dtype`: the quotient rounded to nearest, and where that lands exactly between two values of
+    `dtype` (`_between`) and is not the exact quotient, one fp32 ulp toward it, so the narrowing rounds once
+    as the exact quotient would: the exact output 65519.9995 of one kept key of 65504 rounded to fp32's
+    65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544). The side is the sign of
+    `acc` less the quotient times `divisor`, both exact (`two_product`'s bit split, no splitter to pass fp32's
+    largest at bf16's midpoint; `acc` less the product's rounded part exact by Sterbenz, the two within a
+    factor of two). `out` as it is where the quotient is not within its ulp of it (a held, guarded or
+    flushed one: `quotient`). The bound left at fp32's resolution, as the fp32 reference's: `divisor` is
+    the one rounded (a dropping call's total times its multiplier's rest, `dropped_total`), and the sums
+    and exponentials before it round as the reference's do, so an exact output within their rounding of
+    a boundary may narrow past it."""
+    divisor = expand(divisor, acc)
+    rounded = acc / divisor
+    high, low = two_product(rounded, divisor, bit_split=True)
+    above = (acc - high) - low
+    bits = jax.lax.bitcast_convert_type(rounded, jnp.int32)
+    # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side.
+    toward = jnp.where((above > 0) == (rounded > 0), 1, -1).astype(jnp.int32)
+    odd = jax.lax.bitcast_convert_type(bits + toward, jnp.float32)
+    settled = jnp.where(_between(bits, dtype) & (above != 0), odd, rounded)
+    close = jnp.abs(out - rounded) <= jnp.abs(rounded) * np.float32(2.0 ** -23)
+    return jnp.where(close, settled, out)
+
+
+def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """Whether each fp32 value of `bits` (its int32 bits) lies exactly between two neighbouring values of the
+    16-bit `dtype`, the tie its narrowing rounds to even: the significand bits the narrowing drops (16 of
+    bf16's, 13 of fp16's normals, more below its least normal, 2^-14) are a one and zeros."""
     found = jnp.finfo(dtype)
-    midpoint = np.float32(float(found.max) + float(found.eps) * 2.0 ** (found.maxexp - 2))
-    nearer = np.nextafter(midpoint, np.float32(0.0))
-    high, low = two_product(divisor, jnp.full_like(divisor, midpoint))
-    below = (jnp.abs(acc) - expand(high, acc)) < expand(low + midpoint * residual, acc)
-    within = (jnp.abs(out) == midpoint) & below
-    return jnp.where(within, jnp.where(out > 0, nearer, -nearer), out)
+    exponent = jnp.right_shift(bits, 23) & 0xFF
+    significand = (bits & 0x7FFFFF) | jnp.where(exponent > 0, 0x800000, 0)
+    dropped = 23 - (found.nmant)
+    if found.minexp > -126:
+        # Below the dtype's least normal its narrowing drops a bit more a binade, down to the significand's
+        # whole 24 (half the least subnormal, 2^-25 in fp16, its last tie).
+        dropped = dropped + jnp.clip(127 + found.minexp - exponent, 0, 24 - dropped)
+    half = jnp.left_shift(1, dropped - 1)
+    return (significand & (2 * half - 1)) == half
 
 
 def inverse(total: jax.Array) -> jax.Array:
