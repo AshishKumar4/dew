@@ -38,9 +38,9 @@ def node_target():
     """The node's GPU (`TOPOLOGY`): its generation, its kind's (`generation.gpu_target`), and the facts its
     serialized device states of itself, its multiprocessors and its block's shared memory among them
     (`generation.runtime_facts`), read with no GPU visible, as a prepare runs, so nothing of the CUDA
-    driver's: what its run's load holds the programs to (`BuildTarget.held`). Read beside `here`, which a
-    module importing this one reads at import: from the flows' module, whose gpu_flow imports this one, a
-    prepare's import of gpu_flow met it half initialized (row 9540)."""
+    driver's: what its run's load holds the programs to (`BuildTarget.held`). `here` reads it as this module
+    imports, which gpu_flow imports in turn: it holds nothing of the flows' module, whose import takes
+    gpu_flow's (row 9540)."""
     from jax.experimental import topologies
 
     # The CUDA plugin, which a serialized topology deserializes through, initialized with no GPU and no
@@ -49,6 +49,15 @@ def node_target():
     device = topologies.TopologyDescription.deserialize(Path(os.environ[TOPOLOGY]).read_bytes()).devices[0]
     return generation.runtime_facts(generation.gpu_target(device.device_kind), device,
                                     read=lambda ordinal, attribute: None)
+
+
+def node_topology(path: Path, gpu: str = "sm80") -> Path:
+    """`path` holding a node's serialized topology (`TOPOLOGY`'s, `node_target`'s), one compile-only GPU of
+    generation `gpu` serialized as a host serializes its own: a prepare's node in a CPU process."""
+    from jax.experimental import topologies
+
+    path.write_bytes(topologies.TopologyDescription(list(generation.compile_only_gpus(gpu, 1))).serialize())
+    return path
 
 
 def here() -> str:
