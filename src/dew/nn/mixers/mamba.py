@@ -61,7 +61,7 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
-from dew.nn.sharding import rows_like
+from dew.nn.sharding import explicit_spec, rows_like
 from dew.nn.ssm import affine_states
 
 CHUNK_SIZE = 64
@@ -125,9 +125,13 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         write = (dt_c * x_c)[..., None] * _spread(B_c, channels)
         # The chunk's states a token at a time from the state entering it (`ssm.affine_states`).
         states = affine_states(decay, write, h, axis=1)
-        # The readout `sum_n C_n h_n` as the recurrence reads a token's, an elementwise product summed over
-        # the states, so C spread over the channels meets the states' own placement as B meets the writes'.
-        read = jnp.sum(states * _spread(C_c, channels), axis=-1)
+        # The readout's contraction over the states as it was (`portable_einsum`, its accumulation policy),
+        # each channel its own batch, C spread over the channels placed as the states are.
+        spread = _spread(C_c, channels)
+        placed = explicit_spec(states)
+        if placed is not None:
+            spread = jax.sharding.reshard(spread, placed)
+        read = recurrence_algebra.portable_einsum('bcdn,bcdn->bcd', states, spread)
         return states[:, -1], read
 
     steps = tuple(chunks(t) for t in (x, dt, B, C, resets))

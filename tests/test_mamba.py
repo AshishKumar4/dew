@@ -233,8 +233,9 @@ def channelled(fn, leaf):
 def test_a_scans_b_and_c_gradients_sum_their_channels_as_the_recurrence(case, leaf):
     """The gradient of B and of C, each apart (`channelled`), of the chunked scan at a rate past float32's
     range (`rate_past_the_range`, 128 channels): on par from float64 with the recurrence a token at a time
-    (`stepwise`, check 1), their channel sums paired as its autodiff's, where the write's and the readout's
-    transposes summed 128 channels in a dot, 1.73 times its error (row 8563)."""
+    (`stepwise`, check 1), their channel sums paired as its autodiff's. C's: where the readout's transpose
+    summed 128 channels in a dot, red here (row 8563). B's: a parity guard on the write's spread, which
+    XLA:CPU's reduce of a broadcast's transpose held before too."""
     def scan(x, dt, A, B, C, D, state):
         return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=16)
 
