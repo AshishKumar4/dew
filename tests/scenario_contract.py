@@ -218,7 +218,7 @@ def written(cache: Path) -> set[str]:
         else set()
 
 
-def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root: Path) -> None:
+def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root: Path) -> Path:
     """Resume equals the uninterrupted run, and a resumed run reuses its compiled programs (testing.md's
     contracts): `prepared`'s run uninterrupted and, beside it, paused at `PAUSE`, then resumed
     (`resumption`), each in a fresh process compiling into one persistent cache. The run pauses before its
@@ -229,7 +229,8 @@ def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root:
     the weights, a program the save that wrote it compiles (`dew.checkpoints._state_trees.decoded_ahead`):
     the run resumed a second time from the same pause, its own copy of the paused run in a fresh process
     beside the first, is held alike, both against the cache the runs before them left, and each ends where
-    the uninterrupted run ends."""
+    the uninterrupted run ends. The uninterrupted run's directory, which a claim of `prepared`'s trained run
+    reads after (a sampling's, `assert_samples_from_its_cached_programs`)."""
     whole_phase, paused_phase, resumed_phase = resumption(root)
     cache = Path(str(resumed_phase.cache))
     # Two processes of their own, run side by side: each its own run directory, one cache, compiling alike.
@@ -260,6 +261,7 @@ def assert_resumes_onto_its_uninterrupted_run(prepared: Recorded | Called, root:
         assert missed == 0 and hit > 0, (phase.name, counts)
     # Nothing written after the last logged step either, which its counts do not reach.
     assert not compiled, sorted(compiled)
+    return whole
 
 
 def cached(cache: str, module: str, function: str, *arguments) -> dict:
