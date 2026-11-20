@@ -158,3 +158,17 @@ def test_a_held_still_kernels_higher_orders_keep_its_loss_curvature(order):
     dew, reference = ORDERS[order]
     assert_as_exact(jax.jit(dew), jax.jit(reference), held_still_draw, order, seeds=SEEDS[order])
 
+
+def test_a_linear_maps_batched_pullback_sums_after_it_pulls_back():
+    """A linear map that quarters its operand (`generation.linear_map`), shared by two lanes of a `jax.vmap`,
+    transposed at float32 cotangents of `2^127` each: `2^126`, each lane's cotangent pulled back before the
+    batch's sum, where summed first the sum overflowed to infinity before its quarter (base review 7fa8fe6c2
+    F1); a narrowing pullback asks for the sum first itself (`summed_first`, an exact widening's)."""
+    from dew.nn.kernels.generation import linear_map
+
+    def quartered(x):
+        return linear_map(lambda _, moving: moving * 0.25, lambda _, cotangent: cotangent * 0.25, (), x)
+
+    lanes = jax.vmap(quartered, in_axes=None, axis_size=2)
+    (pulled,) = jax.linear_transpose(lanes, jnp.float32(1.0))(jnp.full((2,), 2.0 ** 127, jnp.float32))
+    assert pulled.dtype == jnp.float32 and float(pulled) == 2.0 ** 126

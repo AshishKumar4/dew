@@ -1352,6 +1352,31 @@ def test_an_exact_widening_transposes_as_a_cast():
     assert pulled.dtype == jnp.bfloat16 and float(pulled) == 1.0
 
 
+def test_an_exact_widening_is_strongly_typed():
+    """`widened_exactly` of a weakly typed float32 `2^-25` to float64, added to a strong float32 1 inside
+    jit, with x64 on: float64's `1 + 2^-25`, the widening's type strong as an explicit conversion's, where a
+    weak float64 yielded to the strong float32 and the sum rounded to 1 (base review 7fa8fe6c2 F2)."""
+    weak = jnp.asarray(2.0 ** -25)
+    assert weak.weak_type and weak.dtype == jnp.float32
+    with jax.enable_x64(new_val=True):
+        found = jax.jit(lambda w: widened_exactly(w, jnp.float64) + jnp.float32(1.0))(weak)
+    assert found.dtype == jnp.float64 and float(found) == 1.0 + 2.0 ** -25
+
+
+def test_a_wide_products_cotangent_widens_exactly(monkeypatch):
+    """The gradient of a wide CPU product (`accumulated`, Dew's wide arithmetic) of float32 `[[1]]` and
+    `[[2^127]]` at the subnormal cotangent `2^-149` (built from its bits): `2^-22`, the cotangent widened
+    from its bits into the float64 sum, where XLA:CPU's cast flushed it and the gradient was 0 (base review
+    7fa8fe6c2 F3)."""
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC, accumulated
+
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    rhs = jnp.asarray([[2.0 ** 127]], jnp.float32)
+    _, pullback = jax.vjp(lambda lhs: accumulated(jnp.matmul, lhs, rhs), jnp.ones((1, 1), jnp.float32))
+    (gradient,) = pullback(jnp.asarray(np.asarray([[1]], np.uint32).view(np.float32)))
+    np.testing.assert_array_equal(np.asarray(gradient), np.float32([[2.0 ** -22]]))
+
+
 def test_an_aligned_sums_subnormal_direction_widens_exactly():
     """The tangent of `aligned_sum([(a, 2^149)])` of a float32 `a` and a float64 `2^149`, with x64 on, at
     `a = 0` in the direction `2^-149` (built from its bits): float64's 1, the direction widened from its

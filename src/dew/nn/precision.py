@@ -935,7 +935,7 @@ def _summed_wide(product: Callable, preferred_element_type, *operands, counts: i
         pullback is formed in that scope here, for the operands a reverse pass differentiates alone."""
         with jax.enable_x64(new_val=True):
             wide = _widened(operands, counts)
-            wide_cotangent = cotangent.astype(jnp.float64)
+            wide_cotangent = widened_exactly(cotangent, jnp.float64)
 
             def transposed(index):
                 # The product is linear in each operand alone, so its transpose there forms the

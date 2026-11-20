@@ -165,8 +165,9 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
         with jax.enable_x64(new_val=True) if dtype == jnp.dtype(jnp.float64) else contextlib.nullcontext():
             return _widened_bits(moving, dtype)
 
+    # Its type strong, as an explicit conversion's: a weak one would yield to a strong float32 it meets.
     return linear_map(apply, lambda _, cotangent: cotangent.astype(source), (), x,
-                      out_aval=jax.typeof(x).update(dtype=dtype))
+                      out_aval=jax.typeof(x).update(dtype=dtype, weak_type=False), summed_first=True)
 
 
 def _widened_bits(x: jax.Array, dtype: jnp.dtype) -> jax.Array:
