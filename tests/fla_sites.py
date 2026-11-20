@@ -7,7 +7,8 @@ on a GPU and records (tests/fixtures/fla/gdn_seeded.npz), and the rule's hooks.
 - `walk/<geometry>`: a two-role walk's one sequence, values 64 wide (test_recurrence_mosaic_gradient).
 - `near two`: write gates near two on aligned keys (test_recurrence_mosaic).
 - `stability/<name>/<regime>/<product>`: test_recurrence_stability's regimes of the delta rule with a decay,
-  the forward's draws and the gradient's (`stressed`, `cotangents`).
+  and of a write gate without it under a decay a head (fla-core's `chunk_simple_gla`, its keys gated), the
+  forward's draws and the gradient's (`stressed`, `cotangents`).
 - `rwkv6/<dtype>/<layout>`: RWKV6's recurrence (`RWKV6`: a decay a key dimension, read before its update,
   its own write weighed), test_recurrence_chunk's draws of one sequence and of packed documents, against
   fla-core's `chunk_rwkv6`.
