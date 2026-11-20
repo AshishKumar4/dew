@@ -25,7 +25,6 @@ from reference_error import (
     indexed_recording,
     recording,
     run_to_run,
-    widened,
     with_gradients,
 )
 from selective_support import (
@@ -204,9 +203,8 @@ def test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted(
 
     def range_safe(*operands):
         with jax.enable_x64(new_val=True):
-            out = exact(*widened(operands))
-        return jax.tree.map(lambda arr: jnp.asarray(arr, jnp.float32), out)
-
+            out = exact(*jax.tree.map(lambda arr: arr.astype(jnp.float64), operands))
+        return jax.tree.map(lambda arr: arr.astype(jnp.float32), out)
     reference = range_safe if case in ("subnormal skip cancelling", "subnormal step") else exact
     assert_as_exact(jax.jit(with_gradients(routed)), reference, draw,
                     f"the selective template at large B, {case}", seeds=FEWEST_SEEDS, truth_fn=exact)
