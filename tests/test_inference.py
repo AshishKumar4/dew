@@ -8,6 +8,7 @@ trainer has just written.
 """
 
 import dataclasses
+import datetime
 import json
 import logging
 import types
@@ -486,7 +487,7 @@ def test_a_saved_runs_processor_keeps_its_fields_as_recorded_and_its_settings_ha
 class Timed(PrefixedBytes):
     """A processor of a user's own holding a duration and a text shaped as an import path."""
 
-    timeout: datetime.timedelta = datetime.timedelta(seconds=3)
+    timeout: datetime.timedelta = dataclasses.field(default_factory=lambda: datetime.timedelta(seconds=3))
     label: str = "tests.label: text"
 
 
