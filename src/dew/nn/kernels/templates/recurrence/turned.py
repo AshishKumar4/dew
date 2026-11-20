@@ -353,7 +353,7 @@ def _halves(query, key, phi, value, d_out, log, beta, ids, teams, *, scale: floa
         q_side = (jnp.einsum('...ij,...ik->...jk', p_small_q, q_later)
                   + jnp.einsum('...ij,...ik->...jk', p_big, q_inv))
         terms = _crossed(q_side, k_earlier) * inv_k
-        earlier = sums_before(terms, scanned=True)
+        earlier = sums_before(terms)
         level = jnp.stack([earlier, later], axis=-3)
         total = total + jnp.reshape(level, (*level.shape[:-4], length, level.shape[-1]))
         size = half
@@ -398,7 +398,7 @@ def turn_gradient(query, key, value, d_out, g, beta, state, d_final, turn, start
     entered = suffix_sums(_crossed(readers, read_mat) * read_post, scanned=True)
     write_mat, write_post = _scaled_einsum(leaving, written_in, rem_k * cot_scales)
     terms = -(_crossed(writers, write_mat) * write_post)
-    left = sums_before(terms, scanned=True)
+    left = sums_before(terms)
     c_cos, c_sin = chunk_rot
     decayed = passes * memories
     p_fac, p_inv = _rotated_scale(jnp.swapaxes(decayed, -1, -2))

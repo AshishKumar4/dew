@@ -80,36 +80,27 @@ def suffix_sums(x: jax.Array, *, scanned: bool = False) -> jax.Array:
     on a B200 (M-JS-114). Where `scanned`, that reversed cumulative sum: a term no position's sum takes
     meets no arithmetic of it, where the dot multiplies it by zero, a nonfinite one NaN in every sum (a
     turned gradient's entering-memory term of 2^126 times its cotangent, `templates.recurrence.turned`)."""
+    x = _wide(x)
     if scanned:
-        return jnp.flip(jnp.cumsum(jnp.flip(_wide(x), -2), axis=-2), -2)
-    return _triangle_sums(x, 0)
+        return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
+    upper = jnp.triu(jnp.ones((x.shape[-2],) * 2, x.dtype))
+    return portable_einsum('ij,...jt->...it', upper, x)
 
 
-def sums_before(x: jax.Array, *, scanned: bool = False) -> jax.Array:
-    """Each position's sum over its chunk's positions before it, along `x`'s second-last axis (`suffix_sums`'
-    exclusive prefix twin, `scanned` alike: a cumulative sum shifted a position, each sum of the earlier
-    terms alone, where an inclusive sum less its own term lost a small sum beside a large term to its
-    rounding: a chunk's last writer's whole weight beside its earlier ones' exp(-30) each, Mamba-3's turns'
-    gradient's worst row 3.75 from float64 over its size)."""
-    if scanned:
-        summed = jnp.cumsum(_wide(x), axis=-2)
-        return jnp.concatenate([jnp.zeros_like(summed[..., :1, :]), summed[..., :-1, :]], axis=-2)
-    return _triangle_sums(x, -1)
+def sums_before(x: jax.Array) -> jax.Array:
+    """Each position's sum over its chunk's positions before it, along `x`'s second-last axis, in at least
+    float32 (`suffix_sums`' exclusive prefix twin, as `scanned`): a cumulative sum shifted a position, each
+    sum of the earlier terms alone, a later term meeting none of its arithmetic, where an inclusive sum less
+    its own term lost a small sum beside a large term to its rounding (a chunk's last writer's whole weight
+    beside its earlier ones' exp(-30) each, Mamba-3's turns' gradient's worst row 3.75 from float64 over its
+    size)."""
+    summed = jnp.cumsum(_wide(x), axis=-2)
+    return jnp.concatenate([jnp.zeros_like(summed[..., :1, :]), summed[..., :-1, :]], axis=-2)
 
 
 def _wide(x: jax.Array) -> jax.Array:
     """`x` in at least float32, a float64 truth's own."""
     return x.astype(at_least_fp32(x.dtype))
-
-
-def _triangle_sums(x: jax.Array, diagonal: int) -> jax.Array:
-    """`x` `[..., C, T]`'s sums along its second-last axis over a triangle of ones: the upper one from
-    `diagonal` on (0, `suffix_sums`), else the lower one through it (-1, `sums_before`); in at least float32,
-    the triangle's ones exact in every form a product splits `x` into (`portable_einsum`)."""
-    x = _wide(x)
-    ones = jnp.ones((x.shape[-2],) * 2, x.dtype)
-    triangle = jnp.triu(ones, diagonal) if diagonal >= 0 else jnp.tril(ones, diagonal)
-    return portable_einsum('ij,...jt->...it', triangle, x)
 
 
 LOG2_E = math.log2(math.e)
