@@ -415,9 +415,12 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             entering = _read(apart, q, affine.values_read, affine.reader_scale) + r
         if affine.before:
             # The correction reads the state the token enters, before its decay (RWKV7's erase); its adjoint
-            # meets the entering state's cotangent beside the decay's, mirrored.
+            # meets the entering state's cotangent beside the decay's, mirrored. Erased against the decayed
+            # state itself, then written, as RWKV7's recurrence adds its erase: formed beside the write first
+            # (`u - s corr`), its low digits were rounded into the write's magnitude before it met the
+            # state it cancels (a packed additive erase's gradient 3.2 times the token loop's, jsf-addpack).
             correction = jnp.sum(c[:, None] * h, axis=0)
-            h = h * decay[:, None] + b[:, None] * (u - strength * correction)[None, :]
+            h = (h * decay[:, None] - b[:, None] * (strength * correction)[None, :]) + b[:, None] * u[None, :]
             output = _read(h, q, affine.values_read, affine.reader_scale) + r
         elif not affine.per_key:
             correction = jnp.sum(c[:, None] * h, axis=0)
