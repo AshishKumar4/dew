@@ -844,7 +844,7 @@ class Decide(SavedRunTask, InItsForm):
                            ) -> list[tuple[dict[str, Answer], Usage]]:
         """Each of a batch's requests' answers and usage, in order, each with its context (`contexts`) and its
         images (`images`, each request's, none for one without; row 9061): every request's rows scored by one
-        server (`_scored`), text rows packed into passes and rows of alike images joined in theirs, as a
+        server (`_rows_scored`), text rows packed into passes and rows of alike images joined in theirs, as a
         server of Jev bodies scores them (row 9634: each request of images ran a pass of its own)."""
         shown = list(images) if images else [()] * len(requests)
         held = [None] * len(requests) if contexts is None else list(contexts)
@@ -854,7 +854,7 @@ class Decide(SavedRunTask, InItsForm):
         laid = [[_Row(*self._shown(state, questions, seen, context))] if seen
                 else [_Row(row) for row in self._encoded(state, questions, context=context)]
                 for (state, questions), seen, context in zip(requests, shown, held, strict=True)]
-        scores = iter(self._scored([row for rows in laid for row in rows]))
+        scores = iter(self._rows_scored([row for rows in laid for row in rows]))
         return [self._replied(questions, [row.encoded for row in rows], [next(scores) for _ in rows])
                 for (_, questions), rows in zip(requests, laid, strict=True)]
 
@@ -1113,9 +1113,9 @@ class Decide(SavedRunTask, InItsForm):
         programs (`RowScoring`, `dew.inference.scoring.ScoringServer`), one path for a call and a
         server alike.
         """
-        return self._scored([_Row(row) for row in rows])
+        return self._rows_scored([_Row(row) for row in rows])
 
-    def _scored(self, rows: Sequence["_Row"]) -> list[np.ndarray]:
+    def _rows_scored(self, rows: Sequence["_Row"]) -> list[np.ndarray]:
         """`logits` of `rows`, text rows and rows of images alike (`_Row`), by one server of this task's
         passes (`RowScoring`), shortest first."""
         server = scoring.ScoringServer(self._row_scoring, self.variables)
@@ -1748,7 +1748,7 @@ class _DecideScoring[RequestT, PayloadT, AnswerT](
 class RowScoring(_DecideScoring[_Row, None, np.ndarray]):
     """A `Decide` task's laid-out rows as a scoring task (`dew.inference.scoring.Scoring`): each request one
     row (`Decide._encoded`, with its images where it holds any, `Decide._shown`), answered by its raw
-    `[Q, K]` logits, the passes a server of Jev bodies runs (`Decide.logits`, `Decide._scored`)."""
+    `[Q, K]` logits, the passes a server of Jev bodies runs (`Decide.logits`, `Decide._rows_scored`)."""
 
     def admit(self, request: _Row) -> scoring.ScoringRequest[_Row, None]:
         return scoring.ScoringRequest((request,), None)
