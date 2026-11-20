@@ -403,6 +403,27 @@ def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budg
         assert (model.budget, model.producer) == (budget, stated)
 
 
+def test_a_launch_with_a_joined_correction_warpgroup_counts_its_registers_in_its_residency_and_budget():
+    """A B200 launch of one consumer beside a correction warpgroup joined at half its weight
+    (`Family.role_schedule`'s `joined`, FlashAttention-4's correction role): its program runs one warpgroup
+    more, its consumer's budget is its schedule's (below a lone consumer's), its correction role's half of
+    it, and its register model counts the correction's registers in what a program allocates, so a
+    multiprocessor holds no more programs of it than its registers do (row 5368)."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    with generation.assumed("sm100"):
+        family = bundles.of("sm100", jnp.bfloat16)
+        joined = ((handoffs.Role("correction", weight=0.5), 1),)
+        held = family.role_schedule(1, joined=joined).registers()
+        assert family.warpgroups(1, joined=joined) == family.warpgroups(1) + 1
+        assert family.registers(1, joined=joined) == held["consumer"] < family.registers(1)
+        assert 0 < held["correction"] < held["consumer"]
+        model = resources.register_model(family, 1, held["consumer"], joined=joined)
+        alone = resources.register_model(family, 1, held["consumer"])
+        assert model.resident(held["consumer"]) <= alone.resident(held["consumer"])
+        assert model.most == family.programs(1, held["consumer"], joined=joined)
+
+
 def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_configs():
     """A pair's step (`rings.Paired` indices) is the pair's block, the slot's twice along the axis its CTAs
     split, at the indices in the pair's blocks (`viewed`'s `Split`), where a plain step is the slot's block;
