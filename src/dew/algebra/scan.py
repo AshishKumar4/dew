@@ -203,7 +203,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         tokens, entering = _read_entering(read, chunk, dict(zip(TOKENS, values, strict=True)))
         apart = _apart(declaration, affine, tokens["B"].shape[0])
         extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1],
-                                      affine.values_read, apart, affine.across is not None)
+                                      affine.values_read, apart, affine.across is not None, affine.before)
         corrected = affine.correction is not None
         form = _form(extents, corrected, saturation)
         # The form's largest values that read no state, prepared with the chunk's decays and tokens: the
@@ -213,7 +213,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         # A split is priced and traced where it is derived (`derive.context`): one derived under another
         # target, precision, numerics or mesh is none of this one's.
         key = (derive.context(), affine.base2, corrected, affine.values_read, apart, extents.across,
-               *((value.shape, str(value.dtype)) for value in given))
+               extents.before, *((value.shape, str(value.dtype)) for value in given))
         split = _cache.holding(splits, key, lambda: _split(
             declaration, names, chunk, affine, form, tuple(held), given, jax.ShapeDtypeStruct(shape, carried),
             extents.tokens, saturation), splits_held)
@@ -413,7 +413,13 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             apart = jnp.where(index % group == 0, h, jnp.where(cut[:, None], 0.0, apart))
             apart = apart * decay[:, None]
             entering = _read(apart, q, affine.values_read, affine.reader_scale) + r
-        if not affine.per_key:
+        if affine.before:
+            # The correction reads the state the token enters, before its decay (RWKV7's erase); its adjoint
+            # meets the entering state's cotangent beside the decay's, mirrored.
+            correction = jnp.sum(c[:, None] * h, axis=0)
+            h = h * decay[:, None] + b[:, None] * (u - strength * correction)[None, :]
+            output = _read(h, q, affine.values_read, affine.reader_scale) + r
+        elif not affine.per_key:
             correction = jnp.sum(c[:, None] * h, axis=0)
             transitioned = (h - b[:, None] * (strength * correction)[None, :]) * decay[:, None]
             h = transitioned + b[:, None] * u[None, :]
@@ -736,9 +742,9 @@ def _chunk(form: linear_scan.Form, held: tuple, values_read: bool, base2: bool, 
     # The language's own products (`_plain`), which the split's forms name and issue themselves
     # (`carry.split`'s roles): a declared product's tangent in this trace reads the state opaquely.
     return (_evaluated(form.outputs, tokens, decays, h, known, _plain, values_read=values_read,
-                       apart=form.apart, base2=base2, across=form.across),
+                       apart=form.apart, base2=base2, across=form.across, before=form.before),
             _evaluated(form.state, tokens, decays, h, known, _plain, values_read=values_read,
-                       apart=form.apart, base2=base2, across=form.across))
+                       apart=form.apart, base2=base2, across=form.across, before=form.before))
 
 
 def _plain(name: str, left, right):
@@ -764,14 +770,16 @@ def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays, issue: C
 
 
 def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Callable | None = None, *,
-               values_read: bool = False, apart: int = 0, base2: bool = False, across: bool = False):
+               values_read: bool = False, apart: int = 0, base2: bool = False, across: bool = False,
+               before: bool = False):
     """A node of the chunk's language (`linear_scan.Chunk`) at the chunk's tokens, decays and entering state
     `h`, each node once (`known`, by node), each matrix product `issue(role, lhs, rhs)`'s (`_issued`, Dew's,
     where none is given): a pair's scores (`scores`) or a strict gram (`gram`), the inverse's doubling
     (`inverse_merge`), an application (`apply`) and a write's `Kᵀ V` (`carry`). A token loop's reads are
     apart from its group's writes where `apart` (`Scan.group`). Where the form decays the state along its
     values (`across`), its decays along them are the tokens' exponents "E"'s (`_decays`, `exp2` where
-    `base2`; `linear_scan.Chunk.across_prefix`), and its token loop's each token's own."""
+    `base2`; `linear_scan.Chunk.across_prefix`), and its token loop's each token's own. Its token loop's
+    corrections read the state a token enters where `before` (`linear_scan.Parts.before`)."""
     issue = issue or _issued
     from egglog import get_callable_args
 
@@ -782,7 +790,7 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
 
     def of(child):
         return _evaluated(child, tokens, decays, h, known, issue, values_read=values_read, apart=apart,
-                          base2=base2, across=across)
+                          base2=base2, across=across, before=before)
 
     if (args := get_callable_args(node, Chunk.token)) is not None:
         value = tokens[terms.text(args[0])]
@@ -795,7 +803,8 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
     elif (args := get_callable_args(node, Chunk.across)) is not None:
         value = getattr(of(args[1]), terms.text(args[0]))
     elif (args := get_callable_args(node, Chunk.loop)) is not None:
-        value = _looped(tokens, decays, h, of(args[0]), corrected=True, values_read=values_read, apart=apart)
+        value = _looped(tokens, decays, h, of(args[0]), corrected=True, values_read=values_read, apart=apart,
+                        before=before)
     elif (args := get_callable_args(node, Chunk.plain)) is not None:
         value = _looped(tokens, decays, h, of(args[0]), corrected=False, values_read=values_read,
                         apart=apart, across=_exp(base2, tokens["E"]) if across else None)
@@ -866,11 +875,12 @@ def _elementwise(node, of: Callable):
 
 
 def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, values_read: bool = False,
-            apart: int = 0, across=None):
+            apart: int = 0, across=None, before: bool = False):
     """The token loop over the chunk, a scan of one token's step (its decay `exp(z_t)` the pair of it and the
     token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs, a row a token, and the state
-    it leaves, each token's read apart from its group's writes where `apart` (`Scan.group`). Split by its
-    construction (`_looped_split`), never unrolled into an e-graph."""
+    it leaves, each token's read apart from its group's writes where `apart` (`Scan.group`), its corrections
+    reading the state it enters where `before` (`linear_scan.Parts.before`). Split by its construction
+    (`_looped_split`), never unrolled into an e-graph."""
     B, s, C, Q, R = (tokens[name] for name in ("B", "s", "C", "Q", "R"))
     count = B.shape[0]
     between = decays.between[jnp.arange(1, count), jnp.arange(count - 1)]
@@ -886,9 +896,11 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
         decay, b, strength, c, q, r, value, along = token
         # Apart from its group's writes: the state its group entered, decayed by every token since it.
         held = decay[:, None] * (jnp.where(index % apart == 0, h, held) if apart else h)
+        # Read before the decay where the token's corrections read the state it enters.
+        entered = _portable(c[None, :], h) if corrected and before else None
         h = decay[:, None] * h * along[None, :]
         if corrected:
-            h = h - strength * b[:, None] * _portable(c[None, :], h)
+            h = h - strength * b[:, None] * (_portable(c[None, :], h) if entered is None else entered)
         h = h + b[:, None] * value[None, :]
         read_from = held if apart else h
         read = (_portable(read_from, q[:, None])[:, 0] if values_read
@@ -1284,28 +1296,36 @@ class _Decays(NamedTuple):
     chunk's start through each token, `exp(G_i)`; `to_last`, from after each token to the chunk's end,
     `exp(G_last - G_j)`; `whole`, the chunk's, `exp(G_last)`, each a decay a value takes alone (`_Split`);
     `between`, from after token `j` through token `i`, `exp(G_i - G_j)` for `j <= i` and zero above the
-    diagonal, which pairs take beside their reads."""
+    diagonal, which pairs take beside their reads; and `entering_before` and `between_before`, `entering`'s
+    and `between`'s a token back, through the token before each (`exp(G_{i-1})`, one at the first;
+    `exp(G_{i-1} - G_j)` for `j < i`), as corrections reading the state a token enters read them
+    (`linear_scan.Parts.before`): shifted from them, never a token's exponent taken away."""
 
     entering: _Split
     to_last: _Split
     whole: _Split
     between: jax.Array
+    entering_before: _Split
+    between_before: jax.Array
 
 
-DECAYS = len(_Split._fields) * 3 + 1
-"""The chunk function's leading operands: its decays (`_flat_decays`' leaves: `entering`, `to_last` and
-`whole` each a split's factors, then `between`), its tokens' values after."""
+DECAYS = len(_Split._fields) * 4 + 2
+"""The chunk function's leading operands: its decays (`_flat_decays`' leaves: `entering`, `to_last`, `whole`
+and `entering_before` each a split's factors, then `between` and `between_before`), its tokens' values
+after."""
 
 
 def _flat_decays(decays: _Decays) -> tuple:
     """`decays`' arrays in the chunk function's order (`DECAYS` of them): each split decay's two factors,
-    `entering`, `to_last` and `whole`, then `between`."""
-    return (*decays.entering, *decays.to_last, *decays.whole, decays.between)
+    `entering`, `to_last`, `whole` and `entering_before`, then `between` and `between_before`."""
+    return (*decays.entering, *decays.to_last, *decays.whole, *decays.entering_before, decays.between,
+            decays.between_before)
 
 
 def _decays_from(leaves: Sequence) -> _Decays:
     """`_flat_decays`' arrays as their decays."""
-    return _Decays(_Split(*leaves[0:2]), _Split(*leaves[2:4]), _Split(*leaves[4:6]), leaves[6])
+    return _Decays(_Split(*leaves[0:2]), _Split(*leaves[2:4]), _Split(*leaves[4:6]), leaves[8],
+                   _Split(*leaves[6:8]), leaves[9])
 
 
 def _scaled(value, decay):
@@ -1407,10 +1427,23 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     # Each exponent masked before its exponential, as each span's: one across a vanished token is no sum
     # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN), and its
     # decay negative zero, which no exponential is (`_crossed`).
+    between = jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), -0.0)
     return _Decays(entering=_two_factors(base2, high + low, started),
                    to_last=_two_factors(base2, (high[-1] - high) + (low[-1] - low), ending),
-                   whole=_two_factors(base2, high[-1] + low[-1], started[-1]),
-                   between=jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), -0.0))
+                   whole=_two_factors(base2, high[-1] + low[-1], started[-1]), between=between,
+                   entering_before=_two_factors(base2, _back(high + low, first=0.0),
+                                                _back(started, first=True)),
+                   between_before=_back(between, first=-0.0))
+
+
+def _back(array, first):
+    """`array` a token back along its first axis (row `i` its row `i - 1`), its first row `first`."""
+    return jnp.concatenate([jnp.full_like(array[:1], first), array[:-1]], axis=0)
+
+
+def _forward_one(array):
+    """`_back`'s transpose: row `i` row `i + 1`'s, its last row zero (its first row's dropped)."""
+    return jnp.concatenate([array[1:], jnp.zeros_like(array[:1])], axis=0)
 
 
 def _crossed(decay: jax.Array) -> jax.Array:
@@ -1457,7 +1490,10 @@ def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
     entering, to_last, whole = (_split_term(decay, cotangent) for decay, cotangent in
                                 ((decays.entering, cotangents.entering), (decays.to_last, cotangents.to_last),
                                  (decays.whole, cotangents.whole)))
-    between = cotangents.between * decays.between
+    # A decay a token back (`entering_before`, `between_before`) is its row before's: its term that row's.
+    entering = entering + _forward_one(_split_term(decays.entering_before, cotangents.entering_before))
+    between = (cotangents.between * decays.between
+               + _forward_one(cotangents.between_before * decays.between_before))
     if between.shape[-1] > 1:
         # A decay a key's pairs' terms `[C, C, K]` formed once, ahead of their scans: fused into the first,
         # XLA:CPU formed them again in its every step, Kimi delta attention's derived forward and backward
