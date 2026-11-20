@@ -604,7 +604,7 @@ def _arm_compile(plain: bool) -> Callable:
         # An arm held whole (`_Whole`) is a jit of its own compiler options, lowered as itself: no other jit
         # may hold it.
         if isinstance(function, _Whole):
-            return function.fn
+            return function
         return (jax.jit if plain else without_ynn)(function, out_shardings=out_shardings)
 
     return compiled
@@ -680,11 +680,11 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         if list(inputs) != leaves:
             raise ValueError(f"{name}: an arm compiled with its own compiler options is held whole, over its "
                              "inputs as arrays, and these inputs are a tree of them")
-        programs[name] = (_Whole(traced_fn), [*map(jax.typeof, leaves)])
         with generation.routes() as reported, tuning.seen() as launched:
             out = traced_fn.trace(*inputs).out_info
         held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported),
                       "launches": launched.held()}
+        programs[name] = (_Whole(traced_fn, held[name]), [*map(jax.typeof, leaves)])
         return out
     with generation.routes() as reported, tuning.seen() as launched:
         closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
@@ -718,12 +718,20 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
 @dataclasses.dataclass(frozen=True)
 class _Whole:
     """An arm's program held whole (`_arm_program`): `fn`, a jit of its own compiler options, which the
-    store's compile lowers as itself (`_arm_compile`) over its inputs' leaves."""
+    store's compile lowers as itself (`_arm_compile`) over its inputs' leaves, each lowering's launches into
+    its `record` (`lower`): its run reports the kept lowering's, as an arm's relowering does (`again`)."""
 
     fn: Callable
+    record: dict = dataclasses.field(compare=False, hash=False)
 
     def __call__(self, *leaves):
         return self.fn(*leaves)
+
+    def lower(self, *args, **options):
+        with tuning.seen() as found:
+            lowered = self.fn.lower(*args, **options)
+        self.record["launches"] = found.held()
+        return lowered
 
 
 def _paired_most(reference_fn, most: int = MOST_SEEDS, *, paired: bool = True) -> int | None:

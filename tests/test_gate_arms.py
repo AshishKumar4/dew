@@ -171,8 +171,8 @@ def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran(tmp_path):
     call's too, whose program a plain jit would take from its cache and trace no launch for a collector open
     around it (row 9550: a witness retraced a program of its own to see them); a jit of its own compiler
     options (`without_ynn`'s) lowered as itself, never nested in another; and prepared into a store and run
-    from it, its prepare's lowering's launches, its run's alike (a relowering past a spill, a GPU's, keeps its
-    own: `_arm_program`'s `again`)."""
+    from it, a plain function's and a whole jit's, its prepare's lowering's launches once, its run's alike (a
+    relowering past a spill, a GPU's, keeps its own: `_arm_program`'s `again`, `_Whole.lower`)."""
     sizes = np.asarray([128, 128], np.int32)
     rng = np.random.default_rng(9550)
     x = rng.standard_normal((256, 128)).astype(np.float32)
@@ -191,7 +191,8 @@ def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran(tmp_path):
         stored = []
         for prepare in (True, False):
             with compiled_truths(tmp_path, prepare=prepare, stamp="launched"):
-                stored.append(ahead_arm(gradient, "a stored kernel gradient", launched=True)(x, dy)[1])
+                stored.extend(ahead_arm(arm, f"a stored kernel gradient, {at}", launched=True)(x, dy)[1]
+                              for at, arm in enumerate((gradient, without_ynn(gradient))))
     expected = [type(op) for op, _ in traced]
     assert expected and all([type(op) for op, _ in launches] == expected
                             for launches in (*(found for _, found in made), *stored))
