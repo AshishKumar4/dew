@@ -153,9 +153,12 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
             if event.kind == "wait":
                 waiters.setdefault(event.at[0], set()).add(c)
     owner_of = {barrier: next(iter(owners)) for barrier, owners in waiters.items() if len(owners) == 1}
-    # Each consumer's first exclusive waited barrier in the walk is its `scored` barrier (`placed.py:321`).
+    committed_bars = {event.at[0] for event in issuer if event.kind == "committed"}
+    # Each consumer's first exclusive waited barrier that the issuer commits to is its `scored` barrier
+    # (`placed.py:321`; excluding the Q-load barrier which the issuer waits on but never commits to).
     scored_of = {
-        next(event.at[0] for event in threads[c] if event.kind == "wait" and owner_of.get(event.at[0]) == c): c
+        next(event.at[0] for event in threads[c]
+             if event.kind == "wait" and owner_of.get(event.at[0]) == c and event.at[0] in committed_bars): c
         for c in range(tiles.consumers)}
 
     copies = _tmem_q_copies(issuer)
@@ -284,12 +287,15 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
     target = generation.gpu_target("sm100")
     spans = template.spans(128, 256, 1)
     v32_tiles = dataclasses.replace(ROWS_TILES, columns=32)
-    for v_width, pinned, expect_cols, expect_copy, expect_most in (
-            (32, v32_tiles, 224, True, 2), (128, ROWS_TILES, 256, False, 2)):
-        q = jnp.ones((1, 128, 1, 128), jnp.bfloat16)
-        k = jnp.ones((1, 256, 1, 128), jnp.bfloat16)
+    # q64/v32 (48 KiB SMEM, 4 CTAs/SM SMEM cap): 160 base cols -> 256 rounded (2 CTAs) vs raw 512//160=3;
+    # 192 with Q -> 256 rounded (2 CTAs) vs raw 512//192=2; distinguishes rounded from raw residency.
+    # q128/v128: 256 base cols (2 CTAs) vs 320 with Q -> 512 rounded (1 CTA); rejects Q in TMEM.
+    for q_width, v_width, pinned, expect_cols, expect_copy, expect_most in (
+            (64, 32, v32_tiles, 192, True, 2), (128, 128, ROWS_TILES, 256, False, 2)):
+        q = jnp.ones((1, 128, 1, q_width), jnp.bfloat16)
+        k = jnp.ones((1, 256, 1, q_width), jnp.bfloat16)
         v = jnp.ones((1, 256, 1, v_width), jnp.bfloat16)
-        op = attention_mosaic.MosaicForward(scale=128 ** -0.5, keys=256, form="full")
+        op = attention_mosaic.MosaicForward(scale=q_width ** -0.5, keys=256, form="full")
         ba = op.bind(q, k, v, None, None, None, None, (), (), None,
                      residuals=template.Kept.NONE, interpret=False)
         with generation.assumed("sm100"), _pinned(pinned):
@@ -300,6 +306,14 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
         assert has_tmem_copy(traced) is expect_copy
         models = traced_models(traced)
         assert models and all(model.most == expect_most for model in models), models
+
+    # Nonuniform legal column pin (v192 padded to 256 with columns=192 -> blocks 192 and 64) traces cleanly.
+    q64 = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
+    k64 = jnp.ones((1, 256, 1, 64), jnp.bfloat16)
+    v192 = jnp.ones((1, 256, 1, 192), jnp.bfloat16)
+    with generation.assumed("sm100"), _pinned(dataclasses.replace(ROWS_TILES, columns=192)):
+        jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
+            q, k, v, spans, natural=True, interpret=False))(q64, k64, v192)
 
     # Rank-only `proposes` must short-circuit before calling `held` (row 9477).
     bwd = attention_mosaic.MosaicBackward(scale=128 ** -0.5, keys=256, form="full")

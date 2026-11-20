@@ -493,8 +493,11 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         counted=walk.counts and form.natural == spec.natural, finishes=rows, columns=first,
                         splits=splits, registered=walk.registered, in_key=walk.in_key,
                         decides=walk.decides, tmem_columns=walk.tmem_columns,
-                        products=walk.products if walk.family.places_on_role and form.natural == spec.natural
-                        else None,
+                        products=(walk.products if (walk.products is not None
+                                                    and walk.family.places_on_role
+                                                    and form.natural == spec.natural
+                                                    and values.shape[-1] == walk.products[4][0])
+                                  else None),
                         table=paged, sources=sources,
                         out_dtype=jnp.float32 if split else out_dtype, walks=walks,
                         shared_by=len(blocks),
