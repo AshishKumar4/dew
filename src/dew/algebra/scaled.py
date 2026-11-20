@@ -39,9 +39,10 @@ from jax.extend import core
 from jax.interpreters import batching, mlir
 
 from dew.algebra.forms import Refused
-from dew.nn import float_bits, precision
+from dew.nn import float_bits
 from dew.nn.derivatives import contracted
-from dew.nn.precision import correctly_rounded_divide, two_product, two_sum
+from dew.nn.float_bits import exact_power2
+from dew.nn.precision import correctly_rounded_divide, power2, two_product, two_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -321,7 +322,7 @@ def _aligned(a: Scaled, to: jax.Array) -> jax.Array:
     """`a`'s significand at the exponent `to`, at least its own: shifted down by their difference, at most
     its format's `shift`, exact (`Format.shift`'s account)."""
     shift = a.format.shift
-    return a.significand * float_bits.exact_power2(jnp.clip(a.exponent - to, -shift, 0), a.significand.dtype)
+    return a.significand * exact_power2(jnp.clip(a.exponent - to, -shift, 0), a.significand.dtype)
 
 
 def add(a: Scaled, b: Scaled) -> Scaled:
@@ -368,7 +369,7 @@ def _chain(x: jax.Array, significand: jax.Array, exponent: jax.Array, reach: int
     growing = exponent >= 0
     last = jnp.where(growing, significand, 0.5 * significand)
     rest = jnp.where(growing, exponent, exponent + 1)
-    product = precision.power2(x, rest) * last
+    product = power2(x, rest) * last
     # A zero +0, its sign none (the module's account): a flushed landing's or a zero factor's alike.
     return jnp.where(product == 0, jnp.zeros_like(product), product)
 
