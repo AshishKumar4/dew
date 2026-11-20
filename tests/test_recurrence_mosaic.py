@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 from fla_sites import RECORDED, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, lowers
+from identity_cover import IDENTITY_COVER
 from kernel_compile import gate_generations
 from reference_error import assert_as_exact, declared_seeds
 from test_recurrence_chunk import (
@@ -1525,12 +1526,16 @@ def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_beg
     assert [failure.split(":")[0] for failure in failed] == ["case recurrence_intra_solve"]
 
 
+def group_name(group: tuple) -> str:
+    """A gate group's name (`GATE_GROUPS`): its geometry, dtype, product, documents and variant."""
+    name, dtype, training, packed, variant = group
+    return (f"{name}-{jnp.dtype(dtype).name}-{'training' if training else 'forward'}"
+            f"{'-packed' if packed else ''}{'' if variant is None else f'-variant-{variant}'}")
+
+
 def _gated(target: str, group: tuple):
     """The gate's test of `target` and `group`, named by them."""
-    name, dtype, training, packed, variant = group
-    label = (f"{target}-{name}-{jnp.dtype(dtype).name}-{'training' if training else 'forward'}"
-             f"{'-packed' if packed else ''}{'' if variant is None else f'-variant-{variant}'}")
-    return pytest.param(target, group, id=label)
+    return pytest.param(target, group, id=f"{target}-{group_name(group)}")
 
 
 @pytest.mark.parametrize('target, group', [_gated(target, group) for target in gate_generations(scoped=True)
@@ -2353,22 +2358,41 @@ def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
     return [tiles, *rungs]
 
 
+
+
+def _cover(target: str) -> tuple[str, ...]:
+    """The gate groups that cover every launch and axis the gate reaches on `target` (`_reach`:
+    `GATE_GROUPS` taken in order where a group reaches what none before it did), by name."""
+    held, cover = set(), []
+    with generation.assumed(generation.gpu_target(target)), report.refusals():
+        for group in GATE_GROUPS:
+            if found := _reach(target, group) - held:
+                held |= found
+                cover.append(group_name(group))
+    return tuple(cover)
+
+
+@pytest.mark.parametrize('target', gate_generations(scoped=True))
+def test_the_identity_tests_cover_is_its_targets_reach(target):
+    """The identity test's groups on `target` (`IDENTITY_COVER`) are the groups that reach every launch and
+    axis the gate reaches there (`_cover`): a change that moves the reach moves the cover, regenerated from
+    this test's message."""
+    found = _cover(target)
+    assert found == IDENTITY_COVER[target], f"IDENTITY_COVER[{target!r}] = {found!r}"
+
+
 @functools.cache
 def _identity_units(target: str) -> tuple:
     """The identity test's units on `target`: each `(label, bound, tiles, kind, pulled, launch, configs,
-    lowered)`, a launch's ladder (`_rungs_of`, walked by `_walked`) of every case of the gate's groups that
-    cover every launch and axis the gate reaches there (`_reach`: `GATE_GROUPS` taken in order where a group
-    reaches what none before it did), with the kernels its configs lower, which a task's time follows (0.92
-    correlated over sm90's and sm100's tasks, where the kernels a config lowers alone were 0.29, jsf-ideal2).
-    Derived in each task, as collection cannot afford it (6.0 to 8.0 s a target of the model alone,
-    jsf-cover, in every CI task's collection), and held a process."""
+    lowered)`, a launch's ladder (`_rungs_of`, walked by `_walked`) of every case of the groups that cover
+    the gate's reach there (`IDENTITY_COVER`), with the kernels its configs lower, which a task's time follows
+    (0.92 correlated over sm90's and sm100's tasks, where the kernels a config lowers alone were 0.29,
+    jsf-ideal2). Derived in each task, as collection cannot afford it, and held a process."""
     facts = generation.gpu_target(target)
-    held, units = set(), []
+    units = []
+    covered = set(IDENTITY_COVER[target])
     with generation.assumed(facts), report.refusals():
-        for group in GATE_GROUPS:
-            if not (found := _reach(target, group) - held):
-                continue
-            held |= found
+        for group in (group for group in GATE_GROUPS if group_name(group) in covered):
             for label, bound, tiles, training in _cases(target, group):
                 for kind, pulled, launch in _rungs_of(bound, tiles, training, facts):
                     walked = tiles.forward if kind == 'forward launch' else tiles
