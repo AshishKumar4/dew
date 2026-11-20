@@ -188,12 +188,12 @@ def test_a_per_key_spreads_factored_pair_keeps_a_result_its_whole_decay_loses():
     np.testing.assert_array_equal(found[SUB], keys[SUB - 2] * factors[0] * factors[1])
 
 
-def lone_pair(reader: float, value: float, decays, *, width: int = 2, later: int = 2):
+def lone_pair(reader: float, value: float, decays, *, width: int = 2, later: int = 2, after: bool = False):
     """A per-key spread's operands of `later + 1` tokens whose one pair is the last's reader and the first's
     write, its score `reader value`, every other score zero: unit keys, the pair's decay `decays` a key, its
     factors across a sub-chunk's reference consistent with it (`recurrence_algebra.SUB`: `decays` up to the
-    reference and one after), every other pair's zero, exact as given (no `scan.between`): `(readers, values,
-    keys, between)`."""
+    reference and one after, or where `after` one up to it and `decays` after), every other pair's zero,
+    exact as given (no `scan.between`): `(readers, values, keys, between)`."""
     from dew.nn.kernels.recurrence_algebra import SUB
 
     readers, values = np.zeros((later + 1, 1), np.float32), np.zeros((later + 1, 1), np.float32)
@@ -202,7 +202,7 @@ def lone_pair(reader: float, value: float, decays, *, width: int = 2, later: int
     between[later, 0] = decays
     if later >= SUB:
         reference = later // SUB * SUB - 1
-        between[reference, 0], between[later, reference] = decays, 1.0
+        between[reference, 0], between[later, reference] = (1.0, decays) if after else (decays, 1.0)
     return readers, values, np.ones((later + 1, width), np.float32), between
 
 
@@ -218,6 +218,20 @@ def test_a_per_key_spreads_read_through_an_underflowed_decay_is_zero(read, later
         np.testing.assert_array_equal(found, np.zeros_like(found))
     else:
         assert np.all(np.isnan(found[later])), found
+
+
+@pytest.mark.parametrize(("later", "after"), [(2, False), (18, False), (18, True)],
+                         ids=["own sub-chunk", "an earlier sub-chunk, zero up to its reference",
+                              "an earlier sub-chunk, zero after its reference"])
+def test_a_per_key_spreads_overflowed_read_is_zero_at_each_key_its_decay_underflows(later, after):
+    """`scan.spread` under a decay a key dimension, one pair of its last token's reader and its first's write
+    whose decay is zero at its first key alone, within a sub-chunk or across one, the zero its factor's up to
+    the reference or after it: a read of 2^70 times 2^70, which overflows, zero at that key and infinite at
+    the other, the recurrence's own (row 9631: across a sub-chunk, NaN at the zero key)."""
+    found = np.asarray(scan.spread(*lone_pair(2.0 ** 70, 2.0 ** 70, (0.0, 1.0), later=later, after=after)))
+    expected = np.zeros_like(found)
+    expected[later, 1] = np.inf
+    np.testing.assert_array_equal(found, expected)
 
 
 def test_a_per_key_spreads_finite_read_through_a_small_decay_is_its_product():
