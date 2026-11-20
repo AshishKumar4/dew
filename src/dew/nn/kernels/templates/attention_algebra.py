@@ -51,6 +51,7 @@ from dew.nn.kernels.templates.attention import (
     dropped_reach,
     drops_in_place,
     kept,
+    mean_held,
     within,
 )
 from dew.nn.precision import float32_einsum, lowered_divide, power2, scalar_power2, two_product, two_sum
@@ -1897,11 +1898,7 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
         return jnp.where(raised > 0, lowered_divide(lifted, divisor, raised), plain)
 
     out = bodies.subnormals(divided, acc.dtype)
-    if held is None:
-        return out
-    largest = jnp.finfo(held).max
-    past = finite(acc) & (jnp.abs(out) > largest)
-    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
+    return out if held is None else mean_held(out, acc, held)
 
 
 def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:

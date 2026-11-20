@@ -1208,21 +1208,24 @@ def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_refere
                     seeds=seeds, truth_fn=_reference(family, anchored=True))
 
 
-MAINLOOPS = ("portable", *(("mosaic",) if INTERPRETED else ()))
-"""The forwards a mean's test walks: the plain-JAX mainloop's, and in a CPU process the Mosaic forward's
-interpreted as an H100 runs it (a GPU runs it in `_mainloops`' Mosaic arms)."""
+MAINLOOPS = ("portable", "triton", *(("mosaic", "decode") if INTERPRETED else ()))
+"""The forwards a mean's test walks: the plain-JAX mainloop's and the Pallas-Triton one's, and in a CPU
+process the Mosaic forward's and its decode step's interpreted as an H100 runs them (a GPU runs them in
+`_mainloops`' Mosaic arms and the decode cells)."""
 
 
 @pytest.mark.parametrize("sink", [None, -20.0], ids=["no sink", "a sink"])
-@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
-@pytest.mark.parametrize("mainloop", MAINLOOPS)
+@pytest.mark.parametrize(("mainloop", "training"),
+                         [(mainloop, training) for mainloop in MAINLOOPS for training in (False, True)
+                          if mainloop != "decode" or not training],
+                         ids=lambda value: {False: "inference", True: "training"}.get(value, value))
 def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, sink):
     """One fp16 query over a key at logit 0 and 1000 at a logit whose weight, 0.50035, narrows up to 0.5005
     for its product, every value fp16's largest, beside a `sink` or none: the output, their mean (and the
     sink's zero), is 65504, on par with the reference (check 1) on both walks, where the narrowed weights
     over their unrounded sum put it at 65522, inf in fp16 (row 9519; beside a sink of -20, the base review of
-    545370f65, F2). Each key's logit is two fp16 entries of it, their sum in fp32 log(0.50035) at the call's
-    scale, 1/8."""
+    545370f65, F2; through Triton and the decode step, of c55dff91f, F1: each dropped a sink's hold). Each
+    key's logit is two fp16 entries of it, their sum in fp32 log(0.50035) at the call's scale, 1/8."""
     keys, width = 1001, 64
     logit = np.float32(8 * np.log(0.50035))
     high = np.float16(logit)
@@ -1235,14 +1238,21 @@ def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, s
                            else template.sinks(jnp.asarray([sink], jnp.float32), 1, 1, width))
 
     def ours(query, key, value):
+        kept = template.Kept.SPLIT if training else template.Kept.NONE
         if mainloop == "portable":
             out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
                                                   hooks, residuals=training)
-        else:
-            kept = template.Kept.SPLIT if training else template.Kept.NONE
+        elif mainloop == "triton":
+            with tuning.pinned(PINS):
+                out = attention_triton.forward(query, key, value, spans, hooks, residuals=kept,
+                                               interpret=INTERPRETED)
+        elif mainloop == "mosaic":
             with generation.assumed("sm90"):
                 out = attention_mosaic.forward(query, key, value, spans, hooks, interpret=True,
                                                residuals=kept)
+        else:
+            with generation.assumed("sm90"):
+                out = attention_decode.attend(query, key, value, spans, hooks, interpret=True)
         return out[0] if training else out
 
     assert_as_exact(ours, lambda query, key, value: template.reference(query, key, value, spans, hooks),

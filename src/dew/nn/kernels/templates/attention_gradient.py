@@ -22,6 +22,7 @@ from dew.nn.kernels.templates.attention_algebra import (
     WEIGHT_SHIFT,
     Parts,
     Recompute,
+    anchor_split,
     expand,
     exponent,
     finite,
@@ -158,9 +159,7 @@ def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Arr
     weight = expand(jnp.minimum(shift, WEIGHT_SHIFT), exponentials)
     small = jnp.where(exponentials < power2(jnp.float32(1.0), weight - 126.0), exponentials, 0.0)
     exponentials = power2(exponentials - small, -weight)
-    rounded = exponentials.astype(dtype)
-    rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
-    own = jnp.where(at_anchor, exponentials, 0.0).sum(axis=-1)
+    rest, own = anchor_split(exponentials, at_anchor, dtype)
     return exponentials, rest, own, small.astype(dtype)
 
 
