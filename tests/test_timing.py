@@ -171,7 +171,7 @@ def test_a_window_whose_case_profiles_is_a_profile_its_profiled_runs_in_its_minu
             "rounds": 1, "repeats": 1}
     profiling = {**case, "name": "p", "profile": {"kernel": "k"}}
     names = ("timed.json", "profiled.json")
-    for name, cases in zip(names, ([case], [case, profiling])):
+    for name, cases in zip(names, ([case], [case, profiling]), strict=True):
         (tmp_path / name).write_text(json.dumps({"cases": cases}))
     timed, profiled = (json.loads(subprocess.run(
         [sys.executable, str(TIMING), "jobs", "--ref", "abc", "--name", "W", f"h100={tmp_path / name}"],
