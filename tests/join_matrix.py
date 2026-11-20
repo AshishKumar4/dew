@@ -2,27 +2,32 @@
 projections of one input run as one GEMM on par with the same layer's projections apart.
 
 Each cell runs a layer as a model's block does, the forward and its reverse mode in one program: a gated MLP,
-whose gate and up projections the join `gate_up` runs as one, or a gated delta net, whose b and a projections
-the join `delta_gates` does (`dew.nn.joined.JOINS`, one mechanism, one selector each). The output and the
-gradients of its input and every parameter (`reference_error.with_gradients`, a drawn cotangent) are held to
-the layer with the join named apart (`generation.chosen`, check 1) from the layer in float64 with them apart,
-as tests/test_joined.py holds a join.
+whose gate and up projections the join `gate_up` runs as one, a gated delta net, whose b and a projections the
+join `delta_gates` does (`dew.nn.joined.JOINS`, one mechanism, one selector each), or an attention layer,
+whose query, key and value projections of unequal widths `qkv` runs side by side (`dew.nn.joined.BESIDE`: one
+`gemm` of their columns, its forward one launch or each product its own as the grouped selector takes it, its
+input gradient one chained launch, the template named). The
+output and the gradients of its input and every parameter (`reference_error.with_gradients`, a drawn
+cotangent) are held to the layer with the join named apart (`generation.chosen`, check 1) from the layer in
+float64 with them apart, as tests/test_joined.py holds a join.
 
 The kernels under test are the joins', named `joined` where the cells run them (the selector's own pick is the
 projections apart where the join measured no faster on the generation, `dew.nn.joined.JOINED_FASTER`): the
-cells' `CHOICES` are `gate_up` and `delta_gates`, a cell running its own. Every other choice a layer reports
-(the products' `grouped_matmul`, the gated product's `swiglu`, the delta net's `rms_norm`, `short_conv` and
-`gated_delta_rule`) runs at XLA, and the fused MLP's `gated_mlp` apart, each named in the cell (`UNFUSED`), so
-the layer's other kernels leave the join's check as it is.
+cells' `CHOICES` are `gate_up`, `delta_gates` and `qkv`, a cell running its own. Every other choice a layer
+reports (the products' `grouped_matmul`, the gated product's `swiglu`, the delta net's `rms_norm`,
+`short_conv` and `gated_delta_rule`, the attention layer's `attention`) runs at XLA, and the fused MLP's
+`gated_mlp` apart, each named in the cell (`UNFUSED`), so the layer's other kernels leave the join's check as
+it is.
 
 What the route serves is read from the join's own selector: the layer traced for its shapes as the case's
 generation with the join named, the route its choice reports for the layer's projections
 (`joined.join_case`: plain Dense layers of one width, bias, dtype and precision, holding their own kernels)
 the `joined` kernel, not the projections apart a failed requirement hands them to. An axis a join's layer has
-no use of (a delta net has no gated product, bias or gate multiplier) takes its one value that says so,
-`none` or `plain`, and no other.
+no use of (a delta net has no gated product, bias or gate multiplier, an attention layer no gated product or
+gate multiplier) takes its one value that says so, `none` or `plain`, and no other.
 """
 
+import dataclasses
 
 import generation_support
 import jax
@@ -35,46 +40,70 @@ from kernel_matrix import AXES
 from reference_error import with_gradients
 from test_joined import assert_joined_as_exact, drawing
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, selection
 from dew.nn.linear import GatedDeltaNet
+from dew.nn.mixer_base import MixerContext
+from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 
 ROWS, FEATURES, HIDDEN = (2, 128), 256, 384
 """The layer's input `[batch, tokens]` rows, the features it reads and writes, a gated MLP's hidden width."""
 HEADS, HEAD_WIDTH = (2, 4), 64
-"""A gated delta net's key and value heads, and the width of each head's key and value."""
+"""A gated delta net's key and value heads, and the width of each head's key and value; an attention
+layer's key heads and query heads (its query, key and value projections 256, 128 and 128 wide)."""
 SEEDS = 8
 GATE_MULTIPLIER = 0.75
 """A scaled gate's multiplier (Falcon-H1's `mlp_multipliers`)."""
-CHOICES = frozenset({"gate_up", "delta_gates"})
+CHOICES = frozenset({"gate_up", "delta_gates", "qkv"})
 """The `generation.CHOICES` entries the cells run, a cell its case's join: each cell asserts that the routes
 it records run that join `joined` and that every choice outside `CHOICES` runs unfused (`UNFUSED`), which
 together reach them all."""
-KERNELS = {"gate_up": frozenset({"joined"}), "delta_gates": frozenset({"joined"})}
+KERNELS = {choice: frozenset({"joined"}) for choice in CHOICES}
 """The kernels under test of each choice the cells run: the join's projections as one."""
-UNFUSED = {**dict.fromkeys(("grouped_matmul", "swiglu", "rms_norm", "short_conv", "gated_delta_rule"),
-                           "xla"), "gated_mlp": "apart"}
+UNFUSED = {**dict.fromkeys(("grouped_matmul", "swiglu", "rms_norm", "short_conv", "gated_delta_rule",
+                            "attention"), "xla"), "gated_mlp": "apart"}
 """The layers' other choices, each named unfused in every cell: XLA's, and the fused MLP's projections
 apart."""
 
 
+def _unfused(join: str) -> dict[str, str]:
+    """`join`'s cells' other choices (`UNFUSED`): the side-by-side join's products the GEMM template's
+    (`grouped_matmul` named `mosaic`), so its cells run the side-by-side forward and the chained input
+    gradient natively where XLA's products would stand for them (head review of 4d6c7a69c)."""
+    return {**UNFUSED, "grouped_matmul": "mosaic"} if join == "qkv" else UNFUSED
+
+
 def _applies(case: dict[str, str]) -> bool:
-    """Whether `case` names a layer its join has: a gated MLP's activation and options, or a delta net's none
-    (`none` activation, no bias, a plain gate)."""
+    """Whether `case` names a layer its join has: a gated MLP's activation and options, an attention layer's
+    bias or none (`none` activation, a plain gate), or a delta net's none (`none` activation, no bias, a plain
+    gate)."""
     if case["join"] == "gate_up":
         return case["activation"] != "none"
+    if case["join"] == "qkv":
+        return (case["activation"], case["gate"]) == ("none", "plain")
     return (case["activation"], case["bias"], case["gate"]) == ("none", "none", "plain")
 
 
-def _layer(case: dict[str, str]) -> GatedMLP | GatedDeltaNet:
-    """`case`'s layer: its two projections separate parameters, as its checkpoints store them."""
+def _layer(case: dict[str, str]) -> GatedMLP | GatedDeltaNet | CausalSelfAttention:
+    """`case`'s layer: its projections separate parameters, as its checkpoints store them."""
     dtype = jnp.dtype(case["dtype"])
+    if case["join"] == "qkv":
+        return CausalSelfAttention(MixerContext(
+            emb_features=FEATURES, num_heads=HEADS[1], num_kv_heads=HEADS[0], head_dim=HEAD_WIDTH,
+            max_seq_len=ROWS[1], attention_bias=case["bias"] == "bias", dtype=dtype))
     if case["join"] == "delta_gates":
         return GatedDeltaNet(emb_features=FEATURES, num_k_heads=HEADS[0], num_v_heads=HEADS[1],
                              head_k_dim=HEAD_WIDTH, head_v_dim=HEAD_WIDTH, dtype=dtype)
     return GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, use_bias=case["bias"] == "bias",
                     activation=case["activation"],
                     gate_multiplier=GATE_MULTIPLIER if case["gate"] == "scaled" else 1.0, dtype=dtype)
+
+
+def _wide(layer: GatedMLP | GatedDeltaNet | CausalSelfAttention):
+    """`layer` computing in float64, the truth's: an attention layer's dtype its context's."""
+    if isinstance(layer, CausalSelfAttention):
+        return layer.clone(ctx=dataclasses.replace(layer.ctx, dtype=jnp.float64))
+    return layer.clone(dtype=jnp.float64)
 
 
 def _input(case: dict[str, str]):
@@ -85,15 +114,22 @@ def _input(case: dict[str, str]):
 def supported(case: dict[str, str]) -> bool:
     """Whether the route serves `case` (tests/kernel_matrix.py): its layer, which its join has (`_applies`),
     traced for its shapes as its generation within an abstract mesh of one of its devices, the join named and
-    the layer's other choices unfused (`UNFUSED`), reports the `joined` kernel for its join."""
+    the layer's other choices unfused (`_unfused`), reports the `joined` kernel for its join, no kernel it
+    names refusing it."""
     if not _applies(case):
         return False
     layer = _layer(case)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), case["generation"])
     params = jax.eval_shape(layer.init, jax.random.key(0), _input(case))
-    with (generation.assumed(case["generation"]), jax.sharding.use_abstract_mesh(mesh),
-          generation.chosen(**UNFUSED, **{case["join"]: "joined"}), generation.routes() as routes):
-        jax.eval_shape(layer.apply, params, _input(case))
+    try:
+        with (generation.assumed(case["generation"]), jax.sharding.use_abstract_mesh(mesh),
+              generation.chosen(**_unfused(case["join"]), **{case["join"]: "joined"}),
+              generation.routes() as routes):
+            jax.eval_shape(layer.apply, params, _input(case))
+    except selection.KernelRefused:
+        # A kernel the case names refusing it (the side-by-side join's template, `_unfused`, on a GPU or
+        # dtype it takes no product of): the route does not serve it.
+        return False
     return [route.kernel for route in routes if route.choice == case["join"]] == ["joined"]
 
 
@@ -101,13 +137,15 @@ CASES = (
     ('sm90', 'gate_up', 'swiglu', 'none', 'plain', 'bfloat16'),
     ('sm80', 'gate_up', 'geglu', 'bias', 'scaled', 'float16'),
     ('sm80', 'delta_gates', 'none', 'none', 'plain', 'float32'),
+    ('sm90', 'qkv', 'none', 'bias', 'plain', 'float16'),
     ('sm90', 'gate_up', 'swiglu', 'bias', 'scaled', 'float32'),
-    ('sm90', 'delta_gates', 'none', 'none', 'plain', 'float16'),
     ('sm90', 'gate_up', 'geglu', 'none', 'scaled', 'bfloat16'),
-    ('sm80', 'gate_up', 'swiglu', 'bias', 'plain', 'bfloat16'),
-    ('sm90', 'gate_up', 'geglu', 'none', 'plain', 'float32'),
     ('sm90', 'delta_gates', 'none', 'none', 'plain', 'bfloat16'),
-    ('sm90', 'gate_up', 'swiglu', 'none', 'plain', 'float16'),
+    ('sm80', 'gate_up', 'swiglu', 'none', 'plain', 'float16'),
+    ('sm80', 'gate_up', 'geglu', 'bias', 'plain', 'bfloat16'),
+    ('sm90', 'qkv', 'none', 'none', 'plain', 'bfloat16'),
+    ('sm90', 'gate_up', 'geglu', 'none', 'plain', 'float32'),
+    ('sm90', 'delta_gates', 'none', 'none', 'plain', 'float16'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("join")`, regenerated where the axes or the route's support change)."""
@@ -125,17 +163,18 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     layer = _layer(combination)
     dtype = jnp.dtype(combination["dtype"])
     params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
-    if combination["join"] == "gate_up":
+    if combination["join"] in ("gate_up", "qkv"):
         params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),
                               params)
-    with generation.chosen(**UNFUSED), generation.routes() as routes:
+    unfused = _unfused(combination["join"])
+    with generation.chosen(**unfused), generation.routes() as routes:
         assert_joined_as_exact(combination["join"], with_gradients(layer.apply),
                                drawing(params, (*ROWS, FEATURES), dtype),
-                               with_gradients(layer.clone(dtype=jnp.float64).apply), "-".join(case),
+                               with_gradients(_wide(layer).apply), "-".join(case),
                                seeds=SEEDS)
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded
-                     if pair[0] not in CHOICES and pair[1] != UNFUSED.get(pair[0], "xla"))
+                     if pair[0] not in CHOICES and pair[1] != unfused.get(pair[0], "xla"))
     assert (combination["join"], "joined") in recorded and not unnamed, (sorted(recorded), unnamed)
 
 
@@ -162,7 +201,7 @@ def per_shard(choice: str, kernel: str) -> dict:
     def truth(*operands):
         # The layer in float64 through XLA's products, which a float64 product runs on.
         with generation.chosen(grouped_matmul="xla"):
-            return with_gradients(layer.clone(dtype=jnp.float64).apply)(*operands)
+            return with_gradients(_wide(layer).apply)(*operands)
 
     named = {**UNFUSED, "grouped_matmul": "mosaic"}
     return {"data": Shard(with_gradients(layer.apply), drawing(params, (*ROWS, FEATURES), dtype),

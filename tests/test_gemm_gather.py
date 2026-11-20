@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import mx_matrix
 import numpy as np
 import pytest
+from gathered_walks import gathered_kernel
 from generation_support import cublas_compiled
 from jax.sharding import Mesh
 from reference_error import assert_as_exact, equations
@@ -212,51 +213,27 @@ def test_a_gathered_kernel_gradients_last_step_addresses_no_step_past_it():
 
 def _strided_gathers(tokens, table, plain, at: int | None = None):
     """`plain @ tokens[table[:, 0]]` a step of `STRIDED_BLOCK`'s rows at a time through a Blackwell's
-    gathered ring, its table's column zero the ring's (`rings.Rows` over a view of stride two): one tile;
-    or, `at` given, every step's rows those of a flat `table` from entry `at` (a Python int, past int32's
-    reach where the table is: `test_a_gathered_rings_steps_past_int32s_reach_lower_for_cuda`)."""
-    from dew.nn.kernels.templates import mosaic_sm100
-
-    family = mosaic_sm100.RINGS
+    gathered ring (`gathered_walks.gathered_kernel`), its table's column zero the ring's (`rings.Rows` over a
+    view of stride two): one tile; or, `at` given, every step's rows those of a flat `table` from entry `at`
+    (a Python int, past int32's reach where the table is:
+    `test_a_gathered_rings_steps_past_int32s_reach_lower_for_cuda`)."""
     (height, width), rows = STRIDED_BLOCK, plain.shape[0]
-    steps = plain.shape[1] // height
 
-    def body(x_gmem, table_gmem, w_gmem, o_gmem):
+    def views(operands, tile):
+        del tile
+        x_gmem, table_gmem, w_gmem, _ = operands
+
         def entries(step):
             return (rings.Rows(table_gmem.at[:, 0], step * height, (0,), 1) if at is None
                     else rings.Rows(table_gmem, at, (0,), 1))
 
-        def scope(*, streams):
-            def schedule(index):
-                views = {"x": (x_gmem, entries),
-                         "w": (w_gmem, lambda step: (0, step))}
-                return True, steps, views, index[0]
+        return {"x": (x_gmem, entries), "w": (w_gmem, lambda step: (0, step))}
 
-            def issue(wg, tile, walk, *, active):
-                del wg, tile, active
-
-                def step(index, slots, carry, accumulators):
-                    del index
-                    (acc,) = accumulators
-                    return carry, (family.products(acc, slots["w"], slots["x"]),)
-
-                return walk(step, None, ((rows, width),))[1]
-
-            def finish(wg, tile, accs, store, *, active):
-                del wg, tile, active
-                for first, (value,) in family.chunks(accs):
-                    store(0, value, o_gmem, (0, 0, rows, first, rows))
-
-            family.persist(streams, (1,), schedule, issue, finish, consumers=1, axis="programs",
-                           outputs=(((rows, width), jnp.float32),), interpret=False,
-                           accumulators=((rows, width),))
-
-        blocks = {"x": ((height, width), jnp.bfloat16), "w": ((rows, height), jnp.bfloat16)}
-        family.scoped(scope, streams=family.streams(blocks, 2, 1, gathered=("x",)))
-
-    return family.kernel(body, out_type=jax.ShapeDtypeStruct((rows, width), jnp.float32), grid=(1,),
-                         grid_names=("programs",), consumers=1, interpret=False,
-                         name="strided_gathers")(tokens, table, plain)
+    blocks = {"x": ((height, width), jnp.bfloat16), "w": ((rows, height), jnp.bfloat16)}
+    kernel = gathered_kernel(blocks, ("x",), (plain.shape[1] // height,), views, (rows, width), stages=2,
+                             out=jax.ShapeDtypeStruct((rows, width), jnp.float32), stored=True,
+                             name="strided_gathers")
+    return kernel(tokens, table, plain)
 
 
 STRIDED_BLOCK = (64, 64)

@@ -8,9 +8,7 @@ from flax.typing import PrecisionLike
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, selection
-from dew.nn.kernels.gemm import gemm, gemm_t
-from dew.nn.kernels.templates import swizzling
-from dew.nn.kernels.templates.gemm import rows_padded
+from dew.nn.kernels.gemm import gemm_t, joined_depths
 from dew.nn.precision import at_least_fp32, refuse_recipe
 
 LOW_RANK_ROW = 'ledger 1304'
@@ -38,8 +36,8 @@ def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scal
     Its reverse mode (first order): the input gradient is one product too, `[dy | u] · [kernel | a]ᵀ` with
     `u = scale · (dy · bᵀ)` rounded once; the factors' gradients are `lhsᵀ · (scale · (dy · bᵀ))` and `tᵀ ·
     dy`, the rank-wide kernel gradients; each operand's only where it is differentiated (a frozen kernel's,
-    `lhsᵀ · dy`, never). The concatenations are copies, a materialized strategy (b); a mainloop walking the
-    appended pair in place is row 1304's next form. A projection the run's low-precision recipe takes (its
+    `lhsᵀ · dy`, never). Each joined product is `gemm.joined_depths`': one `gemm` over the operands joined
+    along the depth, a materialized strategy (b). A projection the run's low-precision recipe takes (its
     role and its widths, `refuse_recipe`) is refused: the adapted product does not take the recipe."""
     refuse_recipe("an adapter's fused product (`gemm.low_rank`)", *kernel.shape)
     return _low_rank(lhs, kernel, a, b, jnp.asarray(scale, jnp.float32), out_dtype, precision,
@@ -54,21 +52,12 @@ def _rank_product(lhs: jax.Array, factor: jax.Array, scale: jax.Array, precision
     return scale.astype(wide) * summed
 
 
-def _appended(base: jax.Array, rank_part: jax.Array, axis: int, compute) -> jax.Array:
-    """`base` with `rank_part` after it along `axis`, the rank padded with zeros to whole steps of the widest
-    depth the template's families take on the product's `compute` dtype (its rows', which its matrix is
-    multiplied in: a 128-byte swizzle's row, `swizzling.SWIZZLE_BYTES`), so the extended depth divides into
-    the base's own steps and both operands extend alike, an fp32 master matrix's as its rows'."""
-    step = swizzling.swizzle_columns(compute, swizzling.SWIZZLE_BYTES)
-    rank_part = rows_padded(rank_part.astype(base.dtype), axis, step)
-    return jnp.concatenate([base, rank_part], axis=axis)
-
-
 def _extended(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu):
-    """`low_rank`'s value and its appended operand `t`, in at least fp32."""
+    """`low_rank`'s value and its appended operand `t`, in at least fp32: `[lhs | t] · [kernel ; b]`, `t`
+    rounded once to `lhs`'s dtype where it joins the depth (`gemm.joined_depths`)."""
     t = _rank_product(lhs, a, scale, precision)
-    out = gemm(_appended(lhs, t, 1, lhs.dtype), _appended(kernel, b, 0, lhs.dtype), out_dtype=out_dtype,
-               precision=precision, interpret_on_cpu=interpret_on_cpu)
+    out = joined_depths(((lhs, kernel), (t.astype(lhs.dtype), b)), out_dtype=out_dtype, precision=precision,
+                        interpret_on_cpu=interpret_on_cpu)
     return out, t
 
 
@@ -105,9 +94,8 @@ def _low_rank_backward(out_dtype, precision, interpret_on_cpu, residuals, cotang
     scaled = scale.astype(wide) * through
     d_lhs = d_kernel = d_a = d_b = d_scale = None
     if wants_lhs:
-        d_lhs = gemm(_appended(dy, scaled.astype(lhs.dtype), 1, lhs.dtype),
-                     _appended(kernel, a, 1, lhs.dtype), transpose_rhs=True, out_dtype=lhs.dtype,
-                     precision=precision, interpret_on_cpu=interpret_on_cpu)
+        d_lhs = joined_depths(((dy, kernel), (scaled.astype(lhs.dtype), a)), transpose_rhs=True,
+                              out_dtype=lhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
     if wants_kernel:
         d_kernel = gemm_t(lhs.astype(work), wide_dy, None, out_dtype=kernel.dtype, precision=precision,
                           interpret_on_cpu=interpret_on_cpu)[0]

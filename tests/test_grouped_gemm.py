@@ -1091,9 +1091,11 @@ def test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie(scatt
     integer values, so every sum is exact whatever tile each launch derives, and each side's one rounding
     the same."""
     rng = np.random.default_rng(5)
-    tokens = jnp.asarray(rng.integers(-3, 4, size=(40, 128)), jnp.bfloat16)
+    # 64 deep and wide, one step and one column tile a launch: every path the cell names at a quarter of
+    # the interpreter's work at 128 (row 8942: 130 s past its group's 120).
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(40, 64)), jnp.bfloat16)
     stacked = (3,) if layered else ()
-    matrices = jnp.asarray(rng.integers(-3, 4, size=(2, *stacked, 3, 128, 128)), jnp.bfloat16)
+    matrices = jnp.asarray(rng.integers(-3, 4, size=(2, *stacked, 3, 64, 64)), jnp.bfloat16)
     layer = jnp.asarray(2, jnp.int32) if layered else None
     # Interpreted on the host's CPU, whatever GPU it has: a B200's kernels compiled for a GH200 abort its
     # process (row 7130).

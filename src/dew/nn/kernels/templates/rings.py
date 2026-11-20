@@ -38,12 +38,15 @@ class Rows:
     its other block indices `rest`: a gathered stream's (`Transport.gathers_rows`), each run copied by the
     loading warpgroup (`gathered.Ring`), or interpreted where no lane-level copy runs, a piece of its own
     (`viewed`'s `Pieces`). A paged pool's key tile across the pages it spans takes a run a key
-    (`attention_mosaic_forward.paged_reads`)."""
+    (`attention_mosaic_forward.paged_reads`). `tiled`, whether its runs are the same at every step of a tile
+    (a gathered product's rows: `start` the tile's, the step in `rest`), so a load reading them ahead reads
+    them once a tile (`Ahead`)."""
 
     table: Any
     start: Any
     rest: tuple
     rows: int
+    tiled: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -147,12 +150,15 @@ class Ahead:
     `reads_ahead`), handed to its load (`Ring.load`'s `ahead`) so it reads those of the next step under this
     one's copies (`gathered.Committed`): `view` the next step's, resolved by the load that reads it ahead
     (a call: an ordinary ring, which reads no step ahead, never resolves it, so no step past the walk's last
-    is addressed, base review 103007773 F1), `live` whether the walk has that step, and `held` whether this
-    step's own were read at the step before (not a walk's first step)."""
+    is addressed, base review 103007773 F1), `live` whether the walk has that step and reads it (none where
+    its rows are the tile's, `Rows.tiled`: the step's own read for every step), `held` whether this step's
+    own were read before (not a walk's first step), and `parity` the half of the ring's two steps' entries
+    this step's are in (its counter's parity; a tiled view's the first, every step of its tile)."""
 
     view: Callable[[], Any]
     live: Any
     held: Any
+    parity: Any
 
 
 def reads_ahead(indices) -> bool:
@@ -164,21 +170,45 @@ def reads_ahead(indices) -> bool:
 def stepped_in(rings: dict, turn_of: Callable, view_of: Callable, ahead_of: Callable | None = None) -> None:
     """A step's loads into `rings` (`turn_of(key, ring)` its turn, `view_of(key, ring)` its source,
     `ahead_of(key, ring)` the next step's where its views read memory: `Ahead`, None otherwise), a barrier
-    pair at a time (`held_together`, `_loaded`): the one loader a producer's and a loading consumer's walks
-    (`fed.Feed`) take."""
-    for group in held_together(rings):
-        _loaded(group, turn_of, view_of, ahead_of)
+    pair at a time (`held_together`): a ring holding its own pair by its own load (`Ring.load`, a gathered
+    ring's its own copies, with the next step's view where it reads ahead), a joined pair's slot freed once
+    and each member copied into it (`_joined_loaded`); the one loader a producer's and a loading consumer's
+    walks (`fed.Feed`) take. Every ring's step is started (`Ring.started`: a ring reading its addresses
+    ahead issues a tile's first step's own reads), then the load warp's reads drained once (`Ring.drained`,
+    the first such ring's for all), before any ring loads, so no ring's wait for its own addresses waits on
+    another's next-step reads issued after its load (base reviews 103007773 F4, b68fc2382 F6)."""
+    groups = held_together(rings)
+    # Each lone ring's step formed once, for its await and its load, by its group's place.
+    lone = {at: _LoneStep(ring, turn_of(key, ring), view_of(key, ring),
+                          None if ahead_of is None else ahead_of(key, ring))
+            for at, group in enumerate(groups) if len(group) == 1 for key, ring in group.items()}
+    for step in lone.values():
+        step.ring.started(step.turn, step.view, step.ahead)
+    ahead = [step for step in lone.values() if step.ahead is not None]
+    if ahead:
+        ahead[0].ring.drained([(step.view, step.ahead) for step in ahead])
+    # The loads in the groups' own order.
+    for at, group in enumerate(groups):
+        if at in lone:
+            step = lone[at]
+            step.ring.load(step.turn, step.view, step.ahead)
+        else:
+            _joined_loaded(group, turn_of, view_of)
 
 
-def _loaded(group: dict, turn_of: Callable, view_of: Callable, ahead_of: Callable | None = None) -> None:
-    """A group's step loaded (`held_together`): a ring holding its own pair by its own load (`Ring.load`, a
-    gathered ring's its own copies, with the next step's view where it reads ahead, `Ahead`), a joined
-    pair's slot freed once and each member copied into it."""
-    if len(group) == 1:
-        [(key, ring)] = group.items()
-        ahead = None if ahead_of is None else ahead_of(key, ring)
-        ring.load(turn_of(key, ring), view_of(key, ring), ahead)
-        return
+@dataclasses.dataclass(frozen=True)
+class _LoneStep:
+    """A ring holding its own barrier pair at a step (`stepped_in`): its turn, its view and the next step's
+    (`Ahead`, None where it reads none ahead)."""
+
+    ring: "Ring"
+    turn: "Turn"
+    view: Any
+    ahead: "Ahead | None"
+
+
+def _joined_loaded(group: dict, turn_of: Callable, view_of: Callable) -> None:
+    """A joined pair's step loaded (`held_together`): its slot freed once and each member copied into it."""
     key, lead = next(iter(group.items()))
     # One slot for the pair (its rings hold one depth, `joined`), its index formed once (`Ring.load`).
     turn = turn_of(key, lead)
@@ -216,9 +246,12 @@ def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
 
         def ahead(name, ring):
             view = fixed[name]
-            if not (isinstance(view, tuple) and reads_ahead(view[1](step))):
+            if not (isinstance(view, tuple) and reads_ahead(indices := view[1](step))):
                 return None
-            return Ahead(functools.partial(ring.viewed, views[name], step + 1), step + 1 < walked, step > 0)
+            # A tile's rows read at its first step and held for its others (base review ae8a242ed F6).
+            live, parity = ((False, 0) if indices.tiled
+                            else (step + 1 < walked, jnp.asarray(counter + step, jnp.int32) % 2))
+            return Ahead(functools.partial(ring.viewed, views[name], step + 1), live, step > 0, parity)
 
         stepped_in(rings, lambda name, ring: ring.turn(counter + step),
                    lambda name, ring: ring.viewed(fixed[name], step), ahead)
@@ -369,6 +402,18 @@ class Ring:
     def viewed(self, view: tuple, step):
         """Step `step`'s source of the stream's view (`viewed`), as `load` takes it."""
         return viewed(view, self.block, step)
+
+    def started(self, turn: Turn, view, ahead: Ahead | None = None) -> None:
+        """The step's addresses' reads a tile's first step issues before any ring of the step loads
+        (`stepped_in`), where its load reads them ahead (`ahead`): nothing for a ring that reads none ahead
+        (`gathered.Committed`'s own)."""
+        del turn, view, ahead
+
+    def drained(self, steps: list) -> None:
+        """The step's address reads of every ring that reads them ahead (`steps`: each one's view and
+        `Ahead`) awaited once, after every ring's `started` and before any loads (`stepped_in`): a ring that
+        reads none ahead is never asked (`gathered.Committed`'s own)."""
+        del steps
 
     def load(self, turn: Turn, view, ahead: Ahead | None = None) -> None:
         """The producer's load of `turn`'s step from `view`, once its slot is free (`free`, `copy`): the

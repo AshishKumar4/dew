@@ -78,3 +78,19 @@ def test_an_op_refuses_a_declared_cell_that_matches_no_call(scope, own):
     with pytest.raises(ValueError):
         Op(generation.Choice.RMS_NORM, (template, Kernel('xla', (), generic=True)),
            declared={(scope, 'rows'): (template if own else fused, "a receipt")})
+
+
+@pytest.mark.parametrize("rows", [2, 8])
+def test_an_ops_preference_naming_no_kernel_for_a_case_routes_it_as_an_op_with_none(rows):
+    """An op whose preference names `xla` for calls of one row and no kernel otherwise (`Op.preferred`
+    returning None) routes a call of `rows` rows as the same op with no preference does: the template where
+    it takes the call, else XLA's program, its refusal named (the template refuses past four rows)."""
+    def stated(call: Call) -> str | None:
+        return 'xla' if call.rows == 1 else None
+
+    kernels = (Kernel('template', (ROWS,)), Kernel('xla', (), generic=True))
+    with_preference = select(Op(generation.Choice.RMS_NORM, kernels, preferred=stated), Call(rows))
+    without = select(Op(generation.Choice.RMS_NORM, kernels), Call(rows))
+    assert (with_preference.kernel, with_preference.preferred, with_preference.refusal) == (
+        without.kernel, without.preferred, without.refusal)
+    assert select(Op(generation.Choice.RMS_NORM, kernels, preferred=stated), Call(1)).kernel == 'xla'

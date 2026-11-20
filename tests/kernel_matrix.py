@@ -87,7 +87,7 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "join": {
         "generation": ("sm90", "sm80"),
-        "join": ("gate_up", "delta_gates"),
+        "join": ("gate_up", "delta_gates", "qkv"),
         "activation": ("swiglu", "geglu", "none"),
         "bias": ("none", "bias"),
         "gate": ("plain", "scaled"),
@@ -157,11 +157,12 @@ paired gate and up product under SwiGLU; the operands' dtype. The fused GEMM's (
 and `gemm_prologue`): the GPU; the stage a region fuses, its consumers into the epilogue, its producer (an RMS
 norm) into the prologue (its consumers after the product in XLA), or both; the consumers, a bias then a cast,
 or a SiLU of twice the product plus a residual; the operands' dtype. The joined projections' (the choices
-`gate_up` and `delta_gates`): the GPU; a gated MLP's gate and up projections joined, or a gated delta net's b
-and a; the MLP's activation, SwiGLU or GeGLU (`none` for the delta net, which has no gated product);
-projections with no bias or one; a gate times its multiplier or not (`plain` for the delta net); the operands'
-dtype. The fused gated MLP's (the choice `gated_mlp`): the GPU; its gated product, SwiGLU or GeGLU; its
-projections unclamped or clamped (`swiglu_limit`); the operands' dtype. The adapted product's (the choice
+`gate_up`, `delta_gates` and `qkv`): the GPU; a gated MLP's gate and up projections joined, a gated delta
+net's b and a, or an attention layer's query, key and value side by side; the MLP's activation, SwiGLU or
+GeGLU (`none` for the delta net and the attention layer, which have no gated product); projections with no
+bias or one; a gate times its multiplier or not (`plain` for the delta net and the attention layer); the
+operands' dtype. The fused gated MLP's (the choice `gated_mlp`): the GPU; its gated product, SwiGLU or GeGLU;
+its projections unclamped or clamped (`swiglu_limit`); the operands' dtype. The adapted product's (the choice
 `low_rank`): the GPU; the adapter's rank; a projection with no bias
 or one; the operands' dtype. The blockwise-scaled FP8 product's (the choice `blockwise_fp8`): the GPU (an
 H100's FP8 tensor cores); the columns a column scale covers (a weight block's 128, or one); the groups;

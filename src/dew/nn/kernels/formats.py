@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import bits
+from dew.nn.float_bits import exact_power2
 from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
 from dew.nn.precision import at_least_fp32
@@ -207,7 +208,10 @@ class MxFp8:
         scale = formats_of.MXFP8.scale
         bias = -jnp.finfo(scale).minexp
         exponent = jnp.clip(jnp.where(largest > 0, binade - 1 - top, -bias), -bias, bias)
-        scales = jax.lax.bitcast_convert_type((exponent + bias).astype(jnp.uint8), scale)
+        # The power its scale is, set in E8M0's bits by the one owner of an exact power (`exact_power2`: every
+        # biased exponent a power, none a zero; its byte the exponent plus 127, which its int8 sum wraps to
+        # past 127 and its bitcast reads back; row 8832).
+        scales = exact_power2(exponent, scale)
         # Each value over its scale as its exponent (`jnp.ldexp`), as `decoded` applies it: the least scale,
         # a block of zeros' or of magnitudes under 2^-118, is float32's subnormal 2^-127, which a program
         # that flushes subnormals (XLA's CPU, op by op or with its simplifier off) reads as zero, its zeros
@@ -217,13 +221,14 @@ class MxFp8:
 
     def decoded(self, dtype=jnp.float32) -> jax.Array:
         """Its values, exactly, in `dtype` (`[..., depth]`, float32 or a float64 truth's): each code times
-        its block's scale."""
-        exponents = jax.lax.bitcast_convert_type(self.scales, jnp.uint8).astype(jnp.int32) - 127
+        its block's scale, an E8M0 byte 0xFF's block NaN (OCP MX 5.4.1: E8M0's one non-number)."""
+        held = jax.lax.bitcast_convert_type(self.scales, jnp.uint8)
+        exponents = jnp.repeat(held.astype(jnp.int32) - 127, formats_of.MXFP8.depth, axis=-1)
         # Each E8M0 scale applied as its exponent (`jnp.ldexp`, in two normal steps): a scale below
         # float32's least normal (2**-128 for inputs near 2**-120) would read as zero where a device
         # flushes subnormals, though the value it scales to is normal.
-        return jnp.ldexp(self.codes.astype(dtype),
-                         jnp.repeat(exponents, formats_of.MXFP8.depth, axis=-1))
+        values = jnp.ldexp(self.codes.astype(dtype), exponents)
+        return jnp.where(exponents == 0xFF - 127, jnp.asarray(jnp.nan, dtype), values)
 
 
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
