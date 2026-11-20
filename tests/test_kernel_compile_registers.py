@@ -183,7 +183,11 @@ def test_a_triton_template_binary_in_compile_mosaic_kernels_reports_shared_regis
 
     # Mosaic estimates join only Mosaic binaries: a same-named Triton binary never masks a missing Mosaic
     # binary and never collides with a same-named Mosaic binary.
-    mosaic_est = {"attention_forward__l0123456789": "Resources(smem_bytes=1024, tmem_cols=0)"}
+    mosaic_est = {
+        "attention_forward__l0123456789": (
+            "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
+        )
+    }
     mixed = kc.reports(mosaic_est, [clean], {})
     assert len(mixed) == 2, mixed
     assert any(r.kind == "mosaic_gpu" and "binary" in r.unread for r in mixed), mixed
