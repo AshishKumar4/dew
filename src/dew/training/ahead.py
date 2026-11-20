@@ -888,12 +888,15 @@ def keeping() -> Iterator[Keeping]:
         programs.save("scoring.dew-aot")
 
     A later process of the same target hands them back (`kept`). A program compiled before the block, or
-    taken within it, is not among them. The block compiles with JAX's persistent cache off
-    (`dew._cache.uncached`): an executable XLA loaded from that cache serializes without its kernels (on a
-    CPU it then loads and fails at its first call, "Function ... not found"; plain JAX, 2026-11-09), so
-    each kept one is compiled here."""
+    taken within it, is not among them. On a CPU the block compiles with JAX's persistent cache off
+    (`dew._cache.uncached`): an executable XLA:CPU loaded from that cache serializes without its kernels (it
+    then loads and fails at its first call, "Function ... not found"; plain JAX, 2026-11-09), so each kept
+    one is compiled here. A GPU's served from the cache serializes whole, its Pallas kernels among it (row
+    6641: served, saved and run in a third process on a GH200, M-MC-30b), so a GPU process keeping its
+    programs reads the cache as any compile does, where it compiled each again."""
     kept = Keeping()
-    with uncached(), options.keeping(kept.heard):
+    served_whole = jax.default_backend() != "cpu"
+    with contextlib.nullcontext() if served_whole else uncached(), options.keeping(kept.heard):
         yield kept
 
 

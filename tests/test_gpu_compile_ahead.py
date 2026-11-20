@@ -580,3 +580,64 @@ def test_a_program_compiled_ahead_for_compile_only_gpus_of_no_stated_memory_comp
         got = jax.device_get(Executable.of(ahead).loaded(jax.devices()[:1])(*leaves))
     for value, wanted in zip(jax.tree.leaves(got), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(np.asarray(value), np.asarray(wanted))
+
+
+SERVED_KEPT = """
+import json
+import sys
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.experimental import pallas as pl
+
+from dew.nn.kernels.options import owned_program
+from dew.training.ahead import kept, keeping
+
+# The persistent cache's reads: each program served from it, and each it had none of.
+events = []
+jax.monitoring.register_event_listener(lambda event, **_: events.append(event))
+
+
+def kernel(x_ref, o_ref):
+    o_ref[...] = x_ref[...] * 2.0 + 1.0
+
+
+def doubled(x):
+    return pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x)
+
+
+x = jnp.arange(128 * 128, dtype=jnp.float32).reshape(128, 128)
+mode, path = sys.argv[1], sys.argv[2]
+if mode == "cache":
+    out = owned_program(doubled)(x)
+elif mode == "keep":
+    with keeping() as programs:
+        out = owned_program(doubled)(x)
+    programs.save(path)
+else:
+    with kept(path):
+        out = owned_program(doubled)(x)
+print(json.dumps({"ok": bool(np.array_equal(np.asarray(out), np.asarray(x) * 2 + 1)),
+                  "hits": sum(event == "/jax/compilation_cache/cache_hits" for event in events),
+                  "misses": sum(event == "/jax/compilation_cache/cache_misses" for event in events)}))
+"""
+"""A Pallas program on this GPU, in a process of its own sharing one cache: compiled into the persistent cache
+(`cache`), kept by `keeping` and saved to `path` (`keep`), or run from the file (`run`); whether it answered
+exactly, and how many programs its cache served and had none of."""
+
+
+def test_a_gpu_process_keeps_a_program_its_cache_serves_and_another_runs_it_compiling_nothing(tmp_path):
+    """On a GPU a block keeping its programs (`ahead.keeping`) reads JAX's persistent cache as any compile
+    does: a Pallas program the cache serves is kept and saved whole, its kernel among it, and a third
+    process handed the file runs it exactly, compiling nothing (row 6641; a CPU's served executable loses its
+    kernels, so a CPU block compiles each again)."""
+    from process_support import fresh
+
+    path = str(tmp_path / "served.dew-aot")
+    assert fresh(SERVED_KEPT, "cache", path, cache_dir=tmp_path / "cache")["ok"]
+    keep = fresh(SERVED_KEPT, "keep", path, cache_dir=tmp_path / "cache")
+    run = fresh(SERVED_KEPT, "run", path, cache_dir=tmp_path / "other")
+    assert keep["ok"] and keep["hits"] and not keep["misses"], keep
+    assert run["ok"] and not run["hits"] and not run["misses"], run
+
