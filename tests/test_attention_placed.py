@@ -389,8 +389,10 @@ def test_split_output_hook_forward_plans_and_emits_fp32_block_smem_residency():
                                                         scale=None, natural=False)
         ba_bf = op_bf.bind(*args_bf, residuals=template.Kept.NONE, interpret=False)
         assert not op_bf.deciding(ba_bf, one_wgmma)
-        assert op_bf.legal(ba_bf, one_wgmma, target)
-        # Certified FP16 dropout forward emits the same dropout-priced registers as the planner.
+        completed = op_bf.completed(ba_bf, one_wgmma)
+        assert completed.relaunch_k == 64 and completed.relaunch_columns is None
+        tight = dataclasses.replace(target, shared_limit=op_bf.staged_bytes(ba_bf, completed.relaunch, target))
+        assert op_bf.legal(ba_bf, completed, tight)
         q_f16 = jnp.ones((1, 128, 4, 64), jnp.float16)
         k_f16 = jnp.ones((1, 256, 2, 64), jnp.float16)
         op_f16, args_f16 = attention_mosaic._forward_call(q_f16, k_f16, k_f16, drop_spans, drop_hooks,
