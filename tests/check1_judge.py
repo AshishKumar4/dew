@@ -108,7 +108,8 @@ def _verdicts(drawn_for, verdict: Verdict, narrow_leaves: list[str], mode: Calla
 
 def _pooled_draws(label: str, references: int):
     """A judge's draws (`pooled_units`) and the YNNPACK mode its map tasks ran the arms in, which must be
-    one: `drawn_for(index)` over its map tasks' records of this site, `drawn(start, stop)` the pooled draws
+    one, as must the host class they ran on (`map_judge.host_class`) and, weighed, their classes' digest:
+    `drawn_for(index)` over its map tasks' records of this site, `drawn(start, stop)` the pooled draws
     of those seeds, refused past the seeds the records hold from seed 0 on."""
     pieces = pooled_units(label)
     held = pieces[-1][1]
@@ -120,6 +121,14 @@ def _pooled_draws(label: str, references: int):
     if len({payload.get("heavy") for _, _, payload in pieces}) > 1:
         raise PoolRefused(f"{label}: the map tasks weighed by different classes (`Conditioning.digest`)",
                           held)
+    # A verdict belongs to the host class whose arithmetic drew it: a pool of two pooled one class's draws
+    # into another's and escalated on their difference (train 1089's image SFT, 165 tasks on one class, 7 on
+    # another), weighed or not.
+    hosts = {payload.get("host") for _, _, payload in pieces}
+    if len(hosts) > 1:
+        raise PoolRefused(f"{label}: the map tasks ran on more than one host class, "
+                          f"{sorted(map(str, hosts))}; one verdict pools one class's draws "
+                          f"(`map_judge.host_class`)", held)
     if refused is not None:
         SWITCHED.append({"label": label, "refused": refused})
     for start, stop, payload in pieces:

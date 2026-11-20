@@ -119,8 +119,12 @@ def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 
         filled = [re.sub(r"\{(\w+)\}", lambda field, values=values: str(values[field[1]]), word)
                   for word in command]
         monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
-        assert ci.main() == 0
-        rows += json.loads(out.read_text())["rows"]
+        code = ci.main()
+        written = json.loads(out.read_text())["rows"]
+        # Its exit says whether a row it wrote is red (.armada.json's task.redExit), and nothing else.
+        red_exit = json.loads((ROOT / ".armada.json").read_text())["task"]["redExit"]
+        assert code == (red_exit if any(row["exitCode"] for row in written) else 0)
+        rows += written
     return rows
 
 

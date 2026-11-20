@@ -8,8 +8,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
-- finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
 - Performance measurements. [569, 285, 1378]
@@ -28,10 +26,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
 - A decode step's query and output pass through grouped_rows' transpose ([B,T,KV,G,D] to [B,T,G,KV,D] and back, attention.py:1113-1128) and a pad to the launch's…. [7926]
 - Attention tests to the bible's §6 and §7 test rules. [8437]
-- Tests/ring_protocol.py:422-435 reads gathered.Gathers' bodies by their fields (fill, fill_wait, read events written by hand) and test_ring_protocol.py:557-568…. [8657]
-- Tests/ring_protocol.py:838-839 accepts a read of an entries parity whose contents are a stale step's. [8678]
-- Tests/test_gemm_gather.py:200-242 (the strided-table gathers kernel) duplicates tests/test_ring_protocol.py:382-424's gathered walk fixture. [8679]
 - The portable recurrence gradient (tests/test_recurrence_stability.py's scalar-delta site at aligned keys, chunk_on 'xla', as tests/test_gpu_compile_ahead.py's…. [9762]
+- Under a manual mesh (a shard_map body checked for varying axes, check_vma), fused_gemm.product's launch (src/dew/nn/kernels/fused_gemm.py:78-107, fuser.fusible…. [9808]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -50,11 +46,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - The GEMM's quantizing epilogue, algebra.md §7.3 and §7.4's encode consumer. [8547]
 - FP8 weights on sm80 decoded in the GEMM's mainloop, algebra.md §7.3 and §7.4. [8548]
 - An FP8 key-value cache's codes decoded in the attention kernel on sm80, algebra.md §7.3's FP8 decodes. [8549]
-- Src/dew/nn/kernels/templates/gathered.py:325-326 and 403. [8658]
-- Src/dew/nn/kernels/templates/gathered.py:325-326 and 413-421. [8667]
 - Jax fork, Pallas Mosaic GPU lowering cache. [8721]
 - The wgmma consumer's register model against ptxas on the GEMM gate's sm90 tiles. [8723]
-- Py's large-write cells (a write of 2^100 decayed by three gates to about e^-120, x about -120, -173 in log2) are 4.0x to 12.8x the fp32 token loop's RMS error…. [9667]
 - Tools/kda_reference.py's rule_inputs draws a recorded site's inputs with NumPy's np.linalg.norm (a reduction whose order follows the host's SIMD) and np.exp…. [6030]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - The register model's proposals miss ptxas by up to about 100 registers either way on the GEMM's gate launches. [7095]
@@ -82,7 +75,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - XLA:CPU edges. [1591]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
-- Training & Data's tests on check 1. [9782]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 
@@ -106,7 +98,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - A ratio's transpose sums landed quotients along an axis its denominator varies over. [8292]
 - The merge law's derivative programs nearly doubled since the base review's fixes. [8427]
-- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235, 9781]
+- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Py `_holds_regions`: 'any other holder of a program (a manual mesh's, a native kernel's) is an opaque leaf'), so a projection mapped per shard…. [6578]
 - Bit-level synthesis in dew.algebra. [3733]
 - The merge law's placed sum keeps two bands of a term's span, not three. [8061]
@@ -131,5 +123,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
+- Shared XLA cache (tests/remote_cache.py). [9797]
+- The perf gate's regressions since 11-07: compile time, the 4B step's stall, a DiT's peak. [10135]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]

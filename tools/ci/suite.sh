@@ -7,7 +7,9 @@
 # The suite runs both Pythons as tasks of about five minutes each on Dew's armada deployment (.armada.json,
 # tools/armada/ci.py), on at most its pool, the gangs' containers beside it. A straggler at the end runs again
 # (task.speculative), and tasks share XLA's compilations through the dew-xla-cache Worker (tests/remote_cache.py).
-# Every suite task runs on AMD EPYC 25/17 or 26/17 (task.cpu): a row is recorded, and reused, on the class it ran on.
+# Every suite task runs on AMD EPYC 25/17 (task.cpu), one class, so a check-1 site's map tasks pool draws of one
+# host's arithmetic and a row is recorded, and reused, on it (2026-11-20: a pin of 25/17 and 26/17 spread one
+# site's 172 map tasks over both, and its judge escalated where either alone settles).
 # The gangs run tests/test_multihost.py's pools across four containers of an armada gang, one host each, which reach
 # each other through armada's relay; `ci.py gangs` reads them from the test's MODELS, so every case runs in one.
 #

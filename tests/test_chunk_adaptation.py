@@ -1296,8 +1296,9 @@ def test_each_activations_slopes_bound_its_derivatives(act):
 
 def test_what_the_adaptation_cannot_serve_is_refused():
     """An adaptation needs a level to step, takes a window of a token or more and a rate of zero or
-    more, and steps parts the level has. No generation steps the level yet, so an adapted objective
-    takes no previews, refuses a rollout's policy and records no task (ValueError, TypeError)."""
+    more, and steps parts the level has. A damped one, whose bounds read the whole sequence, decodes
+    none, so its objective takes no previews (ValueError); an undamped one's generation steps the level
+    as its forward does (tests/test_in_context_generation.py)."""
     with pytest.raises(ValueError):
         LMObjective(decoder(None), LENGTH, adaptation=ChunkAdaptation())
     with pytest.raises(ValueError):
@@ -1305,18 +1306,12 @@ def test_what_the_adaptation_cannot_serve_is_refused():
     with pytest.raises(ValueError):
         ChunkAdaptation(rate=-1.0)
     with pytest.raises(ValueError):
-        LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(),
+        LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(damped=True),
                     samples=Samples(prompt=[1, 2], max_new_tokens=2))
     objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(select=("sideways",)))
     variables = nn.unbox(objective.init(jax.random.key(0)))
     with pytest.raises(ValueError):
         objective.token_scores(variables, jnp.zeros((1, LENGTH + 1), jnp.int32))
-    adapted = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation())
-    with pytest.raises(ValueError):
-        adapted.policy(variables)
-    assert adapted.task_settings() is None
-    with pytest.raises(TypeError):
-        adapted.build_task(variables)
     # A damped step of `down` bounds its curvature through its activation's act'', which a ReLU's point
     # mass at zero leaves unbounded: refused there, and its `up` alone steps.
     relu = decoder(ContinuumLevel(hidden=4, activation="relu"))

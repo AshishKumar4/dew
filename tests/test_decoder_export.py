@@ -318,6 +318,7 @@ def test_an_expert_index_past_the_stack_is_refused(indexed):
         beyond.export(trip.trained)
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", COPIED_MTP, ids=COPIED_MTP)
 def test_the_mtp_copies_carry_the_trained_embedding_and_head(name, trips):
     """GLM's prediction depth ships copies of the trunk's embedding and
@@ -352,6 +353,7 @@ def test_glm5_next_trained_prediction_depth_reads_its_export(trips):
     assert np.any(trip.exported_tensors[projection] != trip.source_tensors[projection])
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", GRADIENTS, ids=GRADIENTS)
 def test_the_gradients_match_the_reference_implementation(name, trips):
     """Compare all trunk next-token CE gradients by source tensor name.
@@ -384,6 +386,7 @@ def test_the_gradients_match_the_reference_implementation(name, trips):
         f"dew's largest deviation is on {worst}")
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", BALANCED, ids=BALANCED)
 def test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export(name, trips):
     """The routers' balancing bias is state the step moves, not a
@@ -1395,6 +1398,7 @@ def assert_same_tensors(written: dict, expected: dict) -> None:
         assert written[tensor].dtype == value.dtype and np.array_equal(written[tensor], value), tensor
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", ["qwen3-moe-tiny", "deepseek-v3-tiny", "glm5-next-tiny"])
 def test_a_moe_decoder_saves_every_tensor_its_source_holds(name, tmp_path):
     """A causal MoE decoder saved in its source's layout writes every tensor the source checkpoint

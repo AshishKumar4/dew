@@ -49,6 +49,7 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 from flax.typing import Initializer
+from jax.core import ShapedArray
 
 from dew import _cache
 from dew.batch import FROZEN
@@ -634,14 +635,25 @@ def auto_part(spec: jax.sharding.PartitionSpec,
                                         else axes[0] if len(axes) == 1 else axes or None for axes in kept))
 
 
+def explicit_placement(aval: ShapedArray) -> jax.sharding.NamedSharding | None:
+    """Where the type `aval` (`jax.typeof`'s) places its value where its mesh has an Explicit axis, None
+    otherwise. A value no Explicit axis splits on such a mesh (a replicated one) still has its placement:
+    the one lookup of an Explicit placement, which `explicit_spec` narrows to a split, a reshard restores
+    (`dew.nn.aligned`), a product infers from its operands (`dew.nn.kernels.xla_products`) and a trainer
+    types its batch by (row 8838)."""
+    sharding = aval.sharding
+    explicit = isinstance(sharding, jax.sharding.NamedSharding) and sharding.mesh.explicit_axes
+    return sharding if explicit else None
+
+
 def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding | None:
     """Where `x`'s type places it, over its dimensions and `trailing` more
     left whole, when an Explicit axis splits it (`MeshSpec.explicit`); None
     otherwise. An operation JAX cannot place from its operands' types (a
     gather, a scatter, a reshape that splits a split dimension, a repeat)
     takes it as its `out_sharding`; None leaves the operation as it was."""
-    sharding = jax.typeof(x).sharding
-    if not isinstance(sharding, jax.sharding.NamedSharding):
+    sharding = explicit_placement(jax.typeof(x))
+    if sharding is None:
         return None
     explicit = set(sharding.mesh.explicit_axes)
     spec = tuple(sharding.spec)

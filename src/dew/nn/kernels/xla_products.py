@@ -128,13 +128,9 @@ def ragged_placement(sources: tuple) -> jax.sharding.NamedSharding | None:
     group axis), a contraction's sum whole, a mesh axis placing two dimensions placing the first alone; None
     where no operand's type names such a mesh."""
     from dew.mesh import mesh_axes
+    from dew.nn.sharding import explicit_placement
 
-    def placed(operand):
-        sharding = jax.typeof(operand).sharding
-        explicit = isinstance(sharding, jax.sharding.NamedSharding) and sharding.mesh.explicit_axes
-        return sharding if explicit else None
-
-    shardings = [None if source is None else placed(source[0]) for source in sources]
+    shardings = [None if source is None else explicit_placement(jax.typeof(source[0])) for source in sources]
     mesh = next((each.mesh for each in shardings if each is not None), None)
     if mesh is None:
         return None
