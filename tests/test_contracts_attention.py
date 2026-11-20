@@ -195,22 +195,22 @@ def test_the_sparse_latent_kernel_holds_every_order(edge):
     over its selected latents and rope heads, is; a slot naming no key reads nothing."""
     from dew.nn import sparse_selection
 
-    shapes = ((1, 3, 4, 64), (1, 3, 4, 64), (1, 3, 64), (1, 3, 64))
+    shapes = ((1, 3, 2, 32), (1, 3, 2, 32), (1, 3, 32), (1, 3, 32))
     selected = jnp.asarray([[[0, -1], [1, 0], [2, 0]]], jnp.int32)
-    scale = 128 ** -0.5
+    scale = 64 ** -0.5
 
-    def drawn(seeds: tuple, size: float) -> tuple:
-        # The operands, their directions and the context's cotangent from `seeds`, bf16: the template's
+    def inputs(seed, size: float) -> tuple:
+        # The operands, their directions and the context's cotangent from `seed`, bf16: the template's
         # decode reads 16-bit latents.
-        primals, direction = (tuple(x.astype(jnp.bfloat16) for x in normal_draw(seed, *shapes, scale=size))
-                              for seed in seeds[:2])
-        (cotangent,) = normal_draw(seeds[2], (1, 3, 4, 64))
+        primals, direction = (tuple(x.astype(jnp.bfloat16)
+                                    for x in normal_draw([tag, seed], *shapes, scale=size))
+                              for tag in (9023, 9024))
+        (cotangent,) = normal_draw([9025, seed], (1, 3, 2, 32))
         return primals, direction, cotangent.astype(jnp.bfloat16)
 
-    primals, direction, cotangent = drawn((9023, 9024, 9025), EDGES[edge])
-
+    @jax.jit
     def sparse(absorbed, query_rot, latent, rot):
-        with generation.assumed("sm90"):
+        with generation.assumed("sm80"):
             return sparse_selection.templated_context(scale, None, 4)(absorbed, query_rot, latent, rot,
                                                                       selected)
 
@@ -222,12 +222,8 @@ def test_the_sparse_latent_kernel_holds_every_order(edge):
         logits = jnp.where(selected[:, :, None, :] >= 0, logits, -jnp.inf)
         return jnp.einsum("bqhk,bqkr->bqhr", jax.nn.softmax(logits, axis=-1), keys)
 
-    def draw(seed):
-        """A seed's operands, directions and cotangent at unit scale (the mesh order's check 1)."""
-        return drawn(([9023, seed], [9024, seed], [9025, seed]), 1.0)
-
-    assert_contract(sparse, primals, direction, cotangent, f"the sparse latent kernel {edge}",
-                    truth_fn=plain, plain_fn=plain, draw=draw if edge == "normal" else None)
+    assert_drawn_contract(sparse, inputs, EDGES[edge], f"the sparse latent kernel {edge}",
+                          truth_fn=plain, plain_fn=plain, seeds=8)
 
 
 @pytest.mark.parametrize("edge", EDGES)
