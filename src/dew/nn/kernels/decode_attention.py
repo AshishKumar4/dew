@@ -181,7 +181,8 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool | Non
                            score_mod=None if softcap is None else Capped(softcap),
                            natural=jnp.dtype(dtype) == jnp.float32 if natural is None else natural,
                            headroom=algebra.headroom(dtype), initial=sinks,
-                           compensated=algebra.compensates(dtype), prescale=power, subtracted=True)
+                           compensated=algebra.compensates(dtype), prescale=power, subtracted=True,
+                           largest=dtype)
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,

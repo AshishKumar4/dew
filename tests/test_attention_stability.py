@@ -1208,16 +1208,16 @@ def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_refere
                     seeds=seeds, truth_fn=_reference(family, anchored=True))
 
 
-MAINLOOPS = ("portable", "triton", *(("mosaic", "decode") if INTERPRETED else ()))
-"""The forwards a mean's test walks: the plain-JAX mainloop's and the Pallas-Triton one's, and in a CPU
-process the Mosaic forward's and its decode step's interpreted as an H100 runs them (a GPU runs them in
-`_mainloops`' Mosaic arms and the decode cells)."""
+MAINLOOPS = ("portable", "triton", "decode_kernel", *(("mosaic", "decode") if INTERPRETED else ()))
+"""The forwards a mean's test walks: the plain-JAX mainloop's, the Pallas-Triton one's and the Triton decode
+kernel's, and in a CPU process the Mosaic forward's and its decode step's interpreted as an H100 runs them (a
+GPU runs them in `_mainloops`' Mosaic arms and the decode cells)."""
 
 
 @pytest.mark.parametrize("sink", [None, -20.0], ids=["no sink", "a sink"])
 @pytest.mark.parametrize(("mainloop", "training"),
                          [(mainloop, training) for mainloop in MAINLOOPS for training in (False, True)
-                          if mainloop != "decode" or not training],
+                          if mainloop not in ("decode", "decode_kernel") or not training],
                          ids=lambda value: {False: "inference", True: "training"}.get(value, value))
 def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, sink):
     """One fp16 query over a key at logit 0 and 1000 at a logit whose weight, 0.50035, narrows up to 0.5005
@@ -1253,6 +1253,14 @@ def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, s
             with generation.assumed("sm90"):
                 out = attention_mosaic.forward(query, key, value, spans, hooks, interpret=True,
                                                residuals=kept)
+        elif mainloop == "decode_kernel":
+            target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
+            pin = {decode_attention.DecodeAttention: decode_attention.Split(1 if sink is None else 2)}
+            sunk = None if sink is None else jnp.full((heads,), sink, jnp.float32)
+            with target, tuning.pinned(pin):
+                out = decode_attention.attend(query, _cache(key), _cache(value),
+                                              jnp.asarray([keys], jnp.int32), sinks=sunk,
+                                              interpret=INTERPRETED)
         else:
             with generation.assumed("sm90"):
                 out = attention_decode.attend(query, key, value, spans, hooks, interpret=True)

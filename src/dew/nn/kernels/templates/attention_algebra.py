@@ -51,7 +51,7 @@ from dew.nn.kernels.templates.attention import (
     dropped_reach,
     drops_in_place,
     kept,
-    mean_held,
+    saturated,
     within,
 )
 from dew.nn.precision import float32_einsum, lowered_divide, power2, scalar_power2, two_product, two_sum
@@ -940,15 +940,6 @@ def settled(state: Partial) -> Partial:
         return total + jnp.where(finite(dropped), dropped, 0.0)
 
     return Partial(joined(state.acc, low.acc), state.m, joined(state.total, low.total), state.scale)
-
-
-def saturated(x: jax.Array, finite_operands: jax.Array) -> jax.Array:
-    """`x` saturated at its float dtype's largest magnitude where `finite_operands` holds and `x` overflowed
-    it (row 6882): one owner shared by `base2_maximum` and `raw_maximum`; a quotient's hold is its values'
-    dtype's (`quotient`, `attention.mean_held`), past fp32's largest the same."""
-    largest = jnp.finfo(x.dtype).max
-    return jnp.where(infinite(x) & finite_operands,
-                     jnp.where(x > 0, largest, -largest).astype(x.dtype), x)
 
 
 def base2_maximum(m: jax.Array) -> jax.Array:
@@ -1903,7 +1894,7 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
         return jnp.where(raised > 0, lowered_divide(lifted, divisor, raised), plain)
 
     out = bodies.subnormals(divided, acc.dtype)
-    return out if held is None else mean_held(out, acc, held)
+    return out if held is None else saturated(out, finite(acc), held)
 
 
 def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:
