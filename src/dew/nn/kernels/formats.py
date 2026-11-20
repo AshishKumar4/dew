@@ -10,6 +10,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import DTypeLike
 
 from dew.algebra import bits
 from dew.nn.kernels.templates import product as formats_of
@@ -85,11 +86,11 @@ class NvFp4:
         words = _staged_words(codes, xp)
         return cls(xp.swapaxes(words, -1, -2), xp.swapaxes(scales, -1, -2), xp.asarray(scale, xp.float32))
 
-    def codes(self) -> jax.Array:
-        """Its codes' values (`[..., depth, width]` float32, each code's E2M1 value) in the depths' own
-        order."""
+    def codes(self, dtype: DTypeLike = jnp.float32) -> jax.Array:
+        """Its codes' values (`[..., depth, width]` in `dtype`, float32 by default, each code's E2M1 value) in
+        the depths' own order."""
         words = jnp.swapaxes(self.words, -1, -2)
-        staged = functools.partial(_codes, staged=True)
+        staged = functools.partial(_codes, dtype=dtype)
         # Each matrix's own, over every leading axis: a bank's groups, a stack of banks' layers before them.
         for _ in range(words.ndim - 2):
             staged = jax.vmap(staged)
@@ -151,12 +152,11 @@ def _e2m1_values(codes: jax.Array) -> jax.Array:
     return jnp.asarray(fake_quant.E2M1)[codes]
 
 
-def _codes(words: jax.Array, *, staged: bool = False) -> jax.Array:
-    """The codes' values of `words` (each its E2M1 value, float32 `[depth, width]`), in the depths' own order
-    where `staged` (`staged_rows`), else the words' own: `bits.nvfp4_decoded` at a block scale of 2^8."""
-    unit = jnp.full((words.shape[0] // 2, words.shape[1]), bits.NVFP4_OWED, jnp.float8_e4m3fn)
-    codes = bits.nvfp4_decoded(words, unit).astype(jnp.float32)
-    return codes[np.argsort(staged_rows(codes.shape[0]))] if staged else codes
+def _codes(words: jax.Array, dtype: DTypeLike = jnp.float32) -> jax.Array:
+    """The codes' values of staged `words` (each its E2M1 value in `dtype`, `[depth, width]`) in the depths'
+    own order (`staged_rows` undone): `bits.nvfp4_codes`, the one word-to-code decode (row 8718)."""
+    codes = bits.nvfp4_codes(words, dtype)
+    return codes[np.argsort(staged_rows(codes.shape[0]))]
 
 
 def _staged_words(codes, xp=jnp):

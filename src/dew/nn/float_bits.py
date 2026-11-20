@@ -23,7 +23,10 @@ def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax
     NaN's is a power and none a zero, from `minexp` to `maxexp - 1`: the one owner of an exact power of two.
     No `exp2`, which XLA computes as `exp(n ln 2)` and whose products it fuses into one `exp` of their sum. A
     format whose width no integer holds (FP6) takes float32's power, its sentinel its own zero, cast to it,
-    exactly. `dtype` is the one JAX makes of it (a Python `float` float32 where x64 is off)."""
+    exactly. `dtype` is the one JAX makes of it (a Python `float` float32 where x64 is off). Past `maxexp - 1`
+    `n` is set in the field as the word's two's complement holds it, which a quantizer's ceiling reads
+    (`fake_quant`): IEEE's infinity at `maxexp`, and in float32 a NaN's `maxexp + 1` the sign bit alone,
+    `0x80000000`."""
     dtype = jax.dtypes.canonicalize_dtype(dtype)
     limits = jnp.finfo(dtype)
     # Its value, not a narrow type's wrap of a sentinel (an unsigned 2-bit -3 is 1).
