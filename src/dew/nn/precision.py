@@ -1353,10 +1353,11 @@ def _protected(transform: Callable) -> Callable:
     return bound_span(Protected(), transform)
 
 
-MARKED_BACKENDS = frozenset({"cpu"})
-"""The lowering backends whose compiler rounds an operation the fork's no-contract attribute marks on its own
-(`no_contract`): XLA:CPU's fusion compiler fences it (the fork's xla no_contract_mark patch); XLA:GPU's fusion
-emitters carry the mark and no fence, and contract it as any other."""
+MARKED_BACKENDS = ("cpu",)
+"""The platforms whose compiler rounds an operation the fork's no-contract attribute marks on its own, so a
+marked transform's operands need no barrier there (`uncontracted`, chosen as the program lowers for its
+platform): XLA:CPU's fusion compiler fences the mark (the fork's xla no_contract_mark patch); XLA:GPU's
+fusion emitters carry it and no fence, and contract it as any other (row 10135)."""
 
 _MARKING = contextvars.ContextVar("dew.nn.precision.marking", default=False)
 """Whether the arithmetic traced now is marked to round alone (`rounding_alone`), so the operands it reads
@@ -1364,28 +1365,24 @@ need no barrier (`uncontracted`)."""
 
 
 def no_contract() -> str | None:
-    """The frontend attribute under which the lowering's compiler rounds a float add, subtract or multiply on
-    its own, never contracted into a fused multiply-add (`jax.extend.backend.no_contract_attribute`, the
-    fork's from post112, where the backend lowered for honours it: `MARKED_BACKENDS`); None where the jaxlib
-    marks nothing (a stock jaxlib), where the backend's compiler does not fence the mark, or where the suite
-    asks the barrier path (`dew._cache.BARRIERED`)."""
+    """The frontend attribute under which a compiler of `MARKED_BACKENDS` rounds a float add, subtract or
+    multiply on its own, never contracted into a fused multiply-add (`jax.extend.backend
+    .no_contract_attribute`, the fork's from post112); None where the jaxlib marks nothing (a stock jaxlib),
+    or where the suite asks the barrier path (`dew._cache.BARRIERED`)."""
     from jax.extend.backend import no_contract_attribute
 
     from dew import _cache
-    from dew.nn.kernels.generation import backend
 
-    if _cache.BARRIERED.value or backend() not in MARKED_BACKENDS:
-        return None
-    return no_contract_attribute()
+    return None if _cache.BARRIERED.value else no_contract_attribute()
 
 
 @contextlib.contextmanager
 def rounding_alone():
-    """Every float add, subtract and multiply traced in the block rounded on its own, never contracted into
-    a fused multiply-add, where the lowering's compiler honours the mark (`no_contract`, `set_xla_metadata`):
-    an error-free transform's arithmetic, each step's rounded value the one every later step reads, its
-    operands read without a barrier (`uncontracted`). Elsewhere nothing is marked, and the transforms hold
-    their operands behind a barrier."""
+    """Every float add, subtract and multiply traced in the block marked to round on its own, never
+    contracted into a fused multiply-add, where the jaxlib marks so (`no_contract`, `set_xla_metadata`): an
+    error-free transform's arithmetic, each step's rounded value the one every later step reads, its operands
+    read without a barrier where the platform the program lowers for fences the mark (`uncontracted`).
+    Elsewhere nothing is marked, and the transforms hold their operands behind a barrier."""
     name = no_contract()
     if name is None:
         yield
@@ -1428,8 +1425,9 @@ def uncontracted(*values):
     the value where it is made, so every reader sees the one rounded value (`two_sum`'s operands,
     `two_product`'s product); a caller whose plain float32 arithmetic leaned on the contractions a barrier
     splits around it takes its sum compensated (`summed_once`, row 7979). Inside a transform whose own
-    arithmetic is marked to round alone (`rounding_alone`), the values as they are: no step reading them
-    contracts, and no barrier splits the fusions around them (row 8378).
+    arithmetic is marked to round alone (`rounding_alone`), the values as they are where the platform the
+    program lowers for fences the mark (`MARKED_BACKENDS`, `jax.lax.platform_dependent`): no step reading
+    them contracts, and no barrier splits the fusions around them (row 8378); the barrier on any other.
 
     In a Pallas TPU kernel's body (`launches.interpreting` False, a launch compiled for a TPU,
     `generation.backend`) the values as they are: Pallas TPU's Mosaic lowering takes no barrier (post108 to
@@ -1439,8 +1437,13 @@ def uncontracted(*values):
     from dew.nn.kernels.generation import backend
     from dew.nn.kernels.launches import interpreting
 
-    in_tpu_kernel = interpreting() is False and backend() == "tpu"
-    return values if in_tpu_kernel or _MARKING.get() else jax.lax.optimization_barrier(values)
+    if interpreting() is False:
+        # A compiled kernel's body, whose platform is its own: a TPU's as it is, any other's barriered.
+        return values if backend() == "tpu" else jax.lax.optimization_barrier(values)
+    if not _MARKING.get():
+        return jax.lax.optimization_barrier(values)
+    return jax.lax.platform_dependent(*values, default=lambda *values: jax.lax.optimization_barrier(values),
+                                      **dict.fromkeys(MARKED_BACKENDS, lambda *values: values))
 
 
 def _odd(dtype) -> bool:
