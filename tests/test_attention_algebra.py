@@ -1119,7 +1119,7 @@ def test_a_padded_query_walks_nothing_again_where_a_real_row_past_fp32_does(form
 
 
 def test_saturated_is_the_one_saturation_rule():
-    """Row 6882: `saturated`, `base2_maximum`, `raw_maximum` and `quotient(..., held=True)` share one
+    """Row 6882: `saturated`, `base2_maximum`, `raw_maximum` and `quotient(..., held=jnp.float32)` share one
     saturation rule: finite operands whose result overflows clamp to `±finfo(dtype).max`, while infinite
     operands, finite results and NaNs pass through unchanged."""
     largest = np.float32(np.finfo(np.float32).max)
@@ -1139,5 +1139,5 @@ def test_saturated_is_the_one_saturation_rule():
 
     acc = jnp.asarray([[largest, -largest, jnp.inf, 2.0]], jnp.float32)
     total = jnp.asarray([0.5], jnp.float32)
-    held = np.asarray(algebra.quotient(lambda sums: sums / total[:, None], acc, total, held=True))
+    held = np.asarray(algebra.quotient(lambda sums: sums / total[:, None], acc, total, held=jnp.float32))
     np.testing.assert_array_equal(held, np.asarray([[largest, -largest, np.inf, 4.0]], np.float32))

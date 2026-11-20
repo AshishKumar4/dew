@@ -8,11 +8,13 @@ in bf16.
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import interprets
 from reference_error import FEWEST_SEEDS, assert_as_exact
 from test_attention_route import CASES, HEADS, KV_HEADS, WIDTH, drawing, keywords
 from test_attention_template import (
@@ -704,6 +706,28 @@ def test_a_resumed_state_of_a_large_denominator_keeps_a_finite_dropping_backward
     assert bool(np.all(np.isfinite(np.asarray(grads.value))))
 
 
+WALKS = ("portable", *(("mosaic",) if interprets() else ()))
+"""The forwards a dropping edge's test walks: the plain-JAX mainloop's at tiles of 8, and in a CPU process the
+Mosaic forward's interpreted as an H100 runs it, its split join's where it trains."""
+
+
+def _walked(spans, hooks, training: bool, mainloop: str = "portable", **options) -> Callable:
+    """`mainloop`'s call over `spans` under `hooks` (`WALKS`; its training walk's where `training`), its
+    output alone, a function of `(query, key, value)` for check 1."""
+    def walked(query, key, value):
+        if mainloop == "portable":
+            out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                                  hooks, residuals=training, **options)
+        else:
+            kept = template.Kept.SPLIT if training else template.Kept.NONE
+            with generation.assumed("sm90"):
+                out = attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept,
+                                               interpret=True, **options)
+        return out[0] if training else out
+
+    return walked
+
+
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
 @pytest.mark.parametrize(("rate", "logit", "seed"),
                          [(1.0 - 2.0 ** -14, -18.0, None), (127 / 256, -17.34375, None),
@@ -725,14 +749,114 @@ def test_an_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(rate, logit,
     value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(2.0 ** 15)
     spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
 
-    def walked(query, key, value):
-        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                              hooks, scale=1.0, residuals=training)
-        return out[0] if training else out
-
+    walked = _walked(spans, hooks, training, scale=1.0)
     assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
                                                                          scale=1.0),
                     lambda seed: (query, key, value), "a small kept fp16 weight", seeds=FEWEST_SEEDS)
+
+
+@pytest.mark.parametrize("mainloop", WALKS)
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+@pytest.mark.parametrize(("weight", "multiplier"), [(0.4999, 3.00085), (0.5002, 2.9998)],
+                         ids=["rounded-at-its-reach", "rounded-with-its-multiplier"])
+def test_an_fp16_kept_weight_near_fp16s_largest_keeps_its_output_finite(weight, multiplier, training,
+                                                                        mainloop):
+    """Two fp16 keys at logits 0 and log(`weight`), the first dropped and the second kept at the multiplier
+    z, values 0 and fp16's largest: the output z w 65504 / (1 + w), 65513.82 and 65517.09, is below the
+    65520 that rounds to inf, finite and on par with the reference (check 1) on both walks of each mainloop
+    (`WALKS`), where one fp16
+    rounding of the kept weight put it past: at the multiplier's reach of 4, 4w to 2 (the base review of
+    70c1aa096, F1); with the multiplier, z w to 1.500977 (row 9505). The logit is two fp16 entries of the
+    key, their sum in fp32 log(`weight`)."""
+    rate = 1.0 - 1.0 / multiplier
+    words = first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1]))
+    logit = np.float32(np.log(weight))
+    high = np.float16(logit)
+    query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[..., :2].set(1)
+    key = (jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(high)
+           .at[0, 1, 0, 1].set(np.float16(logit - np.float32(high))))
+    value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1].set(jnp.finfo(jnp.float16).max)
+    spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
+
+    walked = _walked(spans, hooks, training, mainloop, scale=1.0)
+    assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
+                                                                         scale=1.0),
+                    lambda seed: (query, key, value), "an fp16 kept weight near fp16's largest",
+                    seeds=FEWEST_SEEDS)
+
+
+def _anchor_below_least_subnormal():
+    """`test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term`'s call: its spans, hooks and operands
+    `(query, key, value)`."""
+    rate = 1.0 - 2.0 ** -14
+    words = first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1]))
+    query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[..., 0].set(1)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 0, 0, 0].set(-1)
+    value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1].set(2.0 ** 15)
+    spans = template.spans(1, 2, 1)
+    hooks = template.Hooks(initial=template.sinks(jnp.asarray([18.0], jnp.float16), 1, 1, 8),
+                           drop=dropout_of(words, 1, 1, rate))
+    return spans, hooks, (query, key, value)
+
+
+@pytest.mark.parametrize("mainloop", WALKS)
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+def test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term(training, mainloop):
+    """One fp16 query over a sink at 18 and two keys at logits -1 and 0, values 0 and 2^15, at a rate of
+    1 - 2^-14 under a draw dropping the first key and keeping the second, the row's anchor: its weight e^-18
+    is below fp16's least subnormal, its term times the multiplier 2^14 is not, so the output is about
+    8.18, on par with the reference (check 1) on both walks of each mainloop (`WALKS`), where the training
+    walk's split sums rounded the anchor's own weight to fp16 before the multiplier took it, 0 (the base
+    review of 70c1aa096, F2; row 9506)."""
+    spans, hooks, operands = _anchor_below_least_subnormal()
+    walked = _walked(spans, hooks, training, mainloop, scale=1.0)
+    assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
+                                                                         scale=1.0),
+                    lambda seed: operands, "a kept anchor below fp16's least subnormal", seeds=FEWEST_SEEDS)
+
+
+def test_an_fp16_reference_dropping_products_mixed_derivatives_are_its_products():
+    """The reference's fp16 dropping product of narrowed weights (`attention.reference`'s wide cotangent) is
+    bilinear at every order: one fp16 query over keys at logits 0 and 1, values 0 and v, at a rate of 1/2
+    under a draw dropping the first key and keeping the second, whose output is 2 sigmoid(q) v where q is
+    the query's logit difference: its mixed second derivative as to the query and the kept value, each order
+    of the two, on par with float64's (check 1), where each operand's derivative path stopped the other's
+    and took it to zero (the head review of af043f9b1, F1)."""
+    rate = 0.5
+    words = first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1]))
+    spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(1)
+
+    def output(q, v):
+        query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[0, 0, 0, 0].set(q.astype(jnp.float16))
+        value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(v.astype(jnp.float16))
+        return template.reference(query, key, value, spans, hooks, scale=1.0)[0, 0, 0, 0].astype(jnp.float32)
+
+    def mixed(q, v):
+        by_value_of_query = jax.grad(jax.grad(output, argnums=0), argnums=1)(q, v)
+        by_query_of_value = jax.grad(jax.grad(output, argnums=1), argnums=0)(q, v)
+        return jnp.stack([by_value_of_query, by_query_of_value])
+
+    def truth(q, v):
+        sigmoid = 1 / (1 + jnp.exp(-q))
+        return jnp.stack([2 * sigmoid * (1 - sigmoid)] * 2) * jnp.ones_like(v)
+
+    assert_as_exact(mixed, truth, lambda seed: (jnp.float32(0.0), jnp.float32(1.0)),
+                    "an fp16 dropping product's mixed derivatives", seeds=FEWEST_SEEDS, truth_fn=truth)
+
+
+def test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_gradients():
+    """`test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term`'s call through the Mosaic backward from
+    its forward's split sums (`attention_mosaic_backward`'s D, which reads the anchor's own weight they
+    keep), interpreted for an H100, under a cotangent of ones on every output column: its gradients on par
+    with the reference's (check 1), where its first pass rounded the anchor's own weight to fp16 as the
+    forward's split sums did (the head reviews of c55dff91f, F5, F7, and of 12e76ca7e: the portable
+    backward's centred pass reads no split sum; row 9506)."""
+    spans, hooks, operands = _anchor_below_least_subnormal()
+    ours, reference = _mosaic_gradients(spans, hooks)
+    dout = jnp.ones((1, 1, 1, 8), jnp.float16)
+    assert_as_exact(ours, reference, lambda seed: (*operands, dout),
+                    "a kept anchor below fp16's least subnormal's gradients", seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
@@ -766,11 +890,7 @@ def test_a_kept_fp32_key_near_fp32s_largest_keeps_its_finite_output(training):
     value = jnp.full((1, 1, 1, 8), 2.0 ** 127, jnp.float32)
     spans, hooks = template.spans(1, 1, 1), hooked(words, 1, 1, 0.25)
 
-    def walked(query, key, value):
-        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                              hooks, residuals=training)
-        return out[0] if training else out
-
+    walked = _walked(spans, hooks, training)
     assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks),
                     lambda seed: (query, key, value), "a kept key near fp32's largest", seeds=FEWEST_SEEDS)
 

@@ -887,7 +887,7 @@ DROPPING_FORWARDS = [(call, training, jnp.bfloat16) for call in CALLS
 DROPPING_FORWARDS += [("causal", training, jnp.float16)
                       for training in (template.Kept.NONE, template.Kept.SPLIT)]
 """The dropping forward's cases: each call form, plain and training, over bf16; over fp16 a causal call's,
-whose kept weights narrow as they are (`attention.kept`), the walk bf16's otherwise."""
+whose kept weights enter in two parts (`algebra.kept_parts`), the walk bf16's otherwise."""
 
 
 @ON_EACH_FAMILY
@@ -897,8 +897,9 @@ whose kept weights narrow as they are (`attention.kept`), the walk bf16's otherw
                               for call, training, dtype in DROPPING_FORWARDS])
 def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
     """The forward and the training forward under probability dropout, its draw the reference's bit for bit
-    (`template.Draw`), over bf16 or fp16 operands, the kept weights narrowed exact and summed in place, the
-    draw's multiplier the output's (`attention.kept`, `Forward.dropped`), under the interpreter."""
+    (`template.Draw`), over bf16 or fp16 operands, the kept weights narrowed exact (fp16's in two parts,
+    `algebra.kept_parts`) and summed in place, the draw's multiplier the output's (`attention.kept`,
+    `Forward.dropped`), under the interpreter."""
     _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True, training=training,
                    drop=True)
 
