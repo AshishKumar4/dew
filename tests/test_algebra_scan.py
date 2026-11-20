@@ -1327,26 +1327,77 @@ def test_a_two_sided_decays_chunk_adjoint_is_the_token_scans_gradient(target, st
                        f"two-sided adjoint on {target}")
 
 
-def test_three_two_sided_walks_merged_in_either_grouping_give_the_final_state():
-    """Two-sided GLA's tokens walked in three parts, the first from the state entering and the others from a
-    zero state, merged in either grouping, `(a b) c` and `a (b c)` (each walk's decay along the values summed,
-    `Walk.across`): the final state on par with the token scan's from float64 (check 1)."""
-    forms = scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
-    parts = (range(1), range(1, 3), range(3, TOKENS // CHUNK))
+def gla(h, q, k, v, g, beta):
+    """GLA's token: the state decayed along its keys alone, then written."""
+    del q
+    return jnp.exp(g)[:, None] * h + beta * k[:, None] * v[None, :]
+
+
+def test_two_sided_and_one_sided_walks_merged_in_either_grouping_give_the_final_state():
+    """Three walks merged in either grouping, `(a b) c` and `a (b c)`: two-sided GLA's first chunk from the
+    state entering (`a`), its next two from a one-sided walk's start (`b`: a walk that decays no values
+    stepped through chunks that do), and GLA's last chunk (`c`, one-sided, its walk's decay along the values
+    none): the final state on par with the token scan's whose last chunk's value gates are the identity's
+    from float64 (check 1), each walk's decay along the values summed, a walk of none the zero sum's."""
+    two_sided = scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
+    one_sided = scan.derive_scan(scan.Scan(gla, gated_readout, KIMI, walked="time",
+                                           state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    last = TOKENS // CHUNK - 1
 
     def merged(q, k, v, g, e, beta, h0):
         values = {"q": q, "k": k, "v": v, "g": g, "e": e, "beta": beta}
-        init = forms.init(chunk_of(values, 0, TWO_SIDED))
-        a, b, c = (walk(forms, values, chunks, init._replace(h=h0) if not chunks.start else init,
-                        TWO_SIDED)[1] for chunks in parts)
-        return (forms.finish(forms.merge(forms.merge(a, b, values), c, values), values),
-                forms.finish(forms.merge(a, forms.merge(b, c, values), values), values))
+        plain = {name: value for name, value in values.items() if name != "e"}
+        start = one_sided.init(chunk_of(plain, 0, KIMI))
+        a = walk(two_sided, values, range(1), two_sided.init(chunk_of(values, 0, TWO_SIDED))._replace(h=h0),
+                 TWO_SIDED)[1]
+        b = walk(two_sided, values, range(1, last), start, TWO_SIDED)[1]
+        c = walk(one_sided, plain, range(last, last + 1), start, KIMI)[1]
+        return (two_sided.finish(two_sided.merge(two_sided.merge(a, b, values), c, values), values),
+                two_sided.finish(two_sided.merge(a, two_sided.merge(b, c, values), values), values))
 
-    def twice(*drawn):
-        final = two_sided_tokenwise(*drawn)[1]
+    def twice(q, k, v, g, e, beta, h0):
+        final = two_sided_tokenwise(q, k, v, g, e.at[last * CHUNK:].set(0.0), beta, h0)[1]
         return final, final
 
-    assert_as_exact(jax.jit(merged), jax.jit(twice), two_sided_draw, "two-sided merged", seeds=16)
+    assert_as_exact(jax.jit(merged), jax.jit(twice), two_sided_draw, "two-sided and one-sided merged",
+                    seeds=16)
+
+
+def plain_readout(h, q, k, v, g, e, beta):
+    del k, v, g, e, beta
+    return q @ h
+
+
+def two_sided_base2(h, q, k, v, g, e, beta):
+    """`two_sided` in base 2: its decays `2^g` and `2^e`, exact at integer exponents."""
+    del q
+    return jnp.exp2(g)[:, None] * h * jnp.exp2(e)[None, :] + beta * k[:, None] * v[None, :]
+
+
+def test_a_two_sided_decays_pairs_across_a_sub_chunk_are_decayed_before_they_are_summed():
+    """Two-sided GLA's dual form (an H100's), two writes of a key of 2^63 and a unit value before a
+    sub-chunk's reference (`recurrence_algebra.SUB`) read by a query of 2^64 after it, the value's gate 1/4
+    at the reference's next token: the reader's output 2^126 exactly, the token scan's (its every term
+    normal), each pair's read of 2^127 decayed before the pairs are summed, where summed first they passed
+    float32's largest (row 9029's head review)."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    def at(shape, *entries):
+        x = np.zeros(shape, np.float32)
+        for index, value in entries:
+            x[index] = value
+        return jnp.asarray(x)
+
+    reader = SUB + 1
+    values = {"q": at((CHUNK, KEY), ((reader, 0), 2.0 ** 64)),
+              "k": at((CHUNK, KEY), ((0, 0), 2.0 ** 63), ((1, 0), 2.0 ** 63)),
+              "v": at((CHUNK, VALUE), ((0, 0), 1.0), ((1, 0), 1.0)), "g": jnp.zeros((CHUNK, KEY)),
+              "e": at((CHUNK, VALUE), ((SUB, 0), -2.0)), "beta": jnp.ones((CHUNK,))}
+    with generation.assumed("sm90"):
+        forms = scan.derive_scan(dataclasses.replace(TWO_SIDED_FORMS, update=two_sided_base2,
+                                                     readout=plain_readout), saturation=SATURATION)
+        outputs = forms.mapped(forms.prepare(values), forms.init({}))
+    assert float(outputs[reader, 0]) == 2.0 ** 126
 
 
 def corrected_two_sided(h, q, k, v, g, e, beta):

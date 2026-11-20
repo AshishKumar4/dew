@@ -871,14 +871,16 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
         states = 2 if extents.apart > 1 else 1
         return Work(operations=c * per_token, exponentials=c * (d + (v if extents.across else 0)),
                     span=2.0 * c, kept_bytes=kept(c * states * k * v))
-    if get_callable_args(node, Chunk.prefix) is not None:
-        # The compensated prefix (`scan._decays`): one pass over the tokens' exponents, one kernel.
-        return Work(operations=12.0 * c * d, kernels=1.0, kept_bytes=kept(c * d))
-    if (args := get_callable_args(node, Chunk.decay)) is not None:
-        # Its pairs' exponentials of the prefix's differences, fused with the prefix's pass.
-        part = terms.text(args[0])
-        elements = {"entering": c * d, "to_last": c * d, "whole": d, "between": c * c * d}[part]
-        return Work(operations=elements, exponentials=elements)
+    # A decay's prefix and spans, along the keys (`decay_keys` wide) or the values (`across`, theirs).
+    for prefix, decay, width in ((Chunk.prefix, Chunk.decay, d), (Chunk.across_prefix, Chunk.across, v)):
+        if get_callable_args(node, prefix) is not None:
+            # The compensated prefix (`scan._decays`): one pass over the tokens' exponents, one kernel.
+            return Work(operations=12.0 * c * width, kernels=1.0, kept_bytes=kept(c * width))
+        if (args := get_callable_args(node, decay)) is not None:
+            # Its pairs' exponentials of the prefix's differences, fused with the prefix's pass.
+            elements = {"entering": c * width, "to_last": c * width, "whole": width,
+                        "between": c * c * width}[terms.text(args[0])]
+            return Work(operations=elements, exponentials=elements)
     if (args := get_callable_args(node, Chunk.gram)) is not None:
         if d == 1:
             return product(c, k, c) + Work(operations=2.0 * c * c)
@@ -891,14 +893,6 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
                         else Work(operations=3.0 * c * c * k, kernels=1.0, kept_bytes=kept(c * k)))
     if get_callable_args(node, Chunk.applied) is not None:
         return product(c, v, k)
-    if get_callable_args(node, Chunk.across_prefix) is not None:
-        # The values' compensated prefix, as `prefix`'s over the keys: one pass, one kernel.
-        return Work(operations=12.0 * c * v, kernels=1.0, kept_bytes=kept(c * v))
-    if (args := get_callable_args(node, Chunk.across)) is not None:
-        # Its pairs' exponentials of the values' prefix's differences, fused with its pass, as `decay`'s.
-        part = terms.text(args[0])
-        elements = {"entering": c * v, "to_last": c * v, "whole": v, "between": c * c * v}[part]
-        return Work(operations=elements, exponentials=elements)
     if get_callable_args(node, Chunk.weighed) is not None:
         # Each pair's score times its values decayed along them, summed over the earlier tokens.
         return Work(operations=3.0 * c * c * v, kernels=1.0, kept_bytes=kept(c * v))

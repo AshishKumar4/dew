@@ -2044,11 +2044,13 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     input's block scale near float32's largest (2**113 for inputs near 2**122) overflows the codes' product
     the kernel's scale (2**-9) brings back in range, and one near the least normal underflows it the other
     way (ledger 2715), as two tensor scales near 2**-76 do multiplied first (an NVFP4 product of operands
-    near 2**-65), so no one order holds both ends; the result overflows only where the product does."""
+    near 2**-65), so no one order holds both ends; the result overflows only where the product does. The
+    order is selected before the second product, so an order not taken meets no cotangent: selected after
+    it, its overflowed intermediate times its zero cotangent was NaN in a scale's gradient."""
     tiny = jnp.finfo(product.dtype).tiny
     once = product * first
     kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
-    return jnp.where(kept, once * second, product * second * first)
+    return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)
 
 
 @_protected

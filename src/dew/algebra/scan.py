@@ -52,7 +52,7 @@ from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.nested import nested
-from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, vanishing
+from dew.nn.precision import accurate_exp, at_least_fp32, compensated_add, twice_scaled, vanishing
 from dew.nn.programs import read_by
 
 Axes = tuple[str, ...]
@@ -1113,17 +1113,25 @@ def _each_decayed(reads, rows, between):
     for first in range(0, count, sub):
         own = slice(first, min(first + sub, count))
         mine = reads[own, own]
-        row = _portable_einsum("ijk,jk,ijk->ik", _kept(mine, between[own, own], jnp.isinf(mine)), rows[own],
-                               between[own, own])
+        row = _summed_pairs(_kept(mine, between[own, own], jnp.isinf(mine)), rows[own], between[own, own])
         if first:
-            # The earlier sub-chunks' rows decayed to the reference before the row's sub-chunk, each column's
-            # reads summed, then the row's decay from the reference, each factor at most 1.
+            # The earlier sub-chunks' rows decayed to the reference before the row's sub-chunk, each pair's
+            # read then the row's decay from the reference, each factor at most 1.
             reference, earlier = first - 1, reads[own, :first]
             kept = _kept(earlier, between[own, :first], jnp.isinf(earlier))
-            row = row + between[own, reference] * _portable_einsum(
-                "ijk,jk->ik", kept, rows[:first] * between[reference, :first])
+            row = row + _summed_pairs(kept, rows[:first] * between[reference, :first],
+                                      between[own, reference][:, None, :])
         found.append(row)
     return jnp.concatenate(found, axis=0)
+
+
+def _summed_pairs(reads, rows, decays):
+    """`sum_j reads_ijk rows_jk decays_ijk` `[R, K]`, each pair's product formed before the sum in the order
+    whose intermediate is a normal float32 (`precision.twice_scaled`): its read times its row, or times its
+    decay first, so a pair's term overflows only where it does. Its rows read and summed first, two reads of
+    2^127 under a decay of 1/4 to the reader summed past the largest before it, where each pair's term is
+    2^125 (row 9029's head review)."""
+    return jnp.sum(twice_scaled(reads, rows[None], decays), axis=1)
 
 
 def _kept(reads, between, dropped):
