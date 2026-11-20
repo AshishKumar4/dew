@@ -439,6 +439,81 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
                          length=LENGTH, seeds=32)
 
 
+OJA = recurrence.Hooks(decay='vector', erase='values', scale=KEY_WIDTH ** -0.5)
+"""Oja's rule with a gate a value dimension (`Hooks.erase` 'values', fla's gated_oja_rule), row 9028."""
+
+
+def oja_draw(seed: int):
+    """`draw`'s operands for `OJA` and cotangents, its log decay along the values in (-1, 0)."""
+    rng = np.random.default_rng([9028, seed])
+    (operands,) = draw(OJA, packed=False, seed=seed)
+    along = rng.uniform(-1.0, 0.0, operands.value.shape)
+    operands = dataclasses.replace(operands, log_decay=hosted(along))
+    return operands, cotangents(operands, seed)
+
+
+@pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
+def test_oja_rules_chunks_are_as_exact_as_its_tokens(packed):
+    """Oja's rule (`OJA`) through the chunked op's dispatch, the portable math's forms on its transposed
+    memory, against the decode step's reference a token at a time (`token_by_token`): output, final memory
+    and every operand's gradient from float64 (check 1, row 9028)."""
+    def ours(operands, starts=None):
+        return chunk(OJA, dataclasses.replace(operands, starts=starts), chunk_size=CHUNK)
+
+    def tokens(operands, starts=None):
+        return token_by_token(OJA, dataclasses.replace(operands, starts=starts))
+
+    assert_packed_on_par(ours, tokens, oja_draw, f'{OJA}', packed=packed, documents=TURNED_DOCUMENTS,
+                         length=LENGTH, seeds=8)
+
+
+def oja_token(state, query, key, value, log_decay, beta):
+    """A decode token of Oja's rule as its paper writes it, a value head per key head: the memory `S` `[R, H,
+    K, V]` decayed along its values and its values erased from it, then written, `S D (I - beta v v^T) + beta
+    k v^T`, `D = exp(log_decay)` `[R, H, V]`, read after, `q^T S'`."""
+    decayed = state * jnp.exp(log_decay)[..., None, :]
+    erased = jnp.einsum('rhkv,rhv->rhk', decayed, value)
+    beta_ = beta[..., None, None]
+    written = beta_ * key[..., :, None] * value[..., None, :]
+    updated = decayed - beta_ * erased[..., None] * value[..., None, :] + written
+    return jnp.einsum('rhk,rhkv->rhv', query, updated), updated
+
+
+def test_an_oja_decode_token_is_as_exact_as_its_formula():
+    """A decode token of Oja's rule (`OJA`, scale one) through the public step (`recurrence.step`): output,
+    memory and every gradient against the token as its paper writes it (`oja_token`) from float64 (check 1,
+    row 9028)."""
+    hooks = dataclasses.replace(OJA, scale=1.0)
+    rows, heads, keys, values = 8, 4, KEY_WIDTH, VALUE_WIDTH
+
+    def draw(seed):
+        rng = np.random.default_rng([9028, seed])
+        normal = rng.standard_normal
+        operands = (0.3 * normal((rows, heads, keys, values)), normal((rows, heads, keys)),
+                    unit(normal((rows, heads, keys))), unit(normal((rows, heads, values))),
+                    -rng.uniform(0, 1, (rows, heads, values)), rng.uniform(0, 1, (rows, heads)))
+        seeded = (normal((rows, heads, values)), normal((rows, heads, keys, values)))
+        return *(hosted(x) for x in operands), tuple(hosted(x) for x in seeded)
+
+    def stepped(state, query, key, value, log_decay, beta):
+        token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
+        out, _, updated = recurrence.step(hooks, token)
+        return out, updated
+
+    assert_as_exact(jax.jit(with_gradients(stepped)), jax.jit(with_gradients(oja_token)), draw,
+                    "an oja decode token", seeds=8)
+
+
+@pytest.mark.parametrize('form', [{'erase': 'values', 'delta': False}, {'erase': 'values', 'reads': 'before'},
+                                  {'erase': 'erasing'}],
+                         ids=['without the delta rule', 'read before', 'unknown'])
+def test_an_erase_outside_its_form_is_refused(form):
+    """An erase outside its form (`Hooks.erase`): along the values without the delta rule or read before its
+    token, or an unknown kind, a ValueError (row 9028)."""
+    with pytest.raises(ValueError):
+        recurrence.Hooks(decay='vector', **form)
+
+
 def test_a_turned_readout_before_its_tokens_turn_is_refused():
     """A turned state's readout reads it after its token's turn ('after' or 'apart', `Hooks.turns`): the
     chunked op's frames read each token's query in its own turn's frame, so a readout of the state before
