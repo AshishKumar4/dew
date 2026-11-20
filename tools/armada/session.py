@@ -410,12 +410,13 @@ def by_of(mark: ast.Call) -> str | None | Literal[False]:
     if len(mark.keywords) > 1 or mark.keywords[0].arg != "by":
         return False
     value = mark.keywords[0].value
-    # ASCII, with no character named, so no Python's Unicode tables read it otherwise than the plan's do.
+    # ASCII, naming no character, matched under re.ASCII (an inline (?u) refused): no Python's Unicode tables
+    # read it, or an id, otherwise than the plan's do.
     if (not isinstance(value, ast.Constant) or not isinstance(value.value, str) or not value.value.isascii()
             or "\\N" in value.value):
         return False
     try:
-        re.compile(value.value)
+        re.compile(value.value, re.ASCII)
     except re.error:
         return False
     return value.value
@@ -429,7 +430,8 @@ def setup_key(node: str, setup: tuple[str, str | None]) -> tuple[str, ...] | Non
     name, by = setup
     if by is None:
         return (name,)
-    found = re.search(by, node.partition("[")[2][:-1]) if "[" in node else None
+    # ASCII classes alone (`by_of`), as no Python's Unicode tables read an id otherwise than the plan's do.
+    found = re.search(by, node.partition("[")[2][:-1], re.ASCII) if "[" in node else None
     return None if found is None or not found.group(0) else (name, found.group(0))
 
 

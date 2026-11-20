@@ -1308,7 +1308,8 @@ def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_
         ran[f"3.12:tests/test_models.py#{group}/{count}"] for group in range(1, count + 1)]
     assert sorted((tmp_path / "runs").read_text().splitlines()) == sorted(
         f"{kind} {model}" for kind in "fg" for model in models)
-    for refused in ("by=NAME", "by=r'['", "by='x', other='y'", "other='y'", "by=r'\\N{BULLET}'"):
+    for refused in ("by=NAME", "by=r'['", "by='x', other='y'", "other='y'", "by=r'\\N{BULLET}'",
+                    "by=r'(?u)x'"):
         (tmp_path / "tests/test_refused.py").write_text(
             f"import pytest\nNAME = 'x'\n@pytest.mark.shared_setup('s', {refused})\n"
             "def test_one():\n    pass\n")
