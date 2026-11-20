@@ -947,13 +947,18 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         return closed
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
+    from dew._cache import KERNEL_CHOICES
+    from dew.algebra import derive
     from dew.nn.kernels import tuning
 
     rewrites = _REWRITTEN.setdefault(closed, {})
-    # With kernels, the context the substitutions are decided in too (`fusion.choice_context`: the mesh, the
-    # numerics, the kernel choices a call names and the launches the compiles refused), so a body rewritten
-    # under one choice is none of another's (spec alignment, 8994).
-    key = (_deriving(accurate, saturation), kernels, fusion.choice_context() if kernels else None)
+    # With kernels, the context the substitutions are decided in too (the derivation's: the mesh, the target
+    # and the numerics; the kernel choices a call names; the launches the compiles refused), so a body
+    # rewritten under one choice is none of another's (spec alignment, 8994). Not fusion's whole choice
+    # context: its trace context holds every context variable set, a call's arrays among them, which this
+    # cache, held as long as the body is, would keep alive.
+    key = (_deriving(accurate, saturation), kernels,
+           (derive.context(), KERNEL_CHOICES.value, kernel_report.refusal_entries()) if kernels else None)
     held = rewrites.get(key)
     reused = held is not None and generation.still(held.reads)
     if held is None or not reused:
