@@ -397,7 +397,7 @@ def _alone(index: Index, prologue: Sequence[int], computed: set[int]) -> tuple[i
     while kept:
         for var in jaxpr.eqns[kept.pop()].invars:
             source = producer.get(var) if isinstance(var, jcore.Var) else None
-            if source in prologue and source not in held:
+            if source is not None and source in prologue and source not in held:
                 held.add(source)
                 kept.append(source)
     return tuple(place for place in prologue if place not in held)
