@@ -1653,7 +1653,9 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
       to the chunk's start and scaled, `do` as given;
     - `_key_memory_back` (`algebra.key_memory_block`): `dq_m = scale exp2(E) (do h^T)`, `dk_m = exp2(E_last -
       E) (c dh^T) + d(kg beta) exp2(E) beta`, `d(kg beta) = -(dw + L^T dw)`, `dw = dv h^T`;
-    - `_key_values_back` (`algebra.key_values_back`): `values = beta (dv + L^T dv)`;
+    - `_key_values_back` (`algebra.key_values_back`): `values = beta (dv + L^T dv)`, and the keys' system's
+      gradient `d_system = -(X^T tril(dA, -1) X^T)` (`algebra.key_system_back`), `X = I + L`, `dA = du (v
+      beta)^T - dw (k exp2(E) beta)^T` (the memory launch's part, `key_memory_block`'s, beside the values');
     - `_key_pairs_back`: the pairs' transpose of the scores' gradient scaled (`key_pairs_back`) for `dq_p`,
       and of the system's for `dk_p`."""
     exponents = Exponents.of(step.g)
@@ -1683,6 +1685,12 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
     dk_memory = fp32(add(d_key, fp32(mul(fp32(mul(d_gated, raised), lane), point(beta)), lane)), lane)
     du = point(step.dv)
     values = fp32(mul(fp32(add(du, dot(lower_t, du, lane)), lane), point(beta)), lane)
+    gated = staged(fp32(mul(fp32(mul(point(step.k), raised), lane), point(beta)), lane), lane)
+    valued = staged(fp32(mul(point(step.v), point(beta)), lane), lane)
+    d_a = fp32(add(neg(dot(d_weight, tr(gated), lane)), dot(du, tr(valued), lane)), lane)
+    d_a = staged(where(lag > 0, d_a, zeros), lane)
+    right = staged(fp32(add(d_a, dot(d_a, lower_t, lane)), lane), lane)
+    d_system = where(lag > 0, neg(fp32(add(right, dot(lower_t, right, lane)), lane)), zeros)
     d_scores_scaled = fp32(mul(point(step.d_scores), factor), lane)
     dq_pairs, scored_keys = key_pairs_back(d_scores_scaled, step.q, step.k, exponents, lane)
     keyed_rows = fp32(mul(point(step.k), point(beta)), lane)
@@ -1691,11 +1699,12 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
     keys = fp32(add(scored_keys, system_keys), lane)
     dk_pairs = fp32(add(fp32(mul(d_keyed, point(beta)), lane), keys), lane)
     return {"d_scores": d_scores, "local": local, "dv": dv, "entering": entering, "dq_memory": d_query,
-            "dk_memory": dk_memory, "values": values, "dq_pairs": dq_pairs, "dk_pairs": dk_pairs}
+            "dk_memory": dk_memory, "values": values, "d_system": d_system, "dq_pairs": dq_pairs,
+            "dk_pairs": dk_pairs}
 
 
-KEY_BACK_RECORDS = ("d_scores", "local", "dv", "entering", "dq_memory", "dk_memory", "values", "dq_pairs",
-                    "dk_pairs")
+KEY_BACK_RECORDS = ("d_scores", "local", "dv", "entering", "dq_memory", "dk_memory", "values", "d_system",
+                    "dq_pairs", "dk_pairs")
 """The records a decay a key dimension's fast backward keeps (`key_backward.KeyKept`), one value head's."""
 
 

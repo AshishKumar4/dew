@@ -37,6 +37,7 @@ from contract_support import (
     REVERSE_ONLY,
     assert_contract,
     cancelling_entries,
+    cancelling_orbit,
     exactly_rounded,
     normal_float32,
 )
@@ -355,20 +356,25 @@ DOCUMENTS = ((0, 70, 100), (0, 40, 150))
 """Each row's documents' first steps, over rows of 190 steps: a document that ends inside a chunk, one
 shorter than a chunk, and one longer than two."""
 
+DOCUMENT_HEADS, DOCUMENT_WIDTH = 2, 16
+"""`documents_draw`'s heads and their width: each head's values and state keys."""
+
+
 def documents_draw(seed: int):
     """Two rows of three documents (`DOCUMENTS`) of a forked call (`FORKED`) over one given memory a row,
     each document's entry write (`recurrence_chunk.Chunk.entry_key`: two terms of a state's keys `[N]` and
     a head's values `[P]`, a weight a head), and cotangents of the output and the row's last memory."""
     rows, documents = len(FORKED), len(FORKED[0][0])
-    x, dt, A, B, C, _, _ = mixer_operands((rows, 190, 2, 16, 16, 1), seed)
+    heads, width = DOCUMENT_HEADS, DOCUMENT_WIDTH
+    x, dt, A, B, C, _, _ = mixer_operands((rows, 190, heads, width, width, 1), seed)
     x, b, c, a = (jnp.asarray(t, jnp.float32) for t in ssd_operands(x, dt / 64, A, B, C, 1))
     keys = jax.random.split(jax.random.key(seed + 11), 6)
-    given = 0.3 * jax.random.normal(keys[0], (rows, GIVEN, 2, 16, 16), jnp.float32)
-    entry = (0.3 * jax.random.normal(keys[3], (rows, documents, 2, 2, 16), jnp.float32),
-             0.3 * jax.random.normal(keys[4], (rows, documents, 2, 2, 16), jnp.float32),
-             jax.random.uniform(keys[5], (rows, documents, 2), jnp.float32))
+    given = 0.3 * jax.random.normal(keys[0], (rows, GIVEN, heads, width, width), jnp.float32)
+    entry = (0.3 * jax.random.normal(keys[3], (rows, documents, 2, heads, width), jnp.float32),
+             0.3 * jax.random.normal(keys[4], (rows, documents, 2, heads, width), jnp.float32),
+             jax.random.uniform(keys[5], (rows, documents, heads), jnp.float32))
     seeded = (jax.random.normal(keys[1], x.shape, jnp.float32),
-              jax.random.normal(keys[2], (rows, 2, 16, 16), jnp.float32))
+              jax.random.normal(keys[2], (rows, heads, width, width), jnp.float32))
     return (x, b, c, a, given, *entry), seeded
 
 
@@ -447,6 +453,11 @@ def test_documents_entering_their_own_states_scan_as_each_alone():
                     "the TPU kernel's forked call", seeds=24)
 
 
+LEVELS_SEEDS = cancelling_orbit(DOCUMENT_HEADS, DOCUMENT_HEADS, DOCUMENT_WIDTH)
+"""`levels_documents_draw`'s seeds: its state's every value coordinate written once (`documents_draw`'s
+heads, each a key head of its own)."""
+
+
 def levels_documents_draw(seed: int):
     """`documents_draw`'s forked call whose documents' entry writes are `CANCELLING_LEVELS`' on the state's
     first key (`contract_support.cancelling_entries`, its cotangents too): no input, no decay, and each step's
@@ -483,7 +494,7 @@ def test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel():
     `LEVELS_ROUTES`)."""
     truth = jax.jit(_entry_arm(documents_one_by_one))
     assert_as_exact(_entry_arm(documents_on_the_kernel), exactly_rounded(truth), levels_documents_draw,
-                    "the TPU kernel's forked call's entry writes of cancelling levels", seeds=8,
+                    "the TPU kernel's forked call's entry writes of cancelling levels", seeds=LEVELS_SEEDS,
                     truth_fn=truth)
 
 
@@ -517,7 +528,8 @@ def test_documents_entry_writes_of_cancelling_levels_take_the_selected_tpu_scan(
     truth = jax.jit(_entry_arm(documents_one_by_one))
     with generation.routes() as found:
         assert_as_exact(_entry_arm(documents_as_selected), exactly_rounded(truth), levels_documents_draw,
-                        "the selected TPU scan's forked call's entry writes of cancelling levels", seeds=8,
+                        "the selected TPU scan's forked call's entry writes of cancelling levels",
+                        seeds=LEVELS_SEEDS,
                         truth_fn=truth)
     assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
 

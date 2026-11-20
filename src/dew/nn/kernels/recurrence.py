@@ -147,6 +147,12 @@ class Hooks:
     turns: int = 0
     erase: Erase = 'tied'
     value_decay: bool = False
+    substeps: int = 1
+    """The delta rule's updates a token takes in turn (DeltaProduct's, fla's `chunk_gated_delta_product`): its
+    keys, values and write gates `substeps` of each a token, the chunked op's laid in turn (`[B, S m, ...]`)
+    and a decode token's on an axis of their own (`[rows, m, ...]`), its decay taken before the first and its
+    query read after the last (the readout's row selector, kernel-templates.md §5); its queries and decays a
+    token's."""
 
     @property
     def inverse_bound(self) -> float | None:
@@ -203,6 +209,12 @@ class Hooks:
             raise ValueError(f"a decay along the values is the plain recurrence's, without the delta rule or "
                              f"an erase of its own: not {self}")
         transition = self.erase != 'tied' or self.value_decay
+        if self.substeps < 1 or (self.substeps > 1 and (not self.delta or self.reads != 'after' or self.rated
+                                                        or self.gates is not None or self.skip
+                                                        or self.conv is not None or transition)):
+            raise ValueError(f"a token's delta-rule updates are one or more, more read after the last, its "
+                             f"decay a given log decay's, unrated, without a skip, a conv or a transition of "
+                             f"its own: not {self.substeps} under {self}")
         if transition and (self.reads != 'after' or self.ranks > 1 or self.own_weight or self.turns
                            or self.rated):
             raise ValueError(f"an erase of its own or a decay along the values is read after its token, "
@@ -364,7 +376,9 @@ class Step(Gated):
     Dk]` (vector), or with the gates `gate` `[rows, Hv]`, `log_a` and `bias` `[Hv]`. `beta` `[rows, Hv]` is
     the write gate (a raw beta with the gates), `skip` `[Hv]` the skip's `D`, `z` `[rows, Hv, Dv]` and
     `weight` `[Dv]` the epilogue's, `rate` `[Hv]` a rated decay's, at most zero (`Hooks.rated`), `own`
-    `[Hv, Dk]` the readout's weight of the token's own write (`Hooks.own_weight`). `state` is
+    `[Hv, Dk]` the readout's weight of the token's own write (`Hooks.own_weight`). Under `Hooks.substeps`
+    (DeltaProduct's) `key`, `value` and `beta` hold the token's `m` updates on an axis of their own, `[rows,
+    m, ...]`. `state` is
     `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by `round_to_bf16`), or wider for the reference. `active`
     `[rows]` marks the rows that draw. A pytree of its arrays, so it crosses `jit` and a transformation as a
     token's operands do; the `Hooks` are its static form. Its fields are the decode launch's operands
@@ -579,10 +593,14 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     operand = given['token' if hooks.conv is not None else 'value'].dtype
     work = at_least_fp32(jnp.promote_types(operand, state.dtype))
     key_width = state.shape[2]
-    query, key, value, history = _prologue(hooks, given, work)
-    if hooks.erase == 'values':
+    if hooks.substeps > 1:
+        out, key, value, updated = _substeps(hooks, given, work)
+        history = None
+    elif hooks.erase == 'values':
+        query, key, value, history = _prologue(hooks, given, work)
         out, updated = _values_erased(hooks, given, state.astype(work), query, key, value, work)
     else:
+        query, key, value, history = _prologue(hooks, given, work)
         decay, write = _gates(hooks, given, work, key_width)
         own = given['own'].astype(work) if hooks.own_weight else None
         turn = given['turn'].astype(work) if hooks.turns else None
@@ -600,6 +618,32 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
         if history is not None:
             history = jnp.where(active[:, None, None], history, given['held'])
     return out.astype(operand if dtype is None else dtype), history, held
+
+
+def _substeps(hooks: Hooks, given: dict, work):
+    """A decode token's `hooks.substeps` delta-rule updates in turn (`Hooks.substeps`, DeltaProduct's) in
+    `work`, the state held there between them (`_substep`). `(output, last keys, last values, state)`, the
+    output the state after the last read by the query."""
+    counts = {name: given[name].shape[1] for name in ('key', 'value', 'beta') if name in given}
+    if any(count != hooks.substeps for count in counts.values()):
+        raise ValueError(f"a token of {hooks.substeps} updates takes keys, values and write gates of "
+                         f"{hooks.substeps} each, not {counts}")
+    found = _substep(hooks, given, work, given['state'].astype(work), 0)
+    for substep in range(1, hooks.substeps):
+        found = _substep(hooks, given, work, found[3], substep)
+    return found
+
+
+def _substep(hooks: Hooks, given: dict, work, state, substep: int):
+    """One of a decode token's delta-rule updates (`_substeps`) on `state`: its keys, values and write gates
+    `given`'s at `substep`, its decay the token's on the first alone. `(output, keys, values, state)`."""
+    taken = {**given, **{name: given[name][:, substep] for name in ('key', 'value', 'beta') if name in given}}
+    if substep and 'log_decay' in given:
+        taken['log_decay'] = jnp.zeros_like(given['log_decay'])
+    query, key, value, _ = _prologue(hooks, taken, work)
+    decay, write = _gates(hooks, taken, work, state.shape[2])
+    out, state = update(state, query, key, value, decay, write[..., None], delta=True, reads='after')
+    return out, key, value, state
 
 
 def _erasing(hooks: Hooks, given: dict, work):
@@ -686,9 +730,10 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
             {name: value for name, value in values.items() if name not in rows})
         return (dataclasses.replace(pulled_operands, **inputs, **formed),)
 
-    # The template's decode step turns no state (`Hooks.turns`) and takes the delta rule's own erase beside a
-    # decay along the keys alone (`Hooks.erase`, `Hooks.value_decay`): such a token's launch is the reference.
-    referenced = hooks.turns or hooks.erase != 'tied' or hooks.value_decay
+    # The template's decode step turns no state (`Hooks.turns`), takes one update a token (`Hooks.substeps`)
+    # and the delta rule's own erase beside a decay along the keys alone (`Hooks.erase`, `Hooks.value_decay`):
+    # such a token's launch is the reference.
+    referenced = hooks.turns or hooks.substeps > 1 or hooks.erase != 'tied' or hooks.value_decay
     launched = functools.partial(step_reference if referenced else _launched, hooks, dtype=dtype)
     return contracted("test_the_decode_step_holds_every_order")(
         linear_tangent(lambda operands: (launched(operands), ()), pulled, portable,
