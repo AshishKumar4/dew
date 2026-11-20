@@ -54,16 +54,21 @@ scenario's own API in a fresh process that sees the cell's devices, held to the 
 (every update's gradient finite; its run reloading, generating or sampling as its checkpoint does), and the
 decision workflow's cells are its axes' (`tests/test_decision_workflow.py`). fp8 needs widths a multiple of
 128 and the GPU mesh a fleet, so neither is a CPU tier's axis; the published pipelines' and a quantized
-file's scenarios take their own axes (family and dtype; format and use).
+file's scenarios take their own axes (family and dtype; format and use). A scenario's flows are axes too:
+masked or block diffusion, a language or diffusion policy's RL method, and serving by one call, a paged
+server or a server drafting speculative blocks. Its cells are the combinations its flows admit: a block
+diffusion LM trains on the stream's windows, and a checkpoint that quantizes its activations is trained,
+not served.
 
-Once a scenario, on its first cell, the contracts a run of their own shows: its run, paused and resumed in
-fresh processes over one persistent cache, ends on its uninterrupted run, every checkpointed leaf bit for
-bit, and compiles no program the runs before it did not; its sampling, run twice so, compiles nothing the
-second time and draws the same; and the LM data path's packed, right-padded and unpadded rows of the same
-documents give one first step by check 1, as its rows over two devices do against one device reading them
-in two microbatches, the same split of the gradient's sum (`tests/test_scenario_runs.py`). A masked diffusion LM draws its
-noise a row, so packing or padding its documents changes its draws: its rows are held over devices alone,
-by the parallelism matrix. The GPU mesh's half of sharded against unsharded has no fleet to run on
+Once a flow of a scenario, on its first cell, the contracts a run of their own shows: its run, paused and
+resumed in fresh processes over one persistent cache, ends on its uninterrupted run, every checkpointed leaf
+bit for bit, and compiles no program the runs before it did not; and its sampling, run twice so, compiles
+nothing the second time and draws the same. Once a scenario, on its first cell, the LM data path's packed,
+right-padded and unpadded rows of the same documents give one first step by check 1, as its rows over two
+devices do against one device reading them in two microbatches, the same split of the gradient's sum
+(`tests/test_scenario_runs.py`). A masked diffusion LM draws its noise a row, so packing or padding its
+documents changes its draws: its rows are held over devices alone, by the parallelism matrix. The GPU mesh's
+half of sharded against unsharded has no fleet to run on
 (owner, 2026-10-30, ledger 2221).
 
 Implementations come from their registries. A new implementation cannot opt out by being absent from a hand-kept test list.

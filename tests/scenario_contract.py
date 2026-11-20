@@ -72,15 +72,15 @@ def held_out_measures(objective, optimizer, loader_of: Callable[[int], object],
     return np.asarray(before), np.asarray(after)
 
 
-def covering(axes: Mapping[str, Sequence]) -> list[dict]:
+def covering(axes: Mapping[str, Sequence], admits: Callable[[dict], bool] | None = None) -> list[dict]:
     """A small covering set over a scenario's settings axes (docs/design/testing.md, settings and devices),
     chosen pairwise as the kernel matrix chooses its cells (`kernel_matrix.pairwise`): combinations of the
-    axes' values in which every two values of two axes meet, chosen greedily in the combinations' order, so
-    a scenario's cells are the same each run; a scenario of one axis, whose values meet no other, each of
-    its values."""
+    axes' values its flow `admits` (every one, where None), in which every two values of two axes that an
+    admitted combination holds meet, chosen greedily in the combinations' order, so a scenario's cells are
+    the same each run; a scenario of one axis, whose values meet no other, each of its values."""
     from kernel_matrix import combinations, pairwise
 
-    every = combinations(axes)
+    every = [combination for combination in combinations(axes) if admits is None or admits(combination)]
     return every if len(axes) == 1 else pairwise(every, [])
 
 

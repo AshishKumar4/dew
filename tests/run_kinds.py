@@ -291,10 +291,11 @@ def merging_source(root: Path) -> Path:
     return source
 
 
-def blockwise(root: Path, drawn: bool, release: str = str(DIFFUSION_GEMMA)) -> RunConfig:
+def blockwise(root: Path, drawn: bool, release: str = str(DIFFUSION_GEMMA), tokens: int = 160) -> RunConfig:
     """A block-diffusion run over a release whose text decoder its model nests (`DiffusionGemma.text`), its
-    windows token files in the release's own tokenizer, both named as `release` names them."""
-    corpus = write_token_corpus(root / "gemma-tokens", np.random.RandomState(160).randint(4, 32, 160),
+    windows token files of `tokens` drawn ids in the release's own tokenizer, both named as `release` names
+    them."""
+    corpus = write_token_corpus(root / "gemma-tokens", np.random.RandomState(160).randint(4, 32, tokens),
                                 tokenizer=release, vocab_size=32, eos_id=1)
     spans = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
