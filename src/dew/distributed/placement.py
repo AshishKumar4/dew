@@ -883,6 +883,19 @@ def placed_bytes(tree) -> int:
     return sum(map(_shard_bytes, jax.tree.leaves(tree)))
 
 
+ALLOCATION_BYTES = 256
+"""The unit a BFC pool rounds each request up to (openxla/xla's tsl/framework/bfc_allocator.cc,
+`kMinAllocationSize`): a shard of 4 bytes takes 256 of its pool."""
+
+
+def allocated_bytes(tree) -> int:
+    """The bytes a device's BFC pool charges for `tree`'s arrays placed on it, one allocation a shard
+    (`placed_bytes`, each rounded up to `ALLOCATION_BYTES`): what a fit check places beside a step's
+    temporaries (`dew.training.memory.placeable_beside`)."""
+    unit = ALLOCATION_BYTES
+    return sum(-(-_shard_bytes(leaf) // unit) * unit for leaf in jax.tree.leaves(tree))
+
+
 def placed_shapes[TreeT](tree: TreeT, placement: Placement[TreeT]) -> TreeT:
     """`tree`'s arrays as their shapes, each carrying where `placement` puts it: what a
     lowering, a restore and `Layout.validate` read of a state not yet placed. Each in the dtype a

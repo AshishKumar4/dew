@@ -48,6 +48,7 @@ import pytest
 import test_contracts_gemm as contracts_gemm
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
+import test_gemm_paired as gemm_paired
 import test_gemm_tcgen05 as gemm_tcgen05
 import test_gemm_template as gemm_template
 import test_gemm_widths as gemm_widths
@@ -161,10 +162,9 @@ def test_the_gemm_kernels_run_on_this_gpu():
           for depth in (128, 512)),
         Cell("the template takes a gpt-oss width as exactly as XLA",
              grouped_gemm.the_template_takes_a_gpt_oss_width_as_exactly_as_xla, fault=PARTIAL_TILE),
-        *(Cell(f"the template runs widths no tile divides: {depth}x{width}",
-               functools.partial(gemm_widths.unaligned_widths_run_on_the_template, depth, width,
-                                 interpret=False), fault=PARTIAL_TILE)
-          for depth, width in gemm_widths.WIDTHS),
+        Cell("the template runs widths no tile divides",
+             functools.partial(gemm_widths.unaligned_widths_run_on_the_template, gemm_widths.WIDTHS,
+                               interpret=False), fault=PARTIAL_TILE),
         *(Cell(f"a pair's cooperative tile holds check 1 with its hooks: {case}",
                functools.partial(gemm_template.a_cooperative_tile_holds_check_1_with_its_hooks, case,
                                  gemm_template.PAIRED), "sm90", fault=CLUSTER)
@@ -174,6 +174,14 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
                                  depth, width, dtype), "sm90", fault=BALANCED_TAIL)
           for rows, depth, width in gemm_template.BALANCED_TAILS for dtype in (jnp.bfloat16, jnp.float32)),
+        *(Cell(f"a chained input gradient holds check 1: {case}",
+               functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
+               native={"launch": "chained", "generation": name, "case": case})
+          for name in ("sm90", "sm100") for case in gemm_paired.CHAINED_CASES),
+        *(Cell("a chained input gradient's overflowing sum is walked again",
+               gemm_paired.a_chained_input_gradient_is_as_finite_as_its_products_sum, name,
+               native={"launch": "chained", "generation": name, "case": "overflow"})
+          for name in ("sm90", "sm100")),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",
@@ -192,6 +200,9 @@ def test_the_gemm_kernels_run_on_this_gpu():
         Cell("a Blackwell's gathered product is its gathered rows' product",
              gemm_gather.a_blackwells_gathered_product_is_its_gathered_rows_product, "sm100",
              native={"launch": "gathered", "pass": "forward"}),
+        Cell("a Blackwell's gathered ring reads a strided table's entries",
+             gemm_gather.a_gathered_ring_reads_a_strided_tables_entries, "sm100",
+             native={"launch": "gathered", "pass": "strided table"}),
         *(Cell(f"CUTLASS runs a mapped projection as exactly as XLA where chosen: "
                f"{'shared' if shared else 'mapped'} matrices",
                functools.partial(grouped_gemm.cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen,

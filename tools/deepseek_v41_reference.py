@@ -78,10 +78,15 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from reference_source import loaded, record_padding, saved_fixture
+
+COHORT = "tilelang"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
 DEEPSEEK_V41_REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
@@ -151,9 +156,14 @@ def import_reference():
     model = importlib.import_module("model")
     engram = importlib.import_module("engram")
     model.ParallelEngramEmbedding.forward = _engram_lookup
-    if not getattr(model.Indexer.forward, "publishes", False):
+    if model.Indexer.forward not in _INSTALLED:
         model.Indexer.forward = _publishing_indexer(model)
     return model, engram
+
+
+_INSTALLED: set[object] = set()
+"""The functions this tool installed in place of the release's or torch's own, which a second install
+leaves in place."""
 
 
 def _publishing_indexer(model):
@@ -175,7 +185,7 @@ def _publishing_indexer(model):
             model.shared_attn.index_k = self.k_cache
         return forward(self, x, qr, latent, start_pos, offset)
 
-    publishing.publishes = True
+    _INSTALLED.add(publishing)
     return publishing
 
 
@@ -492,7 +502,7 @@ def install_selection_probe():
     """Wrap torch.Tensor.topk and torch.topk to record every selection: its scored rows, its sorted picks
     and their margins. The releases select through the method, transformers' DeepSeek-V4 router through
     the function (modeling_deepseek_v4.py:1039)."""
-    if getattr(torch.topk, "probed", False):
+    if torch.topk in _INSTALLED:
         return
 
     def probed(topk):
@@ -506,7 +516,7 @@ def install_selection_probe():
                     record.add("selection", rows=rows, picks=picks, **selection_margins(rows, k))
             return result
 
-        probe_topk.probed = True
+        _INSTALLED.add(probe_topk)
         return probe_topk
 
     torch.Tensor.topk, torch.topk = probed(torch.Tensor.topk), probed(torch.topk)
@@ -700,7 +710,8 @@ def widened_outputs(seed: int) -> dict[str, np.ndarray]:
             RECORDS.clear()
             outputs.update({name: value for name, value in recorded.arrays(prefix).items()
                             if name.endswith(("_in", "_out", "_rows", "_picks"))})
-            outputs.update({f"{prefix}logits": logits.numpy(), f"{prefix}loss": np.float64(loss.item())})
+            outputs.update({f"{prefix}logits": logits.numpy(),
+                            f"{prefix}loss": np.asarray(loss.item(), np.float64)})
             with torch.no_grad():
                 outputs.update({f"{prefix}{name}": value for name, value in cached(net, ids).items()})
         for prefix, gradient in gradients.items():
@@ -722,8 +733,9 @@ def write_truth(seed: int):
     print(json.dumps({"differing": differ}))
     if any(differ.values()):
         raise SystemExit(f"the float64 run decides otherwise than seed {seed}'s fixture")
-    np.savez(FIXTURE / "reference_f64.npz", **{name: value for name, value in truth.items()
-                                               if not name.endswith(("_out", "_picks", "draft_ids"))})
+    np.savez(FIXTURE / "reference_f64.npz", allow_pickle=False,
+             **{name: value for name, value in truth.items()
+                if not name.endswith(("_out", "_picks", "draft_ids"))})
 
 
 def orders(drawn: Path, seed: int):
@@ -897,7 +909,7 @@ TEXT_CONFIG = {
 
 def config_json(args) -> dict:
     """The release's config.json (text half) for the toy arguments."""
-    text = {"model_type": "deepseek_v41_text"}
+    text: dict[str, Any] = {"model_type": "deepseek_v41_text"}
     for field, key in TEXT_CONFIG.items():
         value = getattr(args, field)
         text[key] = list(value) if isinstance(value, tuple) else value
@@ -1061,7 +1073,7 @@ def write_vision_recording(seed: int):
     written = save(FIXTURE / "vision_recording.npz", {**arrays, "provenance": provenance(
         "deepseek-ai/DeepSeek-V4.1-Flash", DEEPSEEK_V41_REVISION, "cpu", command, torch=torch.__version__)},
         reference=f"deepseek-ai/DeepSeek-V4.1-Flash@{DEEPSEEK_V41_REVISION}", license="mit")
-    np.savez(FIXTURE / "vision_rows.npz", **{
+    np.savez(FIXTURE / "vision_rows.npz", allow_pickle=False, **{
         name: np.stack([prompts[index][name] for index in range(len(prompts))]) for name in prompts[0]})
     print(f"{written}: {written.stat().st_size} bytes, {len(prompts)} prompts", flush=True)
 
@@ -1078,7 +1090,7 @@ def write_vision(seed: int):
                if name.startswith(("vision.", "aligner.", "image_")) or name.endswith(".bias_vl")}
     save_file(tensors, FIXTURE / "vision.safetensors", metadata={"format": "pt"})
     (FIXTURE / "vision_config.json").write_text(json.dumps(vision_config_json(args), indent=1) + "\n")
-    np.savez(FIXTURE / "vision.npz", **outputs)
+    np.savez(FIXTURE / "vision.npz", allow_pickle=False, **outputs)
     print(f"{FIXTURE}: {len(tensors)} vision tensors, a {len(outputs['vision_span'])}-position span")
 
 
@@ -1098,7 +1110,7 @@ def write(seed: int):
         {"bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 2, "do_sample": False}, indent=1) + "\n")
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(TOKENIZER / name, FIXTURE / name)
-    np.savez(FIXTURE / "reference.npz", **{name: value for name, value in outputs.items()
+    np.savez(FIXTURE / "reference.npz", allow_pickle=False, **{name: value for name, value in outputs.items()
                                            if not name.endswith(("_margin", "_flip"))})
     print(json.dumps({"seed": seed, **assessment}))
     import transformers

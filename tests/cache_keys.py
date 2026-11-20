@@ -52,19 +52,21 @@ def keyed() -> Keyed:
     return handler
 
 
-def text(path: str | None) -> list[str]:
-    """The lines of the text JAX dumped to `path` for a compile, its locations dropped: the computation its
-    key hashes; none where it dumped none."""
-    if path is None:
+def text(directory: Path, name: str | None) -> list[str]:
+    """The lines of the text JAX dumped for a compile to `name` in `directory` (the process's
+    `JAX_DUMP_IR_TO`, its log naming the file alone), its locations dropped: the computation its key hashes;
+    none where it dumped none."""
+    if name is None:
         return []
-    return re.sub(r"\s*loc\([^)]*\)|^#loc.*$", "", Path(path).read_text(), flags=re.M).splitlines()
+    dumped = (directory / name).read_text()
+    return re.sub(r"\s*loc\([^)]*\)|^#loc.*$", "", dumped, flags=re.M).splitlines()
 
 
-def unread(ran: list, prepared: list) -> dict[str, dict]:
+def unread(ran: list, ran_dumps: Path, prepared: list, prepared_dumps: Path) -> dict[str, dict]:
     """Each compile the run missed the cache for, by its module's name: the parts of its key no compile of
     that name the build made shares (all of them where the build compiled none of that name), and where
-    the computation is among them, the first line its text and the build's nearest differ at; where the
-    compile options are, the options each compiled under."""
+    the computation is among them, the first line its text and the build's nearest differ at (each read from
+    its side's dumps, `text`); where the compile options are, the options each compiled under."""
     built: dict[str, list] = {}
     for module, _, parts, options, dumped in prepared:
         built.setdefault(module, []).append((parts, options, dumped))
@@ -77,7 +79,8 @@ def unread(ran: list, prepared: list) -> dict[str, dict]:
                            if all(other.get(part) != value for other, _, _ in others))
         said: dict = {"parts": differing}
         if "computation" in differing:
-            said["text"] = first_difference(text(dumped), [text(theirs) for _, _, theirs in others])
+            said["text"] = first_difference(text(ran_dumps, dumped),
+                                            [text(prepared_dumps, theirs) for _, _, theirs in others])
         if "compile_options" in differing:
             said["options"] = {"run": options, "build": sorted({held for _, held, _ in others}, key=str)}
         missed[module] = said

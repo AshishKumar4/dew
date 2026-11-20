@@ -485,6 +485,70 @@ def _template_routes(trace) -> list:
     return [route for route in found if route.choice == "grouped_matmul" and route.kernel == "mosaic"]
 
 
+@pytest.mark.parametrize("order", ["float16 by bfloat16", "bfloat16 by float16"])
+def test_a_product_of_two_16_bit_formats_is_jaxs_own_through_dew_jit(order):
+    """A product of a float16 and a bfloat16 matrix, no preferred type stated, in either order: through
+    `dew.jit` (the algebra's pass, which prices it) its value is `512 2^-8 2^16 = 2^17` exactly, every product
+    and partial sum a power of two; under the pass on an H100 whose template a call names, it is no launch of
+    the template, which casts its right operand to its left's dtype (a bfloat16 `2^16` an infinite float16:
+    base review 7754e5fde F1), but JAX's own product, which multiplies each as it is. Pricing it, NumPy's
+    promotion of the pair raised (base review 0b8b7ed98 F1)."""
+    import dew
+
+    small, large = jnp.full((256, 512), 2.0 ** -8, jnp.float16), jnp.full((512, 256), 2.0 ** 16, jnp.bfloat16)
+    left, right = (small, large) if order == "float16 by bfloat16" else (large.T, small.T)
+
+    def product(left, right):
+        return jax.lax.dot_general(left, right, (((1,), (0,)), ((), ())))
+
+    made = jax.eval_shape(product, left, right)
+    value = np.asarray(dew.jit(product)(left, right), np.float64)
+    assert (value.shape, value.min(), value.max()) == (made.shape, 2.0 ** 17, 2.0 ** 17)
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+          generation.routes() as passed):
+        jax.jit(algebra.rewritten(product, kernels=True)).trace(left, right)
+    assert not any(route.choice == "grouped_matmul" for route in passed)
+
+
+@pytest.mark.gpu(reason="a mixed product through dew.jit, Mosaic's template named, on an H100")
+@pytest.mark.parametrize("order", ["float16 by bfloat16", "bfloat16 by float16"])
+def test_a_product_of_two_16_bit_formats_through_dew_jit_naming_mosaic_holds_check_1(order):
+    """A product of a float16 and a bfloat16 matrix in either order, through `dew.jit` on an H100 whose
+    grouped products' template a call names (Mosaic's): no launch of the template (its route unreported),
+    and its value on par with JAX's own product from float64 (check 1), drawn over the formats' range (base
+    review 3232beb7c: the CPU witness traced it under the pass and never ran it through `dew.jit` there)."""
+    from reference_error import as_given, assert_as_exact
+
+    import dew
+    from dew.parity import FEWEST_SEEDS
+
+    def product(left, right):
+        return jax.lax.dot_general(left, right, (((1,), (0,)), ((), ())))
+
+    def draw(seed):
+        rng = np.random.default_rng([0x8818, seed])
+        small = jnp.asarray(rng.standard_normal((256, 512)) * 2.0 ** -8, jnp.float16)
+        large = jnp.asarray(rng.standard_normal((512, 256)) * 2.0 ** 8, jnp.bfloat16)
+        return (small, large) if order == "float16 by bfloat16" else (large.T, small.T)
+
+    compiled = dew.jit(product)
+    routed: list = []
+    dtypes: set = set()
+
+    def named(left, right):
+        with generation.chosen(grouped_matmul="mosaic"), generation.routes() as taken:
+            made = compiled(left, right)
+        routed.extend(taken)
+        # Its dtype beside the one JAX's own product makes, which check 1's float64 comparison never reads.
+        dtypes.add((made.dtype, jax.eval_shape(product, left, right).dtype))
+        return made
+
+    assert_as_exact(as_given(named), product, draw, f"a mixed product, {order}, Mosaic named",
+                    seeds=FEWEST_SEEDS)
+    assert not any(route.choice == "grouped_matmul" for route in routed)
+    assert all(made == own for made, own in dtypes)
+
+
 def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew_jit():
     """`dew.jit` over a plain JAX loss on an H100 whose template a call names: its gradient's products run
     the template whether `jax.grad` is taken of the compiled program (inside a plain jit, the pass reads the

@@ -460,17 +460,18 @@ def seeds(destination: Path) -> None:
         process, times = schedule.sampling(case.steps)
         final = source_final(schedule, process, times, case.guidance, LABEL, GUIDANCE_SCALE)
 
-        def draw(seed, prior=prior):
+        def seeded(seed, prior=prior):
             generator = torch.Generator().manual_seed(seed)
             initial = (torch.randn(SEEDED_SHAPE, generator=generator, dtype=torch.float64) * prior).float()
             cotangent = torch.randn(SEEDED_SHAPE, generator=generator, dtype=torch.float64).float()
             return {"x_T": initial.numpy(), "cotangent": cotangent.numpy()}
 
+        draw = seeded
         if case.config.get("thresholding"):
             def clears(inputs, case=case, module=module):
                 return threshold_clearance(module, case, torch.from_numpy(inputs["x_T"]), noises) >= MARGIN
 
-            draw = clearing(draw, clears)
+            draw = clearing(seeded, clears)
 
         def evaluate(inputs, case=case, module=module):
             initial, cotangent = (torch.from_numpy(inputs[key]) for key in ("x_T", "cotangent"))
@@ -529,7 +530,7 @@ def rounding(destination: Path) -> None:
             distances.append(distance(single, moved(truth)))
     arrays["orders"] = drawn.astype(np.uint8)
     arrays[f"{name}.distances"] = np.asarray(distances)
-    np.savez_compressed(destination, **arrays)
+    np.savez_compressed(destination, allow_pickle=False, **arrays)
     print(f"{destination}: {ORDERS} pixel orders")
 
 
@@ -692,7 +693,7 @@ def main(only: Sequence[str] = ()) -> None:
         raise SystemExit(f"no cases named {unknown}")
     arrays: dict[str, np.ndarray] = {}
     cases: dict[str, dict[str, object]] = {}
-    record: dict[str, object] = {"diffusers": diffusers.__version__, "shape": list(SHAPE),
+    record: dict[str, Any] = {"diffusers": diffusers.__version__, "shape": list(SHAPE),
                                  "guidance_scale": GUIDANCE_SCALE,
                                  "label": LABEL, "cases": cases}
     if only:
@@ -720,7 +721,7 @@ def main(only: Sequence[str] = ()) -> None:
         for key, value in brownian_record().items():
             arrays[f"brownian.{key}"] = value
         print(f"brownian: torchsde tree over {arrays['brownian.bounds']}")
-    np.savez_compressed(FIXTURES / "source_schedulers.npz", **arrays)
+    np.savez_compressed(FIXTURES / "source_schedulers.npz", allow_pickle=False, **arrays)
     (FIXTURES / "source_schedulers.json").write_text(json.dumps(record, indent=1) + "\n")
     size = (FIXTURES / "source_schedulers.npz").stat().st_size
     print(f"{FIXTURES / 'source_schedulers.npz'}: {size / 1e3:.0f} kB, {len(CASES)} cases")

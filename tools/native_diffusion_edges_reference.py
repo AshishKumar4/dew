@@ -13,18 +13,17 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import diffusers
 import numpy as np
 import torch
-from diffusers import (
-    DDIMScheduler,
-    DiffusionPipeline,
-    DPMSolverMultistepScheduler,
-    EulerDiscreteScheduler,
-    PNDMScheduler,
-    UNet2DConditionModel,
-)
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
+from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
+from diffusers.schedulers.scheduling_pndm import PNDMScheduler
 from diffusers_wan_reference import float64_scheduler
 from reference_releases import require
 
@@ -40,31 +39,35 @@ def generate(root):
     check_versions()
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    common = dict(num_train_timesteps=20, beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear")
+    common: dict[str, Any] = dict(num_train_timesteps=20, beta_start=0.00085, beta_end=0.012,
+                                  beta_schedule="scaled_linear")
     # 256 independent rows, so each walk's distance from float64 is an RMS over many roundings
     # rather than one draw.
     initial = torch.randn((256, 3), generator=torch.Generator().manual_seed(61), dtype=torch.float64) * 8
     arrays = {"initial": initial.to(torch.float32).numpy()}
-    for name, cls, options in (
+
+    def walked(cls: Any, options: dict[str, Any], dtype):
+        """Four steps of a scheduler `cls` (Diffusers' schedulers share this surface but type none of it)."""
+        scheduler = cls(**common, **options)
+        scheduler.set_timesteps(4)
+        x = torch.from_numpy(arrays["initial"]).to(dtype) * scheduler.init_noise_sigma
+        trajectory = []
+        for time in scheduler.timesteps:
+            model_input = scheduler.scale_model_input(x, time)
+            prediction = torch.sin(model_input) * 0.07 + time.to(dtype) * 0.001
+            x = scheduler.step(prediction, time, x).prev_sample
+            trajectory.append(x.numpy().copy())
+        return scheduler, np.stack(trajectory)
+
+    walks: list[tuple[str, Any, dict[str, Any]]] = [
         ("ddim-linspace", DDIMScheduler, dict(timestep_spacing="linspace", clip_sample=False, set_alpha_to_one=False)),
         ("pndm-linspace", PNDMScheduler, dict(timestep_spacing="linspace", skip_prk_steps=True, set_alpha_to_one=False)),
         ("ddim-clip", DDIMScheduler, dict(clip_sample=True, set_alpha_to_one=False)),
         ("euler-zero-snr", EulerDiscreteScheduler, dict(rescale_betas_zero_snr=True, prediction_type="v_prediction")),
         ("dpm-karras", DPMSolverMultistepScheduler, dict(use_karras_sigmas=True)),
-    ):
-        def walk(dtype):
-            scheduler = cls(**common, **options)
-            scheduler.set_timesteps(4)
-            x = torch.from_numpy(arrays["initial"]).to(dtype) * scheduler.init_noise_sigma
-            trajectory = []
-            for time in scheduler.timesteps:
-                model_input = scheduler.scale_model_input(x, time)
-                prediction = torch.sin(model_input) * 0.07 + time.to(dtype) * 0.001
-                x = scheduler.step(prediction, time, x).prev_sample
-                trajectory.append(x.numpy().copy())
-            return scheduler, np.stack(trajectory)
-
-        scheduler, trajectory = walk(torch.float32)
+    ]
+    for name, cls, options in walks:
+        scheduler, trajectory = walked(cls, options, torch.float32)
         scheduler.save_pretrained(root / name)
         config = json.loads((root / name / "scheduler_config.json").read_text())
         arrays[name + ".config"] = np.asarray(json.dumps(config))
@@ -75,16 +78,18 @@ def generate(root):
         arrays[name + ".trajectory"] = trajectory
         arrays[name + ".final"] = trajectory[-1]
         with float64_scheduler(sys.modules[cls.__module__]):
-            scheduler, trajectory = walk(torch.float64)
+            scheduler, trajectory = walked(cls, options, torch.float64)
         arrays[name + ".betas.fp64"] = scheduler.betas.numpy()
         arrays[name + ".final.fp64"] = trajectory[-1]
-    np.savez_compressed(root / "schedulers.npz", **arrays)
+    np.savez_compressed(root / "schedulers.npz", allow_pickle=False, **arrays)
     torch.manual_seed(173)
-    model = UNet2DConditionModel(sample_size=8, in_channels=4, out_channels=4,
+    # Diffusers types each per-block tuple as a 1-tuple (`tuple[int]`); these are its config's values.
+    unet: dict[str, Any] = dict(sample_size=8, in_channels=4, out_channels=4,
         down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
         up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
         block_out_channels=(32, 32, 64), layers_per_block=1, cross_attention_dim=8,
-        attention_head_dim=(4, 4, 8), norm_num_groups=8, norm_eps=0.001).eval()
+        attention_head_dim=(4, 4, 8), norm_num_groups=8, norm_eps=0.001)
+    model = UNet2DConditionModel(**unet).eval()
     model.save_pretrained(root / "unet", safe_serialization=True)
     arrays = {}
     for name, width in (("norm", 12), ("odd", 10)):
@@ -107,7 +112,7 @@ def generate(root):
         arrays[name + ".context"] = context.numpy()
         arrays[name + ".time"] = time.numpy()
         arrays[name + ".probe"] = probe.numpy().transpose(0, 2, 3, 1)
-    np.savez_compressed(root / "unet_reference.npz", **arrays)
+    np.savez_compressed(root / "unet_reference.npz", allow_pickle=False, **arrays)
     print(json.dumps({"directory": str(root), "scheduler_cases": 5, "unet_cases": 2}))
 
 
@@ -140,14 +145,16 @@ def reload_source(source, exported):
         return
     before = DiffusionPipeline.from_pretrained(source, local_files_only=True, low_cpu_mem_usage=False)
     after = DiffusionPipeline.from_pretrained(exported, local_files_only=True, low_cpu_mem_usage=False)
+    if not callable(before) or not callable(after):
+        raise TypeError(f"{type(before).__name__} is no pipeline to run")
     before.set_progress_bar_config(disable=True)
     after.set_progress_bar_config(disable=True)
     compared = 0
     for component in ("unet", "vae", "text_encoder", "text_encoder_2", "safety_checker"):
         first, second = getattr(before, component, None), getattr(after, component, None)
-        if first is None:
-            if second is not None:
-                raise AssertionError(f"Unexpected component {component}")
+        if first is None or second is None:
+            if first is not second:
+                raise AssertionError(f"Component {component} is in one pipeline only")
             continue
         left, right = first.state_dict(), second.state_dict()
         if left.keys() != right.keys():

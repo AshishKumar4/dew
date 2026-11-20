@@ -65,8 +65,8 @@ class Operation:
     89j)` is 2.2e38), one no larger than its operand's (`keeps_magnitude`), an integer it rounds to, no
     larger than its operand's or 1 (`integral`: `ceil(2**-126)` is 1), a bitwise result, a boolean's at most
     1 and an integer's any value of its dtype (`bitwise`: int32's `not(-2**31)` is `2**31 - 1`), a value at
-    most 0 where its operand is (`keeps_sign`; a conversion where it keeps the sign, `_keeps_sign`); and
-    whether its work is the special-function units' (`exponential`, `cost.work`)."""
+    most 0 where its operand is (`keeps_sign`; a conversion where it keeps the sign, `_keeps_sign`). Which
+    units an operation's work is the kernels' counter states (`emission.SPECIAL_FUNCTIONS`, `cost.work`)."""
 
     symbol: str
     kind: str
@@ -76,7 +76,6 @@ class Operation:
     integral: bool = False
     bitwise: bool = False
     keeps_sign: bool = False
-    exponential: bool = False
 
 
 OPERATIONS: dict[jcore.Primitive, Operation] = {}
@@ -96,15 +95,15 @@ def _speaks(kind: str, *primitives: jcore.Primitive, **facts) -> None:
 
 _speaks("binary", jax.lax.add_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p, jax.lax.min_p,
         jax.lax.atan2_p, jax.lax.rem_p, jax.lax.nextafter_p)
-_speaks("binary", jax.lax.pow_p, exponential=True)
+_speaks("binary", jax.lax.pow_p)
 _speaks("binary", jax.lax.and_p, jax.lax.or_p, jax.lax.xor_p, bitwise=True)
 _speaks("unary", jax.lax.sign_p, jax.lax.integer_pow_p, jax.lax.square_p, jax.lax.erf_inv_p,
         jax.lax.is_finite_p, jax.lax.optimization_barrier_p)
 _speaks("unary", jax.lax.neg_p, jax.lax.abs_p, keeps_magnitude=True)
 _speaks("unary", jax.lax.exp_p, jax.lax.exp2_p, jax.lax.log_p, jax.lax.log2_p, jax.lax.log1p_p,
-        jax.lax.expm1_p, jax.lax.sqrt_p, jax.lax.rsqrt_p, exponential=True)
+        jax.lax.expm1_p, jax.lax.sqrt_p, jax.lax.rsqrt_p)
 _speaks("unary", jax.lax.tanh_p, jax.lax.logistic_p, jax.lax.sin_p, jax.lax.cos_p, jax.lax.erf_p,
-        bounded=True, exponential=True)
+        bounded=True)
 _speaks("unary", jax.lax.floor_p, jax.lax.ceil_p, jax.lax.round_p, integral=True)
 _speaks("unary", jax.lax.not_p, bitwise=True)
 _speaks("comparison", jax.lax.lt_p, jax.lax.le_p, jax.lax.eq_p, jax.lax.ne_p, jax.lax.ge_p, jax.lax.gt_p)
@@ -353,6 +352,9 @@ class Region[Node: (Term, Skeleton)]:
     magnitudes: Mapping[Hashable, Magnitude | None]
     products: dict[int, tuple[np.dtype | None, ...]] = dataclasses.field(default_factory=dict)
     """Each product's parameters' index (`Term.dot`'s), its operands' dtypes (a rule's product its own's)."""
+    made: dict[int, np.dtype] = dataclasses.field(default_factory=dict)
+    """Each product's parameters' index, the dtype it makes as traced (`product_dtype`; a rule's product its
+    source's), apart from its parameters, which the region replays as they were traced."""
     literal_keys: frozenset[Hashable] = frozenset()
     """Each literal's term's key (`literals`' terms)."""
     indexed: dict[Hashable, int] = dataclasses.field(default_factory=dict)
@@ -367,11 +369,13 @@ class Region[Node: (Term, Skeleton)]:
         for term, extent in self.shapes:
             self.extents.setdefault(key(term), extent)
 
-    def interned(self, primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None) -> int:
+    def interned(self, primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None,
+                 made: np.dtype | None = None) -> int:
         """The index of `primitive` at `values` in the region's table (`params`), added where it holds none
         (`_interned`): a rule set's own parameters (a transposed product's plain one) by the rule the
         region's equations were interned by."""
-        return _interned(self.params, self.products, self.indexed, primitive, values, operands)
+        return _interned(self.params, (self.products, self.made), self.indexed, primitive, values, operands,
+                         made)
 
     def shape(self, term: Node) -> tuple[int, ...]:
         """`term`'s shape as its equation states it, a term of the region's: the one lookup of the shapes its
@@ -404,18 +408,23 @@ def key(term: BaseExpr | Skeleton) -> Hashable:
     return term.__egg_typed_expr__
 
 
-def _interned(params: list, products: dict, indexed: dict[Hashable, int], primitive: jcore.Primitive,
-              values: Mapping, operands: tuple | None = None) -> int:
+def _interned(params: list, tables: tuple[dict, dict], indexed: dict[Hashable, int],
+              primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None,
+              made: np.dtype | None = None) -> int:
     """The index of `primitive` at `values` in a region's table `params`, added where it holds none: two
     entries are one where their primitive and parameters are (`parameters_key`) and, of a product, its
-    `operands`' dtypes too, which key its mode (`cost.work`) and are kept in `products`. The one interning
-    of a region's parameters, while it is built (`_region`) and after (`Region.interned`)."""
+    `operands`' dtypes too, which key its mode (`cost.work`), each kept in `tables` (`Region.products`), with
+    the dtype it `made` (`Region.made`, which its operands' dtypes and parameters fix). The one interning of
+    a region's parameters, while it is built (`_region`) and after (`Region.interned`)."""
+    products, made_by = tables
     entry = (*parameters_key(primitive, values), operands)
     if entry not in indexed:
         indexed[entry] = len(params)
         params.append((primitive, dict(values)))
         if operands is not None:
             products[indexed[entry]] = operands
+        if made is not None:
+            made_by[indexed[entry]] = np.dtype(made)
     return indexed[entry]
 
 
@@ -619,8 +628,9 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     depths: dict[jcore.Var, int] = {}
 
     products: dict[int, tuple[np.dtype | None, ...]] = {}
+    made: dict[int, np.dtype] = {}
 
-    param = functools.partial(_interned, params, products, indexed)
+    param = functools.partial(_interned, params, (products, made), indexed)
 
     env: dict[jcore.Var, Node] = {}
     dtypes: dict[Hashable, np.dtype] = {}
@@ -716,7 +726,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     literal_outputs = [atom.val if isinstance(atom, jcore.Literal) else None for atom in jaxpr.outvars]
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
-                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
+                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products, made,
                   frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed,
                   {var: magnitudes.get(key(node)) for var, node in env.items()})
 
@@ -726,9 +736,7 @@ KEEPING_MAGNITUDE = _symbols(lambda operation: operation.keeps_magnitude)
 INTEGRAL = _symbols(lambda operation: operation.integral)
 BITWISE = _symbols(lambda operation: operation.bitwise)
 KEEPING_SIGN = _symbols(lambda operation: operation.keeps_sign)
-EXPONENTIALS = _symbols(lambda operation: operation.exponential)
-"""The symbols whose operations' values prove each fact of their operand's, and those the special-function
-units evaluate (`Operation`)."""
+"""The symbols whose operations' values prove each fact of their operand's (`Operation`)."""
 UNIT = 0
 
 
@@ -1241,6 +1249,20 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
     return None
 
 
+def product_dtype(region: Region, index: int) -> np.dtype:
+    """The dtype the product (`Term.dot`) at parameters `index` makes: as traced (`Region.made`, a rule's
+    product its source's), else its preferred element type, else its operands' one dtype; never another
+    library's promotion of theirs (NumPy's refuses a bfloat16 beside a float16, base review 0b8b7ed98 F1),
+    nor a trace of a product made for it (base review 7754e5fde F3)."""
+    if index in region.made:
+        return region.made[index]
+    preferred = region.params[index][1].get("preferred_element_type")
+    if preferred is not None:
+        return np.dtype(preferred)
+    (dtype,) = {np.dtype(each) for each in region.products[index] if each is not None}
+    return dtype
+
+
 def product_slack(region: Region, index: int) -> int | None:
     """The powers the product of `region`'s parameters `index` adds to its bound for its mode
     (`contraction_slack` at its operands' dtypes, `Region.products`); None where an operand's dtype is
@@ -1480,7 +1502,10 @@ def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., 
             given["preferred_element_type"] = None
         operands = tuple(np.dtype(var.aval.dtype) if isinstance(var.aval, ShapedArray) else None
                          for var in equation.invars)
-        return write(others[0], param(primitive, given, operands))
+        # The dtype it makes as traced (`Region.made`), kept apart from its parameters, which the region
+        # replays as traced (a product of two dtypes' unset preferred type stays so, base review 3232beb7c).
+        (traced,) = (var.aval for var in equation.outvars if isinstance(var.aval, ShapedArray))
+        return write(others[0], param(primitive, given, operands, traced.dtype))
     return write(operation.symbol, *others, param(primitive, equation.params))
 
 

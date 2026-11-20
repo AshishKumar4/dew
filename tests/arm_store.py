@@ -47,7 +47,7 @@ def _arm_compile(compile: Callable, written: dict | None) -> Callable:
         # An arm held whole (`_Whole`) is a jit of its own compiler options, lowered as itself: no other jit
         # may hold it.
         if isinstance(function, _Whole):
-            return function.fn
+            return function
         return compile(function, out_shardings=out_shardings, compiler_options=written)
 
     return compiled
@@ -130,11 +130,11 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         if list(inputs) != leaves:
             raise ValueError(f"{name}: an arm compiled with its own compiler options is held whole, over its "
                              "inputs as arrays, and these inputs are a tree of them")
-        programs[name] = (_Whole(traced_fn), [*map(jax.typeof, leaves)])
         with generation.routes() as reported, tuning.seen() as launched:
             out = traced_fn.trace(*inputs).out_info
         held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported),
                       "launches": launched.held()}
+        programs[name] = (_Whole(traced_fn, held[name]), [*map(jax.typeof, leaves)])
         return out
     with generation.routes() as reported, tuning.seen() as launched:
         closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
@@ -145,29 +145,43 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         # Its lowering's own trace, whose constants are the program's held (a relowering's, past a spill,
         # derives its launches afresh: a halved chunk's sequence table), never the first trace's; refused
         # where they are other arguments than the program was compiled to take.
-        retraced = jax.make_jaxpr(traced_fn)(*jax.tree.unflatten(structure, flat))
+        with tuning.seen() as relaunched:
+            retraced = jax.make_jaxpr(traced_fn)(*jax.tree.unflatten(structure, flat))
         if [jax.typeof(constant) for constant in retraced.consts] != schema:
             raise ValueError(f"{name}: relowered, its program holds other constants than its first trace's, "
                              "which its compile ahead takes as its arguments")
+        # The launches of the lowering compiled, which its run reports (`CompiledTruths.ran`): a relowering
+        # past a spill takes another config than the first trace's.
         held[name]["constants"] = [*map(np.asarray, retraced.consts)]
+        held[name]["launches"] = relaunched.held()
         return retraced
 
-    _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
     # The routes its trace reported and the launches it took, which its run, calling the program and tracing
-    # none, reports at each call (`truths_ahead.CompiledTruths.ran`).
-    held[name]["routes"], held[name]["launches"] = list(reported), launched.held()
+    # none, reports at each call (`truths_ahead.CompiledTruths.ran`), until a lowering of it takes its own
+    # (`again`).
+    held_now = {"routes": list(reported), "launches": launched.held()}
+    _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
+    held[name].update(held_now)
     return shapes
 
 
 @dataclasses.dataclass(frozen=True)
 class _Whole:
     """An arm's program held whole (`_arm_program`): `fn`, a jit of its own compiler options, which the
-    store's compile lowers as itself (`_arm_compile`) over its inputs' leaves."""
+    store's compile lowers as itself (`_arm_compile`) over its inputs' leaves, each lowering's launches into
+    its `record` (`lower`): its run reports the kept lowering's, as an arm's relowering does (`again`)."""
 
     fn: Callable
+    record: dict = dataclasses.field(compare=False, hash=False)
 
     def __call__(self, *leaves):
         return self.fn(*leaves)
+
+    def lower(self, *args, **options):
+        with tuning.seen() as found:
+            lowered = self.fn.lower(*args, **options)
+        self.record["launches"] = found.held()
+        return lowered
 
 
 def _hold(programs: dict, held: dict, name: str, closed, tree, inputs, again: Callable) -> None:

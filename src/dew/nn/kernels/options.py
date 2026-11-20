@@ -1012,7 +1012,7 @@ def trace_context() -> Hashable:
     facts a trace reads (`generation.traced_fact`) are no part of it: each is answered where a trace asks
     it, under the trace's own target, and one read outside a trace may have no answer (a compile-only GPU
     mesh's devices hold no memory statistics); a caller whose trace reads one names it beside this key (the
-    compiles' refusals, `report.refused_launches`). A value it leaves out costs a trace, never a program
+    compiles' refusals, `report.refusal_entries`). A value it leaves out costs a trace, never a program
     traced under other state."""
     import decimal
     import os
@@ -1039,14 +1039,14 @@ def trace_context() -> Hashable:
 def held_context() -> Hashable:
     """The key a trace kept outside the compile point is held by, beside what it is of: the state a trace
     reads of this thread's context (`trace_context`) and the launches the compiles refused, which a
-    template's legality reads as the call traces (`report.refused_launches`, a process's fact a trace reads
+    template's legality reads as the call traces (`report.refusal_entries`, a process's fact a trace reads
     and a caller names beside the trace's state). A step's candidates (`dew.training._candidates`) and the
     algebra's held kernel decisions (`fusion.choice_context`, the derivation's context beside it) are each
     held by it, so a fact added to it reaches both; a launch's derived config is keyed by what its
     derivation reads (`report.derivation_inputs`, `templates.base`)."""
     from dew.nn.kernels.templates import report
 
-    return trace_context(), report.refused_launches()
+    return trace_context(), report.refusal_entries()
 
 
 def _signature(leaf) -> Hashable:

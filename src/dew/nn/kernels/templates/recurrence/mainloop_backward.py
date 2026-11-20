@@ -135,7 +135,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   max_segments: int | None = None, scale: float | None = None,
                   family: mosaic.Family | None = None, interpret: bool = False,
                   inverse=None, kept=None, delta: bool = True,
-                  rounded: bool = False, apart: int = 0, ranged: bool = False,
+                  rounded: bool = False, apart: int = 0, values_gated: bool = False,
+                  unit_keys: bool = False, ranged: bool = False,
                   skip=None,
                   forked: ForkedTable | None = None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
@@ -164,7 +165,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                                   "fp32 call's under the run's fast forms alone")
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                   firsts=firsts, rounded=rounded, apart=apart, ranged=ranged, forked=forked,
+                   firsts=firsts, rounded=rounded, apart=apart, values_gated=values_gated,
+                   unit_keys=unit_keys, ranged=ranged, forked=forked,
                    skipped=skip is not None)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
@@ -238,12 +240,11 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
 
 def _taken_up(run, taken):
     """The gradient of the memory each chunk takes up (`taken`, the reverse walk's, `[chunks * HV * Dk, Dv]`),
-    `[B, NC, HV, Dk, Dv]`, zero at a chunk that takes nothing up (which the walk wrote nothing to)."""
+    `[NC, HV, Dk, Dv]`, zero at a chunk that takes nothing up (which the walk wrote nothing to)."""
     call, table = run.call, run.table
-    taking = (table.loads >= 0).reshape(run.batch, -1)
     taken = taken[table.pad:taken.shape[0] - table.pad]
-    taken = taken.reshape(*taking.shape, call.heads, call.width, call.value_width)
-    return jnp.where(taking[..., None, None, None], taken, 0.0)
+    taken = taken.reshape(-1, call.heads, call.width, call.value_width)
+    return jnp.where((table.loads >= 0)[:, None, None, None], taken, 0.0)
 
 
 def _turned_back(run, taken):
@@ -252,8 +253,8 @@ def _turned_back(run, taken):
     table = run.table
     if table.turning is None:
         return taken
-    rows, after, before = (part.reshape(*taken.shape[:3], -1)[..., None] for part in table.turning)
-    shifted = jnp.pad(taken, ((0, 0),) * 3 + ((1, 1), (0, 0)))
+    rows, after, before = (part.reshape(*taken.shape[:2], -1)[..., None] for part in table.turning)
+    shifted = jnp.pad(taken, ((0, 0),) * 2 + ((1, 1), (0, 0)))
     return rows * taken - after * shifted[..., 2:, :] - before * shifted[..., :-2, :]
 
 
@@ -264,15 +265,20 @@ def _tabled_gradients(run, grads: tuple, taken) -> tuple:
     if taken is None:
         return grads
     table = run.table
-    loads = table.loads.reshape(run.batch, -1)
-    slots = jnp.arange(1, table.count + 1)
-    given = jnp.einsum("bcs,bchkv->bshkv", (loads[..., None] == slots).astype(jnp.float32),
-                       _turned_back(run, _taken_up(run, taken)))
+    # Each chunk taking a given slot up adds to its row's slot (a stored slot's, its storing chunk's walk),
+    # its gradient turned back into the slot's frame where the call turns it (`_turned_back`); a slot a chunk
+    # adds (`Table.adds`) takes the same gradient as the one it loads.
+    returned = _turned_back(run, _taken_up(run, taken))
+    given = jnp.zeros((run.batch, table.count, *returned.shape[1:]), jnp.float32)
+    for slots in (table.loads, *(() if table.adds is None else (table.adds,))):
+        given_slot = (slots > 0) & (slots <= table.count)
+        given = given.at[table.rows, jnp.clip(slots - 1, 0, table.count - 1)].add(
+            jnp.where(given_slot[:, None, None, None], returned, 0.0), mode="drop")
     return (*grads[:5], given[..., :run.key_width, :run.value_width])
 
 
 def _entered_gradient(run, taken):
-    """A forked call's entry write's gradient `[B, NC, HV, Dk, Dv]` (`chunk_forward.ForkedTable.entries`): the
+    """A forked call's entry write's gradient `[NC, HV, Dk, Dv]` (`chunk_forward.ForkedTable.entries`): the
     memory's each chunk takes up, which its entry write adds to; None where the call gives none."""
     if taken is None or run.table.entries is None:
         return None
@@ -952,9 +958,9 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         row, span, last = n * chunk, pl.ds(n * chunk, chunk), n * chunk + chunk - 1
         key_columns = keyed * width + c * call.block
         first = keyed * group
-        views = _query_key_views(call, (q_ref, k_ref), (v_ref, do_ref, dv_ref), (h_ref, dh_ref), row=row,
-                                 key_columns=key_columns, first=first, chunk=n, block=c, split=split, vq=vq,
-                                 scores=(ds_ref, keyed))
+        views, once = _walked_once(call, _query_key_views(
+            call, (q_ref, k_ref), (v_ref, do_ref, dv_ref), (h_ref, dh_ref), row=row, key_columns=key_columns,
+            first=first, chunk=n, block=c, split=split, vq=vq, scores=(ds_ref, keyed)))
 
         def step(index, slots, carry, accumulators, *, scores: bool = True):
             h = first + index
@@ -1016,9 +1022,10 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
 
         # Without the delta rule the scores' products the first step's alone.
         return mosaic.Walk(views, step, steps=group, segments=() if call.delta else (
-            (step, 0, 1), (functools.partial(step, scores=False), 1, group)))
+            (step, 0, 1), (functools.partial(step, scores=False), 1, group)), once=once)
 
     tiles, out_type = _query_key_launched(call, vq)
+    tiles, once = _walked_once(call, tiles)
     # Persistent under the delta rule, whose tile walks one step function (without it, the first step's
     # scores products are a segment of their own, which a persistent tile walks none of): a program a tile
     # paid each tile's setup, its chunk's table entries' dependent loads and its ring's and done barriers,
@@ -1026,7 +1033,8 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     dq, dk, *weights, after, leaving, memory = launch_kernel(
         program, call, out_type=out_type,
         grid=(splits, width // call.block, call.chunks, call.heads // group),
-        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
+        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, once=once or None, stages=1,
+        live=chunk_liveness(10),
         steps=call.group, model=_query_key_model(call), held=_query_key_held(call, vq),
         landing=_query_key_landing(call, splits),
         persistent=call.delta, together=(call.block,) * (2 + call.delta + 2 * (splits == 1)))(
@@ -1037,6 +1045,18 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     after, leaving, memory = (x.reshape(splits, -1, *x.shape[1:]).sum(0) for x in (after, leaving, memory))
     dw = None if not weights else weights[0] if splits == 1 else held.split(weights[0])
     return dq, dk, dw, after, leaving, memory
+
+
+def _walked_once(call: Call, streams: dict) -> tuple[dict, dict]:
+    """`_query_key`'s `streams` (its views or its blocks, by part name) as those its steps stream and those
+    its walk loads once (`mosaic.Walk.once`): without the delta rule the key head's queries, keys and scores'
+    gradient, which every value head's step reads alike (a plain walk's, on a family whose walks load them,
+    `Family.walks_once`; under the delta rule its tiles persist, whose once streams the recurrence's bundles
+    do not load, each step its value head's scores' gradient): streamed, a step each of a group's value heads
+    loaded them again, the 4B SSD's twelve where one serves."""
+    once = () if call.delta or not call.family.walks_once else ("queries", "keys", "ds")
+    held = {name: value for name, value in streams.items() if name.rstrip("0123456789") in once}
+    return {name: value for name, value in streams.items() if name not in held}, held
 
 
 def _query_key_model(call: Call) -> float:

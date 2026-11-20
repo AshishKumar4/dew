@@ -48,9 +48,12 @@ def written() -> None:
     arrays = {"x": x.permute(0, 2, 1).numpy()[:, None], "c": c.numpy()}
     for name, module in head.named_modules():
         if isinstance(module, torch.nn.Conv1d):
-            arrays[f"{name}.kernel"] = module.weight_orig.detach().numpy().transpose(2, 1, 0)[None]
+            if module.bias is None:
+                raise ValueError(f"{name}'s convolution holds no bias")
+            # Spectral norm's own parameter and buffer, which it registers beside the layer's.
+            arrays[f"{name}.kernel"] = module.get_parameter("weight_orig").detach().numpy().transpose(2, 1, 0)[None]
             arrays[f"{name}.bias"] = module.bias.detach().numpy()
-            arrays[f"{name}.u"] = module.weight_u.detach().numpy().copy()
+            arrays[f"{name}.u"] = module.get_buffer("weight_u").detach().numpy().copy()
         elif type(module).__name__ == "BatchNormLocal":
             arrays[f"{name}.weight"] = module.weight.detach().numpy()
             arrays[f"{name}.bias"] = module.bias.detach().numpy()
@@ -59,7 +62,7 @@ def written() -> None:
     with torch.no_grad():
         arrays["logits"] = head(x, c)[:, 0].numpy()[:, None]
     FIXTURE.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE / "head.npz", **arrays)
+    np.savez(FIXTURE / "head.npz", allow_pickle=False, **arrays)
     print(f"{FIXTURE}: a DiscHead over {BATCH} sequences of {LENGTH} tokens, {sorted(arrays)}")
 
 

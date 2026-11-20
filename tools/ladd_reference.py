@@ -52,7 +52,9 @@ precision, so its own float64 path is no truth for a summary to check.
 
 from __future__ import annotations
 
+import functools
 import math
+import operator
 import types
 from pathlib import Path
 
@@ -99,14 +101,14 @@ def spectral(head) -> list[tuple[torch.nn.Module, str]]:
 
 
 def kept(heads) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    return [(module.weight_u.clone(), module.weight_v.clone())
+    return [(module.get_buffer("weight_u").clone(), module.get_buffer("weight_v").clone())
             for head in heads for module, _ in spectral(head)]
 
 
 def restore(heads, held) -> None:
     for (module, _), (u, v) in zip([pair for head in heads for pair in spectral(head)], held, strict=True):
-        module.weight_u.copy_(u)
-        module.weight_v.copy_(v)
+        module.get_buffer("weight_u").copy_(u)
+        module.get_buffer("weight_v").copy_(v)
 
 
 def us(head) -> dict:
@@ -245,7 +247,7 @@ def step(dtype, inputs: dict[str, np.ndarray], scope: dict) -> dict[str, np.ndar
         per_head = [head(f, condition).reshape(f.shape[0], -1).mean(-1).sum()
                     for head, f in zip(heads, real, strict=True)]
         restore(heads, after)
-        gradients = torch.autograd.grad(sum(per_head), real, create_graph=True)
+        gradients = torch.autograd.grad(functools.reduce(operator.add, per_head), real, create_graph=True)
         r1 = sum(torch.square(g).reshape(g.shape[0], -1).sum(-1) for g in gradients)
         discriminator = (torch.relu(1 - real_scores).mean(-1) + torch.relu(1 + held_scores).mean(-1))
         generator = -fake_scores.mean(-1)

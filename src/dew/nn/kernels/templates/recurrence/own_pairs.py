@@ -123,7 +123,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
             prefix = tuple(stream_tile(slots, name, gates).value() for name in ("highs", "lows"))
             found = algebra.key_diagonal_bands(
                 [intra_rows(call, name, operand, beta_ref.at[h, span]) for name in products],
-                shifted_keys(call, shifts, operand("keys"), prefix))
+                shifted_keys(call, shifts, operand("keys"), prefix), unit_keys=call.unit_keys)
             bands = tuple(band + more for band, more in zip(bands, found, strict=True))
 
             @pl.when(index == steps - 1)
@@ -205,12 +205,19 @@ def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, hi_ref, lo_ref) -> d
                         lows=gates.views(lo_ref, row, chunk, h * width, width))
 
 
-def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, operands: tuple, grads: tuple):
+def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, operands: tuple, grads: tuple,
+                      diagonal=None):
     """A key block's gradients through a chunk's pairs stored at `at` (its row and column) into `refs`
     (`dq`, `dk`, `dg`): the queries', the keys' through the gated keys (`beta k`) and their own, and the log
-    decay's (`q dq + k (beta dk' - dk)`); returns the write gates' terms, each row's `sum(dk' k)`."""
+    decay's (`q dq + k (beta dk' - dk)`); returns the write gates' terms, each row's `sum(dk' k)`. Where
+    `diagonal` gives a token's own scores pair's gradient `[C, 1]` (scaled), `grads` were summed without
+    it and it joins the queries' and keys' gradients alone: the log decay's terms never take it, a token's
+    write read by its own query undecayed, its two halves `q (dS k)` and `k (dS q)` equal, each the size of
+    `q k dS` where their difference is none, which summed in left their rounding on every earlier token's
+    suffix sum, 4e-10 at Kimi Linear's last token where float64's was 2e-17 (row 7906)."""
     (query, key, betas), (d_query, d_keyed, d_key), (row, column) = operands, grads, at
-    for ref, grad in zip(refs, (d_query, d_keyed * betas[:, None] + d_key,
+    own_query, own_key = (0.0, 0.0) if diagonal is None else (diagonal * key, diagonal * query)
+    for ref, grad in zip(refs, (d_query + own_query, d_keyed * betas[:, None] + d_key + own_key,
                                 query * d_query + key * (d_keyed * betas[:, None] - d_key)), strict=True):
         fp32_operand(call).store(ref, grad, row, call.chunk, column, keys, family=call.family, smem=smem)
     return jnp.sum(d_keyed * key, axis=1)
@@ -259,8 +266,12 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
                 return functools.reduce(jnp.add, (family.rows_of(slots[f"{name}{p}"].at[e])
                                                   for p in range(square.parts))) * scaled
 
-            strips = [functools.partial(strip, name, scaled)
-                      for name, scaled in (("scores", scale), ("system", 1.0))]
+            # The scores' own pair (offset zero) summed apart (`pairs_back_stored`'s `diagonal`): its strip
+            # scaled to zero there, a scalar's product (a select against a scalar lowers no broadcast).
+            def scores(e):
+                return strip("scores", scale, e) * (e != 0).astype(jnp.float32)
+
+            strips = [scores, functools.partial(strip, "system", 1.0)]
             zero = jnp.zeros(key.shape, jnp.float32)
             def rows(name):
                 return stream_tile(slots, name, given).value().astype(jnp.float32)
@@ -272,7 +283,7 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
                 (zero, zero), zero)
             d_betas = d_betas + pairs_back_stored(
                 call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys, landing["block"],
-                (query, key, betas), (d_query, d_keyed, d_key))
+                (query, key, betas), (d_query, d_keyed, d_key), diagonal=strip("scores", scale, 0)[:, None])
 
             @pl.when(index == steps - 1)
             def _():

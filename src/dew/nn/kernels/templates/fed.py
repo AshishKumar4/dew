@@ -10,7 +10,7 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.handoffs import Role, Schedule
 from dew.nn.kernels.templates.mosaic import RingFamily
-from dew.nn.kernels.templates.rings import Ring, drain
+from dew.nn.kernels.templates.rings import Ring, drain, loaded_once, stepped_in
 
 
 @dataclasses.dataclass(frozen=True)
@@ -38,12 +38,13 @@ class Feed:
 
     @property
     def stages(self) -> int:
-        return min(ring.stages for ring in self.rings.values())
+        # A walk whose every operand is a once stream rotates no ring: one step deep, as `_walked` takes it.
+        return min((ring.stages for ring in self.rings.values()), default=1)
 
     def load(self, index) -> None:
-        for name, ring in self.rings.items():
-            view = ring.viewed(self.views[name], index - self.origin)
-            ring.load(ring.turn(index - self.first), view)
+        # A joined pair's slot freed once and its members copied into it (`rings.stepped_in`).
+        stepped_in(self.rings, lambda name, ring: ring.turn(index - self.first),
+                   lambda name, ring: ring.viewed(self.views[name], index - self.origin))
 
     def primed(self) -> None:
         """The walk's first steps, a slot each, loaded."""
@@ -76,6 +77,11 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     takes_pingpong = False  # its first consumer issues every ring's loads, its partner's tiles' too
     cluster = 1
+
+    def taken_once(self, held: dict, views: dict, wg) -> dict:
+        # Its loads its loading consumer's: a walk's once streams too, before the walk's first step.
+        pl.when(wg == self.loader)(lambda: loaded_once(held, views))
+        return super().taken_once(held, views, wg)
     feeds_itself = True
     gathers_rows = True  # the loading consumer, a whole warpgroup, gathers a step's rows (`gathered.Ring`)
     loader = 0

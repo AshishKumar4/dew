@@ -459,12 +459,9 @@ class AheadOfTime:
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
         step = _saved(path, AheadOfTime, "step")
-        if ("starts" not in vars(step) or "counts" not in vars(step) or "at_run" not in vars(step)
-                or "autotuned" not in record(step.plan, "plan")):
-            raise ValueError(f"{path} holds a step compiled ahead before steps carried their start's "
-                             "programs (`starts`), a sampled pass count's other counts' steps (`counts`) and "
-                             "said whether XLA tuned them and left a choice to run time (`autotuned`, "
-                             "`at_run`); compile it ahead again")
+        if "autotuned" not in record(step.plan, "plan"):
+            raise ValueError(f"{path} holds a step compiled ahead before its plan said whether XLA tuned it "
+                             "(`autotuned`); compile it ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
         counted = [program.executable for held in step.counts.values() for program in held
                    if program is not None]
@@ -474,9 +471,14 @@ class AheadOfTime:
     def loaded(self) -> jax.stages.Compiled:
         """The executable, loaded onto this process's devices, which must be `devices` GPUs or TPUs of
         `generation`: called with the state and batch the step was compiled for, it runs the step. It is
-        admitted as a compiled one is (`dew.communicators.admit`)."""
+        admitted as a compiled one is (`dew.communicators.admit`). Refused where it would not run as its
+        devices' own compile of it (`report.compiled_as_here`: untuned where they tune, or a choice left to
+        run time, `at_run`): a load direct or through `taken` admits it as a run handed it does (`runnable`;
+        rows 8957, 8986)."""
         found = jax.devices() if self.built is None else self.built.own_devices()
         self.held(found)
+        if not report.compiled_as_here(found, tuned=self.tuned, at_run=self.at_run):
+            raise ValueError((AT_RUN if self.at_run else UNTUNED) % self.generation)
         return self.executable.loaded(found)
 
     def held(self, devices: Sequence) -> None:
@@ -700,16 +702,21 @@ class AheadPrograms:
 
     target: BuildTarget
     programs: dict[str, Executable]
-    kept: dict[str, KeptProgram] | None = None
-    """The programs a process compiled at Dew's compile point, each by its fingerprint (`KeptProgram`,
-    `keeping`): a process of their target runs each for a call that lowers to that program under those
-    options (`kept`); None for a file of named programs alone."""
-    tuned: bool = True
+    tuned: bool
     """Whether their compile took the GPU kind's tuned choices, as the device's own compile makes them
     (`report.autotuned`): one on a device, or for a node's topology within `report.for_devices`; a compile
     for a generation's canonical GPUs is XLA's untuned program (`compile_programs`), which `loaded`
     refuses where the process's own compile would tune (row 8422: untuned convolutions left cuDNN's runtime
-    heuristic to pick a non-deterministic algorithm)."""
+    heuristic to pick a non-deterministic algorithm). Stated by every constructor, and a file saved
+    without it refused at its load (row 8459)."""
+    at_run: tuple[str, ...]
+    """The programs leaving a choice to run time their device's own compile makes (`report.left_at_run`: a
+    convolution compiled without its GPU, as `compile_programs` reads one for its memory alone), which
+    `loaded` refuses on any GPU (row 8688)."""
+    kept: dict[str, KeptProgram] | None = None
+    """The programs a process compiled at Dew's compile point, each by its fingerprint (`KeptProgram`,
+    `keeping`): a process of their target runs each for a call that lowers to that program under those
+    options (`kept`); None for a file of named programs alone."""
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
@@ -728,24 +735,34 @@ class AheadPrograms:
         platform (`BuildTarget.own_devices`), the ones it was compiled for: each called with the arguments it
         was compiled for runs it. Refused, naming what differs, where those devices, this JAX, its XLA flags
         or its host are not the target they were built for, and where they would not run as this process's
-        own compile of them (`report.compiled_as_here`: untuned where it tunes; none leaves a choice to run
-        time, which `compile_programs` refuses); each is admitted as a compiled program is
-        (`dew.communicators.admit`)."""
+        own compile of them (`report.compiled_as_here`: untuned where it tunes, or a choice left to run time,
+        `at_run`); each is admitted as a compiled program is (`dew.communicators.admit`)."""
         devices = self.target.own_devices()[:self.target.devices]
         self.target.held(devices)
-        if not report.compiled_as_here(devices, tuned=self.tuned, at_run=False):
-            raise ValueError(f"these programs were compiled for {self.target.generation}'s canonical GPUs, "
-                             "untuned (XLA's defaults where a device's compile tunes its convolutions and "
-                             "GEMMs): compile them for this node's topology (compile_programs' topology, "
-                             "$DEW_NODE_TOPOLOGY), or run with the autotuner off (xla_gpu_autotune_level 0)")
+        if not report.compiled_as_here(devices, tuned=self.tuned, at_run=bool(self.at_run)):
+            raise ValueError(
+                f"programs {', '.join(self.at_run)} were compiled without their GPU and leave a "
+                "convolution's algorithm to run time (report.DEVICELESS_CONVOLUTION_PICKS): compile them on "
+                "this GPU"
+                if self.at_run else
+                f"these programs were compiled for {self.target.generation}'s canonical GPUs, untuned (XLA's "
+                "defaults where a device's compile tunes its convolutions and GEMMs): compile them for this "
+                "node's topology (compile_programs' topology, $DEW_NODE_TOPOLOGY), or run with the autotuner "
+                "off (xla_gpu_autotune_level 0)")
         return {name: program.loaded(devices) for name, program in self.programs.items()}
 
 
-def _saved[Saved](path: str | Path, kind: type[Saved], what: str) -> Saved:
-    """What a `save` of `kind` wrote to `path`, refused where it is not one (`what` it holds)."""
+def _saved[Saved: (AheadOfTime, AheadPrograms)](path: str | Path, kind: type[Saved], what: str) -> Saved:
+    """What a `save` of `kind` wrote to `path`, refused where it is not one (`what` it holds), or where it
+    was saved by a Dew whose `kind` held fewer fields than this one's (a pickle restores those it held
+    alone, and a field's class default would stand in for what it never said: rows 8459, 8759)."""
     loaded = pickle.loads(Path(path).read_bytes())
     if not isinstance(loaded, kind):
         raise ValueError(f"{path} holds no {what} compiled ahead of time")
+    missing = [field.name for field in dataclasses.fields(kind) if field.name not in vars(loaded)]
+    if missing:
+        raise ValueError(f"{path} holds {what} compiled ahead by an earlier Dew, before its files held "
+                         f"{', '.join(missing)}: compile it ahead again")
     return loaded
 
 
@@ -852,7 +869,8 @@ class Keeping:
                          reason)
         target = BuildTarget.of(jax.devices())
         cpu_stated(target, jax.devices())
-        programs = AheadPrograms(target, {}, dict(self.kept))
+        # Each compiled on this process's devices, which made its every choice itself.
+        programs = AheadPrograms(target, {}, tuned=True, at_run=(), kept=dict(self.kept))
         programs.save(path)
         return programs
 
@@ -1002,7 +1020,8 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
                              "constant of its program, which no executable serializes: pass it as an "
                              f"argument): {refused}") from refused
     need = programs_need(gpus[0], [(executable.memory, 0, 0) for executable in built.values()])
-    return AheadPrograms(BuildTarget.built(target, 1, need), built, tuned=tuned)
+    return AheadPrograms(BuildTarget.built(target, 1, need), built, tuned=tuned, at_run=tuple(
+        name for name, compiled in zip(programs, executables, strict=True) if report.left_at_run(compiled)))
 
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
@@ -1422,13 +1441,11 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
     clock whether it closes its update window (`closes_window`). A batch of every row, read whole on
     each process, is `DataPartition()`'s."""
     from dew.data.dataset import DataPartition
-    from dew.distributed.batches import split_fields
-    from dew.training._fit import closes_window
+    from dew.training._fit import handed
     from dew.training.distributed import marked
 
     partition = DataPartition.of(trainer.device_mesh) if partition is None else partition
-    device, _ = split_fields(marked(partition, trainer._counted_batch)(batch))
-    return closes_window(device, trainer._shape.examples)
+    return handed(marked(partition, trainer._counted_batch)(batch), trainer._shape.examples)
 
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool = False,

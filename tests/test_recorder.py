@@ -4,7 +4,8 @@ recording goes on from what an interrupted run kept."""
 import jax
 import numpy as np
 import pytest
-from test_reference_error import _tiny_row, _tiny_row_recording
+from test_recordings import _tiny_row_recording
+from test_reference_error import _tiny_row
 
 from dew.parity_stages import staged_units
 
@@ -12,7 +13,8 @@ from dew.parity_stages import staged_units
 def test_a_summarized_recording_holds_one_draws_outputs_at_a_time():
     """A summarized recording (`record_case`'s summary) keeps of each draw its evidence alone, read as the
     draw is made: when a seed is evaluated, of the seeds before it no truth is held but the last one's,
-    which its reader may still name, and each seed is evaluated once. Every draw's inputs, reference and
+    which its reader may still name, and each seed is evaluated once, its sizing's draws from SIZING_FROM
+    (row 9005) among them. Every draw's inputs, reference and
     truth were held until the count was confirmed and its redraw drawn, a recording's whole outputs where
     its file keeps kilobytes."""
     import gc
@@ -20,10 +22,17 @@ def test_a_summarized_recording_holds_one_draws_outputs_at_a_time():
 
     from tool_support import load
 
+    from dew.parity import SIZING_FROM
+
     recorder = load("recorded_references")
     _, live = _tiny_row(4)
     draw, evaluate = _tiny_row_recording(live)
-    truths, held = [], []
+    truths, held, sizing = [], [], set()
+
+    def drawn(seed):
+        if seed >= SIZING_FROM:
+            sizing.add(seed)
+        return draw(seed)
 
     def watched(inputs):
         gc.collect()
@@ -33,9 +42,12 @@ def test_a_summarized_recording_holds_one_draws_outputs_at_a_time():
         return reference, truth
 
     with jax.enable_x64(new_val=True):
-        recorded = recorder.record_case("site", draw, watched, summary=True)
+        recorded = recorder.record_case("site", drawn, watched, summary=True)
     leaves = len(truths) // len(held)
-    assert len(held) == len(recorded["site.input_digest"]) == staged_units(int(recorded["site.seeds"]))
+    # Each verdict seed recorded, and each draw of its sizing, from SIZING_FROM (none a verdict's), evaluated
+    # once beside them.
+    kept = staged_units(int(recorded["site.seeds"]))
+    assert len(recorded["site.input_digest"]) == kept and len(held) == kept + len(sizing)
     assert max(held) <= leaves, held
 
 

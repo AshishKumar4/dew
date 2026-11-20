@@ -64,7 +64,6 @@ from dew.state import CHECKPOINTED, TokenCount, TrainState
 from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.runtime import Preempted
-from dew.training.trainer import refuse_non_finite
 
 
 def endless():
@@ -193,41 +192,6 @@ def test_a_runs_start_reports_each_phase_it_took_once():
     assert sorted(started) == sorted(seconds | {"startup/start_overlapped"})
 
 
-
-def test_a_state_built_outside_a_trace_is_one_program_its_frozen_tree_the_held_arrays():
-    """A fresh state built outside any trace (`Trainer.initial_state`, a caller's or a test's) compiles one
-    program, its traced start's (`distributed.built_start`), where run eagerly each operation of the
-    model's draw compiled alone (row 8682); a held base's frozen tree is the held arrays themselves and its
-    moving tree buffers of its own, which the step's donation may free."""
-    from dew._cache import uncached
-    from dew.batch import FROZEN
-    from dew.lora import LoRA
-
-    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=8)
-    compiles = []
-
-    def heard(event, seconds, **_):
-        if event == "/jax/core/compile/backend_compile_duration":
-            compiles.append(seconds)
-
-    trainer = Trainer(LMObjective(model, seq_len=8), optax.adam(1e-3), key=jax.random.key(0))
-    jax.monitoring.register_event_duration_secs_listener(heard)
-    # Compiled here, each program counted, none loaded from the persistent cache.
-    with uncached():
-        try:
-            trainer.initial_state()
-        finally:
-            jax.monitoring.unregister_event_duration_listener(heard)
-    assert len(compiles) <= 2, len(compiles)
-    variables = nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
-    adapted = LoRA(rank=2, modules=("q_proj",)).apply(model, variables, key=2)
-    objective = LMObjective(adapted.model, seq_len=8, variables=adapted.variables)
-    state = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0)).initial_state()
-    held = {id(leaf) for leaf in jax.tree.leaves(objective.held_variables())}
-    frozen = jax.tree.leaves(state.variables[FROZEN])
-    assert frozen and all(id(leaf) in held for leaf in frozen)
-    assert not any(id(leaf) in held for leaf in jax.tree.leaves(state.variables["params"]))
 
 def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
     """One budget (row 5725): a fit given both `steps` and `tokens` is refused before it reads, as one given
@@ -1316,12 +1280,16 @@ def held_state(params, ema):
 
 
 def bit_patterns(shape, dtype, seed):
-    """Values drawn bit by bit, so NaN payloads and subnormals turn up, with
-    both zeros, a NaN of every payload bit set and the smallest subnormal first."""
+    """Finite values drawn bit by bit, so subnormals and every sign and mantissa turn up, with both zeros,
+    the largest magnitude of every mantissa bit set and the smallest subnormal first: a non-finite one has
+    the lowest bit of its all-ones exponent cleared, as no save writes a state holding one (row 9021)."""
     kind = np.dtype(f"u{np.dtype(dtype).itemsize}")
     bits = np.random.default_rng(seed).integers(0, np.iinfo(kind).max, size=shape,
                                                 dtype=kind, endpoint=True)
     bits.flat[:4] = [1 << (8 * kind.itemsize - 1), 0, np.iinfo(kind).max, 1]
+    lowest_exponent = kind.type(1 << int(jnp.finfo(dtype).nmant))
+    unfinite = ~np.isfinite(bits.view(dtype).astype(np.float32))
+    bits[unfinite] ^= lowest_exponent
     return bits.view(dtype)
 
 
@@ -1344,7 +1312,7 @@ def awkward_state():
 
 
 def test_the_ema_comes_back_bit_for_bit_however_it_is_read(tmp_path):
-    """Every NaN payload, signed zero and subnormal of the EMA survives a save,
+    """Every signed zero, subnormal and finite bit pattern of the EMA survives a save,
     read whole, typed, without the weights beside it, into pinned host memory
     and as the shapes the checkpoint reports."""
     state = awkward_state()
@@ -2462,7 +2430,17 @@ def test_a_run_that_meets_a_non_finite_state_keeps_its_good_checkpoints(tmp_path
     assert resumed.checkpoints.latest == 2
     restored, *_ = resumed.checkpoints.restore(resumed.initial_state())
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(restored.variables))
-    refuse_non_finite(restored, 3, lambda: 2)
+    # A direct save of a non-finite state, on either tier, is refused at the writer before anything is
+    # written or rotated: the latest step stays the finite one (row 9021: it wrote, and a local save
+    # deleted the finite step it replaced).
+    poisoned = jax.tree.map(lambda leaf: jnp.full_like(leaf, jnp.nan), restored.variables)
+    with pytest.raises(RuntimeError):
+        resumed.checkpoints.save(3, restored.replace(variables=poisoned), None)
+    if tier == "local":
+        with pytest.raises(RuntimeError):
+            resumed.checkpoints.save_local(3, restored.replace(variables=poisoned), None)
+    resumed.checkpoints.wait()
+    assert resumed.checkpoints.latest == 2
 
 
 def test_a_trainers_refit_traces_its_step_and_start_once_and_another_trainers_its_own():

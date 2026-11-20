@@ -92,6 +92,7 @@ def test_a_host_step_prepared_without_a_gpu_starts_here_reading_every_program_fr
     for name, text in (("prepare.py", PREPARE), ("run.py", RUN)):
         (tmp_path / name).write_text(text)
     generation = BuildTarget.of(jax.devices()[:1]).generation
+    # Each side's programs dumped (`JAX_DUMP_IR_TO`), which a miss names how they differ by.
     prepared = reported(tmp_path / "prepare.py", [generation, str(topology)],
                         {**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu",
                          "XLA_FLAGS": companion, "JAX_DUMP_IR_TO": str(tmp_path / "prepared")})
@@ -99,8 +100,10 @@ def test_a_host_step_prepared_without_a_gpu_starts_here_reading_every_program_fr
                    {**environment, "JAX_PLATFORMS": "cuda,cpu", "XLA_FLAGS": companion,
                     "JAX_DUMP_IR_TO": str(tmp_path / "ran")})
     assert set(prepared["startup"]["by_backend"]) == {"cpu", "gpu"}, prepared["startup"]
-    assert ran["counts"]["train/cache_misses"] == 0 and ran["counts"]["train/cache_hits"] > 0, (
-        ran["counts"], unread(ran["keys"], prepared["keys"]))
+    # Text whole: pytest cuts a dict's repr in an assertion's message at a few entries.
+    missed = unread(ran["keys"], tmp_path / "ran", prepared["keys"], tmp_path / "prepared")
+    assert ran["counts"]["train/cache_misses"] == 0 and ran["counts"]["train/cache_hits"] > 0, json.dumps(
+        {"counts": ran["counts"], "missed": missed}, indent=1, default=str)
     started, built = ran["startup"], prepared["startup"]
     assert started["programs"] == built["programs"], (started, built)
 

@@ -18,6 +18,7 @@ import numpy as np
 
 from dew.algebra import scan
 from dew.nn.derivatives import KernelGlue, contracted
+from dew.nn.kernels.chunked_launch import entry_write
 from dew.nn.precision import at_least_fp32, compensated_add
 
 TWO_PI = (np.float32(2 * np.pi), np.float32(2 * np.pi - float(np.float32(2 * np.pi))))
@@ -593,8 +594,12 @@ def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents
     shape = (batch, heads, turned, v.shape[-1])
     opened = jnp.zeros((batch, count, *shape[1:]), work)
     if entry is not None:
-        opened = jnp.einsum('bdrhk,bdrhv,bdh->bdhkv', jnp.asarray(entry[0], work)[..., :turned],
-                            *(jnp.asarray(t, work) for t in entry[1:]))
+        # Each document's entry write, its terms summed aligned (`chunked_launch.entry_write`): formed one at
+        # a time, a rank-two write of 2^80 keys and 2^80 values that cancels was inf - inf (base review
+        # 2354cbaf7 F1).
+        key, value, weight = (jnp.asarray(t, work) for t in entry)
+        opened = entry_write(jnp.moveaxis(key[..., :turned], 2, 3), jnp.moveaxis(value, 2, 3),
+                             weight[..., None, None])
     entries = jnp.moveaxis(jax.vmap(lambda row, at: row[at])(opened, head), 1, 2)
     slots = 1 + given.shape[1] + held
     table = jnp.concatenate([jnp.zeros((batch, 1, *shape[1:]), work),

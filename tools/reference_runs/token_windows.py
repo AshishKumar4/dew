@@ -39,6 +39,8 @@ def main() -> None:
     separator = tokenizer.convert_tokens_to_ids("<|endoftext|>")
     if separator is None or separator == tokenizer.unk_token_id:
         separator = tokenizer.eos_token_id
+    if not isinstance(separator, int):
+        raise ValueError(f"{args.tokenizer} names no single token to separate documents by: {separator!r}")
     needed = args.windows * (args.seq + 1)
     ids: list[int] = []
     documents = 0

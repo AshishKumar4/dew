@@ -16,6 +16,7 @@ import argparse
 import copy
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import timm
@@ -25,8 +26,15 @@ from safetensors.numpy import save_file
 from transformers import Gemma3nAudioConfig, Gemma3nConfig, Gemma3nVisionConfig
 from transformers.models.gemma3n.modeling_gemma3n import Gemma3nForConditionalGeneration
 
+COHORTS = ["timm", "transformers"]
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 MODEL_ARGS = {"channel_multiplier": 1 / 64, "stem_size": 8, "msfa_output_resolution": 2}
 SEED = 1729
+SPECIAL: dict[str, Any] = {"pad_token_id": 0, "bos_token_id": 2, "eos_token_id": 1}
+"""The special tokens' ids: keywords every config takes (PretrainedConfig's), which Gemma3nConfig's own
+signature does not name."""
 LEARNING_RATE = 0.01
 
 
@@ -43,8 +51,7 @@ def reference_model():
     config = Gemma3nConfig(
         text_config=text, vision_config=vision, audio_config=audio,
         image_token_id=49, audio_token_id=57, boi_token_id=3, eoi_token_id=48,
-        boa_token_id=4, eoa_token_id=56, vision_soft_tokens_per_image=4,
-        pad_token_id=0, bos_token_id=2, eos_token_id=1)
+        boa_token_id=4, eoa_token_id=56, vision_soft_tokens_per_image=4, **SPECIAL)
     config._attn_implementation = "eager"
     torch.manual_seed(SEED)
     model = Gemma3nForConditionalGeneration(config).eval()
@@ -55,6 +62,15 @@ def reference_model():
             if name.endswith("layer_scale.gamma"):
                 parameter.uniform_(0.25, 0.75)
     return model
+
+
+def image_features(model: Gemma3nForConditionalGeneration, pixels: torch.Tensor) -> torch.Tensor:
+    """The model's soft image tokens of `pixels` (its call takes them as the FloatTensor it names)."""
+    from transformers.modeling_outputs import BaseModelOutputWithPooling
+
+    output = model.get_image_features(**dict[str, Any](pixel_values=pixels))
+    assert isinstance(output, BaseModelOutputWithPooling) and output.pooler_output is not None
+    return output.pooler_output
 
 
 def write_reference(directory: Path):
@@ -79,7 +95,7 @@ def write_reference(directory: Path):
         pixels = torch.randn((1, 3, height, width), generator=generator)
         with torch.no_grad():
             features = tower(pixels).permute(0, 2, 3, 1).reshape(1, 4, 2048)
-            soft = model.get_image_features(pixels).pooler_output
+            soft = image_features(model, pixels)
         np.save(directory / f"pixels_{name}.npy", pixels.numpy())
         np.save(directory / f"tower_{name}.npy", features.numpy())
         np.save(directory / f"soft_{name}.npy", soft.numpy())
@@ -98,7 +114,9 @@ def write_reference(directory: Path):
     output = tower(pixels).permute(0, 2, 3, 1).reshape(1, 4, 2048)
     loss = (output * weights).mean()
     loss.backward()
-    np.save(directory / "input_grad.npy", pixels.grad.numpy())
+    grad = pixels.grad
+    assert grad is not None  # A leaf of the backward pass.
+    np.save(directory / "input_grad.npy", grad.numpy())
     with torch.no_grad():
         for parameter in tower.parameters():
             parameter.add_(parameter.grad, alpha=-LEARNING_RATE)

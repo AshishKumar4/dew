@@ -457,6 +457,24 @@ def test_older_kept_steps_hold_their_model_alone_and_the_latest_resumes(tmp_path
         np.testing.assert_array_equal(np.asarray(held), np.asarray(expected))
 
 
+
+def test_a_directory_holding_only_a_model_alone_is_no_fresh_runs(tmp_path):
+    """A directory whose committed steps hold their model alone (`Keep(weights_only=True)`), none of them a
+    step a resume reads, is occupied: a fresh run there, asked (`resume="never"`) or chosen (`"auto"`), is
+    refused, as one beside a run's steps is, never started beside them (row 9019: read as empty, a fresh
+    run wrote its steps among them); one that must continue (`"require"`) finds none to continue."""
+    state = trainer(tmp_path / 'run').initial_state()
+    held = tmp_path / 'held'
+    written = Checkpoints(str(held))
+    written.save(2, state.replace(step=jnp.int32(2)), None, weights_only=True)
+    written.wait()
+    assert _items(held, 2) == ['model']
+    alone = Checkpoints(str(held))
+    assert alone.latest is None and alone.occupied == 2
+    for resume in ("auto", "never", "require"):
+        with pytest.raises(ValueError):
+            alone.resumed(resume)
+
 def saved_twice(directory, keep: Keep):
     """A run under `keep` with its fit's step 1 and a save of step 2 landed, and the state it saved."""
     run = trainer(directory, keep=keep)

@@ -14,6 +14,7 @@ import pytest
 from arm_arithmetic import float64_held
 from attention_oracle import attention_on_par, exact_attention, float64_weights
 from contract_support import normal_drawn
+from generation_support import here, interprets
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
 from sharded import assert_runs_per_shard
@@ -81,9 +82,14 @@ def test_folded_attention_is_jax_nn_attention(dtype, heads):
                     truth_fn=lambda q, k, v: exact_attention(q, k, v, keep=reads))
 
 
-ON_GPU = jax.default_backend() == "gpu"
-"""Whether the kernels compile for this host's GPU; elsewhere they run interpreted, sized as on an
-A100 (`on_the_gpu`)."""
+ON_GPU = not interprets()
+"""Whether the kernels compile for this host's GPU (or a GPU tier prepare's target); elsewhere they run
+interpreted, sized as on an A100 (`on_the_gpu`)."""
+
+CUDA_OR_CPU = pytest.mark.skipif(
+    not ON_GPU and here() != "cpu",
+    reason="Pallas-Triton decode kernel runs on a CUDA GPU or interpreted on a CPU, not on a TPU (row 9470)",
+)
 
 
 def on_the_gpu():
@@ -127,6 +133,7 @@ A count between two and the most runs the two slices' merge at another count, an
 every count's kernel within its GPU's block (`COMPILED`)."""
 
 
+@CUDA_OR_CPU
 @pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 def test_the_decode_kernel_reads_each_row_to_its_length_at_every_config(dtype, windowed):
@@ -202,6 +209,7 @@ LONG_SINK_CASES = [("float32", "both", "natural", 32), ("float32", "both", "fold
 their check 1's draws run as armada's map tasks and a judge (`check1_shards`), each within two minutes."""
 
 
+@CUDA_OR_CPU
 @pytest.mark.parametrize(("dtype", "hooks", "natural", "splits"),
                          [case for case in SINK_CASES if case not in LONG_SINK_CASES],
                          ids=["-".join(map(str, case)) for case in SINK_CASES if case not in LONG_SINK_CASES])
@@ -218,6 +226,7 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
     _sinks_and_softcap_hold_check_1(dtype, hooks, natural, splits)
 
 
+@CUDA_OR_CPU
 @pytest.mark.parametrize(("dtype", "hooks", "natural", "splits"), LONG_SINK_CASES,
                          ids=["-".join(map(str, case)) for case in LONG_SINK_CASES])
 @pytest.mark.check1_shards(seeds=8, per_task=4)
@@ -771,6 +780,7 @@ PAGED_SEEDS = 8
 """The paged decode kernel's declared check-1 seeds a config, sized by `seeds_for` paired."""
 
 
+@CUDA_OR_CPU
 @pytest.mark.parametrize("splits", CHECKED_SPLITS)
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])

@@ -26,6 +26,10 @@ from collections.abc import Iterator
 import numpy as np
 from reference_worker import Applied, answered, serve
 
+COHORT = "dreamerv3"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 CONV = {"depth": 4, "mults": (2, 3, 4, 4), "kernel": 5, "units": 64, "layers": 3, "act": "silu",
         "norm": "rms", "winit": "trunc_normal_in", "outer": False, "strided": False}
 """configs.yaml's `enc.simple` and `dec.simple` at the 1M size (`.*\\.depth: 4`, `.*\\.units: 64`)."""
@@ -112,6 +116,7 @@ if __name__ == "__main__":
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
     if sys.argv[2:3] == ["--layout"]:
         shapes = SITES[sys.argv[1]]()[1]()
-        np.savez(sys.argv[3], **{path: np.asarray(shape) for path, shape in shapes.items()})
+        np.savez(sys.argv[3], allow_pickle=False,
+                 **{path: np.asarray(shape) for path, shape in shapes.items()})
     else:
         serve(lambda cases: answered(cases, functools.partial(applying, sys.argv[1])))

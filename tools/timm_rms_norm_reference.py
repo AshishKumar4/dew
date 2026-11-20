@@ -18,6 +18,10 @@ import timm
 import torch
 from timm.layers.fast_norm import rms_norm2d
 
+COHORT = "timm"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 
 def main():
     parser = argparse.ArgumentParser()

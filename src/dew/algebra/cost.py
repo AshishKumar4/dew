@@ -20,10 +20,10 @@ from egglog import DagCostModel, EGraph, get_callable_args
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import CONTRACTED, shape
-from dew.algebra.terms import EXPONENTIALS, RESCALE, Region, Term, integer, key, text
+from dew.algebra.terms import OPERATIONS, RESCALE, Region, Term, integer, key, product_dtype, text
 from dew.nn import programs
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import cost as kernel_cost
+from dew.nn.kernels.templates import cost as kernel_cost, emission
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import eight, half
 from dew.nn.precision import asks_default_precision, effective_precision, precision_names
@@ -90,9 +90,9 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         operand = shape_of(graph, args[0], held)
         _, params = region.params[integer(args[3])]
         # Its result's elements: its operand's unreduced extents (an empty reduction's too).
-        kept = 0 if operand is None else 2 * LANE_BYTES * math.prod(
-            size for axis, size in enumerate(operand) if axis not in params["axes"])
-        return Work(operations=made(graph, args[:1], held), kernels=1.0, kept_bytes=kept)
+        moved = 0 if operand is None else kept(math.prod(
+            size for axis, size in enumerate(operand) if axis not in params["axes"]))
+        return Work(operations=made(graph, args[:1], held), kernels=1.0, kept_bytes=moved)
     if (args := get_callable_args(node, Term.dot)) is not None:
         left, right = (shape_of(graph, operand, held) for operand in args[:2])
         if left is None or right is None:
@@ -109,18 +109,17 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         read = sum(math.prod(extent) * np.dtype(dtype).itemsize
                    for extent, dtype in zip((left, right), operands, strict=True))
         elements = math.prod(left[axis] for axis in batch) * free
-        # Its result at its preferred element type, else its operands' (`Work.kept_bytes`).
-        preferred = params.get("preferred_element_type")
-        kept = np.dtype(preferred if preferred is not None else np.result_type(
-            *(np.dtype(dtype) for dtype in operands))).itemsize
+        # Its result at the dtype the product makes (`terms.product_dtype`, JAX's own rule: a bfloat16 by a
+        # float16 product is bfloat16, which NumPy's promotion refused, base review 0b8b7ed98 F1).
         mode, passes = _mode(params.get("precision"), *operands)
-        return Work(shared_bytes=read, kernels=1.0, kept_bytes=2 * elements * kept,
+        return Work(shared_bytes=read, kernels=1.0,
+                    kept_bytes=kept(elements, product_dtype(region, index).itemsize),
                     **{_MODES[mode]: 2.0 * elements * length * passes})
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1], held))
     if (args := get_callable_args(node, Term.unary)) is not None:
         elements = made(graph, args[:1], held)
-        special = text(args[1]) in EXPONENTIALS
+        special = text(args[1]) in _SPECIAL_FUNCTIONS
         return Work(exponentials=elements) if special else Work(operations=elements)
     if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == RESCALE:
         # A declaration's own rescale of two anchors (`derive.Reduction.rescale`): an exponential an element.
@@ -137,9 +136,21 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
     return Work()
 
 
+_SPECIAL_FUNCTIONS = frozenset(operation.symbol for primitive, operation in OPERATIONS.items()
+                               if primitive in emission.SPECIAL_FUNCTIONS)
+"""The symbols of the operations the special-function units evaluate, by the kernels' counter's one rule
+(`emission.SPECIAL_FUNCTIONS`)."""
+
 LANE_BYTES = 4
 """The bytes a reduction's result element takes in what XLA's fusion keeps on chip (`work`): a vector lane's,
 32 bits, the width a TPU's vector unit reduces in."""
+
+
+def kept(elements: float, itemsize: float = LANE_BYTES) -> float:
+    """The bytes a kernel's result of `elements` of `itemsize` moves on chip (`Work.kept_bytes`): written
+    once by the kernel and read once by its reader, the one rule of every kernel's result `work` and the chunk
+    forms (`dew.algebra.linear_scan`) price."""
+    return 2.0 * elements * itemsize
 
 _MODES = {"16bit": "flops", "tf32": "tf32_flops", "8bit": "fp8_flops", "fp32": "operations"}
 """The `Work` field a product's mode's FLOPs are told in (`generation.Architecture`'s modes; IEEE fp32 is
@@ -184,7 +195,7 @@ def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=j
     kept on chip, written and read (`work`'s products): a chunk form's products (`dew.algebra.linear_scan`, at
     the precision they run at), Dew's fp32 products."""
     mode, passes = _mode(precision, dtype, dtype)
-    return Work(kernels=float(count), kept_bytes=2.0 * rows * columns * count * np.dtype(dtype).itemsize,
+    return Work(kernels=float(count), kept_bytes=kept(rows * columns * count, np.dtype(dtype).itemsize),
                 **{_MODES[mode]: 2.0 * rows * depth * columns * count * passes})
 
 

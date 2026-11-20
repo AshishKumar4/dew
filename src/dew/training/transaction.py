@@ -658,7 +658,7 @@ def checked(state: TrainState | ReplicaState) -> dict[str, Variables | optax.Opt
     """The trees of `state` (a run's, or DiLoCo's replicas' inner copies) a finite step keeps finite and a
     save refuses non-finite: the parameters, the optimizer state and the averages. The one statement of
     them, which the step's acceptance (`finish_attempt`) and a save's refusal
-    (`dew.training.trainer.refuse_non_finite`) read. The optimizer state is read without the
+    (`refuse_non_finite`) read. The optimizer state is read without the
     hyperparameters injected beside it at any depth (`_numerical`): control values a schedule or the user
     sets, not written by a step's gradient, and legally infinite (a clip's bound of `math.inf`)."""
     return {"variables": state.variables, "opt_state": _numerical(state.opt_state), "ema": state.ema}
@@ -1915,3 +1915,31 @@ def loss_arguments[LossT, EffectsT](objective: Objective[LossT, EffectsT], state
                               state.microstep, state.key, state.step, state.ema, state.updates,
                               None if shared is None else tuple(shared))
     return variables, abstract
+
+
+def first_non_finite(state: TrainState) -> str | None:
+    """The first leaf of `state`'s checked trees (`transaction.checked`: the parameters, every optimizer
+    leaf and the averages, and under DiLoCo each replica's inner copy of them) holding a value that is not
+    finite, by its path; None where none does. Read wherever the leaves are placed, one compiled check a
+    placement (`transaction.finite_flags`), the same on every process."""
+    trees = {**checked(state), **({} if state.inner is None else
+                                  {f"inner.{name}": tree for name, tree in checked(state.inner).items()})}
+    leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
+              for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
+              if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
+    finite = finite_flags([leaf for _, leaf in leaves])
+    return next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
+
+
+def refuse_non_finite(state: TrainState, step: int, latest: Callable[[], int | None]) -> None:
+    """Refuse to save a `state` holding a value that is not finite (`first_non_finite`), on any tier: no
+    checkpoint is written and none rotated out, and the run stops, naming the step and the first such leaf,
+    so the checkpoint a resume finds is the last finite one (`latest`, read only to say so) (training.md,
+    checkpoints and resume). Read at the writers' own boundary (`Checkpoints.save`, `save_local`), so a
+    direct save is held to it as a trainer's is (row 9021)."""
+    first = first_non_finite(state)
+    if first is not None:
+        kept = latest()
+        said = "no checkpoint" if kept is None else f"the latest checkpoint, step {kept}"
+        raise RuntimeError(f"step {step}'s state holds a non-finite value at {first}, so no checkpoint of it "
+                           f"is written and {said} is the one a resume finds")

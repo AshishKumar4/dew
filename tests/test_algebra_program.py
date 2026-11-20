@@ -875,6 +875,58 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     assert priced.price.value > unmeasured.price.value
 
 
+def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
+    """A `lax.dot_general` of a bfloat16 and a float16 matrix, no preferred type stated, priced at the dtype
+    JAX makes it (`terms.product_dtype`, its traced result's, which the region records as its stated type),
+    its result kept on chip at two bytes an element beside its leaves' (`Work.kept_bytes`); NumPy's
+    promotion of the pair, which it refuses, raised there (base review 0b8b7ed98 F1). A bare product heads no
+    rewrite window, so `dew.jit` alone never prices it (`test_algebra_fusion`'s witness holds its value)."""
+    def product(a, b):
+        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
+
+    a, b = jnp.ones((2, 3), jnp.bfloat16), jnp.ones((3, 4), jnp.float16)
+    region = terms.region(jax.make_jaxpr(product)(a, b))
+    graph, bundle, _ = program.graphed(region)
+    work = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                         cost_model=cost.model(region, cost.fused(generation.TARGETS["v5e"])))[1].work
+    made = jax.eval_shape(product, a, b).dtype.itemsize
+    assert work.kept_bytes == 2 * (2 * 3 + 3 * 4) + 2 * made * (2 * 4)
+
+
+def test_a_product_of_two_16_bit_formats_replays_as_traced():
+    """A product of a bfloat16 and a float16 matrix, no preferred type stated, its region's term replayed as
+    the engine binds a term's equation (`terms.value_of`): its product bound with its parameters as traced,
+    its preferred type unset, and its value the traced program's bit for bit, one program. The region wrote
+    the dtype it makes into that preferred type, which the replay then bound (base review 3232beb7c); it
+    keeps it apart (`Region.made`)."""
+    def product(a, b):
+        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
+
+    a, b = jnp.full((2, 3), 0.75, jnp.bfloat16), jnp.full((3, 4), 2.5, jnp.float16)
+    traced = jax.make_jaxpr(product)(a, b)
+    region = terms.region(traced)
+
+    def replayed(a, b):
+        def value(term):
+            return terms.value_of(term, value, region, (a, b))
+        return value(region.outputs[0])
+
+    def dots(jaxpr) -> list[dict]:
+        # Each product's parameters, within the programs an equation calls too (a jit's).
+        found = []
+        for equation in jaxpr.eqns:
+            if equation.primitive is jax.lax.dot_general_p:
+                found.append(dict(equation.params))
+            for value in equation.params.values():
+                inner = getattr(value, "jaxpr", None)
+                if inner is not None:
+                    found += dots(getattr(inner, "jaxpr", inner))
+        return found
+
+    assert dots(jax.make_jaxpr(replayed)(a, b).jaxpr) == dots(traced.jaxpr)
+    assert np.asarray(jax.jit(replayed)(a, b)).tolist() == np.asarray(jax.jit(product)(a, b)).tolist()
+
+
 @pytest.mark.parametrize("apart", [0, 1, 4], ids=["as written", "a group of one", "apart from its group"])
 def test_a_token_loops_states_are_kept_each_token(apart):
     """A scan's token loop keeps its state on chip each token, written and read (`Work.kept_bytes`, row
@@ -885,7 +937,7 @@ def test_a_token_loops_states_are_kept_each_token(apart):
     c, k, v = 16, 32, 64
     work = linear_scan._work(linear_scan.Chunk.plain(linear_scan.Chunk.token("U")),
                              linear_scan.Extents(c, k, v, 1, apart=apart), lambda value: (0, 0), None)
-    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * cost.LANE_BYTES * k * v
+    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * 4 * k * v
 
 
 def test_device_memory_is_priced_at_the_parts_measured_stream():
@@ -1381,6 +1433,21 @@ def test_a_value_is_priced_at_the_bytes_its_dtype_holds():
     narrow, wide = priced(jnp.bfloat16), priced(jnp.float32)
     assert (wide.device_bytes, wide.shared_bytes) == (2 * 64 * 64 * 4, 2 * 64 * 64 * 4)
     assert (narrow.device_bytes, narrow.shared_bytes) == (2 * 64 * 64 * 2, 2 * 64 * 64 * 2)
+
+
+@pytest.mark.parametrize("function, exponentials", [
+    (jnp.exp, 64 * 64), (jnp.sqrt, 64 * 64), (jax.lax.erf, 0), (jnp.expm1, 0)],
+    ids=lambda f: getattr(f, "__name__", None))
+def test_a_functions_work_is_the_units_the_kernels_counter_names(function, exponentials):
+    """A region's elementwise function is priced on the units the kernels' counter states it issues on
+    (`emission.SPECIAL_FUNCTIONS`, `cost.work`): an exp and a square root on the special-function units, an
+    erf and an expm1 on the CUDA cores (XLA's polynomial; CUDA's expm1f, FMAs alone), where the algebra's
+    own table charged all four as exponentials (base review 05bd9f77b F2)."""
+    region = terms.region(jax.make_jaxpr(function)(jnp.ones((64, 64), jnp.float32)))
+    graph, bundle, _ = program.graphed(region)
+    _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                             cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
+    assert price.work.exponentials == exponentials, price.work
 
 
 def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
