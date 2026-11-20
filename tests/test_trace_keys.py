@@ -161,19 +161,19 @@ diffusion objective's process, grid, inputs' encoders, teacher tree and constant
 def rolled_out(name: str, batch, objective):
     """A case's batch as its step trains on it: a PPO pack with the columns its rollout adds (`PPORollout`),
     the critic's baseline and its targets; a flow-GRPO batch with a walk's transitions over its latents
-    (`FlowRollout`, as `test_flow_grpo.trajectory_batch` lays them out); every other case's as it is."""
+    (`FlowRollout`'s layout, `transition_rows`); every other case's as it is."""
     if name == "ppo":
         mask = np.asarray(batch["response_mask"], np.float32)
         return {**batch, "old_values": np.zeros_like(mask), "returns": mask}
     if name != "flow_grpo":
         return batch
+    from dew.objectives.rl.flow import transition_rows
+
     rows = len(next(iter(batch.values())))
     states = np.zeros((rows, 3, *objective.latent_shape), np.float32)
-    steps = np.full((rows, 2), 0.5, np.float32)
-    return {**batch, "latents": states[:, :-1], "next_latents": states[:, 1:], "timesteps": steps,
-            "next_timesteps": steps / 2, "rollout_steps": np.full((rows,), 3, np.int32),
-            "old_log_probs": np.zeros((rows, 2), np.float32), "transition_mask": np.ones((rows, 2), bool),
-            "advantages": np.zeros((rows,), np.float32)}
+    times = np.asarray([1.0, 0.5, 0.25], np.float32)
+    densities, stochastic = np.zeros((rows, 2), np.float32), np.ones((rows, 2), bool)
+    return {**batch, **transition_rows(states, times, densities, stochastic, np.zeros((rows,), np.float32))}
 
 
 def unvalued(objective) -> list[str]:

@@ -1903,13 +1903,13 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 def backward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                       hooks: Hooks | None, dout: jax.Array, *,
                       residuals: tuple[jax.Array, jax.Array, jax.Array, Split], scale: float | None = None,
-                      natural: bool = NATURAL, accurate: bool = ACCURATE, certified: bool = False
-                      ) -> Refusal | None:
+                      natural: bool = NATURAL, accurate: bool = ACCURATE, rounded: bool = True,
+                      certified: bool = False) -> Refusal | None:
     """Why `backward` runs no call of these arrays compiled on this device (`MosaicBackward.declined`), and
     where `certified` (the route's selected mainloop alone) as the GPU assembles its configs
     (`MosaicBackward.uncertified`), or None."""
     op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,
-                              accurate=accurate)
+                              accurate=accurate, rounded=rounded)
     ba, target = op.bind(*args, interpret=False), generation.gpu_target()
     return op.uncertified(ba, target) if certified else op.declined(ba, target)
 
