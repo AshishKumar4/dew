@@ -908,7 +908,7 @@ def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -
             if not eqn.primitive.inlined_call or not all(
                     _entrywise(inner, set(read), tile) for inner in nested):
                 return False
-        elif not layout.entrywise(eqn):
+        elif not (layout.entrywise(eqn) or layout.placed(eqn)):
             return False
         tainted.update(eqn.outvars)
     return True
