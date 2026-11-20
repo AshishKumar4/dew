@@ -109,6 +109,7 @@ class CompiledTruths:
     # name (`named`), its outputs' shapes and the launches its kept lowering took, which a second call of
     # the label at the same program returns, compiling nothing again.
     arms: dict[str, tuple[str, Any, Any]] = dataclasses.field(default_factory=dict)
+    prepared_arms: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
 
     def path(self, label: str) -> Path:
         return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]
