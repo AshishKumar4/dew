@@ -311,10 +311,13 @@ def port_training_cells() -> list[Cell]:
 
 
 def forked_cells() -> list[Cell]:
-    """The template over a forked call."""
+    """The template over a forked call, a turned state's on an sm90 alone: an sm80's template refuses its
+    fast backward (`mainloop_backward.fast_backward_form`'s), which the cell names its kernel for, so an A100
+    ran it to a refusal (row 4994: main 1645e8eea's A100 tier; jsf-turnroute, sm80 refused under either
+    precision, sm90 taken)."""
     return [Cell(f"the template's forked documents are as exact as each alone: {hooks}",
                  functools.partial(chunked.the_templates_forked_documents_are_as_exact_as_each_alone, hooks),
-                 fault=FORKED)
+                 "sm90" if hooks.turns else None, fault=FORKED)
             for hooks in chunked.FORKED_TEMPLATE]
 
 
