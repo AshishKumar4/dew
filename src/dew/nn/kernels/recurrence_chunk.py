@@ -282,7 +282,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         return _token_loop(hooks, operands, dtype=dtype)
     given, query, key, value, g, beta, scale, dtype, work = _prologue_of(hooks, operands, dtype)
     state = operands.state
-    query, key, value, g, beta, correction, starts, firsts, max_segments = _laid(
+    (query, key, value, g, beta, correction, starts, firsts, max_segments), stride = _laid(
         hooks, (query, key, value, g, beta), given, operands.starts, operands.firsts, max_segments)
     forked = None
     if operands.loads is not None:
@@ -363,22 +363,23 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                   state, starts, firsts, given.get('turn'), correction,
                                   given['value_decay'].astype(work) if hooks.value_decay else None,
                                   *(() if forked is None else forked.walked), parameters=(5,))
-    # A token's output its last update's (`Hooks.substeps`), an erased token's its second laid token's; the
-    # epilogue in work, the output rounded once.
-    out = out[:, hooks.substeps - 1::hooks.substeps] if correction is None else out[:, 1::2]
+    # A token's output its last laid token's (`_laid`); the epilogue in work, the output rounded once.
+    out = out[:, stride - 1::stride]
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
 
 def _laid(hooks: recurrence.Hooks, tokens: tuple, given: dict, starts, firsts, max_segments: int | None):
     """A call's `tokens` `(query, key, value, g, beta)` laid as the op's tokens: a token's updates in turn
-    (`_substeps_laid`, `Hooks.substeps`) or an erase of its own's two tokens (`_erases_laid`), each a form
-    of its own (`recurrence.Hooks`' validation). `(query, key, value, g, beta, correction, starts, firsts,
-    max_segments)`."""
+    (`_substeps_laid`, `Hooks.substeps`), an erase of its own's two tokens (`_erases_laid`), or as given,
+    each a form of its own (`recurrence.Hooks`' validation). `((query, key, value, g, beta, correction,
+    starts, firsts, max_segments), stride)`: the laid tokens a call's token takes, its output its last's."""
     query, key, value, g, beta = tokens
     if hooks.substeps > 1:
         query, g, starts, firsts, max_segments = _substeps_laid(hooks.substeps, query, g, starts, firsts,
                                                                 max_segments)
-    return (*_erases_laid(hooks, query, key, value, g, beta, given, starts, firsts), max_segments)
+        return (query, key, value, g, beta, None, starts, firsts, max_segments), hooks.substeps
+    laid = _erases_laid(hooks, query, key, value, g, beta, given, starts, firsts)
+    return (*laid, max_segments), 1 if laid[5] is None else 2
 
 
 def _substeps_laid(substeps: int, query, g, starts, firsts, max_segments: int | None):

@@ -73,6 +73,14 @@ class Entries(NamedTuple):
     signed: Callable[[tuple[int, ...]], np.ndarray]
 
 
+def cancelling_orbit(key_heads: int, heads: int, values: int) -> int:
+    """The draws `cancelling_entries` takes to write every value coordinate it moves through once: a value
+    head of a key head's group and a column a draw, `heads // key_heads` of the one and `values` of the other,
+    so an exact fixture declaring this many seeds holds every coordinate in its first stage (check 1 redraws
+    only past a failure, which a coordinate never written cannot raise)."""
+    return heads // key_heads * values
+
+
 def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values: int) -> Entries:
     """Entry writes of `CANCELLING_LEVELS`' seven products on their keys' first dimension for a forked call
     over `FORKED`'s table, as its route and its oracle read them alike: one value coordinate a key head, a

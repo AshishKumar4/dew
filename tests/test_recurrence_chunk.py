@@ -24,6 +24,7 @@ from contract_support import (
     GIVEN,
     HELD,
     cancelling_entries,
+    cancelling_orbit,
     exactly_rounded,
     normal_float32,
 )
@@ -483,13 +484,29 @@ def test_a_delta_product_decode_token_is_as_exact_as_its_recurrence():
                     seeds=8)
 
 
+def test_a_delta_products_decode_memory_is_wide_between_its_updates():
+    """A decode token of two updates (`Hooks.substeps`) on a bf16 memory from zero, one key and value, no
+    decay and a unit query: the first writes the fp32 midpoint `m` of two adjacent bf16 values (a gate of
+    one), the second its negative under a gate of one half, `m + (-m - m) / 2`: output and memory exactly
+    zero, the memory held in fp32 between the updates (`recurrence._substeps`), where rounded to bf16 after
+    the first its residual is half that rounding's."""
+    midpoint = (1.0 + 2.0 ** -8) * 2.0 ** -3
+    token = recurrence.Step(jnp.zeros((1, 1, 1, 1), jnp.bfloat16), query=jnp.ones((1, 1, 1), jnp.float32),
+                            key=jnp.ones((1, 2, 1, 1), jnp.float32),
+                            value=jnp.asarray([midpoint, -midpoint], jnp.float32).reshape(1, 2, 1, 1),
+                            log_decay=jnp.zeros((1, 1), jnp.float32),
+                            beta=jnp.asarray([1.0, 0.5], jnp.float32).reshape(1, 2, 1))
+    out, _, updated = recurrence.step(recurrence.Hooks(decay='scalar', substeps=2, scale=1.0), token)
+    assert (out.astype(jnp.float32).ravel().tolist(), updated.astype(jnp.float32).ravel().tolist()) == (
+        [0.0], [0.0])
+
+
 @pytest.mark.parametrize(('substeps', 'form'), [(2, {'delta': False}), (2, {'reads': 'before'}),
-                                               (2, {'ranks': 2, 'reads': 'apart', 'delta': False}),
-                                               (2, {'rated': True}), (0, {})],
-                         ids=['no delta rule', 'read before', 'ranks', 'rated', 'none'])
+                                               (2, {'erase': 'untied'}), (2, {'rated': True}), (0, {})],
+                         ids=['no delta rule', 'read before', 'an erase of its own', 'rated', 'none'])
 def test_a_delta_product_outside_its_form_is_refused(substeps, form):
     """Substeps (`Hooks.substeps`) outside DeltaProduct's form, a token's delta-rule updates read after its
-    last: a ValueError, where Mamba-3's ranks keep their own readout apart (row 9030)."""
+    last: a ValueError, beside an erase of its own whose laid tokens are a layout of their own (row 9030)."""
     with pytest.raises(ValueError):
         recurrence.Hooks(decay='scalar', substeps=substeps, **form)
 
@@ -1242,7 +1259,8 @@ def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact(hooks):
     truth = jax.jit(leaves(functools.partial(document_by_document, hooks)))
     assert_as_exact(jax.jit(leaves(ours)), exactly_rounded(truth),
                     functools.partial(levels_entered_draw, hooks),
-                    f"xla {hooks} a forked call's entry writes of cancelling levels", seeds=8, truth_fn=truth)
+                    f"xla {hooks} a forked call's entry writes of cancelling levels",
+                    seeds=cancelling_orbit(KEY_HEADS, VALUE_HEADS, VALUE_WIDTH), truth_fn=truth)
 
 
 @pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],

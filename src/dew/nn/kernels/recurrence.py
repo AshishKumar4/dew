@@ -145,14 +145,14 @@ class Hooks:
     readout 'apart' reads none of them: its scores keep the pairs of later tokens alone (`i // R > j //
     R`, `mamba3_mimo_fwd.py`)."""
     turns: int = 0
+    erase: Erase = 'tied'
+    value_decay: bool = False
     substeps: int = 1
     """The delta rule's updates a token takes in turn (DeltaProduct's, fla's `chunk_gated_delta_product`): its
     keys, values and write gates `substeps` of each a token, the chunked op's laid in turn (`[B, S m, ...]`)
     and a decode token's on an axis of their own (`[rows, m, ...]`), its decay taken before the first and its
     query read after the last (the readout's row selector, kernel-templates.md §5); its queries and decays a
     token's."""
-    erase: Erase = 'tied'
-    value_decay: bool = False
 
     @property
     def inverse_bound(self) -> float | None:
@@ -209,20 +209,18 @@ class Hooks:
             raise ValueError(f"a decay along the values is the plain recurrence's, without the delta rule or "
                              f"an erase of its own: not {self}")
         transition = self.erase != 'tied' or self.value_decay
+        if self.substeps < 1 or (self.substeps > 1 and (not self.delta or self.reads != 'after' or self.rated
+                                                        or self.gates is not None or self.skip
+                                                        or self.conv is not None or transition)):
+            raise ValueError(f"a token's delta-rule updates are one or more, more read after the last, its "
+                             f"decay a given log decay's, unrated, without a skip, a conv or a transition of "
+                             f"its own: not {self.substeps} under {self}")
         if transition and (self.reads != 'after' or self.ranks > 1 or self.own_weight or self.turns
                            or self.rated):
             raise ValueError(f"an erase of its own or a decay along the values is read after its token, "
                              f"without ranks, turns, an own write's weight or a rated decay: not {self}")
         if self.erase == 'values' and (self.skip or self.conv is not None or self.gates is not None):
             raise ValueError(f"an erase along the values takes no skip, conv or gates: not {self}")
-        if self.substeps < 1 or (self.substeps > 1 and (
-                not self.delta or self.reads != 'after' or self.ranks > 1 or self.own_weight or self.turns
-                or self.gates is not None or self.rated or self.skip or self.conv is not None
-                or self.erase != 'tied' or self.value_decay)):
-            raise ValueError(f"a token's delta-rule updates are one or more, more read after the last, its "
-                             f"decay a given log decay's, unrated, without ranks, turns, an own write's "
-                             f"weight, a skip, a conv or a transition of its own: not {self.substeps} under "
-                             f"{self}")
         if self.turns < 0 or (self.turns and (self.delta or self.own_weight or self.rated
                                               or self.decay != 'scalar' or self.reads == 'before')):
             raise ValueError(f"a state turns its key pairs under a decay a head's, unrated, without the "

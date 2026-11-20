@@ -37,6 +37,7 @@ from contract_support import (
     REVERSE_ONLY,
     assert_contract,
     cancelling_entries,
+    cancelling_orbit,
     exactly_rounded,
     normal_float32,
 )
@@ -447,6 +448,11 @@ def test_documents_entering_their_own_states_scan_as_each_alone():
                     "the TPU kernel's forked call", seeds=24)
 
 
+LEVELS_SEEDS = cancelling_orbit(2, 2, 16)
+"""`levels_documents_draw`'s seeds: its state's every value coordinate written once (`documents_draw`'s two
+heads, each a key head of its own, of 16 columns)."""
+
+
 def levels_documents_draw(seed: int):
     """`documents_draw`'s forked call whose documents' entry writes are `CANCELLING_LEVELS`' on the state's
     first key (`contract_support.cancelling_entries`, its cotangents too): no input, no decay, and each step's
@@ -483,7 +489,7 @@ def test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel():
     `LEVELS_ROUTES`)."""
     truth = jax.jit(_entry_arm(documents_one_by_one))
     assert_as_exact(_entry_arm(documents_on_the_kernel), exactly_rounded(truth), levels_documents_draw,
-                    "the TPU kernel's forked call's entry writes of cancelling levels", seeds=8,
+                    "the TPU kernel's forked call's entry writes of cancelling levels", seeds=LEVELS_SEEDS,
                     truth_fn=truth)
 
 
@@ -517,7 +523,8 @@ def test_documents_entry_writes_of_cancelling_levels_take_the_selected_tpu_scan(
     truth = jax.jit(_entry_arm(documents_one_by_one))
     with generation.routes() as found:
         assert_as_exact(_entry_arm(documents_as_selected), exactly_rounded(truth), levels_documents_draw,
-                        "the selected TPU scan's forked call's entry writes of cancelling levels", seeds=8,
+                        "the selected TPU scan's forked call's entry writes of cancelling levels",
+                        seeds=LEVELS_SEEDS,
                         truth_fn=truth)
     assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
 
