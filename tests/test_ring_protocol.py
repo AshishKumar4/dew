@@ -639,3 +639,17 @@ def test_a_slot_under_a_roles_index_is_ordered_against_a_read_of_the_roles_whole
         with pytest.raises(Violation) as found:
             explore([writer, apart, [*reader, Event("wait", ("filled", 1), 0)]], {"filled": 1})
         assert found.value.kind == "unordered"
+
+
+def test_an_asynchronous_landing_aliasing_an_implicit_wait_is_caught():
+    """An asynchronous commit landing past the completion an implicit wait awaits must raise `aliased` even
+    when local events between the commit and wait advance in bulk."""
+    barrier = ("B", 0)
+    program = [
+        Event("arrive", barrier), Event("wait", barrier, 0), Event("wait", barrier, 0),
+        Event("arrive", barrier), Event("committed", barrier), Event("read", ("x", 0)),
+        Event("wait", barrier, None), Event("wait", barrier, 2),
+    ]
+    with pytest.raises(Violation) as found:
+        explore([program], {"B": 1})
+    assert found.value.kind == "aliased"
