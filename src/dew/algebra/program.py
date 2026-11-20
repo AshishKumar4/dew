@@ -598,7 +598,8 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
             facts.append(set_(rules.log2_floor(term)).to(i64(held.floor)))
             if held.positive:
                 facts.append(rules.positive(term))
-        if (back := widened.get(region.dtypes.get(named))) is not None:
+        dtype = region.dtypes.get(named)
+        if dtype is not None and (back := widened.get(dtype)) is not None:
             facts.append(set_(rules.narrowed(term)).to(i64(region.stock[back])))
         if (args := get_callable_args(term, terms.Term.reduce)) is not None:
             _, params = region.params[terms.integer(args[3])]

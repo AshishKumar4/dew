@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import difflib
 import importlib
 import importlib.metadata
 import importlib.util
+import itertools
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -126,13 +128,9 @@ class _Chosen:
     target: str
     case: int
     operands: tuple[jax.ShapeDtypeStruct, ...]
-    candidate: error.Candidate
-    single: bool
+    candidate: error.Candidate = dataclasses.field(hash=False, compare=False)
+    single: bool = dataclasses.field(hash=False, compare=False)
     """Whether the declaration returns one array (its form's one output), else a tuple of them."""
-
-    @property
-    def function(self) -> str:
-        return f"_{self.name}_{self.policy}_{self.target}_{self.case}"
 
 
 def _chosen(qualified: str, form: StableForm) -> list[_Chosen]:
@@ -166,11 +164,20 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
     lines += [f"- {found.name}: {found.receipt}" for found in sets]
     lines = [*_flowed(lines), '"""', ""]
     body: list[str] = []
+    # Each distinct form printed once, named by its declaration and its order there; each policy, target
+    # and case that chose it reads it by that name (`named`).
+    named: dict[_Chosen, str] = {}
+    printed_by: dict[tuple[str, str], str] = {}
     for found in chosen:
         form = found.candidate.form or found.candidate.function
-        text, _ = printed.source(jax.make_jaxpr(form)(*found.operands), found.function,
-                                 compensated=found.candidate.compensated)
-        body += ["", "", *text.rstrip("\n").split("\n")]
+        closed = jax.make_jaxpr(form)(*found.operands)
+        text, _ = printed.source(closed, "form", compensated=found.candidate.compensated)
+        if (found.name, text) not in printed_by:
+            function = f"_{found.name}_{sum(name == found.name for name, _ in printed_by)}"
+            printed_by[found.name, text] = function
+            body += ["", "", *printed.source(closed, function, compensated=found.candidate.compensated)[0]
+                     .rstrip("\n").split("\n")]
+        named[found] = printed_by[found.name, text]
     for name in sorted({found.name for found in chosen}):
         own = [found for found in chosen if found.name == name]
         single = own[0].single
@@ -182,7 +189,7 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
             operands = [repr(operand) for operand in _case(found.operands)]
             body += printed.wrapped(f"        ({found.policy!r}, {found.target!r}, (", operands,
                                     ",)):" if len(operands) == 1 else ")):")
-            body.append(f"            {found.function},")
+            body.append(f"            {named[found]},")
         body += ["    }", f"    return forms[(policy, target, case)](*operands){'[0]' if single else ''}"]
     return "\n".join([*lines, *printed.imports("\n".join(body)), *body]) + "\n"
 
@@ -245,14 +252,16 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
         found = [one for qualified in declared for one in _chosen(qualified, DECLARATIONS[qualified])]
         text, path = _written(module, found, declared), _path(module)
         if check:
-            if not path.exists() or path.read_text() != text:
-                stale.append(str(path))
+            written = path.read_text() if path.exists() else ""
+            if written != text:
+                stale.append("\n".join([str(path), *itertools.islice(difflib.unified_diff(
+                    written.splitlines(), text.splitlines(), "written", "generated", lineterm=""), 40)]))
         else:
             path.write_text(text)
         made.append(Generated(tuple(declared), str(path), TESTS, sets, importlib.metadata.version("egglog")))
     if stale:
-        raise ValueError(f"generated modules differ from what generation writes: {stale}; run "
-                         f"`python -m dew.algebra.generate`")
+        raise ValueError("generated modules differ from what generation writes; run `python -m "
+                         "dew.algebra.generate`:\n" + "\n".join(stale))
     return tuple(made)
 
 

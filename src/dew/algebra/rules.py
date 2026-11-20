@@ -239,13 +239,15 @@ class Drawn:
 
     shapes: tuple[tuple[int, ...], ...]
     scale: Callable[[np.random.Generator, tuple[int, ...], list[np.ndarray]], np.ndarray] | None = None
+    dtype: type = np.float32
+    """The float its operands are drawn in (a narrow float's sum's, `jnp.bfloat16`)."""
 
     def _values(self, seed: int) -> list[np.ndarray]:
         rng = np.random.default_rng(seed)
         drawn: list[np.ndarray] = []
         for shape in self.shapes:
             drawn.append(np.asarray(rng.standard_normal(shape) * 10.0 ** rng.uniform(-3, 3, shape)
-                                    if self.scale is None else self.scale(rng, shape, drawn), np.float32))
+                                    if self.scale is None else self.scale(rng, shape, drawn), self.dtype))
         return drawn
 
     def __call__(self, seed: int) -> tuple[jax.Array, ...]:
@@ -268,11 +270,11 @@ class Drawn:
             return drawn
 
         def zero_rows(place, value, first):
-            return np.where((np.arange(len(value)) % 2 == 0)[:, None], np.float32(0), value)
+            return np.where((np.arange(len(value)) % 2 == 0)[:, None], np.zeros((), value.dtype), value)
 
         def one_a_row(place, value, first):
             kept = np.arange(value.shape[-1])[None, :] == (np.arange(len(value)) % value.shape[-1])[:, None]
-            return np.where(kept, value, np.float32(0))
+            return np.where(kept, value, np.zeros((), value.dtype))
 
         families = {"rows of zero": changed(zero_rows), "one element a row": changed(one_a_row)}
         if len(values) > 1:
@@ -412,8 +414,8 @@ first operand's shape's, `Drawn.adversarial`) zeroes the divisor."""
 _PER_ROW_DIVISORS = Drawn(((64, 1024), (64, 1), (64, 1)), scale=lambda rng, shape, drawn: (
     rng.standard_normal(shape) if shape[-1] > 1 else rng.uniform(0.5, 2.0, shape)))
 """An operand of unit scale and two divisors a row, held away from zero."""
-_NARROW = Drawn(((64, 4096),))
-"""Rows long enough that a sum of a narrow float's terms rounds in its own precision at every step."""
+_NARROW = Drawn(((64, 4096),), dtype=jnp.bfloat16)
+"""Rows of bfloat16 long enough that a sum of its terms rounds in its own precision at every step."""
 
 
 def _stable() -> tuple[RuleFamily, ...]:
@@ -550,8 +552,7 @@ def _widened() -> tuple[RuleFamily, ...]:
         rewrite(x.reduce("sum", axes, params)).to(
             x.convert(wide).reduce("sum", axes, params).convert(back), eq(back).to(narrowed(x)),
             eq(wide).to(stock("convert_float32"))),),
-        (lambda x: jnp.sum(x.astype(jnp.bfloat16), -1),
-         lambda x: jnp.sum(x.astype(jnp.bfloat16).astype(jnp.float32), -1).astype(jnp.bfloat16), _NARROW)),)
+        (lambda x: jnp.sum(x, -1), lambda x: jnp.sum(x.astype(jnp.float32), -1).astype(x.dtype), _NARROW)),)
 
 
 _FLOORED = Drawn(((64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: (
