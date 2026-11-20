@@ -1389,6 +1389,7 @@ def test_a_fit_whose_devices_hold_neither_step_searches_the_devices_once_before_
     from model_support import memory_limited_to
 
     from dew.training.ahead import stand_in_gpus
+    from dew.training.compiler import UNPLACED_REFUSED
     from dew.training.planning import PlanRefused
 
     state, streamed, device = streaming_needs()
@@ -1397,8 +1398,8 @@ def test_a_fit_whose_devices_hold_neither_step_searches_the_devices_once_before_
     with (assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to((state + least) // 2)),
           caplog.at_level("INFO", logger="dew.training.compiler"), pytest.raises(PlanRefused)):
         streaming_decoder().fit(streaming_data(), steps=1, log_every=100)
-    searched = [record for record in caplog.records
-                if record.getMessage().startswith("the step fits no plan before its state is placed")]
+    # Each search that found no plan, by the record it makes (its template, not its words).
+    searched = [record for record in caplog.records if record.msg is UNPLACED_REFUSED]
     assert len(searched) == 1, [record.getMessage()[:120] for record in searched]
 
 
@@ -1740,11 +1741,12 @@ def test_a_distillations_streamed_price_reads_its_teachers_banks():
     assert distilled > alone, links
 
 
-def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companions_here():
+def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companions_here(tmp_path):
     """A host step prepared for GPUs this process lacks (one compile-only H100, `prepare_host_step`), over its
     fresh state's shapes, compiles the accelerator's programs for them and its CPU companion's on this
     host's CPUs, nothing placed: what fills the shared cache its run's startup reads (the GPU tier's
     `test_gpu_host_startup`)."""
+    from dew.data.dataset import Loader
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.training.ahead import prepare_host_step
 
@@ -1753,6 +1755,24 @@ def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companion
     tokens = np.stack([np.arange(row, row + 9) % 256 for row in range(1)]).astype(np.int32)
     startup = prepare_host_step(trainer, {"text": tokens})
     assert startup.by_backend["gpu"]["programs"] > 0 and startup.by_backend["cpu"]["programs"] > 0, startup
+    # A configured run compiling ahead reaches it (`AheadTarget.compiled`, row 8380), a step of many programs
+    # into the cache its run reads, refused a file to save it to.
+    from dew.training.ahead import AheadTarget
+
+    with pytest.raises(ValueError):
+        AheadTarget("sm90", 1, path=str(tmp_path / "host.dew-aot")).compiled(trainer, None, steps=1)
+    # Over its host's topology into the cache, a fresh trainer's configured run compiles the host step's
+    # programs, or counts the ones no device run has tuned (`CompiledAhead.untuned`), as a device step's
+    # prepare does (row 9693: it raised, and its state mesh's probe ran inside the start's trace).
+    topology = tmp_path / "node.topology"
+    topology.write_bytes(b"")
+    data = Loader(train=lambda partition: iter([{"text": tokens}] * 2), val=None, batch=len(tokens),
+                  records=None)
+    configured = streaming_decoder(HOST, dtype=jnp.bfloat16)
+    configured.device_mesh = trainer.device_mesh
+    done = AheadTarget("sm90", 1, topology=str(topology)).compiled(configured, data, steps=1)
+    compiled = {} if done.startup is None else done.startup.by_backend
+    assert done.untuned or compiled.get("gpu", {}).get("programs", 0) > 0, (done.untuned, compiled)
     # Targeted as compile_ahead targets a step (`ahead._targeted`): a run that tunes its kernels, which no
     # absent GPU can, is refused, where the copy of that preamble prepared it (row 8380).
     tuned = streaming_decoder(HOST, dtype=jnp.bfloat16)

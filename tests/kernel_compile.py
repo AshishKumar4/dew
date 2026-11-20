@@ -124,6 +124,10 @@ class Report:
     cap: int | None = None
     """The registers its launch runs a thread at, as its compile states them (`_compiled_here`'s), None where
     unstated."""
+    kind: str = "mosaic_gpu"
+    """The compiler that produced the binary (`report.Binary.kind`: `mosaic_gpu` or `triton`)."""
+    index: str | None = None
+    """XLA uniquification suffix (`report.Binary.index`) where a second cubin shares `(kernel, launch)`."""
 
     @property
     def traced(self) -> str:
@@ -160,26 +164,37 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
     and tensor memory from its resource estimate (`estimates`, Pallas's printed `Resources`, its module's,
     `_estimates`), paired by the kernel's name and launch (`report.launch_name`), with its module
     (`modules`, its kernel hash): its registers and spills are its PTX's as the GPU compiles it
-    (`inherited`). An estimate past the shared memory its binary's launch asks for, or none where it asks
-    for some, is another kernel's, and raises, as two binaries of one launch do."""
-    found: dict[str, report.Binary] = {}
+    (`inherited`), or, for a Pallas-Triton template binary (`Binary.kind == "triton"`), its cubin's own
+    shared memory, registers and stack frame (row 7263: Triton prints no Mosaic resource estimate or PTX;
+    TMEM is 0 only where its decoded SASS proves `uses_tmem is False`). An estimate past the shared memory
+    its binary's launch asks for, or none where it asks for some, is another kernel's, and raises, as two
+    binaries of one launch do."""
+    mosaic_found: dict[str, report.Binary] = {}
+    triton_found: dict[str, report.Binary] = {}
     for binary in binaries:
-        if found.setdefault(report.launch_name(binary.kernel, binary.launch), binary) != binary:
-            raise ValueError(f"two binaries of {report.launch_name(binary.kernel, binary.launch)}")
+        if binary.kind == "triton":
+            key = report.launch_name(binary.kernel, binary.launch, binary.index)
+            if triton_found.setdefault(key, binary) != binary:
+                raise ValueError(f"two binaries of {key}")
+        else:
+            key = report.launch_name(binary.kernel, binary.launch)
+            if mosaic_found.setdefault(key, binary) != binary:
+                raise ValueError(f"two binaries of {key}")
     found_reports = []
-    for name in sorted(set(estimates) | set(found)):
-        text, binary = estimates.get(name, ""), found.get(name)
+    for name in sorted(set(estimates) | set(mosaic_found)):
+        text, binary = estimates.get(name, ""), mosaic_found.get(name)
         shared, tmem = SHARED.search(text), TENSOR_MEMORY.search(text)
         if shared and binary is not None and binary.shared is not None and not (
-                int(shared.group(1)) <= binary.shared and (int(shared.group(1)) > 0 or binary.shared == 0)):
-            raise ValueError(f"{name}'s estimate of {shared.group(1)} shared bytes pairs with a binary whose "
-                             f"launch asks for {binary.shared}: the estimate is another kernel's")
+                int(shared.group(1)) <= binary.shared
+                and (int(shared.group(1)) > 0 or binary.shared == 0)):
+            raise ValueError(f"{name}'s estimate of {shared.group(1)} shared bytes pairs with a binary "
+                             f"whose launch asks for {binary.shared}: the estimate is another kernel's")
         # A kernel no binary carries is no compiled kernel, whatever its PTX's compile says.
         unread = tuple(field for field, read in (
             ("shared bytes", shared is not None and binary is not None and binary.shared is not None),
             ("tensor memory columns", tmem), ("binary", binary),
             ("machine code", binary is None or binary.sass is not None)) if not read)
-        kernel, launch = report.kernel_of(name)
+        kernel, launch, _ = report.kernel_of(name)
         found_reports.append(Report(
             kernel, binary.shared if binary is not None else None,
             sum(map(int, tmem.groups())) if tmem else None,
@@ -192,7 +207,22 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
                            if binary is not None else ()),
             threads=binary.threads if binary is not None else None,
             decreased=binary.decreased if binary is not None else None,
-            raised=binary.raised if binary is not None else None))
+            raised=binary.raised if binary is not None else None,
+            kind="mosaic_gpu"))
+    for name in sorted(triton_found):
+        binary = triton_found[name]
+        tmem_known = binary.uses_tmem is False
+        unread = tuple(field for field, read in (
+            ("shared bytes", binary.shared is not None),
+            ("tensor memory columns", tmem_known),
+            ("machine code", binary.sass is not None)) if not read)
+        found_reports.append(Report(
+            binary.kernel, binary.shared, 0 if tmem_known else None,
+            binary.registers, binary.frame, unread, None, binary.launch,
+            sass=tuple(binary.sass or ()), launched=binary.launched,
+            binary_registers=binary.registers, binary_frame=binary.frame,
+            threads=binary.threads, decreased=binary.decreased, raised=binary.raised,
+            kind="triton", index=binary.index))
     return found_reports
 
 
@@ -697,6 +727,8 @@ def inherited(kernel: dict, compiled: dict[str, dict], generation: str) -> dict:
     and so printed no PTX, that compile's. A kernel neither covers takes its executable's binary's where this
     process's builds are every build `generation`'s GPUs run (`_assembles_for`), its verdict then theirs;
     elsewhere it keeps them unread, another compiler's verdict no evidence of the GPU's."""
+    if kernel.get("kind") == "triton" and kernel["registers"] is not None and kernel["spilled"] is not None:
+        return {**kernel, "ptxas": "its executable's binary"}
     name = report.launch_name(kernel["kernel"], kernel["launch"])
     if name in compiled:
         if kernel["module"] is not None:
@@ -864,23 +896,25 @@ def _compiled_here(cases, generation: str) -> list[dict]:
             # its schedule lowers to (`producer_failures`).
             record["stated_models"] = {
                 report.launch_name(kernel["kernel"], kernel["launch"]): stated.record() for kernel in kernels
-                if kernel["launched"] is not None
+                if kernel.get("kind") != "triton" and kernel["launched"] is not None
                 and (launch := report.traced(kernel["launched"])) is not None
                 and (stated := launch.kernels.get(kernel["kernel"])) is not None}
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [inherited(kernel, compiled, generation) for kernel in kernels]
             printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
             for kernel in record["kernels"]:
-                name = report.launch_name(kernel["kernel"], kernel["launch"])
-                if kernel["module"] is not None and name in printed:
-                    PTX[kernel["module"]] = printed[name]
-                ptx = printed.get(name, PTX.get(kernel["module"], ""))
-                # Whether this process dumped its PTX: none where its module compiled before the gate's.
-                kernel["dumped"] = bool(ptx)
-                # The registers its launch runs a thread at, as its compile states them: its consumers' raise
-                # where it raises, else its threads' share of the multiprocessor's registers at the programs
-                # it is launched to hold (`resources.thread_share`); None where its binary states no threads.
-                programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
+                if kernel.get("kind") == "triton":
+                    kernel["dumped"] = True
+                    programs = 1
+                else:
+                    name = report.launch_name(kernel["kernel"], kernel["launch"])
+                    if kernel["module"] is not None and name in printed:
+                        PTX[kernel["module"]] = printed[name]
+                    ptx = printed.get(name, PTX.get(kernel["module"], ""))
+                    # Whether this process dumped its PTX: none where its Mosaic module compiled before the
+                    # gate's.
+                    kernel["dumped"] = bool(ptx)
+                    programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
                 with assumed(gpu_target(generation)):
                     kernel["cap"] = (kernel["raised"] if kernel["raised"] is not None
                                      else None if kernel["threads"] is None
@@ -907,7 +941,8 @@ def mosaic_failures(found: list[dict]) -> list[str]:
             found_kernel = _report(kernel)
             if (why := found_kernel.failure(record["limit"], record["tmem_limit"])) is not None:
                 failed.append(f"{record['name']} {found_kernel.kernel}: {why}")
-            stated = record.get("models", {}).get(found_kernel.kernel)
+            stated = (None if found_kernel.kind == "triton"
+                      else record.get("models", {}).get(found_kernel.kernel))
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
                               f"bytes of shared memory, the kernel asks for {found_kernel.shared}")
@@ -923,6 +958,8 @@ def producer_failures(found: list[dict]) -> list[str]:
     for record in found:
         for kernel in record.get("kernels", ()):
             found_kernel = _report(kernel)
+            if found_kernel.kind == "triton":
+                continue
             stated = record.get("stated_models", {}).get(found_kernel.traced,
                                                           record.get("models", {}).get(found_kernel.kernel))
             if stated is None or not stated["producer"]:

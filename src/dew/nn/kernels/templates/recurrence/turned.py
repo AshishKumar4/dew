@@ -18,7 +18,7 @@ import numpy as np
 
 from dew.algebra import scan
 from dew.nn.derivatives import KernelGlue, contracted
-from dew.nn.kernels.chunked_launch import entry_write
+from dew.nn.kernels.chunked_launch import AlignedDocuments, Forked, entry_write
 from dew.nn.precision import at_least_fp32, compensated_add
 
 TWO_PI = (np.float32(2 * np.pi), np.float32(2 * np.pi - float(np.float32(2 * np.pi))))
@@ -215,23 +215,6 @@ def _turned_forward(launch, scale, group, held, query, key, value, g, beta, stat
                           sin, owned, kind)
 
 
-def _rooted(query, key, state, entry, turn, starts, documents):
-    """`turn_gradient`'s operands: the queries and keys turned into frames each root's first token composes
-    (`_forked_frames`; a packed call's each document's own, `frames`), a forked call's entry keys into its
-    documents' opening frames, and the rotation by minus the row's last token's frame, which turns the final
-    memory's cotangent into them."""
-    if documents is None:
-        tokens, opening = frames(turn, starts), None
-    else:
-        tokens, opening = _forked_frames(turn, starts, documents, given=state.shape[1])
-    cos, sin = scan.rotation(*tokens)
-    rooted = [scan.rotated(_wide(x), cos, sin).astype(x.dtype) for x in (query, key)]
-    if entry is not None and opening is not None:
-        keys = scan.rotated(_wide(entry[0]), *(part[:, :, None] for part in scan.rotation(*opening)))
-        entry = (keys.astype(entry[0].dtype), *entry[1:])
-    return (*rooted, entry, scan.rotation(*(-part[:, -1:] for part in tokens)))
-
-
 def _turned_backward(launch, scale, group, held, residuals, cotangents):
     del launch
     (pullback, query, key, value, g, beta, state, entry, turn, starts, documents, cos, sin, owned,
@@ -253,13 +236,9 @@ def _turned_backward(launch, scale, group, held, residuals, cotangents):
     if d_entry is not None:
         keys = scan.rotated(_wide(d_entry[0]), owned[0][:, :, None], -owned[1][:, :, None])
         d_entry = tuple(doubled(part) for part in (keys.astype(d_entry[0].dtype), *d_entry[1:]))
-    rooted_query, rooted_key, rooted_entry, leaving = _rooted(query, key, state, entry, turn, starts,
-                                                              documents)
-    cos_back, sin_back = _memory_axis(leaving, d_final)
-    d_rooted = scan.rotated(_wide(d_final), cos_back, -sin_back, axis=-2).astype(d_final.dtype)
-    d_turn = turn_gradient(rooted_query, rooted_key, value, d_out, g, beta, state, d_rooted, starts,
+    d_turn = turn_gradient(query, key, value, d_out, g, beta, state, d_final, turn, starts,
                            scale=scale, group=group, pairs=cos.shape[-1], documents=documents, held=held,
-                           entry=rooted_entry)
+                           entry=entry)
     return (*unturned, *(doubled(d) for d in (d_value, d_g, d_beta, d_state, d_skip)), d_entry,
             d_turn.astype(turn_kind.dtype), None, None)
 
@@ -304,38 +283,6 @@ def _taken(x, index):
     return jax.vmap(lambda row, at: row[at])(x, index)
 
 
-def _forked_frames(turn, starts, documents, *, given: int):
-    """A forked call's frames: each token's `(high, low)` `[B, T, H, A]` and each document's opening frame
-    `[B, D, H, A]`, a document's its source's last token's where its slot is one an earlier document stored
-    (`loads` past `given`), else zero (a given memory's frame), its tokens' on from it (`frames`, each
-    wrapped once more)."""
-    firsts, loads, stores = (jnp.asarray(t, jnp.int32) for t in documents)
-    local = frames(turn, starts)
-    batch, length = turn.shape[:2]
-    count = firsts.shape[1]
-    following = jnp.concatenate([firsts[:, 1:], jnp.full((batch, 1), length)], axis=1)
-    lasts = jnp.clip(following - 1, 0, length - 1)
-    ends = tuple(_taken(part, lasts) for part in local)
-    zero = jnp.zeros((batch, *turn.shape[2:]), local[0].dtype)
-    slots = tuple(jnp.zeros((batch, count + 1, *turn.shape[2:]), local[0].dtype) for _ in range(2))
-    opening = []
-    for document in range(count):
-        stored = loads[:, document] > given
-        source = jnp.clip(loads[:, document] - given, 0, count)
-        start = tuple(jnp.where(stored.reshape(-1, *(1,) * (zero.ndim - 1)), _taken(slot, source), zero)
-                      for slot in slots)
-        opening.append(start)
-        end = _wrapped(compensated_add(start, tuple(part[:, document] for part in ends)))
-        into = jax.nn.one_hot(stores[:, document], count + 1, dtype=bool)
-        into = into & (stores[:, document] > 0)[:, None]
-        into = into.reshape(*into.shape, *(1,) * (zero.ndim - 1))
-        slots = tuple(jnp.where(into, part[:, None], slot) for part, slot in zip(end, slots, strict=True))
-    opening = tuple(jnp.stack(parts, axis=1) for parts in zip(*opening, strict=True))
-    document_of = jnp.sum(jnp.arange(length)[None, :, None] >= firsts[:, None, :], axis=-1) - 1
-    on = tuple(_taken(part, jnp.clip(document_of, 0, count - 1)) for part in opening)
-    return _wrapped(compensated_add(local, on)), opening
-
-
 def _crossed(x, y):
     """Each pair's `(J x) . y` `[..., A]` of `x` and `y` `[..., 2 A]` (`J` a quarter turn, `i` on a pair
     `x_2a + i x_2a+1`): a pair's score's derivative in its reader's frame, `x` the reader's side."""
@@ -366,19 +313,21 @@ def _split(x, trailing: int, *, blocks: int, half: int):
     return jnp.reshape(x, (*lead, blocks, 2, half, *x.shape[x.ndim - trailing:]))
 
 
-def _halves(query, key, value, d_out, log, beta, ids, teams, *, scale: float, group: int) -> jax.Array:
+def _halves(query, key, phi, value, d_out, log, beta, ids, teams, *, scale: float, group: int) -> jax.Array:
     """The crossing sums of a chunk's own pairs `[..., C, A]`: each token `t`'s `sum_{u < t <= s} dA_su (J
     q_s) . k_u`, `dA_su = scale beta_u exp(G_s - G_u) (do_s . v_u)` over pairs of one document (`ids`) and of
     later groups (`teams`, each token's group, a readout apart from its group's writes), by halves: a block's
-    later half's pairs with its earlier half's cross each token of either half they lie between, as a suffix
-    over the later half of `(J q_s) . sum_u dA_su k_u` and a prefix over the earlier half of `(J sum_s dA_su
-    q_s) . k_u`; each half's own pairs are the next level's. Every term summed crosses its token: no term
-    cancels another. A chunk is a power of two of whole groups (`turn_gradient`'s), and a level whose
-    blocks are one group each holds no pair a readout apart keeps: the levels stop there (a rank-four call's
-    two smallest, each three small products a chunk). `query` and `key` `[..., C, 2 A]`,
-    `value` and `d_out` `[..., C, V]`, `log` the log decays' prefix `G` as a double float (`_between`) and
-    `beta` `[..., C]`, `ids` and
-    `teams` `[..., C]` broadcast against them."""
+    later half's pairs with its earlier half's cross each token of either half they lie between, rotated into
+    the block midpoint's frame (`phi` less the earlier half's last angle, so readers and writers sum disjoint
+    turns and share no prefix under second-order differentiation, row 8656), as a suffix over the later half
+    of `(J q_s) . sum_u dA_su k_u` and a prefix over the earlier half of `(J sum_s dA_su q_s) . k_u`; each
+    half's own pairs are the next level's. Every term summed crosses its token: no term cancels another. A
+    chunk is a power of two of whole groups (`turn_gradient`'s), and a level whose blocks are one group each
+    holds no pair a readout apart keeps: the levels stop there (a rank-four call's two smallest, each three
+    small products a chunk). `query` and `key` `[..., C, 2 A]` unrotated, `phi` the chunk's within-chunk
+    double-float turn prefix `(high, low)` `[..., C, A]`, `value` and `d_out` `[..., C, V]`, `log` the log
+    decays' prefix `G` as a double float (`_between`) and `beta` `[..., C]`, `ids` and `teams` `[..., C]`
+    broadcast against them."""
     length = query.shape[-2]
     total = jnp.zeros((*query.shape[:-1], query.shape[-1] // 2), query.dtype)
     size = length
@@ -386,6 +335,7 @@ def _halves(query, key, value, d_out, log, beta, ids, teams, *, scale: float, gr
         half = size // 2
         split = functools.partial(_split, blocks=length // size, half=half)
         q, k, v, do = (split(x, 1) for x in (query, key, value, d_out))
+        p = tuple(split(part, 1) for part in phi)
         G = tuple(split(part, 0) for part in log)
         b, doc, team = (split(x, 0) for x in (beta, *(jnp.broadcast_to(t, beta.shape) for t in (ids, teams))))
         kept = ((team[..., 1, :, None] > team[..., 0, None, :])
@@ -397,9 +347,30 @@ def _halves(query, key, value, d_out, log, beta, ids, teams, *, scale: float, gr
         scores = jnp.where(kept, jnp.einsum('...iv,...jv->...ij', do[..., 1, :, :], v[..., 0, :, :]), 0.0)
         weights = jnp.where(kept, scale * b[..., 0, None, :], 0.0)
         pairs = scores * jnp.exp(jnp.where(kept, lag, -jnp.inf)) * weights
-        later = _suffix(_crossed(q[..., 1, :, :], jnp.einsum('...ij,...jk->...ik', pairs, k[..., 0, :, :])),
-                        axis=-2)
-        terms = _crossed(jnp.einsum('...ij,...ik->...jk', pairs, q[..., 1, :, :]), k[..., 0, :, :])
+        # Each half rotated into the block midpoint's frame: readers sum (mid, s], writers sum -(u, mid].
+        # Scale operands above 2^125 by 0.5 (exact power of two) before rotating so a rotation's <=sqrt(2)
+        # growth cannot overflow before the pair weight enters (base review b9f004f74 F1).
+        neg_mid = tuple(-part[..., 0, -1:, :] for part in p)
+        p_later = compensated_add(tuple(part[..., 1, :, :] for part in p), neg_mid)
+        p_earlier = compensated_add(tuple(part[..., 0, :, :] for part in p), neg_mid)
+        q_raw, k_raw = q[..., 1, :, :], k[..., 0, :, :]
+        sq, inv_q = _rotated_scale(q_raw)
+        sk, inv_k = _rotated_scale(k_raw)
+        q_later = scan.rotated(q_raw * sq, *scan.rotation(*p_later)).astype(q_raw.dtype)
+        k_earlier = scan.rotated(k_raw * sk, *scan.rotation(*p_earlier)).astype(k_raw.dtype)
+        limit = np.float32(2.0 ** 125)
+        small_p = jax.lax.stop_gradient(jnp.abs(pairs) <= limit)
+        p_big = jnp.where(small_p, 0.0, pairs)
+        p_small_k = jnp.where(small_p, pairs * jnp.swapaxes(inv_k, -1, -2), 0.0)
+        k_inv = jnp.where(jax.lax.stop_gradient(jnp.abs(k_earlier) <= limit), k_earlier * inv_k, k_earlier)
+        k_side = (jnp.einsum('...ij,...jk->...ik', p_small_k, k_earlier)
+                  + jnp.einsum('...ij,...jk->...ik', p_big, k_inv))
+        later = _suffix(_crossed(q_later, k_side) * inv_q, axis=-2)
+        p_small_q = jnp.where(small_p, pairs * inv_q, 0.0)
+        q_inv = jnp.where(jax.lax.stop_gradient(jnp.abs(q_later) <= limit), q_later * inv_q, q_later)
+        q_side = (jnp.einsum('...ij,...ik->...jk', p_small_q, q_later)
+                  + jnp.einsum('...ij,...ik->...jk', p_big, q_inv))
+        terms = _crossed(q_side, k_earlier) * inv_k
         earlier = _before(terms, axis=-2)
         level = jnp.stack([earlier, later], axis=-3)
         total = total + jnp.reshape(level, (*level.shape[:-4], length, level.shape[-1]))
@@ -407,45 +378,57 @@ def _halves(query, key, value, d_out, log, beta, ids, teams, *, scale: float, gr
     return total
 
 
-def turn_gradient(query, key, value, d_out, g, beta, state, d_final, starts, *, scale: float, group: int,
-                  pairs: int, documents=None, held: int = 0, entry=None) -> jax.Array:
+def turn_gradient(query, key, value, d_out, g, beta, state, d_final, turn, starts, *, scale: float,
+                  group: int, pairs: int, documents=None, held: int = 0, entry=None) -> jax.Array:
     """The cotangent of each token's turn `[B, T, H, A]` of a turned call on the template (`call`), in the
     crossing form: `sum_{u < t <= s} dA_su (J q_s) . k_u` over its pairs, `dA_su` a pair's score's cotangent
     (`scale beta_u` times its decays and `do_s . v_u`, of later groups of `group` where a readout is apart
-    from its group's writes), `q` and `k` the turned queries and keys `[B, T, H, K]` as the template read
-    them, `value` and `d_out` `[B, T, H, V]`, `g` the log decays and `beta` the write gates `[B, T, H]`,
-    `d_final` the final memory's cotangent in its last frame, `starts` `[B, T]` or None. A chunk's own pairs
-    by halves (`_halves`); a pair across chunks through the memory entering a chunk (`S_c`, its readers
-    within the chunk: a suffix over them), the cotangent of the memory leaving it (`dS_c`, its writers within:
-    a prefix) and both for a chunk it passes through whole (`<S_c, J dS_c>`, its every token). `state` the
-    memory entering `[B, H, K, V]` (in its document's first frame) or None; a forked call's (`documents`,
-    `held`, `entry`, `call`'s) its table's given memories, each document laid from a chunk's edge and its
-    memories walked through the table (`_laid_documents`). Only the first `pairs` pairs of a key turn."""
+    from its group's writes), `query` and `key` the unrotated queries and keys `[B, T, H, K]`, `value` and
+    `d_out` `[B, T, H, V]`, `g` the log decays and `beta` the write gates `[B, T, H]`, `d_final` the final
+    memory's cotangent in its last frame, `turn` `[B, T, H, A]`, `starts` `[B, T]` or None. Each chunk works
+    in its own local frame (its entering memory in its opening frame, its leaving cotangent in its closing
+    frame, and each level of `_halves` in its block midpoint's frame) so every contraction's two sides sum
+    disjoint turns and cancel no shared prefix in first or second order (row 8656)."""
     turned = 2 * pairs
     # Chunks of whole groups, a power of two of them, so a group never straddles two chunks' memories.
     chunk = group * 2 ** max((CHUNK // group).bit_length() - 1, 0)
-    rows = (query, key, value, d_out, g, beta)
+    rows = (query, key, value, d_out, g, beta, turn)
     if documents is None:
         walked = _packed(*rows, state, d_final, starts, scale=scale, turned=turned, group=group, chunk=chunk)
     else:
         walked = _laid_documents(*rows, state, d_final, documents, entry, scale=scale, turned=turned,
                                  held=held, group=group, chunk=chunk)
-    (q, k, v, do, log, b, ids, teams, sides, memories, leaving, passes), unlaid = walked
-    (readers, reads), (writers, writes) = sides
-    own = _halves(q, k, v, do, log, b, ids, teams, scale=scale, group=group)
+    ((q, k, phi, v, do, log, b, ids, teams, sides, memories_pair, leaving_pair, passes, chunk_rot),
+     unlaid) = walked
+    memories, mem_scales = memories_pair
+    leaving, cot_scales = leaving_pair
+    (readers, rem_q, reads), (writers, rem_k, writes) = sides
+    own = _halves(q, k, phi, v, do, log, b, ids, teams, scale=scale, group=group)
     # A memory's contraction over the tokens of its document that read it, a cotangent's over those that
     # write it (`reads`, `writes`, each chunk's document's alone, a structure, not the readers' values, so
     # every order's derivative stays): another document's token taken out before the products, where a
     # discarded memory of 2^127 times its cotangent was inf and its zero reader made it NaN (row 8519).
     read_out = jnp.where(reads[..., None], do, 0.0)
     written_in = jnp.where(writes[..., None], v, 0.0)
-    entered = _suffix(_crossed(readers, jnp.einsum('bhnkv,bhncv->bhnck', memories, read_out)), axis=-2)
-    terms = -_crossed(writers, jnp.einsum('bhnkv,bhncv->bhnck', leaving, written_in))
+    read_mat, read_post = _scaled_einsum(memories, read_out, rem_q * mem_scales)
+    entered = _suffix(_crossed(readers, read_mat) * read_post, axis=-2)
+    write_mat, write_post = _scaled_einsum(leaving, written_in, rem_k * cot_scales)
+    terms = -(_crossed(writers, write_mat) * write_post)
     left = _before(terms, axis=-2)
-    through = jnp.sum(_crossed(jnp.swapaxes(leaving, -1, -2), jnp.swapaxes(passes * memories, -1, -2)),
-                      axis=-2)
+    c_cos, c_sin = chunk_rot
+    decayed = passes * memories
+    p_fac, p_inv = _rotated_scale(jnp.swapaxes(decayed, -1, -2))
+    p_fac, p_inv = jnp.swapaxes(p_fac, -1, -2), jnp.swapaxes(p_inv, -1, -2)
+    passed = scan.rotated(decayed * p_fac, c_cos[..., None, :], -c_sin[..., None, :], axis=-2)
+    total_scale = mem_scales * cot_scales * p_inv
+    left_small = jax.lax.stop_gradient(
+        jnp.max(jnp.abs(leaving), axis=(-2, -1), keepdims=True)
+        <= jnp.max(jnp.abs(passed), axis=(-2, -1), keepdims=True))
+    one_f = jnp.asarray(1.0, leaving.dtype)
+    l_scaled = leaving * jnp.where(left_small, total_scale, one_f)
+    p_scaled = passed * jnp.where(left_small, one_f, total_scale)
+    through = jnp.sum(_crossed(jnp.swapaxes(l_scaled, -1, -2), jnp.swapaxes(p_scaled, -1, -2)), axis=-2)
     return unlaid(own + entered + left + through[..., None, :])
-
 
 def _chunked(x, chunks: int, chunk: int):
     """`[B, L, ...]` as `[B, H, chunks, C, ...]`, heads after the batch (`[B, chunks, C]` where it has no
@@ -468,24 +451,87 @@ def _between(later, earlier) -> jax.Array:
     return (later[0] - earlier[0]) + (later[1] - earlier[1])
 
 
-def _sides(q, k, log, b, reads, writes, scale: float):
-    """A chunk's readers of the memory entering it, `q_s scale exp(G_s)`, and writers into the memory
-    leaving it, `k_u beta_u exp(G_end - G_u)`, of the chunk's document alone (`reads`, `writes`): another
-    document's exponents taken out before `exp` (an earlier document's steep prefix less the last one's
-    restarted one is past fp32's largest, and its zero weight times `exp` of it NaN; base review fbb1c2f71
-    F2)."""
-    readers = q * (scale * jnp.exp(jnp.where(reads, log[0] + log[1], -jnp.inf)))[..., None]
+def _rotated_scale(x):
+    """Exact power-of-two factor (0.5 where any component exceeds 2^125, else 1.0) and its inverse so a 2-D
+    rotation's <=sqrt(2) growth cannot overflow before a weight enters (base review b9f004f74 F1)."""
+    limit = np.float32(2.0 ** 125)
+    half, one = jnp.asarray(0.5, x.dtype), jnp.asarray(1.0, x.dtype)
+    factor = jax.lax.stop_gradient(jnp.where(jnp.max(jnp.abs(x), axis=-1, keepdims=True) > limit, half, one))
+    return factor, one / factor
+
+
+def _reduced_turn(turn, work):
+    """Reduce `turn` within pi in at least fp32, preserving wider angle dtypes (e.g. float64 under x64)
+    through prefix sums and trigonometry (base reviews da734bf54 F2, b65e3cab4 F3, d80c85a37 F3)."""
+    return scan.within_pi(jnp.asarray(turn, jnp.promote_types(at_least_fp32(turn.dtype), work)))
+
+
+def _scaled_einsum(mat, vec, rem):
+    """Contract `mat` `[..., K, V]` with `vec` `[..., C, V]` scaled by `rem` `[..., C, 1]`, returning
+    `(product, post_scale)`: `rem` enters before contracting where `|vec| * rem <= 2^125`, else stays in
+    `post_scale` to apply after the cross product so `2^127 * rem` never overflows before a small paired
+    component absorbs it (base reviews b65e3cab4 F2, 1cf389a60 F1)."""
+    limit = np.float32(2.0 ** 125)
+    one = jnp.asarray(1.0, rem.dtype)
+    small = jax.lax.stop_gradient(jnp.max(jnp.abs(vec), axis=-1, keepdims=True) <= limit / rem)
+    pre, post = jnp.where(small, rem, one), jnp.where(small, one, rem)
+    return jnp.einsum('bhnkv,bhncv->bhnck', mat, vec * pre), post
+
+
+def _chunk_frames(g_laid, turn_laid, cut_laid):
+    """Chunk-local log-decay prefix, turn-angle prefix, and closing rotation from laid operands and restarts
+    (base review b9f004f74 F8)."""
+    log = scan.compensated(g_laid, axis=-1, restarts=cut_laid)
+    phi = scan.compensated(turn_laid, axis=-2,
+                           restarts=jnp.broadcast_to(cut_laid[..., None], turn_laid.shape))
+    return log, phi, scan.rotation(phi[0][..., -1, :], phi[1][..., -1, :])
+
+
+def _transfer(state, kept, added, cos_c, sin_c):
+    """Rotate a chunk's scaled `(matrix, scale)` by `(cos_c, sin_c)` and add `added`, halving before
+    rotating whenever `kept * matrix` exceeds 2^125 so `sqrt(2)` never overflows (b65e3cab4 F1)."""
+    matrix, m_scale = state
+    decayed = kept * matrix
+    limit, floor = np.float32(2.0 ** 125), np.float32(2.0 ** 124)
+    half, one, two = (jnp.asarray(v, matrix.dtype) for v in (0.5, 1.0, 2.0))
+    peak = jax.lax.stop_gradient(jnp.max(jnp.abs(decayed), axis=(-2, -1), keepdims=True))
+    halve = peak > limit
+    reset = (peak == 0.0) & (m_scale > one)
+    grow = (m_scale > one) & (peak > 0.0) & (peak <= floor)
+    rot_fac = jnp.where(halve, half, jnp.where(reset, m_scale, jnp.where(grow, two, one)))
+    new_scale = jnp.where(reset, one, m_scale * (one / rot_fac))
+    rotated = scan.rotated(decayed * rot_fac, cos_c[..., None, :], sin_c[..., None, :],
+                           axis=-2).astype(matrix.dtype)
+    return rotated + added * (one / new_scale), new_scale
+
+
+def _sides(q, k, phi, log, b, reads, writes, scale: float):
+    """A chunk's scaled readers and writers with any unabsorbed inverse rotation scale `(readers, rem_q)`
+    and `(writers, rem_k)` kept apart: absorb `inv` into the bounded weight when `|weight| <= 0.5` so
+    `|weight * inv| <= 1` and neither side overflows (base reviews da734bf54 F1, b65e3cab4 F2)."""
+    sq, inv_q = _rotated_scale(q)
+    sk, inv_k = _rotated_scale(k)
+    q_open = scan.rotated(q * sq, *scan.rotation(*phi)).astype(q.dtype)
+    phi_to_end = compensated_add(phi, tuple(-part[..., -1:, :] for part in phi))
+    k_close = scan.rotated(k * sk, *scan.rotation(*phi_to_end)).astype(k.dtype)
+    half, one = jnp.asarray(0.5, q.dtype), jnp.asarray(1.0, q.dtype)
+    w_q = (scale * jnp.exp(jnp.where(reads, log[0] + log[1], -jnp.inf)))[..., None]
+    abs_q = jax.lax.stop_gradient(jnp.abs(w_q) <= half)
+    readers = q_open * jnp.where(abs_q, w_q * inv_q, w_q)
+    rem_q = jnp.where(abs_q, one, inv_q)
     lag = _between(tuple(part[..., -1:] for part in log), log)
-    writers = k * (b * jnp.exp(jnp.where(writes, lag, -jnp.inf)))[..., None]
-    return readers, writers
+    w_k = (b * jnp.exp(jnp.where(writes, lag, -jnp.inf)))[..., None]
+    abs_k = jax.lax.stop_gradient(jnp.abs(w_k) <= half)
+    writers = k_close * jnp.where(abs_k, w_k * inv_k, w_k)
+    rem_k = jnp.where(abs_k, one, inv_k)
+    return (readers, rem_q), (writers, rem_k)
 
-
-def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale: float, turned: int,
+def _packed(query, key, value, d_out, g, beta, turn, state, d_final, starts, *, scale: float, turned: int,
             group: int, chunk: int):
     """`turn_gradient`'s chunks of a call of packed documents, each from a zero memory but a row's first
     (`state`): its tokens in `chunk`-token chunks (padded), each token's document's id (`starts`' count
-    through it), and the memories entering each chunk and their cotangents leaving it, walked over a row's
-    chunks, a document's memory crossing no other's."""
+    through it), and the memories entering each chunk (in its opening frame) and their cotangents leaving it
+    (in its closing frame), walked over a row's chunks, a document's memory crossing no other's."""
     work = at_least_fp32(jnp.result_type(query, key, value, d_out))
     batch, length, heads, _ = query.shape
     pad = (-length) % chunk
@@ -496,101 +542,86 @@ def _packed(query, key, value, d_out, g, beta, state, d_final, starts, *, scale:
 
     q, k = (laid(jnp.asarray(x, work)[..., :turned]) for x in (query, key))
     v, do = (laid(jnp.asarray(x, work)) for x in (value, d_out))
-    begins = jnp.zeros((batch, length), bool) if starts is None else jnp.asarray(starts, bool)
     # Each chunk's log decays' prefix restarts at each document's first token: summed across a chunk's
     # documents, a pair of a later one took its decays as a difference of the earlier ones' (PaTH's row
     # 7609: a first document's -2^30 rounded the next one's to nothing). A token whose decay vanishes cuts
     # a head's as a document's start does (`scan.vanished`).
+    begins = jnp.zeros((batch, length), bool) if starts is None else jnp.asarray(starts, bool)
     g, cut = scan.vanished(jnp.asarray(g, work))
     cut = cut | begins[..., None]
-    log = scan.compensated(laid(g), axis=-1, restarts=laid(cut))
+    cut_laid = laid(cut)
+    log, phi, chunk_rot = _chunk_frames(laid(g), laid(_reduced_turn(turn, work)), cut_laid)
     b = laid(jnp.asarray(beta, work))
     ids = laid(jnp.cumsum(cut.astype(jnp.int32), axis=1), mode='edge')
     # Each token's group: a row's tokens' ranks in turn from its first, each document beginning a token.
     teams = laid(jnp.broadcast_to(jnp.arange(length) // group, (batch, length)), mode='edge')[:, None]
     before = jnp.concatenate([jnp.zeros_like(ids[..., :1, -1]), ids[..., :-1, -1]], axis=-1)
     reads, writes = ids == before[..., None], ids == ids[..., -1:]
-    readers, writers = _sides(q, k, log, b, reads, writes, scale)
+    (readers, rem_q), (writers, rem_k) = _sides(q, k, phi, log, b, reads, writes, scale)
     # A chunk its memory passes through whole: one document's, no decay of it vanished.
     whole = jnp.where(ids[..., -1] == before, log[0][..., -1] + log[1][..., -1], -jnp.inf)
     passes = jnp.exp(whole)[..., None, None]
-    written = jnp.einsum('bhnck,bhncv->bhnkv', writers, v)
-    read = jnp.einsum('bhnck,bhncv->bhnkv', readers, do)
+    written = jnp.einsum('bhnck,bhncv->bhnkv', writers, v * rem_k)
+    read = jnp.einsum('bhnck,bhncv->bhnkv', readers, do * rem_q)
     entering = (jnp.zeros((batch, heads, turned, v.shape[-1]), work) if state is None
                 else jnp.asarray(state, work)[:, :, :turned])
+    unit = jnp.ones((batch, heads, 1, 1), work)
 
-    def forward(memory, chunk):
-        kept, wrote = chunk
-        return kept * memory + wrote, memory
+    def forward(carry, chunk):
+        kept, wrote, cos_c, sin_c = chunk
+        return _transfer(carry, kept, wrote, cos_c, -sin_c), carry
 
-    def backward(cotangent, chunk):
-        kept, reader = chunk
-        return reader + kept * cotangent, cotangent
+    def backward(carry, chunk):
+        kept, reader, cos_c, sin_c = chunk
+        return _transfer(carry, kept, reader, cos_c, sin_c), carry
 
-    memories = _walk(forward, entering, passes, written)
-    leaving = _walk(backward, jnp.asarray(d_final, work)[:, :, :turned], passes, read, reverse=True)
+    memories = _walk(forward, (entering, unit), passes, written, *chunk_rot)
+    leaving = _walk(backward, (jnp.asarray(d_final, work)[:, :, :turned], unit), passes, read, *chunk_rot,
+                    reverse=True)
 
     def unlaid(total):
         total = jnp.reshape(jnp.moveaxis(total, 1, 3), (batch, chunks * chunk, heads, total.shape[-1]))
         return total[:, :length]
 
-    sides = ((readers, reads), (writers, writes))
-    return (q, k, v, do, log, b, ids, teams, sides, memories, leaving, passes), unlaid
+    sides = ((readers, rem_q, reads), (writers, rem_k, writes))
+    return (q, k, phi, v, do, log, b, ids, teams, sides, memories, leaving, passes, chunk_rot), unlaid
 
-
-def _document_of(firsts, length: int):
-    """Each token's document `[B, T]`: the count of `firsts` `[B, D]` at or before it, less one."""
-    return jnp.sum(jnp.arange(length)[None, :, None] >= firsts[:, None, :], axis=-1) - 1
-
-
-def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents, entry, *, scale: float,
-                    turned: int, held: int, group: int, chunk: int):
+def _laid_documents(query, key, value, d_out, g, beta, turn, given, d_final, documents, entry, *,
+                    scale: float, turned: int, held: int, group: int, chunk: int):
     """`turn_gradient`'s chunks of a forked call: each document laid from a chunk's edge (padded to whole
-    chunks, as the template and the portable math lay it), the memories entering each chunk walked through
-    the call's table (a document's first chunk enters its `loads` slot's memory and its entry write, its last
-    leaves its final in its `stores` slot; slot zero none, the next `S'` the given memories `given`, then the
-    stored ones), and their cotangents walked back (a stored slot's the sum of each document entering it,
-    the row's last document's the final memory's)."""
+    chunks, as the template and the portable math lay it), the memories entering each chunk (in its opening
+    frame) walked through the call's table (a document's first chunk enters its `loads` slot's memory and its
+    entry write, its last leaves its final in its `stores` slot; slot zero none, the next `S'` the given
+    memories `given`, then the stored ones), and their cotangents (in each chunk's closing frame) walked back
+    (a stored slot's the sum of each document entering it, the row's last document's the final memory's)."""
     work = at_least_fp32(jnp.result_type(query, key, value, d_out))
     firsts, loads, stores = (jnp.asarray(t, jnp.int32) for t in documents)
     batch, length, heads, _ = query.shape
     count = firsts.shape[1]
-    ends = jnp.concatenate([firsts[:, 1:], jnp.full((batch, 1), length)], axis=1)
-    sizes = jnp.clip(jnp.minimum(ends, length) - jnp.minimum(firsts, length), 0)
-    spans = -(-sizes // chunk) * chunk
-    offsets = jnp.cumsum(spans, axis=1) - spans
-    chunks = -(-(length + count * (chunk - 1)) // chunk)
-    places = jnp.arange(chunks * chunk)
-    document = jnp.sum(places[None, :, None] >= (offsets + spans)[:, None, :], axis=-1)
-    live = document < count
-    document = jnp.minimum(document, count - 1)
-    within = places[None] - _taken(offsets, document)
-    real = live & (within < _taken(sizes, document))
-    token = jnp.where(real, _taken(firsts, document) + within, length)
+    aligned = AlignedDocuments.of(Forked(firsts, loads, stores, None, held), length, chunk)
+    chunks = aligned.length // chunk
+    real = aligned.laid(jnp.ones((batch, length), jnp.bool_))[0]
 
     def laid(x):
-        x = jnp.concatenate([x, jnp.zeros_like(x[:, :1])], axis=1)
-        return _chunked(jax.vmap(lambda row, at: row[at])(x, token), chunks, chunk)
+        return _chunked(aligned.laid(x)[0], chunks, chunk)
 
     q, k = (laid(jnp.asarray(x, work)[..., :turned]) for x in (query, key))
     v, do = (laid(jnp.asarray(x, work)) for x in (value, d_out))
     # A token whose decay vanishes cuts its chunk's prefix (`scan.vanished`): a span through it is none.
     g, cut = scan.vanished(jnp.asarray(g, work))
-    log = scan.compensated(laid(g), axis=-1, restarts=laid(cut))
-    seen = jnp.cumsum(laid(cut).astype(jnp.int32), axis=-1)
+    cut_laid = laid(cut)
+    log, phi, chunk_rot = _chunk_frames(laid(g), laid(_reduced_turn(turn, work)), cut_laid)
+    seen = jnp.cumsum(cut_laid.astype(jnp.int32), axis=-1)
     b = laid(jnp.asarray(beta, work))
     on = _chunked(real, chunks, chunk)[:, None]
     reads, writes = on & (seen == 0), on & (seen == seen[..., -1:])
-    readers, writers = _sides(q, k, log, b, reads, writes, scale)
-    head = _chunked(document, chunks, chunk)[..., 0]
-    alive = _chunked(live, chunks, chunk)[..., 0]
-    first = alive & (jnp.arange(chunks)[None] * chunk == _taken(offsets, head))
-    last = alive & ((jnp.arange(chunks)[None] + 1) * chunk == _taken(offsets + spans, head))
-    final = last & (head == _document_of(firsts, length)[:, -1:])
+    (readers, rem_q), (writers, rem_k) = _sides(q, k, phi, log, b, reads, writes, scale)
+    head, alive, last, final = aligned.document, aligned.alive, aligned.last, aligned.final
+    first = aligned.loads >= 0
     whole = jnp.where(seen[..., -1] == 0, log[0][..., -1] + log[1][..., -1], -jnp.inf)
     passes = (alive[:, None] * jnp.exp(whole))[..., None, None]
-    written = jnp.einsum('bhnck,bhncv->bhnkv', writers, v)
-    read = jnp.einsum('bhnck,bhncv->bhnkv', readers, do)
+    written = jnp.einsum('bhnck,bhncv->bhnkv', writers, v * rem_k)
+    read = jnp.einsum('bhnck,bhncv->bhnkv', readers, do * rem_q)
     shape = (batch, heads, turned, v.shape[-1])
     opened = jnp.zeros((batch, count, *shape[1:]), work)
     if entry is not None:
@@ -605,29 +636,29 @@ def _laid_documents(query, key, value, d_out, g, beta, given, d_final, documents
     table = jnp.concatenate([jnp.zeros((batch, 1, *shape[1:]), work),
                              jnp.asarray(given, work)[..., :turned, :],
                              jnp.zeros((batch, held, *shape[1:]), work)], axis=1)
-    into = _taken(loads, head)
-    out = _taken(stores, head)
-    out = jnp.where(out > 0, given.shape[1] + out, 0)
+    into = jnp.maximum(aligned.loads, 0)
+    out = jnp.where(aligned.stores > 0, given.shape[1] + aligned.stores, 0)
     flags = tuple(x[:, None] for x in (first, last, final, into, out))
     empty = jnp.zeros(shape, work)
-    memories = _walk(functools.partial(_entering, slots=slots), (empty, table), *flags, passes, written,
-                     entries)
+    unit = jnp.ones((batch, heads, 1, 1), work)
+    table_unit = jnp.ones((batch, slots, heads, 1, 1), work)
+    memories = _walk(functools.partial(_entering, slots=slots), (empty, unit, table, table_unit), *flags,
+                     passes, written, entries, *chunk_rot)
     d_held = jnp.asarray(d_final, work)[:, :, :turned]
-    leaving = _walk(functools.partial(_leaving, slots=slots, d_final=d_held), (empty, jnp.zeros_like(table)),
-                    *flags, passes, read, reverse=True)
-    of = _document_of(firsts, length)
-    position = _taken(offsets, of) + jnp.arange(length)[None] - _taken(firsts, of)
+    leaving = _walk(functools.partial(_leaving, slots=slots, d_final=d_held),
+                    (empty, unit, jnp.zeros_like(table), table_unit), *flags, passes, read, *chunk_rot,
+                    reverse=True)
 
     def unlaid(total):
-        total = jnp.reshape(jnp.moveaxis(total, 1, 3), (batch, chunks * chunk, heads, total.shape[-1]))
-        return jax.vmap(lambda row, at: row[at])(total, position)
+        return aligned.unlaid(jnp.reshape(jnp.moveaxis(total, 1, 3),
+                                          (batch, aligned.length, heads, total.shape[-1])))
 
     # A chunk's tokens apart where a vanished decay cuts them (each chunk one document's).
     ids = head[:, None, :, None] * (chunk + 1) + seen
     # Each token's group, counted from its document's first token (a chunk's edge).
-    teams = _chunked(within // group, chunks, chunk)[:, None]
-    sides = ((readers, reads), (writers, writes))
-    return (q, k, v, do, log, b, ids, teams, sides, memories, leaving, passes), unlaid
+    teams = _chunked(aligned.within // group, chunks, chunk)[:, None]
+    sides = ((readers, rem_q, reads), (writers, rem_k, writes))
+    return (q, k, phi, v, do, log, b, ids, teams, sides, memories, leaving, passes, chunk_rot), unlaid
 
 
 def _slot(at, slots: int, dtype):
@@ -636,30 +667,43 @@ def _slot(at, slots: int, dtype):
 
 
 def _entering(carry, chunk, *, slots: int):
-    """A forked walk's chunk forward (`_laid_documents`): the memory entering it (its document's first
-    chunk's from its slot and its entry write), the memory leaving it, stored where its document's last
-    chunk stores."""
-    memory, table = carry
-    begins, ends, _, into, out, kept, wrote, entry = chunk
-    taken = jnp.einsum('bs,bshkv->bhkv', _slot(into, slots, table.dtype), table) + entry
+    """A forked walk's chunk forward (`_laid_documents`): the scaled memory entering it (its document's first
+    chunk's from its slot and its entry write), the memory leaving it (rotated into the chunk's closing
+    frame), stored where its document's last chunk stores."""
+    memory, m_scale, table, t_scale = carry
+    begins, ends, _, into, out, kept, wrote, entry, cos_c, sin_c = chunk
+    taken_mask = (_slot(into, slots, table.dtype) > 0)[..., None, None, None]
+    taken_scale = jnp.sum(jnp.where(taken_mask, t_scale, 0.0), axis=1)
+    taken = jnp.sum(jnp.where(taken_mask, table, 0.0), axis=1) + entry * (1.0 / taken_scale)
     memory = jnp.where(begins[..., None, None], taken, memory)
-    leaving = kept * memory + wrote
+    m_scale = jnp.where(begins[..., None, None], taken_scale, m_scale)
+    leaving, next_scale = _transfer((memory, m_scale), kept, wrote, cos_c, -sin_c)
     into_slot = _slot(out, slots, table.dtype) > 0
     stores = (ends & (out > 0))[..., None, None, None] & into_slot[..., None, None, None]
-    return (leaving, jnp.where(stores, leaving[:, None], table)), memory
+    return (leaving, next_scale, jnp.where(stores, leaving[:, None], table),
+            jnp.where(stores, next_scale[:, None], t_scale)), (memory, m_scale)
 
 
 def _leaving(carry, chunk, *, slots: int, d_final):
-    """A forked walk's chunk backward (`_laid_documents`): the cotangent of the memory leaving it (its
+    """A forked walk's chunk backward (`_laid_documents`): the scaled cotangent of the memory leaving it (its
     document's last chunk's its stored slot's and, the row's last, the final memory's), the memory entering
-    it's summed into its slot where its document's first chunk enters it."""
-    cotangent, d_table = carry
-    begins, ends, final, into, out, kept, reader = chunk
-    from_slot = jnp.einsum('bs,bshkv->bhkv', _slot(out, slots, d_table.dtype), d_table)
-    from_slot = from_slot * (out > 0)[..., None, None]
-    ending = from_slot + jnp.where(final[..., None, None], d_final, 0.0)
+    it's (rotated into the chunk's opening frame) summed into its slot where its document's first chunk
+    enters it."""
+    cotangent, c_scale, d_table, dt_scale = carry
+    begins, ends, final, into, out, kept, reader, cos_c, sin_c = chunk
+    slot_mask = ((out > 0)[..., None, None, None]
+                 & (_slot(out, slots, d_table.dtype) > 0)[..., None, None, None])
+    one = jnp.asarray(1.0, d_table.dtype)
+    from_scale = jnp.where((out > 0)[..., None, None],
+                           jnp.sum(jnp.where(slot_mask, dt_scale, 0.0), axis=1), one)
+    from_slot = jnp.sum(jnp.where(slot_mask, d_table, 0.0), axis=1)
+    ending = from_slot + jnp.where(final[..., None, None], d_final * (one / from_scale), 0.0)
     cotangent = jnp.where(ends[..., None, None], ending, cotangent)
-    entering = reader + kept * cotangent
-    entered = _slot(into, slots, d_table.dtype)[..., None, None, None] * entering[:, None]
-    d_table = d_table + jnp.where(begins[..., None, None, None], entered, 0.0)
-    return (entering, d_table), cotangent
+    c_scale = jnp.where(ends[..., None, None], from_scale, c_scale)
+    entering, next_scale = _transfer((cotangent, c_scale), kept, reader, cos_c, sin_c)
+    enter_mask = ((begins & (into > 0))[..., None, None, None]
+                  & (_slot(into, slots, d_table.dtype) > 0)[..., None, None, None])
+    merged_scale = jnp.where(enter_mask, jnp.maximum(dt_scale, next_scale[:, None]), dt_scale)
+    d_table = (d_table * (dt_scale / merged_scale)
+               + jnp.where(enter_mask, entering[:, None] * (next_scale[:, None] / merged_scale), 0.0))
+    return (entering, next_scale, d_table, merged_scale), (cotangent, c_scale)

@@ -745,6 +745,13 @@ def test_a_gathered_index_ends_a_locations_known_prefix():
     assert ring_protocol._located(ref, [NDIndexer.from_indices_shape((0, 1), shape)]) == ("ring", 0, 1)
     gathered = NDIndexer.from_indices_shape((0, np.asarray([0, 2], np.int32)), shape)
     assert ring_protocol._located(ref, [gathered]) == ("ring", 0)
+    # Row 8978: a constant advanced index `ref.at[[0, 0]].at[1]` on (2, 2) reads base row 0, so it must stop
+    # at `("ring", 0)` and overlap `("ring", 0, 0)` rather than mislabeling as `("ring", 0, 1)`.
+    repeated = [NDIndexer.from_indices_shape((np.asarray([0, 0], np.int32),), (2, 2)),
+                NDIndexer.from_indices_shape((1,), (2, 2))]
+    located = ring_protocol._located(ref, repeated)
+    assert located == ("ring", 0)
+    assert ring_protocol._overlaps(located, ("ring", 0, 0))
 
 
 @pytest.mark.parametrize("waits", [True, False], ids=["ordered", "unordered"])

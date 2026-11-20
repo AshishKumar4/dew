@@ -222,8 +222,9 @@ class GRPOObjective(TokenScorer):
         super().__init__(model, seq_len, balance=balance, **options)
         # The reference is the starting policy, frozen at unit decay, where a KL term reads it.
         self.ema = EMASpec.constant(1.0 if beta > 0 or reward_kl > 0 else None)
-        # The batch is packed `input_ids` rows, not the LM's text windows.
-        self.inputs = InputSpec(sample=Field(IDS_KEY, (seq_len + 1,)))
+        # The batch is packed `input_ids` rows, not the LM's text windows, its ids the model's embedding
+        # table's, checked before scoring as an LM run's are (`Field.indexing`, row 9018; PPO's actor too).
+        self.inputs = InputSpec(sample=Field.indexing(IDS_KEY, (seq_len + 1,), self.model))
         self.beta = beta
         self.epsilon_low = epsilon_low
         self.epsilon_high = epsilon_high

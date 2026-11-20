@@ -13,8 +13,8 @@ import functools
 import importlib
 import re
 
-import jax
 import pytest
+from generation_support import INTERPRETS, here
 from kernel_matrix import CELLS
 from model_flows import FLOWS, flow_flags, flow_named
 from sharded import Shard, assert_kernel_runs_per_shard, interprets
@@ -58,32 +58,58 @@ the CPU lane (a decode's 15 to 30, an SSD's 40, a selective scan's 50, a chunked
 task takes what fits CI's group target."""
 
 
-def cells(test: str) -> list:
+def native(target: str) -> list:
+    """The marks that admit a cell of generation `target` to its native tier's selector: a GPU generation's
+    to the GPU tier's (`gpu`, pinned to its `generations`), a TPU's to the TPU tier's (`tpu`)."""
+    reason = f"a per-shard cell on {target}'s own devices"
+    if target.startswith("sm"):
+        return [pytest.mark.gpu(reason=reason), pytest.mark.generations(target)]
+    return [pytest.mark.tpu(reason=reason)]
+
+
+def cells(test: str, natively: bool = False) -> list:
     """Every per-shard cell the families state, as `test`'s parameters: each marked to run its seeds as map
-    tasks where `CHECK1_SHARDS` names its node, its declared count the family's own."""
-    def param(module: str, choice: str, kernel: str, label: str, seeds: int):
+    tasks where `CHECK1_SHARDS` names its node, its declared count the family's own; or, run `natively`,
+    admitted to its generation's tier (`native`)."""
+    def param(module: str, choice: str, kernel: str, label: str, shard: Shard):
         # A node id of letters, digits, _ and -, as the plan reads ids (tools/armada/ci.py `sites`).
         name = re.sub(r"[^A-Za-z0-9_-]", "_", f"{choice}-{kernel}-{label}")
         held = CHECK1_SHARDS.get(f"{test}[{name}]")
-        assert held is None or held["seeds"] == seeds, (name, held, seeds)
-        return pytest.param(module, choice, kernel, label, id=name,
-                            marks=[pytest.mark.check1_shards(**held)] if held else [])
+        assert held is None or held["seeds"] == shard.seeds, (name, held, shard.seeds)
+        marks = native(shard.target) if natively else [pytest.mark.check1_shards(**held)] if held else []
+        return pytest.param(module, choice, kernel, label, id=name, marks=marks)
 
-    return [param(module, choice, kernel, label, shard.seeds) for module, choice, kernel in kernels()
+    return [param(module, choice, kernel, label, shard) for module, choice, kernel in kernels()
             for label, shard in stated(module, choice, kernel).items()]
 
 
+@INTERPRETS
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize(("module", "choice", "kernel", "label"), cells("test_a_kernel_runs_per_shard"))
 def test_a_kernel_runs_per_shard(module, choice, kernel, label):
-    """One kernel's per-shard cell where this process's devices run it (`sharded.interprets` on the CPU's,
-    its generation's own on a GPU's or a TPU's), skipped where they do not."""
+    """One kernel's per-shard cell as the CPU's devices interpret it, as its generation
+    (`sharded.interprets`), on a CPU alone (`INTERPRETS`: an accelerator runs its route natively), skipped
+    where they do not; its run on its own generation's devices is
+    `test_a_kernel_runs_per_shard_natively`'s."""
     shard = stated(module, choice, kernel)[label]
-    platform = jax.default_backend()
-    held = (shard.target.startswith("sm") if platform == "gpu" else not shard.target.startswith("sm")
-            if platform == "tpu" else interprets(choice, kernel, shard))
-    if not held:
-        pytest.skip(f"{choice} {kernel} runs as {shard.target} on its own devices, not on this {platform}")
+    if not interprets(choice, kernel, shard):
+        pytest.skip(f"{choice} {kernel} runs as {shard.target}, which this process does not interpret")
+    assert_kernel_runs_per_shard(choice, kernel, shard)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize(("module", "choice", "kernel", "label"),
+                         cells("test_a_kernel_runs_per_shard_natively", natively=True))
+def test_a_kernel_runs_per_shard_natively(module, choice, kernel, label):
+    """One kernel's per-shard cell on its own generation's devices: admitted to that generation's tier
+    (`native`: a GPU's `gpu` session pinned to its `generations`, the TPU tier's `tpu` one) and run on
+    devices of that generation alone (`generation_support.here`), skipped on any other: a newer GPU that
+    could run an older one's launches runs its own routes, not the cell's (row 9002: a GPU took any GPU
+    generation's cell for its own). Its run takes two devices of one generation (`mesh`), which a tier's
+    host of one device skips by that mark, naming both counts."""
+    shard = stated(module, choice, kernel)[label]
+    if here() != shard.target:
+        pytest.skip(f"{choice} {kernel} runs as {shard.target}, not as this {here()}")
     assert_kernel_runs_per_shard(choice, kernel, shard)
 
 

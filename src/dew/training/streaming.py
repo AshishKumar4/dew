@@ -278,18 +278,13 @@ def compute_dtype(trainer, start: Start) -> np.dtype:
     return np.dtype(computes_in(None, start.abstract.variables["params"]))
 
 
-def resumed_layout(trainer, resume) -> Layout | None:
+def resumed_layout(trainer, step: int | None) -> Layout | None:
     """The layout of the checkpoint `trainer`'s run resumes (as `resume` asks, `Checkpoints.resumed`, the
     step every process agrees), the given one's with the host fields its rung recorded (`host`,
     `Trainer._checkpoint_envelope`); None for a fresh run. A checkpoint that recorded none trained on the
     devices."""
-    from dew.training.startup import resumed_step
-
     checkpoints = trainer.checkpoints
-    if checkpoints is None or resume == "never":
-        return None
-    step = resumed_step(trainer, resume)
-    if step is None:
+    if checkpoints is None or step is None:
         return None
     rung = checkpoints.rung(step)
     host = () if rung is None else listed(record(rung, "rung").get("host", []), "rung host", read=text,
@@ -322,23 +317,25 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     (`Trainer.layout_choice`). A run that states a layout (`Layout()` among them: `Trainer`'s argument
     given, row 9016), or one the streamed step cannot run, keeps its layout, said by name."""
     stated = trainer._layout_stated
-    resumed = None if stated else resumed_layout(trainer, resume)
+    # The step it resumes and its position, read once for the start (`Trainer._resumed`).
+    known = trainer._resumed(run, resume)
+    resumed = None if stated else resumed_layout(trainer, known.step)
     if resumed is not None:
         trainer._laid_out(resumed)
         trainer.layout_choice = Choice(held=False, fits=False, device=None, streamed=None, refused=None,
                                        streams=resumed.host == STREAMED, resumed=True)
         said(trainer.layout_choice)
-        return trainer._started(resume)
+        return trainer._started(resume, known)
     refused = refusal(trainer, stated=stated, ahead=trainer._compiler.ahead is not None)
     if refused is not None:
         trainer.layout_choice = Choice(held=False, fits=False, device=None, streamed=None, refused=refused,
                                        streams=False)
         said(trainer.layout_choice)
-        return trainer._started(resume)
+        return trainer._started(resume, known)
     # Each fit chooses afresh, from the layout it was given (a refit's of a run that streamed among them).
     given = trainer._given_layout
     trainer._laid_out(given)
-    first = run.primed[2] if run.primed is not None else trainer._primed_first(run, dataset)
+    first = run.primed[2] if run.primed is not None else trainer._primed_first(run, dataset, known.position)
     # Staged as the stream the start read first stages it, as the run's first compile reads it.
     trainer._shape = staged(trainer._shape, run.stages)
     # As the loop hands its step the batch, counted on the host and its rows marked (`FitRun.marked`), so
@@ -354,7 +351,7 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     active = phases.objective_for(phases.at(first))
     rung = Rung.of(active, xla_defaults=False, narrow=True)
     try:
-        start = trainer._started(resume)
+        start = trainer._started(resume, known)
         trainer._planned_unplaced(run, start, batch)
     except LayoutRefused:
         start = None
@@ -364,7 +361,7 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     devices_compiler, devices_rung = trainer._compiler, Rung.of(active, xla_defaults=False, narrow=True)
     rung.put(active)
     trainer._compiler = devices_compiler.anew()
-    laid = trainer._started(resume)
+    laid = trainer._started(resume, known)
     dtype = compute_dtype(trainer, laid)
     unpriced = None
     try:
@@ -404,4 +401,4 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     trainer._laid_out(given)
     # The given layout's start, which its first compile takes the plan above over; or, its devices holding
     # none, its refusal, as a run that streams nothing refuses.
-    return start if start is not None else trainer._started(resume)
+    return start if start is not None else trainer._started(resume, known)

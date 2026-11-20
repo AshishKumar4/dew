@@ -23,9 +23,10 @@ advance: the autodiff output of the program a user composed. Nothing runs at run
 
 ### 1.1 Two modes
 
-**Parked: the dev-time mode** (this section's dev-time row, §6.11). Derived forms run at trace time today
-(`derive`, `scan`: the forms are built where a template calls them), and nothing has needed a generator's
-checked-in output yet. The text stays as the design to resume.
+**The dev-time mode** (§6.11) generates stable numeric forms (`StableForm`), the first of them §1.5's
+acceptance cases (`dew.algebra.acceptance`, rows 9035 and 9037). A template's derived forms still run at
+trace time (`derive`, `scan`: built where a template calls them), and a surrogate's bodies are traced where
+they are declared: neither is generated yet.
 
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
@@ -37,9 +38,10 @@ checked-in output yet. The text stays as the design to resume.
   online and combine forms; numerically stable forms of Dew's own functions; and the internals of declared
   surrogate gradients (§1.3). The generator writes ordinary modules (`*_derived.py` beside the module that
   declares them) with a header naming the declaration, the rule sets and the egglog version. Each generated module
-  ships with generated tests: the accuracy gate's sites for its forms, against the declaration at float64 (§3).
-  CI regenerates them and fails when the checked-in output differs (`generate --check`), so a rule change shows up
-  as a reviewed diff of generated code, never as a silent change in behavior.
+  is held by one suite, `tests/test_algebra_generate.py`: the accuracy gate's site for each of its forms, against
+  the declaration at float64 (§3), and its regeneration (`generate(check=True)`), which fails when the
+  checked-in output differs, so a rule change shows up as a reviewed diff of generated code, never as a silent
+  change in behavior; a train runs it as it runs every test, with no step of the lint lane's own.
 - **Compile time** covers only what Dew cannot know in advance: the composition a user's model, objective and
   optimizer make, and the backward JAX's autodiff traces for it. It runs on every program Dew compiles at its
   seam: training steps, and the forwards of evaluation, rollouts, sampling and serving, which gain from it too,
@@ -152,25 +154,41 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     a reciprocal square root's form, a negation negated and a magnitude's magnitude are XLA's algebraic
     simplifier's, which every compile runs. A value times its sign is its magnitude in exact arithmetic but not
     on a lane that flushes a subnormal product (the CPU's, `tests/certified.py`'s `Lane.flushes`: the product
-    is zero where the magnitude keeps its bits), nor for a complex value; exp and log cancel only over a sign
-    and a range the language holds no fact of. None of these is built;
-  - **reuse** (compile time and dev time): a value the forward already computed. An equal term is one e-class
-    and extraction prices a shared one once, so a value written twice is read once without a rule. A rule
-    would relate a new value to another the program holds; over benchmark_step's and the parallelism matrix's
-    step programs (2026-11-05, every program the pass saw, bodies included) none takes the square root and its
-    reciprocal of one value or the exponentials of a value and its negation, a handful square a value by a
-    product, and the only pattern of note is a divisor shared by several quotients (42 to 452 of 423 to 794
-    divisions a suite). A shared reciprocal `a (1/y)` overflows where `a / y` is finite (a subnormal `y`) and
-    makes a NaN of a zero `a`, so the dominance rule (§6.3) refuses it. Not built;
+    is zero where the magnitude keeps its bits), nor for a complex value; an exponential's logarithm is the
+    stable set's (log space, below), and a logarithm's exponential holds only over a sign and a range. None of
+    these is built;
+  - **reuse** (`reuse`, compile time and dev time, `reorders`; row 9035): a value the forward already
+    computed. An equal term is one e-class and extraction prices a shared one once, so a value written twice is
+    read once without a rule. The rules relate a new value to another the program holds: a quotient by a value
+    whose reciprocal it holds, `a / y` as `a (1/y)`, and by a root whose reciprocal root it holds, `a /
+    sqrt(v)` as `a rsqrt(v)` (a normalization's `x / max(|y|, eps)` beside its reciprocal, a norm's
+    `rsqrt(mean(x²) + eps)`). Over benchmark_step's and the parallelism matrix's step programs (2026-11-05,
+    every program the pass saw, bodies included) the only pattern of note was a divisor shared by several
+    quotients (42 to 452 of 423 to 794 divisions a suite). A shared reciprocal unguarded overflows where `a /
+    y` is finite (a subnormal `y`), makes a NaN of a zero `a`, and flushes to zero where a large `y`'s quotient
+    keeps its value, so each rule reads a divisor an epsilon floors (a maximum's or a sum's, so a window
+    opens at a division by one alone) and fires only where its divisor is held away from zero (its floor,
+    `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest float's
+    least normal power, `rules.least`) and its dividend bounded, the product under the reach (§6.3). A
+    training step's values are mostly unbounded, so it fires on bounded ones alone (an epsilon's floor over a
+    bounded operand);
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max
     rescale of online softmax, log-sum-exp merges and folds, moment merges; the moment merges are not built:
     no rule, declaration or consumer of one exists);
-  - **stable forms** (dev time; §1.5): `log1p` and `expm1`, and a sum's logarithm taken out of its exponent
-    (the log-sum-exp fold), built; log-space divergences, compensated and widened sums, near-equal
-    differences rearranged to cancel exactly, and products and quotients scaled to range are the generator's
-    (parked, §6.11);
-  - **linear scans** (dev time; §6.9), built as the derivation's own sets; **error-free transforms**
-    (`error_free`, §6.9), not built;
+  - **stable forms** (`stable`, dev time; §1.5; row 9037): `log1p` and `expm1`, a sum's logarithm taken out
+    of its exponent (the log-sum-exp fold), logarithms of exponentials in log space (`log(exp(a) / exp(b))`
+    as `a - b`, a KL's divergence of two softmaxes; `log(exp(a) exp(b))`, `log(exp(a))`), differences of
+    near-equal sums rearranged to cancel exactly (`(x + y) - (x + z)` as `y - z`, `(x + y) - x` as `y`),
+    products and quotients regrouped to stay in range (`(a b) / c` as `a (b / c)`, `a / (b c)` as `(a / b) /
+    c`), a scale along a contraction moved to the other operand (§1.5's dV case), and a narrow float's sum
+    added in float32 (widened sums: bfloat16's and float16's, `terms.WIDENED`). Each is measured before it is
+    taken (§1.5);
+  - **linear scans** (dev time; §6.9), built as the derivation's own sets; **error-free transforms** (dev
+    time; §6.9): no rule set, the chooser's own derivation (`dew.algebra.error.compensated`): each candidate's
+    float sums compensated, every addition a double word and every sum's reduction compensated, in spans
+    protected from the pass (`dew.nn.precision`'s). The e-graph's equality is the reals', in which an
+    addition's rounding error is zero, so a rule writing a transform's error term would see it extracted
+    away;
   - **contracted** (compile time and dev time): a multiply its add or subtract reads first, as the fused
     multiply-add the compiler makes of the pair, a pricing aid that rounds as the form it replaces.
 - **Rounding:** a rewrite that rounds identically (`exact`) always applies. (Today its set is always
@@ -197,8 +215,10 @@ floating-point expressions:
   rows), as check 1 measures error.
 - **The declared accuracy** is the precision policy's (`dew.nn.precision`), read once:
   - default numerics: check 1 at the gate's parity (§3) against the form as written;
-  - the accurate numerics (`precision="accurate"`): check 1 at the gate's parity against every other candidate proposed (§6.5; the gate
-is pairwise, so no single most accurate candidate is ranked, and none may be admitted).
+  - the accurate numerics (`precision="accurate"`): check 1 at the gate's parity against the form as written
+    and every other candidate as exact as it (§6.5; the gate is pairwise, so no single most accurate candidate
+    is ranked, and none may be admitted; a proposal not as exact as the form as written, one past the
+    float's range where it is finite, raises no bar).
 - **Among the candidates that meet it,** the generator takes the cheapest by time (§1.6). A candidate that
   misses it is never chosen, however cheap.
 - **At compile time no candidate is measured;** admission is by rounding class alone (§1.4).
@@ -212,7 +232,13 @@ is pairwise, so no single most accurate candidate is ranked, and none may be adm
     is at least one, as a softmax's is (it holds its maximum's unit weight); under a smaller total
     `exp(s − m)` falls below float32's normal range where the folded exponent does not.
 
-  They are the generator's first acceptance cases.
+  They are the generator's first acceptance cases, declared in `dew.algebra.acceptance` and generated beside it
+  (`acceptance_derived.py`): the fold under the accurate policy holds no logarithm, and dV's normalization is
+  proposed on either side of its contraction (the stable set's moved scale), its side chosen by the measured
+  error (tests/test_algebra_generate.py).
+- **Each candidate's sums compensated** (the error-free derivation, §1.4) are proposed after every
+  uncompensated candidate, each at its form's price: a form the e-graph cannot hold, chosen where every
+  uncompensated form rounds a sum's terms away (`(a + b) + c` of `c = -a` large).
 
 ### 1.6 Cost
 
@@ -286,7 +312,10 @@ fitted to them, and a rule set ships only with measured receipts.
   output. Built today (`dew.algebra.fusion`): each product the GEMM template takes (x @ W, dy @ Wᵀ, xᵀ @ dy, and
   `ragged_dot_general`'s grouped forms), alone or with its elementwise consumers, is substituted at the compile
   point where its selector gives the template the launch, its consumers into the epilogue where fused prices
-  less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450). A
+  less; where a stage refuses or does not pay, the product is weighed with fewer (without its prologue,
+  without its epilogue, alone), the stage left as the program wrote it, so a refused consumer leaves no
+  product a plain dot (row 8996); so a plain JAX program compiled through Dew runs the templates its products
+  match (row 3450). A
   region's written program, Dew's call traced over its inputs' types, is traced once a process for the region's
   identity in the context a kernel is chosen in (`fusion.choice_context`: the state a trace reads,
   `dew.nn.kernels.options.trace_context`, XLA's deterministic-ops flag among it, complete by default: a value it leaves
@@ -427,11 +456,12 @@ because its Python API is still marked as subject to change.
 | Module | Holds |
 |---|---|
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
-| `dew.algebra.rules` | The shape of each value a rule makes (`FACTS`, an e-class analysis; the magnitude bound is the region's, `terms.Region.magnitudes`, §6.3), `Rules` and `RuleFamily`, the registry and the sets registered: `identities`, `contracted`, `stable`, `linear`, `joined`, each declared as its rewrites with their instances (`reuse` and `error_free`, §1, are not built; `decoupled` and `carried` are the derivations' own sets, never registered) |
+| `dew.algebra.rules` | The shape of each value a rule makes (`FACTS`, an e-class analysis; the magnitude bound is the region's, `terms.Region.magnitudes`, §6.3), `Rules` and `RuleFamily`, the registry and the sets registered: `identities`, `contracted`, `stable`, `reuse`, `linear`, `joined`, each declared as its rewrites with their instances (the error-free transforms are `error`'s derivation, no set, §1.4; `decoupled` and `carried` are the derivations' own sets, never registered) |
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
 | `dew.algebra.cost` | A node's work in the cost vocabulary (`work`, `templates.cost.Work`), the two schedules (`fused`, `walk`) that turn it into seconds, and the DAG cost models extraction reads (`model`, `stable`) |
 | `dew.algebra.extract` | Extraction: egglog's greedy DAG (`cheapest`) and the exact one, its oracle (§6.5) |
-| `dew.algebra.error` | Dev time: a function's candidate forms in order of price and the first its caller's admission takes (`choose`, §6.5) |
+| `dew.algebra.error` | Dev time: a function's candidate forms in order of price, each one's sums compensated after them (`compensated`, the error-free derivation), and the first its caller's admission takes (`choose`, §6.5) |
+| `dew.algebra.printed` | A jaxpr written back as a plain JAX function (`source`, `loaded`), its sums compensated where asked: what the generator writes and what dev time measures, one text |
 | `dew.nn.derivatives` | Below the engine, so every model module can import it: the marker primitive, its kinds, and the custom-derivative declarations (`declared_derivative`, `declared_tangent`, each of a kind, and `surrogate`, row 3271) |
 | `dew.algebra.program` | The compile-time pass (`rewritten`, `rewritten_program`), its switch (`passes`) and its report |
 | `dew.algebra.fusion` | The compile point's kernels (§2): `fused_program(jaxpr)`, a program with each region a kernel of Dew's takes written as that kernel (an attention, a product the GEMM template takes with its consumers, a norm or SwiGLU), the program itself where none is |
@@ -440,7 +470,8 @@ because its Python API is still marked as subject to change.
 | `dew.algebra.derive` | A monoid walk's declaration (`Reduction`) and its derived forms; the derivation context every derivation keys on (`context`) |
 | `dew.algebra.scan`, `dew.algebra.carry` | A recurrence's declaration (`Scan`) and its chunk forms, split into what every chunk computes at once and what its carry runs in sequence |
 | `dew.algebra.forms` | What every derivation shares: the derived forms (`Derived`), their refusal and their evaluation |
-| `dew.algebra.generate` | Parked (§6.11): the dev-time generator and its `--check` |
+| `dew.algebra.generate` | The dev-time generator (§6.11): `Cases`, `StableForm`, `DECLARATIONS`, `generate` and its `--check` |
+| `dew.algebra.acceptance` | §1.5's acceptance cases, declared stable forms, generated beside it (`acceptance_derived.py`) |
 | `dew.algebra.bits` | Bit-level forms (§7): a declared GF(2)-linear transform of a stored word, its cheapest instruction form over the integer pipes and its proof |
 
 ### 6.2 Terms
@@ -531,6 +562,10 @@ rules read facts of an equation's parameters and layout, functions of a paramete
 | `shape(t)` | `Vec[i64]` | the first stated (every member's is one shape) | every rule that names an axis |
 | `log2_bound(t)` | `i64`, a power of two over the value's magnitude | the first stated (each a true bound of every member) | the dominance rule: a reordering's new intermediates |
 | `reach()` | `i64`, the narrowest float's largest power of two | — | the dominance rule |
+| `log2_floor(t)` | `i64`, a power of two under a number's magnitude, `2**floor <= |x|` (`terms.Apart.floor`, the region's `floors`) | the first stated | a guarded reuse's divisor (§1.4) |
+| `positive(t)` | `Unit`, a value above zero (`terms.Apart.positive`) | — | a root's operand in its domain |
+| `least()` | `i64`, the narrowest float's least normal power | — | a guarded reuse: no reciprocal a flushing lane reads as zero |
+| `narrowed(t)` | `i64`, the conversion back to a value's own narrow float (`stock`'s `convert_<dtype>`) | the first stated | a widened sum's result |
 
 A value's dtype and its equation's parameters are the region's tables (`terms.Region`), read by the rules
 that need them. Not built, and read by nothing: constant axes (a hoisting rule reads a broadcast's laid axes),
@@ -1174,10 +1209,12 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
     each token's state cotangent erased before its decay's is formed. Forward mode and every higher order
     take the same replay; the forward's value stays the forms'. The forms' own derivative cancelled
     independently rounded inverse, decay and readout paths (row 1966);
-  - no `error_free` set: the accurate numerics admit only exact rewrites, so a compensated form is the
-    declaration's own numerics (`Reduction.exponential`, `rescale`: the natural exponent through
-    `two_product` and `2**k`) or the mainloop's own step over the derived parts (`Derived.step`'s `stepped`:
-    the compensated and the guarded sums, an argmax anchor's split), never a rewrite extraction chooses.
+  - no `error_free` set: the e-graph's equality is the reals', in which a transform's error term is zero, so
+    extraction would cancel what a rule wrote. A derivation's compensated form is the declaration's own
+    numerics (`Reduction.exponential`, `rescale`: the natural exponent through `two_product` and `2**k`) or
+    the mainloop's own step over the derived parts (`Derived.step`'s `stepped`: the compensated and the
+    guarded sums, an argmax anchor's split); a dev-time stable form's is the chooser's error-free derivation
+    (`error.compensated`, §1.4), each candidate's sums compensated, measured as every candidate is.
 
 ### 6.10 Marked regions and custom derivatives
 
@@ -1239,7 +1276,10 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 
 ### 6.11 The generator
 
-**Parked** (§1.1): derived forms run at trace time today, and nothing has needed the generator yet.
+Built for stable forms (`StableForm`, rows 9035 and 9037; §1.1): the first declarations are §1.5's
+acceptance cases (`dew.algebra.acceptance`). A template's `Declaration` (a `Reduction` or a `Scan`) and a
+surrogate's `SurrogateBodies` are derived at trace time where they are declared and carry no `cases` yet;
+each joins `DECLARATIONS` when one of its forms is generated rather than traced.
 
 ```python
 @dataclass(frozen=True)
@@ -1271,19 +1311,28 @@ class SurrogateBodies:                # a surrogate's two bodies (row 3271), eac
 
 DECLARATIONS: Mapping[str, Declaration | StableForm | SurrogateBodies]   # registered by the declaring modules
 
+def declare(module: str, name: str, form: StableForm) -> StableForm: ...
 def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]: ...
 ```
 
 - `python -m dew.algebra.generate [names] [--check]` traces each registered declaration at each of its cases,
-  saturates it with every set (`rules.admitted(dev=True)`; no `Mode` type exists), measures each candidate's error on its cases' draws against the
-  declaration at float64 (`dew.algebra.error`), extracts per §1.5 under each policy the cases name, priced for
-  each target, and writes the module and its tests. `Reduction` and `Scan` carry `cases` as well.
-- The output is ordinary Python: plain JAX functions with no import of `dew.algebra`, formatted, linted and typed
-  as any module, and a header naming the declaration, the sets, their receipts and the egglog version. Nothing of
-  the engine is imported at runtime.
-- `--check` regenerates in memory and fails where the checked-in output differs, in CI's lint lane; a changed
-  rule or declaration therefore lands as a reviewed diff of generated code.
-- Sampling is seeded and its families fixed, so generation is deterministic across processes (§3).
+  saturates it with every set (`rules.admitted(dev=True)`; no `Mode` type exists), measures each candidate's
+  error on its cases' draws against the declaration at float64 (check 1, `dew.parity.judge`: the gate's one
+  implementation), extracts per §1.5 under each policy the cases name (`dew.algebra.error.choose`), priced
+  for each target, and writes the module, one function a declaration picking its form by policy, target and
+  its operands' case. The suite that holds every generated module is one hand-written file
+  (`tests/test_algebra_generate.py`, `Generated.tests`): each form's check 1 site against its declaration.
+- The output is ordinary Python (`dew.algebra.printed`): each equation its primitive bound at its own
+  parameters (`lax.<name>_p.bind`), so it computes bit for bit what the chosen candidate computed when it was
+  measured, a compensated form's sums through `dew.nn.precision`, with no import of `dew.algebra`, linted
+  and typed as any module, and a header naming the declarations, the sets, their receipts and the egglog
+  version. Nothing of the engine is imported at runtime. A program with an equation no plain call writes (a
+  custom derivative's call) is refused.
+- `--check` regenerates in memory and fails where the checked-in output differs; it runs as a test
+  (`generate(check=True)`) on every train, so a changed rule, chooser or declaration lands as a reviewed diff of
+  generated code, with no step of the lint lane's own.
+- Sampling is seeded and its families fixed, so generation is deterministic on one platform; the module
+  records the platform it was measured on (armada's CPU, the one CI pins).
 
 ## 7. Bit-level forms
 
@@ -1396,8 +1445,9 @@ Agreed with the GEMM template's owner (2026-11-03):
   template's promotion and epilogue: a form may re-encode the codes, never the scales. NVFP4's E4M3 scale is
   `bits.E4M3_SCALE`, its fields placed at a float32's own (the code's value times 2^-120,
   `E4M3_SCALE_OWED`), its form `E4M3_SCALE_FORM` (the search's: one right and two left shifts and a masked
-  XOR), restored by the one integer rule an NVFP4 code's restore shares (`raised`, the owed 2^120: a
-  subnormal scale as its mantissa's integer times 2^-9, never through a flushing lane), `scales_decoded` the
+  XOR), restored by the one integer rule an NVFP4 code's restore shares (`dew.nn.float_bits.raised_exactly`,
+  the owed 2^120 from its bits: a subnormal scale as its mantissa's integer times 2^-9, never through a
+  flushing lane), `scales_decoded` the
   two together, the format's integer decode
   (`bits.decoded`) on every code.
 - Each decode a template takes is declared and checked in once, in `dew.algebra.bits`, the one source the

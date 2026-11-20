@@ -557,3 +557,31 @@ def test_a_launchs_span_is_its_longest_programs_walk_where_its_programs_walk_une
                  if "cost_estimate" in equation.params]
     assert emission.work_of(kernel).span == span
 
+
+def test_identical_scale_smem_bodies_keep_independent_emission_work():
+    """Row 9483: two distinct `across.ScaleSmem` bodies with identical fields register independent
+    `emission.stating` entries (`eq=False`): binding the second into a jaxpr and releasing the first leaves
+    the second's stated scaling work counted by emission."""
+    import gc
+
+    from dew.nn.kernels.templates import across
+
+    elements = 128 * 64
+    work = Work(operations=elements, shared_bytes=2 * elements * 2)
+    first = emission.stating(lambda r: work)(across.ScaleSmem(elements // 2, 0x3F803F80, bf16=True))
+    second = emission.stating(lambda r: work)(across.ScaleSmem(elements // 2, 0x3F803F80, bf16=True))
+
+    def traced(inline_body):
+        def body(out_gmem, smem):
+            del out_gmem
+            plgpu.inline_mgpu(arg_types=(plgpu.RefType(),))(inline_body)(smem)
+
+        kernel = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
+                              scratch_types=[plgpu.SMEM((128, 64), jnp.bfloat16)])
+        return jax.make_jaxpr(kernel)()
+
+    closed = traced(second)
+    del first, second
+    gc.collect()
+    fixed = emission.emitted(closed, 1, "wg").roles[0].fixed
+    assert fixed == work, fixed

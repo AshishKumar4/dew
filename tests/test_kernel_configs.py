@@ -1512,14 +1512,15 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     compiled = {"a": {"registers": 168, "spilled": 0}, "b": {"registers": 255, "spilled": 40}}
     a, b, c = (inherited(dataclasses.asdict(found), compiled, "sm90") for found in reports(
         {"a": complete, "c": "Resources(smem_scratch_bytes=1024)"},
-        [report.Binary("a", None, 168, 0, shared=1024), report.Binary("b", None, 255, 40, shared=1024)]))
+        [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024),
+         report.Binary("b", None, 255, 40, "mosaic_gpu", shared=1024)]))
     assert not a["unread"]
     assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
     assert set(c["unread"]) == {"shared bytes", "tensor memory columns", "binary", "registers", "spills"}
     assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
     # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
     with pytest.raises(ValueError):
-        reports({"a": complete}, [report.Binary("a", None, 168, 0, shared=512)])
+        reports({"a": complete}, [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=512)])
     # A complete estimate and its PTX's compile without a binary: no compiled kernel, read as missing.
     (unbound,) = (inherited(dataclasses.asdict(found), compiled, "sm90")
                   for found in reports({"a": complete}, []))
@@ -1538,7 +1539,7 @@ def test_a_kernel_no_ptx_covers_takes_its_binarys_figures_only_under_every_build
     from kernel_compile import inherited, reports
 
     complete = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
-    (found,) = reports({"a": complete}, [report.Binary("a", None, 168, 0, shared=1024)])
+    (found,) = reports({"a": complete}, [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024)])
     judged = {}
     for builds, gpu in ((["cuda13"], "sm100"), (["cuda12"], "sm90"), (["cuda12"], "sm100")):
         monkeypatch.setattr(kernel_compile, "cuda_builds", lambda builds=builds: builds)
@@ -1560,7 +1561,7 @@ def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     assert report.kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
     with pytest.raises(report.KernelsOfOneName):
         report.kernel_modules(calls)
-    binaries = [report.Binary("k", "0123456789", registers, 0) for registers in (168, 200)]
+    binaries = [report.Binary("k", "0123456789", registers, 0, "mosaic_gpu") for registers in (168, 200)]
     assert len(reports({}, binaries[:1])) == 1
     with pytest.raises(ValueError):
         reports({}, binaries)

@@ -16,7 +16,7 @@ from typing import Literal, NamedTuple
 import numpy as np
 import tier_wire
 from certified import allowance
-from native_certificates import TRUNCATING, tf32_operand, truncating_underflow
+from native_certificates import TRUNCATING, truncating_underflow
 from op_certificates import (
     BFLOAT16,
     FLOAT32,
@@ -28,6 +28,7 @@ from op_certificates import (
     grid_index,
     nearest,
     stepped,
+    tf32_operand,
 )
 
 
@@ -256,7 +257,7 @@ def exp2(x: Iv, lane: Lane) -> Iv:
 
 def operand(iv: Iv, lane: Lane, parts: int = 1) -> Iv:
     """An fp32 value within `iv` as a product takes it in `parts`: one part as the lane's issuer reaches its
-    TF32 product (`Lane.tf32`: itself; `native_certificates.tf32_operand`'s rounding, monotone, at both
+    TF32 product (`Lane.tf32`: itself; `op_certificates.tf32_operand`'s rounding, monotone, at both
     ends; or read as TF32 from the register, both ends rounded outward on its grid, which encloses nearest
     under either tie and truncation); two bf16 parts (`product.formed`) within the third part's bound of it
     (`PART_BOUNDS`); three, the value itself."""

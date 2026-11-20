@@ -439,6 +439,38 @@ def test_a_fresh_state_placed_on_a_gpu_draws_the_bits_of_jaxs_default_lowering()
     from dew.registry import models
     from dew.training import Trainer
 
+    model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
+                         mlp_features=64, max_seq_len=16)
+    objective = LMObjective(model, 15)
+
+    def trainer(key) -> Trainer:
+        return Trainer(objective, optax.adam(1e-3), key=key)
+
+    # Its key formed on the host's CPU, as a site's draws are: a GPU tier's prepare computes on no other one.
+    with jax.default_device(jax.devices("cpu")[0]):
+        drawer = trainer(jax.random.key(0))
+
+    def initial(data):
+        # The initializer's draws from the key of `data`, as a fresh run's start makes them
+        # (`Trainer.initial_state`): traceable, its floats read outside the trace.
+        return drawer.initial_state(None, jax.random.wrap_key_data(data)).variables
+
+    def drawn(seed):
+        # A seed's key as its raw data, formed on the host's CPU, which a check-1 site compares bit for bit.
+        with jax.default_device(jax.devices("cpu")[0]):
+            return (np.asarray(jax.random.key_data(jax.random.key(seed))),)
+
+    def placed(data):
+        key = jax.random.wrap_key_data(data)
+        return floats(trainer(key).place()[0].variables)
+
+    drawn_here, replayed = jax.jit(initial), float64_replay(initial)
+    assert_as_exact(as_given(placed), as_given(lambda data: floats(drawn_here(data))), drawn,
+                    "a fresh state's weights placed and drawn", seeds=FRESH_WEIGHT_SEEDS,
+                    truth_fn=as_given(lambda data: floats(replayed(data))))
+
+    # The raw bits, after the check-1 site, which a GPU tier's prepare reaches computing on no device before
+    # it (row 7872).
     def bits(key):
         return jax.random.bits(key, (64, 33), jnp.uint32)
 
@@ -447,22 +479,6 @@ def test_a_fresh_state_placed_on_a_gpu_draws_the_bits_of_jaxs_default_lowering()
         with drawing():
             rolled = jax.jit(bits)(key)
         assert np.array_equal(np.asarray(rolled), np.asarray(jax.jit(lambda key: bits(key))(key)))
-    model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
-                         mlp_features=64, max_seq_len=16)
-    objective = LMObjective(model, 15)
-
-    def trainer(key) -> Trainer:
-        return Trainer(objective, optax.adam(1e-3), key=key)
-
-    drawer = trainer(jax.random.key(0))
-
-    def initial(key):
-        # The initializer's draws from `key`, as a fresh run's start makes them (`Trainer.initial_state`).
-        return floats(drawer.initial_state(None, key).variables)
-
-    assert_as_exact(as_given(lambda key: floats(trainer(key).place()[0].variables)), jax.jit(initial),
-                    lambda seed: (jax.random.key(seed),), "a fresh state's weights placed and drawn",
-                    seeds=FRESH_WEIGHT_SEEDS, truth_fn=float64_replay(initial))
 
 
 CERTIFIED = """

@@ -15,7 +15,7 @@ import math
 import time
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -34,9 +34,6 @@ from dew.nn.derivatives import Activation, Algebra, KernelGlue, Surrogate, marke
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 from dew.nn.programs import called, control_flow, inlined, live, with_bodies
-
-if TYPE_CHECKING:
-    from dew.nn.kernels import tuning
 
 
 @dataclasses.dataclass(frozen=True)
@@ -569,8 +566,10 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     `registered` in one call (egglog's every call its own program: 200 facts took 98 ms one at a time, 53 at
     once): each term's shape, which arithmetic computes in its operands' dtype, which broadcasts lay along one
     axis, which literals are powers of two or one, the primitives a stable rule writes, each term's number
-    bound (`rules.log2_bound`), the program's reach (`rules.reach`), which a reordering's new intermediates
-    are held under (§6.3), each extent's power of two (`rules.log2_of`) and each reduction's length's
+    bound (`rules.log2_bound`) and floor away from zero (`rules.log2_floor`, `rules.positive`), the conversion
+    back of each value of a narrow float (`rules.narrowed`), the program's reach (`rules.reach`), which a
+    reordering's new intermediates are held under (§6.3), and its narrowest float's least normal power
+    (`rules.least`), each extent's power of two (`rules.log2_of`) and each reduction's length's
     (`rules.sum_length`)."""
     facts: list = [*registered]
     facts += [set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent)))
@@ -588,10 +587,20 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     facts += _products(region)
     sizes = {size for _, extent in region.shapes for size in extent}
     facts += [set_(rules.log2_of(i64(size))).to(i64(max(size - 1, 0).bit_length())) for size in sorted(sizes)]
+    widened = {np.dtype(narrow): f"convert_{np.dtype(narrow).name}" for narrow in terms.WIDENED}
     for term, _ in region.shapes:
-        bound = region.magnitudes.get(terms.key(term))
+        named = terms.key(term)
+        bound = region.magnitudes.get(named)
         if bound is not None:
             facts += rules.made(term, i64(bound))
+        held = region.floors.get(named)
+        if held is not None and held.floor is not None:
+            facts.append(set_(rules.log2_floor(term)).to(i64(held.floor)))
+            if held.positive:
+                facts.append(rules.positive(term))
+        dtype = region.dtypes.get(named)
+        if dtype is not None and (back := widened.get(dtype)) is not None:
+            facts.append(set_(rules.narrowed(term)).to(i64(region.stock[back])))
         if (args := get_callable_args(term, terms.Term.reduce)) is not None:
             _, params = region.params[terms.integer(args[3])]
             extent = region.shape(args[0])
@@ -604,8 +613,12 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     # against 0.5 (x + y)), so an unbounded value has none (`terms.Magnitude`).
     floats = [jnp.finfo(dtype).max for dtype in region.dtypes.values() if jnp.issubdtype(dtype, jnp.floating)]
     if floats:
-        # The largest power of two under the float's largest, exactly (float64's log2 rounds to 1024).
+        # The largest power of two under the float's largest, exactly (float64's log2 rounds to 1024); the
+        # least normal power of the narrowest float, its smallest normal's.
         facts.append(set_(rules.reach()).to(i64(math.frexp(float(min(floats)))[1] - 1)))
+        narrowest = max((dtype for dtype in region.dtypes.values() if jnp.issubdtype(dtype, jnp.floating)),
+                        key=lambda dtype: jnp.finfo(dtype).minexp)
+        facts.append(set_(rules.least()).to(i64(int(jnp.finfo(narrowest).minexp))))
     if facts:
         graph.register(*facts)
 
@@ -640,7 +653,7 @@ def _products(region: terms.Region) -> list:
         facts.append(set_(rules.contracted_length(term)).to(i64(max(length - 1, 0).bit_length() + slack)))
         wanted = params.get("preferred_element_type")
         operands = {left, right}
-        # Plain only of one dtype: a product of two makes neither's (`terms.product_dtype`), no plain one a
+        # Plain only of one dtype: a product of two makes neither's (`terms.Product.made`), no plain one a
         # rule may move (base review 3232beb7c).
         if len(operands) == 1 and (wanted is None or operands == {jnp.dtype(wanted)}):
             facts.append(rules.plain(i64(index)))
@@ -920,14 +933,11 @@ def _opened(jaxpr: jcore.Jaxpr, spans: list[_Span] | None = None) -> jcore.Jaxpr
 
 @dataclasses.dataclass(frozen=True)
 class _Body:
-    """A body's rewrite as `_closed` holds it: its program (None where nothing changed), and what its rewrite
-    reported (its routes, its launches, the facts it read, its regions' rewrites), replayed where it is
-    written again."""
+    """A body's rewrite as `_closed` holds it: its program (None where nothing changed), what its rewrite
+    reported (`fusion.Recorded`), replayed where it is written again, and its regions' rewrites."""
 
     made: jcore.Jaxpr | None
-    routes: tuple
-    launches: tuning.Seen
-    reads: Mapping
+    record: fusion.Recorded
     rewrites: tuple
 
 
@@ -951,7 +961,6 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         return closed
     from dew._cache import KERNEL_CHOICES
     from dew.algebra import derive
-    from dew.nn.kernels import tuning
 
     rewrites = _REWRITTEN.setdefault(closed, {})
     # With kernels, the context the substitutions are decided in too (the derivation's: the mesh, the target
@@ -962,20 +971,16 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     key = (_deriving(accurate, saturation), kernels,
            (derive.context(), KERNEL_CHOICES.value, kernel_report.refusal_entries()) if kernels else None)
     held = rewrites.get(key)
-    reused = held is not None and generation.still(held.reads)
+    reused = held is not None and held.record.still()
     if held is None or not reused:
-        with (generation.routes(alone=True) as routes, tuning.seen() as seen, generation.recording() as reads,
-              kernel_report.recording() as recorded):
-            made = _rewritten(closed, accurate, saturation, kernels)
-        held = rewrites[key] = _Body(None if made is closed else made, tuple(routes), seen.held(), reads,
-                                     tuple(recorded.rewritten))
+        with kernel_report.recording() as regions:
+            made, record = fusion.recorded(lambda: _rewritten(closed, accurate, saturation, kernels))
+        held = rewrites[key] = _Body(None if made is closed else made, record, tuple(regions.rewritten))
     body = held
-    # Its routes, launches and facts reported where it is written, as its rewrite reported them, and on a
-    # reuse its regions' reports too, so a report around the program holds the body's however often it is
-    # written (`fusion._traced`'s, a region's).
-    generation.reported(body.routes)
-    tuning.noted(body.launches)
-    generation.replay(body.reads)
+    # Reported where it is written, as its rewrite reported it, and on a reuse its regions' reports too, so a
+    # report around the program holds the body's however often it is written (`fusion._traced`'s, a
+    # region's).
+    body.record.replay()
     if reused:
         for made_report in body.rewrites:
             kernel_report.record_rewrite(dataclasses.replace(made_report, reused=True))

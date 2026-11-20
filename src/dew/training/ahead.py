@@ -1156,7 +1156,10 @@ class AheadTarget:
         (`compile_ahead`) and saved, as what ends the run, over the batch `fit` would start it on
         (`first_step_batch`), at the rung the checkpoint a run resumes under `resume` left it, with its
         evaluations' programs where `plan` is what its `fit` is asked for (`Trainer._fit_plan`). A run whose
-        step reads a rollout's batches, which it makes as it trains, is refused."""
+        step reads a rollout's batches, which it makes as it trains, is refused. A run that keeps its
+        variables on the host (`Layout(host=("variables",))`) compiles each program its step calls into the
+        persistent cache its run's startup reads (`prepare_host_step`): many programs, saved to no file
+        (row 8380: the configured run reached none of them)."""
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
@@ -1166,9 +1169,25 @@ class AheadTarget:
                              "keyed as a host's run reads them only over that host's own topology: name it "
                              "(--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY), or save the step to a "
                              "file (--trainer.compile-ahead.path)")
+        if trainer.host_master and (self.path is not None or self.phases):
+            raise ValueError("a step that keeps its variables on the host compiles its programs into the "
+                             "persistent cache its run reads, whole: name no path and no phases")
         # Refused before its first batch is read and its state traced, where its GPUs state no memory.
         stated_limit(list(trainer.device_mesh.devices.flat))
         batch = first_step_batch(trainer, loader, steps, examples, resume)
+        if trainer.host_master:
+            # Into a cache a device run reads as tuned, as a device step's (below): a program no device run
+            # has tuned is counted, its run compiling it on its GPU, never a traceback (row 9693).
+            try:
+                with report.for_devices():
+                    return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
+            except report.Untuned as refused:
+                # Named by its digest where its trees state one, else by its text's (a host step's VJP
+                # results' tree states no form, `stated_digest`).
+                _log.warning("a host step is not preparable here: %s", refused)
+                named = (stated_digest(refused.lowered)
+                         or hashlib.sha256(refused.lowered.as_text().encode()).hexdigest())
+                return CompiledAhead(None, None, (named,))
         topology = None if self.topology is None else Path(self.topology).read_bytes()
         if self.path is not None and not self.phases:
             # Over a host's own GPUs (`topology`), as its run compiles it: every tuned choice the GPU kind's
@@ -1274,11 +1293,17 @@ class CompiledAhead(SystemExit):
     Compiling was the whole run, so uncaught it ends the program with status 0 and no traceback, the
     step's cost logged; `ahead` is the step (the last phase's) and `path` where it was saved, if it was;
     `untuned` the digests (`program_digest`) of the programs no device run has tuned yet, each of a step not
-    preparable (`report.Untuned`)."""
+    preparable (`report.Untuned`); `startup` what a host step's programs compiled into the cache
+    (`prepare_host_step`), its step none."""
 
-    def __init__(self, path: str | None, ahead: AheadOfTime | None, untuned: tuple[str, ...] = ()):
+    def __init__(self, path: str | None, ahead: AheadOfTime | None, untuned: tuple[str, ...] = (), *,
+                 startup: HostStartup | None = None):
         super().__init__(0)
-        self.path, self.ahead, self.untuned = path, ahead, untuned
+        self.path, self.ahead, self.untuned, self.startup = path, ahead, untuned, startup
+        if startup is not None:
+            _log.info("a host step's %d programs compiled ahead into the compilation cache in %.1f s (%s)",
+                      startup.programs, startup.seconds, startup.by_backend)
+            return
         if ahead is None:
             _log.info("no step compiled ahead: none was preparable until a device run has tuned it")
             return

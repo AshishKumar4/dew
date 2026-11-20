@@ -22,7 +22,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import on_float64_device, unrewritten, widened
+from arm_arithmetic import on_float64_device, widened
 from float64_terms import float64_signed_sums
 
 from dew.nn.kernels import generation
@@ -73,25 +73,35 @@ class Entries(NamedTuple):
     signed: Callable[[tuple[int, ...]], np.ndarray]
 
 
+def cancelling_orbit(key_heads: int, heads: int, values: int) -> int:
+    """The draws `cancelling_entries` takes to write every value coordinate it moves through once: a value
+    head of a key head's group and a column a draw, `heads // key_heads` of the one and `values` of the other,
+    so an exact fixture declaring this many seeds holds every coordinate in its first stage (check 1 redraws
+    only past a failure, which a coordinate never written cannot raise)."""
+    return heads // key_heads * values
+
+
 def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values: int) -> Entries:
     """Entry writes of `CANCELLING_LEVELS`' seven products on their keys' first dimension for a forked call
-    over `FORKED`'s table, as its route and its oracle read them alike: the first head's first value column
-    scaled by a drawn sign and a power of two of 2^-28 to 2^-33 a draw, so even a row's three writes' terms
-    sum inside float32's range, as the gates' sums must (testing.md's derivative contracts), their ties kept,
-    and every other column zero, so an entry key's gradient is one product of the levels' (rounded once, as
+    over `FORKED`'s table, as its route and its oracle read them alike: one value coordinate a key head, a
+    value head of its group and a column, both moving with the seed so the draws visit every one, scaled by
+    a drawn sign and a power of two of 2^-28 to 2^-33 a draw, so even a row's three writes' terms sum inside
+    float32's range, as the gates' sums must (testing.md's derivative contracts), their ties kept, and every
+    other coordinate zero, so an entry key's gradient is one product of the levels' (rounded once, as
     float64's: summed over a key head's value heads and columns, float32 rounded each term, 1.9 to 2.6 times
-    the rounded truth's distance); weights of
-    another, each document's signed by the memory it enters (`_entered_signs`), so every memory is zero, one
-    or two writes, a stored one cancelled exactly among them; and cotangents (`Entries.signed`) of one power
-    of two a draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds once, as
-    float64's."""
+    the rounded truth's distance; one fixed coordinate left a dropped write elsewhere unseen, row 9531);
+    weights of another, each document's signed by the memory it enters (`_entered_signs`), so every memory
+    is zero, one or two writes, a stored one cancelled exactly among them; and cotangents (`Entries.signed`)
+    of one power of two a draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds
+    once, as float64's."""
     rows, documents = len(FORKED), len(FORKED[0][0])
     rng = np.random.default_rng([8840, seed])
     factors, levels = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
     key = np.zeros((rows, documents, len(factors), key_heads, keys), np.float32)
     key[..., 0] = factors[:, None]
-    columns = np.zeros((heads, values))
-    columns[0, 0] = rng.choice([-1.0, 1.0]) * 2.0 ** -int(rng.integers(28, 34))
+    group, columns = heads // key_heads, np.zeros((heads, values))
+    columns[np.arange(key_heads) * group + seed % group, seed // group % values] = (
+        rng.choice([-1.0, 1.0], key_heads) * 2.0 ** -int(rng.integers(28, 34)))
     value = np.broadcast_to(levels[:, None, None] * columns, (rows, documents, len(levels), heads, values))
     signs = _entered_signs(rng.choice([-1.0, 1.0], (rows, heads)))
     scale = 2.0 ** -int(rng.integers(10, 15))
@@ -122,25 +132,6 @@ def _entered_signs(drawn: np.ndarray) -> np.ndarray:
             if stores[document]:
                 counts[GIVEN + stores[document]] = entered + signs[row, document]
     return signs
-
-
-def exactly_rounded(truth_fn) -> Callable:
-    """`truth_fn`'s float64 truth rounded once to float32, an arm run as given (`arm_forms.as_given`),
-    computed where and as check 1 computes a truth, outside the scope it runs its arms in
-    (`arm_arithmetic.summed_as_run`, whose float32 sums a CPU's dots take): at the process's own product
-    precision, read here, before any arm's, on `on_float64_device` (a TPU's host, whose float64 it emulates),
-    `widened` and `unrewritten`. The reference of draws whose truth float32 holds exactly or rounds once,
-    which Dew must equal."""
-    from arm_forms import as_given
-
-    precision, truth_fn = jax.config.jax_default_matmul_precision, unrewritten(truth_fn)
-
-    def rounded(*inputs):
-        with (jax.enable_x64(new_val=True), on_float64_device(), jax.default_matmul_precision(precision)):
-            truth = truth_fn(*widened(inputs))
-        return jax.tree.map(lambda leaf: np.asarray(leaf, np.float32), truth)
-
-    return as_given(rounded)
 
 
 class LessFinite(AssertionError):
@@ -233,7 +224,8 @@ def ran(order, label: str, name: str):
 
 
 def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None,
-                    without: tuple[str, ...] = (), draw=None, seeds: int | None = None) -> None:
+                    taking: tuple[str, ...] | None = None, without: tuple[str, ...] = (), draw=None,
+                    seeds: int | None = None) -> None:
     """Every order of `fn` runs at the draw, and each leaf is finite at every position the contract holds:
     where the same order of its float64 run is a normal float32; where, given `plain_fn` (the plain float32
     formula, JAX's own derivatives of it), the plain formula's is finite; and where no order of summation
@@ -246,16 +238,24 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     and its negative twice); and a sum whose terms float32 can overflow in one order and not another is
     held to neither order (row 5426: two orders each overflow partials the other does not). The
     float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn` computes in a fixed
-    precision whatever its inputs' (a declared dot algorithm). `without` names orders the contract does not
-    take yet, each joining with its row's fix (a row's head brings its own test).
+    precision whatever its inputs' (a declared dot algorithm). `taking` names the orders a case holds, where
+    it holds some alone (a seam's orders split across cases, a witness of one order), every order where
+    None; `without` names orders the contract does not take yet, each joining with its row's fix (a row's
+    head brings its own test). A name of no order (`orders`) in either is refused.
 
     And every order runs on training's mesh of two devices (`_on_a_mesh`), as a training step runs it (row
     7973: a launch whose specs left out two of its operands raised under any mesh, and the suite, run off
     one, passed it), a check-1 site there over the cell's seeded `draw` where it gives one, of `seeds` where
     given (a cell sharded across CI's map tasks, its mark's count: `map_judge.marked_seeds`)."""
 
+    every = set(orders(fn, primals, direction, cotangent))
+    named = {*(taking or ()), *without} - every
+    if named:
+        raise ValueError(f"{label}: no order of the contract's is named {sorted(named)}")
+    taken = frozenset(name for name in every if (taking is None or name in taking) and name not in without)
+
     def orders_of(f, *drawn):
-        return {name: order for name, order in orders(f, *drawn).items() if name not in without}
+        return {name: order for name, order in orders(f, *drawn).items() if name in taken}
 
     narrow = orders_of(fn, primals, direction, cotangent)
     plain_orders = {} if plain_fn is None else orders_of(plain_fn, primals, direction, cotangent)
@@ -293,22 +293,23 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
 
     for name, order in narrow.items():
         held(jax.tree.leaves(ran(order, label, name)), name, label)
-    _on_a_mesh(fn, primals, direction, cotangent, label, truth_fn=truth_fn, without=without, draw=draw,
+    _on_a_mesh(fn, primals, direction, cotangent, label, truth_fn=truth_fn, taken=taken, draw=draw,
                seeds=seeds, held=held)
 
 
-def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, without, draw, seeds, held
+def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken, draw, seeds, held
                ) -> None:
-    """Each order of `fn` on training's mesh of two of this process's devices (`MeshSpec`'s, its data axis
-    two), its inputs placed on it whole: at the cell's own inputs held to the contract itself (`held`, as off
-    the mesh; a split its specs do not fit raises, row 7973's class); and where the cell gives its seeded
-    `draw` (a seed's primals, direction and cotangent in its domain, at a scale whose values float32 holds:
-    an edge's, which the contract excuses where float64 is no normal float32, check 1 cannot measure), a
-    check-1 site (`reference_error.assert_as_exact`) against the float64 truth (`truth_fn`'s orders where
-    given), its reference the same order off a mesh, over `seeds` where declared, else the seeds `seeds_for`
-    sizes on every run (a cell's sizing most of its time, row 8429's 300 s): the mesh's program is
-    another, partitioned, whose floats no common bits hold (docs/design/testing.md), and a sum it counts
-    twice fails by its own size. Where the cell set its own mesh, its orders already run under it."""
+    """Each order of `fn` the contract takes (`taken`) on training's mesh of two of this process's devices
+    (`MeshSpec`'s, its data axis two), its inputs placed on it whole: at the cell's own inputs held to the
+    contract itself (`held`, as off the mesh; a split its specs do not fit raises, row 7973's class); and
+    where the cell gives its seeded `draw` (a seed's primals, direction and cotangent in its domain, at a
+    scale whose values float32 holds: an edge's, which the contract excuses where float64 is no normal
+    float32, check 1 cannot measure), a check-1 site (`reference_error.assert_as_exact`) against the
+    float64 truth (`truth_fn`'s orders where given), its reference the same order off a mesh, over `seeds`
+    where declared, else the seeds `seeds_for` sizes on every run (a cell's sizing most of its time, row
+    8429's 300 s): the mesh's program is another, partitioned, whose floats no common bits hold
+    (docs/design/testing.md), and a sum it counts twice fails by its own size. Where the cell set its own
+    mesh, its orders already run under it."""
     from arm_forms import as_given
     from jax.sharding import NamedSharding, PartitionSpec
     from reference_error import assert_as_exact, seeds_for
@@ -320,7 +321,7 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, witho
     mesh = MeshSpec().build(jax.devices()[:2])
     whole = NamedSharding(mesh, PartitionSpec())
     for name in orders(fn, primals, direction, cotangent):
-        if name in without:
+        if name not in taken:
             continue
         site = f"{label}, {name}, on training's mesh of two"
 

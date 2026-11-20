@@ -113,20 +113,28 @@ class Other:
     name: str
 
 
-KEYLESS = frozenset({"diffusion", "flow_grpo", "guidance_distillation", "ladd", "mean_flow", "rcm",
-                     "shortcut", "run diffusion"})
-"""The registered objectives that state no key, so a refit of theirs traces its step again: each holds what
-states no value and no class leaves out (a diffusion process, its grid's class, its inputs' encoders; row
+KEYLESS: frozenset[str] = frozenset()
+"""The registered objectives that state no key, so a refit of theirs traces its step again: none, each
+diffusion objective's process, grid, inputs' encoders, teacher tree and constant average stating theirs (row
 6297)."""
 
 
-def rolled_out(name: str, batch):
+def rolled_out(name: str, batch, objective):
     """A case's batch as its step trains on it: a PPO pack with the columns its rollout adds (`PPORollout`),
-    the critic's baseline and its targets; every other case's as it is."""
-    if name != "ppo":
+    the critic's baseline and its targets; a flow-GRPO batch with a walk's transitions over its latents
+    (`FlowRollout`'s layout, `transition_rows`); every other case's as it is."""
+    if name == "ppo":
+        mask = np.asarray(batch["response_mask"], np.float32)
+        return {**batch, "old_values": np.zeros_like(mask), "returns": mask}
+    if name != "flow_grpo":
         return batch
-    mask = np.asarray(batch["response_mask"], np.float32)
-    return {**batch, "old_values": np.zeros_like(mask), "returns": mask}
+    from dew.objectives.rl.flow import transition_rows
+
+    rows = len(next(iter(batch.values())))
+    states = np.zeros((rows, 3, *objective.latent_shape), np.float32)
+    times = np.asarray([1.0, 0.5, 0.25], np.float32)
+    densities, stochastic = np.zeros((rows, 2), np.float32), np.ones((rows, 2), bool)
+    return {**batch, **transition_rows(states, times, densities, stochastic, np.zeros((rows,), np.float32))}
 
 
 def unvalued(objective) -> list[str]:
@@ -201,7 +209,7 @@ def test_every_keyed_objectives_key_is_the_same_after_its_loss_is_traced_and_bui
         objective, batch = build()
         if batch is None:
             continue
-        batch = rolled_out(name, batch)
+        batch = rolled_out(name, batch, objective)
         before = stated_trace(objective)
         held = {key: frozen_value(value) for key, value in vars(objective).items()}
         variables = objective.drawn_shapes()
@@ -245,7 +253,7 @@ def test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew(built_
         objective, batch = build()
         if batch is None:
             continue
-        batch = rolled_out(name, batch)
+        batch = rolled_out(name, batch, objective)
         rows = len(next(iter(batch.values())))
         loader = Loader(train=lambda partition, batch=batch: iter([batch] * 2), val=None, records=None,
                         batch=rows)
@@ -411,3 +419,16 @@ def test_a_trainers_refit_traces_its_step_again_where_xlas_flags_change(monkeypa
         traced.append(sum(program.kind == "traced" for program in heard.programs))
     first, changed, unchanged = traced
     assert first > 0 and changed > 0 and unchanged == 0, traced
+
+
+def test_a_diffusion_process_states_its_value():
+    """A diffusion process (its schedule and prediction transform, `ByValue`) states a value, equal to a
+    process of its settings built anew and to no other, which a diffusion objective's key holds (row 6297:
+    it stated none, and no diffusion objective kept its trace)."""
+    from dew.diffusion.presets import EDM, Flow, build_process
+    from dew.diffusion.process import Process
+
+    for preset, other in ((Flow(), Flow(shift=3.0)), (EDM(regime="pixel"), EDM(regime="latent"))):
+        built = build_process(preset)
+        assert isinstance(built, Process) and built == build_process(preset), preset
+        assert hash(built) == hash(build_process(preset)) and built != build_process(other), preset

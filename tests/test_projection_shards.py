@@ -169,9 +169,12 @@ def test_a_projection_no_kernel_launches_per_shard_is_on_par_with_one_device(nam
     mesh = Mesh(np.asarray(jax.devices()[:2]), (case["axis"],))
     with (generation.assumed("sm90", interpreted=True), nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT),
           _declared()):
+        # An fsdp weight gathered, its gradient reduce-scattered back (the gather's transpose).
+        fsdp = case["axis"] == "fsdp"
         assert_runs_per_shard(with_gradients(_call(case)), _draw(case), _specs(case, mesh), mesh, name,
                               seeds=SEEDS, truth_fn=_exact(case.get("join")),
-                              moves=("all-gather",) if case["axis"] == "fsdp" else ())
+                              moves=("all-gather",) if fsdp else (),
+                              reductions=(("reduce-scatter", ("fsdp",)),) if fsdp else ())
 
 
 @pytest.mark.mesh(devices=2)
@@ -207,7 +210,8 @@ def test_a_projection_read_apart_from_its_layer_runs_per_shard_as_its_layer_does
           nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT), _declared()):
         assert_runs_per_shard(with_gradients(call), draw, [PartitionSpec(axis), kernel, PartitionSpec(axis)],
                               mesh, f"a projection apart from its layer {axis}", seeds=SEEDS, truth_fn=truth,
-                              moves=("all-gather",) if axis == "fsdp" else ())
+                              moves=("all-gather",) if axis == "fsdp" else (),
+                              reductions=(("reduce-scatter", ("fsdp",)),) if axis == "fsdp" else ())
 
 
 @pytest.mark.mesh(devices=2)

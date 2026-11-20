@@ -1768,7 +1768,8 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                        natural: bool = False, params: tuple = (), width: int | None = None,
                        parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
-                       per_span: int = 1, merged: bool = False, started: bool = False) -> int:
+                       per_span: int = 1, merged: bool = False, started: bool = False,
+                       weight_parts: int = 1) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -1822,8 +1823,11 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
-    # An fp32 call's weights fp32, their remainder fp32 and the part taken (`_parted_products`).
-    step = [logits] * (3 if parts > 1 else 1) + [weights] * (2 if residuals else 1)
+    # An fp32 call's weights fp32, their remainder fp32 and the part taken (`_parted_products`); a dropping
+    # fp16 call's kept weights' second part beside the first (`algebra.kept_parts`: an fp16 causal call at a
+    # rate of 0.1, 64 and 128 wide, compiled spill-free at its derived tiles on sm80, sm90 and sm120,
+    # et-fp16w-a; the draw itself is unpriced, row 9526).
+    step = [logits] * (3 if parts > 1 else 1) + [weights] * ((2 if residuals else 1) + weight_parts - 1)
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
         if family.operands_in_registers:
@@ -1998,7 +2002,9 @@ class ForwardRegisters:
     whether its walk scales in its kernel (`scaled`, `MosaicForward.scales_in_kernel`), converts its keys'
     and values' quantized codes (`codes`, `attention_mosaic_forward._Codes`), a packed call's intervals
     and their queries each (`positions`, `per_span`; none unpacked), whose reach its walk reads first
-    (`_reach_registers`), and whether its walk merges an initial state past its keys (`merged`)."""
+    (`_reach_registers`), whether its walk merges an initial state past its keys (`merged`), and the parts
+    its kept weights enter their product as (`weight_parts`: a dropping fp16 call's two,
+    `algebra.kept_parts`)."""
     dtype: Any
     width: int
     value_width: int
@@ -2012,6 +2018,7 @@ class ForwardRegisters:
     per_span: int = 1
     merged: bool = False
     started: bool = False
+    weight_parts: int = 1
     prologue: tuple | None = None
     """The query prologue its consumers take on their query tiles (`MosaicForward.query_mod`), with its
     parameters' kinds and dtypes, `(hook, kinds, dtypes)`; None where it has none."""
@@ -2033,7 +2040,8 @@ class ForwardRegisters:
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
             scaled=self.scaled, codes=self.codes,
-            positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started))
+            positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started,
+            weight_parts=self.weight_parts))
 
 
 def value_columns(padded: int, columns: int | None) -> int:

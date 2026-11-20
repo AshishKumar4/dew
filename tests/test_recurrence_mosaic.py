@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 from fla_sites import RECORDED, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, lowers
+from identity_cover import COVER_PRECISION, IDENTITY_COVER
 from kernel_compile import gate_generations
 from reference_error import assert_as_exact, declared_seeds
 from test_recurrence_chunk import (
@@ -1525,12 +1526,16 @@ def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_beg
     assert [failure.split(":")[0] for failure in failed] == ["case recurrence_intra_solve"]
 
 
+def group_name(group: tuple) -> str:
+    """A gate group's name (`GATE_GROUPS`): its geometry, dtype, product, documents and variant."""
+    name, dtype, training, packed, variant = group
+    return (f"{name}-{jnp.dtype(dtype).name}-{'training' if training else 'forward'}"
+            f"{'-packed' if packed else ''}{'' if variant is None else f'-variant-{variant}'}")
+
+
 def _gated(target: str, group: tuple):
     """The gate's test of `target` and `group`, named by them."""
-    name, dtype, training, packed, variant = group
-    label = (f"{target}-{name}-{jnp.dtype(dtype).name}-{'training' if training else 'forward'}"
-             f"{'-packed' if packed else ''}{'' if variant is None else f'-variant-{variant}'}")
-    return pytest.param(target, group, id=label)
+    return pytest.param(target, group, id=f"{target}-{group_name(group)}")
 
 
 @pytest.mark.parametrize('target, group', [_gated(target, group) for target in gate_generations(scoped=True)
@@ -2353,22 +2358,42 @@ def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
     return [tiles, *rungs]
 
 
+
+
+def _cover(target: str) -> tuple[str, ...]:
+    """The gate groups that cover every launch and axis the gate reaches on `target` (`_reach`:
+    `GATE_GROUPS` taken in order where a group reaches what none before it did), by name."""
+    held, cover = set(), []
+    with (jax.default_matmul_precision(COVER_PRECISION), generation.assumed(generation.gpu_target(target)),
+          report.refusals()):
+        for group in GATE_GROUPS:
+            if found := _reach(target, group) - held:
+                held |= found
+                cover.append(group_name(group))
+    return tuple(cover)
+
+
+@pytest.mark.parametrize('target', gate_generations(scoped=True))
+def test_the_identity_tests_cover_is_its_targets_reach(target):
+    """The identity test's groups on `target` (`IDENTITY_COVER`) are the groups that reach every launch and
+    axis the gate reaches there (`_cover`): a change that moves the reach moves the cover, regenerated from
+    this test's message."""
+    found = _cover(target)
+    assert found == IDENTITY_COVER[target], f"IDENTITY_COVER[{target!r}] = {found!r}"
+
+
 @functools.cache
 def _identity_units(target: str) -> tuple:
     """The identity test's units on `target`: each `(label, bound, tiles, kind, pulled, launch, configs,
-    lowered)`, a launch's ladder (`_rungs_of`, walked by `_walked`) of every case of the gate's groups that
-    cover every launch and axis the gate reaches there (`_reach`: `GATE_GROUPS` taken in order where a group
-    reaches what none before it did), with the kernels its configs lower, which a task's time follows (0.92
-    correlated over sm90's and sm100's tasks, where the kernels a config lowers alone were 0.29, jsf-ideal2).
-    Derived in each task, as collection cannot afford it (6.0 to 8.0 s a target of the model alone,
-    jsf-cover, in every CI task's collection), and held a process."""
+    lowered)`, a launch's ladder (`_rungs_of`, walked by `_walked`) of every case of the groups that cover
+    the gate's reach there (`IDENTITY_COVER`), with the kernels its configs lower, which a task's time follows
+    (0.92 correlated over sm90's and sm100's tasks, where the kernels a config lowers alone were 0.29,
+    jsf-ideal2). Derived in each task, as collection cannot afford it, and held a process."""
     facts = generation.gpu_target(target)
-    held, units = set(), []
-    with generation.assumed(facts), report.refusals():
-        for group in GATE_GROUPS:
-            if not (found := _reach(target, group) - held):
-                continue
-            held |= found
+    units = []
+    covered = set(IDENTITY_COVER[target])
+    with jax.default_matmul_precision(COVER_PRECISION), generation.assumed(facts), report.refusals():
+        for group in (group for group in GATE_GROUPS if group_name(group) in covered):
             for label, bound, tiles, training in _cases(target, group):
                 for kind, pulled, launch in _rungs_of(bound, tiles, training, facts):
                     walked = tiles.forward if kind == 'forward launch' else tiles
@@ -2408,15 +2433,18 @@ IDENTITY_TASKS = {'sm90': 50, 'sm100': 52, 'sm80': 3, 'sm86': 2, 'sm89': 2, 'sm1
 dealt to some shard whatever the count, and the count a function of the code alone, so a shard's units are its
 id's at one revision whatever a run's timings (row 7254: a count from the durations record moved each id's
 units, sm100's 44 to 52, where a cached task and a rerun one could cover different units). Each the target's
-identity seconds in tests/test_durations.json over 60 s a shard, half the group target, rounded up (at main
-91be41158: sm90 2953 s, sm100 3094, sm80 129, sm86 90, sm89 80, sm120 35); a target absent takes the largest.
-A target whose shards run past the group target shows in the CI plan's check: regenerate it then.
-Regenerated by:
+identity seconds in tests/test_durations.json over 75 to 90 s a shard, under the 120 s group target with
+room, rounded up: each shard's process derives its cover's units whole (`IDENTITY_COVER`) before it deals,
+5.4 to 6.6 s on sm90 and sm100 (jsf-idcost4), so a shard more costs that setup and its process again, and
+moves which parts of a case are compared together (`_dealt`). At main d169ecb95 sm90's 50 shards held 4839 s
+and sm100's 52 held 4682, each deriving every group's reach (11.4 to 12.8 s a shard on armada, about 21 s
+on CI's hosts, whose sm90 mean of 97 s ran about 3.2 times three armada shards' 18 to 38 s, jsf-idcost3);
+without it, about 76 s a shard, so the counts stand (row 9697). Regenerated by:
     python3 -c 'import collections, json, math; seconds = collections.Counter()
-    for node, spent in json.load(open("tests/test_durations.json")).items():
+    for node, (spent, *_) in json.load(open("tests/test_durations.json")).items():
         if "test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[" in node:
             seconds[node.split("[", 1)[1].rsplit("-", 1)[0]] += spent
-    print({target: math.ceil(spent / 60) for target, spent in sorted(seconds.items())})'
+    print({target: math.ceil(spent / 80) for target, spent in sorted(seconds.items())})'
 """
 
 
@@ -2437,7 +2465,7 @@ def test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes(target,
     facts = generation.gpu_target(target)
     bodies: dict[str, set[str]] = collections.defaultdict(set)
     lowered: dict[tuple, dict[str, str]] = {}
-    with generation.assumed(facts), report.refusals():
+    with jax.default_matmul_precision(COVER_PRECISION), generation.assumed(facts), report.refusals():
         for label, bound, _, _, pulled, _, configs, _ in _dealt(list(_identity_units(target)),
                                                                  identity_tasks(target), task):
             named = []

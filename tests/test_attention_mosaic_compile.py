@@ -316,8 +316,8 @@ def _served(generation_name: str, positions: int, heads: int, kv_heads: int, wid
                                                                 scales=scales)[0] is not None))
 
 
-WORK_LIST_GPUS = tuple(name for name in generation.TARGETS if staged_widths(name, jnp.bfloat16))
-"""Every GPU generation whose bundles stage a head for the Mosaic mainloop (`generation.TARGETS`,
+WORK_LIST_GPUS = tuple(name for name in GATED if staged_widths(name, jnp.bfloat16))
+"""One GPU of each architecture whose bundles stage a head for the Mosaic mainloop (`GATED`,
 `staged_widths`), each the work list's gate compiles for."""
 
 
@@ -370,17 +370,50 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("page", [16, 4, 1])
+@pytest.mark.parametrize(("generation_name", "width"), [("sm80", 64), ("sm90", 256), ("sm100", 256)])
+def test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resources(generation_name, width):
+    """Row 7263: a public fp32 decode whose head width or GPU falls back to Pallas-Triton plain-forward
+    kernels (`attention_route.attend`: sm80 64-wide, sm90/sm100 256-wide) reports every Triton kernel's
+    shared bytes, registers, spills and TMEM usage through `compile_mosaic_kernels` / `mosaic_failures` with
+    zero unread fields."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_route
+
+    rows, keys = 2, 4096
+    query = jax.ShapeDtypeStruct((rows, 1, 32, width), jnp.float32)
+    key = jax.ShapeDtypeStruct((rows, keys, 8, width), jnp.float32)
+    spans = template.spans(1, keys, rows, causal=False)
+
+    def decode(query, key, value):
+        return attention_route.attend(query, key, value, spans, natural=False)
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels([KernelCase("decode", lambda: (decode, (query, key, key)))],
+                                       generation_name)
+    kernels = found[0]["kernels"]
+    assert kernels and all(k["kind"] == "triton" for k in kernels), kernels
+    names = {k["kernel"] for k in kernels}
+    assert "attention_forward" in names and "attention_forward_scaled" in names, names
+    assert all(not k["unread"] for k in kernels), kernels
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("page", [16, 1])
 @pytest.mark.parametrize("generation_name", GATED)
 def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, page):
     """A decode step over a paged cache of `page`-key pages (`attention_decode.attend` over pools `[KV, P,
     page, D]` and a table), 16 rows of 4096 keys, 32 query heads over 8 key heads 64 wide, its key tile of
     several pages, its rows gathered through the table (`attention_mosaic_forward.paged_reads`): lowered and
     compiled by ptxas for `generation_name` on this CPU, every launch within its shared memory and spilling
-    nothing (`mosaic_failures`). An A100's rows its one warpgroup's cp.async copies a row a copy in its
-    pipeline's groups (`mosaic_sm80._gathered_walk`; its 16-key pages were each a copy of their own,
-    M-DD-10's W64-a100: 'Number of tiles is not a multiple of 4'; its 4- and 1-key pages refused, row
-    4772)."""
+    nothing (`mosaic_failures`). Multi-key (`16`) and single-key (`1`) pages bracket both regimes (pages of
+    16, 4 and 1 keys compile to identical shared memory, registers and zero spills on sm80, sm90 and sm120).
+    An A100's rows its one warpgroup's cp.async copies a row a copy in its pipeline's groups
+    (`mosaic_sm80._gathered_walk`; its 16-key pages were each a copy of their own, M-DD-10's W64-a100:
+    'Number of tiles is not a multiple of 4'; its 4- and 1-key pages refused, row 4772)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -813,6 +846,47 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
     assert cold and not any(stored for _, stored, _ in cold), cold
     assert all(stored for _, stored, _ in warm), warm
     assert certified(warm) == certified(cold)
+
+
+EDITED_FORWARD = """
+import jax
+import dew._cache
+from dew._cache import package_digest
+
+# Dew's code edited outside the launch's kernels: its digest another, its kernels the same.
+edited = package_digest()[::-1]
+dew._cache.package_digest = lambda: edited
+certifying = []
+
+
+def heard(event, seconds, *, fun_name="", **_):
+    if event == "/jax/core/compile/backend_compile_duration" and fun_name.startswith("jit(certified_"):
+        certifying.append(fun_name)
+
+
+jax.monitoring.register_event_duration_secs_listener(heard)
+""" + CERTIFIED_FORWARD.replace("print(json.dumps([[", "print(json.dumps([certifying, *[[", 1).replace(
+    "for found in report.certifications()]))", "for found in report.certifications()]]))", 1)
+"""`CERTIFIED_FORWARD` in a Dew tree edited outside the launch's kernels (its code's digest another,
+`dew._cache.package_digest`), first naming each certification program it compiled."""
+
+
+@COMPILES_ON_CPU
+def test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_them(tmp_path):
+    """A launch certified by one process is certified in the next on the same machine by its stored verdict
+    though Dew's code changed outside the launch's kernels (`report._lowered_verdict_key`): the edited tree
+    lowers the launch, its kernels the same, and reads their verdict, compiling none; keyed by Dew's whole
+    code alone, every commit compiled every launch of a start again (row 8650: 23 of an edited tree's 51
+    seconds certifying a hybrid decoder's step ahead, FS-8650-SPLIT)."""
+    from process_support import fresh, keeping_picks
+
+    cold = fresh(CERTIFIED_FORWARD, cache_dir=tmp_path, flags=keeping_picks())
+    compiled, *edited = fresh(EDITED_FORWARD, cache_dir=tmp_path, flags=keeping_picks())
+    assert cold and not any(stored for _, stored, _ in cold), cold
+    assert edited and all(stored for _, stored, _ in edited), edited
+    assert not compiled, compiled
+    assert (sorted((op, sorted(modules.items())) for op, _, modules in edited)
+            == sorted((op, sorted(modules.items())) for op, _, modules in cold))
 
 
 @COMPILES_ON_CPU

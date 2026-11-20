@@ -27,18 +27,27 @@ def stepwise(x, dt, A, B, C, D, state, starts=None):
     summed pairwise over the states as `recurrence_algebra.selective_read` defines it: the selective scans'
     token oracle (test_mamba's, test_selective_template's), whose readout order sets a cancelling one's
     rounding near float32's largest."""
-    outputs = []
-    for t in range(x.shape[1]):
+    # One token a step of a `lax.scan`, each step the loop's arithmetic, compiled once a step where a Python
+    # loop unrolled every order of its tokens (row 9511); the state in the steps' type as the first step's
+    # update promotes it.
+    held = jnp.result_type(dt, A, state, x, B)
+
+    def token(state, inputs):
+        x_t, dt_t, b_t, c_t, start = inputs
         if starts is not None:
-            state = jnp.where(starts[:, t, None, None], 0.0, state)
-        state = jnp.exp(dt[:, t, :, None] * A) * state + (dt[:, t] * x[:, t])[..., None] * B[:, t, None, :]
-        terms = C[:, t, None, :] * state
+            state = jnp.where(start[:, None, None], 0.0, state)
+        state = jnp.exp(dt_t[..., None] * A) * state + (dt_t * x_t)[..., None] * b_t[:, None, :]
+        terms = c_t[:, None, :] * state
         while terms.shape[-1] > 1:
             # Pairs of the states' terms, an odd one last as it stands.
             paired = terms[..., 0:terms.shape[-1] // 2 * 2:2] + terms[..., 1:terms.shape[-1] // 2 * 2:2]
             terms = jnp.concatenate([paired, terms[..., terms.shape[-1] // 2 * 2:]], axis=-1)
-        outputs.append(terms[..., 0] + x[:, t] * D)
-    return jnp.stack(outputs, 1), state
+        return state, terms[..., 0] + x_t * D
+
+    marks = jnp.zeros(x.shape[:2], bool) if starts is None else starts
+    state, outputs = jax.lax.scan(token, jnp.asarray(state, held),
+                                  tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, marks)))
+    return jnp.moveaxis(outputs, 0, 1), state
 
 
 NEAR_THE_LARGEST = {"an entering state": None, "a faint write after it": 63,
@@ -230,12 +239,20 @@ def mamba_selective_side(drawn: list, starts) -> list:
 
 def recurred(decay, write, entering, axis: int):
     """`ssm.affine_states`' recurrence a token at a time, `h_t = a_t h_(t-1) + b_t` along `axis` from
-    `entering`, a Python loop of its tokens: the affine scan's token oracle."""
-    states, state = [], entering
-    for a, b in zip(*(jnp.moveaxis(t, axis, 0) for t in (decay, write)), strict=True):
+    `entering`, one token a step of a `lax.scan` (each step the loop's multiply and add, the entering state
+    in the steps' type as the first step's product promotes it): the affine scan's token oracle, compiled
+    once a step where a Python loop of 192 tokens unrolled every order of it, 198 s of a cold run's cell
+    (row 9511)."""
+    dtype = jnp.result_type(decay, write, entering)
+
+    def step(state, token):
+        a, b = token
         state = a * state + b
-        states.append(state)
-    return jnp.stack(states, axis=axis % decay.ndim)
+        return state, state
+
+    _, states = jax.lax.scan(step, jnp.asarray(entering, dtype),
+                             tuple(jnp.moveaxis(t, axis, 0) for t in (decay, write)))
+    return jnp.moveaxis(states, 0, axis % decay.ndim)
 
 
 FAINT_BESIDE_THE_LARGEST = ("a faint write", "a faint cotangent")

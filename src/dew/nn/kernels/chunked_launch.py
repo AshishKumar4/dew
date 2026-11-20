@@ -25,6 +25,7 @@ from dew.batch import document_firsts
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.tables import Column, column, packed, unpacked
 from dew.nn.precision import aligned_sum
+from dew.nn.sharding import rows_like
 
 
 @dataclasses.dataclass(frozen=True)
@@ -449,30 +450,30 @@ class Forked:
         elsewhere), and the document a first token begins (its index into `loads`, the entry write's;
         zero elsewhere). Its sizes are the tokens', none the documents' bound's."""
         firsts = jnp.asarray(self.firsts, jnp.int32)
-        rows, documents = firsts.shape
         held = firsts < length
         lasts = jnp.concatenate([firsts[:, 1:], jnp.full_like(firsts[:, :1], length)], axis=1)
         lasts = jnp.minimum(lasts, length) - 1
-        lines = jnp.arange(rows)[:, None]
         began = jnp.where(held, firsts, length)
-        loads = jnp.full((rows, length), -1, jnp.int32).at[lines, began].set(
-            jnp.asarray(self.loads, jnp.int32), mode="drop")
-        stores = jnp.zeros((rows, length), jnp.int32).at[lines, jnp.where(held, lasts, length)].set(
-            jnp.asarray(self.stores, jnp.int32), mode="drop")
-        numbers = jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), firsts.shape)
-        begun = jnp.zeros((rows, length), jnp.int32).at[lines, began].set(numbers, mode="drop")
-        return loads, stores, begun
+        # A row at a time, each row's buffer placed as `firsts`' rows: a row's tokens are its documents'
+        # alone, so the maps are placed as the rows are, where scattered by a row index into whole buffers,
+        # JAX refused indices and updates split on an Explicit axis (row 9690).
+        def laid(fill: int, at, values):
+            base = rows_like(jnp.full((firsts.shape[0], length), fill, jnp.int32), firsts)
+            return jax.vmap(lambda row, where, value: row.at[where].set(value, mode="drop"))(base, at, values)
+
+        numbers = jnp.zeros_like(firsts) + jnp.arange(firsts.shape[1], dtype=jnp.int32)
+        return (laid(-1, began, jnp.asarray(self.loads, jnp.int32)),
+                laid(0, jnp.where(held, lasts, length), jnp.asarray(self.stores, jnp.int32)),
+                laid(0, began, numbers))
 
 
 @dataclasses.dataclass(frozen=True)
 class AlignedDocuments:
-    """Mamba-1's portable scan's alone (`dew.nn.mixers.mamba.selective_scan`, main's), until it walks a forked
-    call's documents in place as recurrence_chunk's walk does and this is deleted (row 7380). A forked call's
-    documents laid from chunks' edges (`Forked`, its walks): each document's tokens moved
-    past the tokens before it to the next multiple of the chunk, the slots between tokens that leave the
-    memory as it was (zero keys, values and write gates, a unit decay), so a walk takes up each document's
-    memory at its first chunk's edge and leaves its final at its last chunk's. At most `chunk - 1` slots a
-    document, against a row of the call's length were each document laid out apart."""
+    """A forked call's documents laid from chunks' edges (`Forked`, its walks — Mamba-1's portable scan and
+    the turned recurrence's adjoint): each document's tokens moved past the tokens before it to the next
+    multiple of the chunk, the slots between tokens zero (leaving the memory as it was), so a walk takes up
+    each document's memory at its first chunk's edge and leaves its final at its last chunk's. At most
+    `chunk - 1` slots a document, against a row of the call's length were each document laid out apart."""
 
     slots: jax.Array
     """Each token's slot on the aligned grid `[B, S]`."""
@@ -484,6 +485,16 @@ class AlignedDocuments:
     (`recurrence_chunk.Chunk.stores`), zero for none."""
     length: int
     """The aligned grid's slots, the chunks' a row."""
+    document: jax.Array
+    """Each aligned chunk's document index `[B, chunks]`, clipped to the last past a row's live chunks."""
+    alive: jax.Array
+    """Whether each aligned chunk belongs to a live document `[B, chunks]`."""
+    last: jax.Array
+    """Whether each aligned chunk is its document's last chunk `[B, chunks]`."""
+    final: jax.Array
+    """Whether each aligned chunk is the row's last live document's last chunk `[B, chunks]`."""
+    within: jax.Array
+    """Each aligned slot's offset within its document `[B, length]` (zero on padding slots)."""
 
     @classmethod
     def of(cls, forked: Forked, length: int, chunk: int) -> "AlignedDocuments":
@@ -491,26 +502,35 @@ class AlignedDocuments:
         `chunk`."""
         firsts = jnp.asarray(forked.firsts, jnp.int32)
         rows, documents = firsts.shape
-        held = firsts < length
         ends = jnp.concatenate([firsts[:, 1:], jnp.full_like(firsts[:, :1], length)], axis=1)
-        sizes = jnp.where(held, jnp.minimum(ends, length) - firsts, 0)
+        sizes = jnp.clip(jnp.minimum(ends, length) - jnp.minimum(firsts, length), 0)
+        held = sizes > 0
         # Each document's aligned first slot: the chunks every document before it fills, whole.
         chunks = -(-sizes // chunk)
-        opened = (jnp.cumsum(chunks, axis=1) - chunks) * chunk
+        chunk_ends = jnp.cumsum(chunks, axis=1)
+        chunk_starts = chunk_ends - chunks
+        opened = chunk_starts * chunk
         total = -(-length // chunk) + documents
         positions = jnp.arange(length, dtype=jnp.int32)
-        slots = positions[None, :]
         # Each slot's document: the last whose first slot is at or before it, its row's firsts sorted.
         found = jax.vmap(lambda row: jnp.searchsorted(row, positions, side="right"))(firsts)
-        document = jnp.clip(found - 1, 0, documents - 1)
-        aligned = (jnp.take_along_axis(opened, document, axis=1)
-                   + slots - jnp.take_along_axis(firsts, document, axis=1))
+        tok_doc = jnp.clip(found - 1, 0, documents - 1)
+        tok_within = positions[None, :] - jnp.take_along_axis(firsts, tok_doc, axis=1)
+        aligned = (jnp.take_along_axis(opened, tok_doc, axis=1) + tok_within).astype(jnp.int32)
         lines = jnp.arange(rows)[:, None]
-        first = jnp.where(held, opened // chunk, total)
-        last = jnp.where(held, opened // chunk + chunks - 1, total)
+        first = jnp.where(held, chunk_starts, total)
+        last_at = jnp.where(held, chunk_ends - 1, total)
         loads = jnp.full((rows, total), -1, jnp.int32).at[lines, first].set(forked.loads, mode="drop")
-        stores = jnp.zeros((rows, total), jnp.int32).at[lines, last].set(forked.stores, mode="drop")
-        return cls(aligned.astype(jnp.int32), loads, stores, total * chunk)
+        stores = jnp.zeros((rows, total), jnp.int32).at[lines, last_at].set(forked.stores, mode="drop")
+        chunk_idx = jnp.arange(total, dtype=jnp.int32)
+        chunk_doc = jax.vmap(lambda row: jnp.searchsorted(row, chunk_idx, side="right"))(chunk_ends)
+        alive = chunk_doc < documents
+        chunk_doc = jnp.minimum(chunk_doc, documents - 1)
+        last = jnp.zeros((rows, total), jnp.bool_).at[lines, last_at].set(True, mode="drop")
+        final = last & (chunk_doc == tok_doc[:, -1:])
+        within = jax.vmap(lambda row, at, vals: row.at[at].set(vals))(
+            jnp.zeros((rows, total * chunk), jnp.int32), aligned, tok_within)
+        return cls(aligned, loads, stores, total * chunk, chunk_doc, alive, last, final, within)
 
     def laid(self, *operands):
         """The operands `[B, S, ...]` on the aligned grid `[B, length, ...]`, zero between documents."""
@@ -598,7 +618,7 @@ class ForkedChunks:
         if forked.entry is None:
             return None
         # Each row's documents flat, by their count: a write of no terms leaves `-1` nothing to infer.
-        key, value, weight = (x.reshape(x.shape[0] * x.shape[1], *x.shape[2:]) for x in forked.entry)
+        key, value, weight = _flat(*forked.entry)
         taken = jnp.maximum(self.taken, 0)
         key, value, weight = (x[taken] for x in (key, value, weight))
         group = value.shape[-2] // key.shape[-2]
