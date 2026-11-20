@@ -40,8 +40,8 @@ from dew.nn.kernels.templates import (
     mosaic,
     operands,
     outputs,
+    placed as placed_mod,
     product,
-    resources,
     rings,
     stores,
     swizzling,
@@ -2010,8 +2010,8 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
 
         # Each role forms what it reads (`_placed`), one switch's branch (`exclusive`).
         family.scheduled(consumers, _per_role(family, consumers, consumer), producer, exclusive=True,
-                         issuer=_issuer(program, streams, refs, placed))
-
+                         issuer=_issuer(program, streams, refs, placed),
+                         joined=_correction(program, placed, value_width))
 
     return body
 
@@ -2094,12 +2094,14 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                                           reduces=reduces, products=products,
                                                           over_rings=True))
               if family.budgets_registers else None)
+    joined = ((placed_mod.CORRECTION, 1),) if (isinstance(family, placed_mod.Tcgen05Placed)
+                                               and family.corrects(consumers)) else ()
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,
                          approx_math=spec.approximate, name=name, cost=cost, model_flops=model,
                          registers=registers, shared=shared, tmem=tmem, reducing_warpgroups=reduced,
-                         reduces=reduces)(query, key, value, *leaves)
+                         reduces=reduces, joined=joined)(query, key, value, *leaves)
 
 
 def _per_role(family: mosaic.Family, consumers: int, consumer: Callable) -> Callable:
@@ -2131,6 +2133,19 @@ def _issuer(program: _Program, streams, refs, placed: Callable) -> Callable | No
                                          row)[:2] for consumer in served))
 
     return issuer
+
+
+def _correction(program: _Program, placed_at: Callable, value_width: int) -> tuple:
+    """The correction warpgroup role where `program.family` places its sums' rescales on one
+    (`placed.Tcgen05Placed.correcting`, row 5368); empty otherwise."""
+    family, consumers = program.family, program.tiles.consumers
+    if not (isinstance(family, placed_mod.Tcgen05Placed) and family.corrects(consumers)):
+        return ()
+
+    def body(_index):
+        *_, own = placed_at()
+        family.correcting(*own, value_width)
+    return ((placed_mod.CORRECTION, 1, body),)
 
 
 def _written_refs(written: tuple, read: _Read) -> tuple:
