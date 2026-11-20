@@ -21,7 +21,6 @@ import sys
 import time
 import types
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING, Generic, Unpack
 
 import jax
@@ -135,12 +134,12 @@ from dew.training._fit import (
     afresh,
     check_inputs,
     clocked,
-    closes_window,
     consumption_counted,
     counted_step,
     declarations,
     first_batch,
     fit_policies,
+    handed,
     handed_splits,
     pooled_first,
     read_batch,
@@ -150,6 +149,8 @@ from dew.training._fit import (
     resumed_on,
     settled_heap,
     stage_reached,
+    staged,
+    stages_of,
     unrecorded_parts,
     validation_read,
     waited_read,
@@ -157,7 +158,7 @@ from dew.training._fit import (
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Counted
-from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held
+from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held, planned_over
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -497,8 +498,12 @@ class Trainer(Generic[Loss, Effects]):
         phase's (`Loader.batches`), which every split a plan takes cuts (`splits`), as fit and compile-ahead
         do."""
         progress = self._config is not None and self._config.reads_progress()
+        # Unstaged until its stream is read (`staged`): a ramp of a fit before is none of this one's, nor
+        # its batches read whole.
         self._shape = dataclasses.replace(
             self._shape, device=loader.device, prefetch=prefetch, rows=loader.batches or (loader.batch,),
+            ramp=(), stage_starts=frozenset(),
+            split=self._given_split if self._shape.ramp else self._shape.split,
             examples=clocked(examples, steps, bound_ends=loader.bound_ends,
                              custom_progress=self.step is not None and progress))
         # A read that counts its passes for a cadence of them (`Loader.pass_examples` with no epochs bound,
@@ -519,7 +524,8 @@ class Trainer(Generic[Loss, Effects]):
     def _laid_out(self, layout: Layout) -> None:
         """Lay the state out by `layout` as the objective places its trees (`Objective.placement`; ledger
         2777): the one construction of a trainer's layout, given or chosen (`streaming.laid_start`). A step
-        reads its batch whole where the layout or the run asks (`read_whole`), else in the split stated,
+        reads its batch whole where the layout, the run or its ramp asks (`read_whole`, `staged`), else in
+        the split stated,
         which a phase planned afresh plans under (`_compiled_for`; None where the planner chooses), until a
         pooling window or the first plan decides; what was derived of a layout before is derived again; a
         host state beside per-microbatch pass counts refused, however the layout came (rows 8400, 8440)."""
@@ -527,8 +533,8 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("sampled_passes runs each count at its cap's plan where devices hold the state")
         self.layout = self.objective.placement(layout)
         whole = read_whole(self.accumulation, self.split, self.step, self.layout, self.rollout, self.mesh)
-        self._shape = dataclasses.replace(self._shape, split=1 if whole is not None else self.split)
-        self._given_split = self._shape.split
+        self._given_split = 1 if whole is not None else self.split
+        self._shape = self._afresh_shape()
         for derived in ("state_mesh", "_staging"):
             vars(self).pop(derived, None)
 
@@ -770,7 +776,7 @@ class Trainer(Generic[Loss, Effects]):
                                           self._staging.staged_shapes)
         shardings, validation = self._validated(abstract)
         return Start(initializer, key, abstract, draw.through, draw.built, step, shardings, draw.replay,
-                     validation.device_bytes)
+                     validation.device_bytes, kept=stated is not None)
 
     def _placed(self, start: Start, *, positioned: bool
                 ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -1071,8 +1077,9 @@ class Trainer(Generic[Loss, Effects]):
     def _afresh_shape(self) -> RunShape:
         """The run's shape as a step planned afresh plans it, the loop's at a phase of other passes
         (`_planned_afresh`) and a later phase's off the loop (`dew.training.ahead.LaterPlans`): at the
-        split the run was given, or the planner's for its own passes."""
-        return dataclasses.replace(self._shape, split=self._given_split)
+        split the run was given, or the planner's for its own passes; a ramp's batches read whole (`staged`),
+        the split given kept for a later fit."""
+        return dataclasses.replace(self._shape, split=1 if self._shape.ramp else self._given_split)
 
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep:
@@ -1093,17 +1100,17 @@ class Trainer(Generic[Loss, Effects]):
         return self._compiler.drawing(self, self._stepping, compiled, stepped, batch, self.key)
 
     @ruled
-    def _planned_unplaced(self, start: Start, batch: Batch) -> None:
+    def _planned_unplaced(self, run: FitRun, start: Start, batch: Batch) -> None:
         """A fresh run's first step planned and compiled over its state's shapes (`start`'s) before the
         state is placed, held for the run's first compile over `batch` (`StepCompiler.planned_unplaced`),
         which takes it where the devices hold it once the state is placed and otherwise plans from the held
         plan's rung and split (`StepCompiler._plans`):
         built at the pass count of the phase its batch was read in (`PhasePasses.scoped`), as `compile`
         builds it, its admission counting the bytes the start will place in a device's own memory beside it
-        (`Start.unplaced`)."""
+        (`Start.unplaced`). The fit `run` keeps what it searched over (`FitRun.searched`)."""
         with self.phase_passes.scoped(self, self._compiler):
-            self._compiler.planned_unplaced(self._stepping(), start.abstract, batch,
-                                            start.unplaced(self.device_mesh))
+            run.searched = self._compiler.planned_unplaced(self._stepping(), start.abstract, batch,
+                                                           start.unplaced(self.device_mesh))
 
     @ruled
     def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None,
@@ -1574,6 +1581,7 @@ class Trainer(Generic[Loss, Effects]):
         from its start, the replacement plan unchecked)."""
         partition = self._stream_partition()
         stream = dataset.train(partition)
+        run.stages = stages_of(stream)
         try:
             if saved is not None and isinstance(stream, Checkpointable):
                 restored_or_restarted(stream, saved, resume=self.data_resume, step=run.current)
@@ -1663,18 +1671,7 @@ class Trainer(Generic[Loss, Effects]):
             run.unworked = isinstance(run.source, ReadsInProcess) and run.source.in_process
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None and run.restarted is None else None)
-            source = run.source
-            stages = source.stages if isinstance(source, RampedStream | PhasedStream | StepPhases) else ()
-            ramp = stages if isinstance(source, RampedStream) else ()
-            # The steps a stage after the first begins at, each where an update does (`Ramp.stages`): a
-            # ramp's and phases' of other batches here (`PhasedStream.stages`), a schedule's as each begins
-            # (`_scheduled`); the step lays its window out there. Each stage's batch of a ramp is read whole:
-            # no plan splits a ramp's.
-            self._shape = dataclasses.replace(
-                self._shape, ramp=ramp, split=1 if ramp else self._shape.split,
-                stage_starts=frozenset(accumulate((after.records - stage.records) // stage.batch
-                                                  for stage, after in pairwise(stages))))
-
+            self._shape = staged(self._shape, stages_of(run.source))
             run.partition = partition
             run.train = self._prefetched(plan, run, opened, position, ahead)
             run.source = None  # Lifetime transferred to the prefetch worker.
@@ -1751,11 +1748,10 @@ class Trainer(Generic[Loss, Effects]):
                                 self.device_mesh)
         self.phase_passes.at(first)
         with run.startup.phase("compile", "compiling the step"), run.held():
-            # As the loop hands its step the batch (`read_batch`): on the examples clock, marked whether
-            # it closes its window; planned once, where the layout's choice planned it already.
-            batch = closes_window(split_fields(placed)[0], self._shape.examples)
-            if not self._compiler.holds_unplaced(batch, self._shape):
-                self._planned_unplaced(fresh, batch)
+            # As the loop hands its step the batch, planned once: where the layout's choice did, not again.
+            batch = handed(placed, self._shape.examples)
+            if run.searched != planned_over(batch, self._shape):
+                self._planned_unplaced(run, fresh, batch)
         return begun
 
     def _whole_validated(self, state: TrainState, batch: Batch, split: int) -> Validation:

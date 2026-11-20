@@ -216,7 +216,8 @@ class Interval:
     `rollout_seconds` is the time spent sampling, logged under
     train/rollout_seconds when a rollout is set, and `rollout_copied` the bytes its
     rollouts copied of the run's host-held weights onto a device (`rollout.on_devices`), logged
-    under train/rollout_copied_gib. `waited` is the time the
+    under train/rollout_copied_gib where they copied any (a run whose devices hold its weights copies
+    none). `waited` is the time the
     loop spent waiting on its next batch and `compiling` the time it spent
     compiling the step for a shape it had not met, both in seconds, since
     the last log. `compiles` counts StepCompiled records over the whole fit,
@@ -659,7 +660,8 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
         scalars["train/loss_scale"] = float(read.scale)
     if rollout:
         scalars["train/rollout_seconds"] = counts.rollout_seconds
-        scalars["train/rollout_copied_gib"] = counts.rollout_copied / 2 ** 30
+        if counts.rollout_copied:
+            scalars["train/rollout_copied_gib"] = counts.rollout_copied / 2 ** 30
         scalars.update({f"rollout/{name}": float(value) for name, value in read.rollout.items()})
     if read.inspected is not None and int(read.inspected[0]):
         scalars.update(logged(read.inspected[1]))
