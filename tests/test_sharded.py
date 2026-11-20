@@ -66,3 +66,25 @@ def test_a_sum_over_an_axis_no_operand_is_whole_along_fails_the_split(whole):
         # A gather the cell allows excuses no sum it does not name (head review).
         with pytest.raises(AssertionError):
             split_checked(gathered, lambda seed: (x,), (PartitionSpec("data"),), mesh, moves=("all-gather",))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_integer_the_shards_agree_on_is_no_sum_of_values():
+    """A per-shard step whose shards agree on an integer status (a `pmax` of an int32 across them, as the
+    Pallas interpreter agrees on its callbacks' status around an interpreted kernel: three
+    test_linear_attention.py decode cells, train 1089) sums no value across devices: the split passes, where
+    every all-reduce counted as a sum refused it. A float's max across them is a value's and still fails."""
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Auto,), devices=jax.devices()[:2])
+    x = jnp.asarray(np.random.default_rng(0x9001).standard_normal((8, 16)), jnp.float32)
+
+    def agreed(reduce):
+        def local(part):
+            return 2 * part, reduce(part)
+        return jax.shard_map(local, mesh=mesh, in_specs=PartitionSpec("data"),
+                             out_specs=(PartitionSpec("data"), PartitionSpec()))
+
+    split_checked(agreed(lambda part: jax.lax.pmax(jnp.sum(part > 0).astype(jnp.int32), "data")),
+                  lambda seed: (x,), (PartitionSpec("data"),), mesh)
+    with pytest.raises(AssertionError):
+        split_checked(agreed(lambda part: jax.lax.pmax(jnp.max(part), "data")), lambda seed: (x,),
+                      (PartitionSpec("data"),), mesh)
