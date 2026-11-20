@@ -708,16 +708,6 @@ def laid_chunks(length: int, starts, max_segments: int | None, chunk: int) -> np
     return np.stack([chunks.start[kept], chunks.taken[kept]], axis=1)
 
 
-def _merged_parts(family, dtype, held: int, wide: bool) -> int:
-    """The doubling's merge parts (`Lane.merged`, `mainloop._merged`): `held` for fp32, `_fast_parts` for
-    bf16, and zero (fp16) for fp16."""
-    import jax.numpy as jnp
-
-    if wide:
-        return held
-    return mainloop._fast_parts(family) if dtype == np.dtype(jnp.bfloat16) else 0
-
-
 def call_form(family, *, wide: bool, delta: bool, rounded: bool) -> tuple[int, int, str]:
     """The parts a call's operands and passed values take (`chunk_forward.prepared`'s `given` and `held`):
     one of a 16-bit value; an fp32 one's three, or under the fast forms its `family`'s
@@ -853,7 +843,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide), walked=walked,
-               pairing=intra.pairing_parts(family, held), merged=_merged_parts(family, dtype, held, wide),
+               pairing=intra.pairing_parts(family, held),
+               merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
                tf32=tf32_conversion(family), trained=bool(trained),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
