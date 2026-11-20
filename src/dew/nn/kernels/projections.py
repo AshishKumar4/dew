@@ -40,7 +40,6 @@ from dew.nn.sharding import (
     logical_spec,
     on_shards,
     placed_layout,
-    seen_whole,
     shard_shapes,
 )
 
@@ -496,14 +495,15 @@ def launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: Precision
     at every call: a model's projections ask the same question at every layer's trace (row 3213: a warm
     start spent 10.9 of its 75.6 seconds selecting)."""
     rows_type, matrix_type = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in (rows, matrix))
-    whole = seen_whole(rows) and seen_whole(matrix)
+    whole = not automatic_axes()
     return launches(rows_type, matrix_type, out_dtype, precision, whole=whole)
 
 
 def launches(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype, precision: PrecisionLike, *,
              whole: bool) -> bool:
-    """`launched` of a product's operands by their shapes and dtypes, where they are seen `whole`
-    (`seen_whole`): a product formed later in the call (a fused MLP's down product, `dew.nn.gated_mlp`)."""
+    """`launched` of a product's operands by their shapes and dtypes, where a launch sees them `whole` (no
+    automatic mesh axis splits them): a product formed later in the call (a fused MLP's down product,
+    `dew.nn.gated_mlp`)."""
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
     taken, found = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole, generation.gpu_target(),
                             _cache.KERNEL_CHOICES.value, _cache.KERNEL_PINS.value)

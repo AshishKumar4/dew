@@ -150,8 +150,10 @@ _FREE = frozenset({
     gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p, state.get_p,
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
     lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
-    lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p})
+    lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p, jax_core.pvary_p,
+    jax_core.reduced_vary_cast_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
+a value's type cast along manual mesh axes (to vary, or from reduced: no value changes),
 indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's;
 every layout move the Pallas fuser tiles: a dynamic slice and its update, whose index arithmetic is scalar,
 which nothing counts, a split, a stack, a tile and an unstack, so a fused prologue's stage holds no

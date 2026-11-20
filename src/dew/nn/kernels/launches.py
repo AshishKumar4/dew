@@ -9,22 +9,24 @@ from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
+from jax._src import core as jax_core
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn.kernels.templates import outputs
-from dew.nn.sharding import per_shard
+from dew.nn.sharding import checked, computed_from, per_shard
 
 
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
     """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)` held per shard (`_held`), named by
-    its `name`, which its profile names it by, its body traced as a launch's (`_traced`); an `out_shape`
-    stating its outputs as its operands' axes (`outputs.Output`) its shapes, its call declaring their
-    dimensions (`outputs.declared`)."""
+    its `name`, which its profile names it by, its body traced as a launch's (`_traced`), its outputs typed
+    as its operands make them (`_typed`); an `out_shape` stating its outputs as its operands' axes
+    (`outputs.Output`) its shapes, its call declaring their dimensions (`outputs.declared`)."""
     out_shape = params.get("out_shape")
-    held = _held(pl.pallas_call(_traced(kernel, params.get("interpret")), name=name,
-                                **{**params, "out_shape": outputs.structs(out_shape)}), name)
+    traced = _traced(kernel, params.get("interpret"))
+    held = _typed(lambda typed: pl.pallas_call(traced, name=name, **{**params, "out_shape": typed}),
+                  outputs.structs(out_shape), name)
     if not outputs.dimensioned(out_shape):
         return held
 
@@ -35,10 +37,41 @@ def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
     return declaring
 
 
-def kernel(entry: Callable, *, name: str, **params) -> Callable:
-    """`jax.experimental.pallas.mosaic_gpu.kernel(entry, **params)` held per shard (`_held`), named by
-    `name`, its body traced as a launch's (`_traced`)."""
-    return _held(plgpu.kernel(_traced(entry, params.get("interpret")), **params), name)
+def kernel(entry: Callable, *, name: str, out_type, **params) -> Callable:
+    """`jax.experimental.pallas.mosaic_gpu.kernel(entry, out_type=out_type, **params)` held per shard
+    (`_held`), named by `name`, its body traced as a launch's (`_traced`), its outputs typed as its operands
+    make them (`_typed`)."""
+    traced = _traced(entry, params.get("interpret"))
+    return _typed(lambda typed: plgpu.kernel(traced, out_type=typed, **params), out_type, name)
+
+
+def _typed(made: Callable, out, name: str) -> Callable:
+    """`made(typed)`'s launch held per shard (`_held`), `typed` its outputs `out` (`jax.ShapeDtypeStruct`s)
+    as its operands make them where values are typed by the manual axes they vary over
+    (`dew.nn.sharding.checked`): each device computes its results from its own operands, so each varies over
+    every axis an operand varies over unless it states its own (`computed_from`; row 9808: a result typed
+    the same on every device beside a bias each device reads its own of), stated as a typed aval, which
+    Pallas takes as it is where Mosaic GPU's wrapper reads a struct with the check off and drops its type.
+    `out` as it is elsewhere. One launch made a typing."""
+    launches = {}
+
+    def launched(*operands):
+        typed = jax.tree.map(lambda leaf: _aval(computed_from(leaf, *operands))
+                             if checked() and isinstance(leaf, jax.ShapeDtypeStruct) else leaf, out)
+        leaves, structure = jax.tree.flatten(typed)
+        key = structure, tuple(leaves)
+        if key not in launches:
+            launches[key] = _held(made(typed), name)
+        return launches[key](*operands)
+
+    return launched
+
+
+def _aval(struct: jax.ShapeDtypeStruct) -> jax_core.ShapedArray:
+    """`struct` as the aval Pallas makes of it where it checks the manual axes values vary over
+    (`pallas.core`'s conversion of an output's shape): placed on the context's mesh, varying as it states."""
+    return jax_core.ShapedArray(struct.shape, struct.dtype, sharding=jax_core.get_cur_mesh_sharding(),
+                                manual_axis_type=struct.manual_axis_type)
 
 
 _INTERPRETING: contextvars.ContextVar[bool | None] = contextvars.ContextVar("interpreting", default=None)

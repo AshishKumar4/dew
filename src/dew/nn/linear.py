@@ -85,7 +85,6 @@ from .sharding import (
     manual_map,
     on_shards,
     rows_like,
-    seen_whole,
     sequence_shards,
 )
 
@@ -146,7 +145,7 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
         out = _per_row_shard(x, kernel, activation, bias, valid, segments, parts, dtype, rows)
     else:
         pieces = ((x.shape[-1], None),) if parts is None else tuple(parts)
-        case = short_conv.ConvCase(placed=_template_runs(), whole=seen_whole(x), shape=x.shape,
+        case = short_conv.ConvCase(placed=_template_runs(), whole=not automatic_axes(), shape=x.shape,
                                    dtype=jnp.dtype(x.dtype), out=dtype, taps=kernel.shape[-1], parts=pieces)
         if select(short_conv.CONV, case).kernel == 'mosaic_gpu':
             out = short_conv.conv(x, kernel, bias, None if valid is None else jnp.asarray(valid, jnp.int8),

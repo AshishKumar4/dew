@@ -49,6 +49,7 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 from flax.typing import Initializer
+from jax._src import config as jax_config, core as jax_core
 
 from dew import _cache
 from dew.batch import FROZEN
@@ -688,14 +689,34 @@ def rows_like(x: jax.Array, like: jax.Array) -> jax.Array:
     return x if placed is None else jax.sharding.reshard(x, placed)
 
 
+def varying(*operands) -> frozenset[str]:
+    """The manual axes (a checked `shard_map`'s) any array among `operands` (trees; None for none) varies
+    over: what a value computed from them varies over, as JAX types an operation's result."""
+    return frozenset().union(*(jax.typeof(leaf).mat.varying for leaf in jax.tree.leaves(operands)))
+
+
 def varying_like(x: jax.Array, *operands) -> jax.Array:
-    """`x` varying over every manual axis (a checked `shard_map`'s) any of `operands` varies over (None for
-    none): a scan's carry seeded so keeps its type through steps that read them, as a step's output varies
-    wherever an input does."""
-    axes = frozenset().union(*(jax.typeof(operand).mat.varying for operand in operands
-                               if operand is not None))
-    missing = tuple(sorted(axes - jax.typeof(x).mat.varying))
+    """`x` varying over every manual axis any of `operands` varies over (`varying`): a scan's carry seeded
+    so keeps its type through steps that read them, as a step's output varies wherever an input does."""
+    missing = tuple(sorted(varying(*operands) - jax.typeof(x).mat.varying))
     return jax.lax.pcast(x, missing, to="varying") if missing else x
+
+
+def checked() -> bool:
+    """Whether a value traced here is typed by the manual axes it varies over: inside a `shard_map` that
+    checks them (`check_vma`)."""
+    return jax_config._check_vma.value and bool(jax.sharding.get_abstract_mesh().manual_axes)
+
+
+def computed_from(struct: jax.ShapeDtypeStruct, *operands) -> jax.ShapeDtypeStruct:
+    """`struct` typed as a value each device computes from its own `operands` is where values are typed
+    by their manual axes (`checked`): varying over every one any of them varies over (`varying`), unless it
+    states its own (`manual_axis_type`); `struct` itself elsewhere. A launch's results (row 9808: a
+    kernel's result typed the same on every device, beside a bias each device reads its own of)."""
+    if not checked() or struct.manual_axis_type is not None:
+        return struct
+    return jax.ShapeDtypeStruct(struct.shape, struct.dtype, sharding=jax_core.get_cur_mesh_sharding(),
+                                manual_axis_type=jax.sharding.ManualAxisType(varying=varying(*operands)))
 
 
 def automatic_axes() -> tuple[str, ...]:
@@ -706,14 +727,6 @@ def automatic_axes() -> tuple[str, ...]:
     return tuple(name for name in mesh.axis_names if mesh.shape[name] > 1 and name not in mesh.manual_axes)
 
 
-def seen_whole(value: jax.Array) -> bool:
-    """Whether a Pallas kernel, which sees local arrays and carries no
-    manual-axis type, can take `value` where it is traced: no mesh axis
-    outside a `shard_map` splits it (`automatic_axes`), and no `shard_map`
-    that checks varying axes holds it."""
-    return not automatic_axes() and not jax.typeof(value).mat.varying
-
-
 def per_shard(kernel: str) -> None:
     """Raise unless the kernel named `kernel` launches per shard: every
     axis of the context's mesh larger than one device manual (`manual_map`,
@@ -722,7 +735,8 @@ def per_shard(kernel: str) -> None:
     reads them whole, and every device runs the whole batch (row 1923; the
     gated delta net's template, 1897). The kernels' launch points call it as
     they trace (`templates.mosaic.Family.kernel`, the TPU and Triton GEMM
-    launches); a selector refuses such a call first (`seen_whole`)."""
+    launches); a selector refuses such a call first (its `whole`, no
+    `automatic_axes`)."""
     if axes := automatic_axes():
         raise ValueError(f"{kernel} launches with the mesh's {', '.join(axes)} automatic: a kernel reads its "
                          f"operands whole, so it launches only where every axis larger than one device is "
