@@ -2219,7 +2219,8 @@ def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tup
     return found, calls
 
 
-def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = False, *, kind: str) -> Binary:
+def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = False, *,
+            kind: str = "mosaic_gpu") -> Binary:
     """The `Binary` of the kernel `function` from its cubin `elf`: its `.nv.info` attributes' registers,
     frame and threads (`REGISTER_COUNT`, `FRAME_SIZE`, `MAX_THREADS`; a Mosaic module compiles one kernel
     function), `decoded` its SASS findings (`sass_findings_of`), and its register reconfiguration
