@@ -842,22 +842,21 @@ class Decide(SavedRunTask, InItsForm):
     def _requests_answered(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]],
                            images: Sequence[Sequence[Image.Image]], contexts: Sequence[JSON | None] | None
                            ) -> list[tuple[dict[str, Answer], Usage]]:
-        """Each of a batch's requests' answers and usage, in order: those with images (`images`, each
-        request's, none for one without) each through its own multimodal pass (`_seen`), as a request asked
-        alone is, and the rest scored together (`_answered`), each with its context (`contexts`; row 9061:
-        a batch took no request's images)."""
+        """Each of a batch's requests' answers and usage, in order, each with its context (`contexts`) and its
+        images (`images`, each request's, none for one without; row 9061): every request's rows scored by one
+        server (`_scored`), text rows packed into passes and rows of alike images joined in theirs, as a
+        server of Jev bodies scores them (row 9634: each request of images ran a pass of its own)."""
         shown = list(images) if images else [()] * len(requests)
         held = [None] * len(requests) if contexts is None else list(contexts)
         if len(shown) != len(requests) or len(held) != len(requests):
             raise ValueError(f"{len(shown)} requests' images and {len(held)} contexts for {len(requests)} "
                              "requests")
-        plain = [index for index, seen in enumerate(shown) if not seen]
-        answered = dict(zip(plain, self._answered(
-            self.rows([requests[index] for index in plain], contexts=[held[index] for index in plain]),
-            [requests[index][1] for index in plain]), strict=True)) if plain else {}
-        answered.update((index, self._seen(*requests[index], seen, held[index]))
-                        for index, seen in enumerate(shown) if seen)
-        return [answered[index] for index in range(len(requests))]
+        laid = [[_Row(*self._shown(state, questions, seen, context))] if seen
+                else [_Row(row) for row in self._encoded(state, questions, context=context)]
+                for (state, questions), seen, context in zip(requests, shown, held, strict=True)]
+        scores = iter(self._scored([row for rows in laid for row in rows]))
+        return [self._replied(questions, [row.encoded for row in rows], [next(scores) for _ in rows])
+                for (_, questions), rows in zip(requests, laid, strict=True)]
 
     def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
              contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
@@ -1114,8 +1113,13 @@ class Decide(SavedRunTask, InItsForm):
         programs (`RowScoring`, `dew.inference.scoring.ScoringServer`), one path for a call and a
         server alike.
         """
+        return self._scored([_Row(row) for row in rows])
+
+    def _scored(self, rows: Sequence["_Row"]) -> list[np.ndarray]:
+        """`logits` of `rows`, text rows and rows of images alike (`_Row`), by one server of this task's
+        passes (`RowScoring`), shortest first."""
         server = scoring.ScoringServer(self._row_scoring, self.variables)
-        order = sorted(range(len(rows)), key=lambda index: len(rows[index].tokens))
+        order = sorted(range(len(rows)), key=lambda index: len(rows[index].encoded.tokens))
         futures = {index: server.submit(rows[index]) for index in order}
         server.run()
         return [futures[index].result() for index in range(len(rows))]
@@ -1741,13 +1745,13 @@ class _DecideScoring[RequestT, PayloadT, AnswerT](
 
 
 @dataclass(frozen=True)
-class RowScoring(_DecideScoring[Encoded, None, np.ndarray]):
-    """A `Decide` task's laid-out text rows as a scoring task (`dew.inference.scoring.Scoring`): each
-    request one row (`Decide._encoded`), answered by its raw `[Q, K]` logits, the passes a server of
-    Jev bodies runs (`Decide.logits`)."""
+class RowScoring(_DecideScoring[_Row, None, np.ndarray]):
+    """A `Decide` task's laid-out rows as a scoring task (`dew.inference.scoring.Scoring`): each request one
+    row (`Decide._encoded`, with its images where it holds any, `Decide._shown`), answered by its raw
+    `[Q, K]` logits, the passes a server of Jev bodies runs (`Decide.logits`, `Decide._scored`)."""
 
-    def admit(self, request: Encoded) -> scoring.ScoringRequest[_Row, None]:
-        return scoring.ScoringRequest((_Row(request),), None)
+    def admit(self, request: _Row) -> scoring.ScoringRequest[_Row, None]:
+        return scoring.ScoringRequest((request,), None)
 
     def answer(self, payload: None, outputs: Sequence[np.ndarray]) -> np.ndarray:
         return outputs[0]
