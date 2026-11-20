@@ -30,7 +30,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_adversarial.py": {
-   "comparisons": 4,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_agentic_losses.py": {

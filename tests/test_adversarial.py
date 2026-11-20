@@ -92,11 +92,10 @@ class Tokens(nn.Module):
         return (layer_b @ head).reshape(x.shape)
 
 
-def one_step(dtype, inputs) -> dict[str, jax.Array]:
-    """Dew's LADD step at `dtype` on a seed's inputs (tools/ladd_reference.py's `draw`), what check 1
-    judges of it (the generator's `judged`): its loss, every gradient and the kept `u`s."""
-    from flax.traverse_util import flatten_dict
-
+def ladd_step(dtype, inputs):
+    """Dew's LADD objective at `dtype` on a seed's inputs (tools/ladd_reference.py's `draw`): the objective,
+    its variables, the student's and the heads' parameters, the batch and the step reading the oracle's
+    draws."""
     from dew.inputs import Field, InputSpec
 
     reference = generator()
@@ -105,7 +104,8 @@ def one_step(dtype, inputs) -> dict[str, jax.Array]:
     def tree(prefix):
         return jax.tree.map(lambda value: jnp.asarray(value, dtype), reference.nested(inputs, prefix))
 
-    pixels = inputs["pixels"]
+    # Pixels at the step's precision, as a float64 run's are (`unit_range`).
+    pixels = jnp.asarray(inputs["pixels"], dtype)
     layers = {name: {"kernel": tree("teacher")[name]} for name in ("layer_a", "layer_b")}
     task = AdversarialDistillationObjective(
         Tokens(settings["width"]), Flow()(), InputSpec(Field("image", pixels.shape[1:])),
@@ -122,12 +122,21 @@ def one_step(dtype, inputs) -> dict[str, jax.Array]:
             "renoise times": jnp.asarray(inputs["draws/level"], dtype),
             "renoise": jnp.asarray(inputs["draws/renoise"], dtype)}
     step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None, tape=tape)
+    return task, variables, {**student, DISCRIMINATOR: tree("heads")}, {"image": pixels}, step
+
+
+def one_step(dtype, inputs) -> dict[str, jax.Array]:
+    """Dew's LADD step at `dtype` on a seed's inputs (tools/ladd_reference.py's `draw`), what check 1
+    judges of it (the generator's `judged`): its loss, every gradient and the kept `u`s."""
+    from flax.traverse_util import flatten_dict
+
+    reference = generator()
+    task, variables, params, batch, step = ladd_step(dtype, inputs)
 
     def loss(params):
-        return task.scalar_loss({**variables, "params": params}, {"image": pixels}, step)
+        return task.scalar_loss({**variables, "params": params}, batch, step)
 
-    (value, aux), gradient = jax.value_and_grad(loss, has_aux=True)(
-        {**student, DISCRIMINATOR: tree("heads")})
+    (value, aux), gradient = jax.value_and_grad(loss, has_aux=True)(params)
     flat = {"loss": value, **{f"grad/student/{name}": leaf["kernel"] if name.startswith("layer") else leaf
                               for name, leaf in gradient.items() if name != DISCRIMINATOR}}
     for prefix, held in (("grad/heads", gradient[DISCRIMINATOR]), ("spectral", aux.variables[SPECTRAL])):
@@ -194,38 +203,70 @@ def test_validation_does_not_advance_the_spectral_statistics(runs):
         jax.tree.leaves(variables[SPECTRAL]), jax.tree.leaves(trained.variables[SPECTRAL]), strict=True))
 
 
+def sided(task, variables, batch, step, names):
+    """The gradient of `task`'s whole loss (`names` None) or of its parts `names` alone, each at the weight
+    the whole gives it (R1's `r1_weight`), over `variables`' parameters."""
+    def loss(tree):
+        total, aux = task.loss({**variables, "params": tree}, batch, step)
+        if names is None:
+            return total.total
+        return sum(aux.metrics[key] * (task.r1_weight if key == "r1" else 1) for key in names) * total.mass
+    return jax.grad(loss)(variables["params"])
+
+
+CRITIC, STUDENT = ("discriminator", "r1"), ("generator", "distillation")
+"""The heads' losses and the student's, the whole loss their sum."""
+
+
 def test_each_side_trains_on_its_own_loss(runs):
-    """The heads' gradient is the discriminator loss's alone and the
-    student's the generator and distillation losses' alone; the teacher is
-    not a parameter."""
+    """The heads take no gradient from the student's losses and the student none from the heads', exactly,
+    and the heads' a nonzero one from theirs; the teacher is not a parameter (a configured run's
+    objective)."""
     config, batch = runs
     task = config.build()
     assert isinstance(task, AdversarialDistillationObjective)
     params = task.init(jax.random.PRNGKey(1))
     assert TEACHER not in params["params"]
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-
-    def part(name):
-        def loss(tree):
-            total, aux = task.loss({**params, "params": tree}, batch, step)
-            if name is None:
-                return total.total
-            gamma = task.r1_weight
-            return sum(aux.metrics[key] * (gamma if key == "r1" else 1) for key in name) * total.mass
-        # One program a part, not each of the model's operations dispatched alone (332 compiles, row 7664).
-        return jax.jit(jax.grad(loss))(params["params"])
-
-    everything = part(None)
-    critic, student = part(("discriminator", "r1")), part(("generator", "distillation"))
-    for got, want in zip(jax.tree.leaves(everything[DISCRIMINATOR]), jax.tree.leaves(critic[DISCRIMINATOR]),
-                         strict=True):
-        np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-7)
-    for name in everything:
+    # One program a part, not each of the model's operations dispatched alone (332 compiles, row 7664).
+    critic, student = (jax.jit(functools.partial(sided, task, names=names))(params, batch, step)
+                       for names in (CRITIC, STUDENT))
+    assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(student[DISCRIMINATOR]))
+    for name in critic:
         if name != DISCRIMINATOR:
-            for got, want in zip(jax.tree.leaves(everything[name]), jax.tree.leaves(student[name]),
-                                 strict=True):
-                np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-7)
+            assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(critic[name]))
     assert float(sum(jnp.abs(leaf).sum() for leaf in jax.tree.leaves(critic[DISCRIMINATOR]))) > 0
+
+
+SIDED_SEEDS = 8
+"""Check 1's declared seeds for the whole loss's gradient against each side's, sized paired by `seeds_for`
+on armada."""
+
+
+def test_each_sides_gradient_is_the_whole_losss_there():
+    """The whole loss's gradient in the heads' parameters on par with the heads' losses' alone, and in the
+    student's with the student's losses' alone (check 1, the whole loss in float64 the truth), on the LADD
+    step's drawn inputs (`ladd_step`): two programs summing one gradient, the other side's terms exactly
+    zero (`test_each_side_trains_on_its_own_loss`)."""
+    def split(gradient):
+        return {"heads": gradient[DISCRIMINATOR],
+                "student": {name: leaf for name, leaf in gradient.items() if name != DISCRIMINATOR}}
+
+    def whole(dtype):
+        def run(inputs):
+            task, variables, params, batch, step = ladd_step(dtype, inputs)
+            return split(sided(task, {**variables, "params": params}, batch, step, None))
+        return run
+
+    def sides(inputs):
+        task, variables, params, batch, step = ladd_step(jnp.float32, inputs)
+        held = {**variables, "params": params}
+        heads, student = (split(sided(task, held, batch, step, names)) for names in (CRITIC, STUDENT))
+        return {"heads": heads["heads"], "student": student["student"]}
+
+    assert_as_exact(jax.jit(whole(jnp.float32)), jax.jit(sides), lambda seed: (generator().draw(seed),),
+                    "the whole loss's gradient against each side's", seeds=SIDED_SEEDS,
+                    truth_fn=whole(jnp.float64))
 
 
 def test_a_saved_student_samples_in_one_step(runs, tmp_path):
