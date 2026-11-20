@@ -1445,7 +1445,7 @@ class TextGeneration(_NativeTextTask):
             from dew.objectives.lm.adaptation import ChunkAdaptation, InContextDecoder
             from dew.registry import from_record
 
-            model = InContextDecoder(model, from_record(settings.adaptation, ChunkAdaptation))
+            model = InContextDecoder(model, from_record(ChunkAdaptation, settings.adaptation))
         return cls(model, variables, processor, sampling=settings.sampling,
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
