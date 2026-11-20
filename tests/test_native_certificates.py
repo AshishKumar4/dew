@@ -678,7 +678,7 @@ def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_
     output, lies inside its step's enclosure on the state before it, under a causal or a full `mask`
     (`attention_witness.assert_witnessed`), at this GPU's `ex2` (PTX's reach)."""
     with generation.assumed(generation_name):
-        assert_witnessed(0, mask == "causal", interpret=False)
+        assert_witnessed(0, mask == "causal", interpret=False, lane=mosaic_lane())
 
 
 def the_attention_witness_refuses_its_faults_natively(generation_name):
@@ -686,7 +686,7 @@ def the_attention_witness_refuses_its_faults_natively(generation_name):
     (`attention_witness.assert_faults_refused`): a dropped rescale, a maximum from the wrong tile, sums
     rounded to bf16 and a mask off by one key."""
     with generation.assumed(generation_name):
-        assert_faults_refused(interpret=False)
+        assert_faults_refused(interpret=False, lane=mosaic_lane())
 
 
 GENERATIONS = ("sm80", "sm90")

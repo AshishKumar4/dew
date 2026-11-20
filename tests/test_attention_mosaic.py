@@ -1355,8 +1355,8 @@ def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program()
     calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launched]
     assert calls
     # Every compile's kernels read as spilling, as a B200's ptxas read the 4B forward's.
-    spilled = [report.Binary(report.kernel_of(call.name)[0], call.launch, 255, 8, caller=call.caller)
-               for call in calls]
+    spilled = [report.Binary(report.kernel_of(call.name)[0], call.launch, 255, 8, kind="mosaic_gpu",
+                             caller=call.caller) for call in calls]
     with generation.assumed("sm100"), report.refusals():
         report.kept(first, relower=lambda: first, read=lambda executable: spilled)
         misses = report.misses()
@@ -1388,8 +1388,8 @@ def test_a_run_refuses_a_kernel_whose_warpgroup_products_ptxas_serialized_as_a_s
     calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launched]
     assert calls
     serialized = (report.AssemblerNote("C7512", "wgmma.mma_async instructions are serialized"),)
-    noted = [report.Binary(report.kernel_of(call.name)[0], call.launch, 168, 0, caller=call.caller,
-                           notes=serialized) for call in calls]
+    noted = [report.Binary(report.kernel_of(call.name)[0], call.launch, 168, 0, kind="mosaic_gpu",
+                           caller=call.caller, notes=serialized) for call in calls]
     with generation.assumed("sm90"), report.refusals():
         report.kept(first, relower=lambda: first, read=lambda executable: noted)
         misses = report.misses()
