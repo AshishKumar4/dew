@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import math
+import re
 from collections.abc import Callable
 
 import jax
@@ -36,7 +37,7 @@ IMPORTS = {"jnp": "import jax.numpy as jnp", "np": "import numpy as np", "lax": 
 
 def imports(text: str) -> list[str]:
     """The imports printed `text` reads (`IMPORTS`), each where it reads its name, in the tree's order."""
-    return [line for name, line in IMPORTS.items() if f"{name}." in text]
+    return [line for name, line in IMPORTS.items() if re.search(rf"(?<![\w.]){name}\.", text)]
 
 
 class Unprintable(ValueError):
