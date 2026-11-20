@@ -2142,9 +2142,8 @@ def _correction(program: _Program, placed_at: Callable, value_width: int, joined
         return ()
 
     def body(_index):
-        *_, own = placed_at()
-        family.correcting(*own, value_width)
-
+        *_, (lo, hi) = placed_at()
+        family.correcting(lo, hi, value_width)
     return tuple((role, count, body) for role, count in joined)
 
 
