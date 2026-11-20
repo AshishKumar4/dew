@@ -220,6 +220,11 @@ def _marked(loads_ref, t):
     return (t == 0) | (loads_ref[0, t] >= 0)
 
 
+def _segment_count(loads_ref, count: int):
+    """The segments (documents) opening inside a chunk of `count` tokens (row 9078)."""
+    return jax.lax.fori_loop(0, count, lambda t, n: n + _marked(loads_ref, t).astype(jnp.int32), jnp.int32(0))
+
+
 def _segment_after(loads_ref, origin, count: int):
     """The token after the segment opening at `origin`: the next token opening one, else the chunk's end."""
     def found(t, after):
@@ -292,8 +297,7 @@ def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_ref
     if keep:
         outputs[0][...] = carried
     x, b, c, a = x_ref[...], b_ref[...], c_ref[...], a_ref[...]
-    segments = jax.lax.fori_loop(0, count, lambda t, n: n + _marked(loads_ref, t).astype(jnp.int32),
-                                 jnp.int32(0))
+    segments = _segment_count(loads_ref, count)
 
     def segment(_, state):
         y, leaving, origin = state
@@ -340,8 +344,7 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_re
 
     dnext = jnp.where(opening, dfinal_ref[...], dstate_ref[...])
     x, b, c, a, dy, start = x_ref[...], b_ref[...], c_ref[...], a_ref[...], dy_ref[...], entered_ref[...]
-    segments = jax.lax.fori_loop(0, count, lambda t, n: n + _marked(loads_ref, t).astype(jnp.int32),
-                                 jnp.int32(0))
+    segments = _segment_count(loads_ref, count)
 
     def origin_of(k):
         def counted(t, state):
@@ -613,14 +616,67 @@ def _ssd_scan(x, b, c, a, state, forked, chunk_size: int, platform: str,
                           held=held)[:2])
 
 
-def _ssd_portable(x, b, c, a, state, forked, chunk_size: int, held: int) -> tuple[jax.Array, jax.Array]:
-    """Pure-JAX chunked SSD scan reusing `_chunk_forward` (plain) and `recurrence_chunk.xla_ssd_portable`
-    (forked) so forward mode and higher-order derivatives through `_chunk_scan` combine reads and decays
-    before forming any carry (rows 7874, 7875; base review e488dc198 F2, F5)."""
-    if forked is not None:
-        from dew.nn.kernels.recurrence_chunk import xla_ssd_portable
+def _ssd_portable_forked(x, b, c, a, state, forked, chunk_size: int, held: int):
+    """Pure-JAX forked chunk scan reusing `_chunk_forward`, `_windowed`, `_opened`, and `_segment_count`
+    with no cross-layer import (rows 7874, 7875; base review e488dc198 F2, F5)."""
+    batch, total, heads, head_dim = x.shape
+    chunks, state_size = total // chunk_size, b.shape[-1]
+    tokens, given, entry = _forked_blocks(forked, heads, chunk_size)
+    xs = jnp.moveaxis(x.reshape(batch, chunks, chunk_size, heads, head_dim), (1, 3), (2, 1))
+    bs = jnp.moveaxis(b.reshape(batch, chunks, chunk_size, heads, state_size), (1, 3), (2, 1))
+    cs = jnp.moveaxis(c.reshape(batch, chunks, chunk_size, heads, state_size), (1, 3), (2, 1))
+    as_ = jnp.moveaxis(a.reshape(batch, chunks, chunk_size, heads), (1, 3), (2, 1))
 
-        return xla_ssd_portable(x, b, c, a, state, forked, chunk_size, held)
+    def walk_head(x_h, b_h, c_h, a_h, st_h, given_h, entry_h, tok_b):
+        loads_b, stores_b, begun_b, adds_b = tok_b
+        table0 = jnp.zeros((held, head_dim, state_size), st_h.dtype) if held else None
+
+        def chunk_step(carry, inputs):
+            carried, table = carry
+            cx, cb, cc, ca, cl, cs_, cbeg, cadd = inputs
+            segments = _segment_count(cl, chunk_size)
+
+            def seg_step(_, seg_state):
+                y_acc, leaving, origin, tbl = seg_state
+                after = _segment_after(cl, origin, chunk_size)
+                through = after - jnp.int32(1)
+                load = cl[0, origin]
+                mem = jnp.where(load < 0, carried,
+                                _opened(given_h, tbl, entry_h, load, cadd[0, origin], cbeg[0, origin],
+                                        jnp.zeros_like(carried)))
+                operands, inside = _windowed(cx, cb, cc, ca, origin, through)
+                out, left = _chunk_forward(*operands, mem)
+                if tbl is not None:
+                    store = cs_[0, through]
+                    for slot in range(held):
+                        tbl = tbl.at[slot].set(jnp.where(store == slot + 1, left, tbl[slot]))
+                return (jnp.where(inside, out, y_acc), jnp.where(through == chunk_size - 1, left, leaving),
+                        after, tbl)
+
+            y_c, left_c, _, tbl_out = jax.lax.fori_loop(
+                0, segments, seg_step,
+                (jnp.zeros_like(cx), carried, jnp.int32(0), table))
+            return (left_c, tbl_out), y_c
+
+        (final_h, _), ys_h = jax.lax.scan(
+            chunk_step, (st_h, table0), (x_h, b_h, c_h, a_h, loads_b, stores_b, begun_b, adds_b))
+        return ys_h, final_h
+
+    def walk_row(x_r, b_r, c_r, a_r, st_r, given_r, entry_r, tok_r):
+        return jax.vmap(walk_head, in_axes=(0, 0, 0, 0, 0, 0, 0 if entry_r is not None else None, None))(
+            x_r, b_r, c_r, a_r, st_r, given_r, entry_r, tok_r)
+
+    entry_in = entry if entry else None
+    ys, final = jax.vmap(walk_row)(xs, bs, cs, as_, state, given, entry_in, tokens)
+    return jnp.moveaxis(ys.reshape(batch, heads, total, head_dim), 1, 2), final
+
+
+def _ssd_portable(x, b, c, a, state, forked, chunk_size: int, held: int) -> tuple[jax.Array, jax.Array]:
+    """Pure-JAX chunked SSD scan reusing `_chunk_forward` (plain and forked) so forward mode and higher-order
+    derivatives through `_chunk_scan` combine reads and decays before forming any carry with no cross-layer
+    import (rows 7874, 7875; base review e488dc198 F2, F5)."""
+    if forked is not None:
+        return _ssd_portable_forked(x, b, c, a, state, forked, chunk_size, held)
     batch, total, heads, head_dim = x.shape
     chunks, state_size = total // chunk_size, b.shape[-1]
     xs = jnp.moveaxis(x.reshape(batch, chunks, chunk_size, heads, head_dim), (1, 3), (0, 2))
