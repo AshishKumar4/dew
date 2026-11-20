@@ -971,6 +971,66 @@ def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, op
     assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} adjoint")
 
 
+def delta_before(h, q, k, v, g, beta):
+    """The delta rule correcting the state a token enters, before its decay (RWKV7's erase read):
+    `h = D h + beta k (v - k^T h)^T`, `D = exp(g)` a scalar's or each key's."""
+    del q
+    return jnp.reshape(jnp.exp(g), (-1, 1)) * h + beta * jnp.outer(k, v - k @ h)
+
+
+def update_parts(update_fn, operands) -> linear_scan.Parts:
+    """`update_fn`'s token as the rules read it (`linear_scan.parts`, its readout `gated_readout`'s) over a
+    chunk of `operands`' shapes."""
+    declaration = scan.Scan(update_fn, gated_readout, operands, walked="time",
+                            state=((KEY, VALUE), jnp.float32))
+    widths = {"key": KEY, "value": VALUE}
+    shapes = {name: jax.ShapeDtypeStruct((CHUNK, *(widths[axis] for axis in axes[1:])), jnp.float32)
+              for name, axes in operands.items()}
+    names = tuple(declaration.operands)
+    return linear_scan.parts(scan._traced(declaration, update_fn, names, shapes),
+                             scan._traced(declaration, gated_readout, names, shapes), SATURATION)
+
+
+@pytest.mark.parametrize(("update_fn", "operands", "before"), [
+    (delta_before, GATED, True), (delta_before, KIMI, True), (gated_delta_written_as_error, GATED, False),
+    (kimi_delta_written_as_error, KIMI, False)],
+    ids=["before, a head's decay", "before, a key's", "after, a head's", "after, a key's"])
+def test_a_corrections_read_before_or_after_its_decay_reaches_its_own_form(update_fn, operands, before):
+    """A delta rule's correction reading the state a token enters (`delta_before`) reaches the pre-decay
+    form (`linear_scan.Affine.corrected_before`), and one reading its decayed state the after-decay form
+    (`Affine.corrected`), neither the other's: a decay a head's commuting into the read, the after-decay
+    form priced first."""
+    assert update_parts(update_fn, operands).before == before
+
+
+@pytest.mark.parametrize("target", ["sm90", "sm86"])
+@pytest.mark.parametrize(("operands", "draw_fn"), [(GATED, gated_draw), (KIMI, kimi_draw)],
+                         ids=["a head's decay", "a key's"])
+def test_a_pre_decay_corrections_chunks_compute_their_token_scan(operands, draw_fn, target):
+    """The delta rule correcting the state a token enters (`delta_before`), its decay a head's or each
+    key's, walked in chunks through its derived forms (the dual form an H100's extraction takes, the token
+    loop an A10's): outputs and final state on par with the token scan's from float64 (check 1), the WY
+    system's decays a token back (`entering_before`, `between_before`), down to 1e-3 a token."""
+    with generation.assumed(target):
+        forms = scan.derive_scan(scan.Scan(delta_before, gated_readout, operands, walked="time",
+                                           state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+        assert_as_exact(jax.jit(gated_walk(forms, operands)), jax.jit(gated_tokenwise(delta_before)), draw_fn,
+                        f"delta_before on {target}", seeds=16)
+
+
+@pytest.mark.parametrize(("operands", "draw_fn"), [(GATED, gated_draw), (KIMI, kimi_draw)],
+                         ids=["a head's decay", "a key's"])
+def test_a_pre_decay_corrections_chunk_adjoint_is_the_token_scans_gradient(operands, draw_fn):
+    """The pre-decay delta rule's chunk adjoint (`backward`, its token update replayed, its correction read
+    before the decay), walked back: each token operand's gradient on par with the token scan's from float64
+    (check 1), its decays' through the shifted parts' rows."""
+    forms = scan.derive_scan(scan.Scan(delta_before, gated_readout, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    assert_adjoint(forms, gated_tokenwise(delta_before), ("q", "k", "v", "g", "beta"),
+                   functools.partial(chunk_of, axes=operands), draw_fn, ((TOKENS, VALUE), (KEY, VALUE)),
+                   "delta_before adjoint", 16)
+
+
 def kimi_draw_float16(seed):
     """As `kimi_draw`, each key's decay's exponent in float16 (a narrow gate's own dtype)."""
     q, k, v, g, beta = kimi_draw(seed)
