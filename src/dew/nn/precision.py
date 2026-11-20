@@ -1437,9 +1437,10 @@ def uncontracted(*values):
     from dew.nn.kernels.generation import backend
     from dew.nn.kernels.launches import interpreting
 
-    if interpreting() is False:
-        # A compiled kernel's body, whose platform is its own: a TPU's as it is, any other's barriered.
-        return values if backend() == "tpu" else jax.lax.optimization_barrier(values)
+    if (interpreted := interpreting()) is not None:
+        # A kernel's body, whose platform is its launch's: a compiled TPU kernel's as it is, any other's
+        # barriered (an interpreted body's lowers to XLA's programs, whose platform choice a body takes none).
+        return values if not interpreted and backend() == "tpu" else jax.lax.optimization_barrier(values)
     if not _MARKING.get():
         return jax.lax.optimization_barrier(values)
     return jax.lax.platform_dependent(*values, default=lambda *values: jax.lax.optimization_barrier(values),
