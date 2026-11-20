@@ -20,7 +20,7 @@ from jax.core import ShapedArray
 from numpy.lib.array_utils import normalize_axis_tuple
 
 from dew.nn.derivatives import Protected, contracted, declared_tangent
-from dew.nn.float_bits import float_bits, split_bits, widened_exactly
+from dew.nn.float_bits import cast_back, float_bits, split_bits, widened_exactly
 
 
 def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
@@ -367,13 +367,10 @@ def aligned_cotangents(terms: Sequence[Sequence[jax.Array]], cotangent: jax.Arra
 
 def _cast_back(gradient: jax.Array, held: ShapedArray) -> jax.Array | np.ndarray:
     """A widened factor's cotangent in its own factor's type `held`, as the widening's transpose returns it
-    (the cast's, its weakness kept); an integer factor's `float0`."""
+    (`float_bits.cast_back`); an integer factor's `float0`."""
     if not jnp.issubdtype(held.dtype, jnp.inexact):
         return np.zeros(held.shape, jax.dtypes.float0)
-    (back,) = jax.linear_transpose(lambda moving: moving.astype(held.dtype),
-                                   jax.ShapeDtypeStruct(held.shape, held.dtype, weak_type=held.weak_type))(
-                                       gradient)
-    return back
+    return cast_back(gradient, held)
 
 
 def _factor_cotangents(shape: tuple[tuple[int, ...], ...], spec: tuple, factors, cotangent: jax.Array,
