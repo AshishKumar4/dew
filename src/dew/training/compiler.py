@@ -87,6 +87,10 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
+UNPLACED_REFUSED = "the step fits no plan before its state is placed, planned once it is: %s"
+"""What a fresh run's search of its first step before its state is placed logs where it finds no plan
+(`StepCompiler.planned_unplaced`): once a fit (`FitRun.searched`)."""
+
 PLACED_AS_CALLED = functools.partial(placed_shapes, weak=True)
 """A host step's pass over shapes moves each leaf as its shape placed where the move would place it, weakly
 typed as the array its call takes is (`placed_shapes`'s `weak`)."""
@@ -977,7 +981,7 @@ class StepCompiler[L, E]:
         try:
             planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced)
         except PlanRefused as refused:
-            _log.info("the step fits no plan before its state is placed, planned once it is: %s", refused)
+            _log.info(UNPLACED_REFUSED, refused)
             self._unplaced = None
             return signature
         self._unplaced = Unplaced(signature, planned, compiled, keep)

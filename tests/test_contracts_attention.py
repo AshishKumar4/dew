@@ -7,7 +7,7 @@ import itertools
 import jax
 import jax.numpy as jnp
 import pytest
-from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
+from contract_support import EDGES, REVERSE_ONLY, assert_contract, assert_drawn_contract, normal_draw
 
 from dew.nn import attention, kv_cache
 from dew.nn.kernels.templates import (
@@ -196,6 +196,40 @@ def test_a_padded_merges_derivatives_are_the_laws(edge):
         return merged._value(padded, stacked, spec=spec, queries=2, width=16)[0]
 
     assert_contract(merge, (padded, stacked), direction, cotangent, f"a padded merge {edge}", plain_fn=law)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_narrowing_settle_holds_every_order(edge):
+    """`attention.narrowing_settled` (a surrogate whose derivative is its quotient's on every entry): every
+    order finite wherever float64 is a normal float32 and the plain quotient is, the quotient's own, over
+    drawn fp32 quotients of sums over a divisor of 3/2 as an fp16 output narrows them."""
+    divisor = jnp.full((9,), 1.5, jnp.float32)
+
+    def settled(out):
+        return template.narrowing_settled(out, out * divisor, divisor, jnp.float16)
+
+    def plain(out):
+        return out
+
+    def inputs(seed, scale):
+        """A seed's quotients and their direction at `scale`, and its cotangent."""
+        (out, along, cotangent) = normal_draw(seed, (9,), (9,), (9,), scale=scale)
+        return (out,), (along,), cotangent
+
+    assert_drawn_contract(settled, inputs, EDGES[edge], f"the narrowing settle {edge}", truth_fn=plain,
+                          plain_fn=plain)
+
+
+def test_a_nudged_quotient_narrows_once_and_keeps_its_tangent():
+    """`attention.narrowing_settled` at an fp16 tie it nudges: the quotient 1 + 2^-11 formed of sums
+    1 + 2^-11 - 2^-23 over a divisor 1 - 2^-24, whose exact value is below the tie, narrows to 1 as that
+    value rounds once, and its tangent along the quotient is the quotient's own, 1 (the head review of
+    fd1af38ac, F1: a nudged entry's tangent was none)."""
+    tie = jnp.float32(1 + 2.0 ** -11)
+    acc, divisor = jnp.float32(1 + 2.0 ** -11 - 2.0 ** -23), jnp.float32(1 - 2.0 ** -24)
+    settled, tangent = jax.jvp(lambda out: template.narrowing_settled(out, acc, divisor, jnp.float16), (tie,),
+                               (jnp.float32(1.0),))
+    assert settled.astype(jnp.float16) == 1.0 and tangent == 1.0
 
 
 @pytest.mark.parametrize("edge", EDGES)

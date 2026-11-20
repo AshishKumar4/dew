@@ -35,13 +35,7 @@ from flax import linen as nn
 from dew.artifacts import TokenScores
 from dew.batch import TEXT_KEY, Batch, Variables, flat_field, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
-from dew.inference.tasks import (
-    MaskedGeneration,
-    MaskedSettings,
-    recorded_files,
-    recorded_processor,
-    recorded_tokenizer,
-)
+from dew.inference.tasks import MaskedGeneration, MaskedSettings, processor_settings
 from dew.inputs import Field, InputSpec, OutsideTable
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
@@ -196,9 +190,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         return MaskedSettings(seq_len=self.seq_len, max_new_tokens=self.seq_len, process=self.process,
                               solver=self.solver, sampling_steps=self.steps, block=self.block,
                               eos_token_ids=self.eos_token_ids,
-                              tokenizer=recorded_tokenizer(self.processor),
-                              tokenizer_files=recorded_files(self.processor),
-                              processor=recorded_processor(self.processor))
+                              **processor_settings(self.processor))
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))

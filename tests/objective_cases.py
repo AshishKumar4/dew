@@ -65,8 +65,9 @@ def diffusion(preset=None, objective="diffusion", **fields) -> DiffusionRunConfi
 
 
 def with_teacher(kind):
-    """A distilled diffusion kind over the recipe's model, inputs and data,
-    its teacher the recipe's own objective at initialization."""
+    """A distilled diffusion kind over the recipe's model, inputs and data, its teacher the recipe's own
+    objective at initialization, and the first batch it trains on: none for guidance distillation, whose
+    student the recipe's denoiser cannot be (it carries no guidance input)."""
     config = diffusion(guidance=None, ema_decay=None)
     base = config.build()
     drawn = nn.unbox(base.init(jax.random.key(0)))
@@ -83,7 +84,9 @@ def with_teacher(kind):
         "guidance_distillation": lambda: GuidanceDistillationObjective(
             *shared, variables={TEACHER: drawn}, steps=2),
     }[kind]()
-    return built, first(config.data, built)
+    # The recipe's denoiser carries no guidance input, which guidance distillation trains into: that case is
+    # built for its key alone, no batch (`test_trace_keys.built_objectives`).
+    return built, None if kind == "guidance_distillation" else first(config.data, built)
 
 
 def preference_pairs():

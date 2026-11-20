@@ -666,10 +666,14 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                else kept(split.own, anchor_multipliers(hooks.drop, anchors), form.units))
         acc = algebra.split_output(split.others, own, value_rows)
         # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`), a dropping
-        # call's over the rest of its multiplier too, in the one division (`algebra.dropped_total`).
+        # call's over the rest of its multiplier too, in the one division (`algebra.dropped_total`), stored as
+        # the finish stores it (`algebra.settled_store`), in XLA.
         total = rows[1] if not form.headroom else power2(rows[1], -split.shift, reach=TWO_FACTOR_REACH)
-        out = algebra.output_of(*algebra.dropped_total(form, acc, total),
-                                guarded=form.guarded or hooks.initial is not None)
+        dropped, divisor = algebra.dropped_total(form, acc, total)
+        out = algebra.output_of(dropped, divisor, guarded=form.guarded or hooks.initial is not None,
+                                held=form.largest)
+        stored = dataclasses.replace(form, narrowed=algebra.narrowed_of(q.dtype), registered=False)
+        out = algebra.settled_store(stored, out, dropped, divisor, hooked=hooks.output_mod is not None)
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None
 
@@ -735,7 +739,8 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                            dropped=1.0 if hooks.drop is None else hooks.drop.bound,
                            # Its sums hold the reach: no state beside a walk of no headroom (`refused`).
                            units=sums_units(hooks.drop, headroom=algebra.headroom(weights),
-                                                    initial=hooks.initial is not None))
+                                                    initial=hooks.initial is not None),
+                           largest=algebra.largest_of(weights, hooks))
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     hooked = _hooked_of(hooks, call, unit)
     if scales is not None:
@@ -1500,7 +1505,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             if interpret:
                 total = family.stored_row(total, row_smem)
             def ratio(block: jax.Array) -> jax.Array:
-                taken = algebra.quotient(lambda held: held * factor[:, None], block, total)
+                taken = algebra.quotient(lambda held: held * factor[:, None], block, total, held=spec.largest)
                 return jnp.where(factor[:, None] != 0, taken, 0.0)
 
             kept = state.acc.scaled(ratio)
@@ -1838,6 +1843,10 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
     # A value of the keys' columns names its block statically (`_Program.value_columns`), no index read.
     block = (None if column_width is None or value_columns is not None
              else jnp.full((1,), (columns or 0) // column_width, jnp.int32))
+    # An output narrowed to 16 bits settles at its overflow midpoint (`algebra.Forward.narrowed`); an fp32
+    # call's parts' (`parts`) stays fp32.
+    spec = dataclasses.replace(spec, narrowed=None if training or parts > 1
+                               else algebra.narrowed_of(out_dtype or query.dtype), registered=True)
     return _launched(query, key, value,
                      _Read(spans, hooked, anchors, None if table is None else table[0],
                            None if walks is None else walks.blocks, sources, block, into, kept=keeping),

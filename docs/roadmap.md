@@ -29,11 +29,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - 3.12:tests/test_per_shard.py#test_a_kernel_runs_per_shard[gated_delta_rule-mosaic_gpu-fsdp] took 613 s (a check-1 site: its longest draws task 550 s (1 draws),…. [7604]
 - A decode step's query and output pass through grouped_rows' transpose ([B,T,KV,G,D] to [B,T,G,KV,D] and back, attention.py:1113-1128) and a pad to the launch's…. [7926]
 - Attention tests to the bible's §6 and §7 test rules. [8437]
-- Certification's stored verdict is keyed by Dew's whole package digest (report._verdict_key: package_digest beside the launch identity, config, direction, the…. [8650]
 - Tests/ring_protocol.py:422-435 reads gathered.Gathers' bodies by their fields (fill, fill_wait, read events written by hand) and test_ring_protocol.py:557-568…. [8657]
 - Tests/ring_protocol.py:838-839 accepts a read of an entries parity whose contents are a stale step's. [8678]
 - Tests/test_gemm_gather.py:200-242 (the strided-table gathers kernel) duplicates tests/test_ring_protocol.py:382-424's gathered walk fixture. [8679]
-- A launch's certification traces it a second time. [8720]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -92,7 +90,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [5292]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353]
 - A device-plan search whose devices hold no plan walks the whole remat/head ladder before refusing. [8541]
-- The diffusion kinds' starts keep no record and their refits trace again. [6297]
 - The BFC bound places a step's non-aliased outputs beside its temporaries at XLA's raw sizes (memory.placed_beside: stats.output - stats.alias), where each…. [8792]
 
 ## RL and serving
@@ -109,9 +106,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - The merge law's derivative programs nearly doubled since the base review's fixes. [8427]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Py `_holds_regions`: 'any other holder of a program (a manual mesh's, a native kernel's) is an opaque leaf'), so a projection mapped per shard…. [6578]
-- TPU attention precision, sinks and VMEM. [8729, 9660]
 - Bit-level synthesis in dew.algebra. [3733]
 - The merge law's placed sum keeps two bands of a term's span, not three. [8061]
+- TPU attention precision, sinks and VMEM. [8729]
 - Global logical-axis registry (nn/sharding.py:197,608) -> Flax per-parameter partition metadata. [429]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - Tests #28: Hold rsLoRA gradients to PEFT's measured error without a floor. [676]
@@ -123,6 +120,10 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every model comparison on check 1. [2300, 3722, 5212]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 - Check 2's ratio contract reads the law's bound looser than its spec states. [7980]
+
+## Decision
+
+- Decision and config. [9691]
 
 ## Tutorials and docs
 
