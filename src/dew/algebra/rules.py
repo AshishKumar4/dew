@@ -504,6 +504,7 @@ def _moved_scales() -> tuple[RuleFamily, ...]:
     rounding, and dev time measures which is kept."""
     x, y, s, t = vars_("x y s t", Term)
     params, laid, scaled, spread = vars_("params laid scaled spread", i64)
+    extent = var("extent", Vec[i64])
     families = []
     for op, scale_of in (("mul", lambda v, s: v * s), ("div", lambda v, s: v / s)):
         moved = []
@@ -515,11 +516,12 @@ def _moved_scales() -> tuple[RuleFamily, ...]:
             after = target.binary(op, s.shaped("broadcast_in_dim", spread), scaled)
             written, made = (before.dot(y, params), x.dot(after, params)) if on_left else (
                 x.dot(before, params), after.dot(y, params))
+            # The other operand's extent bound first: a rule's actions look up no function's value.
             moved.append(rule(
                 eq(t).to(written), matrix_product(params), plain(scaled), matrix(x), matrix(y),
-                along(laid, i64(0 if on_left else 1)),
-                eq(spread).to(lifted(shape(target), i64(0 if on_left else 1)))).then(
-                union(t).with_(made), set_(shape(s.shaped("broadcast_in_dim", spread))).to(shape(target))))
+                along(laid, i64(0 if on_left else 1)), eq(extent).to(shape(target)),
+                eq(spread).to(lifted(extent, i64(0 if on_left else 1)))).then(
+                union(t).with_(made), set_(shape(s.shaped("broadcast_in_dim", spread))).to(extent)))
         families.append(RuleFamily(
             f"a {'scale' if op == 'mul' else 'divisor'} along a contraction moved to the other operand",
             tuple(moved), (lambda x, s, y, scale_of=scale_of: jnp.dot(scale_of(x, s[None, :]), y),
