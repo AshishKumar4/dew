@@ -729,12 +729,6 @@ def test_a_turned_forked_calls_cancelling_entry_write_is_as_exact_as_each_docume
                          f"xla {TURNED} a forked call's cancelling entry writes", seeds=160)
 
 
-LEVELS_FORMS = [pytest.param(HOOKS[4], id='delta-rule'), pytest.param(FORMED[4], id='ssd')]
-"""The forms whose forked calls the cancelling levels take on the portable math's walk: the gated delta rule
-and Mamba2's SSD (the TPU's selected scan takes the SSD's at its own chunks, test_ssd_kernel's
-`documents_as_selected`)."""
-
-
 def levels_entered_draw(hooks, seed: int):
     """`entered_draw`'s forked call under `hooks` whose documents' entry writes are `CANCELLING_LEVELS`'
     (`contract_support.cancelling_entries`, its cotangents too), nothing else written, decayed or skipped,
@@ -756,14 +750,15 @@ def levels_entered_draw(hooks, seed: int):
     return drawn, (hosted(entries.signed(operands.value.shape)), hosted(entries.signed(final)))
 
 
-@pytest.mark.parametrize('hooks', LEVELS_FORMS)
-def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact(hooks):
-    """A forked call of each form (`LEVELS_FORMS`) on the portable math's walk whose documents' entry writes
-    are three levels cancelling beside float32's largest (`levels_entered_draw`): its output, the row's last
-    memory and its entry keys', values' and weights' gradients held by check 1 against each document a
-    sequence of its own the recurrence a token at a time in float64, rounded once (exact, so the walk must
-    be: a write summed in some order dropped a level at its tie as its negative survived, an ulp here and inf
-    at float32's largest, row 8757; rows 8840, 9463, 9480)."""
+def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact():
+    """A forked call of the gated delta rule (`HOOKS[4]`) on the portable math's walk whose documents' entry
+    writes are three levels cancelling beside float32's largest (`levels_entered_draw`): its output, the
+    row's last memory and its entry keys', values' and weights' gradients held by check 1 against each
+    document a sequence of its own the recurrence a token at a time in float64, rounded once (exact, so the
+    walk must be: a write summed in some order dropped a level at its tie as its negative survived, an ulp
+    here and inf at float32's largest, row 8757; rows 8840, 9480). The SSD's are its TPU scan's
+    (test_ssd_kernel's levels cells), as the rated scan's selector routes them there."""
+    hooks = HOOKS[4]
 
     def leaves(walk):
         def run(operands, seeded):
