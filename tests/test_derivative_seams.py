@@ -22,6 +22,25 @@ def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
                         plain_fn=jnp.abs)
 
 
+def test_the_contract_holds_the_orders_a_case_takes_alone():
+    """A case naming the orders it holds (`taking`, row 9077) holds those alone, off training's mesh and on
+    it: a custom VJP, whose forward-mode orders do not run, holds its primal and its reverse derivative; a
+    name of no order, taken or left out, is refused."""
+    @jax.custom_vjp
+    def doubled(x):
+        return 2 * x
+
+    doubled.defvjp(lambda x: (2 * x, None), lambda _, g: (2 * g,))
+    x = (jnp.asarray([1.0, -3.0], jnp.float32),)
+    direction = (jnp.ones((2,), jnp.float32),)
+    cotangent = jnp.ones((2,), jnp.float32)
+    assert_contract(doubled, x, direction, cotangent, "a custom VJP's reverse derivative",
+                    taking=("primal", "vjp"))
+    for named in ({"taking": ("jvp of grads",)}, {"without": ("vjp twice",)}):
+        with pytest.raises(ValueError):
+            assert_contract(doubled, x, direction, cotangent, "a misnamed order", **named)
+
+
 def split_dot(seed, scale):
     """A split sum's draw (`_summed_over_the_mesh`): two vectors of 1024 at `scale`, their directions, and a
     cotangent, each stream salted apart (row 8464: seeds seed, seed + 1 and seed + 2 made one seed's
