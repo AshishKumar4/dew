@@ -330,7 +330,7 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
         if equation.primitive is not merged.merged_padded_p:
             continue
         padded_aval, stacked_aval = equation.invars[0].aval, equation.invars[1].aval
-        if (isinstance(padded_aval, jax.core.ShapedArray) and isinstance(stacked_aval, jax.core.ShapedArray)
+        if (isinstance(padded_aval, jaxpr_core.ShapedArray) and isinstance(stacked_aval, jaxpr_core.ShapedArray)
                 and stacked_aval.dtype == jnp.float32):
             merges.append(merged.launch_work(
                 equation.params["spec"], jax.ShapeDtypeStruct(padded_aval.shape, padded_aval.dtype),
