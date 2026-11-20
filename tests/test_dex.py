@@ -131,13 +131,6 @@ def folded(variables):
     return {**variables, "params": unflatten_dict(flat)}
 
 
-def traced_wide(tree):
-    """`tree`'s floating leaves in float64 inside a traced function, where `widened`'s numpy cannot read
-    them."""
-    return jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
-                        else leaf, tree)
-
-
 def loads(trains: str = "all", dtype: str = "float32"):
     """The source and the source with DEX on layer 0's heads 1 and 3 (`HEADS`), each loaded computing
     and storing in `dtype`."""
@@ -209,7 +202,7 @@ def exported_site(directory: Path, dtype: str):
     live = jax.jit(lambda variables, ids, _: loaded.model.apply(variables, ids).astype(jnp.float32))
     return (reloaded, live,
             moved_draw(loaded.variables, loaded.model.features_per_head),
-            jax.jit(lambda variables, ids, _: wide.apply(traced_wide(variables), ids)))
+            jax.jit(lambda variables, ids, _: wide.apply(variables, ids)))
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
@@ -288,7 +281,7 @@ def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():
                     seeds=SEEDS["dex at the anneal's start"],
                     truth_fn=jax.jit(lambda variables, ids, _: wide.apply(widened(source.variables), ids)))
     through = jax.jit(lambda variables, ids, _: source.model.apply(folded(variables), ids))
-    wide_through = jax.jit(lambda variables, ids, _: wide.apply(folded(traced_wide(variables)), ids))
+    wide_through = jax.jit(lambda variables, ids, _: wide.apply(folded(variables), ids))
     for updates in (10, None):
         assert_as_exact(stepped(updates), through, draw, "dex through the decoder",
                         seeds=SEEDS["dex through the decoder"], truth_fn=wide_through)
@@ -308,13 +301,10 @@ def test_dex_trains_through_the_decoder_as_its_folded_output_projection():
                 if "layers_0" in key and (key[-1] in ("dex_lambda", "dex_projection")
                                           or key[-2] in ("k_proj", "v_proj", "o_proj"))}
 
-    def gradients(forward, wide: bool = False):
+    def gradients(forward):
+        # The float64 route's weights and cotangent are the gate's widened draw, its gradients float64 too.
         @jax.jit
         def run(variables, ids, cotangent):
-            # The float64 route differentiates its widened weights, its gradients float64 too.
-            if wide:
-                variables, cotangent = traced_wide(variables), traced_wide(cotangent)
-
             def loss(params):
                 return jnp.sum(forward({**variables, "params": params}, ids) * cotangent)
             return kept(jax.grad(loss)(variables["params"]))
@@ -323,7 +313,7 @@ def test_dex_trains_through_the_decoder_as_its_folded_output_projection():
     extended = gradients(loaded.model.apply)
     through = gradients(lambda variables, ids: source.model.apply(folded(variables), ids))
     wide = source.model.clone(dtype=jnp.float64)
-    wide_through = gradients(lambda variables, ids: wide.apply(folded(variables), ids), wide=True)
+    wide_through = gradients(lambda variables, ids: wide.apply(folded(variables), ids))
     assert_as_exact(extended, through, draw, "dex gradients through the decoder",
                     seeds=SEEDS["dex gradients through the decoder"], truth_fn=wide_through)
     found = extended(*draw(0))
@@ -365,7 +355,7 @@ def scanned_site():
 
     wide = mid_anneal(plain.clone(dtype=jnp.float64))
     return (mid_anneal(every_layer(scan_layers=True)), mid_anneal(plain), draw,
-            jax.jit(lambda variables, tokens: wide(traced_wide(variables), tokens)))
+            jax.jit(lambda variables, tokens: wide(variables, tokens)))
 
 
 def test_layers_that_choose_their_own_heads_scan_and_pipeline_as_one_run():
