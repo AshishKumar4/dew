@@ -23,7 +23,7 @@ from dew.nn.inputs import sequence_blocks
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
-from dew.nn.precision import accumulated, at_least_fp32, float32_einsum
+from dew.nn.precision import accumulated, at_least_fp32, exact_products, float32_einsum
 from dew.nn.scatter import DROPPED
 
 
@@ -136,7 +136,8 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
                               precision=precision)
     batch, length, heads, rank = absorbed.shape
     dtypes = tuple(jnp.dtype(x.dtype) for x in (absorbed, query_rot, latent, rot))
-    case = SparseCase(heads, rank, query_rot.shape[-1], indices.shape[-1], dtypes, batch * length)
+    case = SparseCase(heads, rank, query_rot.shape[-1], indices.shape[-1], dtypes, batch * length,
+                      batch * latent.shape[1], scale, precision)
     if select(SPARSE, case).kernel == 'template':
         context = templated_context(scale, precision, block)(absorbed, query_rot, latent, rot, indices)
     else:
@@ -182,7 +183,8 @@ def blocked_context(absorbed, query_rot, latent, rot, indices, *, scale: float, 
 class SparseCase:
     """A sparse latent attention call as its selector reads it (`SPARSE`): its `heads`, each over a latent
     `rank` wide and a rope head `rope` wide, the `top_k` slots each query selects, its four operands'
-    `dtypes`, and its `rows`, a row a query (`TEMPLATE_SPARSE_SUPPORTS`' 'tiles' plans them)."""
+    `dtypes`, its `rows` (a row a query), its `pool_keys` (`B * T`), its `scale`, and its dot `precision`
+    (`TEMPLATE_SPARSE_SUPPORTS`)."""
 
     heads: int
     rank: int
@@ -190,6 +192,9 @@ class SparseCase:
     top_k: int
     dtypes: tuple[jnp.dtype, ...]
     rows: int
+    pool_keys: int
+    scale: float
+    precision: object = None
 
 
 def _template_tiles(case: SparseCase) -> bool:
@@ -202,7 +207,7 @@ def _template_tiles(case: SparseCase) -> bool:
     dtype = case.dtypes[0]
     width = case.rank + case.rope
     query = jax.ShapeDtypeStruct((case.rows, 1, case.heads, width), dtype)
-    pool = jax.ShapeDtypeStruct((1, case.rows * case.top_k, 1, width), dtype)
+    pool = jax.ShapeDtypeStruct((1, case.pool_keys, 1, width), dtype)
     table = jax.ShapeDtypeStruct((case.rows, case.top_k), jnp.int32)
     derived = []
 
@@ -210,7 +215,7 @@ def _template_tiles(case: SparseCase) -> bool:
         lengths = jnp.full((case.rows,), case.top_k, jnp.int32)
         spans = template.spans(1, case.top_k, case.rows, lengths=lengths)
         derived.append(attention_decode.planned(query, pool, pool[..., :case.rank], spans, template.Hooks(),
-                                                table=table)[0])
+                                                scale=case.scale, table=table)[0])
         return query
 
     jax.eval_shape(planned, query, pool, table)
@@ -221,6 +226,9 @@ TEMPLATE_SPARSE_SUPPORTS: tuple[Requirement[SparseCase], ...] = (
     Requirement('dtype',
                 lambda case: len(set(case.dtypes)) == 1 and case.dtypes[0] in (jnp.bfloat16, jnp.float16),
                 lambda case: f"the template's decode reads matching 16-bit operands, not {case.dtypes}",
+                row=INHERENT),
+    Requirement('precision', lambda case: exact_products(case.precision, case.dtypes[0]),
+                lambda case: f"the template's decode runs exact 16-bit products, not {case.precision}",
                 row=INHERENT),
     Requirement('tiles', _template_tiles,
                 lambda case: f"the attention template's decode derives no launch over {case.top_k} selected "

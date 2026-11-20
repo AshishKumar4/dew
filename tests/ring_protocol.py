@@ -991,6 +991,7 @@ class _Order:
         self.committing: dict = {}
         self.fills: dict = {}
         self.stored: list = [[] for _ in threads]
+        self.product_threads: dict[int, int] = {}
 
     def arrived(self, at, clock, *, counted: bool, transaction: int) -> None:
         joined, count, flying = self.accumulating.get(at, ({}, 0, 0))
@@ -1003,16 +1004,15 @@ class _Order:
 
     def ordered(self, at, clock, event, *, write: bool, thread: int | None = None) -> None:
         # Two tcgen05 products issued by the same warp are serialized by the tensor core pipeline.
-        def same_pipeline(prior_event: Event, prior_clock: dict | None, prior_thread: int | None) -> bool:
+        def same_pipeline(prior_event: Event, prior_thread: int | None) -> bool:
             if event.kind != "product" or prior_event.kind != "product" or thread is None:
                 return False
-            if prior_thread is not None:
-                return prior_thread == thread
-            return any(key[0] == "completed" and key[1] == thread for key in (prior_clock or ()))
+            issuer = prior_thread if prior_thread is not None else self.product_threads.get(id(prior_event))
+            return issuer == thread
 
         for where, prior, prior_event in self.writes:
             if _overlaps(where, at) and not _before(prior, clock):
-                if same_pipeline(prior_event, prior, None):
+                if same_pipeline(prior_event, None):
                     continue
                 raise Violation(
                     "unordered", f"{event.kind} of {at} unordered with the {prior_event.kind} of {where}",
@@ -1021,7 +1021,7 @@ class _Order:
         flying += [entry for products in self.committed for entry, done in products if done is None]
         for entry_kind, _, prior_event, _, (prior_thread, _), _ in flying:
             if entry_kind == "product" and prior_event.at and _overlaps(prior_event.at, at):
-                if same_pipeline(prior_event, None, prior_thread):
+                if same_pipeline(prior_event, prior_thread):
                     continue
                 said = (f"{event.kind} of {at} while the {prior_event.kind} writing {prior_event.at} "
                         "is in flight")
@@ -1029,7 +1029,7 @@ class _Order:
         if write:
             for where, prior, prior_event in self.reads:
                 if _overlaps(where, at) and not _before(prior, clock):
-                    if same_pipeline(prior_event, prior, None):
+                    if same_pipeline(prior_event, None):
                         continue
                     raise Violation(
                         "unordered", f"write of {at} unordered with the read of {where} before it",
@@ -1039,7 +1039,7 @@ class _Order:
             # write.
             for _, where, prior_event, _, (prior_thread, _), _ in flying:
                 if _overlaps(where, at):
-                    if same_pipeline(prior_event, None, prior_thread):
+                    if same_pipeline(prior_event, prior_thread):
                         continue
                     said = f"write of {at} while the {prior_event.kind} reading {where} is in flight"
                     raise Violation("unordered", said, [(None, prior_event), (None, event)])
@@ -1056,6 +1056,7 @@ class _Order:
                 if product[1] is None:
                     _, source, read, issued, key, _ = product[0]
                     product[1] = _joined(issued, {("completed", *key): 1})
+                    self.product_threads[id(read)] = key[0]
                     self.reads.append((source, product[1], read))
                     if read.at and key not in written:
                         written.add(key)

@@ -117,11 +117,11 @@ def test_the_selection_attends_as_the_masked_expanded_reference():
 
 def test_the_template_reads_the_selection_as_the_masked_expanded_reference():
     """On an A100, the attention template's decode loads each query's selected latents into its key tiles
-    (`SPARSE`'s 'template', interpreted here), three queries of one row at a latent 32 wide and a rope head
+    (`SPARSE`'s 'template', interpreted here), two rows of two queries at a latent 32 wide and a rope head
     32, bf16: forward and every input gradient on par with the expanded reference under the selection's
-    mask (check 1), a query whose causal set is smaller than k reading its named slots alone (row
-    9023)."""
-    length, top_k = 3, 2
+    mask (check 1), exercising both batch page offsets and a query whose causal set is smaller than k
+    reading its named slots alone (row 9023)."""
+    length, top_k = 2, 2
 
     def pulled(attend):
         # The operands' gradients under the drawn cotangent, through the gate's pullback.
@@ -133,7 +133,7 @@ def test_the_template_reads_the_selection_as_the_masked_expanded_reference():
     sparse, dense = attending(length, rope=32)
     with generation.assumed("sm80"), generation.chosen(sparse_attention="template"):
         assert_as_exact(pulled(sparse), pulled(dense),
-                        selection_draw(length, top_k, cotangent=True, dtype=jnp.bfloat16, batch=1, rank=32,
+                        selection_draw(length, top_k, cotangent=True, dtype=jnp.bfloat16, batch=2, rank=32,
                                        rope=32),
                         'templated selection', seeds=SEEDS['templated selection'])
 
