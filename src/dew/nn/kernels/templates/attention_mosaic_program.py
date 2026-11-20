@@ -21,6 +21,7 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import (
+    after_walk,
     attention_algebra as algebra,
     axes,
     bundles,
@@ -497,13 +498,18 @@ def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups:
     its scores, weights or cotangents across warps) and its `reducing_warpgroups`' scratch
     (`resources.Scope`)."""
     scoped, streams, *after = allocations
+    after_walks = tuple(after[0]) if after else ()
+    if after_walk.uses_over_rings(family, after_walks, over_rings=over_rings):
+        added, rest, _ = after_walk.over_rings_plan(streams, after_walks)
+        held, walks = family.lifetimes(rest)
+        return resources.Scope(program=(scoped, *family.product_held(products), *added, *held),
+                               walks=walks, after=(), reduces=reduces,
+                               reducing_warpgroups=reducing_warpgroups,
+                               addresses=family.product_addresses(products))
     held, walks = family.lifetimes(streams)
-    tiles = tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ()))
-    # The tiles after the walks over the rings' slots where the launch asks it and its family stages them so
-    # (`Family.scoped`'s `over_rings`, `stages_over_rings`).
-    over = held if tiles and over_rings and family.stages_over_rings and not family.walks_scoped else ()
-    return resources.Scope(program=(scoped, *family.product_held(products), *(() if over else held)),
-                           walks=walks, after=tiles, over=over, reduces=reduces,
+    tiles = tuple((tile.shape, tile.dtype) for tile in after_walks)
+    return resources.Scope(program=(scoped, *family.product_held(products), *held),
+                           walks=walks, after=tiles, reduces=reduces,
                            reducing_warpgroups=reducing_warpgroups,
                            addresses=family.product_addresses(products))
 
