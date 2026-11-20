@@ -409,3 +409,23 @@ def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
     for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(jax.device_get(moved.variables["params"])),
                         strict=True):
         np.testing.assert_array_equal(new, old)
+
+
+def test_a_model_with_no_stacked_run_asks_nothing_of_its_optimizers_update(monkeypatch):
+    """A step whose model holds no stacked run its backward could update (`_stage_runs`) plans no update in
+    the backward and never traces its optimizer's update to ask whether it could (`leaf_local`; row 6740: a
+    finetune's step traced a whole update it then discarded, a second of every compile)."""
+    from dew.data.dataset import Loader
+    from dew.objectives.supervised import Supervised
+    from dew.training import transaction
+
+    def asked(*args, **kwargs):
+        raise AssertionError("a model with no stacked run asked whether its update is leaf-local")
+
+    monkeypatch.setattr(transaction, "leaf_local", asked)
+    rows = 2 * jax.device_count()
+    batch = {"x": np.ones((rows, 8), np.float32), "y": np.zeros((rows, 4), np.float32)}
+    data = Loader(train=lambda partition: iter([batch] * 2), val=None, batch=rows, records=None)
+    objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
+    assert int(Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0)).fit(data, steps=1,
+                                                                               log_every=100).step) == 1
