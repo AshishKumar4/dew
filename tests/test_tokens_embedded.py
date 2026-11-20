@@ -307,6 +307,29 @@ def test_a_training_batch_whose_media_fill_ids_past_the_table_trains_and_one_its
     assert outside(raised) == (PLACEHOLDER + 9, ROWS)
 
 
+@pytest.mark.parametrize("made", ["grpo", "ppo", "dpo", "dpo-halved"])
+def test_a_policy_or_preference_runs_ids_are_bounded_by_its_models_table(made):
+    """A GRPO, PPO or DPO run's `input_ids` rows (a policy's packed rows, a preference's windows or its
+    halves a row) declare the model's embedding table as an LM run's text does, so a batch holding an id
+    past it is refused before scoring, naming the id and the table's rows, and one within it passes, where
+    the policy and preference objectives declared an unbounded field and its gather read NaN (row 9018)."""
+    from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective
+    from dew.objectives.rl.ppo import ValueHead
+
+    objective = {"grpo": lambda: GRPOObjective(short(), SEQ_LEN),
+                 "ppo": lambda: PPOObjective(short(), SEQ_LEN, critic=ValueHead(short())),
+                 "dpo": lambda: DPOObjective(short(), SEQ_LEN),
+                 "dpo-halved": lambda: DPOObjective(short(), SEQ_LEN, segments=1)}[made]()
+    inputs = objective.inputs
+    assert inputs is not None
+    rows = np.ones((2, *inputs.sample.shape), np.int32)
+    inputs.bounded({"input_ids": rows})
+    rows.reshape(-1)[-1] = ROWS
+    with pytest.raises(OutsideTable) as raised:
+        inputs.bounded({"input_ids": rows})
+    assert outside(raised) == (ROWS, ROWS)
+
+
 def test_a_masked_run_whose_mask_id_is_outside_its_models_table_is_refused_as_its_objective_is_made():
     """A masked diffusion objective places its mask id inside the compiled step, where no host check of a
     batch sees it, so an objective whose mask id its model's table holds no row for is refused as it is
