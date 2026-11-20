@@ -558,15 +558,15 @@ def refuse_redrawn(model: nn.Module, strategy: Strategy | None) -> None:
                          f"{model.draws_alone}: this decoder draws a token a row at a time (Sample)")
 
 
-def _refuse_closed_holes(model: nn.Module, real: np.ndarray) -> None:
+def refuse_closed_holes(model: nn.Module, real: np.ndarray, closing: str) -> None:
     """Refuse a prompt with a hole between its real tokens (`real`, the host's) for a decoder that draws a
-    token a row at a time (`DrawsAlone`, whose state steps by its tokens' adjacency, a hole breaking it)
-    where a LongRoPE crossing rebuilds a row from its ids alone, the holes closed (`_rebuilt`)."""
+    token a row at a time (`DrawsAlone`), whose state steps by its tokens' adjacency, a hole breaking it,
+    where `closing` (a LongRoPE rebuild's replay, `_rebuilt`; a server's prefill) reads the row's ids with
+    its holes closed."""
     held = np.cumsum(real, axis=1) > 0
-    if isinstance(model, DrawsAlone) and rebuild_position(model) is not None and np.any(
-            real[:, 1:] & ~real[:, :-1] & held[:, :-1]):
-        raise ValueError(f"a LongRoPE rebuild replays a row's ids with its holes closed, and "
-                         f"{model.draws_alone}: a prompt with a hole between its real tokens is refused")
+    if isinstance(model, DrawsAlone) and np.any(real[:, 1:] & ~real[:, :-1] & held[:, :-1]):
+        raise ValueError(f"{closing} reads a row's ids with its holes closed, and {model.draws_alone}: a "
+                         "prompt with a hole between its real tokens is refused")
 
 
 def _refuse_generation(model: nn.Module) -> None:
@@ -1022,7 +1022,8 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
     fields = {name: jax.tree.map(local_rows, value) for name, value in inputs.token_fields.items()}
     refuse_prefix(model, prefix, longest=None)
     real = real_slots(fields, ids.shape, xp=np)
-    _refuse_closed_holes(model, real)
+    if rebuild_position(model) is not None:
+        refuse_closed_holes(model, real, "a LongRoPE rebuild")
     fields = with_served_blocks(fields, real, prefix)
     conditioning = {name: local_rows(value, host=False) for name, value in inputs.conditioning.items()}
     if "params" not in params:

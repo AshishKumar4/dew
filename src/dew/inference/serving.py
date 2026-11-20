@@ -162,7 +162,15 @@ from dew.nn.visibility import with_served_blocks
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample, Speculative, Strategy
-from dew.sampling.text import Generation, Sampling, check_inputs, decoded_rows, rebuild_position, resolve
+from dew.sampling.text import (
+    Generation,
+    Sampling,
+    check_inputs,
+    decoded_rows,
+    rebuild_position,
+    refuse_closed_holes,
+    resolve,
+)
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""
@@ -1150,6 +1158,7 @@ class Server:
         spelling = None if processor is None else (lambda token: processor.spelling([token]))
         valid = check_inputs(self.model, ids, fields, budget, self.sampling, 1, capacity=self.capacity,
                              spelling=spelling).astype(bool)
+        refuse_closed_holes(self.model, valid, "a server's prefill")
         if positions is not None and (positions.shape != valid.shape or not np.array_equal(
                 positions[valid], (np.cumsum(valid, axis=1) - 1)[valid])):
             raise ValueError("a served prompt cannot carry noncanonical positions")

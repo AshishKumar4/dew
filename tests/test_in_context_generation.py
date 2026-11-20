@@ -256,7 +256,8 @@ def test_an_adapting_run_draws_what_its_saved_task_draws(tmp_path):
 def test_a_server_draws_what_its_adapting_task_draws():
     """A server of an adapting decoder's task (`Server.from_task`), two slots for three requests so a
     slot a finished request held seats another, draws each request's tokens as the task alone does: a
-    seated row's levels start from the run's, its chain the cache's own row (row 9066)."""
+    seated row's levels start from the run's, its chain the cache's own row (row 9066). A prompt with a
+    hole between its real ids, which its prefill would close, is refused."""
     from dew.inference.serving import Server
 
     model = InContextDecoder(plain(jnp.float32), ChunkAdaptation(window=3, rate=0.1))
@@ -272,6 +273,11 @@ def test_a_server_draws_what_its_adapting_task_draws():
         served, alone = ticket.result().host(), task(prompt[None], length, key=index).host()
         np.testing.assert_array_equal(served.tokens, alone.tokens)
         np.testing.assert_array_equal(served.lengths, alone.lengths)
+    # A server prefills a prompt's real ids alone, a hole between them closed, which a target would cross.
+    holed = ModelInputs(jnp.asarray([[1, 2, 3]], jnp.int32),
+                        {VALIDITY_FIELD: jnp.asarray([[True, False, True]])})
+    with pytest.raises(ValueError):
+        server.submit(holed, 3, key=0)
 
 
 def test_the_decoder_answers_its_models_generation_hooks():

@@ -1202,10 +1202,12 @@ class Exposing(Protocol):
 @runtime_checkable
 class Selective(Protocol):
     """A decoder that scores one position per row instead of them all, so its
-    prefill runs the head only on the slot the first draw reads."""
+    prefill runs the head only on the slot the first draw reads; its prediction
+    states beside the logits, or None for a decoder that keeps none, whose decode
+    steps carry none (`dew.sampling.strategies.DecoderState.hidden`)."""
 
     def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: ModelKwarg
-                             ) -> tuple[jax.Array, jax.Array]: ...
+                             ) -> tuple[jax.Array | None, jax.Array]: ...
 
 
 @runtime_checkable

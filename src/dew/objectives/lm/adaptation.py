@@ -929,9 +929,9 @@ class InContextDecoder(nn.Module):
                              attention_mask=None, right_padded: bool = False, coordinates=None, **fields):
         """No prediction states and the logits at `slots` alone, one a row (`[rows]`) or `[rows, K]`
         (`dew.nn.protocols.Selective`): a prefill's, whose first draw reads one slot a row, keeps each read
-        slot's states past the levels and runs the head over those alone. Its states are a draft's, which a
-        decoder of no prediction depths gives none of (`CausalTransformer.states_and_logits_at`'s), and a
-        decoder drawing a row at a time drafts nothing (`DrawsAlone`): its decode steps carry none."""
+        slot's states past the levels and runs the head over those alone. Its prediction states would be a
+        draft's, and a decoder drawing a row at a time drafts nothing (`DrawsAlone`): it exposes none, so
+        its decode steps carry none."""
         laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, valid=attention_mask,
                                  positions=positions, right_padded=right_padded)
         wanted = jnp.asarray(slots, jnp.int32).reshape(tokens.shape[0], -1)
