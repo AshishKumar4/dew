@@ -1313,16 +1313,33 @@ def test_a_narrow_float_widens_as_it_converts(source):
     np.testing.assert_array_equal(found[~np.isnan(expected)], expected[~np.isnan(expected)])
 
 
-def test_an_aligned_sums_shared_float32_factor_takes_its_gradient_summed_wide():
+@pytest.mark.parametrize(("lanes", "gradient"), [((2.0 ** 140, -(2.0 ** 140)), 0.0),
+                                                ((2.0 ** 140, -(2.0 ** 140) + 2.0 ** 100), 2.0 ** 100)],
+                         ids=["cancelling", "past float32 alone"])
+def test_an_aligned_sums_shared_float32_factor_takes_its_gradient_summed_wide(lanes, gradient):
     """The gradient in a float32 `a` shared by a batch of aligned sums `aligned_sum([(a, b)])` (`jax.vmap`
-    over float64 `b` of `2^140` and `-2^140`), with x64 on, summed over the batch: 0, each cotangent in
-    float64 through the batch's sum and cast once, where each was cast to float32 first, infinite, and
-    their sum NaN (base review 279405f7f F1)."""
+    over float64 `b` of `2^140` and `-2^140`, or `-2^140 + 2^100`), with x64 on, summed over the batch: 0 and
+    `2^100`, each cotangent in float64 through the batch's sum and cast once, where each was cast to float32
+    first, infinite, and their sum NaN (base reviews 279405f7f F1, 7eccb9f88 F4)."""
     with jax.enable_x64(new_val=True):
-        b = jnp.asarray([2.0 ** 140, -(2.0 ** 140)], jnp.float64)
-        gradient = jax.grad(lambda a: jnp.sum(jax.vmap(lambda b: aligned_sum([(a, b)]))(b)))(jnp.float32(1.0))
-    assert gradient.dtype == jnp.float32
-    np.testing.assert_array_equal(np.asarray(gradient), 0.0)
+        b = jnp.asarray(lanes, jnp.float64)
+        found = jax.grad(lambda a: jnp.sum(jax.vmap(lambda b: aligned_sum([(a, b)]))(b)))(jnp.float32(1.0))
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), np.float32(gradient))
+
+
+def test_an_explicit_float64_widens_as_jax_resolves_it():
+    """`widened_exactly` of a float64 `2^140` to float64 with x64 off and JAX's explicit 64-bit dtypes allowed
+    (`jax_explicit_x64_dtypes`): the float64 itself, the destination as JAX resolves the request, where
+    read as x64's default policy it narrowed to float32's infinity (base review 7eccb9f88 F1)."""
+    held = jax.config.jax_explicit_x64_dtypes
+    jax.config.update("jax_explicit_x64_dtypes", "allow")
+    try:
+        x = jnp.asarray(2.0 ** 140, dtype=np.float64)
+        found = widened_exactly(x, np.float64)
+    finally:
+        jax.config.update("jax_explicit_x64_dtypes", held)
+    assert found.dtype == np.float64 and float(found) == 2.0 ** 140
 
 
 def test_a_host_scalar_widens_at_its_destination():

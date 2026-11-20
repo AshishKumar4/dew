@@ -791,8 +791,9 @@ def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
     @_protected
     def wide(*operands):
         with jax.enable_x64(new_val=True):
-            reduced = reduction(*(operand.astype(jnp.float64) if operand.dtype == jnp.float32 else operand
-                                  for operand in operands))
+            # Widened from its bits, where XLA:CPU's cast flushes a subnormal (`widened_exactly`).
+            reduced = reduction(*(widened_exactly(operand, jnp.float64) if operand.dtype == jnp.float32
+                                  else operand for operand in operands))
             return tuple(term.astype(jnp.float32) if term.dtype == jnp.float64 else term for term in reduced)
 
     return tuple(jax.lax.platform_dependent(*operands, cpu=wide, default=lambda *operands: tuple(
