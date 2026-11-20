@@ -1230,27 +1230,6 @@ def test_a_site_draws_its_second_stage_for_every_reference_it_compares(tmp_path,
     assert [json.loads(line)["stage"] for line in log.read_text().splitlines()] == [2, 2]
 
 
-def test_a_site_draws_its_second_stage_for_every_reference_it_compares(tmp_path, monkeypatch):
-    """Dew's squared error 2.6 on even seeds and 0.1 on odd ones against a reference of the same errors (its
-    ratio 1 at every seed, a pass at the first stage) and a further one of error 1 (inconclusive over 8
-    seeds): the further reference draws the second stage, and the site draws it for both, each judged on
-    the 40 seeds, where the first comparison stopped at its 8 and its added rows went unjudged (spec
-    alignment, 9006)."""
-    from check1_judge import STAGES_LOG
-
-    dew, reference, errors, truth = _set_errors(2.6, 0.1)
-
-    @as_given
-    def alike(x, mine, theirs):
-        return {"y": x + mine}
-
-    log = tmp_path / "stages.jsonl"
-    monkeypatch.setenv(STAGES_LOG, str(log))
-    assert_as_exact(dew, alike, errors, "staged together", seeds=8, truth_fn=truth,
-                    also={"constant": reference})
-    assert [json.loads(line)["stage"] for line in log.read_text().splitlines()] == [2, 2]
-
-
 def test_a_leafs_interval_is_widened_to_hold_its_ratio():
     """A percentile interval that leaves out its own ratio is widened to hold it before any verdict: a
     ratio over PARITY under an interval wholly at or under it is no pass, and a ratio that is not a
