@@ -248,12 +248,13 @@ def test_a_biased_layers_reverse_mode_holds_its_cotangent_once(layer):
 
         trained = {name: params[name] for name in live}
         program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(trained, x).jaxpr
-        return [sorted(var.aval.shape for var in eqn.invars) for eqn in equations(program)
+        # Each barrier's operands by size: a bias's cotangent is held shaped as the product broadcasts it.
+        return [sorted(var.aval.size for var in eqn.invars) for eqn in equations(program)
                 if eqn.primitive is jax.lax.optimization_barrier_p]
 
-    kernel, bias = params["kernel"].shape, params["bias"].shape
-    assert held(("kernel", "bias")) == [sorted([x.shape, kernel, bias])]
-    assert held(("kernel",)) == [sorted([x.shape, kernel])]
+    kernel, bias = params["kernel"].size, params["bias"].size
+    assert held(("kernel", "bias")) == [sorted([x.size, kernel, bias])]
+    assert held(("kernel",)) == [sorted([x.size, kernel])]
     assert held(()) == []
 
 
