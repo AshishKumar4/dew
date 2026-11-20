@@ -1374,6 +1374,22 @@ def test_an_exact_widenings_transpose_keeps_its_sources_type_outside_x64():
     assert jax.typeof(pulled).weak_type
 
 
+@pytest.mark.mesh(devices=2)
+def test_an_exact_widenings_transpose_keeps_its_sources_placement():
+    """The gradient through `widened_exactly` of a float32 split over its rows by an Explicit axis of two
+    devices, widened to float64 under x64: the float32 ones, placed as the source is, where the transpose's
+    source rebuilt from its shape and dtype alone lost the placement (review of cbb640145 F1)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("rows",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    split = NamedSharding(mesh, PartitionSpec("rows", None))
+    with jax.set_mesh(mesh), jax.enable_x64(new_val=True):
+        x = jax.device_put(np.ones((4, 3), np.float32), split)
+        gradient = jax.jit(jax.grad(lambda x: jnp.sum(widened_exactly(x, jnp.float64))))(x)
+    assert gradient.dtype == jnp.float32 and jax.typeof(gradient).sharding.spec == PartitionSpec("rows", None)
+    np.testing.assert_array_equal(np.asarray(gradient), np.ones((4, 3), np.float32))
+
+
 def test_a_host_scalar_widens_at_its_destination():
     """`widened_exactly` of a Python integer past int32 (`2^40`) to float32 with x64 off is float32's
     `2^40`, converted at its destination, where staging it as int32 first raised (base review 279405f7f
