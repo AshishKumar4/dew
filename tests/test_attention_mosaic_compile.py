@@ -372,6 +372,38 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize(("generation_name", "width"), [("sm80", 64), ("sm90", 256), ("sm100", 256)])
+def test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resources(generation_name, width):
+    """Row 7263: a public fp32 decode whose head width or GPU falls back to Pallas-Triton plain-forward
+    kernels (`attention_route.attend`: sm80 64-wide, sm90/sm100 256-wide) reports every Triton kernel's
+    shared bytes, registers, spills and TMEM usage through `compile_mosaic_kernels` / `mosaic_failures` with
+    zero unread fields."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_route
+
+    rows, keys = 2, 4096
+    query = jax.ShapeDtypeStruct((rows, 1, 32, width), jnp.float32)
+    key = jax.ShapeDtypeStruct((rows, keys, 8, width), jnp.float32)
+    spans = template.spans(1, keys, rows, causal=False)
+
+    def decode(query, key, value):
+        return attention_route.attend(query, key, value, spans, natural=False)
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels([KernelCase("decode", lambda: (decode, (query, key, key)))],
+                                       generation_name)
+    kernels = found[0]["kernels"]
+    assert kernels and all(k["kind"] == "triton" for k in kernels), kernels
+    names = {k["kernel"] for k in kernels}
+    assert "attention_forward" in names and "attention_forward_scaled" in names, names
+    assert all(not k["unread"] for k in kernels), kernels
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)
+
+
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("page", [16, 1])
 @pytest.mark.parametrize("generation_name", GATED)
 def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, page):
