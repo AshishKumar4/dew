@@ -466,7 +466,7 @@ def test_a_delta_product_decode_token_is_as_exact_as_its_recurrence():
         operands = (hosted(0.3 * normal((rows, heads, keys, values))), hosted(normal((rows, heads, keys))),
                     hosted(unit(normal((rows, 3, heads, keys)))), hosted(normal((rows, 3, heads, values))),
                     hosted(-softplus(normal((rows, heads)))), hosted(sigmoid(normal((rows, 3, heads)))))
-        return operands, (hosted(normal((rows, heads, values))), hosted(normal((rows, heads, keys, values))))
+        return *operands, (hosted(normal((rows, heads, values))), hosted(normal((rows, heads, keys, values))))
 
     def stepped(state, query, key, value, log_decay, beta):
         token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
