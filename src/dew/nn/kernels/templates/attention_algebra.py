@@ -949,15 +949,22 @@ def settled(state: Partial) -> Partial:
     return Partial(joined(state.acc, low.acc), state.m, joined(state.total, low.total), state.scale)
 
 
+def saturated(x: jax.Array, finite_operands: jax.Array) -> jax.Array:
+    """`x` saturated at its float dtype's largest magnitude where `finite_operands` holds and `x` overflowed
+    it (row 6882): one owner shared by `base2_maximum` and `raw_maximum`; a quotient's hold is its values'
+    dtype's (`quotient`, `attention.mean_held`), past fp32's largest the same."""
+    largest = jnp.finfo(x.dtype).max
+    return jnp.where(infinite(x) & finite_operands,
+                     jnp.where(x > 0, largest, -largest).astype(x.dtype), x)
+
+
 def base2_maximum(m: jax.Array) -> jax.Array:
     """A natural initial maximum (a sink's logit, a partial's) in base 2, `m * log2(e)`, saturated at fp32's
     largest where that product passes it. Exact as far as any key reads it: a folded logit is at most fp32's
     largest less an ulp (`Forward.base2`), so a maximum past fp32's largest in base 2 exceeds every key's
     by over an ulp there, 2^104, as its saturation does, and every key's weight is zero under either, the
     state's own one; one past its negative is below every key's alike."""
-    folded = m * LOG2E
-    largest = float(jnp.finfo(jnp.float32).max)
-    return jnp.where(infinite(folded) & finite(m), jnp.sign(m) * largest, folded)
+    return saturated(m * LOG2E, finite(m))
 
 
 def raw_maximum(m: jax.Array, scale: float) -> jax.Array:
@@ -965,9 +972,7 @@ def raw_maximum(m: jax.Array, scale: float) -> jax.Array:
     saturated at fp32's largest where that quotient passes it, as `base2_maximum` saturates: a raw product is
     finite, so a maximum past fp32's largest exceeds every key's and weighs them all zero, as its saturation
     does."""
-    raw = m / np.float32(scale)
-    largest = float(jnp.finfo(jnp.float32).max)
-    return jnp.where(infinite(raw) & finite(m), jnp.sign(m) * largest, raw)
+    return saturated(m / np.float32(scale), finite(m))
 
 
 def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Partial:

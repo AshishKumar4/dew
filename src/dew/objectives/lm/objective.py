@@ -68,13 +68,7 @@ from dew.batch import (
 )
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
-from dew.inference.tasks import (
-    Processor,
-    TextSettings,
-    recorded_files,
-    recorded_processor,
-    recorded_tokenizer,
-)
+from dew.inference.tasks import Processor, TextSettings, processor_settings
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.looping import exit_objective
 from dew.nn.continuum import feedforward_levels
@@ -895,9 +889,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return TextSettings(seq_len=self.seq_len,
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
                             sampling=self.sampled(Sampling() if samples is None else samples.sampling),
-                            tokenizer=recorded_tokenizer(self.processor),
-                            tokenizer_files=recorded_files(self.processor),
-                            processor=recorded_processor(self.processor), prefix=self.prefix)
+                            **processor_settings(self.processor), prefix=self.prefix)
 
     def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
         """Refuse a batch's blocks where no trunk layer reads them, where prediction depths would read

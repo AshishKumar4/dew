@@ -638,7 +638,27 @@ class KernelOp(tokamax.Op):
         # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them; its
         # kernels carry it in their names, so a compile's reports name it (`report.launching`).
         with report.launching(self, ba, config):
-            return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
+            awaiting = report.awaiting()
+            if awaiting is None:
+                return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
+            return self._captured(ba, config, awaiting)
+
+    def _captured(self, ba: tokamax.BoundArguments, config: Hashable, awaiting: tuple):
+        """The launch's call where its certification awaits it (`report.awaiting`): traced once into its
+        program's jaxpr at its operands' own abstract values (a shard's in a shard_map), which certification
+        replays and compiles aside (`report.capture`), and that jaxpr evaluated here, its equations bound into
+        the program as the call's own trace binds them (a custom derivative's rule kept as its equation)."""
+        from jax.extend import core as jax_core
+
+        arrays, fill = programs.holes((ba.args, ba.kwargs), lambda leaf: isinstance(leaf, jax.Array))
+
+        def launched(*values):
+            args, kwargs = fill(values)
+            return self._fwd(*args, config=config, **kwargs)[0]
+
+        closed, shapes = jax.make_jaxpr(launched, return_shape=True)(*arrays)
+        report.capture(awaiting, closed)
+        return jax.tree.unflatten(jax.tree.structure(shapes), jax_core.jaxpr_as_fun(closed)(*arrays))
 
     def exhausted(self, ba: tokamax.BoundArguments) -> report.Exhausted:
         """The refusal of a call of `ba` no config holds (`taken` None): none fits, or certification refused

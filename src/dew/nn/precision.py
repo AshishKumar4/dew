@@ -2036,7 +2036,7 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     tiny = jnp.finfo(product.dtype).tiny
     once = product * first
     kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
-    return jnp.where(kept, once * second, product * second * first)
+    return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)  # no cotangent unchosen
 
 
 @_protected

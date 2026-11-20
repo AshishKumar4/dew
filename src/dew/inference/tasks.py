@@ -16,11 +16,13 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import inspect
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self, TypedDict, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -31,6 +33,7 @@ from flax.core import freeze
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
+from dew import _records
 from dew._cache import persist_compilations
 from dew._coordination import agreed
 from dew._files import is_uri, staged
@@ -95,6 +98,8 @@ if TYPE_CHECKING:
     from dew.quantization import Quantization
     from dew.registry import ModelConfig
 
+_log = logging.getLogger(__name__)
+
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Conversation = Sequence[Mapping[str, object]]
 """One conversation's messages, each a mapping of its role and content, as a chat template reads them."""
@@ -126,6 +131,7 @@ def length_ladder(top: int, smallest: int, rungs: int) -> tuple[int, ...]:
     return tuple(sorted({max(min(smallest, top), top >> step) for step in range(rungs)}))
 
 
+@runtime_checkable
 class Processor(Protocol):
     """Interface for a loaded source's host processor, which prepares requests and decodes tokens.
 
@@ -405,7 +411,7 @@ class SavedRun:
         persist_compilations()
         with Checkpoints(directory) as checkpoints:
             step = checkpoints.pinned(step)
-            import_trusted(checkpoints.artifact(step), trust)
+            import_trusted(scanned_artifact(checkpoints.artifact(step)), trust)
             record = saved_artifact(checkpoints, step)
         if record is None:
             raise ValueError("this checkpoint's objective declares no inference record; declare "
@@ -888,6 +894,13 @@ class TaskSettings:
     tokenizer_files: Mapping[str, str] | None = dataclasses.field(default=None, metadata={ADDED: True})
     """What the run tokenizer is: each of its files' hash (`recorded_files`), which the files a load finds
     where `tokenizer` says they are must hash to; None where a run recorded none, as runs before it."""
+    custom: JSON = dataclasses.field(default=None, hash=False, metadata={ADDED: True})
+    """A processor of the user's own, its class record (`recorded_custom`: a dataclass, or a class of Dew's
+    or a trusted package's, by its import path and constructor fields), which a load builds under the
+    packages it trusts (`saved_custom`), so the reloaded task takes the text and chat the live one took (row
+    9065); `{"unrecorded": reason}` for one no record describes, which a run loads without, naming why; None
+    for a run tokenizer's or a source's. The record, not the live processor: a run's settings are its
+    record's."""
 
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:
@@ -1064,13 +1077,106 @@ def recorded_processor(processor: Processor | None) -> SourceReference | None:
     return processor.source if isinstance(processor, SourceProcessor) else None
 
 
+def scanned_artifact(record: JSON | Mapping[str, object]) -> JSON | Mapping[str, object]:
+    """A run's inference record as a load's eager import scan reads it (`dew.registry.import_trusted`):
+    its own processor's record (`TaskSettings.custom`, a top-level field) left out, whose strings are its
+    user's data; its classes import where the registry reaches them."""
+    match record:
+        case Mapping():
+            return {key: value for key, value in record.items() if key != "custom"}
+        case _:
+            return record
+
+
+def recorded_custom(processor: Processor | None) -> JSON:
+    """The record `TaskSettings.custom` keeps of a host `processor` of the user's own: its class record
+    (`dew.registry.to_record`: a dataclass, a class of Dew's or a trusted package's, by its import path and
+    constructor fields); `{"unrecorded": reason}` where no class record describes it (a class an import path
+    names none of, a field no record carries, a constructor its record's keywords build none of), which a
+    run saves without, as before, the load naming why; None for a run tokenizer's adapter or a source's
+    processor, a subclass of either among them, which their own readers rebuild as their base adapter, over
+    the run's held tokenizer or the source's files (`recorded_tokenizer`, `recorded_processor`)."""
+    from dew.registry import Unrecordable, class_record, to_record
+
+    if processor is None or isinstance(processor, RunProcessor) or recorded_processor(processor) is not None:
+        return None
+    try:
+        record = to_record(processor, Processor | None)
+    except Unrecordable as refused:
+        return {"unrecorded": f"{type(processor).__qualname__}: {refused}"}
+    named = class_record(record) if isinstance(record, Mapping) else None
+    if named is None:
+        return {"unrecorded": f"{type(processor).__qualname__}: its record is no class record: {record!r}"}
+    try:
+        # The registry builds a class from its record's fields as keywords: a constructor that takes them
+        # otherwise (a required `InitVar`, a positional-only argument) would refuse its rebuild.
+        inspect.signature(type(processor)).bind(**named[1])
+    except TypeError as refused:
+        return {"unrecorded": f"{type(processor).__qualname__}: its record's fields build none: {refused}"}
+    return record
+
+
+def saved_custom(record: JSON) -> Processor | None:
+    """The processor of the user's own a run's record keeps (`TaskSettings.custom`): built from its class
+    record under the packages the load trusts (`dew.registry.owned_built`), a processor (`Processor`); None
+    where it kept none or none was recorded (`{"unrecorded": ...}`, `unrecorded_custom`), its reason said
+    once a process, whichever load reads it (a run's, an export's)."""
+    from dew.registry import owned_built
+
+    if (reason := unrecorded_custom(record)) is not None:
+        _said_unrecorded(reason)
+    if record is None or reason is not None:
+        return None
+    built = owned_built(record, called=True, what="a run's processor")
+    if not isinstance(built, Processor):
+        raise ValueError(f"a run's processor record builds a {type(built).__qualname__}, no processor "
+                         f"(`dew.inference.tasks.Processor`)")
+    return built
+
+
+@functools.cache
+def _said_unrecorded(reason: str) -> None:
+    """Say once a process why a run's own processor was not recorded (`saved_custom`)."""
+    _log.warning("this run's own processor was not recorded, so its task takes its run tokenizer's or "
+                 "source's processor where it had one, else token ids alone: %s", reason)
+
+
+def unrecorded_custom(record: JSON) -> str | None:
+    """Why a run's processor of the user's own went unrecorded (`recorded_custom`), or None where it was
+    recorded or the run had none."""
+    if record is None:
+        return None
+    fields = _records.record(record, "custom")
+    return _records.text(fields["unrecorded"], "unrecorded") if set(fields) == {"unrecorded"} else None
+
+
+class ProcessorSettings(TypedDict):
+    """The task settings' fields that record a run's host processor (`processor_settings`)."""
+
+    tokenizer: str | None
+    tokenizer_files: Mapping[str, str] | None
+    processor: SourceReference | None
+    custom: JSON
+
+
+def processor_settings(processor: Processor | None) -> ProcessorSettings:
+    """The task settings' fields that record a run's host `processor` (`TaskSettings`): where its run
+    tokenizer is and what it is, a source's processor, or a processor of the user's own (`recorded_custom`),
+    each None where it is not that: what every objective's `task_settings` records alike."""
+    return {"tokenizer": recorded_tokenizer(processor), "tokenizer_files": recorded_files(processor),
+            "processor": recorded_processor(processor), "custom": recorded_custom(processor)}
+
+
 def _saved_processor(settings: TaskSettings, config: ModelConfig, run: str) -> Processor | None:
     """Build the run's host processor: the checkpoint's own, reloaded from the
-    source it recorded beside `config`'s model, or its run tokenizer (`dew.data.text.tokenizer_for`, the
-    copy the run holds)."""
+    source it recorded beside `config`'s model, the user's own its record rebuilt (`TaskSettings.custom`),
+    or its run tokenizer (`dew.data.text.tokenizer_for`, the copy the run holds)."""
     from dew.data.text import tokenizer_for
     from dew.interop.pretrained import load_processor
 
+    custom = saved_custom(settings.custom)
+    if custom is not None:
+        return custom
     if settings.processor is not None:
         return load_processor(settings.processor, config.build())
     if settings.tokenizer is None:

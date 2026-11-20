@@ -15,7 +15,7 @@ import math
 import time
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -34,9 +34,6 @@ from dew.nn.derivatives import Activation, Algebra, KernelGlue, Surrogate, marke
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 from dew.nn.programs import called, control_flow, inlined, live, with_bodies
-
-if TYPE_CHECKING:
-    from dew.nn.kernels import tuning
 
 
 @dataclasses.dataclass(frozen=True)
@@ -920,14 +917,11 @@ def _opened(jaxpr: jcore.Jaxpr, spans: list[_Span] | None = None) -> jcore.Jaxpr
 
 @dataclasses.dataclass(frozen=True)
 class _Body:
-    """A body's rewrite as `_closed` holds it: its program (None where nothing changed), and what its rewrite
-    reported (its routes, its launches, the facts it read, its regions' rewrites), replayed where it is
-    written again."""
+    """A body's rewrite as `_closed` holds it: its program (None where nothing changed), what its rewrite
+    reported (`fusion.Recorded`), replayed where it is written again, and its regions' rewrites."""
 
     made: jcore.Jaxpr | None
-    routes: tuple
-    launches: tuning.Seen
-    reads: Mapping
+    record: fusion.Recorded
     rewrites: tuple
 
 
@@ -951,7 +945,6 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         return closed
     from dew._cache import KERNEL_CHOICES
     from dew.algebra import derive
-    from dew.nn.kernels import tuning
 
     rewrites = _REWRITTEN.setdefault(closed, {})
     # With kernels, the context the substitutions are decided in too (the derivation's: the mesh, the target
@@ -962,20 +955,16 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     key = (_deriving(accurate, saturation), kernels,
            (derive.context(), KERNEL_CHOICES.value, kernel_report.refusal_entries()) if kernels else None)
     held = rewrites.get(key)
-    reused = held is not None and generation.still(held.reads)
+    reused = held is not None and held.record.still()
     if held is None or not reused:
-        with (generation.routes(alone=True) as routes, tuning.seen() as seen, generation.recording() as reads,
-              kernel_report.recording() as recorded):
-            made = _rewritten(closed, accurate, saturation, kernels)
-        held = rewrites[key] = _Body(None if made is closed else made, tuple(routes), seen.held(), reads,
-                                     tuple(recorded.rewritten))
+        with kernel_report.recording() as regions:
+            made, record = fusion.recorded(lambda: _rewritten(closed, accurate, saturation, kernels))
+        held = rewrites[key] = _Body(None if made is closed else made, record, tuple(regions.rewritten))
     body = held
-    # Its routes, launches and facts reported where it is written, as its rewrite reported them, and on a
-    # reuse its regions' reports too, so a report around the program holds the body's however often it is
-    # written (`fusion._traced`'s, a region's).
-    generation.reported(body.routes)
-    tuning.noted(body.launches)
-    generation.replay(body.reads)
+    # Reported where it is written, as its rewrite reported it, and on a reuse its regions' reports too, so a
+    # report around the program holds the body's however often it is written (`fusion._traced`'s, a
+    # region's).
+    body.record.replay()
     if reused:
         for made_report in body.rewrites:
             kernel_report.record_rewrite(dataclasses.replace(made_report, reused=True))
