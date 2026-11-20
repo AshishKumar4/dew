@@ -41,6 +41,7 @@ from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
+    attention_algebra as algebra,
     attention_decode,
     attention_mosaic,
     attention_portable,
@@ -1277,6 +1278,65 @@ def test_a_mean_of_an_infinite_value_stays_infinite_through_the_hold():
     opposite = template.reference(query, jnp.zeros((1, 2, 1, 8), jnp.float16),
                                   jnp.concatenate([inf, -inf], axis=1), two)
     assert bool(jnp.all(alone == jnp.inf)) and bool(jnp.all(jnp.isnan(opposite)))
+
+
+NARROWING_TIES = {
+    "float16": [65520.0, 1.5 * 2.0 ** -14 + 2.0 ** -25, 3 * 2.0 ** -25, 2.0 ** -25, 1000.25, -65520.0],
+    "bfloat16": [(2 - 2.0 ** -8) * 2.0 ** 127, 1 + 2.0 ** -8, -(1 + 3 * 2.0 ** -8) * 2.0 ** 100,
+                 (1 + 2.0 ** -8) * 2.0 ** -126],
+}
+"""Points exactly between two neighbouring values of each 16-bit dtype, which a narrowing ties to even: fp16's
+overflow midpoint, ties among its subnormals and the least (half its least subnormal), a normal one and a
+negative one; bf16's overflow midpoint, normal ties of either sign and one at its least normal."""
+
+
+@pytest.mark.parametrize("dtype", NARROWING_TIES, ids=NARROWING_TIES.keys())
+def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
+    """Sums over a divisor whose fp32 quotient rounds onto a 16-bit tie (`NARROWING_TIES`), and the sums an
+    fp32 ulp either side of the tie's product with the divisor and on it where exact: the settled quotient
+    (`algebra.narrowing_settled`) narrows to `dtype` as the exact quotient rounds once, to the tie's nearer
+    neighbour where it is not the tie and to the even one where it is, where the fp32 quotient's second
+    rounding took a quotient below fp16's overflow midpoint to inf (row 9544), and so at the overflow
+    midpoint does a register epilogue's settle of it alone (`algebra.midpoint_settled`); a held quotient,
+    past the one it stands for, as it is. Each divisor a drawn fp32 value from 2^-6 to 2^6, the expectation
+    the float64 quotient's side of the tie (two fp32 values' quotient lies on a tie in float64 only where it
+    is one)."""
+    narrow = jnp.dtype(dtype)
+    rng = np.random.default_rng([9544, len(dtype)])
+    ties = np.asarray(NARROWING_TIES[dtype], np.float64)
+    # Drawn divisors and one just below 1, whose tie's product rounds so the quotient lies off it.
+    divisors = np.append(np.float32(np.ldexp(1 + rng.random(64), rng.integers(-6, 7, 64))),
+                         np.float32(1 - 2.0 ** -24))
+    tie, divisor = (np.ravel(x) for x in np.meshgrid(ties, divisors, indexing="ij"))
+    divisor = divisor.astype(np.float32)
+    centre = np.float32(tie * divisor)
+    acc = np.concatenate([np.nextafter(centre, -np.inf), centre, np.nextafter(centre, np.inf)])
+    divisor, tie, centre = (np.tile(x, 3) for x in (divisor, tie, centre))
+    # A tie's product with a divisor past fp32's largest is no sum a quotient of the tie has, and one below
+    # fp32's least normal a sum XLA's CPU flushes (row 4023).
+    finite = np.isfinite(centre) & np.isfinite(acc) & (np.abs(acc) >= np.finfo(np.float32).tiny)
+    acc, divisor, tie = acc[finite], divisor[finite], tie[finite]
+    rounded = np.asarray(jnp.asarray(acc) / jnp.asarray(divisor))
+    settled = algebra.narrowing_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
+    found = np.asarray(settled.astype(narrow).astype(jnp.float32), np.float64)
+    exact = acc.astype(np.float64) / divisor.astype(np.float64)
+
+    def narrowed(x):
+        return np.asarray(jnp.asarray(np.float32(x)).astype(narrow).astype(jnp.float32), np.float64)
+
+    # The tie's neighbours, an fp32 value either side of it narrowed once; the even one, the tie narrowed.
+    nearer, further = (narrowed(np.nextafter(np.float32(tie), np.float32(np.sign(tie) * side)))
+                       for side in (0.0, np.inf))
+    expected = np.where(exact == tie, narrowed(tie), np.where(np.abs(exact) < np.abs(tie), nearer, further))
+    np.testing.assert_array_equal(found, expected)
+    largest = jnp.finfo(narrow).max
+    midpoint = np.abs(tie) > largest
+    alone = algebra.midpoint_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
+    found = np.asarray(alone.astype(narrow).astype(jnp.float32), np.float64)
+    np.testing.assert_array_equal(found[midpoint], expected[midpoint])
+    held = algebra.narrowing_settled(jnp.float32(jnp.finfo(narrow).max), jnp.float32(65522.0),
+                                     jnp.float32(1.0), narrow)
+    assert held == jnp.finfo(narrow).max
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
