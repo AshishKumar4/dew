@@ -381,6 +381,11 @@ class Region[Node: (Term, Skeleton)]:
         return _interned(self.params, (self.products, self.made), self.indexed, primitive, values, operands,
                          made)
 
+    @functools.cached_property
+    def made_by(self) -> dict[int, Opaque[Node]]:
+        """Each leaf an equation outside the language makes (`opaque`), by its index, that equation."""
+        return {leaf: opaque for opaque in self.opaque for leaf in opaque.outputs}
+
     def shape(self, term: Node) -> tuple[int, ...]:
         """`term`'s shape as its equation states it, a term of the region's: the one lookup of the shapes its
         terms carry (`shapes`, `extents` by `key`)."""
