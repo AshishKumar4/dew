@@ -1278,9 +1278,9 @@ def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
     neighbour where it is not the tie and to the even one where it is, where the fp32 quotient's second
     rounding took a quotient below fp16's overflow midpoint to inf (row 9544), and so at the overflow
     midpoint does a register epilogue's settle of it alone (`algebra.midpoint_settled`); a held quotient,
-    past the one it stands for, as it is. Each divisor a drawn fp32 value from 2^-6 to 2^6, the expectation the float64
-    quotient's side of the tie (two fp32 values' quotient lies on a tie in float64 only where it is
-    one)."""
+    past the one it stands for, as it is. Each divisor a drawn fp32 value from 2^-6 to 2^6, the expectation
+    the float64 quotient's side of the tie (two fp32 values' quotient lies on a tie in float64 only where it
+    is one)."""
     narrow = jnp.dtype(dtype)
     rng = np.random.default_rng([9544, len(dtype)])
     ties = np.asarray(NARROWING_TIES[dtype], np.float64)

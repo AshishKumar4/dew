@@ -52,6 +52,7 @@ from dew.nn.kernels.templates.attention import (
     drops_in_place,
     kept,
     mean_held,
+    narrowing_settled,
     within,
 )
 from dew.nn.precision import float32_einsum, lowered_divide, power2, scalar_power2, two_product, two_sum
@@ -1966,32 +1967,6 @@ def narrowed_of(dtype: DTypeLike) -> DTypeLike | None:
     return dtype if jnp.dtype(dtype).itemsize == 2 else None
 
 
-def narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
-    """`out`, the sums `acc` over `divisor` (fp32), as their quotient rounded to odd where it narrows to the
-    16-bit `dtype`: the quotient rounded to nearest, and where that lands exactly between two values of
-    `dtype` (`_between`) and is not the exact quotient, one fp32 ulp toward it, so the narrowing rounds once
-    as the exact quotient would: the exact output 65519.9995 of one kept key of 65504 rounded to fp32's
-    65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544). The side is the sign of
-    `acc` less the quotient times `divisor`, both exact (`two_product`'s bit split, no splitter to pass fp32's
-    largest at bf16's midpoint; `acc` less the product's rounded part exact by Sterbenz, the two within a
-    factor of two). `out` as it is where the quotient is not within its ulp of it (a held, guarded or
-    flushed one: `quotient`). The bound left at fp32's resolution, as the fp32 reference's: `divisor` is
-    the one rounded (a dropping call's total times its multiplier's rest, `dropped_total`), and the sums
-    and exponentials before it round as the reference's do, so an exact output within their rounding of
-    a boundary may narrow past it."""
-    divisor = expand(divisor, acc)
-    rounded = acc / divisor
-    high, low = two_product(rounded, divisor, bit_split=True)
-    above = (acc - high) - low
-    bits = jax.lax.bitcast_convert_type(rounded, jnp.int32)
-    # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side.
-    toward = jnp.where((above > 0) == (rounded > 0), 1, -1).astype(jnp.int32)
-    odd = jax.lax.bitcast_convert_type(bits + toward, jnp.float32)
-    settled = jnp.where(_between(bits, dtype) & (above != 0), odd, rounded)
-    close = jnp.abs(out - rounded) <= jnp.abs(rounded) * np.float32(2.0 ** -23)
-    return jnp.where(close, settled, out)
-
-
 def midpoint_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
     """`narrowing_settled` at `dtype`'s overflow midpoint alone (its largest and half an ulp, the one tie
     whose narrowing turns a finite output to inf), at a row's cost, where a whole tile's settle costs
@@ -2009,22 +1984,6 @@ def midpoint_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: 
     below = (jnp.abs(acc) - expand(high, acc)) < expand(low, acc)
     within = (jnp.abs(out) == midpoint) & below
     return jnp.where(within, jnp.where(out > 0, nearer, -nearer), out)
-
-
-def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
-    """Whether each fp32 value of `bits` (its int32 bits) lies exactly between two neighbouring values of the
-    16-bit `dtype`, the tie its narrowing rounds to even: the significand bits the narrowing drops (16 of
-    bf16's, 13 of fp16's normals, more below its least normal, 2^-14) are a one and zeros."""
-    found = jnp.finfo(dtype)
-    exponent = jnp.right_shift(bits, 23) & 0xFF
-    significand = (bits & 0x7FFFFF) | jnp.where(exponent > 0, 0x800000, 0)
-    dropped = 23 - (found.nmant)
-    if found.minexp > -126:
-        # Below the dtype's least normal its narrowing drops a bit more a binade, down to the significand's
-        # whole 24 (half the least subnormal, 2^-25 in fp16, its last tie).
-        dropped = dropped + jnp.clip(127 + found.minexp - exponent, 0, 24 - dropped)
-    half = jnp.left_shift(1, dropped - 1)
-    return (significand & (2 * half - 1)) == half
 
 
 def inverse(total: jax.Array) -> jax.Array:
