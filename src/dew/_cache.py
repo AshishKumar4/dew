@@ -390,6 +390,12 @@ DERIVED = _context(default_value=False)
 hand-written ones, keyed on as `ALGEBRA` is: a program traced under one set of forms is never run under the
 other, and check 1 drives both (docs/design/algebra.md §6.9)."""
 
+BARRIERED = _context(default_value=False)
+"""Whether precision's error-free transforms hold their operands behind an optimization barrier where the
+running jaxlib marks their arithmetic uncontracted instead (`dew.nn.precision.rounding_alone`), keyed on as
+`ALGEBRA` is: the suite runs the barrier path on a lane whose jaxlib marks (row 8378), and a program traced
+on one path is never run on the other."""
+
 WHOLE = _context(default_value=False)
 """Whether a model runs its layer stack and sequences whole (`dew.nn.sharding.whole`), keyed on as `ALGEBRA`
 is: a trace reads it, so JAX's trace context holds it, and a program traced whole is never run staged."""
