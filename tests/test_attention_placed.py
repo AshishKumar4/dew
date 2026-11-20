@@ -209,7 +209,7 @@ def test_two_consumers_with_distinct_queries_on_tcgen05s_rows_match_reference_in
         return template.reference(query, key, value, template.spans(256, 128, 1))
 
     assert_as_exact(jax.jit(ours), jax.jit(theirs), draw,
-                    "two-consumer tcgen05.rows distinct Q in TMEM", seeds=4)
+                    "two-consumer tcgen05.rows distinct Q in TMEM", seeds=SEEDS)
 
 
 def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
