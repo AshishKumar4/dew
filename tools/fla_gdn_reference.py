@@ -6,12 +6,12 @@ GPU, forward and every gradient, at each site tests/fla_sites.py names, over the
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla> <unit> <site>...
     PYTHONPATH=src:tests:tools python tools/fla_gdn_reference.py --merge <unit>...
 
-on a GPU, Dew's environment recording and a second Python with torch and fla-core (`--serve`, the
-"fla" cohort, tools/reference_releases.py) running fla and its reference, each run a unit of named sites
-(`--list` names them all), the units then merged. What lands is tests/fixtures/fla/gdn_seeded.npz (fla's
-simple GLA's sites in simple_gla_seeded.npz, `fla_sites.SIMPLE_RECORDED`), a summary recording (`record_case(..., summary=True)`): per site, seed and
-leaf, fla's distance from float64 at the site's inputs, which the test draws again (`Site.arrays`), and the
-truth's sketch, which Dew's float64 token recurrence is held to.
+on a GPU, Dew's environment recording and a second Python with torch and fla-core (`--serve`, the "fla"
+cohort, tools/reference_releases.py) running fla and its reference, each run a unit of named sites (`--list`
+names them all), the units then merged. What lands is tests/fixtures/fla/gdn_seeded.npz (fla's simple GLA's
+sites in simple_gla_seeded.npz, `fla_sites.SIMPLE_RECORDED`), a summary recording (`record_case(...,
+summary=True)`): per site, seed and leaf, fla's distance from float64 at the site's inputs, which the test
+draws again (`Site.arrays`), and the truth's sketch, which Dew's float64 token recurrence is held to.
 
 fla runs at its defaults (an fp32 call's products TF32, as the fast forms' bar is). Packed documents run as
 fla runs them, one flattened row of sequences (`cu_seqlens`), a row's first taking its entering memory
@@ -35,6 +35,9 @@ import numpy as np
 COHORT = "fla"
 """The reference releases this tool runs against (tools/reference_releases.py), and the environment
 tools/check_tool_types.py checks it in."""
+
+FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "fla" / "gdn_seeded.npz"
+"""The delta rules' recording (`fla_sites.RECORDED`), which a command but a merge names unread."""
 
 TRUTHS = {False: "fla's naive_recurrent_gated_delta_rule and naive_recurrent_kda on each sequence in torch "
                  "float64",
@@ -295,10 +298,11 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
 
 def main() -> None:
     """The recorder's command line (`reference_worker.recording_command`), its sites `fla_sites`'s."""
-    from fla_sites import RECORDED
     from reference_worker import recording_command
 
-    fixture = fixture_of(sys.argv[2:]) if sys.argv[1:2] == ["--merge"] else RECORDED
+    # A merge's recording read from its units' sites (`fixture_of`, which reads Dew's fla_sites); the
+    # worker's environment, fla's, holds no JAX, so nothing else here imports it.
+    fixture = fixture_of(sys.argv[2:]) if sys.argv[1:2] == ["--merge"] else FIXTURE
     recording_command(__file__, "fla_sites", serve=serve, write_seeded=write_seeded, fixture=fixture,
                       license="MIT")
 
