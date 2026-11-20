@@ -38,7 +38,7 @@ from dew.nn.precision import biased, float32_dot_general
 from .kernels import gemm, generation
 from .kernels.generation import INHERENT, Choice, device_generation
 from .kernels.projections import kernel_path, mapped_shards, recipe_takes, shard_placement
-from .kernels.selection import Kernel, Op, Requirement, select
+from .kernels.selection import Kernel, Op, Requirement, forced, select
 from .sharding import on_shards, seen_whole
 
 
@@ -347,10 +347,13 @@ class BesidePlan:
 
 
 def _launching(named: bool):
-    """The scope a named side-by-side product's launches run in: the grouped GEMM's template named, its
-    products' launches taken where legal and refused by name where not (`generation.chosen`); else the
-    selectors' own (an unnamed call's measured routes)."""
-    return generation.chosen(grouped_matmul='mosaic') if named else contextlib.nullcontext()
+    """The scope a named side-by-side product's launches run in: the grouped GEMM's template named where its
+    caller names no grouped choice, its products' launches taken where legal and refused by name where not
+    (`generation.chosen`); the caller's own where it names the template's, another refused before any
+    launch (`BESIDE_SUPPORTS`' `grouped`); else the selectors' own (an unnamed call's measured routes)."""
+    if named and forced(Choice.GROUPED_MATMUL) is None:
+        return generation.chosen(grouped_matmul='mosaic')
+    return contextlib.nullcontext()
 
 
 class BesideCase:
@@ -435,6 +438,11 @@ BESIDE_SUPPORTS: tuple[Requirement[BesideCase], ...] = (
     Requirement('widened', lambda case: not case.widened,
                 "a 16-bit product rounds once with its fp32 bias, XLA's widened product", row=INHERENT,
                 kind='handoff'),
+    Requirement('grouped',
+                lambda case: not case.plan.named or forced(Choice.GROUPED_MATMUL) in (None, 'mosaic'),
+                lambda case: (f"grouped_matmul {forced(Choice.GROUPED_MATMUL)!r} is named beside qkv "
+                              "'joined', whose product runs the grouped GEMM template's launches"),
+                row=INHERENT),
     Requirement('launched', lambda case: case.launched,
                 "no launch takes the projections' product side by side, its forward or its input gradient "
                 "(`gemm.side_by_side`)", row=INHERENT),
