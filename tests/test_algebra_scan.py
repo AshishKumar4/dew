@@ -1504,9 +1504,8 @@ def test_a_steep_chunks_split_decays_keep_the_state_it_enters_and_leaves():
     about 2^90 and that chunk's three gates of -40 (`steep_last_draw`): its readers after the gates (through
     `entering`) and the state it leaves (through `whole`), their tangent and their gradient by the decays
     through the forms' own derivatives (`late_reads`), on par with the token scan's from float64 (check 1),
-    each standalone decay
-    (`e^-120`) taken as two normal factors (`scan._Split`), where whole it underflowed to zero and read the
-    state as none (row 9660)."""
+    each standalone decay (`e^-120`) taken as two normal factors (`scan._Split`), where whole it underflowed
+    to zero and read the state as none (row 9660)."""
     declared = scan.Scan(scalar_gla, gated_readout, GATED, walked="time", state=((KEY, VALUE), jnp.float32))
 
     def tokenwise(q, k, v, g, beta, h0):
