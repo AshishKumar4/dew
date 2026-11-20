@@ -1084,7 +1084,7 @@ def test_a_step_is_priced_at_the_longer_of_its_products_and_its_shared_traffic()
 
     assert per_flop(pair, b200) < per_flop(one_cta, b200)
     cooperative = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, family="wgmma")
-    tensor = cost.rates(h100, device=False)[0]
+    tensor = cost.rates(h100, device=False).tensor
     assert pricing.step_seconds(cooperative, h100, (2, 2)) == 2 * 128 * 256 * 64 / tensor
     walk = pricing.split_walk(pair, groups=1, rows=24576, depth=9216, width=2560, itemsizes=(2, 2), stored=2,
                                  multiprocessors=148, step_seconds=1.0, bandwidth=1.0, launch_seconds=None)
@@ -1103,11 +1103,13 @@ def test_a_parts_units_are_priced_at_the_clock_it_holds_under_load():
     restated = dataclasses.replace(unmeasured, clock_hz=1.549e9)
     loaded, stated = cost.rates(b200, device=False), cost.rates(unmeasured, device=False)
     # The CUDA cores, the special-function units and shared memory: the clock's alone.
-    assert loaded[3:6] == cost.rates(restated, device=False)[3:6]
-    assert all(rate < boosted for rate, boosted in zip(loaded[:6], stated[:6], strict=True)
-               if rate is not None)
+    again = cost.rates(restated, device=False)
+    assert (loaded.cuda, loaded.special, loaded.shared) == (again.cuda, again.special, again.shared)
+    clocked = ("tensor", "tf32", "eight", "cuda", "special", "shared")
+    assert all(getattr(loaded, unit) < getattr(stated, unit) for unit in clocked
+               if getattr(loaded, unit) is not None)
     assert unmeasured.loaded_clock_hz == unmeasured.clock_hz
-    assert cost.rates(b200, device=True)[-1] == cost.rates(unmeasured, device=True)[-1]
+    assert cost.rates(b200, device=True).device == cost.rates(unmeasured, device=True).device
 
 
 def test_a_decoded_operand_moves_its_stage_its_decoders_reads_and_each_decoded_copy():

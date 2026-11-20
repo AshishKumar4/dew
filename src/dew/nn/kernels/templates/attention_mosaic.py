@@ -1012,7 +1012,8 @@ def streams(query, target: generation.GpuTarget) -> bool:
     (`cost.rates`: the tensor rate its instruction family, clock and multiprocessors derive, no catalog's
     peak, row 3799): a decode step's few rows a key head, never a prefill's. False where either rate is
     unknown."""
-    tensor, *_, memory = cost.rates(target, device=True)
+    rated = cost.rates(target, device=True)
+    tensor, memory = rated.tensor, rated.device
     if not (tensor and memory):
         return False
     return 2 * query.shape[1] / jnp.dtype(query.dtype).itemsize < tensor / memory
