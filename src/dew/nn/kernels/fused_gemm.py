@@ -233,7 +233,7 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     fusion of the consumers reading it (`algebra.cost.fused`), each XLA program as the algebra prices it
     (`algebra.program.priced`). None where the target states no tensor rate."""
     rates = cost.rates(target, device=True)
-    if rates[0] is None:
+    if rates.tensor is None:
         return None, None
     product = algebra_cost.product_work(region.rows, region.depth, region.width, dtype=region.operands,
                                         precision=region.precision)
