@@ -1292,8 +1292,9 @@ class _Decays(NamedTuple):
     between: jax.Array
 
 
-DECAYS = 7
-"""The chunk function's leading operands: its decays (`_flat_decays`' leaves), its tokens' values after."""
+DECAYS = len(_Split._fields) * 3 + 1
+"""The chunk function's leading operands: its decays (`_flat_decays`' leaves: `entering`, `to_last` and
+`whole` each a split's factors, then `between`), its tokens' values after."""
 
 
 def _flat_decays(decays: _Decays) -> tuple:
