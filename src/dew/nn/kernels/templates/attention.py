@@ -1499,7 +1499,7 @@ def blocked(depth: int) -> bool:
     return depth % FP32_BLOCK == 0 and blocks >= 2 and not blocks & (blocks - 1)
 
 
-def _compensated_blocks(lefts: Sequence[jax.Array], rights: Sequence[jax.Array],
+def _compensated_blocks(lefts: list[jax.Array], rights: list[jax.Array],
                         reduce_block: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
     """Sum `reduce_block(left, right)` across `FP32_BLOCK`-deep blocks with TwoSum compensation
     (`compensated_total`), shared by `kernel_dot` and `kernel_rows`."""
