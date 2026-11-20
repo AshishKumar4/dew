@@ -119,6 +119,8 @@ class Lane:
     """Whether the call is fp32's, its output stored fp32 and a one-part operand TF32."""
     pairing: int = 1
     """The parts a factored pair's fp32 operand takes (`intra.pairing_parts`, `operand`)."""
+    merged: int = 0
+    """The parts the doubling's merges take in fp32 (`mainloop._merged`): zero for fp16, else `merged`."""
     tf32: Literal["plain", "rna", "read"] = "read"
     """How a one-part fp32 operand reaches its product (`operand`), the issuer's: 'plain', as itself (an
     interpreted product, a plain fp32 dot: mosaic_sm80.py's and mosaic_sm90.py's interpreted branches);

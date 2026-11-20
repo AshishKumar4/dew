@@ -1690,6 +1690,7 @@ def _linear_primitive() -> type:
         a zero tangent's leaf beside an infinite one was a 0 inf, NaN (row 8757)."""
         directions = jax.tree.structure(primals).flatten_up_to(tangents)
         live = [direction is not None and not zero(direction) for direction in directions]
+        # Over the primals themselves, so `fill` rebuilds them once (`programs.holes`).
         moving, fill = programs.holes(primals, live)
         if not moving:
             return nothing(out_aval)

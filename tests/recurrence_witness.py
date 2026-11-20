@@ -179,13 +179,15 @@ def solved(system: Iv, lane: Lane) -> Iv:
     first = (rows % 2 == 1) & (cols == rows - 1)
     current = Iv(identity + np.where(first, lower_a.lo, 0.0), identity + np.where(first, lower_a.hi, 0.0))
 
-    # A 16-bit call's merges in fp16; an fp32 call's as it holds its values (`mainloop._merged`).
+    # Each call's doubling merges as `mainloop._merged`: fp16 where `lane.merged` is zero, else fp32 parts.
+    merge_lane = dataclasses.replace(lane, held=lane.merged, wide=True) if lane.merged else None
+
     def merge(x: Iv) -> Iv:
-        return staged(x, lane) if lane.wide else cast(x, FLOAT16)
+        return staged(x, merge_lane) if merge_lane is not None else cast(x, FLOAT16)
 
     def merged(x: Iv, y: Iv) -> Iv:
-        if lane.wide:
-            return dot(x, y, lane, parts=(lane.held, lane.held))
+        if merge_lane is not None:
+            return dot(x, y, merge_lane, parts=(lane.merged, lane.merged))
         return dot(x, y, lane, FLOAT16)
 
     width = 2
@@ -552,6 +554,8 @@ class Run:
     """Whether it is the fused inference walk's (`walk_enclosures`), its records `WALKED`'s."""
     pairing: int
     """The parts a factored pair's fp32 operand takes (`Lane.pairing`, `intra.pairing_parts`)."""
+    merged: int
+    """The parts the doubling's merges take in fp32 (`Lane.merged`, `mainloop._merged`): zero for fp16."""
     tf32: Literal["plain", "rna", "read"]
     """How a one-part fp32 operand reaches its product (`Lane.tf32`): its family's issuer's, or plain where
     the launches were interpreted."""
@@ -641,6 +645,16 @@ def laid_chunks(length: int, starts, max_segments: int | None, chunk: int) -> np
     chunks = tables.unpacked(chunked_launch.ChunkSpan, lambda i: np.asarray(table)[:, i])
     kept = chunks.taken > 0
     return np.stack([chunks.start[kept], chunks.taken[kept]], axis=1)
+
+
+def _merged_parts(family, dtype, held: int, wide: bool) -> int:
+    """The doubling's merge parts (`Lane.merged`, `mainloop._merged`): `held` for fp32, `_fast_parts` for
+    bf16, and zero (fp16) for fp16."""
+    import jax.numpy as jnp
+
+    if wide:
+        return held
+    return mainloop._fast_parts(family) if dtype == np.dtype(jnp.bfloat16) else 0
 
 
 def call_form(family, *, wide: bool, delta: bool, rounded: bool) -> tuple[int, int, str]:
@@ -779,7 +793,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide), walked=walked,
-               pairing=intra.pairing_parts(family, held),
+               pairing=intra.pairing_parts(family, held), merged=_merged_parts(family, dtype, held, wide),
                tf32=tf32_conversion(family), trained=bool(trained),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
@@ -837,7 +851,7 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
     enclose = functools.partial(walk_enclosures, write=run.write) if run.walked else writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               tf32=run.tf32)
+                               merged=run.merged, tf32=run.tf32)
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
@@ -1397,7 +1411,7 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     it (the initial memory's, `dh0`, for the first)."""
     run = back.run
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               tf32=run.tf32)
+                               merged=run.merged, tf32=run.tf32)
 
     def stored(iv: Iv, dtype) -> Iv:
         """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where
