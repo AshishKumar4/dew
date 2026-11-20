@@ -405,6 +405,21 @@ class Prefixed(RunProcessor):
     prefix: str = ""
 
 
+@dataclasses.dataclass(frozen=True)
+class Named(PrefixedBytes):
+    """A processor of a user's own that keeps a dtype's name as its record states it (row 9065's review)."""
+
+    dtype: str = "bfloat16"
+
+
+@dataclasses.dataclass(frozen=True)
+class PositionalOnly(PrefixedBytes):
+    """A processor whose constructor takes its field positionally alone, which no record's keywords build."""
+
+    def __init__(self, prefix, /):
+        object.__setattr__(self, "prefix", prefix)
+
+
 def _tiny_lm(processor):
     """A tiny byte-level decoder's LM objective over `processor`, its state as a trainer starts it."""
     from dew.objectives.lm import LMObjective
@@ -460,6 +475,26 @@ def test_a_saved_runs_processor_record_builds_a_trusted_processor_class_alone(tm
     for named in ("os:getcwd", "dew.data.text:ByteTokenizer"):
         with pytest.raises(ValueError):
             saved_custom({"class": named, "fields": {}})
+
+
+def test_a_saved_runs_processor_keeps_its_fields_as_recorded_and_its_settings_hash(tmp_path):
+    """A saved run's processor whose field is a dtype's name rebuilds holding that name (the task record's
+    `dtype` policy), and the run's task settings hash beside its record (row 9065's review)."""
+    objective, state = _tiny_lm(Named("> "))
+    hash(objective.task_settings())
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    task = TextGeneration.from_run(str(tmp_path / "run"), trust=(Named.__module__,))
+    assert task.processor == Named("> ") and task.processor.dtype == "bfloat16"
+
+
+def test_a_processor_its_record_builds_none_of_saves_unrecorded():
+    """A processor whose constructor takes its field positionally alone records why it went unrecorded, not
+    a record no rebuild reads (row 9065's review)."""
+    from dew.inference.tasks import recorded_custom, unrecorded_custom
+
+    assert "PositionalOnly" in unrecorded_custom(recorded_custom(PositionalOnly("> ")))
 
 
 def test_a_run_processors_subclass_is_its_own_record(tmp_path):

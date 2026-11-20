@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import functools
 import json
+import logging
 import os
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -123,6 +124,8 @@ if TYPE_CHECKING:
     from dew.nn.dex import DifferentialExtension
     from dew.sampling.guidance import Guidance
     from dew.sampling.solvers.common import Solver
+
+_log = logging.getLogger(__name__)
 
 
 def _refined(layout: Layout | None, model: RefinesLayout | None) -> Layout | None:
@@ -367,11 +370,12 @@ class Pretrained:
 
         custom = None if self.settings is None else saved_custom(self.settings.custom)
         match self.tokenizer:
+            case _ if custom is not None:
+                # A saved run's processor of its user's own, its record built under the load's trust, before
+                # the files its export wrote beside it.
+                return custom
             case _ if self.processor is not None:
                 return self.processor
-            case _ if custom is not None:
-                # A saved run's processor of its user's own, its record built under the load's trust.
-                return custom
             case HFTokenizer() as held:
                 return RunProcessor(held)
             case str(name):
@@ -407,6 +411,7 @@ class Pretrained:
             TextSettings,
             saved_model,
             saved_settings,
+            unrecorded_custom,
         )
         from dew.registry import models
 
@@ -418,6 +423,8 @@ class Pretrained:
         # end-of-sequence ids and process, which the export writes in the format its readers read.
         held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
         task = held if isinstance(held, TaskSettings) else None
+        if task is not None and (reason := unrecorded_custom(task.custom)) is not None:
+            _log.warning("this run's own processor was not recorded: %s", reason)
         budget = None if task is None else task.max_new_tokens
         # A run's tokenizer as its loaders build it, the copy the run holds (`tokenizer_for`), which its
         # export writes and a run started from it encodes with; the byte vocabulary by its name.

@@ -894,7 +894,7 @@ class TaskSettings:
     tokenizer_files: Mapping[str, str] | None = dataclasses.field(default=None, metadata={ADDED: True})
     """What the run tokenizer is: each of its files' hash (`recorded_files`), which the files a load finds
     where `tokenizer` says they are must hash to; None where a run recorded none, as runs before it."""
-    custom: JSON = dataclasses.field(default=None, metadata={ADDED: True})
+    custom: JSON = dataclasses.field(default=None, hash=False, metadata={ADDED: True})
     """A processor of the user's own, its class record (`recorded_custom`: a dataclass, or a class of Dew's
     or a trusted package's, by its import path and constructor fields), which a load builds under the
     packages it trusts (`saved_custom`), so the reloaded task takes the text and chat the live one took (row
@@ -1084,24 +1084,24 @@ def recorded_custom(processor: Processor | None) -> JSON:
     describes it (a class an import path names none of, a field no record carries, a constructor argument
     its fields keep none of), which a run saves without, as before, the load naming why; None for a run
     tokenizer's adapter itself, a source's, or none."""
-    from dew.interop.processors import Processor as SourceProcessor
     from dew.registry import Unrecordable, class_record, to_record
 
-    if processor is None or type(processor) is RunProcessor or isinstance(processor, SourceProcessor):
+    # The run tokenizer's own adapter over a tokenizer its record names, or a source's processor, which their
+    # readers rebuild as they were (`recorded_tokenizer`, `recorded_processor`).
+    if processor is None or recorded_processor(processor) is not None or (
+            type(processor) is RunProcessor and recorded_tokenizer(processor) is not None):
         return None
     try:
         record = to_record(processor, Processor | None)
     except Unrecordable as refused:
         return {"unrecorded": f"{type(processor).__qualname__}: {refused}"}
-    # A constructor argument its record keeps none of (a required `InitVar`) would refuse its rebuild.
     named = class_record(_records.record(record, "custom"))
-    held = {} if named is None else named[1]
-    missing = [name for name, parameter in inspect.signature(type(processor)).parameters.items()
-               if parameter.default is inspect.Parameter.empty and name not in held
-               and parameter.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)]
-    if missing:
-        return {"unrecorded": f"{type(processor).__qualname__}: its constructor takes {missing}, which its "
-                              f"record keeps none of"}
+    try:
+        # The registry builds a class from its record's fields as keywords: a constructor that takes them
+        # otherwise (a required `InitVar`, a positional-only argument) would refuse its rebuild.
+        inspect.signature(type(processor)).bind(**({} if named is None else named[1]))
+    except TypeError as refused:
+        return {"unrecorded": f"{type(processor).__qualname__}: its record's fields build none: {refused}"}
     return record
 
 
@@ -1118,6 +1118,14 @@ def saved_custom(record: JSON) -> Processor | None:
         raise ValueError(f"a run's processor record builds a {type(built).__qualname__}, no processor "
                          f"(`dew.inference.tasks.Processor`)")
     return built
+
+
+def said_custom(record: JSON) -> Processor | None:
+    """`saved_custom` where a load establishes its task's processor: an unrecorded one's reason logged once,
+    its run tokenizer's or source's processor then taken where it had one, else token ids alone."""
+    if (reason := unrecorded_custom(record)) is not None:
+        _log.warning("this run's own processor was not recorded: %s", reason)
+    return saved_custom(record)
 
 
 def unrecorded_custom(record: JSON) -> str | None:
@@ -1153,11 +1161,13 @@ def _saved_processor(settings: TaskSettings, config: ModelConfig, run: str) -> P
     from dew.data.text import tokenizer_for
     from dew.interop.pretrained import load_processor
 
-    if (reason := unrecorded_custom(settings.custom)) is not None:
-        # Its run tokenizer's or source's processor below where it had one, else token ids alone.
-        _log.warning("this run's own processor was not recorded: %s", reason)
-    elif settings.custom is not None:
-        return saved_custom(settings.custom)
+    custom = said_custom(settings.custom)
+    if isinstance(custom, RunProcessor) and settings.tokenizer is not None:
+        # A run processor's subclass over the run's tokenizer reads the copy the run holds, verified.
+        return dataclasses.replace(custom, tokenizer=tokenizer_for(settings.tokenizer,
+                                                                   files=settings.tokenizer_files, held=run))
+    if custom is not None:
+        return custom
     if settings.processor is not None:
         return load_processor(settings.processor, config.build())
     if settings.tokenizer is None:
