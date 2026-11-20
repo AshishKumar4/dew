@@ -994,11 +994,15 @@ class _Order:
             self.pending[thread].remove(entry)
 
     def retired(self, thread, kind, kept: int, clock) -> None:
-        """A wait retiring all but its `kept` latest asynchronous reads of `kind`: each read ends here."""
+        """A wait retiring all but its `kept` latest asynchronous issues of `kind`, each issue's reads
+        together (a product's every source, one group a wgmma issue): each read ends here."""
         mine = [entry for entry in self.pending[thread] if entry[0] == kind]
-        for entry in mine[:max(len(mine) - kept, 0)]:
-            self.reads.append((entry[1], dict(clock), entry[2]))
-            self.pending[thread].remove(entry)
+        issues = list(dict.fromkeys(entry[4] for entry in mine))
+        retiring = set(issues[:max(len(issues) - kept, 0)])
+        for entry in mine:
+            if entry[4] in retiring:
+                self.reads.append((entry[1], dict(clock), entry[2]))
+                self.pending[thread].remove(entry)
 
 
 def commits_group(event: Event) -> bool:
