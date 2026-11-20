@@ -50,8 +50,10 @@ env:
   # from bc61de0, had none (2026-11-16: every hub-only Colab run failed after booking from 23:39Z). And
   # which asks again, within one outage budget, a refusal that made nothing, keeps a run's deadline its one
   # end, sizes a task by the cap it runs under and keys a pinned job's environment by its pin (armada 41bff47,
-  # the 2026-11-18 audit's cleanup).
-  ARMADA: github:AshishKumar4/armada#41bff47070001cd8451fc8323f656222de32fd3b
+  # the 2026-11-18 audit's cleanup). Armada 0b42045 grades a task's rows as written under its red exit
+  # (.armada.json's task.redExit), so a packed red runs again alone; puts a pack's part again through a
+  # dropped connection; and bounds an artifact's download by its silence, not its length (2026-11-20).
+  ARMADA: github:AshishKumar4/armada#0b42045994cef978d4d04b56d2d93fe38eec55ae
 
 jobs:
   # A commit this workflow passed on another push, or one the land queue
