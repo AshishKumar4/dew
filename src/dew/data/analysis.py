@@ -985,7 +985,7 @@ def _analyzed(
         None if absorbed is None else absorbed[0],
         epochs,
         tuple(at for at, stage in enumerate(stages) if at >= eager and isinstance(stage, TokenSplit)),
-        _order(source, lowered, stages, per_share=per_share),
+        _order(source, lowered, stages, streamed=per_share and read == "streamed"),
         parts_unending,
         unending,
         records_unending,
@@ -1008,7 +1008,7 @@ indexed read's do, where one whose counts are not stated keeps a deficit of each
 
 
 def _order(source: Source | Combined, lowered: Sequence[_Lowering], stages: Sequence[Stage], *,
-           per_share: bool = False) -> Mapping[str, object]:
+           streamed: bool = False) -> Mapping[str, object]:
     """The canonical order a resume must find unchanged (`_Lowering.order`): what `source` reads, a store by
     its description, phases, a mixture or a concatenation by its members' orders (`lowered`) and the names
     they go by (`_members`), then the stages that order its rows, a memory read's own among them
@@ -1026,7 +1026,7 @@ def _order(source: Source | Combined, lowered: Sequence[_Lowering], stages: Sequ
             "corpora": [child.order for child in lowered],
             "members": _members(source.pipelines),
             "weights": list(source.weights),
-            "shares": ("accepted rows" if source.tokens is None else STATED_SHARES if per_share and all(
+            "shares": ("accepted rows" if source.tokens is None else STATED_SHARES if streamed and all(
                 _states_its_targets(child) for child in source.pipelines) else "tokens"),
             # The seed of the mix's corpus order where it has one, which another plan's is not.
             **({} if source.seed is None else {"selection_seed": source.seed}),
