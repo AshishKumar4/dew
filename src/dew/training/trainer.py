@@ -70,7 +70,7 @@ from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, owned_program, shapes_of
 from dew.nn.kernels.templates import report
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import Link, Schedule, boxed, tracing
+from dew.nn.sharding import Link, Schedule, boxed, explicit_placement, tracing
 from dew.objectives.base import (
     Aux,
     Held,
@@ -911,8 +911,8 @@ class Trainer(Generic[Loss, Effects]):
             return model_batch(batch)
         traced, shapes = jax.make_jaxpr(self._model_batch, return_shape=True)(batch)
         return jax.tree.map(lambda aval: jax.ShapeDtypeStruct(
-            aval.shape, aval.dtype, sharding=aval.sharding if aval.sharding.mesh.explicit_axes else None,
-            weak_type=aval.weak_type), jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
+            aval.shape, aval.dtype, sharding=explicit_placement(aval), weak_type=aval.weak_type),
+            jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
 
     def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1, *,
                     objective: Objective[Loss, Effects]):
@@ -1788,11 +1788,15 @@ class Trainer(Generic[Loss, Effects]):
         the run reads its stream from its beginning: that stream, handed on; else a stream opened now, the
         primed one closed."""
         primed, run.primed = run.primed, None
-        # Handed on where it was read from the position the run reads from, its beginning or a resume's,
-        # restored there once (row 9663); a relaxed resume starting a stage again (`FitRun.restarted`, which
-        # `_prefetched` moves a staged stream to) reads elsewhere.
-        if (primed is not None and primed[0] == partition and primed[4] == position
-                and run.restarted is None):
+        # Handed on where read from the run's position, restored there once (row 9663), not where a relaxed
+        # resume starts a stage again (`FitRun.restarted`); a resume's on every process or none, so each runs
+        # the same collectives (`resumed_on`'s; row 9713: a share that read nothing there agreed alone).
+        mine = (primed is not None and primed[0] == partition and primed[4] == position
+                and run.restarted is None)
+        if position is not None and jax.process_count() > 1:
+            from dew._coordination import from_every_process
+            mine = all(from_every_process(mine))
+        if mine and primed is not None:
             return primed[1], (primed[2], primed[3])
         if primed is not None:
             _closed(primed[1])

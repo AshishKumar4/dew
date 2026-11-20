@@ -495,16 +495,29 @@ def _merges(call: Call) -> tuple:
     return tuple(tuple(plgpu.SMEM(tile, merged.stored) for _ in range(merged.parts)) for _ in range(3))
 
 
+def merge_parts(family: mosaic.Family, dtype, *, held: int, ranged: bool) -> int:
+    """The parts the doubling's merges take in fp32 (`_merged`): `held` for fp32, `_fast_parts` for `ranged`
+    16-bit or bf16 (fp16 underflows tiny write gates below 2^-24, row 8569), else zero (fp16; row 9521)."""
+    dtype = jnp.dtype(dtype)
+    if dtype == jnp.float32:
+        return held
+    if ranged or dtype == jnp.bfloat16:
+        return _fast_parts(family)
+    return 0
+
+
 def _merged(call: Call) -> Operand:
-    """The form the doubling's merges take the inverse and its power in (`_merges`): an fp32 call's; a
-    `ranged` or `bfloat16` 16-bit call's fp32 in its fast forms' parts (`_fast_parts`), fp32's range at
-    TF32's precision or past it (fp16 underflows tiny write gates below 2^-24, zeroing a bf16 chunk inverse
-    under faint cross terms, row 8569); else one fp16 part."""
-    if call.held.dtype == jnp.float32:
-        return call.held
-    if call.ranged or call.held.dtype == jnp.bfloat16:
-        return Operand(call.rows, _fast_parts(call.family), jnp.dtype(jnp.float32))
+    """The form the doubling's merges take the inverse and its power in (`_merges`, `merge_parts`)."""
+    parts = merge_parts(call.family, call.held.dtype, held=call.held.parts, ranged=call.ranged)
+    if parts:
+        return Operand(call.rows, parts, jnp.dtype(jnp.float32))
     return Operand(call.rows, 1, jnp.dtype(jnp.float16))
+
+
+def solve_persistent(call: Call) -> bool:
+    """Whether a doubling solve (`_solved`, `intra._intra_solve`) runs persistent: false on `mma.sync` with
+    fp32-range merges, where the persistent loop's divmod registers push TF32 solves over 255 (row 9637)."""
+    return not (call.family.operands_in_registers and _merged(call).dtype == jnp.float32)
 
 
 def summing_staging(call: Call) -> tuple:
@@ -1093,8 +1106,10 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
     narrow = applies and call.value_block != call.block
     held = dataclasses.replace(call.held, rows=call.rows)
 
-    def program(at, k_ref, v_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, taken_ref, *outputs,
-                streams, staging, landing):
+    def program(at, *refs, streams, staging, landing):
+        k_ref = refs[0]
+        v_ref, rest = (refs[1], refs[2:]) if applies else (None, refs[1:])
+        hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, _taken_ref, *outputs = rest
         a_ref, w_ref, u_ref = ((*outputs, None, None) if not applies else outputs if keeps
                                else (None, *outputs))
         n, h = at["chunks"], at["heads"]
@@ -1165,17 +1180,16 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
     if keeps:
         out_type = (held.shape(call.heads * chunk), *out_type)
     model, held_tiles, staging, landing = _solved_resources(call, keeps=keeps, applies=applies, narrow=narrow)
+    inputs = (k, v, hi, lo, beta, hi, lo, taken) if applies else (k, hi, lo, beta, hi, lo, taken)
     solved = launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                            grid_names=("chunks", "heads"),
                            blocks=stream_blocks(keys=((chunk, width), call.given),
                                                 **({"values": ((chunk, value_width),
                                                                call.given)} if applies else {}))
                            | vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
-                           stages=1, live=chunk_liveness(7), steps=1, model=model, held=held_tiles,
-                           staging=staging, landing=landing,
-                           persistent=not (family.operands_in_registers
-                                           and _merged(call).dtype == jnp.float32),
-                           reduces=False)(k, v, hi, lo, beta, hi, lo, taken)
+                           stages=1, live=chunk_liveness(len(inputs) - 1), steps=1, model=model,
+                           held=held_tiles, staging=staging, landing=landing,
+                           persistent=solve_persistent(call), reduces=False)(*inputs)
     return solved if keeps else (None, *solved)
 
 
@@ -1185,8 +1199,7 @@ def _solves_apart(call: Call) -> bool:
     (`Family.operands_in_registers`). Beside the application's tiles the solve spilled on H100
     (fast32-sm90 at 09bfe984c) and exceeded 99 KB SMEM on consumer mma.sync GPUs (sm86/sm89/sm120, row 8569),
     while 1-part TF32 on `tcgen05` (B200) stays fused and spill-free."""
-    merged = _merged(call)
-    return merged.parts > 1 or (call.family.operands_in_registers and merged.dtype == jnp.float32)
+    return _merged(call).parts > 1 or not solve_persistent(call)
 
 
 def whole_blocks(width: int, block: int) -> list[int]:

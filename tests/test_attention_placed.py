@@ -142,8 +142,10 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
     query = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     key = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
-    threads, arrivals = programs(_placed_forward(tiles, spans), query, key,
-                                 threads=tiles.consumers + 1, rare=False)
+    threads, arrivals = programs(
+        _placed_forward(tiles, spans), query, key,
+        threads=tiles.consumers + 1 + len(placed.correction_roles(placed.ROWS, tiles.consumers, width)),
+        rare=False)
     (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
     q_smem = _consumer_q_smem(threads, tiles.consumers)
     # Map each consumer-exclusive barrier name to its consumer index so each score MMA's `scored` arrival
@@ -250,6 +252,53 @@ def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
     for thread in threads_e:
         assert _tmem_q_copies(thread) == []
     assert explore(threads_e, arrivals_e) > 0
+
+
+@pytest.mark.parametrize("moves", [False, True], ids=["kept", "moved"])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_correction_warpgroup_at_d256_holds_protocol_in_every_interleaving(call, moves):
+    """Row 5368: at d256 on 1-consumer `tcgen05.rows`, the dedicated `CORRECTION` warpgroup rescales kept
+    sums in TMEM off the softmax warpgroup's critical path: every interleaving of consumer, correction, and
+    producer/issuer holds without deadlock or race over 5 steps (reusing both factor slots) and at 0- and
+    1-step reaches, both when rescales are skipped (`kept`) and taken (`moved`), and dropping a `factor_ready`
+    wait before reading `factors` is caught as a race."""
+    from ring_protocol import Violation, explore, programs
+
+    query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 320, 1, 256), jnp.bfloat16)
+    spans = template.spans(256, 320, 1, **CALLS[call])
+    threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key, threads=3, rare=moves)
+    consumer_writes = {e.at[0] for e in threads[0] if e.kind == "write" and e.at[0].startswith("smem")}
+    factor_reads = [e for e in threads[1] if e.kind == "read" and e.at[0] in consumer_writes]
+    assert factor_reads, "correction factor load must be traced"
+    assert explore(threads, arrivals) > 0
+    # Negative control: dropping the correction warpgroup's factor_ready waits lets the factor read race
+    # with the consumer's factor write.
+    factor_ready = next(e.at[0] for e in threads[1] if e.kind == "wait")
+    mutated = list(threads)
+    mutated[1] = [e for e in threads[1] if not (e.kind == "wait" and e.at[0] == factor_ready)]
+    with pytest.raises(Violation):
+        explore(mutated, arrivals)
+    if call == "full" and not moves:
+        q1, k1 = jnp.ones((1, 128, 1, 256), jnp.bfloat16), jnp.ones((1, 128, 1, 256), jnp.bfloat16)
+        for steps in (0, 1):
+            short = template.KeySpans(start=jnp.zeros((1, 128), jnp.int32),
+                                      end=jnp.full((1, 128), steps * 64, jnp.int32),
+                                      query_ids=None, key_ids=None, keys=128)
+            short_maps = {5: np.array([[0]], np.int32), 6: np.array([[steps]], np.int32),
+                          7: np.array([[0]], np.int32), 8: np.array([[steps]], np.int32)}
+            short_threads, short_arrivals = programs(_placed_forward(ROWS_TILES, short), q1, k1, threads=3,
+                                                     rare=False,
+                                                     known=lambda idx, _aval, m=short_maps: m.get(idx))
+            assert explore(short_threads, short_arrivals) > 0
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_correction_warpgroup_at_d256_holds_check_1_interpreted(call):
+    """Row 5368: 1-consumer d256 `tcgen05.rows` with the dedicated `CORRECTION` warpgroup holds check 1
+    against the reference under the interpreter (full and causal)."""
+    _check_forward(call, jnp.bfloat16, (1, 256, 2, 1), natural=False, interpret=True, width=256,
+                   value_width=256, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
 
 
 def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
@@ -359,31 +408,58 @@ def test_the_forward_on_tcgen05s_rows_holds_check_1_over_short_walks_interpreted
 @INTERPRETS
 def test_the_forward_on_tcgen05s_rows_streams_values_its_keys_columns_as_handed_interpreted():
     """A forward whose values are its keys' leading columns (`in_key`) on a B200's tcgen05 rows, whose
-    issuing role declares the values' stream (`MosaicForward.reads_key_slot`), streams the value array it
-    was handed: bit for bit the same call without `in_key`, under the interpreter (row 6643)."""
+    issuing role declares the values' stream (`MosaicForward.reads_key_slot`), holds check 1 against the
+    reference over seeded draws under the interpreter (rows 6643, 6695)."""
     shape = (1, 128, 1, 64)
-    query, key = (jax.random.normal(stream, shape, jnp.float32).astype(jnp.bfloat16)
-                  for stream in jax.random.split(jax.random.key(0), 2))
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
-    with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
-        keyed, unkeyed = (attention_mosaic.forward(query, key, key, spans, None, interpret=True,
-                                                   in_key=in_key) for in_key in (True, False))
-    np.testing.assert_array_equal(np.asarray(keyed, np.float32), np.asarray(unkeyed, np.float32))
+
+    def draw(seed: int):
+        query, key = (jax.random.normal(stream, shape, jnp.float32).astype(jnp.bfloat16)
+                      for stream in jax.random.split(jax.random.key(seed), 2))
+        return query, key
+
+    def ours(query, key):
+        with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
+            return attention_mosaic.forward(query, key, key, spans, None, interpret=True, in_key=True)
+
+    def reference(query, key):
+        return template.reference(query, key, key, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "tcgen05.rows in_key forward", seeds=SEEDS)
 
 
 @INTERPRETS
 def test_the_forward_on_tcgen05s_rows_keeps_a_subnormal_output_interpreted():
     """The forward on a B200's tcgen05 rows, its sums kept in tensor memory and taken by their rows' ratio
     as stored (`mosaic.Kept.scale`), under the interpreter on XLA's CPU, which flushes a subnormal product:
-    a full bf16 call of 128 keys, every logit 0, one key's values 2^-120 and the rest 0, returns 2^-127
-    (below fp32's and bf16's least normal) at every entry, exactly, as every other forward finish does
-    (`algebra.quotient`, row 6302), where the product by the inverse total returned 0."""
-    query = jnp.zeros((1, 128, 1, 64), jnp.bfloat16)
-    value = jnp.zeros_like(query).at[:, 0].set(2.0 ** -120)
+    a full bf16 call of 128 keys, every logit 0, one key's values near 2^-120 and the rest 0, holds check 1
+    against the reference over seeded draws (subnormal outputs near 2^-127, rows 6302, 6711)."""
     spans = template.spans(128, 128, 1)
-    with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
-        out = attention_mosaic.forward(query, query, value, spans, None, interpret=True)
-    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full(out.shape, 2.0 ** -127, np.float32))
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        signs = jnp.where(jax.random.bernoulli(streams[0], shape=(1, 1, 1, 64)), 1.0, -1.0)
+        mags = jax.random.uniform(streams[1], (1, 1, 1, 64), jnp.float32, minval=1.0, maxval=2.0)
+        query = jnp.zeros((1, 128, 1, 64), jnp.bfloat16)
+        scaled = (signs * mags * jnp.float32(2.0 ** -120)).astype(jnp.bfloat16)
+        value = jnp.zeros_like(query).at[:, :1].set(scaled)
+        return query, query, value
+    from dew.nn.precision import power2
+
+    def ours(query, key, value):
+        with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
+            return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
+
+    def exact_ref(query, key, value):
+        del key
+        return jnp.broadcast_to(power2(value[:, :1].astype(jnp.float32), -7).astype(jnp.bfloat16),
+                                query.shape)
+
+    def truth(query, key, value):
+        return template.reference(query, key, value, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(exact_ref), draw, "tcgen05.rows subnormal output", seeds=SEEDS,
+                    truth_fn=truth)
 
 
 @INTERPRETS

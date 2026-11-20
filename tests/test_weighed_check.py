@@ -324,6 +324,21 @@ def test_a_sharded_weighed_site_judges_its_weighed_check_from_its_own_map_tasks(
         monkeypatch.delenv(POOL)
 
 
+def test_a_compensated_sum_is_weighed_as_its_double_float_pair_rounds():
+    """Dew's compensated sum (`dew.nn.precision.compensated_sum`, a reduction whose combine is a double-float
+    pair's) is weighed by its pair's bound, `u |sum| + gamma_{n-1}^2 sum |x|` (row 9781: its reduction had no
+    rule and refused every program holding one, Gemma 3n's norms among them): of rows whose large terms
+    cancel, its scale is below a plain sum's, `(n - 1) u sum |x|`, at every row."""
+    from dew.nn.precision import compensated_sum
+
+    rng = np.random.default_rng(9781)
+    large = rng.uniform(1e5, 1e6, (8, 32))
+    x = jnp.asarray(np.concatenate([large, -large, rng.standard_normal((8, 64))], axis=1), jnp.float32)
+    _, compensated = rounding_scale(lambda x: compensated_sum(x, (1,)), x)
+    _, plain = rounding_scale(lambda x: jnp.sum(x, axis=1), x)
+    assert np.all(np.asarray(compensated) < np.asarray(plain))
+
+
 def test_the_rounding_scale_knows_an_operation_by_its_object():
     """The rounding scale reads each operation's rule by JAX's primitive object: a user's primitive named
     `add`, which doubles its operand, has no rule and is refused, where its name's rule weighed it as one

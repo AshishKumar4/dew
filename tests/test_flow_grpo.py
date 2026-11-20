@@ -1554,3 +1554,40 @@ def test_a_flow_steps_watched_cotangents_reach_its_policys_calls(guided):
     assert probe[0] == rows * 2 * transitions and np.isfinite(probe[2])
     assert all((left == right).all()
                for left, right in zip(jax.tree.leaves(params), jax.tree.leaves(expected), strict=True))
+
+
+def a_flows_scaling_rounds_a_subnormal_result_once():
+    """`dew.sampling.flow`'s scaling by a power of two (`_scaled`, a quotient's restoration) of
+    `0.5 + 2^-24` by `2^-149` on a device that keeps subnormals: the least subnormal, its one correctly
+    rounded value, where the power's parts applied whole first rounded `2^-127 + 2^-150` to `2^-127` and
+    then its tie to zero (row 8971: flow's scaling `precision.power2`'s). A GPU numerics cell
+    (tests/test_gpu_numerics.py), as XLA:CPU flushes the subnormal either way."""
+    from reference_error import ahead_arm
+
+    from dew.sampling.flow import _scaled
+
+    found = np.asarray(ahead_arm(jax.jit(_scaled), "a flow's scaling")(np.float32(0.5 + 2.0 ** -24),
+                                                                          np.int32(-149)))
+    assert found.dtype == np.float32 and found.view(np.uint32) == 1, found.view(np.uint32)
+
+
+def test_a_flows_scaling_is_exact_where_its_result_is_normal():
+    """`dew.sampling.flow`'s scaling by a power of two, float32 and float64, by scalar and broadcast powers
+    within one factor's range and past it: `x * 2^k` bit for bit, in `x`'s type, where `x` and the result
+    are normal (`np.ldexp`'s), a result past the largest infinite (`precision.power2`, row 8971)."""
+    from dew.sampling.flow import _scaled
+
+    for dtype, big, small in ((np.float32, 150, 100), (np.float64, 1500, 1000)):
+        with jax.enable_x64(new_val=dtype == np.float64):
+            # Values `(2, 1)` against powers `(2, 3)`, broadcast inside the scaling, every result normal.
+            within = (np.asarray([[1.0 + 2.0 ** -20], [-1.75]], dtype),
+                      np.asarray([[-60, 0, 60], [-30, 30, 1]], np.int32))
+            past = (np.asarray([[2.0 ** -small], [-(2.0 ** small)]], dtype),
+                    np.asarray([[big, big - 1, big - 2], [-big, -big + 1, -big + 2]], np.int32))
+            for value, power in (within, past):
+                found = np.asarray(jax.jit(_scaled)(value, power))
+                expected = np.ldexp(value, power)
+                assert found.dtype == dtype
+                np.testing.assert_array_equal(found.view(f"uint{8 * found.itemsize}"),
+                                              expected.view(f"uint{8 * expected.itemsize}"))
+    assert np.all(np.isinf(np.asarray(_scaled(np.asarray([1.5], np.float32), np.int32(200)))))

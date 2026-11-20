@@ -25,6 +25,7 @@ from dew.nn.kernels.templates import (
     axes,
     bundles,
     emission,
+    handoffs,
     layout,
     mosaic,
     operands,
@@ -160,8 +161,9 @@ def scheduled_roles(family: mosaic.Family, consumers: int, consumer: Callable[[i
         del index
         consumer(role)
 
+    reducers = () if reducer is None else ((handoffs.REDUCER, consumers, reducer),)
     return walked.scheduled(consumers, functools.partial(mosaic.per_role, roles=consumers, run=compute),
-                            producer, issuer=lambda: issued(walked), reducer=reducer)
+                            producer, issuer=lambda: issued(walked), joined=reducers)
 
 
 def placed_scratch(family: mosaic.Family, walked: int, dtype, fused: tuple[int, ...], kept: tuple[int, ...]
@@ -639,7 +641,7 @@ def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differ
 
 
 def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, scaled: bool = False,
-             magnitudes: bool = False) -> int:
+             magnitudes: bool = False, joined: tuple = ()) -> int:
     """The warpgroups of a launch of `consumers` whose arithmetic may reduce across warps implicitly, each
     reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a
     `hooked` launch's hook's (`hook_reduces`: a unit row, which the fork selects by a reduction across warps,
@@ -650,9 +652,8 @@ def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, scaled: boo
     A launch's rows flagged to their block's flag reserve none: the flag is its warpgroup's vote
     (`attention_mosaic_forward._status_stored`, `bar.red.or.pred`)."""
     if scaled or magnitudes or hooked:
-        return family.warpgroups(consumers)
+        return family.warpgroups(consumers, joined=joined)
     return 0
-
 
 def forward_reduces(family: mosaic.Family, reducing_warpgroups: int) -> bool:
     """Whether a forward launch's arithmetic reduces across warps, reserving its family's reduction scratch

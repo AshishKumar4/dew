@@ -87,6 +87,7 @@ from dew.nn.kernels.options import (
     collecting,
     owned_program,
     program_digest,
+    program_name,
     shapes_of,
     stated_digest,
     taking,
@@ -360,9 +361,10 @@ class AheadOfTime:
     before its first step on those GPUs."""
     planned_parts: Mapping[str, float] = dataclasses.field(default_factory=dict)
     """The seconds of that search's work by part, summed over its threads (a compile at once runs several):
-    JAX's traces (`traced`), the algebra's passes over the traced programs (`algebra`, `report.passes`),
-    JAX's lowerings (`lowered`) and XLA's compiles (`compiled`; the planner's reading,
-    `planning.spending`)."""
+    the step's JAX traces (`traced`), the algebra's passes over the traced programs (`algebra`,
+    `report.passes`), the step's lowerings (`lowered`) and XLA's compiles (`compiled`; the planner's reading,
+    `planning.spending`), and a fresh state's start, traced, lowered and compiled beside them (`start`,
+    `distributed.START_PROGRAM`'s, row 6740)."""
     capacity: int | None = None
     """The allocator's limit each target GPU holds the plan to, derived from the memory stated for it
     (`dew._devices.allocator_limit`); None for a TPU's, whose topology states its own."""
@@ -1182,12 +1184,10 @@ class AheadTarget:
                 with report.for_devices():
                     return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
             except report.Untuned as refused:
-                # Named by its digest where its trees state one, else by its text's (a host step's VJP
-                # results' tree states no form, `stated_digest`).
+                # Named as every untuned program is (`program_name`), a host step's VJP results stating no
+                # form.
                 _log.warning("a host step is not preparable here: %s", refused)
-                named = (stated_digest(refused.lowered)
-                         or hashlib.sha256(refused.lowered.as_text().encode()).hexdigest())
-                return CompiledAhead(None, None, (named,))
+                return CompiledAhead(None, None, (program_name(refused.lowered),))
         topology = None if self.topology is None else Path(self.topology).read_bytes()
         if self.path is not None and not self.phases:
             # Over a host's own GPUs (`topology`), as its run compiles it: every tuned choice the GPU kind's
@@ -1227,7 +1227,7 @@ class AheadTarget:
                 # Its run compiles it on the device, which tunes it (and the next prepare finds it), or makes
                 # the choice a compile without it cannot (`report.CompiledOnDevice`).
                 _log.warning("a step is not preparable here: %s", refused)
-                untuned.append(program_digest(refused.lowered))
+                untuned.append(program_name(refused.lowered))
                 continue
             _log.info("a step compiled ahead into the cache in %.1f s", ahead.planned_seconds)
         return CompiledAhead(None, ahead, tuple(untuned))
@@ -1510,13 +1510,20 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     """`compile_ahead`'s step and programs, the evaluations' with `plan`, what the run's `fit` is asked for
     (`Trainer._fit_plan`), over its own data or a configured run's loader (`AheadTarget.compiled`), with its
     planning's seconds by their parts (`AheadOfTime.planned_parts`)."""
+    from dew.telemetry.compiles import Ledger
+    from dew.training.distributed import START_PROGRAM
     from dew.training.planning import spending
 
-    with report.recording() as recorded, spending() as spent:
+    with report.recording() as recorded, spending() as spent, Ledger(START_PROGRAM) as start:
         ahead = _planned_ahead(trainer, batch, frontier=frontier, plan=plan, topology=topology)
-    # The planning's seconds by its parts, which perf_gate reports beside its whole (row 5339): JAX's traces,
-    # lowerings and compiles (the planner's own reading of them, `spending`) and the algebra's passes.
-    return dataclasses.replace(ahead, planned_parts={**spent, "algebra": sum(recorded.passes)})
+    # The planning's seconds by its parts, which perf_gate reports beside its whole (row 5339): the step's
+    # JAX traces, lowerings and compiles (the planner's own reading of them, `spending`), the fresh state's
+    # start compiled beside them (`start`, its own program's; row 6740: the gate read it as the step's) and
+    # the algebra's passes.
+    started = {kind: sum(made.seconds for made in start.programs if made.kind == kind) for kind in spent}
+    stepped = {kind: seconds - started[kind] for kind, seconds in spent.items()}
+    return dataclasses.replace(ahead, planned_parts={**stepped, "start": sum(started.values()),
+                                                     "algebra": sum(recorded.passes)})
 
 
 class _Targeted(NamedTuple):

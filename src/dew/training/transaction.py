@@ -1574,12 +1574,15 @@ class Transaction:
             return None
         if holds_back(state.opt_state) or clips_qk(state.opt_state):
             return None
-        if not consumed_where_made(self.optimizer, state, 1, shared=self.shared,
-                                   progressed=self.bound is not None):
-            return None
+        # The model's runs and its optimizer's copies first, read off the trees: the optimizer's update is
+        # traced (`consumed_where_made`) only for a run that could be updated so (row 6740: a model with no
+        # stacked run traced a whole update it then discarded).
         params = state.variables["params"]
         runs = _stage_runs(params)
         if not runs or not _held_in_copies(state.opt_state, params):
+            return None
+        if not consumed_where_made(self.optimizer, state, 1, shared=self.shared,
+                                   progressed=self.bound is not None):
             return None
         copies = _param_copies(state.opt_state, params)
         names = tuple(f"{in_backward.MOMENTS}_{index}" for index in range(len(copies)))
