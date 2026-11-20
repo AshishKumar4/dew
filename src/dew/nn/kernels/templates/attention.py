@@ -1950,9 +1950,11 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
             return jnp.where(nonzero, lowered_divide(numerator, divisor, raised), 0.0)
 
         weighed = bodies.subnormals(weighed_by, delta.dtype)
-        initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
-                          total=(-weighed).astype(state.total.dtype),
-                          acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
+        # In the state's own structure, its static marks with it (`Initial.valueless`).
+        initial = dataclasses.replace(
+            state, m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
+            total=(-weighed).astype(state.total.dtype),
+            acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded
