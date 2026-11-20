@@ -1113,41 +1113,41 @@
 "tests/test_contracts_objectives.py::test_the_lm_heads_hold_every_order_of_their_gradient[normal-whole]"
 ],
 "tests/test_contracts_recurrence.py": [
-"tests/test_contracts_recurrence.py::test_a_split_convs_bias_holds_its_orders[normal]",
-"tests/test_contracts_recurrence.py::test_a_turned_template_call_holds_every_order[normal]",
+"tests/test_contracts_recurrence.py::test_a_turned_template_call_holds_every_order[near the largest-first orders]",
+"tests/test_contracts_recurrence.py::test_a_turned_template_call_holds_every_order[near the least normal-grad of grad]",
+"tests/test_contracts_recurrence.py::test_a_turned_template_call_holds_every_order[normal-grad of grad]",
+"tests/test_contracts_recurrence.py::test_a_turned_template_call_holds_every_order[normal-second orders, staged]",
 "tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[one sequence-near the least normal-first orders]",
-"tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[one sequence-the largest its chunk holds-jvp of grad, scanned]",
-"tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[packed-near the largest-second orders, staged]",
+"tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[packed-near the largest-grad of grad]",
 "tests/test_contracts_recurrence.py::test_the_chunked_delta_rule_holds_every_order[packed-normal-second orders, staged]",
-"tests/test_contracts_recurrence.py::test_the_chunked_op_holds_every_order[near the largest]",
-"tests/test_contracts_recurrence.py::test_the_decode_step_holds_every_order[near the largest]",
-"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_gdn-second jvp]",
-"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_kda-second orders, staged]",
-"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_gdn-second orders, staged]",
-"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_kda-jvp of grad]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-kimi_delta]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-gated_delta]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta]",
+"tests/test_contracts_recurrence.py::test_the_chunked_op_holds_every_order[normal]",
+"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_gdn-jvp of grad]",
+"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_gdn-first orders]",
+"tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_kda-first orders]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-gated_delta-grad of grad]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-kimi_delta-grad of grad]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-gated_delta-first orders]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-gated_delta-jvp of grad]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta-first orders]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[near the largest]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[near the least normal]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[normal]",
-"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the largest-first orders]",
+"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the largest-grad of grad]",
 "tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the largest-jvp of grad, scanned]",
 "tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the largest-jvp of grad]",
-"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the largest-second orders, staged]",
-"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the least normal-grad of grad]",
+"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the least normal-first orders]",
 "tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the least normal-jvp of grad, scanned]",
 "tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the least normal-jvp of grad]",
-"tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the least normal-second jvp]",
 "tests/test_contracts_recurrence.py::test_the_selective_scan_holds_its_orders[near the least normal-second orders, staged]",
 "tests/test_contracts_recurrence.py::test_the_short_conv_holds_every_order[near the largest]",
-"tests/test_contracts_recurrence.py::test_the_ssd_port_holds_its_orders[near the least normal-second orders, staged]",
-"tests/test_contracts_recurrence.py::test_the_ssd_port_holds_its_orders[normal-second orders, staged]",
-"tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[near the least normal-jvp of grad, scanned]",
+"tests/test_contracts_recurrence.py::test_the_ssd_port_holds_its_orders[normal-grad of grad]",
+"tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[near the least normal-grad of grad]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-first orders]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-grad of grad]",
 "tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-jvp of grad, scanned]",
-"tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-jvp of grad]"
+"tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-jvp of grad]",
+"tests/test_contracts_recurrence.py::test_the_template_rule_holds_its_orders[normal-second orders, staged]"
 ],
 "tests/test_contracts_sampling.py": [
 "tests/test_contracts_sampling.py::test_a_transitions_quadratic_term_holds_every_order[near the least normal]"
@@ -1305,6 +1305,9 @@
 "tests/test_decision_state_once.py::test_each_question_reads_the_shared_part_and_itself",
 "tests/test_decision_state_once.py::test_rows_over_one_state_score_the_input_term_each_questions_own_row_scores",
 "tests/test_decision_state_once.py::test_sibling_questions_packed_a_window_read_each_their_own_requests_context"
+],
+"tests/test_decision_streams.py": [
+"tests/test_decision_streams.py::test_each_token_reads_exactly_what_its_streams_record_says_in_a_packed_window[joint]"
 ],
 "tests/test_decision_task.py": [
 "tests/test_decision_task.py::test_a_laya_release_loaded_and_saved_again_states_the_dtype_its_task_computed_in",
@@ -3005,12 +3008,12 @@
 "tests/test_recurrence.py::test_each_covering_hook_combination_steps_as_its_float64_form[l2norm=True]"
 ],
 "tests/test_recurrence_chunk.py": [
-"tests/test_recurrence_chunk.py::test_a_ragged_last_chunk_keeps_its_tokens_and_document_resets[scalar decay-delta-one sequence-9-16]",
-"tests/test_recurrence_chunk.py::test_a_turned_forked_documents_arithmetic_reads_only_its_ancestors[two trees]",
-"tests/test_recurrence_chunk.py::test_a_turned_states_long_documents_under_a_short_memory_are_as_exact_as_the_recurrence[one sequence]",
-"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=False, scale=None, decay='none', gates=None, delta=False, write_gate=True, rated=False, skip=True, output=None, write_bound=None, reads='after', own_weight=False, ranks=1, turns=0)-one sequence]",
-"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=True, scale=None, decay='scalar', gates=Gates(write='sigmoid', limit=None), delta=True, write_gate=False, rated=False, skip=False, output=None, write_bound=None, reads='after', own_weight=False, ranks=1, turns=0)-one sequence]",
-"tests/test_recurrence_chunk.py::test_the_output_rounds_once_after_the_epilogue[Hooks(conv=None, l2norm=False, scale=0.1, decay='scalar', gates=None, delta=True, write_gate=False, rated=False, skip=True, output=OutputNorm(epsilon=1e-06, activation='silu', read_in=None), write_bound=None, reads='after', own_weight=False, ranks=1, turns=0)-port]",
+"tests/test_recurrence_chunk.py::test_a_forked_delta_products_documents_are_as_exact_as_each_alone[starts]",
+"tests/test_recurrence_chunk.py::test_a_transitions_decode_token_is_as_exact_as_its_formula[untied]",
+"tests/test_recurrence_chunk.py::test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[packed]",
+"tests/test_recurrence_chunk.py::test_a_turned_states_long_documents_under_a_short_memory_are_as_exact_as_the_recurrence[packed]",
+"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=True, scale=None, decay='scalar', gates=Gates(write='sigmoid', limit=None), delta=True, write_gate=False, rated=False, skip=False, output=None, write_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-one sequence]",
+"tests/test_recurrence_chunk.py::test_the_output_rounds_once_after_the_epilogue[Hooks(conv=None, l2norm=False, scale=0.1, decay='scalar', gates=None, delta=True, write_gate=False, rated=False, skip=True, output=OutputNorm(epsilon=1e-06, activation='silu', read_in=None), write_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-port]",
 "tests/test_recurrence_chunk.py::test_the_portable_rule_takes_forward_mode_at_its_public_seam[packed]"
 ],
 "tests/test_recurrence_mosaic.py": [
@@ -3251,10 +3254,6 @@
 "tests/test_ring_protocol.py::test_a_gathered_walk_over_the_load_warps_holds_every_property_in_every_interleaving[stages2-tiles3]",
 "tests/test_ring_protocol.py::test_a_load_warp_reading_entries_no_fill_wrote_is_caught",
 "tests/test_ring_protocol.py::test_the_ring_familys_walk_holds_every_property_in_every_interleaving[stages1-consumers2-tiles(3,)-inflight0-stepped]"
-],
-"tests/test_rl_contracts.py": [
-"tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[DPOObjective]",
-"tests/test_rl_contracts.py::test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima[GRPOObjective]"
 ],
 "tests/test_rl_expert_balance.py": [
 "tests/test_rl_expert_balance.py::test_a_policy_runs_balance_flag_builds_a_policy_that_balances_its_routers[dpo]"
