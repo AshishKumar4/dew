@@ -483,3 +483,49 @@ def test_a_launch_carries_each_warpgroups_paths_its_steps_times():
     roles = (emission.Role(cost.Work(chains=(waits,)), (cost.Work(chains=(stepping,)),)),)
     assert emission.Emitted(roles).paths(8) == (cost.Chain(products=8, columns=1024, barriers=4),)
 
+
+_SWIZZLED = (plgpu.TilingTransform((8, 64)), plgpu.SwizzleTransform(128))
+
+
+def _waits(body, *scratch, warpgroups: int = 1) -> tuple:
+    """The paths a kernel of `body` over `scratch` waits through, each warpgroup's work outside its walks."""
+    kernel = plgpu.kernel(body, out_type=_ROW, num_threads=warpgroups, thread_name="wg",
+                          scratch_types=list(scratch))
+    return tuple(role.fixed.chains for role in emission.emitted(jax.make_jaxpr(kernel)(), warpgroups,
+                                                                 "wg").roles)
+
+
+@pytest.mark.parametrize("allowed, waited", [(0, (cost.Chain(products=1, columns=128),)), (1, ())])
+def test_a_warpgroup_waits_on_the_products_it_drains(allowed, waited):
+    """A 64 x 128 product of 16-bit operands 64 deep, waited down to `allowed` in flight: drained, the
+    warpgroup's path waits on it, its 128 columns (`cost.Chain.columns`); let fly, a later trip waits on it,
+    which this one's work hides (row 4123)."""
+    def body(out_gmem, a, b):
+        del out_gmem
+
+        def scope(acc):
+            plgpu.wgmma(acc, a, b)
+            plgpu.wgmma_wait(allowed)
+            return acc[...]
+
+        pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
+
+    assert _waits(body, plgpu.SMEM((64, 64), jnp.bfloat16, transforms=_SWIZZLED),
+                  plgpu.SMEM((64, 128), jnp.bfloat16, transforms=_SWIZZLED)) == (waited,)
+
+
+def test_a_warpgroup_waits_on_a_copy_its_barrier_lands_or_on_another_warpgroups_arrival():
+    """A barrier's wait the warpgroup's path runs through: a tile copy landing on it (its bytes), or, where
+    none of its copies or products lands on it, another warpgroup's arrival, a round trip (row 4123)."""
+    def copied(out_gmem, tile, ready):
+        plgpu.copy_gmem_to_smem(out_gmem, tile, ready)
+        plgpu.barrier_wait(ready)
+
+    def handed(out_gmem, ready):
+        del out_gmem
+        plgpu.barrier_wait(ready)
+
+    assert _waits(copied, plgpu.SMEM((128,), jnp.float32), plgpu.Barrier()) == (
+        (cost.Chain(copies=1, copy_bytes=512),),)
+    assert _waits(handed, plgpu.Barrier()) == ((cost.Chain(barriers=1),),)
+
