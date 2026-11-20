@@ -2137,12 +2137,13 @@ def _issuer(program: _Program, streams, refs, placed: Callable) -> Callable | No
 
 def _correction(program: _Program, placed_at: Callable, value_width: int, joined: tuple) -> tuple:
     """Bind `Tcgen05Placed.correcting` to the planned `joined` correction role tuple (row 5368)."""
-    if not joined:
+    family = program.family
+    if not joined or not isinstance(family, placed_mod.Tcgen05Placed):
         return ()
 
     def body(_index):
         *_, own = placed_at()
-        program.family.correcting(*own, value_width)
+        family.correcting(*own, value_width)
 
     return tuple((role, count, body) for role, count in joined)
 
