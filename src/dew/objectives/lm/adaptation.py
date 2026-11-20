@@ -923,21 +923,22 @@ class InContextDecoder(nn.Module):
         when it is read: decoding, past the rows' cache, else from a chain that has read nothing."""
         laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, valid=attention_mask,
                                  positions=positions, right_padded=right_padded)
-        return self._decoded(tokens, None, decode, laid, fields)
+        return self._decoded(tokens, None, decode, laid, fields)[1]
 
     def states_and_logits_at(self, tokens, slots, decode: bool = False, positions=None, segment_ids=None,
                              attention_mask=None, right_padded: bool = False, coordinates=None, **fields):
-        """The logits at `slots` alone, one a row (`[rows]`) or `[rows, K]` (`dew.nn.protocols.Selective`):
-        a prefill's, whose first draw reads one slot a row, runs the head for a slot's own logits only where
-        a row reads them. No states: a draft's, which no strategy it draws by reads (`DrawsAlone`)."""
+        """The trunk's final states `[B, S, features]` and the logits at `slots` alone, one a row (`[rows]`)
+        or `[rows, K]` (`dew.nn.protocols.Selective`): a prefill's, whose first draw reads one slot a row,
+        keeps each read slot's states past the levels and runs the head over those alone."""
         laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, valid=attention_mask,
                                  positions=positions, right_padded=right_padded)
         wanted = jnp.asarray(slots, jnp.int32).reshape(tokens.shape[0], -1)
-        logits = self._decoded(tokens, wanted, decode, laid, fields)
-        return None, logits[:, 0] if jnp.ndim(slots) == 1 else logits
+        hidden, logits = self._decoded(tokens, wanted, decode, laid, fields)
+        return hidden, logits[:, 0] if jnp.ndim(slots) == 1 else logits
 
-    def _decoded(self, tokens, wanted, decode: bool, laid, fields) -> jax.Array:
-        """`__call__`'s logits, or at the slots `wanted` names alone (`states_and_logits_at`)."""
+    def _decoded(self, tokens, wanted, decode: bool, laid, fields) -> tuple[jax.Array, jax.Array]:
+        """The trunk's final states and `__call__`'s logits, or at the slots `wanted` names alone
+        (`states_and_logits_at`)."""
         if laid is not None and (laid.starts is not None or laid.forks is not None):
             raise ValueError("a row decodes one document, its windows counted from its first real token: "
                              "a packed or forked request steps none")
@@ -951,8 +952,9 @@ class InContextDecoder(nn.Module):
                                                **fields)
             held = self.get_variable("cache", IN_CONTEXT)
         else:
-            hidden, updated = self.model.apply(self._read(), tokens, coordinates=laid, method="hidden_states",
-                                               **fields), None
+            hidden = jnp.asarray(self.model.apply(self._read(), tokens, coordinates=laid,
+                                                  method="hidden_states", **fields))
+            updated = None
             held = self._opened(tokens.shape[0])
         real = real_slots({} if laid is None else {COORDINATES_FIELD: laid}, tokens.shape[:2])
         blocks = fields.get(BLOCKS_FIELD)
@@ -963,7 +965,7 @@ class InContextDecoder(nn.Module):
             for name, entry in updated["cache"].items():
                 self.put_variable("cache", name, entry)
             self.put_variable("cache", IN_CONTEXT, held)
-        return logits
+        return jnp.asarray(hidden), logits
 
     def _scanned(self, held: dict, hidden, tokens, real, blocks, wanted) -> tuple[dict, jax.Array]:
         """The rows' chains `held` past `tokens`' slots, a slot at a time, and each slot's logits, or the
@@ -977,11 +979,11 @@ class InContextDecoder(nn.Module):
         def keyed(rank):
             return tuple((rank // window)[:, None] for window in windows)
 
-        def own(carry, states, token, count):
-            # A slot's logits at the versions it reads, its target unknown.
+        def passed(carry, states, token, count):
+            # A slot's states past the levels at the versions it reads, its target unknown.
             versions, chosen, _, _ = chain.opened(carry, (states[:, None], token[:, None], nothing, runs,
                                                           keyed(count)))
-            return chain.logits(chain.read(versions, chosen, states[:, None])[0])[:, 0]
+            return chain.read(versions, chosen, states[:, None])[0][:, 0]
 
         def stepped(state, adjacent, inputs):
             # The waiting slot, closed with this token as its target, a block of the training scan, the
@@ -1001,28 +1003,26 @@ class InContextDecoder(nn.Module):
             pending = jnp.where(real[:, None], states.astype(state["pending"].dtype), state["pending"])
             following = {"chain": carry, "pending": pending, "block": jnp.where(real, block, state["block"]),
                          "count": count + real.astype(jnp.int32)}
-            return following, own(carry, states, token, count) if wanted is None else carry
+            return following, passed(carry, states, token, count)
 
         def every(scanned, inputs):
             state, adjacent = scanned
-            following, logits = stepped(state, adjacent, inputs)
-            return (following, inputs[3]), logits
+            following, read = stepped(state, adjacent, inputs)
+            return (following, inputs[3]), chain.logits(read[:, None])[:, 0]
 
         def selected(scanned, inputs):
+            # The slots a row reads keep their states past the levels, which the head reads after the scan.
             state, adjacent, kept = scanned
-            at, states, token = inputs[:3]
-            following, carry = stepped(state, adjacent, inputs)
-            read = wanted == at
-            found = jax.lax.cond(jnp.any(read), lambda: own(carry, states, token, state["count"]),
-                                 lambda: jnp.zeros_like(kept[:, 0]))
-            return (following, inputs[3], jnp.where(read[..., None], found[:, None], kept)), None
+            following, read = stepped(state, adjacent, inputs)
+            chosen = wanted == inputs[0]
+            return (following, inputs[3], jnp.where(chosen[..., None], read[:, None], kept)), None
 
         inputs = (jnp.arange(width), jnp.moveaxis(hidden, 1, 0), tokens.T, real.T, blocks.T)
         first = jnp.ones((rows,), bool)
         if wanted is None:
             (held, _), logits = jax.lax.scan(every, (held, first), inputs)
             return held, jnp.moveaxis(logits, 0, 1)
-        shape = jax.eval_shape(own, held["chain"], hidden[:, 0], tokens[:, 0], held["count"])
+        shape = jax.eval_shape(passed, held["chain"], hidden[:, 0], tokens[:, 0], held["count"])
         kept = jnp.zeros((rows, wanted.shape[1], *shape.shape[1:]), shape.dtype)
         (held, _, kept), _ = jax.lax.scan(selected, (held, first, kept), inputs)
-        return held, kept
+        return held, chain.logits(kept)

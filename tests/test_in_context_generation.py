@@ -16,7 +16,7 @@ from block_support import model as kinded, wrapped
 from reference_error import assert_as_exact, dew_path
 from test_chunk_adaptation import LENGTH, LEVEL, VOCAB, _replayed, decoder, drawn_variables, variable_shapes
 
-from dew.batch import BLOCKS_FIELD, COORDINATES_FIELD, token_coordinates
+from dew.batch import BLOCKS_FIELD, COORDINATES_FIELD, VALIDITY_FIELD, token_coordinates
 from dew.data.chat import Role
 from dew.inference.tasks import TextGeneration
 from dew.interop import Pretrained
@@ -189,7 +189,8 @@ def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
     alone (`Selective`), each step's logits on par with the training forward's at the ids so far (check 1,
     the truth in float64): the steps before the switch at eight ids and the two past it, where its levels
     rebuilt with the trunk's cache read the factors the whole history reads (row 9066). A prompt's blocks,
-    which a rebuild's replay of its ids would not carry, are refused there."""
+    which a rebuild's replay of its ids would not carry, and a hole between its real tokens, which the
+    replay closes, are refused there."""
     loaded = Pretrained.load(PHI3, dtype="float32", attention_impl="reference", max_seq_len=48)
     adaptation = ChunkAdaptation(window=3, rate=0.1)
     model = loaded.model.clone(continuum=LEVEL)
@@ -226,6 +227,10 @@ def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
     blocked = ModelInputs(jnp.asarray(ids[:, :4]), {BLOCKS_FIELD: jnp.ones((ROWS, 4), jnp.int32)})
     with pytest.raises(ValueError):
         prefill_state(decoding, variables, blocked, decode_ops(decoding, variables, 0, 0))
+    hole = jnp.asarray([[True, False, True, True]] * ROWS)
+    holed = ModelInputs(jnp.asarray(ids[:, :4]), {VALIDITY_FIELD: hole})
+    with pytest.raises(ValueError):
+        generate(decoding, variables, holed, 2, key=jax.random.key(0))
 
 
 def test_an_adapting_run_draws_what_its_saved_task_draws(tmp_path):
@@ -298,6 +303,10 @@ def test_the_decoder_answers_its_models_generation_hooks():
     assert replacing == (multimodal.replaced_ids, multimodal.replaces_media)
     assert token_table(wrapping) == token_table(multimodal)
     assert decoding.mixed_admission_refusal() is not None and decoding.split_prefill_refusal() is not None
+    prompt = jnp.zeros((ROWS, PROMPT), jnp.int32)
+    states, logits = decoding.apply(drawn_variables(0, model), prompt, jnp.full((ROWS,), PROMPT - 1),
+                                    method="states_and_logits_at")
+    assert states.shape == (ROWS, PROMPT, model.emb_features) and logits.shape == (ROWS, model.vocab_size)
 
 
 def test_what_an_adapting_decoder_cannot_draw_is_refused():
