@@ -921,13 +921,6 @@ class StepCompiler[L, E]:
         return dataclasses.replace(compiled, step=self.runner(stepping, kept, settings.device_mesh),
                                    planned=kept)
 
-    def holds_unplaced(self, batch: Batch, shape: RunShape) -> bool:
-        """Whether a fresh run's first step was planned over `batch`'s shapes before its state was placed
-        (`planned_unplaced`), the plan its first compile takes, and under the run's `shape` as it stands:
-        a plan made before the run decided how its batches are cut (a ramp's, each batch read whole) is no
-        plan of its step."""
-        return self._unplaced is not None and self._unplaced.signature == planned_over(batch, shape)
-
     def anew(self) -> StepCompiler[L, E]:
         """A compiler of this one's objective, links, step compiled ahead and pass counts, nothing planned:
         where a run lays its state out otherwise than the plans this one made were for
@@ -941,7 +934,7 @@ class StepCompiler[L, E]:
         return None if self._unplaced is None else self._unplaced.planned
 
     def planned_unplaced(self, stepping: Stepping, state: TrainState, batch: Batch,
-                         unplaced: int) -> None:
+                         unplaced: int) -> Hashable:
         """A fresh run's first step planned and compiled over `state`, its shapes, before the `unplaced`
         bytes a device holds of it are placed, so the step compiles while the run's start builds the state
         (`Trainer._opened`), not after it: each candidate is judged on the devices' free bytes in all beside
@@ -952,13 +945,18 @@ class StepCompiler[L, E]:
         does not fit the placed devices, or none fitted before the state was placed, that compile plans once
         the state is placed, from the plan's rung and split (`_plans`), not from the ladder's foot, its
         search finding the executables this one compiled, which the process holds
-        (`dew.nn.kernels.options.held`)."""
+        (`dew.nn.kernels.options.held`). What it searched over (`planned_over`), its plan held or none
+        found, which the fit searching it keeps (`FitRun.searched`): no fit searches it twice before placing
+        its state."""
+        signature = planned_over(batch, stepping.shape)
         try:
             planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced)
         except PlanRefused as refused:
             _log.info("the step fits no plan before its state is placed, planned once it is: %s", refused)
-            return
-        self._unplaced = Unplaced(planned_over(batch, stepping.shape), planned, compiled, keep)
+            self._unplaced = None
+            return signature
+        self._unplaced = Unplaced(signature, planned, compiled, keep)
+        return signature
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
              trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:

@@ -42,7 +42,7 @@ def arguments(function: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> 
                                       arguments.vararg, arguments.kwarg) if argument is not None]
 
 
-def annotations(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[tuple[str, ast.expr]]:
+def annotated(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[tuple[str, ast.expr]]:
     """Every annotation in a signature, paired with the name it belongs to."""
     for argument in arguments(function):
         if argument.annotation is not None:
@@ -137,10 +137,11 @@ def outside(scope: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.Cla
     decorators, defaults, annotations, a class's bases and keywords."""
     if isinstance(scope, ast.ClassDef):
         return [*scope.decorator_list, *scope.bases, *scope.keywords]
-    defaults = [*scope.args.defaults, *(default for default in scope.args.kw_defaults if default is not None)]
+    defaults: list[ast.AST] = [*scope.args.defaults,
+                               *(default for default in scope.args.kw_defaults if default is not None)]
     if isinstance(scope, ast.Lambda):
         return defaults
-    return [*scope.decorator_list, *defaults, *(annotation for _, annotation in annotations(scope))]
+    return [*scope.decorator_list, *defaults, *(annotation for _, annotation in annotated(scope))]
 
 
 def comprehended(nodes: Sequence[ast.AST], table: Mapping[str, str], body: Mapping[str, str]
@@ -188,8 +189,8 @@ def scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence
         importers = [node for node in by if isinstance(node, ast.Import | ast.ImportFrom)]
         others = [node for node in by if not isinstance(node, ast.arg | ast.Import | ast.ImportFrom)]
         paths = {held.get(id(node)) for node in others}
-        if others and not importers and len(paths) == 1 and None not in paths:
-            imported[name] = paths.pop()
+        if others and not importers and len(paths) == 1 and (path := paths.pop()) is not None:
+            imported[name] = path
         elif others:
             local.add(name)
         elif importers:

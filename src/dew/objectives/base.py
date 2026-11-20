@@ -77,7 +77,7 @@ from dew.nn.precision import (
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectsParameters, StagedStacks
 from dew.nn.sharding import LogicalAxes, abstract, boxed_axes, rows_taken
-from dew.objectives.drawn import drawn_once
+from dew.objectives.drawn import WHOLE, drawn_once
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -1301,7 +1301,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         if jax_core.trace_state_clean():
             # Outside any trace, one program, not each operation's, its held arrays kept (row 8682): this
             # body's, which an override calling it then changes once (row 8730's class).
-            return drawn_once(lambda tree, draw: self._initialized(draw, tree), held, key, _whole,
+            return drawn_once(lambda tree, draw: self._initialized(draw, tree), held, key, WHOLE,
                               kept=(Held(self), "init"))
         return self._initialized(key, held)
 
@@ -2165,11 +2165,6 @@ class _Unkeyed:
 
 
 UNKEYED = _Unkeyed()
-
-
-def _whole[Tree](tree: Tree) -> Tree:
-    """`tree` whole: every leaf of an objective's init a held array may pass through as it is."""
-    return tree
 
 
 class Held:

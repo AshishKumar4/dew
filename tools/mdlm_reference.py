@@ -70,7 +70,8 @@ def published(names: set[str] = METHODS) -> types.SimpleNamespace:
     text = source("diffusion.py")
     methods = selected(text, names, within="Diffusion", filename="diffusion.py")
     module = selected(text, {"_sample_categorical", "Loss"}, filename="diffusion.py")
-    module.append(ast.ClassDef(name="MDLM", bases=[], keywords=[], body=methods, decorator_list=[]))
+    module.append(ast.ClassDef(name="MDLM", bases=[], keywords=[], body=methods, decorator_list=[],
+                               type_params=[]))
     scope = ran(module, {"torch": torch, "np": np, "dataclass": dataclasses.dataclass,
                          "utils": types.SimpleNamespace(print_nans=lambda *_: None)}, "diffusion.py")
     noise: dict = {}
@@ -88,7 +89,7 @@ class Backbone(torch.nn.Module):
         return self.hidden @ self.head
 
 
-def stand_in(reference, backbone, length: int = LENGTH) -> object:
+def stand_in(reference, backbone, length: int = LENGTH):
     """MDLM's `Diffusion` as configs/config.yaml sets it up for this vocabulary and rows of `length`."""
     model = reference.MDLM()
     model.backbone, model.noise = backbone, reference.LogLinearNoise()
@@ -141,10 +142,12 @@ def nelbo(reference, inputs: dict[str, np.ndarray], dtype) -> tuple[np.ndarray, 
                torch.tensor(inputs["mask_uniform"], dtype=dtype)):
         loss = model._loss(tokens, torch.ones_like(tokens, dtype=dtype))
     loss.loss.backward()
+    hidden, head = backbone.hidden.grad, backbone.head.grad
+    if hidden is None or head is None:
+        raise RuntimeError("the backward pass left the backbone without its gradients")
     return seen[0].numpy(), {"nlls": loss.nlls.detach().numpy(),
                              "loss": loss.loss.detach().numpy().reshape(1),
-                             "grad_hidden": backbone.hidden.grad.numpy(),
-                             "grad_head": backbone.head.grad.numpy()}
+                             "grad_hidden": hidden.numpy(), "grad_head": head.numpy()}
 
 
 def main() -> None:
@@ -183,7 +186,7 @@ def main() -> None:
                   reverse_categorical=(q / q.sum(-1, keepdim=True)).numpy())
     arrays["commit"] = np.array(COMMIT)
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, **arrays)
+    np.savez(FIXTURE, allow_pickle=False, **arrays)
     recorded = record_case("nelbo", draw, lambda inputs: tuple(nelbo(reference, inputs, dtype)[1]
                                                                for dtype in (torch.float32, torch.float64)),
                            store_inputs=False, summary=True,

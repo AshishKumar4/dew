@@ -49,11 +49,11 @@ def stub_torch_utils() -> None:
     import torch
 
     persistence = types.ModuleType("torch_utils.persistence")
-    persistence.persistent_class = lambda cls: cls
+    vars(persistence)["persistent_class"] = lambda cls: cls
     misc = types.ModuleType("torch_utils.misc")
-    misc.const_like = lambda ref, value: torch.as_tensor(value, dtype=ref.dtype, device=ref.device)
+    vars(misc)["const_like"] = lambda ref, value: torch.as_tensor(value, dtype=ref.dtype, device=ref.device)
     package = types.ModuleType("torch_utils")
-    package.persistence, package.misc = persistence, misc
+    vars(package).update(persistence=persistence, misc=misc)
     sys.modules.update({"torch_utils": package, "torch_utils.persistence": persistence,
                         "torch_utils.misc": misc})
 
@@ -151,7 +151,7 @@ def saved_fixture(path: Path, arrays: dict, meta: dict) -> None:
 
     arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, **arrays)
+    np.savez_compressed(path, allow_pickle=False, **arrays)
 
 
 def git_head(path: str | Path) -> str:
@@ -347,7 +347,7 @@ def write_probes(directory: Path, model, vocab: int, continued=None) -> None:
     (`torch_greedy`)."""
     import numpy as np
 
-    from dew.interop.verify import probe_ids
+    from dew.interop.probe import probe_ids
 
     ids = probe_ids(vocab)
     mask, padded, positions = padded_probe(ids)

@@ -335,7 +335,7 @@ def compiled_gradient(hooks, name: str) -> list[dict]:
 
 
 @COMPILES_ON_CPU
-@pytest.mark.check1_shards(seeds=512, per_task=8)
+@pytest.mark.check1_shards(seeds=512, per_task=3)
 def test_kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla_interpreted():
     """Kimi delta attention's 16-bit gradient through the template, interpreted, under decays at its floor and
     write gates down to 2^-60 (fla_sites' `FLOOR_GATES`): its output, final memory and every operand's

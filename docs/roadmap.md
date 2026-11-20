@@ -19,7 +19,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701, 5739]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293, 5368]
 - Inference through the templates. [3424, 3602]
-- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5322, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900]
+- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 5900]
 - The kernel challenge's lessons in the templates. [5271]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
@@ -93,7 +93,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A start record (dew.training.warm) is kept and loaded by a single process alone. [6218]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
-- step_fits reads each device's allocator (step_headroom, Device.memory_stats) before its agreement. [8767]
 - Narrow copies at the Qwen3.5-4B decision step. [6638]
 - A program compiled ahead without its GPU that holds a convolution is refused and compiled on its GPU. [8527]
 

@@ -31,8 +31,10 @@ raised to the penalty), and the settings.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import types
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -56,11 +58,9 @@ def searched(model, ids, mask, eos, pad, penalty, early, **shaping) -> tuple[np.
     `pad` to the budget, and their scores, one prompt at a time."""
     width, tokens, scores = ids.shape[1], [], []
     wide = next(model.parameters()).dtype == torch.float64
-    kept = generation.torch
-    if wide:
-        generation.torch = types.SimpleNamespace(**{**vars(torch), "float32": torch.float64,
-                                                    "float": torch.float64})
-    try:
+    # Under float64, generation's own float32 casts widened with the model's (its module's `torch`).
+    widened = types.SimpleNamespace(**{**vars(torch), "float32": torch.float64, "float": torch.float64})
+    with patch.object(generation, "torch", widened) if wide else contextlib.nullcontext():
         for row, valid in zip(ids, mask, strict=True):
             real = torch.from_numpy(row[width - int(valid.sum()):])[None]
             with torch.no_grad():
@@ -72,8 +72,6 @@ def searched(model, ids, mask, eos, pad, penalty, early, **shaping) -> tuple[np.
             drawn = result.sequences.numpy()[:, real.shape[1]:]
             tokens.append(np.pad(drawn, ((0, 0), (0, NEW_TOKENS - drawn.shape[1])), constant_values=pad))
             scores.append(result.sequences_scores.to(torch.float64).numpy())
-    finally:
-        generation.torch = kept
     return np.concatenate(tokens), np.concatenate(scores)
 
 
@@ -124,7 +122,7 @@ def write(name: str) -> None:
     print(f"{name}: EOS {eos}, pad {pad}, {ended} of {len(SETTINGS) * len(ids) * WIDTH} beams end on EOS")
     if not ended:
         raise SystemExit(f"{name}: no beam ends on EOS")
-    np.savez(FIXTURES / name / "beam.npz", **arrays)
+    np.savez(FIXTURES / name / "beam.npz", allow_pickle=False, **arrays)
 
 
 def main() -> None:

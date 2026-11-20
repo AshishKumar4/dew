@@ -155,10 +155,10 @@ def main():
                                                    attn_implementation="eager").cpu().eval()
     release = release_blocks()
     release.install_noncausal(model)
-    probe = inputs(1, config.text_config.vocab_size)
+    probe = inputs(1, config.get_text_config().vocab_size)
     ids = torch.from_numpy(probe["input_ids"])
     altered = ids.clone()
-    altered[0, 1] = (altered[0, 1] - 6) % (config.text_config.vocab_size - 7) + 7
+    altered[0, 1] = (altered[0, 1] - 6) % (config.get_text_config().vocab_size - 7) + 7
     with torch.no_grad(), release.blocks(None):
         causal = model(input_ids=ids, use_cache=False).logits[0, 0]
         causal_changed = model(input_ids=altered, use_cache=False).logits[0, 0]
@@ -180,7 +180,7 @@ def main():
     arrays = {"blocks.redraw": np.asarray(REDRAW), "precision": np.asarray("ieee")}
     draws, references, truths = [], [], []
     for seed in range(staged_units(args.seeds)):
-        draw = inputs(seed, config.text_config.vocab_size)
+        draw = inputs(seed, config.get_text_config().vocab_size)
         ids = torch.from_numpy(draw["input_ids"])
         blocks = torch.from_numpy(draw["block_groups"])
         with torch.no_grad(), release.blocks(blocks):

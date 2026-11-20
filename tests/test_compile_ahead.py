@@ -2019,7 +2019,8 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     setting the autotuner's level 0, as a repeatable lane's do), its products then the run's own, unless
     it leaves a convolution's algorithm to run time (`at_run`). A step of this host's own target stands for
     the GPU host's here: a CPU is no target a step compiles ahead for."""
-    from dew.training.ahead import AheadOfTime, BuildTarget, compile_ahead
+    from dew._cache import uncached
+    from dew.training.ahead import AheadOfTime, BuildTarget, Executable, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     compile_ahead(fine_tune(MeshSpec().build(gpus("sm90"))), batch).save(tmp_path / "step.dew-aot")
@@ -2035,6 +2036,18 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     assert len([entry for entry in caplog.records if entry.name == "dew.training.ahead"]) == 1
     tuned = dataclasses.replace(own, plan={**record(own.plan, "plan"), "autotuned": True})
     assert tuned.tuned and tuned.runnable(here) is tuned
+    # Loaded direct, as a tool or a caller of `taken` loads it, the untuned step is refused alike and the
+    # tuned one loads (row 8986): a step this host loads as it is, over its every device.
+    every = jax.devices()
+    replicated = jax.sharding.NamedSharding(jax.sharding.Mesh(np.asarray(every), ("devices",)),
+                                            jax.sharding.PartitionSpec())
+    with uncached():
+        doubled = jax.jit(lambda x: x * 2.0, out_shardings=replicated).lower(
+            jax.ShapeDtypeStruct((4,), jnp.float32, sharding=replicated)).compile()
+    loads = dataclasses.replace(own, built=BuildTarget.of(every), executable=Executable.of(doubled))
+    with pytest.raises(ValueError):
+        loads.loaded()
+    assert dataclasses.replace(loads, plan=tuned.plan).loaded() is not None
     # Built under the flags it runs under: XLA's flags are part of a step's target (`BuildTarget.flags`).
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0")
     level_zero = dataclasses.replace(handed, built=BuildTarget.of(here))
