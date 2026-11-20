@@ -1292,7 +1292,8 @@ class _Decays(NamedTuple):
     between: jax.Array
 
 
-_DECAYS_TREE = jax.tree.structure(_Decays(*(_Split(*(jnp.zeros(()),) * 2),) * 3, jnp.zeros(())))
+_ZERO = _Split(jnp.zeros(()), jnp.zeros(()))
+_DECAYS_TREE = jax.tree.structure(_Decays(_ZERO, _ZERO, _ZERO, jnp.zeros(())))
 DECAYS = _DECAYS_TREE.num_leaves
 """The chunk function's leading operands: its decays (`_Decays`' leaves), its tokens' values after."""
 
@@ -1443,7 +1444,9 @@ def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
     `j < s <= i`, summed over the rectangle by compensated scans. A difference of two prefix sums of these
     terms loses the deep decays' gradients near zero (the oracle's `summed_ranges`)."""
     weight = math.log(2.0) if base2 else 1.0
-    entering, to_last, whole = (_split_term(decays[index], cotangents[index]) for index in range(3))
+    entering, to_last, whole = (_split_term(decay, cotangent) for decay, cotangent in
+                                ((decays.entering, cotangents.entering), (decays.to_last, cotangents.to_last),
+                                 (decays.whole, cotangents.whole)))
     between = cotangents.between * decays.between
     if between.shape[-1] > 1:
         # A decay a key's pairs' terms `[C, C, K]` formed once, ahead of their scans: fused into the first,
