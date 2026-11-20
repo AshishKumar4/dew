@@ -33,6 +33,11 @@ class Mean[Scored: Artifact]:
     name: str
     better: Literal["higher", "lower"]
     reads: type[Scored]
+    fields: tuple[str, ...] = ()
+    """The batch fields `fn` reads beside the artifact, a sample's targets or the captions a score compares:
+    `fit` reads them in each split's first batch before it trains a step (`dew.training.evaluation`'s
+    admission, row 9063), where a missing one surfaced at the split's first scoring, the end of a run that
+    scores at its end alone."""
 
     def __post_init__(self) -> None:
         if self.better not in ("higher", "lower"):
@@ -125,8 +130,8 @@ class ImageMetric(Mean[ImageGrid | VideoGrid]):
 
     def __init__(self, name: str, measure: Callable[[ImageGrid | VideoGrid, Batch], ArrayLike], *,
                  better: Literal["higher", "lower"] = "higher",
-                 reads: type[ImageGrid | VideoGrid] = ImageGrid):
-        super().__init__(measure, name, better, reads)
+                 reads: type[ImageGrid | VideoGrid] = ImageGrid, fields: tuple[str, ...] = ()):
+        super().__init__(measure, name, better, reads, fields)
 
     def __call__(self, artifact: Artifact, batch: Batch) -> tuple[float, float]:
         with metric_device():
@@ -144,4 +149,4 @@ class PairedImageMetric(ImageMetric):
             samples, targets = paired(artifact, batch, field)
             return measure(samples, targets, data_range, per_example=True)
 
-        super().__init__(name=name, measure=measured, reads=reads)
+        super().__init__(name=name, measure=measured, reads=reads, fields=(field,))

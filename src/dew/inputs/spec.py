@@ -247,12 +247,27 @@ class InputSpec:
         need not be `whole`, a validation split's that an objective may score
         from fewer fields (a rollout's prompts alone), is held to the shapes of
         the fields it carries, but for an inpainting spec's mask and the sample
-        it masks, which every draw and loss reads (ledger 2900)."""
-        for condition in self.conditions.values():
-            if condition.field not in batch and whole:
-                raise ValueError(
-                    f"objective.inputs needs condition field {condition.field!r} in the training batch"
-                )
+        it masks, which every draw and loss reads (ledger 2900). A condition
+        that reads captions is held to the widths its encoder tokenizes them to
+        (`_token_widths`, row 9063): captions a data step encoded with another
+        encoder, or at another context, are refused before a step, where the
+        encoder read them at whatever width they came."""
+        for keyword, condition in self.conditions.items():
+            if condition.field not in batch:
+                if whole:
+                    raise ValueError(
+                        f"objective.inputs needs condition field {condition.field!r} in the training batch")
+                continue
+            if not condition.encoder.reads_captions:
+                continue
+            held = batch[condition.field]
+            widths = ({name: tuple(np.shape(value))[1:] for name, value in held.items()}
+                      if isinstance(held, Mapping) else None)
+            declared = _token_widths(condition.encoder)
+            if widths != declared:
+                raise ValueError(f"objective.inputs condition {keyword!r} reads {condition.field!r} as its "
+                                 f"encoder tokenizes captions, {declared} a row, and the batch holds "
+                                 f"{widths}: encode the captions with the run's encoder")
         if self.mask is not None and self.mask.key not in batch:
             raise ValueError(f"an inpainting objective reads each image's mask, {self.mask.key!r}, in every "
                              "batch it trains on or scores: draw one with dew.data.images.RandomMask() "
@@ -294,6 +309,12 @@ class InputSpec:
                       for keyword, condition in _records.record(record.get("conditions", {}),
                                                                 "conditions").items()}
         return registry.from_record(InputSpec, {**record, "conditions": conditions})
+
+def _token_widths(encoder: ConditionEncoder) -> dict[str, tuple[int, ...]]:
+    """The shape a row of each field `encoder` tokenizes a caption into holds (`ConditionEncoder.tokenize`,
+    its context), read off one caption: every encoder that reads captions pads each to its context."""
+    return {name: tuple(np.shape(value))[1:] for name, value in encoder.tokenize([""]).items()}
+
 
 @dataclasses.dataclass(frozen=True)
 class TextCondition:
