@@ -47,6 +47,7 @@ from flax import linen as nn
 from dew.batch import (
     BLOCKS_FIELD,
     COORDINATES_FIELD,
+    Variables,
     document_ranks,
     document_starts,
     prefix_sum,
@@ -59,7 +60,18 @@ from dew.nn.continuum import HeadTerms, LevelTerms, level_names
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import ReadsProgress
-from dew.nn.protocols import Generating, ProjectionGroup, SteppedInContext, block_chunks_of
+from dew.nn.projections import projection_groups
+from dew.nn.protocols import (
+    Bounded,
+    CacheCapacity,
+    Generating,
+    Layered,
+    ProjectionGroup,
+    ReplacesTokens,
+    Serving,
+    SteppedInContext,
+    block_chunks_of,
+)
 
 if TYPE_CHECKING:
     from dew.nn.kv_cache import KVCache
@@ -779,6 +791,12 @@ class InContextDecoder(nn.Module):
         refused = decoded_alone(self.adaptation)
         if refused is not None:
             raise ValueError(refused)
+        lacking = [protocol.__name__ for protocol in (Bounded, CacheCapacity, Layered)
+                   if not isinstance(self.model, protocol)]
+        if lacking:
+            raise ValueError(f"an adapting decoder generates over a decoder that states its bounds, its "
+                             f"cache's capacity and its layout, and {type(self.model).__name__} is no "
+                             f"{', '.join(lacking)}")
         super().__post_init__()
 
     @property
@@ -798,15 +816,25 @@ class InContextDecoder(nn.Module):
 
     @property
     def kv_cache(self) -> KVCache:
-        """`model`'s cache layout (`dew.nn.protocols.Layered`), which its trunk keeps; none where `model`
-        declares none (AttributeError, so it is no `Layered`)."""
+        """`model`'s cache layout (`dew.nn.protocols.Layered`), which its trunk keeps."""
         return self.model.kv_cache
 
     @property
     def cache_rebuild_position(self) -> int | None:
         """`model`'s (`dew.nn.protocols.Serving`): a row crossing it rebuilds its whole cache, its chain's
-        too, from its history (`dew.sampling.text.empty_cache`); none where `model` serves none."""
-        return self.model.cache_rebuild_position
+        too, from its history (`dew.sampling.text.empty_cache`); None where `model` serves none."""
+        return self.model.cache_rebuild_position if isinstance(self.model, Serving) else None
+
+    @property
+    def replaced_ids(self) -> frozenset[int]:
+        """The ids `model` replaces before its table reads them (`dew.nn.protocols.ReplacesTokens`), which
+        a generation's ids may hold past its vocabulary; none where it replaces none."""
+        return self.model.replaced_ids if isinstance(self.model, ReplacesTokens) else frozenset()
+
+    @property
+    def replaces_media(self) -> bool:
+        """Whether `model` replaces the id at a slot media fill (`dew.nn.protocols.ReplacesTokens`)."""
+        return isinstance(self.model, ReplacesTokens) and self.model.replaces_media
 
     @nn.nowrap
     def _over(self, model: nn.Module) -> InContextDecoder:
@@ -841,8 +869,10 @@ class InContextDecoder(nn.Module):
 
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
-        """`model`'s (`dew.nn.protocols.Serving`): its variables are `model`'s."""
-        return self.model.inference_projection_groups(variables)
+        """The groups `model` packs over its own variables (`dew.nn.protocols.Serving`), by its own rules
+        (`projection_groups`): none where an adapter wraps it, and those alone its quantization selects as
+        their members."""
+        return projection_groups(self.model, variables)
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
@@ -864,7 +894,7 @@ class InContextDecoder(nn.Module):
             self.put_variable("cache", name, entry)
         self.put_variable("cache", IN_CONTEXT, self._opened(batch_size))
 
-    def _read(self) -> dict:
+    def _read(self) -> Variables:
         """The variables `model` reads, its decode cache apart, its frozen leaves among its parameters
         (`thaw`), as its training forward reads them."""
         return thaw({name: tree for name, tree in self.variables.items() if name != "cache"})
@@ -893,13 +923,27 @@ class InContextDecoder(nn.Module):
         when it is read: decoding, past the rows' cache, else from a chain that has read nothing."""
         laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, valid=attention_mask,
                                  positions=positions, right_padded=right_padded)
+        return self._decoded(tokens, None, decode, laid, fields)
+
+    def states_and_logits_at(self, tokens, slots, decode: bool = False, positions=None, segment_ids=None,
+                             attention_mask=None, right_padded: bool = False, coordinates=None, **fields):
+        """The logits at `slots` alone, one a row (`[rows]`) or `[rows, K]` (`dew.nn.protocols.Selective`):
+        a prefill's, whose first draw reads one slot a row, runs the head for a slot's own logits only where
+        a row reads them. No states: a draft's, which no strategy it draws by reads (`DrawsAlone`)."""
+        laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, valid=attention_mask,
+                                 positions=positions, right_padded=right_padded)
+        wanted = jnp.asarray(slots, jnp.int32).reshape(tokens.shape[0], -1)
+        logits = self._decoded(tokens, wanted, decode, laid, fields)
+        return None, logits[:, 0] if jnp.ndim(slots) == 1 else logits
+
+    def _decoded(self, tokens, wanted, decode: bool, laid, fields) -> jax.Array:
+        """`__call__`'s logits, or at the slots `wanted` names alone (`states_and_logits_at`)."""
         if laid is not None and (laid.starts is not None or laid.forks is not None):
             raise ValueError("a row decodes one document, its windows counted from its first real token: "
                              "a packed or forked request steps none")
         if fields.get("adapters") is not None:
             raise ValueError("an adapter set's rows read their own adapters, which their levels' steps in "
                              "context do not select")
-        rows = tokens.shape[0]
         if decode:
             trunk = {name: entry for name, entry in self.variables["cache"].items() if name != IN_CONTEXT}
             hidden, updated = self.model.apply({**self._read(), "cache": trunk}, tokens, decode=True,
@@ -909,21 +953,22 @@ class InContextDecoder(nn.Module):
         else:
             hidden, updated = self.model.apply(self._read(), tokens, coordinates=laid, method="hidden_states",
                                                **fields), None
-            held = self._opened(rows)
+            held = self._opened(tokens.shape[0])
         real = real_slots({} if laid is None else {COORDINATES_FIELD: laid}, tokens.shape[:2])
         blocks = fields.get(BLOCKS_FIELD)
         blocks = (jnp.full(tokens.shape[:2], -1, jnp.int32) if blocks is None
                   else jnp.asarray(blocks, jnp.int32))
-        held, logits = self._scanned(held, hidden, tokens, real, blocks)
+        held, logits = self._scanned(held, hidden, tokens, real, blocks, wanted)
         if updated is not None and self.is_mutable_collection("cache"):
             for name, entry in updated["cache"].items():
                 self.put_variable("cache", name, entry)
             self.put_variable("cache", IN_CONTEXT, held)
         return logits
 
-    def _scanned(self, held: dict, hidden, tokens, real, blocks) -> tuple[dict, jax.Array]:
-        """The rows' chains `held` past `tokens`' slots, a slot at a time, and each slot's logits."""
-        rows = tokens.shape[0]
+    def _scanned(self, held: dict, hidden, tokens, real, blocks, wanted) -> tuple[dict, jax.Array]:
+        """The rows' chains `held` past `tokens`' slots, a slot at a time, and each slot's logits, or the
+        logits at the slots `wanted` (`[rows, K]`) names alone."""
+        rows, width = tokens.shape
         chain = self._chain(rows)
         windows = self.adaptation.windows(len(chain.starts))
         nothing = jnp.zeros((rows, 1), hidden.dtype)
@@ -932,27 +977,52 @@ class InContextDecoder(nn.Module):
         def keyed(rank):
             return tuple((rank // window)[:, None] for window in windows)
 
-        def slot(state, inputs):
-            states, token, real, block = inputs
-            carry, count = state["chain"], state["count"]
+        def own(carry, states, token, count):
+            # A slot's logits at the versions it reads, its target unknown.
+            versions, chosen, _, _ = chain.opened(carry, (states[:, None], token[:, None], nothing, runs,
+                                                          keyed(count)))
+            return chain.logits(chain.read(versions, chosen, states[:, None])[0])[:, 0]
+
+        def stepped(state, adjacent, inputs):
             # The waiting slot, closed with this token as its target, a block of the training scan, the
-            # target weighed where training's loss weighs it (`scored_targets`).
+            # target weighed where training's loss weighs it (`scored_targets`): the slot before it in the
+            # call real (at a call's first, the previous call's last, which a cursor continues), not the
+            # objective's padding id, and outside the waiting slot's block. Then this slot waits.
+            _, states, token, real, block = inputs
+            carry, count = state["chain"], state["count"]
             closing = (count > 0) & real
-            counted = closing & ~((state["block"] == block) & (block >= 0))
+            counted = closing & adjacent & ~((state["block"] == block) & (block >= 0))
             if self.pad_id is not None:
                 counted = counted & (token != self.pad_id)
             waiting = state["pending"].astype(hidden.dtype)[:, None]
             closed, _ = chain.block(carry, (waiting, token[:, None], counted[:, None].astype(hidden.dtype),
                                             runs, keyed(count - 1)), logits=False)
             carry = _where(closing, closed, carry)
-            # This slot's logits at the versions it reads, its target unknown.
-            versions, chosen, _, _ = chain.opened(carry, (states[:, None], token[:, None], nothing, runs,
-                                                          keyed(count)))
-            logits = chain.logits(chain.read(versions, chosen, states[:, None])[0])
             pending = jnp.where(real[:, None], states.astype(state["pending"].dtype), state["pending"])
-            state = {"chain": carry, "pending": pending, "block": jnp.where(real, block, state["block"]),
-                     "count": count + real.astype(jnp.int32)}
-            return state, logits[:, 0]
+            following = {"chain": carry, "pending": pending, "block": jnp.where(real, block, state["block"]),
+                         "count": count + real.astype(jnp.int32)}
+            return following, own(carry, states, token, count) if wanted is None else carry
 
-        held, logits = jax.lax.scan(slot, held, (jnp.moveaxis(hidden, 1, 0), tokens.T, real.T, blocks.T))
-        return held, jnp.moveaxis(logits, 0, 1)
+        def every(scanned, inputs):
+            state, adjacent = scanned
+            following, logits = stepped(state, adjacent, inputs)
+            return (following, inputs[3]), logits
+
+        def selected(scanned, inputs):
+            state, adjacent, kept = scanned
+            at, states, token = inputs[:3]
+            following, carry = stepped(state, adjacent, inputs)
+            read = wanted == at
+            found = jax.lax.cond(jnp.any(read), lambda: own(carry, states, token, state["count"]),
+                                 lambda: jnp.zeros_like(kept[:, 0]))
+            return (following, inputs[3], jnp.where(read[..., None], found[:, None], kept)), None
+
+        inputs = (jnp.arange(width), jnp.moveaxis(hidden, 1, 0), tokens.T, real.T, blocks.T)
+        first = jnp.ones((rows,), bool)
+        if wanted is None:
+            (held, _), logits = jax.lax.scan(every, (held, first), inputs)
+            return held, jnp.moveaxis(logits, 0, 1)
+        shape = jax.eval_shape(own, held["chain"], hidden[:, 0], tokens[:, 0], held["count"])
+        kept = jnp.zeros((rows, wanted.shape[1], *shape.shape[1:]), shape.dtype)
+        (held, _, kept), _ = jax.lax.scan(selected, (held, first, kept), inputs)
+        return held, kept

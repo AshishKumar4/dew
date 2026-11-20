@@ -35,6 +35,7 @@ from typing_extensions import TypeVar
 from dew._hashing import array_fingerprint
 from dew._records import finite
 from dew.batch import (
+    BLOCKS_FIELD,
     VALIDITY_FIELD,
     Coordinates,
     Variables,
@@ -446,9 +447,11 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
                          None if states is None else states[rows, slot], adapters=adapters)
     if rebuild_position(model) is not None:
-        if cache is not None or logical is not None or inputs.conditioning:
+        # A rebuild replays a row's ids alone (`_rebuilt`), so a prompt's blocks would not reach it.
+        if (cache is not None or logical is not None or inputs.conditioning
+                or BLOCKS_FIELD in inputs.token_fields):
             raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
-                             'without custom coordinates')
+                             'without custom coordinates or blocks')
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
         slots = jnp.where(real, prefix_sum(real, dtype=jnp.int32) - 1, -1)
         history = write_cache(jnp.zeros((batch, model.max_seq_len), inputs.tokens.dtype),

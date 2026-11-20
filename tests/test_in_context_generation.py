@@ -21,9 +21,20 @@ from dew.data.chat import Role
 from dew.inference.tasks import TextGeneration
 from dew.interop import Pretrained
 from dew.lora import LoRA
+from dew.nn.blocks import token_table
 from dew.nn.inputs import ModelInputs
 from dew.nn.mixers import AttentionMixer
-from dew.nn.protocols import BlockReading, Bounded, CacheCapacity, Generating, Layered, Serving
+from dew.nn.projections import projection_groups
+from dew.nn.protocols import (
+    BlockReading,
+    Bounded,
+    CacheCapacity,
+    Generating,
+    Layered,
+    ReplacesTokens,
+    Selective,
+    Serving,
+)
 from dew.nn.visibility import served_blocks
 from dew.objectives.lm import LMObjective, Samples
 from dew.objectives.lm.adaptation import ChunkAdaptation, InContextDecoder
@@ -39,8 +50,10 @@ PAD = 7
 """The padding id the padded case's objective names, which its draws hold among their real tokens."""
 PREFIX = 3
 MASK = np.ones((ROWS, LENGTH), bool)
+MASK[0, 3] = False
 MASK[1, :2] = False
-"""Every draw's real slots: the second row's first two slots padding, as a padded prompt's are."""
+"""Every draw's real slots: a hole inside the first row's prompt, which no target crosses, and the second
+row's first two slots padding, as a padded prompt's are."""
 
 DECODE_SEEDS = {"one level": 8, "a chain": 8, "padding ids": 8, "an adapter": 8,
                 "a prefix under a wrapper": 32}
@@ -95,7 +108,7 @@ def drawn(seed: int, case: str):
     rng = np.random.default_rng([9066, seed])
     tokens = rng.integers(0, VOCAB, (ROWS, LENGTH)).astype(np.int32)
     if CASES[case][2] is not None:
-        tokens[:, [3, 8]] = PAD
+        tokens[:, [2, 8]] = PAD
     return drawn_variables(seed, model, scale=0.5), tokens, MASK.copy()
 
 
@@ -138,13 +151,13 @@ def decoded(objective: LMObjective):
 
 @pytest.mark.parametrize("case", list(CASES))
 def test_a_decode_reads_the_logits_its_training_forward_gives(case):
-    """The adapting decoder's logits at every slot of a padded prompt and the tokens decoded after it,
-    two of its windows closing past the prompt, on par with its objective's training forward's over the
-    same tokens (check 1, the forward Dew's own path: `dew_path`), the truth the forward in float64: the
-    decode steps each row's level where its training steps it, by the targets its loss counts, and reads
-    each slot through the version its training reads it at (row 9066). One level, a chain of two, the
-    objective's padding id among the tokens, the trunk under a LoRA adapter, and a prefix run's blocks
-    read by a decoder a multimodal wrapper holds."""
+    """The adapting decoder's logits at every slot of a padded prompt, one with a hole, and the tokens decoded
+    after it, two of its windows closing past the prompt, on par with its objective's training forward's over
+    the same tokens (check 1, the forward Dew's own path: `dew_path`), the truth the forward in float64: the
+    decode steps each row's level where its training steps it, by the targets its loss counts, and reads each
+    slot through the version its training reads it at (row 9066). One level, a chain of two, the objective's
+    padding id among the tokens, the trunk under a LoRA adapter, and a prefix run's blocks read by a decoder a
+    multimodal wrapper holds."""
     objective, wide = objective_of(case), objective_of(case, jnp.float64)
     assert_as_exact(jax.jit(decoded(objective)), dew_path(jax.jit(trained(objective))),
                     lambda seed: drawn(seed, case), f"a decode stepping {case}", seeds=DECODE_SEEDS[case],
@@ -154,6 +167,8 @@ def test_a_decode_reads_the_logits_its_training_forward_gives(case):
 PHI3 = Path(__file__).parent / "fixtures" / "hf" / "phi3-tiny"
 
 CROSSING_SEEDS = 8
+STEPS = 7
+"""The crossing's decode steps past its four prompt ids: states of four to ten ids, the switch past eight."""
 """Check 1's declared seeds for a decode across LongRoPE's switch against the training forward, sized
 paired by `seeds_for` on armada (cf76ed921)."""
 
@@ -161,9 +176,11 @@ paired by `seeds_for` on armada (cf76ed921)."""
 def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
     """Phi-3's LongRoPE switches its factors past its original context, where a generation rebuilds a
     crossing row's cache from its history (`cache_rebuild_position`): four ids prefilled and five more
-    fed one at a time through the adapting decoder's cache, each step's logits on par with the training
-    forward's at the ids so far (check 1, the truth in float64), its levels rebuilt with the trunk's
-    cache, at the factors the whole history reads (row 9066)."""
+    fed one at a time through the adapting decoder's cache, its prompt prefilled for its last slot's logits
+    alone (`Selective`), each step's logits on par with the training forward's at the ids so far (check 1,
+    the truth in float64): the steps before the switch at eight ids and the two past it, where its levels
+    rebuilt with the trunk's cache read the factors the whole history reads (row 9066). A prompt's blocks,
+    which a rebuild's replay of its ids would not carry, are refused there."""
     loaded = Pretrained.load(PHI3, dtype="float32", attention_impl="reference", max_seq_len=48)
     adaptation = ChunkAdaptation(window=3, rate=0.1)
     model = loaded.model.clone(continuum=LEVEL)
@@ -176,7 +193,7 @@ def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
         ops = decode_ops(decoding, variables, 0, 0)
         state, _ = prefill_state(decoding, variables, ModelInputs(ids[:, :4]), ops)
         steps = {}
-        for step in range(5):
+        for step in range(STEPS):
             steps[f"step {step}"] = state.logits
             state = ops.advance(state, ids[:, 4 + step], jnp.ones(ROWS, bool))
         return steps
@@ -184,16 +201,22 @@ def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
     def forward(objective):
         def run(variables, ids):
             return {f"step {step}": objective.token_scores(variables, ids[:, :5 + step],
-                                                           logits=True).logits[:, -1] for step in range(5)}
+                                                           logits=True).logits[:, -1]
+                    for step in range(STEPS)}
         return run
 
     def draw(seed):
         rng = np.random.default_rng([9066, 3, seed])
-        ids = rng.integers(0, model.vocab_size, (ROWS, 10)).astype(np.int32)
+        ids = rng.integers(0, model.vocab_size, (ROWS, 5 + STEPS)).astype(np.int32)
         return drawn_variables(seed, model, scale=0.5), ids
 
+    assert model.cache_rebuild_position == 8
     assert_as_exact(walk, dew_path(forward(objective)), draw, "a decode across LongRoPE's switch",
                     seeds=CROSSING_SEEDS, truth_fn=forward(wide))
+    variables, ids = draw(0)
+    blocked = ModelInputs(jnp.asarray(ids[:, :4]), {BLOCKS_FIELD: jnp.ones((ROWS, 4), jnp.int32)})
+    with pytest.raises(ValueError):
+        prefill_state(decoding, variables, blocked, decode_ops(decoding, variables, 0, 0))
 
 
 def test_an_adapting_run_draws_what_its_saved_task_draws(tmp_path):
@@ -239,11 +262,13 @@ def test_a_server_draws_what_its_adapting_task_draws():
 
 def test_the_decoder_answers_its_models_generation_hooks():
     """The adapting decoder answers the hooks a generation reads as its model does (`dew.nn.protocols`):
-    its bounds, its cache's layout and capacity, its LongRoPE rebuild, its projections, its blocks, its
-    run's progress and its own refusal; a mixed call's rows and a shared prefix it refuses."""
+    its bounds, its cache's layout and capacity, its LongRoPE rebuild, the projections it packs by its own
+    rules (an adapter's none), its blocks, the ids a multimodal model replaces before its table, its run's
+    progress and its own refusal; a mixed call's rows and a shared prefix it refuses."""
     model = plain(jnp.float32)
     decoding = InContextDecoder(model, ChunkAdaptation(window=3))
-    for protocol in (Bounded, CacheCapacity, Layered, Serving, Generating, BlockReading):
+    for protocol in (Bounded, CacheCapacity, Layered, Serving, Generating, BlockReading, Selective,
+                     ReplacesTokens):
         assert isinstance(decoding, protocol), protocol.__name__
     answers = (decoding.max_seq_len, decoding.vocab_size, decoding.kv_cache, decoding.cache_rebuild_position)
     assert answers == (model.max_seq_len, model.vocab_size, model.kv_cache, model.cache_rebuild_position)
@@ -255,7 +280,14 @@ def test_the_decoder_answers_its_models_generation_hooks():
     assert decoding.generation_refusal() == model.generation_refusal()
     assert decoding.block_chunks() == model.block_chunks()
     shapes = variable_shapes(model)
-    assert decoding.inference_projection_groups(shapes) == model.inference_projection_groups(shapes)
+    assert decoding.inference_projection_groups(shapes) == projection_groups(model, shapes)
+    lora = adapted(jnp.float32)
+    assert InContextDecoder(lora, adaptation).inference_projection_groups(variable_shapes(lora)) == ()
+    multimodal = prefixed(jnp.float32)
+    wrapping = InContextDecoder(multimodal, adaptation)
+    replacing = (wrapping.replaced_ids, wrapping.replaces_media)
+    assert replacing == (multimodal.replaced_ids, multimodal.replaces_media)
+    assert token_table(wrapping) == token_table(multimodal)
     assert decoding.mixed_admission_refusal() is not None and decoding.split_prefill_refusal() is not None
 
 
