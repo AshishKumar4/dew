@@ -863,7 +863,7 @@ class Decide(SavedRunTask, InItsForm):
     @staticmethod
     def _contexts(requests: Sequence[object], contexts: Sequence[JSON | None] | None) -> list[JSON | None]:
         """Each request's context, in order (`contexts`), none for each where none is given."""
-        held = [None] * len(requests) if contexts is None else list(contexts)
+        held: list[JSON | None] = [None] * len(requests) if contexts is None else list(contexts)
         if len(held) != len(requests):
             raise ValueError(f"{len(held)} contexts for {len(requests)} requests")
         return held

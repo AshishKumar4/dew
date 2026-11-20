@@ -1843,7 +1843,8 @@ def test_a_batched_map_that_keeps_its_rows_groups_the_order_whatever_reads_it(re
         assert data.plan is not None and data.plan.lowering == "global"
         reader = data.train(partition)
         try:
-            batches = [next(reader) for _ in range(24 // 2 // partition.count)]
+            # An epoch's twelve steps, each share's part of each step's two rows.
+            batches = [next(reader) for _ in range(24 // 2)]
         finally:
             reader.close()
         ids = [int(i) for batch in batches for i in np.asarray(batch["i"]).ravel()]
