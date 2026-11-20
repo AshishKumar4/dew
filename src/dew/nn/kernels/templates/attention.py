@@ -1343,21 +1343,12 @@ def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
     rounding, as the kernels hold it (`attention_algebra.quotient`): narrowed to fp16 for their product, the
     weights round up by as much as 2^-11 of each where the denominator sums them unrounded, the mean of 1001
     values of 65504 at 65522, inf in fp16 (row 9519). An infinite or NaN sum's (an infinite value's) stays
-    as it is. Its derivative is the mean's, `out`'s (`_held`)."""
+    as it is. Its derivative is the mean's, `out`'s: the held value is `out` and its difference from it,
+    which no derivative reads, exact, both within a factor of two of the largest."""
     largest = float(jnp.finfo(dtype).max)
-    return _held(out, jnp.isfinite(sums) & (jnp.abs(out) > largest), largest)
-
-
-@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
-def _held(out: jax.Array, past: jax.Array, largest: float) -> jax.Array:
-    """`out` at `largest` of its sign where `past` (`held_mean`), its tangent `out`'s."""
-    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
-
-
-@_held.defjvp
-def _held_tangent(largest: float, primals: tuple, tangents: tuple) -> tuple[jax.Array, jax.Array]:
-    out, past = primals
-    return _held(out, past, largest), tangents[0]
+    past = jnp.isfinite(sums) & (jnp.abs(out) > largest)
+    held = jnp.where(out > 0, largest, -largest).astype(out.dtype)
+    return jnp.where(past, out + jax.lax.stop_gradient(held - out), out)
 
 
 def output_hooked(out: jax.Array, output_mod: Callable | None, output_params: tuple[Param, ...]) -> jax.Array:
