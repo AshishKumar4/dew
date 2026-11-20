@@ -431,6 +431,7 @@ def test_a_model_with_no_stacked_run_asks_nothing_of_its_optimizers_update():
     objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
     counted = optax.GradientTransformation(inner.init, counted_update)
     trainer = Trainer(objective, counted, key=jax.random.key(0))
-    with Ledger("counted_update") as traced:
+    # `leaf_local` traces the update as a program of its own, named `update`.
+    with Ledger("update") as traced:
         assert int(trainer.fit(data, steps=1, log_every=100).step) == 1
     assert not traced.programs, traced.programs
