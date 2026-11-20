@@ -1507,13 +1507,13 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
     return over, unresolved
 
 
-def needs_second_stage(draws: _Draws, label: str, *, ratio_rule=_at_parity, power: int = 1) -> bool:
+def needs_second_stage(draws: _Draws, label: str, *, ratio_rule=None, power: int = 1) -> bool:
     """Whether a site's first-stage `draws` against one reference draw check 1's second stage
     (`_staged`): any of its leaves not passing, every factor to `power`."""
     return any(_judgement(draws, label, (LOWER_TAIL, UPPER_TAIL), ratio_rule=ratio_rule, power=power))
 
 
-def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True, ratio_rule=_at_parity,
+def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True, ratio_rule=None,
             further: bool | None = None, power: int = 1) -> tuple[list[Finding], list[Finding], int]:
     """Check 1's two pre-declared stages over `drawn(start, stop)`, the draws of seeds start to stop: at
     `seeds`, a site whose every leaf passes (`_judgement`: its ratio by `ratio_rule`, its rows and values,

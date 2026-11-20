@@ -90,7 +90,7 @@ def _verdicts(drawn_for, verdict: Verdict, narrow_leaves: list[str], mode: Calla
     reference is judged on its full range (`parity.needs_second_stage`), so a comparison that passed at the
     first stage beside one drawing the second has its added rows judged too (spec alignment, 9006)."""
     overs, unresolveds, seeds = [], [], verdict.seeds
-    further = any(needs_second_stage(drawn_for(index)(0, seeds), named)
+    further = any(needs_second_stage(drawn_for(index)(0, seeds), named, power=verdict.powers[index])
                   for index, named in enumerate(verdict.labels))
     for index, named in enumerate(verdict.labels):
         over, unresolved, stage = _staged(drawn_for(index), seeds, named, power=verdict.powers[index],

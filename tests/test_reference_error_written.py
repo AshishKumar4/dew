@@ -44,3 +44,24 @@ def test_a_reference_compiled_without_ynnpacks_fusions_is_held_as_written_too():
     with pytest.raises(GateFailure):
         assert_as_exact(_combined, without_ynn(_combined), _cancelling, "a combination XLA's fusions rewrite",
                         seeds=8)
+
+
+def test_a_written_comparisons_bound_decides_its_own_second_stage():
+    """A ratio between PARITY and its square (Dew's squared errors twice the reference's, a stable 2 in
+    RMS ratio terms by its log) passes the comparison as written at its first stage, its factors squared
+    (`needs_second_stage`'s and `_staged`'s `power`), where the plain comparison's bound draws the second
+    stage: the written comparison's own bound decides its stage, never the plain one's (head review)."""
+    from dew.parity import NO_ZERO_ROWS, PARITY, _Draws, _staged, needs_second_stage
+
+    ratio = (PARITY + PARITY ** 2) / 2
+
+    def drawn(start, stop):
+        count = stop - start
+        # Each seed's squared errors' logs: Dew's at `ratio` squared over the reference's one.
+        return _Draws(["leaf"], np.full((count, 1), 2 * np.log(ratio)), np.zeros((count, 1)),
+                      np.zeros((count, 1, 2)), [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (0,))
+
+    assert needs_second_stage(drawn(0, 64), "plain") and not needs_second_stage(drawn(0, 64), "written",
+                                                                                 power=2)
+    assert _staged(drawn, 64, "written", power=2)[2] == 1
+
