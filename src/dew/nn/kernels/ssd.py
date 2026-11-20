@@ -625,11 +625,10 @@ def _ssd_scan(x, b, c, a, state, forked, chunk_size: int, platform: str,
 
 @functools.cache
 def _ssd_rule(chunk_size: int, platform: str, held: int):
-    """`_chunk_scan`'s reverse-mode rule (`derivatives.declared_derivative`): forward and reverse run the TPU
-    Pallas kernels (`ssd_forward`, `ssd_backward`). Its other orders are its route's: the products' wrapper
-    (`recurrence_chunk._per_product`) takes forward mode and the orders past the first through the portable
-    chunked op, as it does every kernel's, where a pure-JAX SSD scan of this module's own served a direct
-    caller alone, its forked walk's segment loop a while loop no second order reverses (row 9698)."""
+    """`_chunk_scan`'s first-order reverse-mode rule (`derivatives.declared_derivative`): its forward and
+    backward the TPU Pallas kernels (`ssd_forward`, `ssd_backward`). Forward mode and every higher order are
+    its route's: the products' wrapper (`recurrence_chunk._per_product`) takes them through the portable
+    chunked op, as it does every kernel's (row 9698)."""
     def primal(x, b, c, a, state, forked):
         return _ssd_scan(x, b, c, a, state, forked, chunk_size, platform, held)
 

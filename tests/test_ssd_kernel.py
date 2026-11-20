@@ -541,16 +541,31 @@ def test_documents_entry_writes_of_cancelling_levels_take_the_selected_tpu_scan(
     assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
 
 
-def test_a_forked_call_through_the_route_holds_every_order():
+def route_holds_every_order() -> list:
     """`levels_documents_draw`'s forked call (documents taking their memories up, entry writes of cancelling
     levels) through the route a model takes (`documents_as_selected`): every order of it finite wherever
-    float64's is a normal float32 (`assert_contract`), the kernel's own rule reverse mode's alone
-    (`ssd._ssd_rule`) and every other order the route's portable chunked op's (row 9698: a pure-JAX copy
-    of the scan took them, its forked walk refusing any second order). On a TPU the route takes the kernel;
-    off one the portable math, the kernel lowered for an assumed TPU running on none (`ssd._interpreting`)."""
+    float64's is a normal float32 (`assert_contract`), the kernel's own rule first-order reverse mode
+    (`ssd._chunk_scan`) and forward mode and every higher order the route's portable chunked op's
+    (`recurrence_chunk._per_product`, row 9698). The routes it took."""
     operands, seeded = levels_documents_draw(0)
-    assert_contract(documents_as_selected, operands, operands, seeded, "the route's forked call",
-                    truth_fn=documents_one_by_one)
+    with generation.routes() as found:
+        assert_contract(documents_as_selected, operands, operands, seeded, "the route's forked call",
+                        truth_fn=documents_one_by_one)
+    return found
+
+
+def test_a_forked_call_through_the_route_holds_every_order():
+    """`route_holds_every_order` on the host's route: off a TPU the portable math (the kernel lowered for an
+    assumed TPU runs on none, `ssd._interpreting`)."""
+    route_holds_every_order()
+
+
+@on_device
+def test_a_forked_call_through_the_tpu_route_holds_every_order():
+    """`route_holds_every_order` on a TPU, the route its Pallas scan: the kernel's reverse mode handing every
+    other order to the portable chunked op."""
+    found = route_holds_every_order()
+    assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
 
 
 def test_documents_adding_a_slot_scan_as_each_alone():
@@ -614,7 +629,8 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
         normal = normal_float32(theirs)
         np.testing.assert_array_equal(np.asarray(ours, np.float64)[normal], theirs[normal])
     # Every order the kernel's rule takes finite wherever float64's is a normal float32 (the contract's
-    # seams): its primal and its reverse mode (`contract_support.REVERSE_ONLY`: rows 7874, 7875).
+    # seams): its primal and its first-order reverse mode (`contract_support.REVERSE_ONLY`), every other
+    # order the route's (`test_a_forked_call_through_the_route_holds_every_order`, row 9698).
     # The kernel as a program differentiates and places it (no compiler options, which refuse to nest in the
     # mesh run's program, `without_ynn`).
     assert_contract(documents_on_the_kernel, operands, operands, seeded,
