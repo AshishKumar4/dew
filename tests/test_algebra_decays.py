@@ -220,18 +220,42 @@ def test_a_per_key_spreads_read_through_an_underflowed_decay_is_zero(read, later
         assert np.all(np.isnan(found[later])), found
 
 
-@pytest.mark.parametrize(("later", "after"), [(2, False), (18, False), (18, True)],
+@pytest.mark.parametrize(("across", "after"), [(False, False), (True, False), (True, True)],
                          ids=["own sub-chunk", "an earlier sub-chunk, zero up to its reference",
                               "an earlier sub-chunk, zero after its reference"])
-def test_a_per_key_spreads_overflowed_read_is_zero_at_each_key_its_decay_underflows(later, after):
+def test_a_per_key_spreads_overflowed_read_is_zero_at_each_key_its_decay_underflows(across, after):
     """`scan.spread` under a decay a key dimension, one pair of its last token's reader and its first's write
     whose decay is zero at its first key alone, within a sub-chunk or across one, the zero its factor's up to
     the reference or after it: a read of 2^70 times 2^70, which overflows, zero at that key and infinite at
     the other, the recurrence's own (row 9631: across a sub-chunk, NaN at the zero key)."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    later = SUB + 2 if across else 2
     found = np.asarray(scan.spread(*lone_pair(2.0 ** 70, 2.0 ** 70, (0.0, 1.0), later=later, after=after)))
     expected = np.zeros_like(found)
     expected[later, 1] = np.inf
     np.testing.assert_array_equal(found, expected)
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["one spread", "a batch of two"])
+def test_a_per_key_spreads_overflowed_read_through_a_vanished_decay_has_zero_gradients(batched):
+    """`scan.spread` under a decay a key dimension, one pair across a sub-chunk whose read of 2^70 times 2^70
+    overflows and whose decay is zero at every key: its keys' and decays' gradients zero, as its output is,
+    one spread or a batch of two (`jax.vmap`), where no infinity meets a zero factor (row 9631)."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    readers, values, keys, between = (jnp.asarray(x) for x in lone_pair(2.0 ** 70, 2.0 ** 70, 0.0,
+                                                                          later=SUB + 2))
+
+    def total(keys, between):
+        return jnp.sum(scan.spread(readers, values, keys, between))
+
+    pulled = jax.grad(total, argnums=(0, 1))
+    if batched:
+        pulled = jax.vmap(pulled)
+        keys, between = (jnp.stack([x, x]) for x in (keys, between))
+    for gradient in pulled(keys, between):
+        np.testing.assert_array_equal(np.asarray(gradient), np.zeros(gradient.shape, np.float32))
 
 
 def test_a_per_key_spreads_finite_read_through_a_small_decay_is_its_product():

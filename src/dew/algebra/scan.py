@@ -972,7 +972,8 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     if between.shape[-1] == 1:
         # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
         # decay's derivative would read it.
-        return _kept(jnp.where(active, issue(role, left, right.T), 0.0), joined)[..., 0] * joined[..., 0]
+        products = jnp.where(active, issue(role, left, right.T), 0.0)
+        return _kept(products, joined, ~jnp.isnan(products))[..., 0] * joined[..., 0]
     # The factors read the reference's own decay (1, on the diagonal a strict pairing excludes).
     return jnp.where(active, _factored(left, right, between, joined, issue, role), 0.0)
 
@@ -1018,13 +1019,14 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
     multiplied before it is applied (log-linear's level weights, kernel-templates.md Appendix B), none where
     None. A scalar decay's pairs decay the reads, then a product applies them; a decay a key dimension's
     factor around each sub-chunk's reference as `_factored`'s (`recurrence_algebra.SUB`): an earlier
-    sub-chunk's keys decayed to the reference `p` before the row's sub-chunk and applied, the row's decay
-    from it after, each factor at most 1; a sub-chunk's own pairs elementwise over its keys.
+    sub-chunk's keys decayed to the reference `p` before the row's sub-chunk and read, the row's decay from it
+    after, each factor at most 1; a sub-chunk's own pairs elementwise over its keys.
 
     A read that overflows, formed before its decay (the token order's, row 5426's contract), reads zero
-    through a decay that underflows to zero, each key's within a sub-chunk and a pair's whole across one:
-    the term the recurrence decays to its range there, which float32's scores-then-decay order cannot form,
-    where infinity times that zero was NaN (rows 9547 and train 1079's review F1). A NaN read reads NaN."""
+    through a decay that underflows to zero, each key's by the pair's whole decay at that key (`_kept`): the
+    term the recurrence decays to its range there, which float32's scores-then-decay order cannot form,
+    where infinity times that zero was NaN (rows 9547, 9631 and train 1079's review F1). A NaN read reads
+    NaN."""
     from dew.nn.kernels import recurrence_algebra
 
     issue = issue or _issued
@@ -1032,7 +1034,7 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
     reads = jnp.where(active, issue("scores", readers, values.T), 0.0)
     if scalar:
         # Out before a weight multiplies it: an overflowing product times a level's zero weight is NaN.
-        reads = _kept(reads, between)[..., 0]
+        reads = _kept(reads, between, ~jnp.isnan(reads))[..., 0]
     if weights is not None:
         reads = reads * weights
     if scalar:
@@ -1042,40 +1044,30 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
     rows = []
     for first in range(0, count, sub):
         own = slice(first, min(first + sub, count))
-        row = _portable_einsum("ijk,jk,ijk->ik", _kept(reads[own, own], between[own, own]), keys[own],
+        mine = reads[own, own]
+        row = _portable_einsum("ijk,jk,ijk->ik", _kept(mine, between[own, own], jnp.isinf(mine)), keys[own],
                                between[own, own])
         if first:
-            reference = first - 1
-            earlier = _read_earlier(reads[own, :first], keys[:first] * between[reference, :first],
-                                    between[own, :first], issue)
-            row = row + between[own, reference] * earlier
+            # The earlier sub-chunks' keys decayed to the reference before the row's sub-chunk, each key's
+            # reads summed, then the row's decay from the reference, each factor at most 1.
+            reference, earlier = first - 1, reads[own, :first]
+            kept = _kept(earlier, between[own, :first], jnp.isinf(earlier))
+            row = row + between[own, reference] * _portable_einsum(
+                "ijk,jk->ik", kept, keys[:first] * between[reference, :first])
         rows.append(row)
     return jnp.concatenate(rows, axis=0)
 
 
-def _kept(reads, between):
-    """Pairs' reads `[R, C]` a key at a time `[R, C, K]`, zero where that key's decay (`between` `[R, C, K]`,
-    a scalar decay's `K` one) is zero but a NaN, selected before the decay multiplies it: a live pair's decay
-    that underflows (`_crossed`'s positive zero) weighs its read to zero, which, formed before that decay, may
-    overflow, infinity times zero (a query's and a key's 2^70 under decays of exp(-160), head review of
-    512810acf F7). A NaN read reads NaN as the recurrence's (train 1079's review F1)."""
-    return jnp.where(~jnp.isnan(reads)[..., None] & (between == 0), 0.0, reads[..., None])
-
-
-def _read_earlier(reads, keys, between, issue: Callable):
-    """A sub-chunk's rows' reads `[R, J]` of the earlier sub-chunks' writes, their `keys` `[J, K]` decayed to
-    the sub-chunk's reference: the product `issue` applies, or where a read overflowed, each key's own sum,
-    its overflowed reads kept (`_kept`, by the pairs' whole decay `between` `[R, J, K]`), so no infinity
-    meets a key's factor of zero, before the reference or after it (row 9631: zeroed only where its decay was
-    zero at every key, a read through a decay zero at some keys was NaN at those)."""
-    applied = issue("apply", reads, keys)
-
-    def per_key():
-        # A finite read keeps its factors' product, which its whole decay loses (row 9549).
-        kept = jnp.where(jnp.isinf(reads)[..., None], _kept(reads, between), reads[..., None])
-        return _portable_einsum("ijk,jk->ik", kept, keys).astype(applied.dtype)
-
-    return lax.cond(jnp.any(jnp.isinf(reads)), per_key, lambda: applied)
+def _kept(reads, between, dropped):
+    """Pairs' reads `[R, C]` a key at a time `[R, C, K]`, each of `dropped` `[R, C]` zero where that key's
+    decay (`between` `[R, C, K]`, a scalar decay's `K` one) is zero, selected before the decay multiplies it:
+    a live pair's decay that underflows (`_crossed`'s positive zero) weighs its read to zero, which, formed
+    before that decay, may overflow, infinity times zero (a query's and a key's 2^70 under decays of
+    exp(-160), head review of 512810acf F7). A scalar decay's pairs drop every read but a NaN, which reads NaN
+    as the recurrence's (train 1079's review F1); a decay a key's the overflowed reads alone, each key's other
+    reads its factors' product, which its whole decay loses (row 9549), across a sub-chunk too, where a read
+    zeroed only at a decay zero at every key was NaN at a key whose decay alone was (row 9631)."""
+    return jnp.where(dropped[..., None] & (between == 0), 0.0, reads[..., None])
 
 
 def _lowered(overlaps):
