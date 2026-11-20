@@ -360,17 +360,13 @@ def aligned_cotangents(terms: Sequence[Sequence[jax.Array]], cotangent: jax.Arra
     originals, factors, shape, spec = _laid_out(terms, ((axis, None),) * len(terms))
     # The cotangent in the sum's type, as reverse mode hands the transpose its output's cotangent.
     given = jnp.asarray(cotangent, jnp.result_type(*factors))
-    pulled = _factor_cotangents(shape, spec, factors, given, tuple(range(len(factors))))
-    return [_cast_back(gradient, jax.typeof(jnp.asarray(original)))
-            for original, gradient in zip(originals, pulled, strict=True)]
-
-
-def _cast_back(gradient: jax.Array, held: ShapedArray) -> jax.Array | np.ndarray:
-    """A widened factor's cotangent in its own factor's type `held`, as the widening's transpose returns it
-    (`float_bits.cast_back`); an integer factor's `float0`."""
-    if not jnp.issubdtype(held.dtype, jnp.inexact):
-        return np.zeros(held.shape, jax.dtypes.float0)
-    return cast_back(gradient, held)
+    held = [jax.typeof(jnp.asarray(original)) for original in originals]
+    # The factors a cotangent reaches, as the declared rule's `live`: an integer factor takes `float0`.
+    live = tuple(place for place, aval in enumerate(held) if jnp.issubdtype(aval.dtype, jnp.inexact))
+    pulled = dict(zip(live, _factor_cotangents(shape, spec, factors, given, live), strict=True))
+    # Each cast back to its factor's type, as the widening's transpose returns it (`float_bits.cast_back`).
+    return [cast_back(pulled[place], aval) if place in pulled else np.zeros(aval.shape, jax.dtypes.float0)
+            for place, aval in enumerate(held)]
 
 
 def _factor_cotangents(shape: tuple[tuple[int, ...], ...], spec: tuple, factors, cotangent: jax.Array,
