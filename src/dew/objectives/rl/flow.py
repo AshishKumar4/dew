@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from jax.typing import ArrayLike
 
 from dew._coordination import agreed, agreed_same, broadcast_from_process_zero, collective_host
 from dew.batch import VALID_ROWS, Batch, Variables
@@ -532,25 +533,41 @@ class FlowRollout(GroupedRollout):
         # A sample of a source row a partly read share repeated trains nothing (`real_samples`).
         held = real_samples(context)
         real = np.ones(local_advantages.shape[0], bool) if held is None else held[owned]
-        shape = (local_advantages.shape[0], selected)
         prepared = {condition.field: jax.tree.map(lambda leaf: np.asarray(leaf)[owned],
                                                  context[condition.field])
                     for condition in self.objective.inputs.conditions.values()}
-        prepared.update({
-            "latents": np.asarray(generated.states)[owned, :selected],
-            "next_latents": np.asarray(generated.states)[owned, 1:selected + 1],
-            "timesteps": np.broadcast_to(generated.times[:selected], shape),
-            "next_timesteps": np.broadcast_to(generated.times[1:selected + 1], shape),
-            "rollout_steps": np.full(shape[:1], self.steps, np.int32),
-            OLD_LOG_PROBS_KEY: np.asarray(generated.log_probs)[owned, :selected],
-            "transition_mask": (np.asarray(generated.stochastic)[owned, :selected]
-                                & (local_advantages[:, None] != 0) & real[:, None]),
-            ADVANTAGES_KEY: local_advantages,
-            REWARDS_KEY: rewards[owned],
-        })
+        # This rank's rows of the walk, laid out as every flow batch is (`transition_rows`).
+        mine = FlowTrajectory(np.asarray(generated.states)[owned], np.asarray(generated.times),
+                              np.asarray(generated.log_probs)[owned], np.asarray(generated.stochastic)[owned])
+        trains = mine.stochastic[:, :selected] & (local_advantages[:, None] != 0) & real[:, None]
+        prepared.update({**transition_rows(mine, local_advantages, selected=selected, trains=trains),
+                         REWARDS_KEY: rewards[owned]})
         if spatial:
             prepared["spatial"] = {name: np.asarray(value)[owned] for name, value in spatial.items()}
         return prepared
 
-__all__ = ["FlowGRPOObjective", "FlowReward", "FlowRollout", "GroupedRollout"]
+def transition_rows(trajectory: FlowTrajectory, advantages: ArrayLike, *, selected: int | None = None,
+                    trains: ArrayLike | None = None) -> Batch:
+    """A walk's transitions as the flow objective trains on them (`FlowGRPOObjective`; the one layout, a
+    rollout's (`FlowRollout`) and a caller's alike, row 9694): its first `selected` transitions (every one
+    where None), each row's states and the states they step to, both endpoints' times, its walk's grid
+    points (`rollout_steps`), its recorded log densities, which transitions train (`trains`, the walk's
+    stochastic ones where None) and each row's advantage. In NumPy over a walk on the host, in JAX over a
+    traced one."""
+    xp = jnp if isinstance(trajectory.states, jax.core.Tracer) else np
+    states, times = xp.asarray(trajectory.states), xp.asarray(trajectory.times)
+    count, points = states.shape[:2]
+    selected = points - 1 if selected is None else selected
+    shape = (count, selected)
+    return {"latents": states[:, :selected], "next_latents": states[:, 1:selected + 1],
+            "timesteps": xp.broadcast_to(times[:selected], shape),
+            "next_timesteps": xp.broadcast_to(times[1:selected + 1], shape),
+            "rollout_steps": xp.full(shape[:1], points, xp.int32),
+            OLD_LOG_PROBS_KEY: xp.asarray(trajectory.log_probs)[:, :selected],
+            "transition_mask": xp.asarray(trajectory.stochastic)[:, :selected] if trains is None
+            else xp.asarray(trains),
+            ADVANTAGES_KEY: xp.asarray(advantages)}
+
+
+__all__ = ["FlowGRPOObjective", "FlowReward", "FlowRollout", "GroupedRollout", "transition_rows"]
 

@@ -16,9 +16,7 @@ uses; the preview hook limits itself to the display count.
 
 from __future__ import annotations
 
-import hashlib
 import json
-import weakref
 from abc import abstractmethod
 from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import replace
@@ -275,34 +273,20 @@ def _averaged(decay: float | optax.Schedule | None) -> EMASpec | None:
 
 def _keyed_inputs(inputs: InputSpec) -> TracedSetting:
     """`inputs` as a trace key states it (`DiffusionObjective.traced_by`): its sample, its mask and each
-    condition's field and unconditional datum by value, its encoder by its value too (`_encoder_value`),
-    whose parameters its encoding closes over: two objectives over encoders of one record and one set of
-    weights key alike, built anew or not, and two of other weights apart."""
+    condition's field and unconditional datum by value, its encoder by its class and record
+    (`_encoder_value`), its weights the step's arguments."""
     return (inputs.sample, inputs.mask,
             tuple(sorted((name, condition.field, condition.unconditional, _encoder_value(condition.encoder))
                          for name, condition in inputs.conditions.items())))
 
 
-_ENCODER_VALUES: dict[int, tuple[str, str, str]] = {}
-"""Each live encoder's value (`_encoder_value`), by its identity, dropped as the encoder goes."""
-
-
-def _encoder_value(encoder: ConditionEncoder) -> tuple[str, str, str]:
-    """`encoder` as a trace key states it: its class, the record a run keeps of it (`recorded_fields`) and a
-    digest of its parameters, each leaf's path, dtype, shape and bytes, which its encoding closes over as
-    constants. Taken once an encoder object, read off the host once."""
-    held = _ENCODER_VALUES.get(id(encoder))
-    if held is None:
-        digest = hashlib.sha256()
-        for path, leaf in jax.tree_util.tree_flatten_with_path(encoder.params)[0]:
-            array = np.asarray(leaf)
-            digest.update(f"{jax.tree_util.keystr(path)}:{array.dtype}:{array.shape}".encode())
-            digest.update(array.tobytes())
-        held = (f"{type(encoder).__module__}.{type(encoder).__qualname__}",
-                json.dumps(encoder.recorded_fields(), sort_keys=True, default=repr), digest.hexdigest())
-        _ENCODER_VALUES[id(encoder)] = held
-        weakref.finalize(encoder, _ENCODER_VALUES.pop, id(encoder), None)
-    return held
+def _encoder_value(encoder: ConditionEncoder) -> tuple[str, str]:
+    """`encoder` as a trace key states it: its class and the record a run keeps of it (`recorded_fields`).
+    Its parameters are the step's arguments (the state's `encoders`, `encode_conditions`), which the held
+    trees' shapes key, so no digest of them is part of the key (row 9692: one host-copied and hashed every
+    encoder's weights each fit, and a non-addressable shard of a multi-process run's raised)."""
+    return (f"{type(encoder).__module__}.{type(encoder).__qualname__}",
+            json.dumps(encoder.recorded_fields(), sort_keys=True, default=repr))
 
 
 class DiffusionObjective(Objective[Ratio]):
