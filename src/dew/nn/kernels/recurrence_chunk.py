@@ -1172,7 +1172,8 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying), dtype=dtype,
                     key_width=key.shape[-1], heads=(shard_key.shape[-2], *shard_value.shape[-2:]),
-                    extent=Extent(*shard_value.shape[:2], starts is not None or firsts is not None),
+                    extent=Extent(shard_value.shape[0], shard_value.shape[1],
+                                  starts is not None or firsts is not None),
                     call=call, family=family, product=product, delta=delta, decayed=decayed,
                     per_key=g.ndim == 4, forked=forked is not None, readout=readout, apart=apart, turns=turns)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
@@ -1804,14 +1805,14 @@ class ScanCase:
 class ScanCell(NamedTuple):
     """A rated scan's cell a receipt declares (`ScanCase.cell`): its values' dtype, its product, its value
     heads and their width and its key groups and the state's width on a launch's shard, unpadded, its chunk,
-    and its extent."""
+    and its extent: None where its case read no shard (`scan_case`'s `shards`), a cell none declares."""
 
     dtype: str
     product: str
-    values: tuple[int, int]
-    keys: tuple[int, int]
+    values: tuple[int | None, int]
+    keys: tuple[int | None, int]
     chunk: int
-    extent: Extent
+    extent: Extent | None
 
 
 SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
@@ -1861,7 +1862,7 @@ def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | 
         widths = (_scan_widths(widths[0]), _scan_widths(widths[1]), chunk_size)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     held = {} if shards is None else {'shard_heads': (shards[0].shape[2], shards[1].shape[2]),
-                                      'extent': Extent(*shards[0].shape[:2], packed)}
+                                      'extent': Extent(shards[0].shape[0], shards[0].shape[1], packed)}
     return ScanCase(varying=bool(jax.typeof(x).mat.varying),
                     dtype=jnp.dtype(x.dtype), widths=widths,
                     tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(x.dtype))
