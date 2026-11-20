@@ -156,11 +156,11 @@ def reference_arm(case: dict, names: frozenset = frozenset()):
     key, with the score hooks `names` (`sinks`, `softcap`); a query that sees no key reads zero, as every
     attention call reads (`attention_kernel`)."""
     mask = np.asarray(case_keep(case))
-    live = jnp.asarray(mask.any(axis=-1))[:, :, None, None]
-    sinks = SINKS if "sinks" in names else None
     softcap = SOFTCAP if "softcap" in names else None
 
     def call(query, key, value, rng):
+        live = jnp.asarray(mask.any(axis=-1))[:, :, None, None]
+        sinks = jnp.asarray(SINKS, jnp.float32) if "sinks" in names else None
         out = reference_attention(query, key, value, mask=jnp.asarray(mask)[:, None], sinks=sinks,
                                   softcap=softcap, dropout_rate=RATE, dropout_seed=dropout_seed(rng))
         return jnp.where(live, out, 0)
