@@ -738,6 +738,24 @@ class InContextDecoder(nn.Module):
         """The positions the model reads, its own (`dew.nn.protocols.Bounded`)."""
         return self.model.max_seq_len
 
+    @property
+    def vocab_size(self) -> int:
+        """The rows of the model's table, its own (`dew.nn.protocols.StatesVocabulary`)."""
+        return self.model.vocab_size
+
+    @property
+    def per_layer_types(self):
+        """The model's layers' kinds, its own: what a decode reads of its trunk (`rebuild_position`)."""
+        return self.model.per_layer_types
+
+    def kind_of(self, kind):
+        """The model's layer kind `kind`, its own (`rebuild_position`)."""
+        return self.model.kind_of(kind)
+
+    def with_cache_capacity(self, capacity: int) -> InContextDecoder:
+        """This decoder over the model at another decode-cache capacity (`dew.nn.protocols.CacheCapacity`)."""
+        return InContextDecoder(self.model.with_cache_capacity(capacity), self.adaptation)
+
     def init_cache(self, batch_size: int):
         """Open the trunk's decode cache for `batch_size` rows and each row's chain beside it, no slot
         waiting (`CausalTransformer.init_cache`)."""
