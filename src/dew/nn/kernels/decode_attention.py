@@ -183,7 +183,7 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool | Non
                            natural=jnp.dtype(dtype) == jnp.float32 if natural is None else natural,
                            headroom=algebra.headroom(dtype), initial=sinks,
                            compensated=algebra.compensates(dtype), prescale=power, subtracted=True,
-                           narrowed=algebra.narrowed_of(stored))
+                           largest=dtype, narrowed=algebra.narrowed_of(stored))
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
