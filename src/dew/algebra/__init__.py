@@ -22,7 +22,7 @@ import functools
 import importlib
 from collections.abc import Callable
 from types import ModuleType
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from dew.algebra import cost, derive, error, forms, program, rules, scan, terms
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
     SATURATION: Saturation
     rewritten: Callable[..., Callable]
-    rewritten_program: Callable[..., object]
+    rewritten_program: Callable[..., Any]
 
 _SUBMODULES = frozenset({"cost", "derive", "error", "forms", "program", "rules", "scan", "terms"})
 """The submodules the package names (`__all__`), each imported where it is first read."""
@@ -48,7 +48,7 @@ class _Limited(NamedTuple):
 
     SATURATION: Saturation
     rewritten: Callable[..., Callable]
-    rewritten_program: Callable[..., object]
+    rewritten_program: Callable[..., Any]
 
 
 @functools.cache
@@ -64,7 +64,7 @@ def _limited() -> _Limited:
                     functools.partial(program.rewritten_program, saturation=saturation))
 
 
-def __getattr__(name: str) -> ModuleType | type | Callable[..., object] | Saturation:
+def __getattr__(name: str) -> ModuleType | type | Callable[..., Any] | Saturation:
     """`name` of the package, loaded where it is first read and held from then on, so each read after the
     first is the same object (the module's own attribute)."""
     if name in _SUBMODULES:
