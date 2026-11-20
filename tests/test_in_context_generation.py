@@ -37,6 +37,9 @@ PROMPT = 5
 PAD = 7
 """The padding id the padded case's objective names, which its draws hold among their real tokens."""
 PREFIX = 3
+MASK = np.ones((ROWS, LENGTH), bool)
+MASK[1, :2] = False
+"""Every draw's real slots: the second row's first two slots padding, as a padded prompt's are."""
 
 DECODE_SEEDS = {"one level": 8, "a chain": 8, "padding ids": 8, "an adapter": 8,
                 "a prefix under a wrapper": 8}
@@ -57,9 +60,10 @@ def chained(dtype):
 def adapted(dtype):
     """The test decoder under a LoRA adapter on its queries, which its trunk computes under the adapter's
     interceptor (`dew.lora`), its factors drawn with every other leaf."""
-    base = plain(dtype)
-    return LoRA(rank=2, modules=("q_proj",)).apply(
+    base = plain(jnp.float32)
+    model = LoRA(rank=2, modules=("q_proj",)).apply(
         base, base.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)), key=0).model
+    return model.clone(dtype=dtype)
 
 
 def prefixed(dtype):
@@ -84,17 +88,14 @@ def objective_of(case: str, dtype=jnp.float32) -> LMObjective:
 
 
 def drawn(seed: int, case: str):
-    """A seed's variables (`drawn_variables`) and token rows, the second row's first two slots padding, as
-    a padded prompt's are; the padded case's rows hold its padding id among their real tokens, in the
-    prompt and past it."""
+    """A seed's variables (`drawn_variables`) and token rows, real where `MASK` holds; the padded case's
+    rows hold its padding id among their real tokens, in the prompt and past it."""
     model = objective_of(case).model
     rng = np.random.default_rng([9066, seed])
     tokens = rng.integers(0, VOCAB, (ROWS, LENGTH)).astype(np.int32)
     if CASES[case][2] is not None:
         tokens[:, [3, 8]] = PAD
-    mask = np.ones((ROWS, LENGTH), bool)
-    mask[1, :2] = False
-    return drawn_variables(seed, model, scale=0.5), tokens, mask
+    return drawn_variables(seed, model, scale=0.5), tokens, MASK.copy()
 
 
 def trained(objective: LMObjective):
@@ -113,14 +114,14 @@ def decoder_of(objective: LMObjective) -> InContextDecoder:
 
 def decoded(objective: LMObjective):
     """The objective's decoder's logits at the slots its training forward scores: the prompt's slots
-    prefilled, a prefix run's blocks served over it as a generation serves them (`served_blocks`), each
-    later token decoded alone, the cache carried between the calls."""
+    prefilled, a prefix run's blocks served over it as a generation serves them, on the host
+    (`served_blocks` of `MASK`'s), each later token decoded alone, the cache carried between the calls."""
     decoding = decoder_of(objective)
+    served = ({} if objective.prefix is None
+              else {BLOCKS_FIELD: served_blocks(MASK[:, :PROMPT], objective.prefix)})
 
     def run(variables, tokens, mask):
         cache = decoding.apply(variables, tokens.shape[0], method="init_cache", mutable=["cache"])[1]["cache"]
-        served = ({} if objective.prefix is None
-                  else {BLOCKS_FIELD: served_blocks(jnp.asarray(mask[:, :PROMPT]), objective.prefix)})
         found, updated = decoding.apply({**variables, "cache": cache}, tokens[:, :PROMPT], decode=True,
                                         attention_mask=mask[:, :PROMPT], mutable=["cache"], **served)
         steps = [found]
