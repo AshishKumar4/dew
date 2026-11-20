@@ -24,7 +24,6 @@ import pytest
 import test_audio as audio
 import test_chunked_cross_entropy as chunked_cross_entropy
 import test_float64_terms as float64_terms_tests
-import test_flow_grpo as flow_grpo
 import test_fp8_base as fp8_base
 import test_lowering as lowering
 import test_moe_precision as moe_precision
@@ -44,6 +43,13 @@ OWN = "the GPU's own arithmetic, facts or placement, which a CPU does not have"
 """Why a numerics cell stays on the GPU: what it holds is the device's own."""
 
 
+def _flow_scaling():
+    """`test_flow_grpo`'s flow-scaling cell, its module imported only where the cell runs (row 8971)."""
+    from test_flow_grpo import a_flows_scaling_rounds_a_subnormal_result_once
+
+    a_flows_scaling_rounds_a_subnormal_result_once()
+
+
 def numerics_cells(tmp_path_factory) -> list[Cell]:
     """The GPU's own arithmetic and driver facts, its encoders' compiles and a Dense layer's float64 terms."""
     return [
@@ -55,8 +61,7 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
              precision_policy.divides_as_ieee_division_on_an_approximate_divider, fault=OWN),
         Cell("a power of two's scaling rounds a subnormal result once on a GPU",
              precision_policy.power2_rounds_a_subnormal_result_once, fault=OWN),
-        Cell("a flow's scaling rounds a subnormal result once on a GPU",
-             flow_grpo.a_flows_scaling_rounds_a_subnormal_result_once, fault=OWN),
+        Cell("a flow's scaling rounds a subnormal result once on a GPU", _flow_scaling, fault=OWN),
         *(Cell(f"a compensated primitive under jit is its eager arithmetic on a GPU: {shape}",
                functools.partial(precision_policy.compensated_primitives_hold_under_jit, shape), fault=OWN)
           for shape in precision_policy.COMPENSATED_SHAPES),
