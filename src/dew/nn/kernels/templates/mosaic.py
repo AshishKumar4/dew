@@ -955,7 +955,8 @@ class Issuer[Accumulator](abc.ABC):
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
-                        together: tuple[int, ...] = ()) -> tuple | dict:
+                        together: tuple[int, ...] = (),
+                        tmem_limit: int | None = None) -> tuple | dict:
         """The memory a program's products take where the issuer keeps each product's accumulator itself
         (tcgen05's chunks: tensor memory of each product width in `widths` and a tensor-core barrier, a
         consumer role each), and stages a register left operand of each `(depth, dtype)` in `lefts` where
@@ -966,7 +967,7 @@ class Issuer[Accumulator](abc.ABC):
         sums of each width in `sums` stay in an accumulator of the issuer's across the walk (`accumulated`),
         where it keeps them so, a role each. Groups of `together`'s widths a role sums together
         (`summed_together`) take an accumulator each where the issuer awaits them as one."""
-        del consumers, widths, lefts, ahead, sums, together
+        del consumers, widths, lefts, ahead, sums, together, tmem_limit
         return ()
 
     def keeps_sums(self, width: int) -> bool:

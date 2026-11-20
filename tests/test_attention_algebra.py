@@ -1140,13 +1140,23 @@ def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int
     product with its reciprocal and a sum of products into one of unrounded products, so each order is held
     as written and as compiled. As written is op by op (`as_given`, which the gate runs uncompiled) where the
     draw reaches fp32's subnormals (`_reaches_subnormals`), which XLA's CPU keeps one primitive at a time and
-    flushes in a compiled program (row 4023); compiled with no rewrite, its products held from any fused
-    multiply-add (`arm_arithmetic.as_written`, `products_held`, its own program run as given) for every
-    other draw, where op by op compiled each primitive of the merge's windows apart (the cotangent cell
-    6.81 GiB op by op, 1.28 jitted). The reference runs op by op, so none of those rewrites reaches the bar
-    it sets (row 6909: a compiled reference summing products shared Dew's error)."""
-    written = as_given(ours if getattr(draw, "reaches_subnormals", False)
-                       else jax.jit(products_held(ours), compiler_options=as_written()))
+    flushes in a compiled program (row 4023) — grouped 16 independent draws per seed through eager `jax.vmap`
+    so every primitive still runs one at a time without compiling while cutting Python dispatch 16x (rows
+    10136, 10146); compiled with no rewrite, its products held from any fused multiply-add
+    (`arm_arithmetic.as_written`, `products_held`, its own program run as given) for every other draw, where
+    op by op compiled each primitive of the merge's windows apart (the cotangent cell 6.81 GiB op by op, 1.28
+    jitted). The reference runs op by op, so none of those rewrites reaches the bar it sets (row 6909: a
+    compiled reference summing products shared Dew's error)."""
+    reaches = getattr(draw, "reaches_subnormals", False)
+    if reaches and seeds >= 32:
+        group = 16
+        base_draw = draw
+
+        def draw(seed, _draw=base_draw, _group=group):
+            return jax.tree.map(lambda *xs: jnp.stack(xs), *(_draw(seed * _group + i) for i in range(_group)))
+
+        ours, reference, seeds = jax.vmap(ours), jax.vmap(reference), seeds // group
+    written = as_given(ours if reaches else jax.jit(products_held(ours), compiler_options=as_written()))
     for program, run in ((jax.jit(ours), "jitted"), (written, "as written")):
         assert_as_exact(program, as_given(reference), draw, f"{label} {run}", seeds=seeds)
 

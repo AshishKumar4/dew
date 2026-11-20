@@ -403,3 +403,32 @@ def test_the_decode_matrix_holds_on_this_tpu():
     jax's Pallas paged attention on par with the reference path at every pair of axis values it serves, each
     cell on its own TPU (`decode_matrix`)."""
     run_cells(cells_of(decode_matrix.a_decode_step_is_on_par))
+
+
+@on_tpu
+@pytest.mark.parametrize(("width", "precision"), [(64, None), (128, "highest")],
+                         ids=["default-64", "highest-128"])
+def test_a_paged_decode_step_on_this_tpu_falls_back_where_jaxs_kernel_refuses(width, precision):
+    """A bf16 paged pool's decode step on this TPU (`kv_cache.KVStore.decode`, 16 query heads over 8, the
+    selector's own kernel) at a width (64) or precision (`'highest'` on v5e) where `kv_cache.TPU_PAGED_SUPPORTS`
+    refuses jax's Pallas paged attention (rows 7385, 10142): on par with the reference path (check 1) through
+    the fallback route where refused, and through `tpu` where a newer TPU's MXU takes fp32-by-bf16."""
+    from dew.nn.kernels import generation
+
+    case = {"generation": "tpu", "layout": "paged", "heads": "gqa-16-8", "hook": "plain", "dtype": "bfloat16",
+            "width": str(width), "kernel": "tpu"}
+    lengths = jnp.asarray(decode_matrix.LENGTHS, jnp.int32)
+
+    def ours(query, key, value, dout, sinks):
+        del dout, sinks
+        paged = decode_matrix._Paged(None)
+        cache = paged.init(jax.random.key(0), key, value, query[:, 0], lengths, None)["cache"]
+        return (paged.apply({"cache": cache}, key, value, query[:, 0], lengths, None,
+                            mutable=["cache"])[0][:, None],)
+
+    served = width % 128 == 0 and (precision is None or generation.gpu_target().fp32_by_bf16_precise)
+    with jax.default_matmul_precision(precision), generation.routes() as routes:
+        assert_as_exact(jax.jit(ours), jax.jit(decode_matrix._step(case, reference=True)),
+                        decode_matrix._drawn(case), f"a paged decode step {width} wide at {precision}",
+                        seeds=decode_matrix.SEEDS, terms=decode_matrix._terms(case))
+    assert (("paged_decode", "tpu") in {(found.choice, found.kernel) for found in routes}) == served

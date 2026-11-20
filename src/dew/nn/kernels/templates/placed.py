@@ -138,7 +138,8 @@ class Tcgen05Placed(Tcgen05Rings):
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
-                        together: tuple[int, ...] = ()) -> dict:
+                        together: tuple[int, ...] = (),
+                        tmem_limit: int | None = None) -> dict:
         # A role's two turns of the one product it issues ahead, each its logits' accumulator (`LOGITS`) and
         # over it the one left operand it is given (`WEIGHTS`, 16-bit two to a column): a turn's weights are
         # written once its consumer has read the turn's logits whole into its registers, which they are
@@ -168,7 +169,8 @@ class Tcgen05Placed(Tcgen05Rings):
             scratch[QUERY] = tuple(self.tensor_memory((rows, q_width), q_dtype) for _ in range(consumers))
         held = tuple(scratch[name] for name in (LOGITS, SUMS, QUERY) if name in scratch)
         cols = resources.tensor_memory_columns(jax.tree.leaves(held))
-        if self.corrects(consumers, cols, generation.gpu_target().tmem_columns or 0):
+        limit = (generation.gpu_target().tmem_columns if tmem_limit is None else tmem_limit) or 0
+        if self.corrects(consumers, cols, limit):
             scratch["factor_ready"] = self.signals(2).scratch()
             scratch[FACTORS] = plgpu.SMEM((2, rows), jnp.float32)
         return scratch
@@ -665,7 +667,8 @@ class Tcgen05Walked(Tcgen05Placed):
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
-                        together: tuple[int, ...] = ()) -> dict:
+                        together: tuple[int, ...] = (),
+                        tmem_limit: int | None = None) -> dict:
         # The program's two turns of the scores and of their cotangents (`ahead`'s widths, a step's walked
         # tile), a packed 16-bit view over each (`lefts`' dtype: the narrowed lefts over the turn's first
         # half), the kept sums (`sums`, `kept_sums`'), and the hand-offs: the scores' (`scored`, two turns,
@@ -675,7 +678,7 @@ class Tcgen05Walked(Tcgen05Placed):
         # its turns, a half of its columns over each (a 64-row accumulator of them, half a column's lanes
         # each, `Tcgen05ChunksIssuer`'s), and its hand-offs: the issuer's commit (`dq_ready`) and the
         # compute warpgroup's read of it, its turns free (`freed`).
-        del consumers, together
+        del consumers, together, tmem_limit
         ((scores, cotangents), (left,)) = ahead, tuple(dict.fromkeys(lefts))
         rows, (_, dtype) = self.rows, left
 
