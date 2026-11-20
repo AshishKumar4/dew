@@ -688,8 +688,8 @@ RWKV7_FLOOR = -math.exp(-0.5)
 """RWKV7's least log decay, `w = exp(-e^{-1/2} sigmoid(x))`'s."""
 
 ADDITIVE = recurrence.Hooks(decay='vector', erase='additive', scale=KEY_WIDTH ** -0.5)
-"""RWKV7's additive diagonal plus low rank, laid as tokens correcting the state they enter
-(`recurrence_chunk._erases_laid`, `linear_scan.Affine.corrected_before`)."""
+"""RWKV7's additive diagonal plus low rank, a token erasing along its own vector the state it enters beside
+its write (`recurrence_chunk._erases_laid`, `linear_scan.Affine.erased_before`)."""
 
 UNTIED = recurrence.Hooks(decay='vector', erase='untied', scale=KEY_WIDTH ** -0.5)
 """GDN-2's and Comba's erase vectors of their own under a decay a key dimension's, which laid tokens take."""
@@ -702,8 +702,8 @@ TRANSITIONS = [
                  id='two-sided')]
 """The delta rule's transitions beside its tied erase and a decay along the keys (`Hooks.erase`,
 `Hooks.value_decay`, row 9029): GDN-2's and Comba's erase vectors of their own, a head's and a key
-dimension's decay; RWKV7's additive diagonal plus low rank, its laid tokens correcting the state they enter
-(row 9670); two-sided GLA's decay along the values (Oja's rule's erase along the values, row 9028:
+dimension's decay; RWKV7's additive diagonal plus low rank, its tokens erasing the state they enter (row
+9670); two-sided GLA's decay along the values (Oja's rule's erase along the values, row 9028:
 test_gated_oja)."""
 
 
@@ -819,7 +819,7 @@ def test_an_additive_erases_decay_gradient_is_its_decays_alone():
     """RWKV7's additive erase (`Hooks.erase` 'additive', `S' = D S - a (b^T S)`) through the chunked op, one
     token of no decay (`g = 0`) and no write over a memory `(1, 2^-27)`, erase vectors `b = (1, 0)` and `a =
     (0, 1/2)`: its final memory's second key's gradient by the decay exactly 2^-27, the decay's alone, the
-    erase reading the memory before its decay independent of it (`linear_scan.Affine.corrected_before`, row
+    erase reading the memory before its decay independent of it (`linear_scan.Affine.erased_before`, row
     9670). Laid as the delta rule's correction of the decayed memory (`b exp(-g)` read through `D S`), its
     decay entered twice, the second key's `2^-27 - 1/2` rounded to `-1/2` before its decay, and the two
     cancelled to zero (row 9029's head review)."""
@@ -909,9 +909,9 @@ def test_a_forked_erase_runs_in_a_shard_map_that_checks_varying_axes(hooks):
 def test_a_forked_erases_documents_are_as_exact_as_each_alone(hooks, by_firsts):
     """A forked call of an erase of its own (`Chunk.loads`), each document entering its table slot's memory
     with an entry write of its own, its documents given by their starts or their first slots alone, through
-    laid tokens correcting the state after its decay (an untied erase's) or before it (an additive one's): its
-    output, last memory and every gradient against each document a sequence of its own a token at a time from
-    float64 (check 1), the stored finals each a document's last laid token's."""
+    tokens correcting the state after its decay (an untied erase's laid tokens) or before it (an additive
+    one's): its output, last memory and every gradient against each document a sequence of its own a token at
+    a time from float64 (check 1), the stored finals each a document's last token's."""
     def drawn(seed):
         operands, seeded = entered_draw(hooks, seed, entries=True)
         return transitioned(hooks, operands, seed), seeded

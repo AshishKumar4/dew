@@ -801,7 +801,9 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     own write in it (`Hooks.own_weight`), each head's given every chunk. A turned call's turns are its
     wrapper's (`templates.recurrence.turned`), which launches this unturned. `correction` `[B, S, Hv, Dk]`,
     where given, reads each token's correction of the decayed memory in place of its keys, `h = D h + beta k
-    (v + c^T D h)^T` (an erase of its own's laid tokens, `_erases_laid`); `across` `[B, S, Hv, Dv]`, where
+    (v + c^T D h)^T` (an untied erase's laid tokens, `_erases_laid`), or with `erase_left` `[B, S, Hv, Dk]`
+    each token's erase along it of the memory it enters beside its write, `h = D h + a (c^T h)^T + beta k v^T`
+    (an additive erase's); `across` `[B, S, Hv, Dv]`, where
     given, decays the memory along its values too, `h = D h E + beta k v^T`, `E = exp(across)` (two-sided
     GLA's, `recurrence.Hooks.value_decay`); and `values_read` reads the memory along its values (`h scale
     q`: Oja's rule's transposed memory, `_portable`)."""
@@ -1590,8 +1592,8 @@ def _on_template(query, key, value, g, beta, state, skip, turn, *, starts, first
 def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, turn, *, starts, firsts, forked,
                  scale: float, dtype, own, chunk_size: int, correction=None, across=None, erase_left=None):
     """The chunked op's `(output, final memory)` on the portable math (`_portable`, its chunk `held_chunk`'s
-    under the delta rule; a turned call's through `_turned_or_plain`; an erase of its own's laid tokens'
-    (`correction`, `chunk`'s), a decay along the values' (`across`) and Oja's rule's their own, which turn
+    under the delta rule; a turned call's through `_turned_or_plain`; an erase of its own's (`correction`,
+    `erase_left`, `chunk`'s), a decay along the values' (`across`) and Oja's rule's their own, which turn
     none)."""
     # Oja's rule's keys on its transposed memory are its values (`_portable`).
     width = value.shape[-1] if hooks.erase == 'values' else key.shape[-1]
