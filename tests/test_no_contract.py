@@ -60,8 +60,11 @@ def test_an_error_free_transform_marks_its_arithmetic_where_the_jaxlib_marks():
                   (jax.jit(lambda x, y: jax.jvp(two_sum, (x, y), (y, x))), False)]
 
     def lowered(platform: str):
-        return [(transform.trace(x, y).lower(lowering_platforms=(platform,)), paired)
-                for transform, paired in transforms]
+        # Traced for a CPU (`jax.default_device`, the platform a call's code is chosen for), whatever the
+        # process's default, then lowered for `platform`.
+        with jax.default_device(cpu):
+            return [(transform.trace(x, y).lower(lowering_platforms=(platform,)), paired)
+                    for transform, paired in transforms]
 
     def held(programs, *, barrier: bool, marked: bool):
         for program, paired in programs:
