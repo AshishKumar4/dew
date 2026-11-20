@@ -202,8 +202,9 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     of its own (`model_flows.prepared_apart`) over the node's serialized topology (here a compile-only
     A100's, serialized as a host serializes its own), its Dew and reference programs compiled for that GPU
     and its truths' programs compiled into the tier's store, and what it took reported. The dense fp32
-    decoder's flow, the cheapest of two kinds to prepare (armada: 77 s against the selective scan's 152,
-    whose prepare held this test at 117 s on CI past the 120 s group target, row 9709)."""
+    decoder's flow, the cheapest of two kinds to prepare: with the selective scan's this test took 120 s on
+    CI at main 4f7110c66 and 117 s at 84cba23c0, against a 120 s group target (row 9709); prepared apart
+    on armada, the dense fp32 flow took 77 s and the selective scan's 152."""
 
 
     topology = node_topology(store / "topology.bin")
