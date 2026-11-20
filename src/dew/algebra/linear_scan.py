@@ -907,7 +907,8 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
             exponentials = elements[part] * (1 if part.startswith("between") else 2)
             if part.endswith("_before"):
                 # A token back: its shifted copy kept beside the decay it is shifted from (`scan._back`).
-                return Work(operations=exponentials, exponentials=exponentials, kept_bytes=kept(elements[part]))
+                return Work(operations=exponentials, exponentials=exponentials,
+                            kept_bytes=kept(elements[part]))
             return Work(operations=exponentials, exponentials=exponentials)
     if (args := get_callable_args(node, Chunk.gram)) is not None:
         if d == 1:
