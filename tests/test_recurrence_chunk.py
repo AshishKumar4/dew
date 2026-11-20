@@ -385,30 +385,32 @@ DELTA_PRODUCTS = [recurrence.Hooks(decay='scalar', l2norm=True, substeps=2),
 (fla's `chunk_gated_delta_product`), and a decay a key dimension over three."""
 
 
-def substepped_draw(hooks: recurrence.Hooks, packed: bool, seed: int):
+def substepped_draw(hooks: recurrence.Hooks, seed: int):
     """`draw`'s operands of `LENGTH` tokens of `hooks.substeps` updates each, and cotangents: its keys,
-    values and write gates fresh at every update, its queries and decays a token's, and with `packed`
-    documents at `draw`'s tokens."""
+    values and write gates fresh at every update, its queries and decays a token's."""
     (laid,) = draw(hooks, packed=False, seed=seed, length=LENGTH * hooks.substeps)
     every = hooks.substeps
-    starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), LENGTH)) if packed else None
-    operands = dataclasses.replace(laid, query=laid.query[:, ::every], log_decay=laid.log_decay[:, ::every],
-                                   starts=starts)
+    operands = dataclasses.replace(laid, query=laid.query[:, ::every], log_decay=laid.log_decay[:, ::every])
     out, final = cotangents(laid, seed)
     return operands, (out[:, ::every], final)
 
 
 @pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
-@pytest.mark.parametrize('hooks', DELTA_PRODUCTS, ids=str)
+@pytest.mark.parametrize('hooks', DELTA_PRODUCTS, ids=['two updates a head', 'three updates a key dimension'])
 def test_a_delta_products_chunks_are_as_exact_as_its_tokens(hooks, packed):
     """DeltaProduct (`Hooks.substeps`) on the chunked op's portable math, its updates the op's tokens in
     turn, against the decode step's reference a token at a time, its updates on their own axis
     (`token_by_token`): the output, the final memory and every operand's gradient from float64 (check 1, row
     9030)."""
-    dew = jax.jit(with_gradients(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)))
-    reference = jax.jit(with_gradients(functools.partial(token_by_token, hooks)))
-    assert_as_exact(dew, reference, functools.partial(substepped_draw, hooks, packed),
-                    f'{hooks} packed={packed}', seeds=8)
+    # Packed documents at `draw`'s tokens, marked outside the differentiated operands.
+    starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), LENGTH)) if packed else None
+
+    def differentiated(fn):
+        return jax.jit(with_gradients(lambda operands: fn(dataclasses.replace(operands, starts=starts))))
+
+    assert_as_exact(differentiated(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)),
+                    differentiated(functools.partial(token_by_token, hooks)),
+                    functools.partial(substepped_draw, hooks), f'{hooks} packed={packed}', seeds=8)
 
 
 @pytest.mark.parametrize(('substeps', 'form'), [(2, {'delta': False}), (2, {'reads': 'before'}),
