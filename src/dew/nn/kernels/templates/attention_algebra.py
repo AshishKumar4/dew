@@ -1294,9 +1294,7 @@ def kept_parts(p: jax.Array, multiplier: jax.Array | None, reach: float, dtype) 
         return (narrow(kept(p, multiplier, reach), dtype),)
     if drops_in_place(dtype, reach):
         return split_parts(kept(p, multiplier, reach))
-    # Its row's power of two along the product's columns, as the rows' product reads it.
-    value, exponent = _scaled(kept(p, multiplier, reach), rows=True)
-    return tuple(product.Scaled(part, exponent[:, None]) for part in split_parts(value))
+    return weights_parts(kept(p, multiplier, reach), dtype, rows=True, split=True)
 
 
 def in_units(spec: "Forward", products: jax.Array) -> jax.Array:
@@ -1773,9 +1771,9 @@ def anchor_split(p: jax.Array, at_anchor: jax.Array, dtype) -> tuple[jax.Array, 
 
 def _summed_row(part: jax.Array | product.Scaled) -> jax.Array:
     """A product's part's rows' sums `[bq]`, fp32, a scaled one's taken back by its rows' powers of two
-    (`[bq, 1]`, `kept_parts`)."""
+    (`[bq]`, `weights_parts`)."""
     if isinstance(part, product.Scaled):
-        return taken_back(part.value.astype(jnp.float32).sum(axis=-1), jnp.reshape(part.exponent, (-1,)))
+        return taken_back(part.value.astype(jnp.float32).sum(axis=-1), part.exponent)
     return part.astype(jnp.float32).sum(axis=-1)
 
 
@@ -2110,7 +2108,7 @@ def summed_products(parts: Parts, operand: jax.Array,
     one's taken back by its power of two, in order."""
     def taken(part) -> jax.Array:
         if isinstance(part, product.Scaled):
-            return taken_back(dot(part.value, operand), part.exponent)
+            return restored(dot(part.value, operand), part.exponent)
         return dot(part, operand)
 
     first, *rest = parts
@@ -2120,11 +2118,14 @@ def summed_products(parts: Parts, operand: jax.Array,
     return total
 
 
-def weights_parts(weights: jax.Array, dtype, rows: bool = False) -> Parts:
+def weights_parts(weights: jax.Array, dtype, rows: bool = False, *, split: bool = False) -> Parts:
     """Weights `[bq, bk]` (fp32) narrowed for their product with an operand of `dtype` (`summed_products`):
     fp16's at a power-of-two scale that keeps them in its range (`_fp16_scaled`, a row's with `rows`),
-    which its product takes back."""
+    which its product takes back; with `split`, two fp16 parts at that one scale (`split_parts`)."""
     if dtype == jnp.float16:
+        if split:
+            scaled, exponent = _scaled(weights, rows)
+            return tuple(product.Scaled(part, exponent) for part in split_parts(scaled))
         return (product.Scaled(*_fp16_scaled(weights, rows)),)
     return (weights.astype(dtype),)
 
