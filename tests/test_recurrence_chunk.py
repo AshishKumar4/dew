@@ -448,6 +448,94 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
                          length=LENGTH, seeds=32)
 
 
+OJA = recurrence.Hooks(decay='vector', erase='values', scale=KEY_WIDTH ** -0.5)
+"""Oja's rule with a gate a value dimension (`Hooks.erase` 'values', fla's gated_oja_rule), row 9028."""
+
+
+def oja_token(state, query, key, value, log_decay, beta):
+    """A decode token of Oja's rule as its paper writes it, a value head per key head: the memory `S` `[R, H,
+    K, V]` decayed along its values and its values erased from it, then written, `S D (I - beta v v^T) + beta
+    k v^T`, `D = exp(log_decay)` `[R, H, V]`, read after, `q^T S'`."""
+    decayed = state * jnp.exp(log_decay)[..., None, :]
+    erased = jnp.einsum('rhkv,rhv->rhk', decayed, value)
+    beta_ = beta[..., None, None]
+    written = beta_ * key[..., :, None] * value[..., None, :]
+    updated = decayed - beta_ * erased[..., None] * value[..., None, :] + written
+    return jnp.einsum('rhk,rhkv->rhv', query, updated), updated
+
+
+def test_an_oja_decode_token_is_as_exact_as_its_formula():
+    """A decode token of Oja's rule (`OJA`, scale one) through the public step (`recurrence.step`): output,
+    memory and every gradient against the token as its paper writes it (`oja_token`) from float64 (check 1,
+    row 9028)."""
+    hooks = dataclasses.replace(OJA, scale=1.0)
+    rows, heads, keys, values = 8, 4, KEY_WIDTH, VALUE_WIDTH
+
+    def draw(seed):
+        rng = np.random.default_rng([9028, seed])
+        normal = rng.standard_normal
+        operands = (0.3 * normal((rows, heads, keys, values)), normal((rows, heads, keys)),
+                    unit(normal((rows, heads, keys))), unit(normal((rows, heads, values))),
+                    -rng.uniform(0, 1, (rows, heads, values)), rng.uniform(0, 1, (rows, heads)))
+        seeded = (normal((rows, heads, values)), normal((rows, heads, keys, values)))
+        return *(hosted(x) for x in operands), tuple(hosted(x) for x in seeded)
+
+    def stepped(state, query, key, value, log_decay, beta):
+        token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
+        out, _, updated = recurrence.step(hooks, token)
+        return out, updated
+
+    assert_as_exact(jax.jit(with_gradients(stepped)), jax.jit(with_gradients(oja_token)), draw,
+                    "an oja decode token", seeds=8)
+
+
+def oja_edge(state, key, value, beta):
+    """A decode token of Oja's rule over one key, a query of one, no decay and scale one, in fp32 (`OJA`'s
+    through `recurrence.step`): `(output, memory)` of a memory `state` `[Dv]`, a key `key` `[1]`, values
+    `value` `[Dv]` and a write gate `beta`."""
+    def held(x, *shape):
+        return jnp.reshape(jnp.asarray(x, jnp.float32), (1, 1, *shape))
+
+    token = recurrence.Step(held(state, 1, len(state)), query=held([1.0], 1), key=held(key, 1),
+                            value=held(value, len(value)), log_decay=jnp.zeros((1, 1), jnp.float32),
+                            beta=held(beta))
+    out, _, updated = recurrence.step(dataclasses.replace(OJA, decay='scalar', scale=1.0), token)
+    return out.ravel(), updated.ravel()
+
+
+@pytest.mark.parametrize(('state', 'key', 'value', 'beta', 'expected'), [
+    ([-2.0 ** 127], [2.0 ** 127], [1.0], 0.25, [-2.0 ** 126]),
+    ([2.0 ** 120, 0.0], [0.0], [2.0 ** -60, 1.0], 2.0 ** -100, [2.0 ** 120, -2.0 ** -40]),
+    ([2.0 ** 127] * 4, [0.0], [0.5] * 4, 0.25, [2.0 ** 127 - 2.0 ** 125] * 4)],
+    ids=['a correction past the largest', 'a gated value past the least', 'an ungated read past the largest'])
+def test_an_oja_decode_tokens_gate_scales_its_formed_correction(state, key, value, beta, expected):
+    """A decode token of Oja's rule (`oja_edge`), its memory and output exact in fp32: the gated correction
+    `beta k - beta v^T S^T` one exact sum, which neither its ungated parts past fp32's largest (2^128) nor
+    `beta v` past its least (2^-160) loses."""
+    out, updated = oja_edge(state, key, value, beta)
+    assert (out.tolist(), updated.tolist()) == (expected, expected)
+
+
+def test_an_oja_decode_tokens_gate_gradient_sums_its_terms_exactly():
+    """The gate's derivative of a decode token of Oja's rule (`oja_edge`) at a memory `[2^31, 2, 0, 0]`,
+    values of 1/2 and a key of 2^30: its write's `k` 2^30 and its erase's read `v^T S^T` 2^30 + 1, summed
+    exactly, give twice its second output's -1, where each rounded apart cancelled to zero."""
+    def second(beta):
+        return 2.0 * oja_edge([2.0 ** 31, 2.0, 0.0, 0.0], [2.0 ** 30], [0.5] * 4, beta)[0][1]
+
+    assert float(jax.grad(second)(jnp.float32(0.25))) == -1.0
+
+
+@pytest.mark.parametrize('form', [{'erase': 'values', 'delta': False}, {'erase': 'values', 'reads': 'before'},
+                                  {'erase': 'erasing'}],
+                         ids=['without the delta rule', 'read before', 'unknown'])
+def test_an_erase_outside_its_form_is_refused(form):
+    """An erase outside its form (`Hooks.erase`): along the values without the delta rule or read before its
+    token, or an unknown kind, a ValueError (row 9028)."""
+    with pytest.raises(ValueError):
+        recurrence.Hooks(decay='vector', **form)
+
+
 def test_a_turned_readout_before_its_tokens_turn_is_refused():
     """A turned state's readout reads it after its token's turn ('after' or 'apart', `Hooks.turns`): the
     chunked op's frames read each token's query in its own turn's frame, so a readout of the state before

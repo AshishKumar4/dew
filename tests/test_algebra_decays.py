@@ -168,24 +168,54 @@ def test_the_decay_takes_the_same_tangent_forward_as_backward():
                     seeds=PAIRING_SEEDS)
 
 
-def test_a_per_key_spreads_factored_pair_keeps_a_result_its_whole_decay_loses():
-    """`scan.spread` under a decay a key dimension: a reader at a sub-chunk's first token
-    (`recurrence_algebra.SUB`) and a write of keys 2^120 two tokens earlier, in the sub-chunk before, under
-    base-2 log decays of -80 a token and dimension there: its read through the factors to and from the
-    sub-chunk's reference, about 2^-80 each, exactly the write decayed by one and then the other, near 2^-40,
-    where the pair's whole decay, 2^-160, is zero in float32 and a select on it read zero (head review of
-    4bc3f5016 F1)."""
+def factored_draw(seed: int):
+    """A per-key spread's operands of two sub-chunks (`recurrence_algebra.SUB`) and its exponents: a reader
+    at the second's first token and a write two tokens earlier, in the first, of keys 2^100 to 2^126, under
+    integer base-2 log decays of -75 to -89 a key at the two tokens between them, summing to -150 or below,
+    so the pair's whole decay underflows float32 where its factors to and from the reference do not; its
+    decays exact powers of two of the exponents' differences (`np.ldexp`, no `scan.between`), a future
+    pair's negative zero, which a live span's underflow is not (`scan._crossed`)."""
     from dew.nn.kernels.recurrence_algebra import SUB
 
+    rng = np.random.default_rng([9549, seed])
     chunk, width = 2 * SUB, 2
     readers, values = np.zeros((chunk, 1), np.float32), np.zeros((chunk, 1), np.float32)
-    keys, exponents = np.zeros((chunk, width), np.float32), np.zeros((chunk, width), np.float32)
-    readers[SUB], values[SUB - 2], keys[SUB - 2] = 1.0, 1.0, 2.0 ** 120
-    exponents[SUB - 1:SUB + 1] = -80.0
-    between = scan.between(exponents, base2=True)
-    found = np.asarray(scan.spread(readers, values, keys, between))
-    factors = np.asarray(between[SUB - 1, SUB - 2]), np.asarray(between[SUB, SUB - 1])
-    np.testing.assert_array_equal(found[SUB], keys[SUB - 2] * factors[0] * factors[1])
+    keys, exponents = np.zeros((chunk, width), np.float32), np.zeros((chunk, width), np.int32)
+    readers[SUB], values[SUB - 2] = 1.0, 1.0
+    keys[SUB - 2] = np.ldexp(np.float32(1.0), rng.integers(100, 127, width))
+    exponents[SUB - 1:SUB + 1] = -rng.integers(75, 90, (2, width))
+    total = np.cumsum(exponents, axis=0)
+    lower = np.tri(chunk, dtype=bool)[..., None]
+    decays = np.ldexp(np.float32(1.0), total[:, None] - total[None, :])
+    between = np.where(lower, decays, -0.0).astype(np.float32)
+    return readers, values, keys, between, exponents.astype(np.float32)
+
+
+def token_spread(readers, values, keys, between, exponents):
+    """The spread a token at a time, its state a key's: each token decays it by its own exponent's power of
+    two (`jnp.ldexp`, exact) and writes its key times its value, and its reader reads it; the decays `between`
+    unread, an oracle of their own."""
+    del between
+
+    def step(state, token):
+        reader, value, key, exponent = token
+        state = jnp.ldexp(state, exponent.astype(jnp.int32)) + key * value
+        return state, reader * state
+
+    return jax.lax.scan(step, jnp.zeros(keys.shape[1:], keys.dtype), (readers, values, keys, exponents))[1]
+
+
+def test_a_per_key_spreads_factored_pair_keeps_a_result_its_whole_decay_loses():
+    """`scan.spread` under a decay a key dimension, a pair across sub-chunks whose whole decay underflows
+    float32 where its factors to and from the reference do not (`factored_draw`): its read through the
+    factors held by check 1 against the spread a token at a time (`token_spread`), from float64, where a
+    select on the whole decay read zero (head review of 4bc3f5016 F1; row 9549)."""
+    def spread(readers, values, keys, between, exponents):
+        del exponents
+        return scan.spread(readers, values, keys, between)
+
+    assert_as_exact(jax.jit(spread), jax.jit(token_spread), factored_draw, "a per-key spread's factored pair",
+                    seeds=8)
 
 
 def lone_pair(reader: float, value: float, decays, *, width: int = 2, later: int = 2, after: bool = False):
