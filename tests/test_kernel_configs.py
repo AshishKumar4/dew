@@ -926,10 +926,17 @@ def _contract_cases(generation_name: str, form: str | None = None) -> list:
     is that bundle's, compiled at the gate's picks."""
     found: dict = {}
     contract = _family_forms(generation_name)
+    target_forms = ({form} & contract) if form is not None else contract
     for shape in GEMM_SHAPES:
         for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True, form=form):
             if case.form in contract:
                 found.setdefault((case.form, case.consumers), case)
+        if target_forms.issubset({key[0] for key in found}):
+            by_form = {name: pricing.family_of(case.tile, jnp.bfloat16) for (name, _), case in found.items()}
+            if all(all((name, count) in found
+                       for count in {1, min(by_form[name].consumers, mosaic_gpu.CONSUMERS)})
+                   for name in target_forms):
+                break
     return list(found.values())
 
 

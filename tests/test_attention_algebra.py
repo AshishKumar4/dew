@@ -1123,7 +1123,8 @@ def _scaled_masses(totals, *others):
     return tuple(jnp.ldexp(x, -exponent) for x in (totals, *others))
 
 
-def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int) -> None:
+def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int,
+                                run: str | None = None) -> None:
     """`ours` on par with `reference` against float64 (check 1), jitted and as written: its compiler
     rewrites a quotient divided again into one over the divisors' product, a division by a broadcast into a
     product with its reciprocal and a sum of products into one of unrounded products, so each order is held
@@ -1146,8 +1147,9 @@ def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int
 
         ours, reference, seeds = jax.vmap(ours), jax.vmap(reference), seeds // group
     written = as_given(ours if reaches else jax.jit(products_held(ours), compiler_options=as_written()))
-    for program, run in ((jax.jit(ours), "jitted"), (written, "as written")):
-        assert_as_exact(program, as_given(reference), draw, f"{label} {run}", seeds=seeds)
+    for program, mode in ((jax.jit(ours), "jitted"), (written, "as written")):
+        if run is None or run == mode:
+            assert_as_exact(program, as_given(reference), draw, f"{label} {mode}", seeds=seeds)
 
 
 @pytest.mark.parametrize("draw", [_masses_past_fp32s_largest, _masses_near_fp32s_largest],
@@ -1276,13 +1278,14 @@ def test_the_merges_derivative_as_to_its_denominators_is_on_par(draw):
                                 seeds=DERIVATIVE_SEEDS)
 
 
+@pytest.mark.parametrize("run", ["jitted", "as written"])
 @pytest.mark.parametrize("draw", [_opposite_near_largest, _subunit_masses_of_alternate_signs,
                                   _subunit_masses_under_large_outputs, _masses_past_fp32s_largest,
                                   _masses_near_fp32s_largest],
                          ids=["opposite-near-largest", "subunit-masses-of-alternate-signs",
                               "subunit-masses-under-large-outputs", "masses-past-fp32s-largest",
                               "masses-near-fp32s-largest"])
-def test_the_merges_derivative_along_its_denominators_is_on_par(draw):
+def test_the_merges_derivative_along_its_denominators_is_on_par(draw, run):
     """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along its
     denominators, every other one's direction an eighth of it, on par with the mean's own formed in fp32 as
     (sum(d o / L) - out sum(d / L)) over the masses' sum over L, a power of two near their largest
@@ -1304,7 +1307,7 @@ def test_the_merges_derivative_along_its_denominators_is_on_par(draw):
         return ((jnp.sum(directions * outputs) - out * jnp.sum(directions)) / jnp.sum(shares))[None, None]
 
     _on_par_jitted_and_op_by_op(ours, reference, draw, f"the merge's derivative along, {draw.__name__}",
-                                seeds=ALONG_SEEDS)
+                                seeds=ALONG_SEEDS, run=run)
 
 
 def _opposite_near_largest_over_unequal_masses(seed):
@@ -1338,12 +1341,13 @@ def _tiny_and_huge_masses_along_the_tiny(seed):
     return outputs, totals.astype(jnp.float32), jnp.zeros(2, jnp.float32).at[0].set(first)
 
 
+@pytest.mark.parametrize("run", ["jitted", "as written"])
 @pytest.mark.parametrize("draw", [_along_one_to_two(_opposite_near_largest_over_unequal_masses),
                                   _along_one_to_two(_subunit_masses_of_alternate_signs),
                                   _tiny_and_huge_masses_along_the_tiny],
                          ids=["opposite-near-largest-over-unequal-masses",
                               "subunit-masses-of-alternate-signs", "tiny-and-huge-masses-along-the-tiny"])
-def test_the_merges_derivative_along_its_outputs_is_on_par(draw):
+def test_the_merges_derivative_along_its_outputs_is_on_par(draw, run):
     """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along drawn
     directions of its outputs alone, on par with sum(w d) / sum(w) formed in fp32, against float64 (check
     1): its masses' tangents inactive form no term, where a zero times a mass coefficient past fp32's
@@ -1359,7 +1363,7 @@ def test_the_merges_derivative_along_its_outputs_is_on_par(draw):
 
     _on_par_jitted_and_op_by_op(ours, reference, draw,
                                 f"the merge's derivative along its outputs, {draw.__name__}",
-                                seeds=ALONG_SEEDS)
+                                seeds=ALONG_SEEDS, run=run)
 
 
 MERGE_EDGE_SEEDS = 512
@@ -1398,9 +1402,10 @@ def _a_subnormal_gap_along_units(seed):
     return outputs, totals.astype(jnp.float32), masses, along
 
 
+@pytest.mark.parametrize("run", ["jitted", "as written"])
 @pytest.mark.parametrize("draw", [_equal_outputs_along_large_directions, _a_subnormal_gap_along_units],
                          ids=["equal-outputs-along-large-directions", "a-subnormal-gap-along-units"])
-def test_the_merges_mixed_second_derivative_is_on_par(draw):
+def test_the_merges_mixed_second_derivative_is_on_par(draw, run):
     """The mixed second derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along
     drawn directions of its masses and its outputs, in both orders, on par with sum(dw (do - d out)) / W
     formed in fp32 over the masses' power of two (`_scaled_masses`), d out = sum(w do) / W, against float64
@@ -1425,7 +1430,7 @@ def test_the_merges_mixed_second_derivative_is_on_par(draw):
 
     _on_par_jitted_and_op_by_op(ours, reference, draw,
                                 f"the merge's mixed second derivative, {draw.__name__}",
-                                seeds=SECOND_ORDER_SEEDS)
+                                seeds=SECOND_ORDER_SEEDS, run=run)
 
 
 def _unit_masses_along_two(seed):
@@ -1481,13 +1486,14 @@ def _halves_over_masses(outputs, totals):
     return jnp.ldexp(outputs * 0.5 - out * 0.5, -exponent), summed
 
 
+@pytest.mark.parametrize("run", ["jitted", "as written"])
 @pytest.mark.parametrize("draw", [_unit_masses_along_two, _masses_past_2_127_along_their_own,
                                   _masses_near_2_126_along_least_normal,
                                   _unit_masses_under_small_outputs_along_2_127],
                          ids=["unit-masses-along-two", "masses-past-2^127-along-their-own",
                               "masses-near-2^126-along-least-normal",
                               "unit-masses-under-small-outputs-along-2^127"])
-def test_the_merges_derivative_along_drawn_directions_is_on_par(draw):
+def test_the_merges_derivative_along_drawn_directions_is_on_par(draw, run):
     """The derivative of finished slices' merge (`algebra.finished_merged`, at one maximum) along drawn
     tangents of its denominators, on par with sum(d (o - out)) / W formed in fp32 over the masses' power
     of two and the tangents' own, exactly (`_halves_over_masses`), against float64 (check 1): a forward
@@ -1506,7 +1512,7 @@ def test_the_merges_derivative_along_drawn_directions_is_on_par(draw):
 
     _on_par_jitted_and_op_by_op(ours, reference, draw,
                                 f"the merge's derivative along drawn directions, {draw.__name__}",
-                                seeds=MERGE_EDGE_SEEDS)
+                                seeds=MERGE_EDGE_SEEDS, run=run)
 
 
 def _masses_of_2_20_under_a_cotangent_of_16(seed):
@@ -1647,10 +1653,11 @@ def _subnormal_gap(seed):
             jax.random.normal(streams[4], ()))
 
 
+@pytest.mark.parametrize("run", ["jitted", "as written"])
 @pytest.mark.parametrize("order", ["mixed", "forward over reverse", "reverse over reverse"])
 @pytest.mark.parametrize("draw", [_zero_gap, _zero_mass, _subnormal_gap],
                          ids=["zero-gap", "zero-mass", "subnormal-gap"])
-def test_the_merges_derivatives_of_its_gradient_are_on_par(draw, order):
+def test_the_merges_derivatives_of_its_gradient_are_on_par(draw, order, run):
     """The derivatives of the gradient as to the masses of finished slices' merge (`algebra.finished_merged`,
     at one maximum) under a drawn cotangent c, each `order` its own program (one program of the three held
     an op-by-op run past 10 GiB): its jvp along drawn output directions d, c (d - sum(w d) / W) / W
@@ -1685,7 +1692,7 @@ def test_the_merges_derivatives_of_its_gradient_are_on_par(draw, order):
 
     _on_par_jitted_and_op_by_op(ours, reference, draw,
                                 f"the derivatives of the merge's gradient, {draw.__name__}, {order}",
-                                seeds=SECOND_ORDER_SEEDS)
+                                seeds=SECOND_ORDER_SEEDS, run=run)
 
 
 @_reaches_subnormals
