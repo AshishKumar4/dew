@@ -358,8 +358,9 @@ def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
     two bf16 tokens of unit-basis keys `e0` (scale one, a zero memory and decays): the first writing `e0`
     under a gate of 2^-k (k drawn from 20 to 40), the second reading with `e0` and writing `e0` under a gate
     of one, a cotangent of one power of two on its output's first entry alone. The second token's write
-    erases what the first left, so its decay's gradient is exactly zero and every gradient float64's exactly
-    (powers of two throughout), which check 1 holds against the recurrence a token at a time: a token's own
+    erases what the first left, so its decay's gradient is exactly zero and every log decay's gradient
+    float64's exactly (powers of two throughout), which check 1 holds against the recurrence a token at a
+    time: a token's own
     scores pair taken out of the decay's terms after they were summed in fp32 lost the cross term's 2^-k
     with it (base review 29b07fb60 F1, row 7906; restored beside the faint cross site's recording, row
     9073)."""
@@ -385,6 +386,12 @@ def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
         read = jnp.zeros((1, 2, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(2.0 ** -int(rng.integers(0, 8)))
         return operands, (read, jnp.zeros((1, 1, width, width), jnp.float32))
 
-    assert_as_exact(jax.jit(with_gradients(lambda o: chunk_on('mosaic_gpu', hooks, o))),
-                    jax.jit(with_gradients(lambda o: token_by_token(hooks, o))), draw,
-                    "kimi delta attention's small cross term", seeds=8)
+    def decays_gradient(run):
+        # The log decays' gradient alone: the template's corrected values in its fast forms' bf16 leave
+        # its final memory 1 + 2^-k where the recurrence's is one, which this cell does not hold.
+        def gradient(operands, seeded):
+            return with_gradients(lambda o: run(hooks, o))(operands, seeded)[1].log_decay
+        return jax.jit(gradient)
+
+    assert_as_exact(decays_gradient(partial(chunk_on, 'mosaic_gpu')), decays_gradient(token_by_token), draw,
+                    "kimi delta attention's small cross term's decay gradient", seeds=8)
