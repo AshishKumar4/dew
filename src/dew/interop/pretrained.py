@@ -358,16 +358,20 @@ class Pretrained:
     def text_processor(self) -> TaskProcessor | None:
         """Return what the bundle's tasks encode and decode text with.
 
-        That is the source's processor, or a run processor over a saved run's tokenizer (its held copy,
-        `dew.data.text.tokenizer_for(..., held=run)`) or the vocabulary `tokenizer` names (Dew's byte
-        vocabulary).
+        That is the source's processor, a saved run's processor of its user's own (`TaskSettings.custom`),
+        or a run processor over a saved run's tokenizer (its held copy, `dew.data.text.tokenizer_for(...,
+        held=run)`) or the vocabulary `tokenizer` names (Dew's byte vocabulary).
         """
         from dew.data.text import HFTokenizer, tokenizer_for
-        from dew.inference.tasks import RunProcessor
+        from dew.inference.tasks import RunProcessor, saved_custom
 
+        custom = None if self.settings is None else saved_custom(self.settings.custom)
         match self.tokenizer:
             case _ if self.processor is not None:
                 return self.processor
+            case _ if custom is not None:
+                # A saved run's processor of its user's own, its record built under the load's trust.
+                return custom
             case HFTokenizer() as held:
                 return RunProcessor(held)
             case str(name):

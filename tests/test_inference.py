@@ -8,6 +8,7 @@ trainer has just written.
 """
 
 import dataclasses
+import logging
 import json
 import types
 from pathlib import Path
@@ -397,6 +398,13 @@ class PrefixedBytes:
         return self._bytes.bos_id
 
 
+@dataclasses.dataclass(frozen=True)
+class Prefixed(RunProcessor):
+    """A run processor of a user's own with one field of its own (row 9065's review)."""
+
+    prefix: str = ""
+
+
 def _tiny_lm(processor):
     """A tiny byte-level decoder's LM objective over `processor`, its state as a trainer starts it."""
     from dew.objectives.lm import LMObjective
@@ -425,10 +433,10 @@ def test_a_saved_runs_own_processor_reloads_and_reads_text_as_the_live_one(tmp_p
                                   np.asarray(live.processor("hi").tokens))
 
 
-def test_a_saved_runs_processor_no_record_describes_saves_without_it(tmp_path):
+def test_a_saved_runs_processor_no_record_describes_saves_without_it(tmp_path, caplog):
     """A run over a processor no record describes (a class made inside a function, which no import path
-    names) saves without raising, its run loading its model with no processor, as every such run did
-    (row 9065)."""
+    names) saves without raising, recording why, and its run loads its model with no processor, as every
+    such run did, the load saying why once (row 9065)."""
 
     class Opaque(PrefixedBytes):
         pass
@@ -437,7 +445,34 @@ def test_a_saved_runs_processor_no_record_describes_saves_without_it(tmp_path):
     checkpoints = Checkpoints(str(tmp_path / "run"))
     checkpoints.save(0, state, None, artifact=objective.inference_record())
     checkpoints.wait()
-    assert TextGeneration.from_run(str(tmp_path / "run")).processor is None
+    with caplog.at_level(logging.WARNING, logger="dew.inference.tasks"):
+        assert TextGeneration.from_run(str(tmp_path / "run")).processor is None
+    said = [record.getMessage() for record in caplog.records if "was not recorded" in record.getMessage()]
+    assert len(said) == 1 and "Opaque" in said[0], said
+
+
+def test_a_saved_runs_processor_record_builds_a_trusted_processor_class_alone(tmp_path):
+    """A saved run's processor record that names a function, or a class no processor is, is refused at its
+    load, naming the processor, where a record that builds by running what it names would have run it
+    (row 9065's review); one a load does not trust is refused naming `trust=`."""
+    from dew.inference.tasks import saved_custom
+
+    with pytest.raises(ValueError, match="trust"):
+        saved_custom({"class": "os:getcwd", "fields": {}})
+    with pytest.raises(ValueError, match="no processor"):
+        saved_custom({"class": "dew.data.text:ByteTokenizer", "fields": {}})
+
+
+def test_a_run_processors_subclass_is_its_own_record(tmp_path):
+    """A run over a dataclass subclass of the run processor records its own class, not the run tokenizer
+    alone, and its saved run rebuilds it (row 9065's review)."""
+
+    objective, state = _tiny_lm(Prefixed(ByteTokenizer(), prefix="> "))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    task = TextGeneration.from_run(str(tmp_path / "run"), trust=(Prefixed.__module__,))
+    assert type(task.processor) is Prefixed and task.processor.prefix == "> "
 
 
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=None):

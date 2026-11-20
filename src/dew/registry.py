@@ -546,7 +546,11 @@ def to_record(value, annotation) -> JSON:
     from dew._records import recorded_duration
 
     if isinstance(value, datetime.timedelta):
-        return recorded_duration(value)
+        try:
+            return recorded_duration(value)
+        except ValueError as refused:
+            # A duration no record carries is a value no record describes (`Unrecordable`), as any other.
+            raise Unrecordable(str(refused)) from refused
     if isinstance(value, np.dtype) or (isinstance(value, type)
                                        and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes')):
         return dtype_name(value)
@@ -799,6 +803,26 @@ def nominal_class(annotation: Annotation) -> type | None:
     if not isinstance(origin, type) or issubclass(origin, (Mapping, Sequence, tuple)):
         return None
     return origin
+
+
+def owned_built(record: JSON, *, called: bool, what: str) -> Configured:
+    """What a class record (`class_record`) builds where it names a class of Dew's or of a trusted package
+    (`_owned`; with `called`, one whose instances are called), its module imported first where a trusted
+    package holds it (as `import_trusted` imports a record's): a value a record carries beside the fields
+    any class declares (a run's own processor). Any other record (a function's among them, which builds by
+    running it) is refused, as is a class no trust admits, naming `what` and `trust=`."""
+    named = class_record(_records.record(record, what))
+    if named is None:
+        raise ValueError(f"{what} is recorded as a class record, {{'class': ..., 'fields': ...}}; got "
+                         f"{record!r}")
+    module = named[0].partition(":")[0]
+    if module.split(".")[0] in _TRUSTED and module.replace(".", "").isidentifier():
+        importlib.import_module(module)
+    member = imported(named[0])
+    if not _owned(member, called=called):
+        raise ValueError(f"{what} names {named[0]!r}, which no trusted package holds: a record builds a "
+                         f"class of Dew's or of a package the load trusts (trust=, --trust)")
+    return _built(member, named[1], dtypes=True)
 
 
 def class_record(value: Mapping[str, object] | Mapping[RecordKey, object]
