@@ -670,6 +670,69 @@ def test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_inte
     assert explore(threads, arrivals) > 0
 
 
+def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_role():
+    """Row 8979: a focused producer/reducer trace of `attention_mosaic_dkv._PlacedDq` covering ordinals 0
+    and 1 on the same compute role (`lo=0, hi=3, role=0`): explores every interleaving with zero violations,
+    and fails with `Violation` when `_PlacedDq._turn` drops its `ordinal` term."""
+    import types
+
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+    from ring_protocol import Violation, explore, programs
+
+    from dew.nn.kernels.templates import attention_mosaic_dkv as dkv, placed, rings
+
+    block_q, width, slot_cols = 64, 64, 64
+    dq_out = jnp.zeros((1, 1, 3 * block_q, 1, width), jnp.float32)
+    walk = types.SimpleNamespace(
+        interpret=False,
+        program=types.SimpleNamespace(family=placed.KEYS, tiles=types.SimpleNamespace(block_q=block_q)))
+
+    class _NoOrdinal(dkv._PlacedDq):
+        def _turn(self, ordinal, piece: int):
+            del ordinal
+            return rings.Turn.of(piece, dkv.REDUCED)
+
+    def traced(ring_cls, name: str):
+        def launch(dq_arr):
+            def body(dq_ref):
+                def scope(stage, filled, emptied):
+                    ring = ring_cls(walk, dq_ref, (None, stage, filled, emptied), (0, 0))
+                    half = jnp.zeros((block_q, width), jnp.float32)
+                    role = jax.lax.axis_index("wg")
+
+                    @pl.when(role == 0)
+                    def _():
+                        ring.added((half,), 0, types.SimpleNamespace(turn=0, n=0))
+                        ring.added((half,), 2 * block_q, types.SimpleNamespace(turn=0, n=placed.TURNS))
+                        ring.drained(0, 3, role=0)
+
+                    @pl.when(role == 1)
+                    def _():
+                        ring.reduced(0, 3, role=0)
+
+                pl.run_scoped(
+                    scope,
+                    plgpu.SMEM((placed.TURNS, dkv.REDUCED, block_q, slot_cols), jnp.float32),
+                    tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),
+                    tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),
+                )
+
+            return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(dq_arr.shape, dq_arr.dtype),
+                                grid=(1,), grid_names=("p",), num_threads=2, thread_name="wg",
+                                kernel_name=name)()
+
+        return programs(launch, dq_out, threads=2)
+
+    threads, arrivals = traced(dkv._PlacedDq, "dq_ring_ordinals")
+    assert explore(threads, arrivals) > 0
+
+    # Dropping `ordinal` in `_PlacedDq._turn` must be caught by `explore`.
+    bad_threads, bad_arrivals = traced(_NoOrdinal, "dq_ring_ordinals_mutated")
+    with pytest.raises(Violation):
+        explore(bad_threads, bad_arrivals)
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
 def test_a_fused_walk_and_its_dq_reducer_compile_spill_free_on_a_b200(width):
