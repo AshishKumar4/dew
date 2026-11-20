@@ -154,19 +154,21 @@ class Affine(Expr):
                   correction: Token) -> Affine: ...
     """`D h + left (right + correction^T (D h))^T`: an input and the corrections along one vector."""
 
+    @method(cost=3)
     @classmethod
     def erased_before(cls, base2: i64Like, per_key: i64Like, exponent: Token, erase: Token, correction: Token,
                       left: Token, right: Token) -> Affine: ...
     """`D h + erase (correction^T h)^T + left right^T`: an erase along its own vector reading the state the
     token enters beside a write along another (RWKV7's, `D S - (kk a) (kk^T S) + k v^T`), a rank-two token
-    one triangular system solves (`_identities`' `erased`), where the shared-left form lays two."""
+    whose erased values one triangular system solves, its writes known (`_identities`' `erased`). Priced past
+    `corrected_before`, so a correction along the write's own vector keeps its one-vector form."""
 
     @method(cost=2)
     @classmethod
     def corrected_before(cls, base2: i64Like, per_key: i64Like, exponent: Token, left: Token, right: Token,
                          correction: Token) -> Affine: ...
     """`D h + left (right + correction^T h)^T`: `corrected`'s, its corrections reading the state the token
-    enters, before its decay (RWKV7's erase, `-a (b^T S)` beside `D S`). Priced past `corrected`, so an
+    enters, before its decay (the read RWKV7's erase takes, `erased_before`). Priced past `corrected`, so an
     update a scalar decay lets read either way (`D` commuting into the read) keeps the after-decay form."""
 
     @classmethod
