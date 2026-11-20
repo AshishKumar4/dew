@@ -10,9 +10,10 @@ Each case's weights and config are what tools/check_native_diffusion.py's
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import jax
-from diffusers import FlaxUNet2DConditionModel
+from diffusers.models.unets.unet_2d_condition_flax import FlaxUNet2DConditionModel
 from native_diffusion_reference_files import convert
 
 CASES = {"sd1": (False, (1, 1, 1), 4, 8, False), "sd2": (True, (1, 1, 1), 4, 12, False),
@@ -38,7 +39,8 @@ def build(root):
         cross = (False, True, True) if extra else (True, True, False)
         down = tuple("CrossAttnDownBlock2D" if flag else "DownBlock2D" for flag in cross)
         up = tuple("CrossAttnUpBlock2D" if flag else "UpBlock2D" for flag in cross[::-1])
-        model = FlaxUNet2DConditionModel(
+        # The UNet's config as its save writes it; its signature names one-element tuples for these.
+        config: dict[str, Any] = dict(
             sample_size=8, in_channels=channels, out_channels=4,
             down_block_types=down, up_block_types=up, block_out_channels=(32, 32, 64),
             layers_per_block=2, attention_head_dim=(4, 4, 8), cross_attention_dim=context_width,
@@ -46,6 +48,7 @@ def build(root):
             transformer_layers_per_block=depths, addition_embed_type="text_time" if extra else None,
             addition_time_embed_dim=2 if extra else None,
             projection_class_embeddings_input_dim=POOLED + ids_count * 2 if extra else None)
+        model = FlaxUNet2DConditionModel(**config)
         params = model.init_weights(jax.random.PRNGKey(31))
         model.save_pretrained(folder, params=params)
         (directory / "model_index.json").write_text(json.dumps({"unet": ["diffusers", "FlaxUNet2DConditionModel"]}))

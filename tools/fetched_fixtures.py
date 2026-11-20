@@ -124,7 +124,7 @@ def manifest(payload: Path) -> Path:
     return payload.with_name(payload.name + PINNED)
 
 
-def _pinned(name: str, pin: dict, root: Path) -> None:
+def _pinned(name: str, pin: Pin | dict, root: Path) -> None:
     manifest(root / name).write_text(json.dumps(pin, indent=1, sort_keys=True) + "\n")
 
 
@@ -132,7 +132,7 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _stored(pin: dict, root: Path) -> Path:
+def _stored(pin: Pin | dict, root: Path) -> Path:
     if pin.get("kind") == RELEASE:
         # Under its validated sha256 alone, never the pin's path, so no pin reaches outside the store; and
         # under no Python suffix, so a release's code held here is no Python a checkout's linters read.
@@ -140,7 +140,7 @@ def _stored(pin: dict, root: Path) -> Path:
     return root / LOCAL / f"{pin['sha256']}.npz"
 
 
-def _sha(pin: dict) -> str:
+def _sha(pin: Pin | dict) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", str(pin["sha256"])):
         raise ValueError(f"{pin['sha256']!r} is no sha256")
     return pin["sha256"]
@@ -580,7 +580,7 @@ def check(root: Path = REPO_ROOT) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("fetch", "check", "upload", "move", "stage", "dispatch"))
     parser.add_argument("staged", nargs="?", type=Path, help="dispatch: stage's lines")
     parser.add_argument("--settings", type=Path, help="stage: the GPU outputs bucket's settings")

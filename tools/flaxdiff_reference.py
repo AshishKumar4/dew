@@ -44,9 +44,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_releases import commit
 
-COMMIT = "3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a"
-HYBRID_COMMIT = "94d2d21caeb79aba48a505fa79d9a1a974751234"
+COHORT = "flaxdiff"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
+COMMIT = commit("flaxdiff", "flaxdiff")
+HYBRID_COMMIT = commit("flaxdiff-hybrid", "flaxdiff")
 
 # The model entry of a FlaxDiff run config, at a size a fixture can hold.
 MODEL = {"output_channels": 4, "patch_size": 2, "emb_features": 32, "num_layers": 4,
@@ -72,7 +79,9 @@ def main(argv=None) -> None:
     sys.path.insert(0, args.flaxdiff_path)
     from flaxdiff.models.common import FourierEmbedding
     if args.architecture == "hybrid_dit":
-        from flaxdiff.models.ssm_dit import HybridSSMAttentionDiT as Model
+        from flaxdiff_hybrid import hybrid_dit
+
+        Model = hybrid_dit()
         model_config = {**MODEL, "ssm_state_dim": 8, "ssm_attention_ratio": "3:1",
                         "use_2d_fusion": True, "use_zigzag": True}
         commit = HYBRID_COMMIT
@@ -103,8 +112,8 @@ def main(argv=None) -> None:
          "jax_version": jax.__version__}, indent=1) + "\n")
     arrays = {f"params/{name}": np.asarray(leaf)
               for name, leaf in flatten_dict(params["params"], sep="/").items()}
-    np.savez(out / "reference.npz", **arrays, fourier_table=table, x=x, temb=temb, text=text,
-             text_mask=mask, output=output)
+    np.savez(out / "reference.npz", allow_pickle=False, **arrays, fourier_table=table, x=x, temb=temb,
+             text=text, text_mask=mask, output=output)
 
 
 if __name__ == "__main__":

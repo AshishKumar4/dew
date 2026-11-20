@@ -73,7 +73,7 @@ def unit(path: str, name: str) -> bytes:
     return found.get(name, MISSING) if isinstance(found, dict) else found
 
 
-UNITS: dict[bytes, dict[str, bytes] | bytes] = {}
+UNITS: dict[bytes, dict[str, bytes] | None] = {}
 """Each module text's units' digests (`digested`), by the text's digest: a plan keys a module's units for
 many files, and reads and hashes its text once a key (`cache_key`'s `read`)."""
 
@@ -113,7 +113,7 @@ def digested(source: bytes, path: str) -> dict[str, bytes] | None:
             self.scope.pop()
             return node
 
-        def visit_FunctionDef(self, node):
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> ast.AST:
             found[".".join([*self.scope, node.name])].append(ast.dump(node))
             documented = ast.get_docstring(node, clean=False) is not None
             node.body = [*node.body[:1 if documented else 0], ast.Pass()]

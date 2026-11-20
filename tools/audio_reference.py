@@ -11,6 +11,7 @@ input gradients and one SGD update. No pretrained weights are downloaded.
 import argparse
 import json
 from pathlib import Path
+from typing import Literal, overload
 
 import numpy as np
 import torch
@@ -30,7 +31,11 @@ from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel, Gemma4M
 LEARNING_RATE = 0.002
 
 
-def audio_config(kind):
+@overload
+def audio_config(kind: Literal["gemma3n"]) -> Gemma3nAudioConfig: ...
+@overload
+def audio_config(kind: Literal["gemma4"]) -> Gemma4AudioConfig: ...
+def audio_config(kind: Literal["gemma3n", "gemma4"]) -> Gemma3nAudioConfig | Gemma4AudioConfig:
     """The tiny audio tower, alone here and in tools/audio_wrapper_reference.py's wrapper."""
     if kind == "gemma3n":
         return Gemma3nAudioConfig(
@@ -71,14 +76,21 @@ def perturb(model):
                 buffer.fill_(0.08)
 
 
+def grad_of(tensor: torch.Tensor) -> torch.Tensor:
+    """A leaf's gradient after the backward pass, which every leaf here reaches."""
+    assert tensor.grad is not None
+    return tensor.grad
+
+
 def reference(kind):
     torch.manual_seed(314)
-    config = audio_config(kind)
     if kind == "gemma3n":
+        config = audio_config("gemma3n")
         model = Gemma3nAudioEncoder(config).eval()
         projector = Gemma3nMultimodalEmbedder(config, Gemma3nTextConfig(hidden_size=32)).eval()
         extractor = Gemma3nAudioFeatureExtractor(feature_size=16)
     else:
+        config = audio_config("gemma4")
         config._attn_implementation = "sdpa"
         model = Gemma4AudioModel(config).eval()
         projector = Gemma4MultimodalEmbedder(config, Gemma4TextConfig(hidden_size=32)).eval()
@@ -118,15 +130,15 @@ def write_reference(root):
         loss.backward()
         save_file(host_arrays(model.state_dict()), str(directory / "encoder.safetensors"))
         save_file(host_arrays(projector.state_dict()), str(directory / "projector.safetensors"))
-        save_file({name: p.grad.detach().numpy().copy() for name, p in model.named_parameters()},
+        save_file({name: grad_of(p).detach().numpy().copy() for name, p in model.named_parameters()},
                   str(directory / "encoder_grad.safetensors"))
         np.savez(directory / "reference.npz", input_features=features.detach().numpy(),
                  input_features_mask=mask.numpy(), encoded=hidden.detach().numpy(), valid=valid.numpy(),
-                 projected=soft.detach().numpy(), input_gradient=features.grad.detach().numpy(),
+                 projected=soft.detach().numpy(), input_gradient=grad_of(features).detach().numpy(),
                  coefficient=coefficient.numpy(), loss=loss.detach().numpy())
         with torch.no_grad():
             for parameter in model.parameters():
-                parameter.add_(parameter.grad, alpha=-LEARNING_RATE)
+                parameter.add_(grad_of(parameter), alpha=-LEARNING_RATE)
             for parameter in projector.parameters():
                 if parameter.grad is not None:
                     parameter.add_(parameter.grad, alpha=-LEARNING_RATE)

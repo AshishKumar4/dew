@@ -31,6 +31,10 @@ import torch
 from pytorch_fid.fid_score import calculate_frechet_distance
 from pytorch_fid.inception import FID_WEIGHTS_URL, InceptionV3
 
+COHORT = "pytorch-fid"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURE = (Path(__file__).resolve().parents[1]
            / "tests/fixtures/inception/pytorch_fid_reference.npz")
 COUNT = 8

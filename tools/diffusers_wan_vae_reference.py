@@ -32,12 +32,17 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from diffusers_reference_helpers import drawn_wan_vae
 from reference_releases import RELEASES, require
 from reference_vjp import recorded_vjp
+
+if TYPE_CHECKING:
+    from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
+    from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
 DIFFUSERS = RELEASES["diffusers"]["diffusers"]
 CONFIG = {"base_dim": 8, "z_dim": 4, "dim_mult": [1, 2, 2, 2], "num_res_blocks": 2, "attn_scales": [],
@@ -47,24 +52,40 @@ HEIGHT, WIDTH = 32, 48
 SEED = 37
 
 
+def posterior_of(model: AutoencoderKLWan, video: torch.Tensor) -> DiagonalGaussianDistribution:
+    from diffusers.models.modeling_outputs import AutoencoderKLOutput
+
+    output = model.encode(video)
+    assert isinstance(output, AutoencoderKLOutput)  # return_dict's default.
+    return output.latent_dist
+
+
+def decoded_of(model: AutoencoderKLWan, latent: torch.Tensor) -> torch.Tensor:
+    from diffusers.models.autoencoders.vae import DecoderOutput
+
+    output = model.decode(latent)
+    assert isinstance(output, DecoderOutput)  # return_dict's default.
+    return output.sample
+
+
 def build(root: Path) -> dict[str, np.ndarray]:
-    from diffusers import AutoencoderKLWan
+    from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 
     model, generator = drawn_wan_vae(AutoencoderKLWan, CONFIG, SEED, root / "vae")
     named = list(model.named_parameters())
 
     video = (torch.rand((BATCH, 3, FRAMES, HEIGHT, WIDTH), generator=generator) * 2 - 1).requires_grad_()
-    posterior = model.encode(video).latent_dist
+    posterior = posterior_of(model, video)
     mean, std = posterior.mean, posterior.std
     encoded = recorded_vjp("encode", {"probe_mean": mean, "probe_std": std}, {"video": video}, named,
                            generator)
 
     latent = torch.randn(mean.shape, generator=generator).requires_grad_()
-    pixels = model.decode(latent).sample
+    pixels = decoded_of(model, latent)
     decoded = recorded_vjp("decode", {"probe": pixels}, {"latent": latent}, named, generator)
 
     with torch.no_grad():
-        image_mean = model.encode(video[:, :, :1].detach()).latent_dist.mean
+        image_mean = posterior_of(model, video[:, :, :1].detach()).mean
 
     arrays = {
         "video": video.detach().numpy(), "mean": mean.detach().numpy(), "std": std.detach().numpy(),
@@ -82,7 +103,7 @@ def bfloat16_walk(fixture: Path) -> dict[str, np.ndarray]:
     `torch_dtype=torch.bfloat16`: one nine-frame video's posterior and the
     decode of one latent, with the input gradients of both. Inputs and probes
     are bfloat16 values; everything is recorded as float32."""
-    from diffusers import AutoencoderKLWan
+    from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 
     model = AutoencoderKLWan.from_pretrained(fixture / "vae", torch_dtype=torch.bfloat16).eval()
     generator = torch.Generator().manual_seed(SEED + 1)
@@ -92,14 +113,14 @@ def bfloat16_walk(fixture: Path) -> dict[str, np.ndarray]:
 
     video = torch.rand((1, 3, FRAMES, HEIGHT, WIDTH), generator=generator) * 2 - 1
     video = video.bfloat16().requires_grad_()
-    posterior = model.encode(video).latent_dist
+    posterior = posterior_of(model, video)
     mean, std = posterior.mean, posterior.std
     probe_mean = bfloat16(torch.randn(mean.shape, generator=generator))
     probe_std = bfloat16(torch.randn(std.shape, generator=generator))
     ((mean.float() * probe_mean).sum() + (std.float() * probe_std).sum()).backward()
 
     latent = torch.randn(mean.shape, generator=generator).bfloat16().requires_grad_()
-    pixels = model.decode(latent).sample
+    pixels = decoded_of(model, latent)
     probe = bfloat16(torch.randn(pixels.shape, generator=generator))
     (pixels.float() * probe).sum().backward()
     tensors = {"video": video, "mean": mean, "std": std, "probe_mean": probe_mean, "probe_std": probe_std,
@@ -115,7 +136,7 @@ def main(destination: str) -> None:
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(root / "wan_vae.npz", **build(root))
+    np.savez_compressed(root / "wan_vae.npz", allow_pickle=False, **build(root))
     record = {"diffusers": DIFFUSERS, "config": CONFIG, "batch": BATCH, "frames": FRAMES,
               "height": HEIGHT, "width": WIDTH, "seed": SEED}
     (root / "wan_vae.json").write_text(json.dumps(record, indent=1) + "\n")
@@ -133,6 +154,6 @@ if __name__ == "__main__":
 
         require("diffusers")
         torch.set_num_threads(2)
-        np.savez_compressed(sys.argv[3], **bfloat16_walk(Path(sys.argv[2])))
+        np.savez_compressed(sys.argv[3], allow_pickle=False, **bfloat16_walk(Path(sys.argv[2])))
     else:
         main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-wan-vae-reference")

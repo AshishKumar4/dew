@@ -106,7 +106,7 @@ def write_recording(modeling) -> None:
 
 
 def write_released(modeling, full: bool) -> None:
-    from dew.interop.verify import probe_ids
+    from dew.interop.probe import probe_ids
 
     directory = FIXTURES / 'ouro-1.4b'
     directory.mkdir(parents=True, exist_ok=True)

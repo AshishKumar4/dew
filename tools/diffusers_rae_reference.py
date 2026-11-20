@@ -60,10 +60,11 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import on_bfloat16_grid
+from diffusers_reference_helpers import on_bfloat16_grid, returned
 from reference_releases import RELEASES, require
 from reference_vjp import recorded_vjp
 
@@ -85,7 +86,8 @@ SEED = 41
 
 
 def build(name: str, root: Path) -> dict[str, np.ndarray]:
-    from diffusers import AutoencoderRAE
+    from diffusers.models.autoencoders.autoencoder_rae import AutoencoderRAE
+    from diffusers.models.autoencoders.vae import DecoderOutput, EncoderOutput
 
     config = CONFIGS[name]
     torch.manual_seed(SEED)
@@ -106,16 +108,16 @@ def build(name: str, root: Path) -> dict[str, np.ndarray]:
     model.save_pretrained(root, safe_serialization=True)
     decoder = [(key, value) for key, value in model.named_parameters() if key.startswith("decoder.")]
     for _, value in decoder:
-        value.requires_grad_(requires_grad=True)
+        value.requires_grad_(True)
 
     size = grid * config["patch_size"]
     image = torch.rand((BATCH[name], 3, size, size), generator=generator).requires_grad_()
-    latent = model.encode(image).latent
+    latent = returned(model.encode(image), EncoderOutput).latent
     encoded = recorded_vjp("encode", {"probe_latent": latent}, {"image": image}, [], generator,
                            reached=True)
 
     code = torch.randn(latent.shape, generator=generator).requires_grad_()
-    pixels = model.decode(code).sample
+    pixels = returned(model.decode(code), DecoderOutput).sample
     decoded = recorded_vjp("decode", {"probe": pixels}, {"code": code}, decoder, generator, reached=True)
 
     arrays = {"image": image.detach().numpy(), "latent": latent.detach().numpy(), **encoded,
@@ -165,7 +167,7 @@ def from_published(cls, repo: str, revision: str):
 
 
 def published(destination: str) -> None:
-    from diffusers import AutoencoderRAE
+    from diffusers.models.autoencoders.autoencoder_rae import AutoencoderRAE
 
     from _dew_torch.precision import float64, float64_twin
 
@@ -205,11 +207,11 @@ def published(destination: str) -> None:
     arrays["dinov2_plain.tokens"] = exact
     arrays["dinov2_plain.tokens.float32_gap"] = np.float64(gap(single, exact))
     print("dinov2_plain", float(arrays["dinov2_plain.tokens.float32_gap"]))
-    np.savez_compressed(destination, **arrays)
+    np.savez_compressed(destination, allow_pickle=False, **arrays)
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 
-PLAIN = {"hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 1, "image_size": 518, "patch_size": 14}
+PLAIN: dict[str, Any] = {"hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 1, "image_size": 518, "patch_size": 14}
 PLAIN_INPUT = 112
 
 
@@ -236,7 +238,7 @@ def main(destination: str) -> None:
     root = Path(destination)
     for name in CONFIGS:
         (root / name).mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(root / name / "reference.npz", **build(name, root / name))
+        np.savez_compressed(root / name / "reference.npz", allow_pickle=False, **build(name, root / name))
     (root / "dinov2_plain").mkdir(parents=True, exist_ok=True)
     build_plain(root / "dinov2_plain")
     record = {"diffusers": DIFFUSERS, "transformers": TRANSFORMERS, "configs": CONFIGS, "statistics": STATISTICS,
