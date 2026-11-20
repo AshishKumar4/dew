@@ -19,6 +19,7 @@ stage every row of it shares, the decay's prefix within each chunk (`cumulated`)
 
 import dataclasses
 import functools
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -31,6 +32,7 @@ from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients
 from dew.nn.kernels import launches
 from dew.nn.precision import (
     accurate_exp,
+    aligned_sum,
     at_least_fp32,
     compensated_add,
     l2norm,
@@ -60,6 +62,10 @@ class Conv:
         if sorted(self.order) != ['k', 'q', 'v']:
             raise ValueError(f"a conv's order is a permutation of 'qkv', not {self.order!r}")
 
+
+
+Erase = Literal['tied', 'values']
+"""What the delta rule erases a token (`Hooks.erase`)."""
 
 @dataclasses.dataclass(frozen=True)
 class Gates:
@@ -113,7 +119,10 @@ class Hooks:
     complex number by `e^{-i turn}` (`Gated.turn`) before the decay, a head's (Mamba-3's rotating basis; the
     chunked op's every kernel reads it through frames, `templates.recurrence.turned`, each token's in its
     turn's), unrated, without the delta rule or an own write's weight, its readout after the token's turn
-    ('after' or 'apart'; base review fbb1c2f71 F1)."""
+    ('after' or 'apart'; base review fbb1c2f71 F1). `erase` is what the delta rule erases a token
+    (kernel-templates.md §3's erase kinds): 'tied', its keys' own, `S' = (I - beta k k^T) D S + beta k v^T`;
+    'values', Oja's rule's, along the values under a decay along them (`log_decay` `[..., Hv, Dv]`), `S' = S
+    D (I - beta v v^T) + beta k v^T`, the delta rule on the transposed memory (row 9028)."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None
@@ -132,6 +141,7 @@ class Hooks:
     readout 'apart' reads none of them: its scores keep the pairs of later tokens alone (`i // R > j //
     R`, `mamba3_mimo_fwd.py`)."""
     turns: int = 0
+    erase: Erase = 'tied'
 
     @property
     def inverse_bound(self) -> float | None:
@@ -180,6 +190,14 @@ class Hooks:
             raise ValueError('the gates form one log decay a head: their decay is scalar')
         if self.rated and (self.decay != 'scalar' or self.gates is not None):
             raise ValueError('a rated decay is one a head without the gates, which rate their own')
+        if self.erase not in ('tied', 'values'):
+            raise ValueError(f"an erase is 'tied' or 'values', not {self.erase!r}")
+        if self.erase == 'values' and (not self.delta or self.reads != 'after' or self.ranks > 1
+                                       or self.own_weight or self.turns or self.rated or self.skip
+                                       or self.conv is not None or self.gates is not None):
+            raise ValueError(f"an erase along the values is the delta rule's, read after its token, without "
+                             f"ranks, turns, an own write's weight, a rated decay, a skip, a conv or gates: "
+                             f"not {self}")
         if self.turns < 0 or (self.turns and (self.delta or self.own_weight or self.rated
                                               or self.decay != 'scalar' or self.reads == 'before')):
             raise ValueError(f"a state turns its key pairs under a decay a head's, unrated, without the "
@@ -533,11 +551,14 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     work = at_least_fp32(jnp.promote_types(operand, state.dtype))
     key_width = state.shape[2]
     query, key, value, history = _prologue(hooks, given, work)
-    decay, write = _gates(hooks, given, work, key_width)
-    own = given['own'].astype(work) if hooks.own_weight else None
-    turn = given['turn'].astype(work) if hooks.turns else None
-    out, updated = update(state.astype(work), query, key, value, decay, write[..., None], delta=hooks.delta,
-                          reads=hooks.reads, own=own, turn=turn)
+    if hooks.erase == 'values':
+        out, updated = _values_erased(hooks, given, state.astype(work), query, key, value, work)
+    else:
+        decay, write = _gates(hooks, given, work, key_width)
+        own = given['own'].astype(work) if hooks.own_weight else None
+        turn = given['turn'].astype(work) if hooks.turns else None
+        out, updated = update(state.astype(work), query, key, value, decay, write[..., None],
+                              delta=hooks.delta, reads=hooks.reads, own=own, turn=turn)
     out = normed(hooks, skipped(hooks, out, value, given, work), given, work)
     held = _held(updated, key, value, state.dtype)
     if operands.active is not None:
@@ -547,6 +568,32 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
         if history is not None:
             history = jnp.where(active[:, None, None], history, given['held'])
     return out.astype(operand if dtype is None else dtype), history, held
+
+
+def _values_erased(hooks: Hooks, given: dict, state, query, key, value, work):
+    """A decode token of Oja's rule (`Hooks.erase` 'values'), in `work`: on the transposed state `S^T`, the
+    delta rule of keys `v`, values `k` and a decay along its keys, the token's `log_decay` `[rows, Hv, Dv]`
+    (a head's `[rows, Hv]` where scalar), read along the transposed state's values, `S'^T q`.
+    `(output, state')`. The gated correction `beta k - beta (v^T D S^T)`, `S D` read once as the token reads
+    it, is one exact sum of its exact terms (`precision.aligned_sum`), rounded once: corrected ungated, `k -
+    v^T D S^T` passed fp32's largest at a memory of -2^127 and a key of 2^127 under a gate of 1/4, whose
+    memory and output stay -2^126; gated before its sum, `beta v` lost a value of 2^-60 under a gate of
+    2^-100 to underflow, its read of a memory of 2^120 a normal -2^-40; gated after it, four values of 1/2
+    read a memory of 2^127 as 2^128, where the gated read of 1/4 is 2^126. The gate's gradient sums its
+    write's and its erase's exactly: apart, each rounded, a key of 2^30 and a read of 2^30 + 1 cancelled to
+    zero where it is -1/2."""
+    if hooks.decay == 'none':
+        decay = jnp.ones(value.shape, work)
+    else:
+        decay = accurate_exp(given['log_decay'].astype(work))
+        decay = jnp.broadcast_to(decay[..., None] if hooks.decay == 'scalar' else decay, value.shape)
+    decayed = decay[..., :, None] * jnp.swapaxes(state, -1, -2)
+    gate = given['beta'].astype(work)[..., None, None]
+    # The gate one factor of both terms, so its gradient is one aligned sum of theirs.
+    terms = [(gate, key[..., None, :]), (gate, -value[..., :, None], decayed)]
+    corrected = aligned_sum(terms, axis=-2)[..., 0, :]
+    transposed = decayed + value[..., :, None] * corrected[..., None, :]
+    return jnp.sum(transposed * query[..., None, :], axis=-1), jnp.swapaxes(transposed, -1, -2)
 
 
 def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
@@ -598,8 +645,10 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
             {name: value for name, value in values.items() if name not in rows})
         return (dataclasses.replace(pulled_operands, **inputs, **formed),)
 
-    # The template's decode step turns no state (`Hooks.turns`): a turned token's launch is the reference.
-    launched = functools.partial(step_reference if hooks.turns else _launched, hooks, dtype=dtype)
+    # The template's decode step turns no state (`Hooks.turns`) and erases along the keys alone
+    # (`Hooks.erase`): such a token's launch is the reference.
+    referenced = hooks.turns or hooks.erase != 'tied'
+    launched = functools.partial(step_reference if referenced else _launched, hooks, dtype=dtype)
     return contracted("test_the_decode_step_holds_every_order")(
         linear_tangent(lambda operands: (launched(operands), ()), pulled, portable,
                        kind=KernelGlue()))(operands)

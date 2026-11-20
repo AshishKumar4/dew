@@ -86,11 +86,13 @@ def test_the_masked_form_is_as_exact_as_flas_level_by_level(packed):
 def test_a_live_span_that_underflows_reads_as_the_recurrence(read):
     """Three tokens of one document within a block under log decays `[0, -80, -80]`, each live, its first
     and last tokens' span `exp(-160)` zero in float32 (`scan.spread`'s pairs): a key's and the last query's
-    2^70, whose score overflows before that decay weighs it, read finite with every gradient, as float64's
-    are, where infinity times the zero decay was NaN (head review of 512810acf F7), the last token's levels
-    weighed zero too, where the weight met the infinity first (head review of bd4031d41 F1); and a NaN in
-    the first key read NaN at every token, as the recurrence a token at a time reads it, where a decay
-    rounded to zero took the pair for a document's start (train 1079's review F1)."""
+    2^70, whose score overflows before that decay weighs it: every token's read exactly zero and every
+    gradient finite, the contract of a score that overflows formed before its decay (rows 5426 and 9547;
+    the recurrence a token at a time, which decays before it reads, reads 2^-20 there), where infinity times
+    the zero decay was NaN (head review of 512810acf F7), the last token's levels weighed zero too, where
+    the weight met the infinity first (head review of bd4031d41 F1); and a NaN in the first key read NaN at
+    every token, as the recurrence a token at a time reads it, where a decay rounded to zero took the pair
+    for a document's start (train 1079's review F1)."""
     weights = jnp.ones((1, 3, 1, levels(3)), jnp.float32)
     if read == "overflowing at a level of zero weight":
         weights = weights.at[0, 2].set(0.0)
@@ -103,11 +105,12 @@ def test_a_live_span_that_underflows_reads_as_the_recurrence(read):
     query, key = (jnp.asarray(x, jnp.float32).reshape(1, 3, 1, 1) for x in ([0.0, 0.0, 2.0 ** 70],
                                                                            [2.0 ** 70, 0.0, 0.0]))
 
-    def summed(query, key, g):
-        return log_linear_attention(query, key, value, g, weights, scale=1.0).sum()
+    def read(query, key, g):
+        return log_linear_attention(query, key, value, g, weights, scale=1.0)
 
-    out, grads = jax.value_and_grad(summed, argnums=(0, 1, 2))(query, key, g)
-    assert all(np.isfinite(np.asarray(x)).all() for x in (out, *grads))
+    out, pull = jax.vjp(read, query, key, g)
+    np.testing.assert_array_equal(np.asarray(out), np.zeros(out.shape, np.float32))
+    assert all(np.isfinite(np.asarray(x)).all() for x in pull(jnp.ones_like(out)))
 
 
 def test_a_blocks_pairs_keep_a_decay_past_a_vanished_one_and_no_future_overflow():
