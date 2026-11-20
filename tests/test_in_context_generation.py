@@ -149,19 +149,28 @@ def decoded(objective: LMObjective):
     return run
 
 
+def on_real(run):
+    """`run`'s logits at its rows' real input slots, nothing at the rest: a slot the mask leaves out holds
+    no token, which neither a decode nor the training forward gives logits that anything reads."""
+    def real(variables, tokens, mask):
+        return jnp.where(jnp.asarray(mask)[:, :-1, None], run(variables, tokens, mask), 0.0)
+    return real
+
+
 @pytest.mark.parametrize("case", list(CASES))
 def test_a_decode_reads_the_logits_its_training_forward_gives(case):
-    """The adapting decoder's logits at every slot of a padded prompt, one with a hole, and the tokens decoded
-    after it, two of its windows closing past the prompt, on par with its objective's training forward's over
-    the same tokens (check 1, the forward Dew's own path: `dew_path`), the truth the forward in float64: the
-    decode steps each row's level where its training steps it, by the targets its loss counts, and reads each
-    slot through the version its training reads it at (row 9066). One level, a chain of two, the objective's
-    padding id among the tokens, the trunk under a LoRA adapter, and a prefix run's blocks read by a decoder a
-    multimodal wrapper holds."""
+    """The adapting decoder's logits at every real slot of a padded prompt, one with a hole, and the tokens
+    decoded after it, two of its windows closing past the prompt, finite at every slot, on par with its
+    objective's training forward's over the same tokens (check 1, the forward Dew's own path: `dew_path`), the
+    truth the forward in float64: the decode steps each row's level where its training steps it, by the
+    targets its loss counts, and reads each slot through the version its training reads it at (row 9066). One
+    level, a chain of two, the objective's padding id among the tokens, the trunk under a LoRA adapter, and a
+    prefix run's blocks read by a decoder a multimodal wrapper holds."""
     objective, wide = objective_of(case), objective_of(case, jnp.float64)
-    assert_as_exact(jax.jit(decoded(objective)), dew_path(jax.jit(trained(objective))),
+    assert_as_exact(jax.jit(on_real(decoded(objective))), dew_path(jax.jit(on_real(trained(objective)))),
                     lambda seed: drawn(seed, case), f"a decode stepping {case}", seeds=DECODE_SEEDS[case],
-                    truth_fn=trained(wide))
+                    truth_fn=on_real(trained(wide)))
+    assert np.all(np.isfinite(np.asarray(jax.jit(decoded(objective))(*drawn(0, case)))))
 
 
 PHI3 = Path(__file__).parent / "fixtures" / "hf" / "phi3-tiny"
