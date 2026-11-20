@@ -2045,8 +2045,7 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     the kernel's scale (2**-9) brings back in range, and one near the least normal underflows it the other
     way (ledger 2715), as two tensor scales near 2**-76 do multiplied first (an NVFP4 product of operands
     near 2**-65), so no one order holds both ends; the result overflows only where the product does. The
-    order is selected before the second product, so an order not taken meets no cotangent: selected after
-    it, its overflowed intermediate times its zero cotangent was NaN in a scale's gradient."""
+    order selected before the second product, the one not taken meets no cotangent (NaN in a gradient)."""
     tiny = jnp.finfo(product.dtype).tiny
     once = product * first
     kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
