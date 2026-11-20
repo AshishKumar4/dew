@@ -3,8 +3,7 @@ each step declaring its identity or defined here, so an edit elsewhere in the te
 resumable: under the plan version before this Dew's, phases on their own streams, a bounded mixture laid out
 and shuffled, a shuffled chain through a configured step taken to a bound, streamed and read into memory,
 and a seeded mix of two named corpora; before the condition encoders moved to dew.interop (row 5996), phases
-and a mix whose steps depend on one (`Conditioned`); and while Grain's concatenating packer laid windows
-(row 9059), documents concatenated, their cuts overlapped or not."""
+and a mix whose steps depend on one (`Conditioned`)."""
 
 import dataclasses
 from collections.abc import Mapping
@@ -53,15 +52,6 @@ def bounded_mixture(layout: str):
     else:
         laid, read = mix(corpora).pack(8, fields=("id",), policy="concat").shuffle(seed=4), "memory"
     return compile(laid.read(read).batch(2), read=read, examples=2 * len(LENGTHS))
-
-
-def concatenated(overlap: int):
-    """Documents of `LENGTHS` concatenated into windows of eight ids, each cut through a document starting
-    again `overlap` ids before it, read streamed, in batches of two."""
-    pieces = [{"id": np.arange(length, dtype=np.int32) + 1000 * (index + 1)}
-              for index, length in enumerate(LENGTHS)]
-    return compile(Pipeline(Memory(pieces)).pack(8, fields=("id",), policy="concat", overlap=overlap)
-                   .repeat().batch(2), read="streamed", loading=READ)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,6 +108,16 @@ def conditioned_mixture():
     streamed mix, kept by its digest."""
     return compile(mix([named("a", 1).map(Conditioned()), named("b", 2)], seed=4).batch(2), read="streamed",
                    loading=READ)
+
+
+def concatenated(overlap: int):
+    """Documents of `LENGTHS` concatenated into windows of eight ids, each cut through a document starting
+    again `overlap` ids before it, read streamed, in batches of two: saved while Grain's concatenating packer
+    laid them (row 9059). Defined below the steps whose identity is their code, which it leaves in place."""
+    pieces = [{"id": np.arange(length, dtype=np.int32) + 1000 * (index + 1)}
+              for index, length in enumerate(LENGTHS)]
+    return compile(Pipeline(Memory(pieces)).pack(8, fields=("id",), policy="concat", overlap=overlap)
+                   .repeat().batch(2), read="streamed", loading=READ)
 
 
 SAVED = {"step_phases": (step_phases, 2), "step_phases_later": (step_phases, 5),
