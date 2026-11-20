@@ -114,7 +114,7 @@ phase's reader: phases through a step whose table its repr hides (`hidden_field_
 SAVED_BY_GRAINS_PACKER = Path(__file__).with_name("fixtures") / "positions" / "main-45131ca01"
 """Positions main saved at 45131ca01, while Grain's concatenating packer laid a concatenating pack's windows
 (row 9059): its own position, the remainder it held a slice of its document, a window emitted after it, its
-cuts overlapped or not (`saved_positions_support.concatenated`)."""
+cuts overlapped or not (`concatenated_positions`)."""
 
 
 @pytest.mark.parametrize(("saved_at", "module", "name"), [
@@ -125,9 +125,9 @@ cuts overlapped or not (`saved_positions_support.concatenated`)."""
     (SAVED_UNDER_15, "hidden_field_positions", "hidden_global"),
     (SAVED_UNDER_15, "hidden_field_positions", "hidden_global_phases"),
     (SAVED_UNDER_16, "hidden_field_positions", "hidden_phases"),
-    (SAVED_BY_GRAINS_PACKER, "saved_positions_support", "concatenated"),
-    (SAVED_BY_GRAINS_PACKER, "saved_positions_support", "concatenated_overlapped"),
-    (SAVED_BY_GRAINS_PACKER, "saved_positions_support", "concatenated_overlapped_later")])
+    (SAVED_BY_GRAINS_PACKER, "concatenated_positions", "concatenated"),
+    (SAVED_BY_GRAINS_PACKER, "concatenated_positions", "concatenated_overlapped"),
+    (SAVED_BY_GRAINS_PACKER, "concatenated_positions", "concatenated_overlapped_later")])
 def test_a_position_an_earlier_dew_saved_resumes_where_it_stopped(saved_at, module, name):
     """A position an earlier Dew saved resumes onto the rows a read of the same chain stopped where it
     stopped reads next. Saved while a step's encoder was dew.inputs's: a phased read past its first phase,

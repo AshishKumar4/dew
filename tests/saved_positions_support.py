@@ -110,22 +110,9 @@ def conditioned_mixture():
                    loading=READ)
 
 
-def concatenated(overlap: int):
-    """Documents of `LENGTHS` concatenated into windows of eight ids, each cut through a document starting
-    again `overlap` ids before it, read streamed, in batches of two: saved while Grain's concatenating packer
-    laid them (row 9059). Defined below the steps whose identity is their code, which it leaves in place."""
-    pieces = [{"id": np.arange(length, dtype=np.int32) + 1000 * (index + 1)}
-              for index, length in enumerate(LENGTHS)]
-    return compile(Pipeline(Memory(pieces)).pack(8, fields=("id",), policy="concat", overlap=overlap)
-                   .repeat().batch(2), read="streamed", loading=READ)
-
-
 SAVED = {"step_phases": (step_phases, 2), "step_phases_later": (step_phases, 5),
          "bounded_mixture_strided": (lambda: bounded_mixture("strided"), 2),
          "bounded_mixture_held": (lambda: bounded_mixture("held"), 3), "taken": (taken, 3),
          "taken_in_memory": (lambda: taken(read="memory"), 3), "mixture": (mixture, 3),
-         "conditioned_phases": (conditioned_phases, 5), "conditioned_mixture": (conditioned_mixture, 3),
-         "concatenated": (lambda: concatenated(0), 3),
-         "concatenated_overlapped": (lambda: concatenated(1), 3),
-         "concatenated_overlapped_later": (lambda: concatenated(1), 5)}
+         "conditioned_phases": (conditioned_phases, 5), "conditioned_mixture": (conditioned_mixture, 3)}
 """Each saved position's loader and the steps read before it was saved."""
