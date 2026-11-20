@@ -1306,7 +1306,7 @@ def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_
     # An id beyond ASCII keys nothing, whatever the pattern's flags: no Python reads it otherwise.
     key = ci.session.setup_key
     for beyond in ("\U000105c0", "\u00e9"):
-        assert key(node.format(f"test_forward[{beyond}]"), ("models", r"(?u:^\w)")) is None
+        assert key(node.format(f"test_forward[{beyond}]"), ("models", r"^\w")) is None
     assert key(node.format("test_forward[m-a-tiny]"), ("models", r"m-[a-z]-tiny")) == ("models", "m-a-tiny")
     count = len(ran)
     assert [set(ci.members("tests/test_models.py", f"{group}/{count}")) for group in range(1, count + 1)] == [
@@ -1314,7 +1314,7 @@ def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_
     assert sorted((tmp_path / "runs").read_text().splitlines()) == sorted(
         f"{kind} {model}" for kind in "fg" for model in models)
     for refused in ("by=NAME", "by=r'['", "by='x', other='y'", "other='y'", "by=r'\\N{BULLET}'",
-                    "by=r'(?u)x'"):
+                    "by=r'(?u)x'", "by=r'(?u:^\\w)'", "by=r'(?i)m'"):
         (tmp_path / "tests/test_refused.py").write_text(
             f"import pytest\nNAME = 'x'\n@pytest.mark.shared_setup('s', {refused})\n"
             "def test_one():\n    pass\n")

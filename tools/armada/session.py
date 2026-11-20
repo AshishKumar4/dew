@@ -403,18 +403,19 @@ def marked_setups(name: str, text: str) -> dict[str, tuple[str, str | None]]:
 
 
 def by_of(mark: ast.Call) -> str | None | Literal[False]:
-    """A `SHARED_SETUP` mark's `by`, a literal regular expression of ASCII naming no character: None where it
-    names none, False where it has another keyword or a `by` that is no such literal (the file then refused,
-    `marked_setups`)."""
+    """A `SHARED_SETUP` mark's `by`, a literal regular expression of ASCII naming no character and setting no
+    flag: None where it names none, False where it has another keyword or a `by` that is no such literal (the
+    file then refused, `marked_setups`)."""
     if not mark.keywords:
         return None
     if len(mark.keywords) > 1 or mark.keywords[0].arg != "by":
         return False
     value = mark.keywords[0].value
-    # ASCII, naming no character, matched under re.ASCII (an inline (?u) refused): no Python's Unicode tables
-    # read it, or an id, otherwise than the plan's do.
+    # ASCII, naming no character and setting no flag of its own, matched under re.ASCII: every Python the plan
+    # and its tasks run compiles it alike (3.12 refuses a scoped (?u:...) that 3.14 takes) and reads it, or
+    # an id, through no Unicode table.
     if (not isinstance(value, ast.Constant) or not isinstance(value.value, str) or not value.value.isascii()
-            or "\\N" in value.value):
+            or "\\N" in value.value or re.search(r"\(\?[aiLmsux-]+[:)]", value.value)):
         return False
     try:
         re.compile(value.value, re.ASCII)
