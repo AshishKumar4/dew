@@ -1995,11 +1995,9 @@ def midpoint_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: 
 
 def settled_store(spec: Forward, out: jax.Array, acc: jax.Array, divisor: jax.Array, *,
                   hooked: bool) -> jax.Array:
-    """A finished quotient `out` of `acc` over `divisor` as its call stores it: where it narrows to 16 bits
-    (`Forward.narrowed`) unhooked (a hook reads the fp32 quotient as it is), settled for its narrowing,
-    the overflow midpoint alone in a register epilogue (`Forward.registered`, `midpoint_settled`), else
-    rounded to odd (`narrowing_settled`). The one policy `finish` and the Mosaic forward's split join
-    take."""
+    """A finished quotient `out` of `acc` over `divisor` as its call stores it, the one policy `finish` and
+    the Mosaic split join take: narrowed to 16 bits unhooked (`Forward.narrowed`), settled for it, at the
+    overflow midpoint alone in a register epilogue (`midpoint_settled`), else rounded to odd."""
     if spec.narrowed is None or hooked:
         return out
     settle = midpoint_settled if spec.registered else narrowing_settled
