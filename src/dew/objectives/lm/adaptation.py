@@ -742,7 +742,7 @@ class InContextDecoder(nn.Module):
         """Open the trunk's decode cache for `batch_size` rows and each row's chain beside it, no slot
         waiting (`CausalTransformer.init_cache`)."""
         self.decoder.init_cache(batch_size)
-        self.variable("cache", IN_CONTEXT, functools.partial(self._opened, batch_size))
+        self.put_variable("cache", IN_CONTEXT, self._opened(batch_size))
 
     def _chain(self, rows: int) -> _Chain:
         """The training scan's chain over `rows` rows (`adapted_scores`'s), its windows straddling a row's
@@ -783,7 +783,8 @@ class InContextDecoder(nn.Module):
         hidden = self.decoder.hidden_states(tokens, train=train, decode=True, coordinates=laid, **fields)
         rows = tokens.shape[0]
         real = jnp.ones(tokens.shape[:2], bool) if laid.valid is None else jnp.asarray(laid.valid, bool)
-        held = self.variable("cache", IN_CONTEXT, functools.partial(self._opened, rows))
+        held = (self.get_variable("cache", IN_CONTEXT) if self.has_variable("cache", IN_CONTEXT)
+                else self._opened(rows))
         chain = self._chain(rows)
         windows = self.adaptation.windows(len(chain.starts))
         nothing = jnp.zeros((rows, 1), jnp.float32)
@@ -811,5 +812,7 @@ class InContextDecoder(nn.Module):
                      "count": count + valid.astype(jnp.int32)}
             return state, logits[:, 0]
 
-        held.value, logits = jax.lax.scan(slot, held.value, (jnp.moveaxis(hidden, 1, 0), tokens.T, real.T))
+        held, logits = jax.lax.scan(slot, held, (jnp.moveaxis(hidden, 1, 0), tokens.T, real.T))
+        if self.is_mutable_collection("cache"):
+            self.put_variable("cache", IN_CONTEXT, held)
         return jnp.moveaxis(logits, 0, 1)
