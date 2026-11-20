@@ -139,18 +139,30 @@ def full_forward_scores(task: TextGeneration, requests: Sequence[Served], model:
     @as_given
     def scored(row, drawn, _served=None):
         weights = widened(variables) if wide else variables
-        scores = []
+        # A request whose prompt, draws, fields and conditioning are another's of this call, bit for bit,
+        # scores as it does: computed once, each request's scores its own entry still.
+        scores, made = [], {}
         for request, tokens in zip(requests, drawn, strict=True):
             inputs = served_inputs(np.asarray(row), request, vocab)
             prompt, tokens = np.asarray(inputs.tokens), np.asarray(tokens)
             carried = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
             held = with_served_blocks(carried, np.ones(prompt.shape, bool), task.prefix)
             given = request.conditioned(np.asarray(row))
-            reading = functools.partial(forward, conditioning=widened(given) if wide else given)
-            scores.append(drawn_scores(reading, weights, prompt, tokens, held, per_step=not wide,
-                                       policy=task.sampling))
+            key = exactly((prompt, tokens, held, given))
+            if key not in made:
+                reading = functools.partial(forward, conditioning=widened(given) if wide else given)
+                made[key] = drawn_scores(reading, weights, prompt, tokens, held, per_step=not wide,
+                                         policy=task.sampling)
+            scores.append(made[key])
         return tuple(itertools.chain.from_iterable(zip(*scores, strict=True)))
     return scored
+
+
+def exactly(tree) -> tuple:
+    """`tree`'s identity bit for bit: its structure and each leaf's dtype, shape and bytes."""
+    leaves, structure = jax.tree.flatten(tree)
+    return (str(structure), *((np.asarray(leaf).dtype.str, np.shape(leaf), np.asarray(leaf).tobytes())
+                              for leaf in leaves))
 
 
 def served_row(seed: int, vocab: int, width: int) -> np.ndarray:
