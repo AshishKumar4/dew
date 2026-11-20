@@ -77,6 +77,22 @@ def python() -> str:
     return ".".join(map(str, sys.version_info[:2]))
 
 
+@functools.cache
+def host_class() -> str:
+    """The class this process's results belong to: its CPU's microarchitecture (tools/armada/host.py's
+    `cpu_class`: XLA:CPU compiles for the host's features, and the classes' estimate instructions round
+    apart), and the kind of each accelerator it computes on beside it. A map task records it with its draws,
+    and a judge refuses a pool of more than one (`check1_judge._pooled_draws`)."""
+    import jax
+    from tool_support import load
+
+    held = load("host", "tools/armada").cpu_class()
+    if jax.default_backend() == "cpu":
+        return held
+    kinds = sorted({device.device_kind for device in jax.devices()})
+    return "-".join([*kinds, held])
+
+
 def _file(site: str) -> str:
     return hashlib.sha256(site.encode()).hexdigest()[:16]
 
