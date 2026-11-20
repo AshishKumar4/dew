@@ -46,7 +46,6 @@ from dew.nn.precision import (
     accurate_exp,
     asks_default_precision,
     at_least_fp32,
-    compensated_sum,
     exact_products,
     l2norm,
     rounds_products,
@@ -177,7 +176,7 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
     if hooks.erase not in ('untied', 'additive'):
         return query, key, value, g, beta, None, starts, firsts
     heads = value.shape[2]
-    a, b = (_shared(given[name].astype(g.dtype), heads // given[name].shape[2])
+    a, b = (jnp.repeat(given[name], heads // given[name].shape[2], axis=2).astype(g.dtype)
             for name in ('erase_key', 'erase_read'))
     reader = -b
     zero_keys = jnp.zeros_like(reader)
@@ -193,27 +192,6 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
             laid(jnp.ones_like(beta) if hooks.erase == 'additive' else beta, beta),
             laid(reader, zero_keys), None if starts is None else laid(starts, jnp.zeros_like(starts)),
             None if firsts is None else firsts * 2)
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
-def _shared(vector, group: int):
-    """`vector` `[B, S, Hk, D]` repeated over the `group` value heads each key head serves, its cotangent
-    the group's summed once (`precision.compensated_sum`), in no order a transpose takes: a packed additive
-    erase's vectors' copies cancelled across their group, their sum's rounding 3.2 times the token loop's
-    worst row (row 9670's packed check)."""
-    return jnp.repeat(vector, group, axis=2)
-
-
-def _shared_forward(vector, group: int):
-    return jnp.repeat(vector, group, axis=2), None
-
-
-def _shared_backward(group: int, _, cotangent):
-    split = cotangent.reshape(*cotangent.shape[:2], -1, group, *cotangent.shape[3:])
-    return (compensated_sum(split, (3,)),)
-
-
-_shared.defvjp(_shared_forward, _shared_backward)
 
 
 def _read_checked(hooks: recurrence.Hooks, operands: Chunk) -> dict:
