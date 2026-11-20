@@ -195,22 +195,30 @@ def packed_sequences(starts, firsts, bound: int, *, chunk: int) -> Sequences:
     return sequences(batch, length, cu_seqlens(starts, batch * (bound + 1), firsts), chunk=chunk)
 
 
+def entry_terms(key, value, weight, *, values_first: bool = False) -> list[tuple]:
+    """A forked document's entry write's terms (`entry_write`'s), each `(weight, key_r, value_r)` as the
+    write lays them: `key` `[..., R, Dk]` and `value` `[..., R, Dv]` a key column and a value row a term, or
+    with `values_first` `value` `[..., Dv, R]`, a value column and a key row (the TPU forked scan's layout);
+    the one layout the write's sum (`entry_write`) and its transpose (`dew.nn.aligned.aligned_cotangents`,
+    the TPU forked scan's backward) take (row 8666). Of rank zero, none."""
+    rank = key.shape[-2]
+    if values_first:
+        return [(weight, value[..., :, r:r + 1], key[..., r:r + 1, :]) for r in range(rank)]
+    return [(weight, key[..., r, :, None], value[..., r, None, :]) for r in range(rank)]
+
+
 def entry_write(key, value, weight, *, values_first: bool = False) -> jax.Array:
     """A forked document's entry write `weight sum_r key_r value_r^T` (`recurrence_chunk.Chunk.entry_key`):
-    `key` `[..., R, Dk]`, `value` `[..., R, Dv]`, the write `[..., Dk, Dv]`, or with `values_first` `value`
-    `[..., Dv, R]` and the write `[..., Dv, Dk]` (the TPU forked scan's layout); `weight` broadcast against
-    the write. Its terms summed aligned to the largest (`precision.aligned_sum`), so a sum in range is its
-    value though its terms leave fp32's range: the one form the portable walk's opening, the template's
-    chunks (`ForkedChunks.entries`) and the TPU forked scan take. Of rank zero it is zero, the memory it
-    enters unchanged, as the einsum before it gave (row 8967: an aligned sum of no terms raised)."""
-    rank = key.shape[-2]
-    if not rank:
+    the write `[..., Dk, Dv]`, or with `values_first` `[..., Dv, Dk]` (`entry_terms`' layouts); `weight`
+    broadcast against the write. Its terms summed aligned to the largest (`precision.aligned_sum`), so a sum
+    in range is its value though its terms leave fp32's range: the one form the portable walk's opening, the
+    template's chunks (`ForkedChunks.entries`) and the TPU forked scan take. Of rank zero it is zero, the
+    memory it enters unchanged, as the einsum before it gave (row 8967: an aligned sum of no terms raised)."""
+    if not key.shape[-2]:
         width = (value.shape[-2], key.shape[-1]) if values_first else (key.shape[-1], value.shape[-1])
         shape = jnp.broadcast_shapes(jnp.shape(weight), key.shape[:-2] + width)
         return jnp.zeros(shape, jnp.result_type(jnp.float32, weight, key, value))
-    if values_first:
-        return aligned_sum([(weight, value[..., :, r:r + 1], key[..., r:r + 1, :]) for r in range(rank)])
-    return aligned_sum([(weight, key[..., r, :, None], value[..., r, None, :]) for r in range(rank)])
+    return aligned_sum(entry_terms(key, value, weight, values_first=values_first))
 
 
 def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> Sequences:
