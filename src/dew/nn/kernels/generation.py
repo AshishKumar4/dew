@@ -1589,10 +1589,17 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         def tangent(residuals, moving):
             operands, _ = residuals
-            whole = [zero_from_primal(operand) for operand in jax.tree.leaves(operands)]
-            for index, value in zip(live, moving, strict=True):
-                whole[index] = value
-            return jax.jvp(portable, operands, jax.tree.unflatten(tree, whole))[1]
+            leaves = jax.tree.leaves(operands)
+
+            def moved(*values):
+                # `portable` of the perturbed operands, the others held as constants: a zero direction
+                # would meet an infinite factor (inf * 0, NaN, where a bias's own tangent was 1: row 6740).
+                whole = list(leaves)
+                for index, value in zip(live, values, strict=True):
+                    whole[index] = value
+                return portable(*jax.tree.unflatten(tree, whole))
+
+            return jax.jvp(moved, tuple(leaves[index] for index in live), tuple(moving))[1]
 
         def transposed(residuals, cotangent):
             operands, saved = residuals

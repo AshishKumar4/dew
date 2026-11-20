@@ -847,7 +847,10 @@ def test_an_xla_projection_in_its_layer_holds_every_order(edge, form):
     primals = normal_draw(6027, rows, matrix, scale=EDGES[edge])
     direction = normal_draw(6028, rows, matrix, scale=EDGES[edge])
     (cotangent,) = normal_draw(6029, out)
-    product = projections._in_layer_product(jax.lax.dot_general, dimensions, None, None, with_bias=False)
+    taken = projections._in_layer_product(jax.lax.dot_general, dimensions, None, None)
+
+    def product(rows, matrix):
+        return taken(rows, (matrix,))
 
     def plain(rows, matrix):
         return jax.lax.dot_general(rows, matrix, dimensions)
@@ -867,7 +870,10 @@ def test_a_biased_xla_projection_in_its_layer_holds_every_order(edge):
     primals = normal_draw(6740, rows, matrix, out[-1:], scale=EDGES[edge])
     direction = normal_draw(6741, rows, matrix, out[-1:], scale=EDGES[edge])
     (cotangent,) = normal_draw(6742, out)
-    product = projections._in_layer_product(jax.lax.dot_general, dimensions, None, None, with_bias=True)
+    taken = projections._in_layer_product(jax.lax.dot_general, dimensions, None, None)
+
+    def product(rows, matrix, bias):
+        return taken(rows, (matrix, bias))
 
     def plain(rows, matrix, bias):
         return jax.lax.dot_general(rows, matrix, dimensions) + bias

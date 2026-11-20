@@ -412,15 +412,16 @@ def _row_shift(norm: nn.LayerNorm, x: jax.Array, mask) -> jax.Array:
 
 
 class _Shifted(nn.LayerNorm):
-    """flax's `nn.LayerNorm` over its input less `shift`, each row's mean (`_row_shift`, its own where none
-    is given), which a layer norm does not change: its statistics read rows centered near zero, so a row
-    whose mean dwarfs its spread rounds as a row near zero does. The shift is a constant to the gradient,
-    whose own term a layer norm's invariance makes zero; its output in the dtype flax gives the input."""
+    """flax's `nn.LayerNorm` over its input less `shift`, a constant of each row (its mean, `_row_shift`,
+    where none is given), which a layer norm does not change: its statistics read rows centered near zero,
+    so a row whose mean dwarfs its spread rounds as a row near zero does. The shift is a constant to the
+    gradient, whose own term a layer norm's invariance makes zero; its output in the dtype flax gives the
+    input."""
 
     @nn.compact
     def __call__(self, x, *, mask=None, shift=None):
         wide = jnp.promote_types(x.dtype, jnp.float32)
-        shift = _row_shift(self, x, mask) if shift is None else shift
+        shift = _row_shift(self, x, mask) if shift is None else jax.lax.stop_gradient(shift)
         normed = super().__call__(x.astype(wide) - shift, mask=mask)
         # The parameters' values, out of the partitioning box a norm declaring its axes stores them in.
         held = [nn.unbox(self.get_variable("params", name)) for name in ("scale", "bias")
@@ -441,13 +442,14 @@ class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.nothing_saveab
     residual sums alive (291 MiB of its temporaries on a GH200, row 6741). A caller that states
     `use_fast_variance=False` takes the corrected two-pass, its centered rows centered again.
 
-    The shift is taken ahead of the rematerialized body, one value a row its backward keeps and reads:
-    recomputed inside it, each norm's mean was a reduction of its own in the backward, 98 of a DiT-B step's
-    fusions and its compile's growth (row 6740)."""
+    The shift is taken ahead of the rematerialized body, one value a row its backward keeps and reads, where
+    recomputed inside it each norm's mean was a reduction of its own in the backward (row 6740)."""
 
+    @nn.nowrap
     def __call__(self, x, *, mask=None, shift=None):
-        """`x` normed, its rows' shift (`_row_shift`, its own where none is given) taken here, outside the
-        rematerialized body."""
+        """`x` normed, its rows' shift (`_row_shift`, where none is given) taken here, outside the
+        rematerialized body, which reads it as an input; not a method of its own to flax (`nn.nowrap`), so a
+        capture of intermediates holds the body's output alone, as it did."""
         return super().__call__(x, mask=mask, shift=_row_shift(self, x, mask) if shift is None else shift)
 
     def spread(self, x: jax.Array) -> jax.Array:

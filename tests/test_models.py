@@ -739,25 +739,28 @@ def test_a_layer_norms_recompute_reduces_no_more_than_flaxs():
     ahead of it: its backward's recompute reduces its rows no more often than flax's own norm rematerialized
     the same way does, where a shift recomputed inside it was a mean of its own in every norm's backward,
     98 of a DiT-B step's fusions and its compile's growth (row 6740)."""
-    from dew.nn.programs import equations
+    from jax.extend.core import primitives
+
+    from dew.nn.programs import bodies, equations
 
     x = jnp.ones((2, 6, 16), jnp.float32)
 
-    def reductions(norm):
+    def recomputed(norm):
         variables = norm.init(jax.random.key(0), x)
 
         def loss(params, x):
             return jnp.sum(norm.apply({"params": params}, x) ** 2)
 
         program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(variables["params"], x).jaxpr
-        # The rematerialized bodies (`jax.checkpoint`'s equations, its primitive's name `remat2`): the
-        # forward's and the backward's recompute.
-        bodies = [eqn.params["jaxpr"] for eqn in equations(program) if eqn.primitive.name == "remat2"]
-        return sum(each.primitive.name == "reduce_sum" for body in bodies
-                   for each in equations(getattr(body, "jaxpr", body)))
+        # The backward's recompute: the rematerialized body its differentiation runs again.
+        again = [eqn for eqn in equations(program)
+                 if eqn.primitive is primitives.remat_p and eqn.params["differentiated"]]
+        assert again, "no rematerialized body is recomputed"
+        return sum(each.primitive is jax.lax.reduce_sum_p for eqn in again for body in bodies(eqn)
+                   for each in equations(body))
 
-    flaxs = reductions(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_saveable)(epsilon=1e-5))
-    assert flaxs > 0 and reductions(LayerNorm(epsilon=1e-5)) <= flaxs, flaxs
+    flaxs = recomputed(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_saveable)(epsilon=1e-5))
+    assert recomputed(LayerNorm(epsilon=1e-5)) <= flaxs, flaxs
 
 
 TOWER_NORM_SEEDS = 8

@@ -381,26 +381,25 @@ def dot_general(xla, path: tuple | None = None):
             if launched(rows, rhs, out_dtype, precision):
                 out = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return added(out.reshape(*lhs.shape[:-1], rhs.shape[1]))
-        taken = _in_layer_product(xla, dimension_numbers, precision, preferred_element_type,
-                                  with_bias=bias is not None, **kwargs)
-        return taken(lhs, rhs, *([] if bias is None else [bias]))
+        taken = _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, **kwargs)
+        return taken(lhs, (rhs,) if bias is None else (rhs, bias))
 
     return product
 
 
-def _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, *, with_bias: bool,
-                      **kwargs):
+def _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, **kwargs):
     """A projection's product no launch takes, XLA's own (`xla`, any of its forms: a batched one's, DeepSeek
-    V4's grouped `o_a_proj`), and its bias where it has one (`with_bias`, added as `precision.biased` adds
-    it, a span the algebra pass keeps as that one is), through the rule as the template's is
-    (`derivatives.portable_formed`): the input's cotangent returned only with the kernel's gradient and the
-    bias's formed, one barrier for both."""
-    def portable(lhs, rhs, *bias):
+    V4's grouped `o_a_proj`), of its rows and its parameters, its kernel and its bias where it has one
+    (added as `precision.biased` adds it, a span the algebra pass keeps as that one is), through the rule as
+    the template's is (`derivatives.portable_formed`): the input's cotangent returned only with the
+    parameters' gradients formed, one barrier for both."""
+    def portable(lhs, parameters):
+        rhs, *bias = parameters
         out = xla(lhs, rhs, dimension_numbers, precision=precision,
                   preferred_element_type=preferred_element_type, **kwargs)
-        return marked(Protected(), biased_value)(out, *bias) if with_bias else out
+        return marked(Protected(), biased_value)(out, *bias) if bias else out
 
-    return portable_formed(portable, parameters=1 + with_bias)
+    return portable_formed(portable)
 
 
 def rows_split(lhs: jax.Array) -> jax.sharding.PartitionSpec | None:

@@ -164,22 +164,36 @@ def _floating(leaf) -> bool:
     return not isinstance(leaf, SymbolicZero) and dtype is not None and jnp.issubdtype(dtype, jnp.inexact)
 
 
-def portable_formed[Value](portable: Callable[..., Value], /, parameters: int = 1) -> Callable[..., Value]:
-    """`portable`, an XLA program whose last `parameters` operands are parameters (a projection's kernel and
-    its bias, a norm's weight, an attention's sinks), its value and every derivative XLA's of it
+def portable_formed[Value](portable: Callable[..., Value], /) -> Callable[..., Value]:
+    """`portable`, an XLA program whose last operand is a parameter, or a tree of them (a projection's kernel
+    and its bias, a norm's weight, an attention's sinks), its value and every derivative XLA's of it
     (`generation.linear_tangent`), its reverse mode the rule's: it returns the inputs' cotangents only with
-    the parameters' gradients formed (`with_gradients_formed`). Its forward saves nothing; its backward
-    recomputes `portable` as its VJP reads it."""
+    the parameters' gradients formed (`with_gradients_formed`), each formed only where a reverse pass
+    differentiates it (`live_cotangents`: a frozen operand's never is). Its forward saves nothing; its
+    backward recomputes `portable` as its VJP reads it."""
     from dew.nn.kernels.generation import linear_tangent
 
-    def backward(saved, operands, cotangent):
+    def backward(saved, operands, cotangent, live):
         del saved
-        pulled = jax.vjp(portable, *operands)[1](cotangent)
-        inputs, formed = with_gradients_formed(tuple(pulled[:-parameters]), tuple(pulled[-parameters:]))
+        leaves, tree = jax.tree.flatten(operands)
+        first = len(leaves) - len(jax.tree.leaves(operands[-1]))
+
+        def moved(*values):
+            # `portable` of the live leaves, the others held as they are.
+            whole = list(leaves)
+            for index, value in zip(live, values, strict=True):
+                whole[index] = value
+            return portable(*jax.tree.unflatten(tree, whole))
+
+        pulled = jax.vjp(moved, *(leaves[index] for index in live))[1](cotangent)
+        inputs, formed = with_gradients_formed(
+            tuple(each for index, each in zip(live, pulled, strict=True) if index < first),
+            tuple(each for index, each in zip(live, pulled, strict=True) if index >= first))
         return (*inputs, *formed)
 
     return contracted("test_a_portable_formed_rule_holds_every_order")(linear_tangent(
-        lambda *operands: (portable(*operands), ()), backward, portable, kind=KernelGlue()))
+        lambda *operands: (portable(*operands), ()), backward, portable, kind=KernelGlue(),
+        live_cotangents=True))
 
 
 def contracted[Function](test: str, /) -> Callable[[Function], Function]:
