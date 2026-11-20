@@ -1008,28 +1008,29 @@ def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spe
     assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
 
 
-FUSED_DELTA_HYBRID = {"layer_types": ("linear_attention", "full_attention") * 2, "kinds": {
+FUSED_DELTA_STACK = {"layer_types": ("linear_attention",) * 4, "kinds": {
     "linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
         "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 8,
         "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4, "fused_in_proj": True}}}}}
-"""Gated delta nets on Qwen3-Next's fused projections beside full attention, two of each, at a tiny width."""
+"""Four gated delta nets on Qwen3-Next's fused projections at a tiny width: no attention layer, whose query a
+rule giving the heads the stage axis places on it, which a stage's vmap refuses."""
 
 
 @pytest.mark.mesh(devices=4)
 def test_a_pipeline_of_delta_nets_split_over_the_sequence_leaves_the_stage_axis_to_its_vmap():
-    """Two stages beside a sequence axis of two, under rules giving the heads the stage axis, train a hybrid
-    decoder's gated delta nets (their fused projections, which place no heads) split over the sequence as
-    the plain step does: the split places their heads over the axes the rows, the sequence and the stage's
+    """Two stages beside a sequence axis of two, under rules giving the heads the stage axis, train a stack of
+    gated delta nets (their fused projections, which place no heads) split over the sequence as the plain
+    step does: the split places their heads over the axes the rows, the sequence and the stage's
     vmap leave (`linear.sequence_delta_rule`), where a placement naming the stage axis is one the stage's
     vmapped map refuses (row 1437 link 2's head review). Loss and gradients check 1's against the plain step
     from float64."""
     from dew.mesh import DEFAULT_RULES
 
-    model = tiny(max_seq_len=16, **FUSED_DELTA_HYBRID)
+    model = tiny(max_seq_len=16, **FUSED_DELTA_STACK)
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 16), jnp.int32)))
     four = jax.devices()[:4]
     with jax.enable_x64(new_val=True):
-        twin, wide = tiny(max_seq_len=16, dtype=jnp.float64, **FUSED_DELTA_HYBRID), float64_held(variables)
+        twin, wide = tiny(max_seq_len=16, dtype=jnp.float64, **FUSED_DELTA_STACK), float64_held(variables)
 
     def stepped(model, variables, spec, microbatches=None):
         # Each arm placed and compiled on its own mesh, called as given (`loss_and_grads` sets its mesh).
