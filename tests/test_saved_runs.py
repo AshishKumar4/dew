@@ -213,6 +213,7 @@ def extracted(tmp_path: Path, recorded: str, kind: str) -> Path:
     return tmp_path / "runs" / kind
 
 
+@pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_trained_to_finite_losses(tmp_path, recorded, kind):
     """Each run of the corpus logged finite losses and gradient norms at every step it logged them
@@ -237,6 +238,7 @@ def test_a_run_that_logged_a_loss_not_finite_is_refused_as_a_reference(tmp_path)
     assert trained_finite(tmp_path / "finite") == {1: {"train/loss": 1.4, "train/grad_norm": 0.45}}
 
 
+@pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, monkeypatch, recorded, kind):
     """A kind's run saved at an earlier main rebuilds from its record, in the compute it recorded, and,
@@ -267,6 +269,7 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, monkeypatch, re
             SavedRun.pinned(str(run))
 
 
+@pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run(tmp_path, recorded, kind):
     """A kind's run saved at an earlier main, exported by `dew export` where its checkpoint declared its task,
@@ -291,6 +294,7 @@ def test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run
     assert answered_alike(answers(pipeline(str(release))), answers(task.from_run(str(run))))
 
 
+@pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 @pytest.mark.parametrize("data_resume", ["exact", "relaxed"])
 def test_an_earlier_mains_run_resumes_its_state_and_its_data_by_its_mode(
@@ -369,6 +373,7 @@ def rebuilt(tmp_path: Path, monkeypatch, recorded: str, kind: str, **stated) -> 
     return run, last, dataclasses.replace(here, trainer=trainer, **sourced, **stated)
 
 
+@pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_path, monkeypatch, recorded,
                                                                          kind):
@@ -385,6 +390,7 @@ def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_pat
 
 # The name `train` is given and the data's form are apart from each other and from the main that saved the
 # run: each main's run resumes through both forms, one under its trainer's name and one under another's.
+@pytest.mark.shared_setup("saved_run", by=r"[0-9a-f]{12}-[a-z0-9-]+?(?=-(?:None|another)-|$)")
 @pytest.mark.parametrize(("named", "given"), [(None, "chain"), ("another", "loader")])
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, monkeypatch, recorded, kind,
