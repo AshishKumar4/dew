@@ -13,7 +13,16 @@ from collections.abc import Callable
 from check1_wire import DRAWS, STAGES
 from map_judge import PoolRefused, ask_later, manifests, pooled_units
 
-from dew.parity import NARROW_FACTORS, GateFailure, Inconclusive, _Draws, _exact, _staged, _verdict
+from dew.parity import (
+    NARROW_FACTORS,
+    GateFailure,
+    Inconclusive,
+    _Draws,
+    _exact,
+    _staged,
+    _verdict,
+    needs_second_stage,
+)
 
 SWITCHED: list[dict] = []
 """The sites decided onto YNNPACK's fusions (`_ynn_decided`) since the last test's report took them: each its
@@ -73,10 +82,14 @@ def _verdicts(drawn_for, verdict: Verdict, narrow_leaves: list[str], mode: Calla
     whether its reference equalled the truth on every first-stage seed, unknown (None) for the first where a
     `library` arm's error stands in for its reference's on some leaves, and the arms' YNNPACK mode (`mode`,
     read once they have run); a GateFailure where any leaf is over, else an Inconclusive where any is left
-    unresolved."""
+    unresolved. The second stage is the site's: where any reference's first-stage draws draw it, every
+    reference is judged on its full range (`parity.needs_second_stage`), so a comparison that passed at the
+    first stage beside one drawing the second has its added rows judged too (spec alignment, 9006)."""
     overs, unresolveds, seeds = [], [], verdict.seeds
+    further = any(needs_second_stage(drawn_for(index)(0, seeds), named)
+                  for index, named in enumerate(verdict.labels))
     for index, named in enumerate(verdict.labels):
-        over, unresolved, stage = _staged(drawn_for(index), seeds, named)
+        over, unresolved, stage = _staged(drawn_for(index), seeds, named, further=further)
         exact = (None if verdict.library and not index
                  else _exact(drawn_for(index)(0, seeds).theirs))
         _logged(named, stage, _verdict(over, unresolved), narrow_leaves, mode(), exact)

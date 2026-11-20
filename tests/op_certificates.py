@@ -140,6 +140,17 @@ def rounded_away(value, fmt: Format) -> np.ndarray:
     return _quantized(value, fmt, 0.5)
 
 
+def tf32_operand(values) -> np.ndarray:
+    """fp32 operands' values (as float64) as a tensor core multiplies them in a TF32 product (an fp32 product
+    at the default precision, src/dew/nn/kernels/templates/product.py): rounded to TF32 to nearest, a tie away
+    from zero (PTX's cvt.rna.tf32.f32), as the GEMM template's Triton launches read both operands of the
+    forward's, the input gradient's and the kernel gradient's products on an A100 and an H100 (row 2084, link
+    2: each of 38,400 values of each operand, 30% of them ties, read so, where 85% were their round to
+    nearest even and 35% their truncation). A product of two is exact in float64 (22 bits), as
+    `native_dot_holds` takes."""
+    return rounded_away(values, TFLOAT32)
+
+
 def truncated(value, fmt: Format) -> np.ndarray:
     """Exact values rounded toward zero in `fmt`, as float64."""
     return _quantized(value, fmt, 0.0)

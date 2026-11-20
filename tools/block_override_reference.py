@@ -175,27 +175,31 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(args.output)
     sys.path.insert(0, str(ROOT / "tests"))
-    from dew.parity_stages import REDRAW, staged_units
+    from dew.parity_stages import REDRAW, SIZING_FROM, staged_units
 
     arrays = {"blocks.redraw": np.asarray(REDRAW), "precision": np.asarray("ieee")}
-    draws, references, truths = [], [], []
-    for seed in range(staged_units(args.seeds)):
-        draw = inputs(seed, config.get_text_config().vocab_size)
-        ids = torch.from_numpy(draw["input_ids"])
-        blocks = torch.from_numpy(draw["block_groups"])
-        with torch.no_grad(), release.blocks(blocks):
-            reference = model(input_ids=ids, use_cache=False).logits
-        with torch.no_grad(), oracle_precision(), release.blocks(blocks):
-            truth = exact(input_ids=ids, use_cache=False).logits
-        if reference.dtype != torch.float32 or truth.dtype != torch.float64:
-            raise RuntimeError(f"reference/oracle returned {reference.dtype}/{truth.dtype}")
-        draws.append(draw)
-        references.append(reference.numpy())
-        truths.append(truth.numpy())
-    for name in draws[0]:
-        arrays[f"blocks.input.{name}"] = np.stack([draw[name] for draw in draws])
-    arrays["blocks.reference.logits"] = np.stack(references)
-    arrays["blocks.truth.logits"] = np.stack(truths)
+    # The verdict's draws, and pilots of their own from SIZING_FROM on, four times the declared seeds: the
+    # draws `calibrate`'s sizing of the reference against itself takes, none a verdict's (`seeds_for`).
+    for under, seeds in (("blocks", range(staged_units(args.seeds))),
+                         ("blocks.pilot", range(SIZING_FROM, SIZING_FROM + 4 * args.seeds))):
+        draws, references, truths = [], [], []
+        for seed in seeds:
+            draw = inputs(seed, config.get_text_config().vocab_size)
+            ids = torch.from_numpy(draw["input_ids"])
+            blocks = torch.from_numpy(draw["block_groups"])
+            with torch.no_grad(), release.blocks(blocks):
+                reference = model(input_ids=ids, use_cache=False).logits
+            with torch.no_grad(), oracle_precision(), release.blocks(blocks):
+                truth = exact(input_ids=ids, use_cache=False).logits
+            if reference.dtype != torch.float32 or truth.dtype != torch.float64:
+                raise RuntimeError(f"reference/oracle returned {reference.dtype}/{truth.dtype}")
+            draws.append(draw)
+            references.append(reference.numpy())
+            truths.append(truth.numpy())
+        for name in draws[0]:
+            arrays[f"{under}.input.{name}"] = np.stack([draw[name] for draw in draws])
+        arrays[f"{under}.reference.logits"] = np.stack(references)
+        arrays[f"{under}.truth.logits"] = np.stack(truths)
     save(args.output / "reference.npz", arrays, reference=REFERENCE, license=LICENSE)
     provenance = {"generator": "tools/block_override_reference.py", "generator_revision": git_head(ROOT),
                   "repo": REPO, "revision": REVISION, "patch_sha256": PATCH_SHA256,
@@ -207,8 +211,10 @@ def main():
 
 
 def calibrate(directory: Path, sites: tuple[str, ...] = ("blocks",)):
-    """Declare the recorded site's seeds with the gate's reference-vs-reference sizing, retaining
-    enough recorded draws for its redraw policy. No candidate implementation is measured."""
+    """Declare the recorded site's seeds with the gate's reference-vs-reference sizing on the recording's
+    pilots (its draws from SIZING_FROM on, none a verdict's: `seeds_for`), retaining enough recorded draws
+    for its redraw policy. No candidate implementation is measured. A recording made before its generator
+    recorded pilots is refused: record it again."""
     sys.path.insert(0, str(ROOT / "tests"))
     from reference_error import indexed_recording, recording, seeds_for
 

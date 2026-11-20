@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import UnrecordedTruth, as_given, assert_as_exact, indexed_recording
-from test_reference_error import _squared_case
+from test_recordings import _squared_case
 
 pytestmark = pytest.mark.usefixtures("unqualified")
 """The gate's own tests: their sites are its subjects, declared at the counts they test it at."""

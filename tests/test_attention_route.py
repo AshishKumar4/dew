@@ -241,10 +241,12 @@ def shares_on_one_device(routed, heads: int, kv_heads: int, shards: int):
 
 
 def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_heads: int, rules, label: str,
-                       moves=(), shards: int | None = None, seeds: int = MESH_SEEDS) -> None:
+                       moves=(), reductions=(), shards: int | None = None, seeds: int = MESH_SEEDS) -> None:
     """`case`'s named template call on `mesh`, its arguments placed by `specs` and the logical axis `rules` in
     context, runs per shard (`sharded.assert_runs_per_shard`), and its compiled step moves no operand between
-    devices beyond `moves`. Its output and gradients are on par with one device's whole call over the site's
+    devices beyond `moves` and sums across them only an operand's gradient over the axes it is whole along and
+    the `reductions` it names (`sharded.split_checked`). Its output and gradients are on par with one device's
+    whole call over the site's
     `seeds` draws (check 1), measured from float64 on the reference path. With `shards`, they are on par
     with the shares of the same route run on one device (`shares_on_one_device`) instead, and the split is
     also asserted against the fp32 reference path: its own error within 1.5 times that path's on every
@@ -258,7 +260,7 @@ def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_he
     with nn.logical_axis_rules(rules):
         # With `shards`, the one split run of each draw compared with both arms (row 2156).
         assert_runs_per_shard(with_gradients(routed), draw, specs, mesh, label, seeds=seeds,
-                              truth_fn=truth, moves=moves, arm=arm,
+                              truth_fn=truth, moves=moves, reductions=reductions, arm=arm,
                               also=None if shards is None else ("the reference path", truth))
 
 
@@ -310,8 +312,10 @@ def test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expe
     keys = PartitionSpec(None, None, ("expert", "tensor"))
     specs = [heads, keys, keys, PartitionSpec(("tensor", "expert")), heads]
     case = MESH_CASES["own-documents"]
+    # The key heads gathered, their gradient summed back over both axes (the gather's transpose).
     per_shard_contract(case, mesh, specs, heads=WIDE_HEADS, kv_heads=8,
                        rules=KEY_HEADS_LEADING_THE_OTHER_WAY, moves=("all-gather",),
+                       reductions=(("all-reduce", ("expert", "tensor")),),
                        label="template split eight ways, key heads the other way", shards=WIDE_SHARDS,
                        seeds=WIDE_SEEDS[8])
 
