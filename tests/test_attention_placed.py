@@ -670,7 +670,7 @@ def test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_inte
     assert explore(threads, arrivals) > 0
 
 
-def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_role(monkeypatch):
+def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_role():
     """Row 8979: a focused producer/reducer trace of `attention_mosaic_dkv._PlacedDq` covering ordinals 0
     and 1 on the same compute role (`lo=0, hi=3, role=0`): explores every interleaving with zero violations,
     and fails with `Violation` when `_PlacedDq._turn` drops its `ordinal` term."""
@@ -688,11 +688,16 @@ def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_rol
         interpret=False,
         program=types.SimpleNamespace(family=placed.KEYS, tiles=types.SimpleNamespace(block_q=block_q)))
 
-    def traced(name: str):
+    class _NoOrdinal(dkv._PlacedDq):
+        def _turn(self, ordinal, piece: int):
+            del ordinal
+            return rings.Turn.of(piece, dkv.REDUCED)
+
+    def traced(ring_cls, name: str):
         def launch(dq_arr):
             def body(dq_ref):
                 def scope(stage, filled, emptied):
-                    ring = dkv._PlacedDq(walk, dq_ref, (None, stage, filled, emptied), (0, 0))
+                    ring = ring_cls(walk, dq_ref, (None, stage, filled, emptied), (0, 0))
                     half = jnp.zeros((block_q, width), jnp.float32)
                     role = jax.lax.axis_index("wg")
 
@@ -719,13 +724,11 @@ def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_rol
 
         return programs(launch, dq_out, threads=2)
 
-    threads, arrivals = traced("dq_ring_ordinals")
+    threads, arrivals = traced(dkv._PlacedDq, "dq_ring_ordinals")
     assert explore(threads, arrivals) > 0
 
     # Dropping `ordinal` in `_PlacedDq._turn` must be caught by `explore`.
-    monkeypatch.setattr(dkv._PlacedDq, "_turn",
-                        lambda self, ordinal, piece: rings.Turn.of(piece, dkv.REDUCED))
-    bad_threads, bad_arrivals = traced("dq_ring_ordinals_mutated")
+    bad_threads, bad_arrivals = traced(_NoOrdinal, "dq_ring_ordinals_mutated")
     with pytest.raises(Violation):
         explore(bad_threads, bad_arrivals)
 

@@ -748,6 +748,26 @@ def test_an_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(rate, logit,
                     draw, "a small kept fp16 weight", seeds=FEWEST_SEEDS)
 
 
+def _assert_resumed_dropout_on_par(drop, draw, label: str, *, training: bool, output_mod=None):
+    """Compare the portable mainloop against `template.reference` under `assert_as_exact` for a single-key
+    resumed-state dropout call."""
+    spans = template.spans(1, 1, 1)
+
+    def hooks_of(state_m, state_total, state_acc):
+        return template.Hooks(initial=template.Initial(state_m, state_total, state_acc),
+                              output_mod=output_mod, drop=drop)
+
+    def walked(query, key, value, state_m, state_total, state_acc):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks_of(state_m, state_total, state_acc), residuals=training)
+        return out[0] if training else out
+
+    def reference(query, key, value, state_m, state_total, state_acc):
+        return template.reference(query, key, value, spans, hooks_of(state_m, state_total, state_acc))
+
+    assert_as_exact(walked, reference, draw, label, seeds=FEWEST_SEEDS)
+
+
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16], ids=["fp32", "fp16"])
 @pytest.mark.parametrize("bits", [32, 48, 53])
@@ -758,12 +778,7 @@ def test_a_resumed_states_small_sums_are_kept_under_a_near_total_draw(bits, dtyp
     flushed to 0: by the whole multiplier at 2^-32 (the base review of 56a716c95, F2), by its rest past a
     power capped at 2^32 at 2^-53 and past fp16's 2^15 at 2^-48 (of 4e2eb287e and b872d1849, F2)."""
     rate = 1.0 - 2.0 ** -bits
-    spans = template.spans(1, 1, 1)
     drop = dropout_of(seed_words(0), 1, 1, rate)
-
-    def hooks_of(state_m, state_total, state_acc):
-        return template.Hooks(initial=template.Initial(state_m, state_total, state_acc),
-                              output_mod=lambda out: out * 2.0 ** 125, drop=drop)
 
     def draw(draw_seed: int):
         keys = jax.random.split(jax.random.PRNGKey(draw_seed), 2)
@@ -775,15 +790,8 @@ def test_a_resumed_states_small_sums_are_kept_under_a_near_total_draw(bits, dtyp
         state_acc = (signs * mag * jnp.float32(2.0 ** -120)).astype(jnp.float32)
         return query, key, value, state_m, state_total, state_acc
 
-    def walked(query, key, value, state_m, state_total, state_acc):
-        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                              hooks_of(state_m, state_total, state_acc), residuals=training)
-        return out[0] if training else out
-
-    def reference(query, key, value, state_m, state_total, state_acc):
-        return template.reference(query, key, value, spans, hooks_of(state_m, state_total, state_acc))
-
-    assert_as_exact(walked, reference, draw, "resumed small sums under near-total draw", seeds=FEWEST_SEEDS)
+    _assert_resumed_dropout_on_par(drop, draw, "resumed small sums under near-total draw", training=training,
+                                   output_mod=lambda out: out * 2.0 ** 125)
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
@@ -811,11 +819,7 @@ def test_a_large_state_beside_an_fp16_walk_keeps_its_finite_output(training):
     and value 0 at a rate of 1/4, whatever the draw: on par with the independent attention reference (check
     1), where the state's sums taken up into the walk's units by 1.5 overflowed (the base review of
     a648b3279, F2)."""
-    spans = template.spans(1, 1, 1)
     drop = dropout_of(seed_words(0), 1, 1, 0.25)
-
-    def hooks_of(state_m, state_total, state_acc):
-        return template.Hooks(initial=template.Initial(state_m, state_total, state_acc), drop=drop)
 
     def draw(draw_seed: int):
         keys = jax.random.split(jax.random.PRNGKey(draw_seed), 2)
@@ -827,15 +831,7 @@ def test_a_large_state_beside_an_fp16_walk_keeps_its_finite_output(training):
         state_acc = (signs * mag * jnp.float32(2.0 ** 126)).astype(jnp.float32)
         return query, key, value, state_m, state_total, state_acc
 
-    def walked(query, key, value, state_m, state_total, state_acc):
-        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                              hooks_of(state_m, state_total, state_acc), residuals=training)
-        return out[0] if training else out
-
-    def reference(query, key, value, state_m, state_total, state_acc):
-        return template.reference(query, key, value, spans, hooks_of(state_m, state_total, state_acc))
-
-    assert_as_exact(walked, reference, draw, "large state beside fp16 walk", seeds=FEWEST_SEEDS)
+    _assert_resumed_dropout_on_par(drop, draw, "large state beside fp16 walk", training=training)
 
 
 def _portable_gradients(spans, hooks, scale: float = 1.0):
