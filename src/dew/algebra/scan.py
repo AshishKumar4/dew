@@ -209,7 +209,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         # The form's largest values that read no state, prepared with the chunk's decays and tokens: the
         # operands of its function, whose state the carry reads (`carry.split`).
         held = _prepared(form, tokens, decays, issue or _issued)
-        given = (*decays, *(tokens[name] for name in TOKENS), *held.values())
+        given = (*_flat_decays(decays), *(tokens[name] for name in TOKENS), *held.values())
         # A split is priced and traced where it is derived (`derive.context`): one derived under another
         # target, precision, numerics or mesh is none of this one's.
         key = (derive.context(), affine.base2, corrected, affine.values_read, apart, extents.across,
@@ -568,10 +568,10 @@ def _merged(a, b, carried, issue: Callable) -> Walk:
     its own, each touched by it alone)."""
     if not (isinstance(a, Walk) and isinstance(b, Walk)):
         raise Refused("a merge of walks init did not start from their operands' shapes")
-    entered = a.h if b.across is None else a.h * accurate_exp(b.across)[None, :]
+    entered = a.h if b.across is None else _scaled_exp(a.h, b.across[None, :])
     if b.transfer is None:
-        h = accurate_exp(b.decay)[:, None] * entered + b.h
-        transfer = None if a.transfer is None else accurate_exp(b.decay)[:, None] * a.transfer
+        h = _scaled_exp(entered, b.decay[:, None]) + b.h
+        transfer = None if a.transfer is None else _scaled_exp(a.transfer, b.decay[:, None])
     else:
         h = issue("transfer_apply", b.transfer, entered) + b.h
         transfer = (issue("transfer_decay", accurate_exp(a.decay), b.transfer) if a.transfer is None
@@ -602,9 +602,6 @@ def _transition(prepared: Prepared, h: jax.Array) -> jax.Array:
     columns = jax.vmap(linear, in_axes=1, out_axes=1)(padded.reshape(keys, blocks, width))
     return columns.reshape(keys, blocks * width)[:, :keys]
 
-
-DECAYS = 4
-"""The chunk function's leading operands: its decays (`_Decays`' four fields), its tokens' values after."""
 
 TOKENS = ("B", "U", "s", "C", "Q", "R", "E")
 """A token's values (`_token`'s), as the chunk's form names them (`linear_scan.Chunk.token`): "E" its
@@ -727,14 +724,13 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
     return {**dict.fromkeys(range(DECAYS), 1.0), **bounded}
 
 
-def _chunk(form: linear_scan.Form, held: tuple, values_read: bool, base2: bool, h, entering, to_last, whole,
-           between, *values):
+def _chunk(form: linear_scan.Form, held: tuple, values_read: bool, base2: bool, h, *operands):
     """A chunk's outputs and the state it leaves, from the state `h` entering it, its decays (`_Decays`'
-    fields, each at most 1), its tokens' values (`_token`'s, `TOKENS`) and the form's prepared values
+    leaves, each at most 1), its tokens' values (`_token`'s, `TOKENS`) and the form's prepared values
     (`held`'s nodes, `_prepared`): the extracted form evaluated (`_evaluated`), its readout along the state's
     values where `values_read`, its decays along the values (`linear_scan.Chunk.across`) of its tokens'
     exponents "E" (`exp2` where `base2`), which `carry.split` splits."""
-    decays = _Decays(entering=entering, to_last=to_last, whole=whole, between=between)
+    decays, values = _decays_from(operands[:DECAYS]), operands[DECAYS:]
     tokens = dict(zip(TOKENS, values[:len(TOKENS)], strict=True))
     known = {terms.key(node): value for node, value in zip(held, values[len(TOKENS):], strict=True)}
     # The language's own products (`_plain`), which the split's forms name and issue themselves
@@ -828,7 +824,7 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
         local = pairing is not None and _pairing_role(pairing[0]) == "scores"
         value = issue("readout_local" if local else "apply", of(args[0]), of(args[1]))
     elif (args := get_callable_args(node, Chunk.written)) is not None:
-        value = issue("carry", (of(args[0]) * of(args[2])).T, of(args[1]))
+        value = issue("carry", _scaled(of(args[0]), of(args[2])).T, of(args[1]))
     elif (args := get_callable_args(node, Chunk.doubled)) is not None:
         # Differentiated by its own rule where Dew's products make it (`_lowered`); a mainloop's are forward.
         value = _lowered(of(args[0])) if issue is _issued else _doubled(of(args[0]), issue)
@@ -849,23 +845,23 @@ def _elementwise(node, of: Callable):
     if (args := get_callable_args(node, Chunk.rows)) is not None:
         return of(args[1])[:, None] * of(args[0])
     if (args := get_callable_args(node, Chunk.times)) is not None:
-        left, right = of(args[0]), of(args[1])
+        # The decay (or the values' decay, `across`) on the right, the value it scales on the left.
+        first_decays = get_callable_args(args[0], Chunk.decay) is not None
+        value, decay = (of(args[1]), of(args[0])) if first_decays else (of(args[0]), of(args[1]))
         # A decay across a document's start (`_crossed`) takes its factor out by select before the product,
         # so a memory past the largest read before its reset is no 0 times inf, nor its gradient (row 8560);
-        # a live span's that underflows multiplies as the recurrence does.
-        if get_callable_args(args[1], Chunk.decay) is not None:
-            left = jnp.where(_crossed(right), 0.0, left)
-        elif get_callable_args(args[0], Chunk.decay) is not None:
-            right = jnp.where(_crossed(left), 0.0, right)
-        return left * right
+        # a live span's that underflows multiplies as the recurrence does, a split decay's factors in turn.
+        if first_decays or get_callable_args(args[1], Chunk.decay) is not None:
+            value = jnp.where(_crossed(decay.first if isinstance(decay, _Split) else decay), 0.0, value)
+        return _scaled(value, decay)
     if (args := get_callable_args(node, Chunk.plus)) is not None:
         return of(args[0]) + of(args[1])
     if (args := get_callable_args(node, Chunk.minus)) is not None:
         return of(args[0]) - of(args[1])
     if (args := get_callable_args(node, Chunk.decayed)) is not None:
-        return of(args[1])[:, None] * of(args[0])
+        return _scaled(of(args[0]), jax.tree.map(lambda x: x[:, None], of(args[1])))
     if (args := get_callable_args(node, Chunk.columns)) is not None:
-        return of(args[0]) * of(args[1])[None, :]
+        return _scaled(of(args[0]), jax.tree.map(lambda x: x[None, :], of(args[1])))
     return None
 
 
@@ -878,7 +874,7 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
     B, s, C, Q, R = (tokens[name] for name in ("B", "s", "C", "Q", "R"))
     count = B.shape[0]
     between = decays.between[jnp.arange(1, count), jnp.arange(count - 1)]
-    stepped = jnp.concatenate([decays.entering[:1], between])
+    stepped = jnp.concatenate([_scaled(1.0, jax.tree.map(lambda x: x[:1], decays.entering)), between])
     # A decay along the values too (`across`, each token's own gates `[C, V]`).
     valued = jnp.ones((count, values.shape[-1]), stepped.dtype) if across is None else across
     # The state carried in the type its first step leaves it in: operands wider than it widen it (a float32
@@ -1272,16 +1268,72 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False,
     return high, low
 
 
+class _Split(NamedTuple):
+    """A decay `exp(x)` as two factors, each a normal float32 or one: `first`, `exp(max(x, -L))`, and `rest`,
+    `exp(x - max(x, -L))` (`L` its dtype's least normal's exponent, `_normal_floor`), applied in turn
+    (`_scaled`): each at most 1, so a value's product with them falls monotonically to its own, and a decay
+    alone past fp32's least normal (three gates of -40, `e^-120`) never zeroes a write of 2^100 whose decayed
+    value (`e^-51`) is normal (row 9660)."""
+
+    first: jax.Array
+    rest: jax.Array
+
+
 class _Decays(NamedTuple):
     """A chunk's decays from its tokens' exponents (`_decays`), each per key: `entering`, the decay from the
     chunk's start through each token, `exp(G_i)`; `to_last`, from after each token to the chunk's end,
-    `exp(G_last - G_j)`; `whole`, the chunk's, `exp(G_last)`; `between`, from after token `j` through token
-    `i`, `exp(G_i - G_j)` for `j <= i` and zero above the diagonal."""
+    `exp(G_last - G_j)`; `whole`, the chunk's, `exp(G_last)`, each a decay a value takes alone (`_Split`);
+    `between`, from after token `j` through token `i`, `exp(G_i - G_j)` for `j <= i` and zero above the
+    diagonal, which pairs take beside their reads."""
 
-    entering: jax.Array
-    to_last: jax.Array
-    whole: jax.Array
+    entering: _Split
+    to_last: _Split
+    whole: _Split
     between: jax.Array
+
+
+DECAYS = 7
+"""The chunk function's leading operands: its decays (`_flat_decays`' leaves), its tokens' values after."""
+
+
+def _flat_decays(decays: _Decays) -> tuple:
+    """`decays`' arrays in the chunk function's order (`DECAYS` of them): each split decay's two factors,
+    `entering`, `to_last` and `whole`, then `between`."""
+    return (*decays.entering, *decays.to_last, *decays.whole, decays.between)
+
+
+def _decays_from(leaves: Sequence) -> _Decays:
+    """`_flat_decays`' arrays as their decays."""
+    return _Decays(_Split(*leaves[0:2]), _Split(*leaves[2:4]), _Split(*leaves[4:6]), leaves[6])
+
+
+def _scaled(value, decay):
+    """`value` times a decay (`_Split`'s factors in turn, else the array)."""
+    if isinstance(decay, _Split):
+        return value * decay.first * decay.rest
+    return value * decay
+
+
+def _normal_floor(dtype, base2: bool) -> float:
+    """The least exponent whose decay (`exp`, or `exp2` with `base2`) is a normal number of `dtype`."""
+    return math.ceil(math.log(float(jnp.finfo(dtype).tiny)) / (math.log(2.0) if base2 else 1.0))
+
+
+def _two_factors(base2: bool, exponent, kept) -> _Split:
+    """`exp(exponent)` (`exp2` where `base2`) as its two factors (`_Split`) where `kept`, else a crossed
+    decay's negative zero (`_crossed`) and one; each exponent masked before its exponential."""
+    floor = _normal_floor(exponent.dtype, base2)
+    exponent = jnp.where(kept, exponent, 0.0)
+    first = jnp.maximum(exponent, floor)
+    return _Split(jnp.where(kept, _exp(base2, first), -0.0),
+                  jnp.where(kept, _exp(base2, exponent - first), 1.0))
+
+
+def _scaled_exp(value, exponent):
+    """`value` times `exp(exponent)` (natural units, at most 0: a walk's decay), its two factors in turn."""
+    floor = _normal_floor(exponent.dtype, base2=False)
+    first = jnp.maximum(exponent, floor)
+    return value * accurate_exp(first) * accurate_exp(exponent - first)
 
 
 def _decays(exponents, base2: bool) -> _Decays:
@@ -1315,17 +1367,25 @@ def vanished(exponents, base2: bool = False) -> tuple[jax.Array, jax.Array]:
 
 def _walked(exponents, base2: bool) -> jax.Array:
     """A chunk's whole decay in natural units, per key, as a walk's state carries it (`Derived.step`,
-    `merge`): its exponents' compensated sum, or its dtype's vanished decay where a token's decay vanishes
-    (`vanishing`; two of -2**127 summed are -inf, and its residual NaN)."""
+    `merge`): its exponents' compensated sum, or the walk's vanished decay where a token's decay vanishes
+    (`_held`; two of -2**127 summed are -inf, and its residual NaN)."""
     live, cut = vanished(exponents, base2)
     summed = _scanned(live)[-1] * (math.log(2.0) if base2 else 1.0)
-    return _held(jnp.where(jnp.any(cut, axis=0), vanishing(exponents.dtype, base2=False), summed))
+    return _held(jnp.where(jnp.any(cut, axis=0), _vanished_walk(exponents.dtype), summed))
+
+
+def _vanished_walk(dtype) -> float:
+    """A walk's vanished decay in natural units: twice its dtype's vanished exponent (`vanishing`), so its two
+    factors applied in turn (`_scaled_exp`) are zero, where a walk's decay of `e^-120` (three gates of -40)
+    takes a state of 2^100 to a normal `e^-51`, which a floor at the vanished exponent itself (-105) zeroed
+    (row 9660)."""
+    return 2.0 * vanishing(dtype, base2=False)
 
 
 def _held(decay: jax.Array) -> jax.Array:
-    """A walk's decay in natural units held from below at its dtype's vanished one (`vanishing`): zero
-    there, and a walk's sums of vanished chunks finite."""
-    return jnp.maximum(decay, jnp.asarray(vanishing(decay.dtype, base2=False), decay.dtype))
+    """A walk's decay in natural units held from below at its vanished one (`_vanished_walk`): zero there,
+    and a walk's sums of vanished chunks finite."""
+    return jnp.maximum(decay, jnp.asarray(_vanished_walk(decay.dtype), decay.dtype))
 
 
 def _decays_value(exponents, base2: bool) -> _Decays:
@@ -1346,12 +1406,9 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     # Each exponent masked before its exponential, as each span's: one across a vanished token is no sum
     # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN), and its
     # decay negative zero, which no exponential is (`_crossed`).
-    return _Decays(entering=jnp.where(started, _exp(base2, jnp.where(started, high + low, 0.0)), -0.0),
-                   to_last=jnp.where(ending, _exp(base2, jnp.where(ending,
-                                                                   (high[-1] - high) + (low[-1] - low), 0.0)),
-                                     -0.0),
-                   whole=jnp.where(started[-1], _exp(base2, jnp.where(started[-1], high[-1] + low[-1], 0.0)),
-                                   -0.0),
+    return _Decays(entering=_two_factors(base2, high + low, started),
+                   to_last=_two_factors(base2, (high[-1] - high) + (low[-1] - low), ending),
+                   whole=_two_factors(base2, high[-1] + low[-1], started[-1]),
                    between=jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), -0.0))
 
 
@@ -1396,8 +1453,9 @@ def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
     `j < s <= i`, summed over the rectangle by compensated scans. A difference of two prefix sums of these
     terms loses the deep decays' gradients near zero (the oracle's `summed_ranges`)."""
     weight = math.log(2.0) if base2 else 1.0
-    entering = cotangents.entering * decays.entering
-    to_last = cotangents.to_last * decays.to_last
+    entering, to_last, whole = (_split_term(decay, cotangent) for decay, cotangent in
+                                ((decays.entering, cotangents.entering), (decays.to_last, cotangents.to_last),
+                                 (decays.whole, cotangents.whole)))
     between = cotangents.between * decays.between
     if between.shape[-1] > 1:
         # A decay a key's pairs' terms `[C, C, K]` formed once, ahead of their scans: fused into the first,
@@ -1410,8 +1468,13 @@ def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
     # Rectangle sums: each row's terms left of a column, then the rows from a column's own row down.
     left = jnp.swapaxes(_earlier(_scanned(jnp.swapaxes(between, 0, 1))), 0, 1)
     spanning = jnp.diagonal(_scanned(left, reverse=True), axis1=0, axis2=1).T
-    whole = (cotangents.whole * decays.whole)[None]
-    return ((from_on + before + spanning + whole) * weight,)
+    return ((from_on + before + spanning + whole[None]) * weight,)
+
+
+def _split_term(decay: _Split, cotangent: _Split):
+    """A split decay's term of its exponent's gradient: its first factor's where its exponent is above the
+    floor (its rest one), its rest's below it (its first the floor's, a constant)."""
+    return jnp.where(decay.rest < 1, cotangent.rest * decay.rest, cotangent.first * decay.first)
 
 
 

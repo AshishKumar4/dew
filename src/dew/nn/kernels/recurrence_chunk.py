@@ -264,7 +264,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     A memory entering is read through its chunk's decays at their size while it lies within 2^96 of the
     values: past it, a decay that leaves fp32's normals (a chunk's prefix under 2^-126) reads it as zero, as
     fla's chunked form does (row 2344: on par at 2^96 through a token's decay of exp2(-124.8), a write gate's
-    output 150 times the recurrence's distance at 2^110). A call names a kernel through `generation.chosen`
+    output 150 times the recurrence's distance at 2^110). A decay a value takes alone, a chunk's span past
+    fp32's least normal, is kept as two normal factors (`dew.algebra.scan._Split`, row 9660), while a
+    product's own range is fla's: a term whose factors meet a decay past the least normal one at a time
+    reads zero as fla's does. A call names a kernel through `generation.chosen`
     alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call)."""
     if not admitted(hooks):
         return _token_loop(hooks, operands, dtype=dtype)

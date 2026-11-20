@@ -877,10 +877,12 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
             # The compensated prefix (`scan._decays`): one pass over the tokens' exponents, one kernel.
             return Work(operations=12.0 * c * width, kernels=1.0, kept_bytes=kept(c * width))
         if (args := get_callable_args(node, decay)) is not None:
-            # Its pairs' exponentials of the prefix's differences, fused with the prefix's pass.
-            elements = {"entering": c * width, "to_last": c * width, "whole": width,
-                        "between": c * c * width}[terms.text(args[0])]
-            return Work(operations=elements, exponentials=elements)
+            # Its pairs' exponentials of the prefix's differences, fused with the prefix's pass; a decay a
+            # value takes alone two a span (`scan._Split`: its factors each normal).
+            part = terms.text(args[0])
+            elements = {"entering": c * width, "to_last": c * width, "whole": width, "between": c * c * width}
+            exponentials = elements[part] * (1 if part == "between" else 2)
+            return Work(operations=exponentials, exponentials=exponentials)
     if (args := get_callable_args(node, Chunk.gram)) is not None:
         if d == 1:
             return product(c, k, c) + Work(operations=2.0 * c * c)
