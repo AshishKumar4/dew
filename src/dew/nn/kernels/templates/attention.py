@@ -38,7 +38,7 @@ import numpy as np
 from jax.typing import DTypeLike
 
 from dew._hashing import fmix32
-from dew.nn.derivatives import Protected, contracted
+from dew.nn.derivatives import Protected, contracted, surrogate
 from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import bodies
@@ -1370,32 +1370,36 @@ def mean_held(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
     return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
 
 
-def narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
-    """`out`, the sums `acc` over `divisor` as the finish formed it (fp32; a recovered subnormal's bits,
-    `attention_algebra.quotient`), rounded to odd where it narrows to the 16-bit `dtype`: where it lands
-    exactly between two values of `dtype` (`_between`) and is not the exact quotient, one fp32 ulp toward it,
-    so the narrowing rounds once as the exact quotient would: the exact output 65519.9995 of one kept key of
-    65504 rounded to fp32's 65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544).
-    The side is the sign of `acc` less `out` times `divisor`, exact (`_remainder_sign`). A finite `out` over
-    a positive divisor alone; any other, a held one (its dtype's largest, no tie) and a guarded zero as
-    they are, selected, no arithmetic on them (an infinite one's difference from itself NaN; a subnormal's
-    sum with zero flushed on XLA's CPU). Its derivative is `out`'s, a nudged entry's none. The bound left at
-    fp32's resolution, as the fp32 reference's: `divisor` is the one rounded (a dropping call's total times
-    its multiplier's rest, `dropped_total`), and the sums and exponentials before it round as the
-    reference's do, so an exact output within their rounding of a boundary may narrow past it."""
-    value = jax.lax.stop_gradient(out)
-    if value.dtype != jnp.float32:
+def _narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """`narrowing_settled`'s value."""
+    if out.dtype != jnp.float32:
         return out
-    acc = jax.lax.stop_gradient(acc)
-    divisor = jax.lax.stop_gradient(jax.lax.broadcast_in_dim(divisor, acc.shape, tuple(range(divisor.ndim))))
-    above = _remainder_sign(acc, value, divisor)
-    bits = jax.lax.bitcast_convert_type(value, jnp.int32)
-    # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side.
-    toward = jnp.where((above > 0) == (value > 0), 1, -1).astype(jnp.int32)
+    divisor = jax.lax.broadcast_in_dim(divisor, acc.shape, tuple(range(divisor.ndim)))
+    above = _remainder_sign(acc, out, divisor)
+    bits = jax.lax.bitcast_convert_type(out, jnp.int32)
+    # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side, its
+    # side read from its sign bit (a subnormal's comparison with zero reads it as zero where the CPU treats
+    # subnormal operands as zero).
+    toward = jnp.where((above > 0) == (bits > 0), 1, -1).astype(jnp.int32)
     odd = jax.lax.bitcast_convert_type(bits + toward, jnp.float32)
-    nudged = (_between(bits, dtype) & (above != 0) & jnp.isfinite(value) & jnp.isfinite(acc)
+    nudged = (_between(bits, dtype) & (above != 0) & jnp.isfinite(out) & jnp.isfinite(acc)
               & (divisor > 0))
     return jnp.where(nudged, odd, out)
+
+
+narrowing_settled = surrogate(_narrowing_settled, lambda dtype, primals, tangents, value: tangents[0],
+                              nondiff_argnums=(3,))
+"""`out`, the sums `acc` over `divisor` as the finish formed it (fp32; a recovered subnormal's bits,
+`attention_algebra.quotient`), rounded to odd where it narrows to the 16-bit `dtype`: where it lands exactly
+between two values of `dtype` (`_between`) and is not the exact quotient, one fp32 ulp toward it, so the
+narrowing rounds once as the exact quotient would: the exact output 65519.9995 of one kept key of 65504
+rounded to fp32's 65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544). The side is
+the sign of `acc` less `out` times `divisor`, exact (`_remainder_sign`). A finite fp32 `out` over a positive
+divisor alone; any other, a held one (its dtype's largest, no tie) and a guarded zero as they are, selected,
+no arithmetic on them. Its derivative is `out`'s on every entry, nudged or not (`surrogate`). The bound left
+at fp32's resolution, as the fp32 reference's: `divisor` is the one rounded (a dropping call's total times
+its multiplier's rest, `dropped_total`), and the sums and exponentials before it round as the reference's
+do, so an exact output within their rounding of a boundary may narrow past it."""
 
 
 def _remainder_sign(acc: jax.Array, quotient: jax.Array, divisor: jax.Array) -> jax.Array:
