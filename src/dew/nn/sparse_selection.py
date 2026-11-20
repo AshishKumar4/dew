@@ -135,8 +135,8 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
     absorbed = float32_einsum('bshn,rhn->bshr', query_nope, key_weight.astype(query_nope.dtype),
                               precision=precision)
     batch, length, heads, rank = absorbed.shape
-    case = SparseCase(heads, rank, query_rot.shape[-1], indices.shape[-1], jnp.dtype(latent.dtype),
-                      batch * length)
+    dtypes = tuple(jnp.dtype(x.dtype) for x in (absorbed, query_rot, latent, rot))
+    case = SparseCase(heads, rank, query_rot.shape[-1], indices.shape[-1], dtypes, batch * length)
     if select(SPARSE, case).kernel == 'template':
         context = templated_context(scale, precision, block)(absorbed, query_rot, latent, rot, indices)
     else:
@@ -171,9 +171,9 @@ def blocked_context(absorbed, query_rot, latent, rot, indices, *, scale: float, 
                   + float32_einsum('bqhp,bqkp->bqhk', q_rot, rots, precision=precision,
                                    preferred_element_type=wide)) * scale
         logits = jnp.where(allowed[:, :, None, :], logits, jnp.finfo(wide).min)
-        weights = jax.nn.softmax(logits, axis=-1).astype(keys.dtype)
-        return float32_einsum('bqhk,bqkr->bqhr', weights, keys, precision=precision)
-
+        weights = jax.nn.softmax(logits, axis=-1)
+        return float32_einsum('bqhk,bqkr->bqhr', weights, keys.astype(wide), precision=precision,
+                              preferred_element_type=wide).astype(keys.dtype)
     context = jax.lax.map(attend, tuple(blocked(x) for x in (absorbed, query_rot, indices)))
     return jnp.moveaxis(context, 0, 1).reshape(batch, blocks * block, heads, -1)[:, :length]
 
@@ -181,14 +181,14 @@ def blocked_context(absorbed, query_rot, latent, rot, indices, *, scale: float, 
 @dataclasses.dataclass(frozen=True)
 class SparseCase:
     """A sparse latent attention call as its selector reads it (`SPARSE`): its `heads`, each over a latent
-    `rank` wide and a rope head `rope` wide, the `top_k` slots each query selects, the latents' `dtype`, and
-    its `rows`, a row a query (`TEMPLATE_SPARSE_SUPPORTS`' 'tiles' plans them)."""
+    `rank` wide and a rope head `rope` wide, the `top_k` slots each query selects, its four operands'
+    `dtypes`, and its `rows`, a row a query (`TEMPLATE_SPARSE_SUPPORTS`' 'tiles' plans them)."""
 
     heads: int
     rank: int
     rope: int
     top_k: int
-    dtype: jnp.dtype
+    dtypes: tuple[jnp.dtype, ...]
     rows: int
 
 
@@ -199,9 +199,10 @@ def _template_tiles(case: SparseCase) -> bool:
 
     if backend() != "gpu":
         return False
+    dtype = case.dtypes[0]
     width = case.rank + case.rope
-    query = jax.ShapeDtypeStruct((case.rows, 1, case.heads, width), case.dtype)
-    pool = jax.ShapeDtypeStruct((1, case.rows * case.top_k, 1, width), case.dtype)
+    query = jax.ShapeDtypeStruct((case.rows, 1, case.heads, width), dtype)
+    pool = jax.ShapeDtypeStruct((1, case.rows * case.top_k, 1, width), dtype)
     table = jax.ShapeDtypeStruct((case.rows, case.top_k), jnp.int32)
     derived = []
 
@@ -217,8 +218,10 @@ def _template_tiles(case: SparseCase) -> bool:
 
 
 TEMPLATE_SPARSE_SUPPORTS: tuple[Requirement[SparseCase], ...] = (
-    Requirement('dtype', lambda case: case.dtype in (jnp.bfloat16, jnp.float16),
-                lambda case: f"the template's decode reads 16-bit latents, not {case.dtype}", row=INHERENT),
+    Requirement('dtype',
+                lambda case: len(set(case.dtypes)) == 1 and case.dtypes[0] in (jnp.bfloat16, jnp.float16),
+                lambda case: f"the template's decode reads matching 16-bit operands, not {case.dtypes}",
+                row=INHERENT),
     Requirement('tiles', _template_tiles,
                 lambda case: f"the attention template's decode derives no launch over {case.top_k} selected "
                              f"latents {case.rank + case.rope} wide on this GPU", row=INHERENT),

@@ -138,6 +138,21 @@ def test_the_template_reads_the_selection_as_the_masked_expanded_reference():
                         'templated selection', seeds=SEEDS['templated selection'])
 
 
+def test_mixed_dtype_sparse_selection_refuses_template_and_keeps_fp32_range():
+    """On a GPU, mixed fp32 queries/rope beside fp16 latents must not select `'template'` (which would narrow
+    `2**16` to fp16 inf); it falls back to `'xla'` and stays finite."""
+    q_nope = jnp.zeros((1, 2, 2, 16), jnp.float32)
+    q_rot = jnp.full((1, 2, 2, 32), 2.0 ** 16, jnp.float32)
+    latent = jnp.ones((1, 2, 32), jnp.float16)
+    rot = jnp.full((1, 2, 32), 2.0 ** -16, jnp.float32)
+    kw = jnp.zeros((32, 2, 16), jnp.float32)
+    vw = jnp.ones((32, 2, 12), jnp.float32)
+    indices = jnp.asarray([[[0, 1], [0, 1]]], jnp.int32)
+    with generation.assumed("sm80"):
+        out = sparse_latent_attention(q_nope, q_rot, latent, rot, kw, vw, indices, scale=1.0)
+    assert bool(jnp.all(jnp.isfinite(out)))
+
+
 def test_packed_documents_select_inside_their_own_document():
     """On par (check 1) on the real tokens, the padding's queries defined by neither."""
     length, top_k = 19, 4

@@ -138,8 +138,7 @@ class Tcgen05Placed(Tcgen05Rings):
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
-                        together: tuple[int, ...] = ()) -> dict:
-        # A role's two turns of the one product it issues ahead, each its logits' accumulator (`LOGITS`) and
+                        together: tuple[int, ...] = (), tmem_limit: int | None = None) -> dict:
         # over it the one left operand it is given (`WEIGHTS`, 16-bit two to a column): a turn's weights are
         # written once its consumer has read the turn's logits whole into its registers, which they are
         # formed from, and the turn's next logits issued after the product reading those weights, the tensor
@@ -168,7 +167,8 @@ class Tcgen05Placed(Tcgen05Rings):
             scratch[QUERY] = tuple(self.tensor_memory((rows, q_width), q_dtype) for _ in range(consumers))
         held = tuple(scratch[name] for name in (LOGITS, SUMS, QUERY) if name in scratch)
         cols = resources.tensor_memory_columns(jax.tree.leaves(held))
-        if self.corrects(consumers, cols, generation.gpu_target().tmem_columns or 0):
+        limit = (tmem_limit if tmem_limit is not None else generation.gpu_target().tmem_columns) or 0
+        if self.corrects(consumers, cols, limit):
             scratch["factor_ready"] = self.signals(2).scratch()
             scratch[FACTORS] = plgpu.SMEM((2, rows), jnp.float32)
         return scratch

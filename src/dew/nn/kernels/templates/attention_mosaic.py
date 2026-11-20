@@ -985,18 +985,20 @@ class MosaicForward(_Mainloop[Tiles]):
                                           scaled=scaled, ahead=ahead, training=training,
                                           query_width=query_width, tmem_columns=target.tmem_columns)
             if with_query != base:
-                staged = (self._staged_bytes(ba, config, target, products=base)
-                          if target.shared_limit else None)
+                base_staged = (self._staged_bytes(ba, config, target, products=base)
+                               if target.shared_limit else None)
+                with_staged = (self._staged_bytes(ba, config, target, products=with_query)
+                               if target.shared_limit else None)
                 regs = self.registers(ba, config)
                 tmem_limit = target.tmem_columns or 0
                 base_tmem = family.product_columns(base)
                 with_tmem = family.product_columns(with_query)
                 base_joined = placed.correction_roles(family, config.consumers, base_tmem, tmem_limit)
                 with_joined = placed.correction_roles(family, config.consumers, with_tmem, tmem_limit)
-                base_most = resources.register_model(family, config.consumers, regs, shared=staged,
+                base_most = resources.register_model(family, config.consumers, regs, shared=base_staged,
                                                      target=target, tmem=base_tmem,
                                                      joined=base_joined).most
-                with_most = resources.register_model(family, config.consumers, regs, shared=staged,
+                with_most = resources.register_model(family, config.consumers, regs, shared=with_staged,
                                                      target=target, tmem=with_tmem,
                                                      joined=with_joined).most
                 if with_most >= base_most:

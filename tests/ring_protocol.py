@@ -456,7 +456,7 @@ def _tcgen05_product(self: _Interpreter, equation, values) -> list:
         # Its left operand in tensor memory, its thread's or another's stores' (`_tmem_store`): a read of
         # what a store or copy must have written last, landed before it (no store's, or overwritten since by
         # an MMA through an aliased view, a read of nothing).
-        self.emit("read", slots[0], "filled")
+        self.emit("read", slots[0], "tmem_filled")
     return self.emit("product", destination, slots)
 
 
@@ -1017,6 +1017,15 @@ class _Order:
                 raise Violation(
                     "unordered", f"{event.kind} of {at} unordered with the {prior_event.kind} of {where}",
                                 [(None, prior_event), (None, event)])
+        flying = [entry for entries in self.pending for entry in entries]
+        flying += [entry for products in self.committed for entry, done in products if done is None]
+        for entry_kind, _, prior_event, _, (prior_thread, _), _ in flying:
+            if entry_kind == "product" and prior_event.at and _overlaps(prior_event.at, at):
+                if same_pipeline(prior_event, None, prior_thread):
+                    continue
+                said = (f"{event.kind} of {at} while the {prior_event.kind} writing {prior_event.at} "
+                        "is in flight")
+                raise Violation("unordered", said, [(None, prior_event), (None, event)])
         if write:
             for where, prior, prior_event in self.reads:
                 if _overlaps(where, at) and not _before(prior, clock):
@@ -1028,8 +1037,6 @@ class _Order:
             # A read still in flight (a product's, a store's or a tensor-memory load's not retired, a
             # tcgen05 product no commit's completion has ended) ends after this write, whatever orders the
             # write.
-            flying = [entry for entries in self.pending for entry in entries]
-            flying += [entry for products in self.committed for entry, done in products if done is None]
             for _, where, prior_event, _, (prior_thread, _), _ in flying:
                 if _overlaps(where, at):
                     if same_pipeline(prior_event, None, prior_thread):
@@ -1084,7 +1091,11 @@ class _Order:
             if event.argument and kind == "load":
                 self.arrived(event.argument, clock, counted=True, transaction=1)
         elif kind in ("read", "write"):
-            if kind == "read" and event.argument == "filled":
+            if kind == "read" and event.argument == "filled" and not any(
+                    where == event.at and _before(prior, clock) for where, prior, _ in self.writes):
+                raise Violation("unwritten", f"read of {event.at}, which no fill ordered before it wrote",
+                                [(thread, event)])
+            if kind == "read" and event.argument == "tmem_filled":
                 prior_writes = [(prior, writer) for where, prior, writer in self.writes
                                 if _overlaps(where, event.at) and _before(prior, clock)]
                 latest = [writer for prior, writer in prior_writes
@@ -1100,7 +1111,9 @@ class _Order:
         elif kind == "commit":
             self.unfenced[thread].clear()
         elif kind == "tmem_store":
-            # Lands at its thread's next `tmem_commit` (`_tmem_store`).
+            # Check read/write races at issue (JAX requires `wait_load_tmem` before issuing an overlapping
+            # store); the write lands for other threads at this thread's next `tmem_commit` (`_tmem_store`).
+            self.ordered(event.at, clock, event, write=True)
             self.stored[thread].append(event)
         elif kind == "tmem_commit":
             for store in self.stored[thread]:

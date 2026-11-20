@@ -208,7 +208,6 @@ def test_the_sparse_latent_kernel_holds_every_order(edge):
         (cotangent,) = normal_draw([9025, seed], (1, 3, 2, 32))
         return primals, direction, cotangent.astype(jnp.bfloat16)
 
-    @jax.jit
     def sparse(absorbed, query_rot, latent, rot):
         with generation.assumed("sm80"):
             return sparse_selection.templated_context(scale, None, 4)(absorbed, query_rot, latent, rot,
