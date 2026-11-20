@@ -598,7 +598,7 @@ class ForkedChunks:
         if forked.entry is None:
             return None
         # Each row's documents flat, by their count: a write of no terms leaves `-1` nothing to infer.
-        key, value, weight = (x.reshape(x.shape[0] * x.shape[1], *x.shape[2:]) for x in forked.entry)
+        key, value, weight = _flat(*forked.entry)
         taken = jnp.maximum(self.taken, 0)
         key, value, weight = (x[taken] for x in (key, value, weight))
         group = value.shape[-2] // key.shape[-2]

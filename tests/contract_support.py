@@ -73,25 +73,35 @@ class Entries(NamedTuple):
     signed: Callable[[tuple[int, ...]], np.ndarray]
 
 
+def cancelling_orbit(key_heads: int, heads: int, values: int) -> int:
+    """The draws `cancelling_entries` takes to write every value coordinate it moves through once: a value
+    head of a key head's group and a column a draw, `heads // key_heads` of the one and `values` of the other,
+    so an exact fixture declaring this many seeds holds every coordinate in its first stage (check 1 redraws
+    only past a failure, which a coordinate never written cannot raise)."""
+    return heads // key_heads * values
+
+
 def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values: int) -> Entries:
     """Entry writes of `CANCELLING_LEVELS`' seven products on their keys' first dimension for a forked call
-    over `FORKED`'s table, as its route and its oracle read them alike: the first head's first value column
-    scaled by a drawn sign and a power of two of 2^-28 to 2^-33 a draw, so even a row's three writes' terms
-    sum inside float32's range, as the gates' sums must (testing.md's derivative contracts), their ties kept,
-    and every other column zero, so an entry key's gradient is one product of the levels' (rounded once, as
+    over `FORKED`'s table, as its route and its oracle read them alike: one value coordinate a key head, a
+    value head of its group and a column, both moving with the seed so the draws visit every one, scaled by
+    a drawn sign and a power of two of 2^-28 to 2^-33 a draw, so even a row's three writes' terms sum inside
+    float32's range, as the gates' sums must (testing.md's derivative contracts), their ties kept, and every
+    other coordinate zero, so an entry key's gradient is one product of the levels' (rounded once, as
     float64's: summed over a key head's value heads and columns, float32 rounded each term, 1.9 to 2.6 times
-    the rounded truth's distance); weights of
-    another, each document's signed by the memory it enters (`_entered_signs`), so every memory is zero, one
-    or two writes, a stored one cancelled exactly among them; and cotangents (`Entries.signed`) of one power
-    of two a draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds once, as
-    float64's."""
+    the rounded truth's distance; one fixed coordinate left a dropped write elsewhere unseen, row 9531);
+    weights of another, each document's signed by the memory it enters (`_entered_signs`), so every memory
+    is zero, one or two writes, a stored one cancelled exactly among them; and cotangents (`Entries.signed`)
+    of one power of two a draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds
+    once, as float64's."""
     rows, documents = len(FORKED), len(FORKED[0][0])
     rng = np.random.default_rng([8840, seed])
     factors, levels = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
     key = np.zeros((rows, documents, len(factors), key_heads, keys), np.float32)
     key[..., 0] = factors[:, None]
-    columns = np.zeros((heads, values))
-    columns[0, 0] = rng.choice([-1.0, 1.0]) * 2.0 ** -int(rng.integers(28, 34))
+    group, columns = heads // key_heads, np.zeros((heads, values))
+    columns[np.arange(key_heads) * group + seed % group, seed // group % values] = (
+        rng.choice([-1.0, 1.0], key_heads) * 2.0 ** -int(rng.integers(28, 34)))
     value = np.broadcast_to(levels[:, None, None] * columns, (rows, documents, len(levels), heads, values))
     signs = _entered_signs(rng.choice([-1.0, 1.0], (rows, heads)))
     scale = 2.0 ** -int(rng.integers(10, 15))
