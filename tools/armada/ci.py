@@ -1401,18 +1401,13 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     return told(out, code)
 
 
-def red_exit() -> int:
-    """The exit a task gives where a row it wrote is red: its commit's .armada.json's task.redExit, which
-    armada reads as the rows written, a packed task rerun alone; 0 where it names none, the rows its verdict."""
-    return int(json.loads((REPO / ".armada.json").read_text()).get("task", {}).get("redExit", 0))
-
-
 def told(out: Path, code: int) -> int:
-    """`code`, else `red_exit` where a row is red, the task's verdict `out` said last: each red row, its name
-    and its output's first lines (why it is red, its signal and the file it reached: `tested`) and last (what
-    pytest said last). armada keeps a task's log tail beside its exit, and a map task's verdict reaches no
-    report but its judge's red row, which names that tail (Main, 2026-11-09: a map task "exited 1 after 437
-    s", its row's "pytest exited -9" kept in its output alone)."""
+    """`code`, else its commit's .armada.json's task.redExit (0 where it names none: the rows its verdict),
+    which armada reads as the rows written, a packed task rerun alone, where a row is red; the task's verdict
+    `out` said last: each red row, its name and its output's first lines (why it is red, its signal and the
+    file it reached: `tested`) and last (what pytest said last). armada keeps a task's log tail beside its
+    exit, and a map task's verdict reaches no report but its judge's red row, which names that tail (Main,
+    2026-11-09: a map task "exited 1 after 437 s", its row's "pytest exited -9" kept in its output alone)."""
     rows = json.loads(out.read_text())["rows"]
     for found in rows:
         if found["exitCode"]:
@@ -1420,7 +1415,8 @@ def told(out: Path, code: int) -> int:
             shown = (lines if len(lines) <= 2 * TOLD_LINES
                      else [*lines[:TOLD_LINES], "...", *lines[-TOLD_LINES:]])
             print("\n".join([f"RED {found['name']}", *(f"  | {line}" for line in shown)]), flush=True)
-    return code or (red_exit() if any(found["exitCode"] for found in rows) else 0)
+    red = int(json.loads((REPO / ".armada.json").read_text()).get("task", {}).get("redExit", 0))
+    return code or (red if any(found["exitCode"] for found in rows) else 0)
 
 
 TOLD_LINES = 5
