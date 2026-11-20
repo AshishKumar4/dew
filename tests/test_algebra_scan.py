@@ -1389,8 +1389,8 @@ def test_a_two_sided_decays_pairs_across_a_sub_chunk_are_decayed_before_they_are
               "v": at((CHUNK, VALUE), ((0, 0), 1.0), ((1, 0), 1.0)), "g": jnp.zeros((CHUNK, KEY)),
               "e": at((CHUNK, VALUE), ((SUB, 0), -2.0)), "beta": jnp.ones((CHUNK,))}
     with generation.assumed("sm90"):
-        base2 = dataclasses.replace(TWO_SIDED_FORMS, update=functools.partial(two_sided, exponential=jnp.exp2),
-                                    readout=plain_readout)
+        update = functools.partial(two_sided, exponential=jnp.exp2)
+        base2 = dataclasses.replace(TWO_SIDED_FORMS, update=update, readout=plain_readout)
         forms = scan.derive_scan(base2, saturation=SATURATION)
         outputs = forms.mapped(forms.prepare(values), forms.init({}))
     assert float(outputs[reader, 0]) == 2.0 ** 126
