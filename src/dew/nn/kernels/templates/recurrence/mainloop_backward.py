@@ -78,13 +78,13 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     float64 against the portable math's 3.1e-7), take none. A decay a key dimension's form takes each
     sub-chunk's own pairs each their own decay (`algebra.key_diagonal_pairs_back`)."""
     dtype = jnp.dtype(dtype)
-    if dtype == jnp.float32 and not rounded:
+    if per_key and dtype == jnp.float32 and not rounded:
         return False
     if delta:
         return True
     if per_key or dtype == jnp.float16:
         return False
-    return rounded or not wide
+    return rounded or dtype == jnp.float32 or not wide
 
 
 class Kept(NamedTuple):
@@ -160,9 +160,9 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     (`_tabled_gradients`, `_entered_gradient`), None for another."""
     dtype = jnp.result_type(q, k, v)
     if not fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=jnp.dtype(do.dtype) != dtype):
-        raise NotImplementedError("the fast backward takes the delta rule, or a bf16 call without it and a "
-                                  "decay a head (its output's gradient bf16 where it is not rounded), an "
-                                  "fp32 call's under the run's fast forms alone")
+        raise NotImplementedError("the fast backward takes the delta rule (under a decay a key dimension "
+                                  "not in fp32 three-part form), or a bf16 or fp32 call without it and a "
+                                  "decay a head (a bf16 call's output gradient bf16 where not rounded)")
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
                    firsts=firsts, rounded=rounded, apart=apart, values_gated=values_gated,
