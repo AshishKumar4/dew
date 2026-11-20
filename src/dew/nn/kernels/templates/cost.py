@@ -42,10 +42,76 @@ class Stated:
     (`emission.costed`): the steps of its walks, every consumer's over the call's batch and heads (`steps`,
     attention's `walked_steps`, the recurrence's `launch_kernel`'s: a laid call's mean chunks a sequence over
     its sequences), the trips its data decides, which the count multiplies a step's work by; and the bytes it
-    reads and writes, each of its operands and outputs once (`bytes_accessed`, `estimate`'s)."""
+    reads and writes, each of its operands and outputs once (`bytes_accessed`, `estimate`'s); and the most
+    steps one of its programs walks (`longest`, its critical path) where its programs walk unequal shares (a
+    causal walk's tiles), None where each walks their mean."""
 
     steps: float
     bytes_accessed: int
+    longest: float | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Chain:
+    """One dependent path through a tile walk, counted, its latencies a part's (`chained`): its dependent
+    reductions (`span`, each `GpuTarget.kernel_step_seconds`), the warpgroup products it waits on (`products`)
+    and their columns (`columns`, each a 16-bit step of 64 of their depth), its warpgroups' barrier round
+    trips (`barriers`), and the tile copies it waits on (`copies`, their `copy_bytes`) through a ring of
+    `stages`, whose S - 1 steps ahead hide what of a copy a step outlasts. A walk of K such steps counts K
+    times each and keeps its stages."""
+
+    span: float = 0.0
+    products: float = 0.0
+    columns: float = 0.0
+    barriers: float = 0.0
+    copies: float = 0.0
+    copy_bytes: float = 0.0
+    stages: int = 1
+
+    def then(self, other: "Chain") -> "Chain":
+        """This path followed by `other`: their events one after another, waited through the one ring a walk's
+        loops share (the shallower one's where both wait on copies through rings apart, which hides less)."""
+        stages = (min(self.stages, other.stages) if self.copied and other.copied
+                  else self.stages if self.copied else other.stages)
+        return Chain(**{name: getattr(self, name) + getattr(other, name) for name in _COUNTED}, stages=stages)
+
+    @property
+    def copied(self) -> bool:
+        """Whether the path waits on a tile copy."""
+        return bool(self.copies or self.copy_bytes)
+
+    def times(self, count: float) -> "Chain":
+        """This path walked `count` times: each event's count multiplied, its ring the same."""
+        return dataclasses.replace(self, **{name: getattr(self, name) * count for name in _COUNTED})
+
+    def outlasts(self, other: "Chain") -> bool:
+        """Whether this path takes at least `other`'s time at every part's latencies: at least as many of each
+        event, and its copies through no more stages, unless `other` waits on none."""
+        counted = all(getattr(self, name) >= getattr(other, name) for name in _COUNTED)
+        return counted and (self.stages <= other.stages or not other.copied)
+
+
+_COUNTED = ("span", "products", "columns", "barriers", "copies", "copy_bytes")
+
+
+def _kept(chains: tuple[Chain, ...]) -> tuple[Chain, ...]:
+    """`chains` but each another outlasts (`Chain.outlasts`), in their order, one of equal chains kept: the
+    longest of them at any part's latencies is the longest of these, so the pruning prices nothing less."""
+    kept: list[Chain] = []
+    for chain in chains:
+        if any(held.outlasts(chain) for held in kept):
+            continue
+        kept = [held for held in kept if not chain.outlasts(held)] + [chain]
+    return tuple(kept)
+
+
+def followed(first: tuple[Chain, ...], then: tuple[Chain, ...]) -> tuple[Chain, ...]:
+    """The paths of `first`'s work followed by `then`'s, run one after the other: each of the one's paths
+    then each of the other's (`Chain.then`), each another outlasts left out; either's where the other has
+    none."""
+    if not (first and then):
+        return first or then
+    return _kept(tuple(one.then(other) for one in first for other in then))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,7 +127,9 @@ class Work:
     latency in XLA's schedule (`dew.algebra.cost.Fused`). The algebra's terms and a template's instructions
     both price through it; a schedule turns it into seconds by the work-span model (Brent's): the larger of
     its work at its units' rates and its span at a dependent step's latency, XLA's fusion's
-    (`dew.algebra.cost.fused`) or a template's tile walk (`walked`)."""
+    (`dew.algebra.cost.fused`) or a template's tile walk (`walked`). A walk's dependent paths, counted by the
+    events they wait on (`chains`, `Chain`), price at the part's latencies where it measured them
+    (`chained`)."""
 
     flops: float = 0.0
     operations: float = 0.0
@@ -78,23 +146,28 @@ class Work:
     operands and results in (`dew.algebra.cost.work`'s: a leaf's read once, a reduction's and a product's
     result written once and read once): a TPU's VMEM, at its rate (`GpuTarget.vmem_rate`); a GPU's on-chip
     copies, which no rate prices (`rates`)."""
+    integer_operations: float = 0.0
+    """32-bit integer operations a CUDA multiprocessor's ALU issues (add, shift, logic, comparison), beside
+    its fp32 lanes at its own rate (`Architecture.integer_per_clock`)."""
+    chains: tuple[Chain, ...] = ()
 
     def __add__(self, other: "Work") -> "Work":
         # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
         # which the term that chains them states (`dew.algebra.linear_scan`).
-        return Work(self.flops + other.flops, self.operations + other.operations,
-                    self.exponentials + other.exponentials, self.conversions + other.conversions,
-                    self.device_bytes + other.device_bytes, self.shared_bytes + other.shared_bytes,
-                    self.tf32_flops + other.tf32_flops, max(self.span, other.span),
-                    self.fp8_flops + other.fp8_flops, self.kernels + other.kernels,
-                    self.kept_bytes + other.kept_bytes)
+        summed = {field.name: getattr(self, field.name) + getattr(other, field.name)
+                  for field in dataclasses.fields(Work) if field.name not in ("span", "chains")}
+        # Each path no other outlasts, the side with none's kept as the other's.
+        chains = (_kept(self.chains + other.chains) if self.chains and other.chains
+                  else self.chains or other.chains)
+        return Work(**summed, span=max(self.span, other.span), chains=chains)
 
 
 class Rates(NamedTuple):
     """A target's rate of each unit `units` prices, per second (`rates`), read by name: the tensor cores'
     16-bit, TF32 and FP8 modes, the CUDA cores, the special-function units, shared memory, the on-chip memory
-    XLA's fusion keeps its kernels' operands and results in, and device memory; None where the target
-    states none. Named, so a unit added among them misreads no consumer (the review of train 1074, F5)."""
+    XLA's fusion keeps its kernels' operands and results in, the integer units (a CUDA multiprocessor's
+    ALU) and device memory; None where the target states none. Named, so a unit added among them misreads
+    no consumer (the review of train 1074, F5)."""
 
     tensor: float | None
     tf32: float | None
@@ -103,6 +176,7 @@ class Rates(NamedTuple):
     special: float | None
     shared: float | None
     kept: float | None
+    integer: float | None
     device: float | None
 
 
@@ -111,15 +185,15 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
     """`target`'s rate of each unit `units` prices, per second: the tensor cores' 16-bit, TF32 and FP8 modes
     (FP8's the 16-bit one's where the generation states none, its codes unpacked into 16-bit products), the
     vector units (the CUDA cores, a TPU's VPU), the special-function units, shared memory, the on-chip memory
-    XLA's fusion keeps its kernels' operands and results in (`Work.kept_bytes`) and device memory. Each is a
-    multiprocessor's at the clock the target holds under a step's tensor-core load
-    (`GpuTarget.loaded_clock_hz`: a B200's measured 1.549 GHz, not its 1.965 GHz boost), or with `device`
-    the whole device's (its multiprocessors at that clock, the tensor cores at its datasheet's dense peak
-    where it states no clock), where a tile walk's device bytes and XLA's fusion's staged bytes cost nothing
-    (infinite). What XLA's fusion keeps on chip is a TPU's VMEM traffic, with `device` at its VMEM rate
-    (`GpuTarget.vmem_rate`), and nothing a GPU's or a tile walk's (infinite). None for a unit the target
-    states no rate of (a TPU's vector and transcendental units, an unmeasured TPU's VMEM, a datasheet's
-    missing clock)."""
+    XLA's fusion keeps its kernels' operands and results in (`Work.kept_bytes`), the integer units (a CUDA
+    multiprocessor's ALU, `Architecture.integer_per_clock`) and device memory. Each is a multiprocessor's at
+    the clock the target holds under a step's tensor-core load (`GpuTarget.loaded_clock_hz`: a B200's
+    measured 1.549 GHz, not its 1.965 GHz boost), or with `device` the whole device's (its multiprocessors at
+    that clock, the tensor cores at its datasheet's dense peak where it states no clock), where a tile walk's
+    device bytes and XLA's fusion's staged bytes cost nothing (infinite). What XLA's fusion keeps on chip is a
+    TPU's VMEM traffic, with `device` at its VMEM rate (`GpuTarget.vmem_rate`), and nothing a GPU's or a tile
+    walk's (infinite). None for a unit the target states no rate of (a TPU's vector and transcendental units,
+    an unmeasured TPU's VMEM, a datasheet's missing clock, an integer rate unread)."""
     clock = target.loaded_clock_hz
     if not device:
         each = clock
@@ -139,20 +213,22 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
     return Rates(tensor=tensor, tf32=rate(target.tensor_rate("tf32")), eight=eight,
                  cuda=rate(architecture.vector_per_clock), special=rate(architecture.exponentials_per_clock),
                  shared=math.inf if device else rate(None if held is None else held.shared_bytes_per_clock),
-                 kept=kept, device=target.memory_rate if device else math.inf)
+                 kept=kept, integer=rate(architecture.integer_per_clock),
+                 device=target.memory_rate if device else math.inf)
 
 
 def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
     """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit, TF32 and
     FP8 modes in turn), the CUDA cores (operations and conversions), the special-function units, on-chip
     memory (shared memory's bytes, then what XLA's fusion keeps there, one memory's two levels, so a TPU's
-    one VMEM is one unit) and device memory; and, level by level, the work at a rate the target states none
+    one VMEM is one unit), device memory and the integer units; and, level by level, the work at a rate the
+    target states none
     of, which no time prices (0 where one does)."""
     grouped = (((work.flops, at.tensor), (work.tf32_flops, at.tf32), (work.fp8_flops, at.eight)),
                ((work.operations + work.conversions, at.cuda),),
                ((work.exponentials, at.special),),
                ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
-               ((work.device_bytes, at.device),))
+               ((work.device_bytes, at.device),), ((work.integer_operations, at.integer),))
     priced = [sum((amount / per_second for amount, per_second in unit if amount and per_second is not None),
                   0.0) for unit in grouped]
     unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped for amount, per_second in unit)
@@ -174,13 +250,38 @@ def step_latency(target: generation.GpuTarget, *, device: bool) -> float | None:
     return target.step_seconds if device else target.kernel_step_seconds
 
 
+def path(work: Work, target: generation.GpuTarget) -> float:
+    """The seconds of `work`'s longest dependent path in a template's walk: its span at an in-kernel step's
+    latency (`spanned`) or its longest chain at the part's latencies (`chained`), the larger; the one peak
+    every price of a walk reads, the greedy (`walked`) and the algebra's exact extractor's
+    (`dew.algebra.cost.Walk.spanned`) alike."""
+    return max(spanned(work, step_latency(target, device=False))[0], chained(work, target))
+
+
+def chained(work: Work, target: generation.GpuTarget) -> float:
+    """The longest of `work`'s paths (`Work.chains`) at `target`'s part's latencies: a path's events waited
+    one after another, C, and its copies, L, waited past what its ring hides, max(C, (L + C) / stages); an
+    event the part measured no latency of priced by none (`GpuTarget.product_latency`, `barrier_seconds`,
+    `copy_latency`, `kernel_step_seconds`)."""
+    step = target.kernel_step_seconds or 0.0
+    fixed, per_column = target.product_latency or (0.0, 0.0)
+    barrier = target.barrier_seconds or 0.0
+    copied, per_byte = target.copy_latency or (0.0, 0.0)
+
+    def seconds(chain: Chain) -> float:
+        waited = (chain.span * step + chain.products * fixed + chain.columns * per_column
+                  + chain.barriers * barrier)
+        return max(waited, (chain.copies * copied + chain.copy_bytes * per_byte + waited) / chain.stages)
+
+    return max(map(seconds, work.chains), default=0.0)
+
+
 def walked(work: Work, target: generation.GpuTarget) -> float:
     """The seconds a program of a template's tile walk spends on `work` by the work-span model: its units'
     work overlapped, each at its rate on one multiprocessor, the longest unit's time (`units`), or its span
     at an in-kernel step's latency where longer (`spanned`); its device bytes the launch's, which a form of
-    its algebra does not change."""
-    return max(*units(work, rates(target, device=False))[0],
-               spanned(work, step_latency(target, device=False))[0])
+    its algebra does not change; or its longest dependent path where longer (`path`)."""
+    return max(*units(work, rates(target, device=False))[0], path(work, target))
 
 
 def seconds(work: Work, target: generation.GpuTarget) -> float:
@@ -190,6 +291,5 @@ def seconds(work: Work, target: generation.GpuTarget) -> float:
     where unmeasured): a server's price of a step (`attention_decode.priced_step`), where `walked` is one
     program's."""
     launch = target.launch_seconds or 0.0
-    worked = max(*units(work, rates(target, device=True))[0],
-                 spanned(work, step_latency(target, device=False))[0])
+    worked = max(*units(work, rates(target, device=True))[0], path(work, target))
     return worked + work.kernels * launch

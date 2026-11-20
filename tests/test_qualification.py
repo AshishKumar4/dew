@@ -10,6 +10,7 @@ from check1_wire import LATER, QUALIFY
 from reference_error import StaleSeeds, as_given, assert_as_exact, seeds_for
 from truths_ahead import compiled_truths
 
+from dew.parity import SIZING_FROM
 from dew.parity_stages import staged_units
 
 LABEL = "a reversed dot"
@@ -97,6 +98,42 @@ def test_a_site_judged_from_its_prepared_truths_sizes_itself_in_its_run(monkeypa
     records = [json.loads(line) for line in (tmp_path / "qualified.jsonl").read_text().splitlines()]
     found = [(record["declared"], record["sized"]) for record in records]
     assert found == [(sized, sized), (sized // 2, sized)]
+
+
+def test_an_accuracy_claims_site_sizes_its_bound_as_written_too(monkeypatch, tmp_path):
+    """A site whose reference is written apart from Dew (an accuracy claim, its reference compiled as written
+    too, `reference_error._written_twin`) sizes under `QUALIFY` both pairs it is judged by, Dew against its
+    reference compiled alike and against it as written (`seeds_for`'s `written`), and declares the larger,
+    run live and from programs its prepare compiled under `QUALIFY`, the twin's at its sizing draws' own
+    shapes too (pilots of another length than its verdict's draws): the as-written head's review, its sizing
+    took the pair compiled alike alone and its prepare compiled no twin at a sizing draw's shape."""
+    _, _, truth, verdict_draw = site()
+
+    def draw(seed):
+        # A pilot (from SIZING_FROM on) of 48 values, a verdict's of 64.
+        x, w = verdict_draw(seed)
+        return (x[:48], w[:48]) if seed >= SIZING_FROM else (x, w)
+
+    def dot(x, w):
+        return jnp.dot(x, w)
+
+    def reference(x, w):
+        # Its own, written apart from Dew: the dot of `x` at bfloat16's precision, far from the truth beside
+        # Dew's, so each pair resolves at few seeds whichever way it compiles.
+        return jnp.dot(x.astype(jnp.bfloat16).astype(jnp.float32), w)
+
+    alike = seeds_for(reference, draw, LABEL, dew_fn=dot, truth_fn=truth)
+    written = seeds_for(reference, draw, LABEL, dew_fn=dot, truth_fn=truth, written=True)
+    declared = max(alike, written)
+    store = tmp_path / "store"
+    monkeypatch.setenv(QUALIFY, str(tmp_path / "qualified.jsonl"))
+    with compiled_truths(store, prepare=True, stamp="here"):
+        assert_as_exact(dot, reference, draw, LABEL, seeds=declared, truth_fn=truth)
+    assert_as_exact(dot, reference, draw, LABEL, seeds=declared, truth_fn=truth)
+    with compiled_truths(store, prepare=False, stamp="here"):
+        assert_as_exact(dot, reference, draw, LABEL, seeds=declared, truth_fn=truth)
+    records = [json.loads(line) for line in (tmp_path / "qualified.jsonl").read_text().splitlines()]
+    assert [(record["sized"], record["sized as written"]) for record in records] == [(declared, written)] * 2
 
 
 def test_a_compiled_sites_run_draws_its_second_stage_from_its_programs(tmp_path, monkeypatch):

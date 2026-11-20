@@ -22,7 +22,7 @@ from arm_arithmetic import float64_held
 from checkpoint_cases import LENGTH, PATHS, ROWS, loaded, tokens
 from flax import linen as nn
 from model_support import float64_twin, floating_gradient, stepped_outputs
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, dew_path
 from tool_support import load
 
 from dew.nn.attention_residuals import AttentionResiduals
@@ -217,7 +217,7 @@ def _steps_its_forward(model, variables, inputs, **apply) -> None:
     from the model's float64 twin over drawn inputs (`_against_its_twin`)."""
     variables, top, record, twin, wide = _against_its_twin(model, variables)
     assert_as_exact(lambda *drawn: _call(top, variables, drawn, **apply),
-                    lambda *drawn: _call(model, variables, drawn, **apply),
+                    dew_path(lambda *drawn: _call(model, variables, drawn, **apply)),
                     lambda seed: _redrawn(inputs, seed), f"forward at {record}", seeds=RUNG_SEEDS,
                     truth_fn=lambda *drawn: _call(twin, wide, drawn, **apply))
 
@@ -229,11 +229,12 @@ def _steps_its_gradient(name: str, model, variables, inputs, **apply) -> None:
     parameter its own leaf (`_against_its_twin`), at the setting its truth resolves (`judged`)."""
     variables, top, record, twin, wide = _against_its_twin(model, variables)
     assert_as_exact(lambda *drawn: _stepped(judged(top), variables, drawn, **apply),
-                    lambda *drawn: _stepped(judged(model), variables, drawn, **apply),
+                    dew_path(lambda *drawn: _stepped(judged(model), variables, drawn, **apply)),
                     lambda seed: _redrawn(inputs, seed), f"gradient at {record}", seeds=GRADIENT_SEEDS[name],
                     truth_fn=lambda *drawn: _stepped(judged(twin), wide, drawn, **apply))
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", PATHS)
 def test_a_checkpoints_remat_rungs_climb_and_restore(name):
     source = loaded(name)
@@ -244,6 +245,7 @@ SCANNED = ("qwen35-tiny", "qwen35-native-tiny", "qwen35-blocks-tiny", "qwen38-mo
 """Hybrid checkpoints whose decoders scan by period, a gated delta net's rung read in the scan's body."""
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", SCANNED)
 def test_a_scanned_checkpoints_remat_rungs_climb(name):
     """A decoder that scans its runs (`scan_layers`, a period of delta nets and attention one body) climbs
@@ -254,12 +256,14 @@ def test_a_scanned_checkpoints_remat_rungs_climb(name):
                          method="logits")
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", PATHS)
 def test_a_checkpoints_top_rung_steps_its_forward_as_it_does(name):
     source = loaded(name)
     _steps_its_forward(source.model, source.variables, (tokens(name),), method="logits")
 
 
+@pytest.mark.shared_setup("models", by=r"[a-z0-9_+]+(?:-[a-z0-9_+]+)*")
 @pytest.mark.parametrize("name", [name for name in PATHS if name in GRADIENT_SEEDS])
 def test_a_covering_checkpoints_top_rung_steps_its_gradient_as_it_does(name):
     source = loaded(name)
@@ -311,7 +315,7 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
             return output, pull(cotangent)[0]
         return run
 
-    assert_as_exact(jax.jit(stepped(scanned)), jax.jit(stepped(plain)), draw,
+    assert_as_exact(jax.jit(stepped(scanned)), dew_path(jax.jit(stepped(plain))), draw,
                     "a scanned, rematerialized continuum decoder", seeds=CONTINUUM_SEEDS,
                     truth_fn=stepped(float64_twin(plain)))
 
@@ -332,8 +336,10 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
 
     forward = jax.jit(plain.apply)
 
+    # The full passes at the shapes the decode's steps compute, one token each from an empty cache: the same
+    # model, one of Dew's own paths (`dew_path`), an invariance claim.
+    @dew_path
     def passes(variables, drawn, _):
-        # The full passes at the shapes the decode's steps compute, one token each from an empty cache.
         return stepped_outputs(lambda length: forward(variables, drawn[:, :length]), LENGTH, 1)
 
     assert_as_exact(jax.jit(decoded(plain)), passes, draw,
