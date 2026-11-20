@@ -835,6 +835,36 @@ def test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term(training, main
                     lambda seed: operands, "a kept anchor below fp16's least subnormal", seeds=FEWEST_SEEDS)
 
 
+def test_an_fp16_reference_dropping_products_mixed_derivatives_are_its_products():
+    """The reference's fp16 dropping product of narrowed weights (`attention.reference`'s wide cotangent) is
+    bilinear at every order: one fp16 query over keys at logits 0 and 1, values 0 and v, at a rate of 1/2
+    under a draw dropping the first key and keeping the second, whose output is 2 sigmoid(q) v where q is
+    the query's logit difference: its mixed second derivative as to the query and the kept value, each order
+    of the two, on par with float64's (check 1), where each operand's derivative path stopped the other's
+    and took it to zero (the head review of af043f9b1, F1)."""
+    rate = 0.5
+    words = first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1]))
+    spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(1)
+
+    def output(q, v):
+        query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[0, 0, 0, 0].set(q.astype(jnp.float16))
+        value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(v.astype(jnp.float16))
+        return template.reference(query, key, value, spans, hooks, scale=1.0)[0, 0, 0, 0].astype(jnp.float32)
+
+    def mixed(q, v):
+        by_value_of_query = jax.grad(jax.grad(output, argnums=0), argnums=1)(q, v)
+        by_query_of_value = jax.grad(jax.grad(output, argnums=1), argnums=0)(q, v)
+        return jnp.stack([by_value_of_query, by_query_of_value])
+
+    def truth(q, v):
+        sigmoid = 1 / (1 + jnp.exp(-q))
+        return jnp.stack([2 * sigmoid * (1 - sigmoid)] * 2) * jnp.ones_like(v)
+
+    assert_as_exact(mixed, truth, lambda seed: (jnp.float32(0.0), jnp.float32(1.0)),
+                    "an fp16 dropping product's mixed derivatives", seeds=FEWEST_SEEDS, truth_fn=truth)
+
+
 def test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_gradients():
     """`test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term`'s call through the Mosaic backward from
     its forward's split sums (`attention_mosaic_backward`'s D, which reads the anchor's own weight they

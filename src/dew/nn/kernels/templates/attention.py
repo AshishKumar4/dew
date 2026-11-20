@@ -1313,14 +1313,15 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                                   preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
 
         grouped = weights.reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
+        narrowed = product(grouped.astype(value.dtype), value)
         if not cotangent_wide:
-            return product(grouped.astype(value.dtype), value)
-        narrowed = product(jax.lax.stop_gradient(grouped).astype(value.dtype), value)
+            return narrowed
+        # Its value the narrowed product's; its derivatives at every order the same bilinear product's in
+        # fp32, the narrowing straight through, both operands live (`derivative_of`).
         rounded = grouped.astype(value.dtype).astype(grouped.dtype)
-        # The weights' derivative through the narrowing as its identity, in fp32, its value none.
-        weighed = product(grouped + jax.lax.stop_gradient(rounded - grouped),
-                          jax.lax.stop_gradient(value).astype(grouped.dtype))
-        return narrowed + derivative_of(weighed)
+        wide_product = product(grouped + jax.lax.stop_gradient(rounded - grouped),
+                               value.astype(grouped.dtype))
+        return jax.lax.stop_gradient(narrowed) + derivative_of(wide_product)
 
     drop = hooks.drop
     if hooks.rounds is not None:
