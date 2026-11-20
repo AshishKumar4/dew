@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from arm_arithmetic import as_written
+from arm_arithmetic import as_written, products_held
 from low_precision_support import edge_values
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
@@ -1140,13 +1140,13 @@ def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int
     product with its reciprocal and a sum of products into one of unrounded products, so each order is held
     as written and as compiled. As written is op by op (`as_given`, which the gate runs uncompiled) where the
     draw reaches fp32's subnormals (`_reaches_subnormals`), which XLA's CPU keeps one primitive at a time and
-    flushes in a compiled program (row 4023); compiled with no rewrite (`arm_arithmetic.as_written`, its own
-    program, run as given) for every other draw, where op by op compiled each primitive of the
-    merge's windows apart (the cotangent cell 6.81 GiB op by op, 1.28 jitted). The reference runs op by
-    op, so none of those rewrites reaches the bar it sets (row 6909: a compiled reference summing products
-    shared Dew's error)."""
+    flushes in a compiled program (row 4023); compiled with no rewrite, its products held from any fused
+    multiply-add (`arm_arithmetic.as_written`, `products_held`, its own program run as given) for every
+    other draw, where op by op compiled each primitive of the merge's windows apart (the cotangent cell
+    6.81 GiB op by op, 1.28 jitted). The reference runs op by op, so none of those rewrites reaches the bar
+    it sets (row 6909: a compiled reference summing products shared Dew's error)."""
     written = as_given(ours if getattr(draw, "reaches_subnormals", False)
-                       else jax.jit(ours, compiler_options=as_written()))
+                       else jax.jit(products_held(ours), compiler_options=as_written()))
     for program, run in ((jax.jit(ours), "jitted"), (written, "as written")):
         assert_as_exact(program, as_given(reference), draw, f"{label} {run}", seeds=seeds)
 

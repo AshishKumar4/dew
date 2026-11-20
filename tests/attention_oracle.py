@@ -297,3 +297,18 @@ def attention_on_par(fused, reference, draw, label: str, *, keep=None, softcap=N
 
     assert_as_exact(jax.jit(program(fused)), jax.jit(program(reference)), draw, label, seeds=seeds,
                     truth_fn=program(exact), terms=terms)
+
+
+def plain_merged(padded, stacked, *, rate: float, queries: int, width: int):
+    """The plain merge of a split row's slices `padded` `[B, S, R, H, Dv]` (their maxima and denominators
+    `stacked` `[2, B, H, S, R]`) at their first `queries` rows and `width` columns, normalized
+    (flash-decoding's: each slice's output weighed by its denominator times the exponential of its maximum,
+    taken to natural units by `rate`, over the largest held, summed and divided), as JAX differentiates it:
+    independent of the merge law. A slice of zero total weighs nothing and the weight's derivative along that
+    total is its factor, the law's (row 7124)."""
+    out = padded[:, :, :queries, :, :width]
+    maxima, totals = (jnp.moveaxis(x[..., :queries], 1, 3) for x in (stacked[0], stacked[1]))
+    top = jax.lax.stop_gradient(jnp.max(maxima, axis=1, keepdims=True))
+    weights = jnp.exp((maxima - top) * rate) * totals
+    mass = jnp.sum(weights, axis=1)
+    return jnp.sum(weights[..., None] * out, axis=1) / jnp.where(mass > 0, mass, 1.0)[..., None]

@@ -3,11 +3,14 @@
 computes on (`float64_host`), its inputs (`widened`) and its compiled program (`Truth`)."""
 
 import contextlib
+import functools
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.core import eval_jaxpr
+from jax.extend import core as jcore
 from jax.extend.core import primitives
 
 from dew.nn import programs
@@ -166,34 +169,85 @@ def summed_as_run():
     return contextlib.nullcontext()
 
 
-AS_WRITTEN = {"cpu": "algsimp,constant_folding,fusion,cpu-instruction-fusion,reduction-splitter,"
-                     "multi_output_fusion",
-              "gpu": "algsimp,constant_folding,fusion,priority-fusion,multi_output_fusion,"
-                     "horizontal-loop-fusion,horizontal-input-fusion",
-              "tpu": "algsimp,constant_folding,fusion,multi_output_fusion"}
-"""XLA's passes a reference arm and a float64 truth compile without (`as_written`), by backend: its
-algebraic simplifier, which rewrites (A/B)/C as A/(B*C) and divides by a broadcast through its reciprocal;
-its constant folding, which computes at compile time what the program computes when it runs (and, without
-the simplifier, XLA:CPU's raises SIGFPE on an operation of no elements: an MXFP8 step over an empty group);
-and its fusions, which sum a product unrounded beside its rounded opposite (a fused multiply-add), so equal
-and opposite terms do not cancel. With them a reference carries the rewrite Dew's arm, compiled by the same
-XLA, carries too, and check 1 holds the two on par wherever both are wrong (a merge of +-2^127 and a least
-normal: 3.6e30 where the truth is 1.2e-38, row 6909). Without them each operation is as written, still
-compiled: the platform's own compiled semantics (XLA:CPU flushes a compiled program's subnormals, Dew's arm's
-and the reference's alike, where an operation run alone keeps them) at a compiled program's cost (armada, a
-transformer block's gradient: 3.4 ms a draw, 9.9 ms with the passes, 43 ms an operation at a time). The GPU's
-names are its fusion passes', read on the GPU tier; the TPU's, the open pipeline's, on the TPU tier."""
+AS_WRITTEN = {"cpu": "algsimp,constant_folding,reduction-splitter,multi_output_fusion",
+              "gpu": "algsimp,constant_folding,multi_output_fusion,horizontal-loop-fusion,"
+                     "horizontal-input-fusion",
+              "tpu": "algsimp,constant_folding,multi_output_fusion"}
+"""XLA's passes a reference's twin compiles without (`as_written`), by backend: its algebraic simplifier,
+which rewrites (A/B)/C as A/(B*C) and divides by a broadcast through its reciprocal; its constant folding,
+which computes at compile time what the program computes when it runs (and, without the simplifier,
+XLA:CPU's raises SIGFPE on an operation of no elements: an MXFP8 step over an empty group); and a
+reduction's split, which reorders its sum. With them a reference carries the rewrite Dew's arm, compiled by
+the same XLA, carries too, and check 1 holds the two on par wherever both are wrong (a merge of +-2^127 and a
+least normal: 3.6e30 where the truth is 1.2e-38, row 6909). A fusion's one effect on a value, summing a
+product unrounded beside another term (a fused multiply-add: so equal and opposite terms do not cancel), is
+held by its products' barriers (`products_held`), the fusions kept: a twin compiled without them ran every
+operation as a kernel of its own, a delta net's nvfp4 gradient's 1,929 s and past 10 GiB where main's
+reference ran in 42 s (test_joined, train 1099). The GPU's names are its passes', read on the GPU tier; the
+TPU's, the open pipeline's, on the TPU tier."""
+
+UNFUSED = {"cpu": "fusion,cpu-instruction-fusion",
+           "gpu": "fusion,priority-fusion",
+           "tpu": "fusion"}
+"""The fusion passes a twin also compiles without where the gate cannot hold its products (`as_written`'s
+`held`: an arm running Dew's own programs, whose compile point compiles them, `arm_forms._with_options`)."""
+
+PRODUCTS = frozenset({jax.lax.mul_p, jax.lax.square_p, jax.lax.integer_pow_p})
+"""The operations whose float result a fusion may sum unrounded beside another term (a fused multiply-add):
+XLA:CPU contracts every product a fused addition reads, which none of its options turns off (armada,
+2026-11-20: `xla_cpu_enable_fast_math` and the `xla_cpu_fast_math_honor_*` options each left a fused
+`a * b + c` contracted, as a `reduce_precision` to the product's own format and an added zero did, both
+elided); a product behind an optimization barrier stays rounded, its readers a fusion of their own."""
 
 
-def as_written(platform: str | None = None) -> dict:
+def as_written(platform: str | None = None, *, held: bool = True) -> dict:
     """The compiler options that compile a program as written on `platform` (`AS_WRITTEN`; where none is
     named, the platform the context places a call on, `generation.placed_platform`: a GPU tier part's prepare
     places its programs on its compile-only GPU; a device's `platform` where a program runs on one): each of
-    its operations as it is, none rewritten with another or fused with it."""
+    its operations as it is, none rewritten with another; its fusions kept where its products are `held`
+    (`products_held`), else compiled without them too (`UNFUSED`)."""
     from dew.nn.kernels.generation import placed_platform
 
     platform = platform or placed_platform()
-    return {"xla_disable_hlo_passes": AS_WRITTEN["gpu" if platform in ("cuda", "rocm", "gpu") else platform]}
+    backend = "gpu" if platform in ("cuda", "rocm", "gpu") else platform
+    passes = AS_WRITTEN[backend] if held else f"{AS_WRITTEN[backend]},{UNFUSED[backend]}"
+    return {"xla_disable_hlo_passes": passes}
+
+
+def products_held(fn):
+    """`fn` computing as it traces, each float product (`PRODUCTS`) its program and the programs within it
+    compute (a call's, a loop's, a branch's) behind an optimization barrier, so a fusion sums none unrounded
+    beside another term: what a twin as written compiles, its fusions kept (`AS_WRITTEN`)."""
+    @functools.wraps(fn)
+    def held(*inputs, **options):
+        closed, shapes = jax.make_jaxpr(functools.partial(fn, **options), return_shape=True)(*inputs)
+        return jax.tree.unflatten(jax.tree.structure(shapes), eval_jaxpr(
+            _products_held(closed.jaxpr), closed.consts, *jax.tree.leaves(inputs)))
+    return held
+
+
+def _products_held(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`jaxpr` with each float product's result (`PRODUCTS`) read through an optimization barrier, at every
+    depth (`dew.nn.programs.with_bodies`); a native kernel's body, which XLA never sees, as it is
+    (`programs.opaque`); `jaxpr` itself where it computes no product."""
+    equations, changed = [], False
+    for equation in jaxpr.eqns:
+        if not programs.opaque(equation):
+            params = programs.with_bodies(equation.params, _products_held)
+            if any(params[name] is not value for name, value in equation.params.items()):
+                equation, changed = equation.replace(params=params), True
+        floats = [var for var in equation.outvars if not isinstance(var, jcore.DropVar)
+                  and jnp.issubdtype(var.aval.dtype, jnp.floating)]
+        if equation.primitive in PRODUCTS and floats:
+            (made,) = equation.outvars
+            product = jcore.Var(made.aval)
+            equations += [equation.replace(outvars=[product]),
+                          jcore.new_jaxpr_eqn([product], [made], jax.lax.optimization_barrier_p, {},
+                                              jcore.no_effects, equation.source_info)]
+            changed = True
+            continue
+        equations.append(equation)
+    return jaxpr.replace(eqns=equations) if changed else jaxpr
 
 
 def unrewritten(fn):
@@ -255,7 +309,7 @@ class Written:
 
     def program(self, platform: str):
         if platform not in self._made:
-            self._made[platform] = self.compile(self.fn, compiler_options=as_written(platform))
+            self._made[platform] = self.compile(products_held(self.fn), compiler_options=as_written(platform))
         return self._made[platform]
 
     def __call__(self, *inputs, **options):

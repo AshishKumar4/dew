@@ -13,6 +13,7 @@ import pytest
 from contract_support import (
     EDGES,
     FORWARD_ORDERS,
+    ORDER_SETS,
     REVERSE_ONLY,
     assert_contract,
     assert_drawn_contract,
@@ -127,19 +128,6 @@ def precedent_chunked(query, key, value, g, beta, *, chunk_size: int, starts=Non
             k[:, :, index] * jnp.exp(last[..., None] - decay[:, :, index])[..., None], -1, -2) @ corrected
     out = jnp.stack(outputs, axis=2).reshape(batch, heads, chunks * chunk_size, -1)[:, :, :length]
     return jnp.moveaxis(out, 1, 2)
-
-
-ORDER_SETS = {"first orders": ("primal", "jvp", "vjp"), "jvp of grad": ("jvp of grad",),
-              "second jvp": ("second jvp",), "grad of grad": ("grad of grad",),
-              "second orders, staged": ("jvp of grad, remat", "second jvp, remat", "jvp of grad, nested jit"),
-              "jvp of grad, scanned": ("jvp of grad, scanned",)}
-"""The contract's orders (`contract_support.orders`) a case of the chunked delta rule takes at once: all ten
-in one case took 127 to 156 s near float32's largest, each order's program compiled for itself (row
-4433); the three second orders in one case 172 s over packed documents there (row 5348), so each is a case
-of its own, the scanned one apart from the staged ones (an interpreted selective scan's 170 s alone). The
-derived delta rule's and a turned template call's every order in one case, their rule and references
-dispatched op by op, took 178 to 193 s and 132 s at unit operands (row 9512): each a case an order set, its
-rule and references staged (`jax.jit`)."""
 
 
 INTERPRETED_REMAT = ("jvp of grad, remat", "second jvp, remat") if INTERPRETED else ()

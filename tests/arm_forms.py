@@ -366,7 +366,8 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False, written: bo
     within it (`over_windows`), without YNNPACK's fusions, paired by `pairing` (`_Paired`); a `reference`
     unrewritten (`arm_arithmetic.unrewritten`), but one of Dew's own paths (`dew_path`), which runs under the
     rewrite as Dew's arm does. `written`, compiled as written (`arm_arithmetic.as_written`: none of XLA's
-    rewrites or fusions, the twin an accuracy claim bounds Dew's arm by, `_written_twin`), a `without_ynn`
+    rewrites, its products held from its fusions, the twin an accuracy claim bounds Dew's arm by,
+    `_written_twin`), a `without_ynn`
     program from its own function; else with them, as Dew's arm is."""
     run = unrewritten if reference and not _declared(fn) else _as_is
     if isinstance(fn, _RunToRun):
@@ -374,8 +375,10 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False, written: bo
     fn = _own_function(fn) if written else fn
     if _given(fn) or getattr(fn, "without_ynn", False):
         return run(fn)
-    # As written for the platform each call runs on (`arm_arithmetic.Written`), read where it runs.
-    options = as_written if written else dict
+    # As written for the platform each call runs on (`arm_arithmetic.Written`), read where it runs: an arm
+    # running Dew's own programs, whose products Dew's compile point compiles beyond the gate's hold, without
+    # fusions too (`as_written`'s `held`).
+    options = functools.partial(as_written, held=False) if written else dict
     if getattr(fn, "dew_programs", False):
         plain = _with_options(fn, options) if written else fn
         return run(plain) if compile is jax.jit else _Paired(
