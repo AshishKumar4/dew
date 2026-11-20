@@ -98,7 +98,8 @@ def landing(source: bytes) -> tuple[bytes, bytes, int, int, float]:
         reader = imageio.get_reader(original)
         rate = float(reader.get_meta_data()["fps"])
         every = max(1, round(rate / FPS))
-        frames = [frame for index, frame in enumerate(reader) if index % every == 0][:SECONDS * FPS]
+        frames = [frame for index, frame in enumerate(reader.iter_data())
+                  if index % every == 0][:SECONDS * FPS]
         reader.close()
         height, width = frames[0].shape[:2]
         imageio.mimwrite(cut, frames, fps=FPS, codec="libx264", macro_block_size=1, pixelformat="yuv420p",
@@ -131,7 +132,7 @@ def write(notebook_path: Path, name: str) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("notebook", type=Path, help="the tutorial notebook whose film to show")
     parser.add_argument("name", help="the gallery folder under site/public/gallery/")
     arguments = parser.parse_args()

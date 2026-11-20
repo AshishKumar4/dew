@@ -142,8 +142,13 @@ import time
 import tomllib
 import xml.etree.ElementTree as ET
 from collections import Counter
-from collections.abc import Container, Mapping, Sequence
+from collections.abc import Collection, Container, Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from costs import Cost
+    from session import Entry
 
 
 @functools.cache
@@ -180,13 +185,9 @@ r2 = records.r2
 watched = _loaded(HERE / "watched.py")
 followed = _loaded(HERE / "followed.py")
 progress = _loaded(HERE / "progress.py")
-natives = _loaded(HERE / "natives.py")
-digests = _loaded(HERE / "digests.py")
-grading = _loaded(HERE / "grading.py")
+natives, digests, grading = (_loaded(HERE / f"{name}.py") for name in ("natives", "digests", "grading"))
 host, stalls, temp_roots = (_loaded(HERE / f"{name}.py") for name in ("host", "stalls", "temp_roots"))
-costs = _loaded(HERE / "costs.py")
-cuts = _loaded(HERE / "cuts.py")
-partition = _loaded(HERE / "partition.py")
+costs, cuts, partition = (_loaded(HERE / f"{name}.py") for name in ("costs", "cuts", "partition"))
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
@@ -199,8 +200,7 @@ grouped_rows = rows.grouped_rows
     records.recorded, records.record_of, records.written, records.listed, records.CACHE_PREFIX,
     records.RECORD_TRIES)
 VARIED, varied, cut_of, place_variant = rows.VARIED, rows.varied, rows.cut_of, rows.place_variant
-shares = _loaded(HERE / "shares.py")
-collection = _loaded(HERE / "collection.py")
+shares, collection = (_loaded(HERE / f"{name}.py") for name in ("shares", "collection"))
 gpu_measures = _loaded(HERE / "measures.py")
 GPU_HEADROOM, gpu_needs = gpu_measures.GPU_HEADROOM, gpu_measures.gpu_needs
 apportioned, deadline_shares, task_shares = shares.apportioned, shares.deadline_shares, shares.task_shares
@@ -412,7 +412,7 @@ class Reading:
         if module not in self.modules:
             self.modules[module] = units(module)
         found = self.modules[module]
-        return found.get(executed, digests.MISSING) if isinstance(found, dict) else found
+        return (found.get(executed) or digests.MISSING) if isinstance(found, dict) else found
 
 
 def cache_key(common: str, name: str, split: str, depends: list[str],
@@ -676,7 +676,7 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
             if kept is not None and kept["key"] == key and standing(kept, current):
                 return kept, each
         base = mainline()
-        named = None if base is None else recorded(main_key(base, python, place, each), token)
+        named = {} if base is None else recorded(main_key(base, python, place, each), token) or {}
         main_run = None if not named else recorded(green_key(python, place, each, named["key"]), token)
         if (main_run is not None and main_run["depends"] is not None and main_run["key"] == named["key"]
                 and cache_key(common, name, split, main_run["depends"], reading) == named["key"]
@@ -706,7 +706,7 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
         return None
     place = row(python, name, split)
     if kept is not None:
-        found = recorded(green_key(python, place, *kept), token)
+        found, current = recorded(green_key(python, place, *kept), token), None
         try:
             current = epoch(python, place, kept[0], common, token)[0]
         except Unread:
@@ -995,7 +995,7 @@ def draws_of(mark: Mark, per_task: int | None = None, weighed_per_task: int | No
     return spans + [(start, min(start + weighed, end)) for start in range(mark.units, end, weighed)]
 
 
-def cut_draws(mark: Mark, rates: Mapping[bool, costs.Cost | None], target: float) -> list[tuple[int, int]]:
+def cut_draws(mark: Mark, rates: Mapping[bool, "Cost | None"], target: float) -> list[tuple[int, int]]:
     """The spans of a site's map tasks (`draws_of`): its declared per_task each, or fewer where its
     measured cost (`site_rate`, the unweighted check's and the weighed check's apart, `rates` by whether
     weighed) puts a task of its declared cut past `costs.SITE_TARGETS` of `target`: as many as they hold
@@ -1007,7 +1007,7 @@ def cut_draws(mark: Mark, rates: Mapping[bool, costs.Cost | None], target: float
     within it."""
     most = target * costs.SITE_TARGETS
 
-    def fitting(units: int, declared: int, cost: costs.Cost | None) -> int:
+    def fitting(units: int, declared: int, cost: "Cost | None") -> int:
         return declared if cost is None else max(1, min(units, cost.fitting(declared, most)))
 
     per_task = fitting(mark.units, mark.per_task, rates[False])
@@ -1047,7 +1047,7 @@ def site_task(python: str, name: str, test: str, span: tuple[int, int] | None = 
 
 
 def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]], measured: Mapping[str, float],
-         timings: Mapping[str, float], *, weighed: bool) -> costs.Cost | None:
+         timings: Mapping[str, float], *, weighed: bool) -> "Cost | None":
     """What a map task of test file `name`'s site `test` takes under `python`: its setup and a unit's draws as
     its last judge timed them from its map tasks' records (`timings`, armada's file timings, `site_costs`),
     whatever their sizes; else over those of its map tasks' `spans` that armada measured (under their task
@@ -1062,7 +1062,7 @@ def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]], me
 
 
 def site_rate(python: str, name: str, test: str, mark: Mark, timings: Mapping[str, Mapping[str, float]], *,
-              weighed: bool) -> costs.Cost | None:
+              weighed: bool) -> "Cost | None":
     """What a map task of test file `name`'s site `test` takes under `python` (`rate`), by its judge's records
     of its map tasks (`timings`' files), else over its map tasks of any cut armada measured, by their names
     (`site_task`), each span read from its name's end: its weighed check's units apart from the rest
@@ -1559,7 +1559,7 @@ def evidence_name(python: str, tests: list[str], group: str) -> str:
 
 def watched_pytest(command: list[str], environment: dict[str, str], deadline: float, grace: float, pid: Path,
                    python: str, name: str, began: float
-                   ) -> tuple[int, str, bool, str, set[str], set[str], dict]:
+                   ) -> tuple[int, str, bool, str, set[str] | None, set[str], dict]:
     """pytest run as a task runs it (`ran_pytest`), with the task environment's py-spy reading a stalled run's
     stacks (`stalls.dumped`) and a collector outside it reading those of any process of it a signal ends
     (`natives.Capture`): its exit, output, whether it expired, a stall's stacks, the files it opened and
@@ -1716,7 +1716,7 @@ def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
             for parent in path.parents if parent == digests.FIXTURES or digests.FIXTURES in parent.parents}
 
 
-def wrote_inputs(depends: list[str], changed: Container[str]) -> bool:
+def wrote_inputs(depends: list[str], changed: Collection[str]) -> bool:
     """Whether a run's inputs `depends` (followed.py's records) hold a file `changed` (`watched.changed`:
     written, removed or made) names: a file read, probed or run as a module, or the entries an import's lookup
     finds of its name (`followed.LOOKUP`, `digests.looked_up`). A directory's listing is weighed by none: a
@@ -1769,7 +1769,7 @@ def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[s
     return sorted({*depends, *(path for span in (*first, *later) for path in found[span])})
 
 
-def drawn_whole(spans: list[tuple[int, int]], start: int, stop: int) -> bool:
+def drawn_whole(spans: Sequence[tuple[int, ...]], start: int, stop: int) -> bool:
     """Whether sorted `spans` draw units `start` to `stop` each once, end to end."""
     at = start
     for begin, end in spans:
@@ -1781,7 +1781,7 @@ def drawn_whole(spans: list[tuple[int, int]], start: int, stop: int) -> bool:
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
            opened: set[str] | None = None, unkeyed: Container[str] = (),
-           changed: Container[str] = ()) -> None:
+           changed: Collection[str] = ()) -> None:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
     they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
@@ -1998,8 +1998,8 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     test computes what its run reads and must not compute while it holds the GPU, its float64 truths and
     its programs compiled for the GPU the node's topology names (DEW_NODE_TOPOLOGY), into the store its
     environment names (DEW_TIER_TRUTHS), which the run is given too. Their rows are written to `out` and
-    nothing is recorded, no test having run to its end: a prepare that fails is said in its row, and its run
-    is red for what it lacks, never computing it on the GPU. A file's process under other flags
+    nothing is recorded, no test having run to its end: a prepare that fails is said in its row and exit;
+    its run is red for what it lacks, never computing it on the GPU. A file's process under other flags
     (`lane_units`) prepares apart, under them, as it runs. First
     the pinned fixtures the tests read offline are fetched, as the run fetches them
     (tools/fetched_fixtures.py), so the run finds each whole and waits on no download with the GPU held.
@@ -2036,9 +2036,9 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:
             done.result()
-    out.write_text(json.dumps({"rows": [row_ for verdict in verdicts.values()
-                                        for row_ in json.loads(verdict.read_text())["rows"]]}))
-    return 0
+    rows = [row_ for verdict in verdicts.values() for row_ in json.loads(verdict.read_text())["rows"]]
+    out.write_text(json.dumps({"rows": rows}))
+    return int(any(row_["exitCode"] != 0 for row_ in rows))  # Row 9541: an uncollected file's exit 0 hid it.
 
 
 def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str,
@@ -2221,7 +2221,7 @@ def raised(record: dict[str, float], held: list[dict], marked: dict) -> dict[str
     return taken
 
 
-def folded_entries(record: dict[str, session.Entry], verdict: dict, target: float) -> dict:
+def folded_entries(record: dict[str, "Entry"], verdict: dict, target: float) -> dict:
     """The durations `record`'s entries with main's CI `verdict` folded in (`session.entry`): each test's
     warm time as `folded` keeps the record, a run in which it compiled a program the shared cache lacked
     (a row's `cold`) timing it no warm time; its cold time the least of the green runs so, raised by a

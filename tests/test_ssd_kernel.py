@@ -30,6 +30,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from contract_support import (
+    ADDS,
+    FORKED,
+    GIVEN,
+    HELD,
     REVERSE_ONLY,
     assert_contract,
     cancelling_entries,
@@ -351,33 +355,20 @@ DOCUMENTS = ((0, 70, 100), (0, 40, 150))
 """Each row's documents' first steps, over rows of 190 steps: a document that ends inside a chunk, one
 shorter than a chunk, and one longer than two."""
 
-FORKED = (((1, 2, 2), (1, 0, 0)), ((1, 2, 3), (1, 2, 0)))
-"""Each row's documents' table slots and stored slots (`recurrence_chunk.Chunk.loads`, `Chunk.stores`), one
-given memory a row then two stored: the first row's start continued by its first document, whose final both
-later ones enter; the second row a chain from its start, each document entering its predecessor's final.
-Every memory is entered, so no gradient's row is float64 zero, whose terms the gate would trace each
-draw."""
-
-
-ADDS = ((0, 0, 1), (0, 0, 2))
-"""Each row's documents' added slots (`Chunk.adds`): the first row's last document adding its row's given
-memory to its parent's final, the second row's the first document's final to its predecessor's (row
-7662)."""
-
-
 def documents_draw(seed: int):
     """Two rows of three documents (`DOCUMENTS`) of a forked call (`FORKED`) over one given memory a row,
     each document's entry write (`recurrence_chunk.Chunk.entry_key`: two terms of a state's keys `[N]` and
     a head's values `[P]`, a weight a head), and cotangents of the output and the row's last memory."""
-    x, dt, A, B, C, _, _ = mixer_operands((2, 190, 2, 16, 16, 1), seed)
+    rows, documents = len(FORKED), len(FORKED[0][0])
+    x, dt, A, B, C, _, _ = mixer_operands((rows, 190, 2, 16, 16, 1), seed)
     x, b, c, a = (jnp.asarray(t, jnp.float32) for t in ssd_operands(x, dt / 64, A, B, C, 1))
     keys = jax.random.split(jax.random.key(seed + 11), 6)
-    given = 0.3 * jax.random.normal(keys[0], (2, 1, 2, 16, 16), jnp.float32)
-    entry = (0.3 * jax.random.normal(keys[3], (2, 3, 2, 2, 16), jnp.float32),
-             0.3 * jax.random.normal(keys[4], (2, 3, 2, 2, 16), jnp.float32),
-             jax.random.uniform(keys[5], (2, 3, 2), jnp.float32))
+    given = 0.3 * jax.random.normal(keys[0], (rows, GIVEN, 2, 16, 16), jnp.float32)
+    entry = (0.3 * jax.random.normal(keys[3], (rows, documents, 2, 2, 16), jnp.float32),
+             0.3 * jax.random.normal(keys[4], (rows, documents, 2, 2, 16), jnp.float32),
+             jax.random.uniform(keys[5], (rows, documents, 2), jnp.float32))
     seeded = (jax.random.normal(keys[1], x.shape, jnp.float32),
-              jax.random.normal(keys[2], (2, 2, 16, 16), jnp.float32))
+              jax.random.normal(keys[2], (rows, 2, 16, 16), jnp.float32))
     return (x, b, c, a, given, *entry), seeded
 
 
@@ -391,7 +382,7 @@ def documents_on_the_kernel(x, b, c, a, given, key, value, weight, added: bool =
     from dew.nn.sharding import manual_map
 
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
-    forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, (key, value, weight), 2,
+    forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, (key, value, weight), HELD,
                     jnp.asarray(ADDS, jnp.int32) if added else None)
     length = x.shape[1]
     # The table's memories as a chunk's call holds them, `[N, P]`, the SSD's transposed.
@@ -462,8 +453,8 @@ def levels_documents_draw(seed: int):
     state's first key read by a unit reader, so its output, last state and entry writes' gradients are each
     a sum float32 holds exactly or rounds once, as float64's is."""
     (x, b, c, a, given, key, value, _), (out, last) = documents_draw(seed)
-    rows, documents, _, heads, width = value.shape
-    entries = cancelling_entries(seed, rows, documents, heads, key.shape[-1], heads, width)
+    *_, heads, width = value.shape
+    entries = cancelling_entries(seed, heads, key.shape[-1], heads, width)
     reader = jnp.zeros_like(c).at[..., 0].set(1.0)
     operands = (jnp.zeros_like(x), jnp.zeros_like(b), reader, jnp.zeros_like(a), jnp.zeros_like(given),
                 *(jnp.asarray(part) for part in (entries.key, entries.value, entries.weight)))
@@ -511,7 +502,7 @@ def documents_as_selected(x, b, c, a, given, key, value, weight, added: bool = F
     operands = recurrence_chunk.Chunk(
         c, b, x, beta=jnp.zeros((rows, steps, heads), x.dtype), rate=-jnp.ones((heads,), x.dtype),
         state=jnp.swapaxes(given, -1, -2), firsts=jnp.asarray(DOCUMENTS, jnp.int32), loads=loads,
-        stores=stores, entry_key=key, entry_value=value, entry_weight=weight, held=2,
+        stores=stores, entry_key=key, entry_value=value, entry_weight=weight, held=HELD,
         adds=jnp.asarray(ADDS, jnp.int32) if added else None)
     out, final = recurrence_chunk.chunk(LEVELS_HOOKS, operands, chunk_size=64)
     # The chunked op's memory `[N, P]`, the SSD's transposed.

@@ -109,6 +109,10 @@ class Report:
     """The digest of the launch that traced it (`report.Binary.launched`), None where no binary carries it."""
     binary_registers: int | None = None
     binary_frame: int | None = None
+    binary_losses: tuple[str, ...] = ()
+    """The codes of the notes of a performance loss its binary carries (`report.Binary.notes`, what the
+    plugin's own ptxas noted as it assembled the kernel, `LOSSES`), beside the gate's own read of its PTX's
+    (`losses`)."""
     """Its registers a thread and stack frame's bytes as its executable's binary carries them
     (`report.Binary`): this process's assembly, which `inherited` reads where no PTX of it was dumped."""
     threads: int | None = None
@@ -184,6 +188,8 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             launched=binary.launched if binary is not None else None,
             binary_registers=binary.registers if binary is not None else None,
             binary_frame=binary.frame if binary is not None else None,
+            binary_losses=(tuple(note.code for note in binary.notes if note.code in LOSSES)
+                           if binary is not None else ()),
             threads=binary.threads if binary is not None else None,
             decreased=binary.decreased if binary is not None else None,
             raised=binary.raised if binary is not None else None))
@@ -496,7 +502,10 @@ def _named(collective: tuple[str, frozenset[str]]) -> str:
 def mosaic_kernels(record: dict) -> list[dict]:
     """Each Mosaic GPU kernel's report from `record`'s evidence (`reports`, `_compiled`), as a record a test's
     process of its own writes back as JSON (`compile_mosaic_kernels`)."""
-    binaries = [report.Binary(**found) for found in record.get("binaries", ())]
+    # A binary's notes come back from its record as their fields (`dataclasses.asdict`).
+    binaries = [report.Binary(**{**found, "notes": tuple(report.AssemblerNote(**note)
+                                                          for note in found.get("notes", ()))})
+                for found in record.get("binaries", ())]
     return [dataclasses.asdict(found) for found in
             reports(record.get("estimates", {}), binaries, record.get("modules"))]
 

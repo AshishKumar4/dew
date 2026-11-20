@@ -229,9 +229,19 @@ class CorpusCounts:
         self.chunks += sum(value is not None and not isinstance(value, Rejected) for value in outputs)
 
 
-_WARN_OVER = 0.01
-"""The share of a corpus's attempted records it may reject before a run warns, once: a filter that
-drops more than one record in a hundred is worth a look."""
+_REJECTED_MANY = "corpus %s rejected more than %.1f%% of attempted records (%s)"
+"""What a read says of a corpus that rejected more of its records than `Loading.warn_over`."""
+
+
+def warn_rejections(counts: Mapping[str, CorpusCounts], warn_over: float) -> None:
+    """Warn, once each, of the corpora of a memory read's preparation (`dew.data.materialize`) that rejected
+    more than `warn_over` of the records they attempted (`Loading.warn_over`), as a streamed read's counter
+    warns as it reads (`_KeepAccepted`; row 9057: a memory read warned of none)."""
+    for counted in counts.values():
+        rejected = sum(counted.rejected.values())
+        if counted.attempted and rejected / counted.attempted > warn_over:
+            reason = counted.rejected.most_common(1)[0][0]
+            _log.warning(_REJECTED_MANY, counted.label, warn_over * 100, reason)
 
 @dataclasses.dataclass(frozen=True)
 class Streak:
@@ -253,8 +263,8 @@ class Streak:
 class _KeepAccepted:
     def __init__(self, counts: CorpusCounts, tokens: Callable[[Batch], int] | None,
                  streak: Streak | None = None, members: Mapping[str, CorpusCounts] | None = None,
-                 credits: bool = False):
-        self.counts, self.tokens, self.streak = counts, tokens, streak
+                 credits: bool = False, warn_over: float = 0.01):
+        self.counts, self.tokens, self.streak, self.warn_over = counts, tokens, streak, warn_over
         self.members, self.credits = dict(members or {}), credits
         """A mixture's members' counts, under which it counts what it rejects of each member's rows
         (`Rejected.member`, `MEMBER`), and, where it `credits` them (its last counter), the examples each
@@ -325,9 +335,8 @@ class _KeepAccepted:
             for counts in self._refusing(member_of(element), members_of(element)):
                 counts.rejected[reason] += 1
         self.consecutive += 1
-        if not self.warned and self.rejections / self.counts.attempted > _WARN_OVER:
-            _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
-                         self.counts.label, _WARN_OVER * 100, reason)
+        if not self.warned and self.rejections / self.counts.attempted > self.warn_over:
+            _log.warning(_REJECTED_MANY, self.counts.label, self.warn_over * 100, reason)
             self.warned = True
         if self.streak is not None and self.consecutive >= self.streak.after and self.streak.varying:
             if (self.consecutive - self.streak.after) % self.streak.rows == 0:
@@ -475,7 +484,8 @@ class Accepted(pygrain.IterDataset[Batch]):
     (`rows` false, `CorpusCounts.rows`). A mixture's counter past the mix counts what it rejects of each
     member's rows under that member (`members`, each's name and label), and its last counter, which
     `credits` them, the examples each member's rows complete as it delivers them (`MEMBERS`); each
-    member is its key, name and label."""
+    member is its key, name and label. It warns of a corpus that rejects more than `warn_over` of its
+    records (`Loading.warn_over`)."""
 
     def __init__(
         self,
@@ -489,16 +499,17 @@ class Accepted(pygrain.IterDataset[Batch]):
         examples: bool = False,
         members: Sequence[tuple[str, str, str]] = (),
         credits: bool = False,
+        warn_over: float = 0.01,
     ):
         super().__init__(parent)
         self._records, self._name, self._label = parent, name, label
         self._tokens, self._streak, self._rows, self._examples = tokens, streak, rows, examples
-        self._members, self._credits = tuple(members), credits
+        self._members, self._credits, self._warn_over = tuple(members), credits, warn_over
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         counts = CorpusCounts(self._name, self._label, rows=self._rows, examples=self._examples)
         members = {key: CorpusCounts(name, label, examples=True) for key, name, label in self._members}
-        predicate = _KeepAccepted(counts, self._tokens, self._streak, members, self._credits)
+        predicate = _KeepAccepted(counts, self._tokens, self._streak, members, self._credits, self._warn_over)
         return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
 

@@ -45,6 +45,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -139,7 +140,7 @@ def import_reference():
     module = loaded("deepseek_v4_0731_model",
                     hf_hub_download(REPO, "inference/model.py", revision=DEEPSEEK_V4_0731_REVISION))
     v41.set_quantizers(module, enabled=False)
-    module.rotate_activation = lambda x: x
+    vars(module)["rotate_activation"] = lambda x: x  # the published module's own, replaced
     v41.install_selection_probe()
     return module
 
@@ -215,9 +216,11 @@ def transformers_model(directory: Path, dtype: torch.dtype):
     grouped_mm takes no float64) and its attention eager; refused if it leaves a trunk tensor unread."""
     from transformers import DeepseekV4ForCausalLM
 
-    model, report = DeepseekV4ForCausalLM.from_pretrained(str(directory), dtype=dtype, local_files_only=True,
-                                                          output_loading_info=True,
-                                                          experts_implementation="eager")
+    # The model and its loading report, as `output_loading_info` asks (transformers types the model alone).
+    loaded: Any = DeepseekV4ForCausalLM.from_pretrained(
+        str(directory), dtype=dtype, local_files_only=True, output_loading_info=True,
+        experts_implementation="eager")
+    model, report = loaded
     unread = {key: sorted(report[key]) for key in ("missing_keys", "mismatched_keys", "error_msgs")
               if report[key]}
     # transformers builds no drafter and ignores `mtp.*` on load

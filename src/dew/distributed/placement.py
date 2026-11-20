@@ -11,7 +11,7 @@ import dataclasses
 import fnmatch
 import json
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
 import jax
@@ -756,7 +756,7 @@ class Layout:
                 on = sharding.mesh
                 if on not in shared:
                     shared[on] = frozenset(device.id for device in devices.intersection(on.devices.flat))
-                held.append((_variable_path(path[:1]), shared[on], _shard_bytes(leaf)))
+                held.append((_variable_path(path[:1]), shared[on], placed_bytes(leaf)))
         totals = collections.Counter()
         for _, ids, size in held:
             totals[ids] += size
@@ -871,16 +871,26 @@ def _without_state_axes(entry: MeshAxes) -> MeshAxes:
     return kept if kept else None
 
 
-def _shard_bytes(leaf) -> int:
-    """The bytes each device its sharding places it on holds of `leaf`, an
-    array or an abstract one that carries its sharding."""
-    return math.prod(leaf.sharding.shard_shape(np.shape(leaf))) * leaf.dtype.itemsize
-
-
-def placed_bytes(tree) -> int:
-    """The bytes a device holds of `tree`'s arrays, each laid out as its
-    sharding places it (abstract arrays carry their sharding)."""
-    return sum(map(_shard_bytes, jax.tree.leaves(tree)))
+def placed_bytes(tree, placement: Placement | None = None, *, device: Hashable | None = None,
+                 memory: str | None = None) -> int:
+    """The bytes a device holds of `tree`'s arrays, each laid out as its sharding places it (abstract
+    arrays carry their sharding) or as `placement` places it: `device`'s, none of a leaf placed on other
+    devices, where given; those in `memory` alone where given (`"device"`, a device's own memory: a bank in
+    its host's pinned memory is none of it). A key's data counts as its buffer holds it (its dtype's
+    itemsize); a host value of no dtype (a Python count among a step's fields) is none of it."""
+    leaves = jax.tree.leaves(tree)
+    placed = None if placement is None else jax.tree.leaves(placement)
+    if placed is not None and len(placed) != len(leaves):
+        raise ValueError(f"a placement of {len(placed)} leaves places a tree of {len(leaves)}")
+    total = 0
+    for index, leaf in enumerate(leaves):
+        if not isinstance(leaf, jax.Array | jax.ShapeDtypeStruct):
+            continue
+        sharding: jax.sharding.Sharding = leaf.sharding if placed is None else placed[index]
+        if ((memory is None or (sharding.memory_kind or "device") == memory)
+                and (device is None or device in sharding.device_set)):
+            total += math.prod(sharding.shard_shape(np.shape(leaf))) * leaf.dtype.itemsize
+    return total
 
 
 ALLOCATION_BYTES = 256
@@ -893,16 +903,26 @@ def allocated_bytes(tree) -> int:
     (`placed_bytes`, each rounded up to `ALLOCATION_BYTES`): what a fit check places beside a step's
     temporaries (`dew.training.memory.placeable_beside`)."""
     unit = ALLOCATION_BYTES
-    return sum(-(-_shard_bytes(leaf) // unit) * unit for leaf in jax.tree.leaves(tree))
+    return sum(-(-placed_bytes(leaf) // unit) * unit for leaf in jax.tree.leaves(tree))
 
 
-def placed_shapes[TreeT](tree: TreeT, placement: Placement[TreeT]) -> TreeT:
+def placed_shapes[TreeT](tree: TreeT, placement: Placement[TreeT], *, weak: bool = False) -> TreeT:
     """`tree`'s arrays as their shapes, each carrying where `placement` puts it: what a
     lowering, a restore and `Layout.validate` read of a state not yet placed. Each in the dtype a
-    program reads it as: a host float64 leaf a float32 one where x64 is off."""
+    program reads it as: a host float64 leaf a float32 one where x64 is off. Strongly typed, as a state
+    placed from them is; weakly typed where `weak` and the leaf is (`weak_typed`): a host step's pass over
+    the shapes of the arrays its calls take, which keys its programs as those calls do
+    (`dew.training.execution`, `OuterProgram.abstract_of`)."""
     return jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(
         np.shape(leaf), jax.dtypes.canonicalize_dtype(leaf.dtype, allow_extended_dtype=True),
-        sharding=sharding), tree, placement)
+        sharding=sharding, weak_type=weak and weak_typed(leaf)), tree, placement)
+
+
+def weak_typed(leaf: jax.typing.ArrayLike | jax.ShapeDtypeStruct) -> bool:
+    """Whether `leaf`, an array, a shape or a host value, is weakly typed: a host value never is."""
+    if isinstance(leaf, jax.Array):
+        return jax.typeof(leaf).weak_type
+    return leaf.weak_type if isinstance(leaf, jax.ShapeDtypeStruct) else False
 
 
 @runtime_checkable

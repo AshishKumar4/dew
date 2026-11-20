@@ -297,21 +297,24 @@ class Produced:
     """What a training stream declares it hands each step, checked on each batch before its transfer
     (docs/design/training.md, the producer's contract; row 5724): its share's rows of a step, one of the
     global batches its loader states (`Loader.batch`, a schedule's phases' `Loader.batches`, a ramp's
-    stages'). A batch of other rows is refused naming both, where it would compile as another step; its
-    fields' dtypes may change, each its own step's (a mixed-precision stream's). A batch measured in tokens
-    (`Loader.batch_tokens`) holds rows as its tokens fit, and states none."""
+    stages'), and each field its chain fixes at its per-row shape (`Loader.fields`; row 9017). A batch of
+    other rows is refused naming both, where it would compile as another step, as is one missing a fixed
+    field or holding it at another shape, naming the field; its fields' dtypes may change, each its own
+    step's (a mixed-precision stream's). A batch measured in tokens (`Loader.batch_tokens`) holds rows as
+    its tokens fit, and states none."""
 
     rows: frozenset[int] | None
+    fields: Mapping[str, tuple[int | None, ...]] = dataclasses.field(default_factory=dict)
 
     @classmethod
     def of(cls, loader: Loader, partition: DataPartition) -> Produced:
         if loader.batch_tokens is not None or any(tokens is not None for tokens in loader.token_batches):
-            return cls(None)
+            return cls(None, loader.fields)
         ramp = loader.ramp
         ramped = () if ramp is None else tuple(
             stage.batch for stage in ramp.stages(loader.batch, partition.window))
         batches = {loader.batch, *loader.batches, *ramped}
-        return cls(frozenset(partition.rows(batch) for batch in batches))
+        return cls(frozenset(partition.rows(batch) for batch in batches), loader.fields)
 
     def checked(self, batch: Batch) -> Batch:
         rows = rows_of(batch)
@@ -319,7 +322,22 @@ class Produced:
             raise ValueError(f"the training stream handed a step {rows} rows on this share, where its loader "
                              f"states {sorted(self.rows)}: a step after the batch changed its rows, which "
                              "would compile another step; batch where the rows are made")
+        for name, shape in self.fields.items():
+            held = batch.get(name)
+            if held is None:
+                raise ValueError(f"the training stream handed a step no field {name!r}, which its chain "
+                                 "states each row holds: a step after it dropped the field")
+            if isinstance(held, np.ndarray) and not _fits(held.shape[1:], shape):
+                raise ValueError(f"the training stream handed a step field {name!r} at {held.shape[1:]} a "
+                                 f"row, where its chain states {shape}: a step after it changed the shape, "
+                                 "which would compile another step")
         return batch
+
+
+def _fits(held: tuple[int, ...], shape: tuple[int | None, ...]) -> bool:
+    """Whether a row's shape `held` is `shape`, each axis it leaves free (None) any length."""
+    return len(held) == len(shape) and all(axis is None or axis == size for size, axis in zip(held, shape,
+                                                                                               strict=True))
 
 
 def marked(partition: DataPartition, prepare: Callable[[Batch], Batch] | None = None
@@ -478,34 +496,36 @@ class StartBuild:
 
 
 def start_build(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                shardings: Placement[TrainState], through: Mapping[int, int], *, kept: bool) -> StartBuild:
+                shardings: Placement[TrainState], through: Mapping[int, int], built: tuple[int, ...], *,
+                kept: bool) -> StartBuild:
     """The one way a fresh state is built and placed, which a run's start runs (`placed_start`) and a run
     compiled ahead compiles (`start_compiled`): where its init passes no frozen leaf through, one program
     builds the state; where it does, the passed leaves are the held arrays placed where the state keeps them,
-    and the program builds the rest (`_rest`). One build a process keeps for each init it `kept` (a refit's
-    start traced once, `traced_draw`; by the object itself), placement and held arrays it passes through,
-    held weakly (`Held`, `_cache.holding`), so a trainer's refits compile and lower its program once (PF03):
-    their start's program keeps the executable their call runs (`start_compiling`). An init no process
-    keeps is traced afresh each fit, so its build is read once and kept by none, where it took a kept one's
-    place among the `KEPT_STARTS`."""
+    and the program builds the rest (`drawn_rest`), the frozen leaves at `built` among it (`traced_draw`'s
+    `TracedDraw.built`). One build a process keeps for each init it `kept` (a refit's start traced once,
+    `traced_draw`; by the object itself), placement and held arrays it passes through, held weakly (`Held`,
+    `_cache.holding`), so a trainer's refits compile and lower its program once (PF03): their start's
+    program keeps the executable their call runs (`start_compiling`). An init no process keeps is traced
+    afresh each fit, so its build is read once and kept by none, where it took a kept one's place among the
+    `KEPT_STARTS`."""
     if not kept:
-        return _built(initial_state, initializer, shardings, through)
+        return _built(initial_state, initializer, shardings, through, built)
     inputs = jax.tree.leaves(initializer)
     where = jax.tree.flatten(shardings)
     passed = tuple((index, Held(inputs[given])) for index, given in sorted(through.items()))
     return holding(_BUILDS, (Held(initial_state), where[1], tuple(where[0]), passed),
-                   lambda: _built(initial_state, initializer, shardings, through), KEPT_STARTS)
+                   lambda: _built(initial_state, initializer, shardings, through, built), KEPT_STARTS)
 
 
 def _built(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-           shardings: Placement[TrainState], through: Mapping[int, int]) -> StartBuild:
+           shardings: Placement[TrainState], through: Mapping[int, int], built: tuple[int, ...]
+           ) -> StartBuild:
     """`start_build`'s build, made."""
     moving, frozen = apart(shardings)
     if not frozen or not through:
         return StartBuild(initial_state, shardings, {}, through)
     inputs = jax.tree.leaves(initializer)
     where, structure = jax.tree.flatten(frozen)
-    built = tuple(index for index in range(len(where)) if index not in through)
     # Each passed leaf is placed once, where the state keeps it, whatever path the init moves it to.
     return StartBuild(drawn_rest(initial_state, HELD_APART, built),
                       (moving, tuple(where[index] for index in built)),

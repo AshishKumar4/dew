@@ -44,7 +44,7 @@ def main() -> None:
         arrays[f"{name}/mu"] = np.asarray([shift(tokens, **constants) for tokens in TOKENS], np.float64)
     arrays["constant_names"] = np.asarray(sorted(CONSTANTS["flux"]))
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, **arrays)
+    np.savez(FIXTURE, allow_pickle=False, **arrays)
     print(f"{FIXTURE}: {sorted(arrays)}")
 
 

@@ -22,7 +22,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import on_float64_device, widened
+from arm_arithmetic import on_float64_device, unrewritten, widened
 from float64_terms import float64_signed_sums
 
 from dew.nn.kernels import generation
@@ -41,6 +41,27 @@ dropping -2^103 at a tie as 2^103 survives summed to inf, row 8757). Each a mult
 float64 sums them, and any power of two times them, exactly in any order."""
 
 
+GIVEN = 1
+"""The memories a forked call's row table holds before its documents store theirs (`Chunk.loads`: a row's
+start, a cache)."""
+
+FORKED = (((1, 2, 2), (1, 0, 0)), ((1, 2, 3), (1, 2, 0)))
+"""The forked tests' table, each row's documents' table slots and stored slots
+(`recurrence_chunk.Chunk.loads`, `Chunk.stores`), one given memory a row then two stored: the first row's
+start continued by its first document, whose final both later documents enter (a slot's gradient summing
+two documents'); the second row a chain from its start, each document entering its predecessor's final.
+Every memory is entered, so no gradient's row is float64 zero, whose terms the gate would trace each draw.
+Its token boundaries are each route's (test_recurrence_chunk's, test_ssd_kernel's `DOCUMENTS`)."""
+
+HELD = 2
+"""The stored slots `FORKED`'s rows hold (`Chunk.held`)."""
+
+ADDS = ((0, 0, 1), (0, 0, 2))
+"""Each `FORKED` row's documents' added slots (`Chunk.adds`): the first row's last document adding its row's
+given memory to its parent's final, the second row's the first document's final to its predecessor's (row
+7662)."""
+
+
 class Entries(NamedTuple):
     """A forked call's entry writes of `CANCELLING_LEVELS` (`cancelling_entries`): keys `[R, D, 7, Hk, K]`,
     values `[R, D, 7, H, V]` and weights `[R, D, H]`, and `signed(shape)`, a cotangent of that shape of one
@@ -52,24 +73,27 @@ class Entries(NamedTuple):
     signed: Callable[[tuple[int, ...]], np.ndarray]
 
 
-def cancelling_entries(seed: int, rows: int, documents: int, key_heads: int, keys: int, heads: int,
-                       values: int) -> Entries:
+def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values: int) -> Entries:
     """Entry writes of `CANCELLING_LEVELS`' seven products on their keys' first dimension for a forked call
-    of `rows` rows of `documents` documents each over the forked tests' table (a row whose later documents
-    enter its first's final, a row a chain), as its route and its oracle read them alike: each value column
+    over `FORKED`'s table, as its route and its oracle read them alike: the first head's first value column
     scaled by a drawn sign and a power of two of 2^-28 to 2^-33 a draw, so even a row's three writes' terms
-    sum inside float32's range, as the gates' sums must (testing.md's derivative contracts), their ties
-    kept; weights of another, signed so every memory a document enters is zero, one or two writes (the
-    chain's last weight its middle one's negated); and cotangents (`Entries.signed`) of one power of two a
-    draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds once, as float64's."""
+    sum inside float32's range, as the gates' sums must (testing.md's derivative contracts), their ties kept,
+    and every other column zero, so an entry key's gradient is one product of the levels' (rounded once, as
+    float64's: summed over a key head's value heads and columns, float32 rounded each term, 1.9 to 2.6 times
+    the rounded truth's distance); weights of
+    another, each document's signed by the memory it enters (`_entered_signs`), so every memory is zero, one
+    or two writes, a stored one cancelled exactly among them; and cotangents (`Entries.signed`) of one power
+    of two a draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds once, as
+    float64's."""
+    rows, documents = len(FORKED), len(FORKED[0][0])
     rng = np.random.default_rng([8840, seed])
     factors, levels = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
     key = np.zeros((rows, documents, len(factors), key_heads, keys), np.float32)
     key[..., 0] = factors[:, None]
-    columns = rng.choice([-1.0, 1.0], (heads, values)) * 2.0 ** -int(rng.integers(28, 34))
+    columns = np.zeros((heads, values))
+    columns[0, 0] = rng.choice([-1.0, 1.0]) * 2.0 ** -int(rng.integers(28, 34))
     value = np.broadcast_to(levels[:, None, None] * columns, (rows, documents, len(levels), heads, values))
-    signs = rng.choice([-1.0, 1.0], (rows, documents, heads))
-    signs[1, 2] = -signs[1, 1]
+    signs = _entered_signs(rng.choice([-1.0, 1.0], (rows, heads)))
     scale = 2.0 ** -int(rng.integers(10, 15))
 
     def signed(shape):
@@ -79,15 +103,40 @@ def cancelling_entries(seed: int, rows: int, documents: int, key_heads: int, key
     return Entries(key, value.astype(np.float32), weight.astype(np.float32), signed)
 
 
+def _entered_signs(drawn: np.ndarray) -> np.ndarray:
+    """Each `FORKED` document's write's sign `[R, D, H]`, a row's first `drawn` `[R, H]`, by the signed count
+    of writes the memory it enters holds: one entering a memory of none (a given one, zero in the levels'
+    draws, or one cancelled) takes the row's; one entering a memory of one write cancels it where its own
+    final is stored and a later document enters it, so an exact zero crosses a stored slot, and adds a second
+    of its sign where not; one entering two writes takes the other sign. The memory each leaves is zero, one
+    or two writes."""
+    signs = np.zeros((*drawn.shape[:1], len(FORKED[0][0]), *drawn.shape[1:]))
+    for row, (loads, stores) in enumerate(FORKED):
+        counts: dict[int, np.ndarray] = {}
+        for document, load in enumerate(loads):
+            entered = counts.get(load, np.zeros_like(drawn[row]))
+            carried = stores[document] and GIVEN + stores[document] in loads[document + 1:]
+            continued = np.where(np.abs(entered) == 1, -np.sign(entered) if carried else np.sign(entered),
+                                 -np.sign(entered))
+            signs[row, document] = np.where(entered == 0, drawn[row], continued)
+            if stores[document]:
+                counts[GIVEN + stores[document]] = entered + signs[row, document]
+    return signs
+
+
 def exactly_rounded(truth_fn) -> Callable:
     """`truth_fn`'s float64 truth rounded once to float32, an arm run as given (`arm_forms.as_given`),
-    computed where and as check 1 computes a truth (`on_float64_device`, `widened`: a TPU's on its host, whose
-    float64 it emulates): the reference of draws whose truth float32 holds exactly or rounds once, which Dew
-    must equal."""
+    computed where and as check 1 computes a truth, outside the scope it runs its arms in
+    (`arm_arithmetic.summed_as_run`, whose float32 sums a CPU's dots take): at the process's own product
+    precision, read here, before any arm's, on `on_float64_device` (a TPU's host, whose float64 it emulates),
+    `widened` and `unrewritten`. The reference of draws whose truth float32 holds exactly or rounds once,
+    which Dew must equal."""
     from arm_forms import as_given
 
+    precision, truth_fn = jax.config.jax_default_matmul_precision, unrewritten(truth_fn)
+
     def rounded(*inputs):
-        with jax.enable_x64(new_val=True), on_float64_device():
+        with (jax.enable_x64(new_val=True), on_float64_device(), jax.default_matmul_precision(precision)):
             truth = truth_fn(*widened(inputs))
         return jax.tree.map(lambda leaf: np.asarray(leaf, np.float32), truth)
 

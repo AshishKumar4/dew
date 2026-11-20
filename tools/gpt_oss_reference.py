@@ -68,7 +68,7 @@ def write_moe() -> None:
         output, _ = block(hidden)
     arrays = {name: parameter.detach().numpy() for name, parameter in block.named_parameters()}
     arrays.update(hidden=hidden.numpy(), output=output.numpy())
-    np.savez(FIXTURES / "moe.npz", **arrays)
+    np.savez(FIXTURES / "moe.npz", allow_pickle=False, **arrays)
 
 
 def write_mxfp4() -> None:
@@ -135,7 +135,7 @@ def write_mxfp4_encoder() -> None:
         arrays[f"{domain}_weight"] = weight
         arrays[f"{domain}_blocks"] = packed.transpose(1, 2).reshape(experts, outputs, inputs // 32, 16).numpy()
         arrays[f"{domain}_scales"] = scales.transpose(1, 2).contiguous().numpy()
-    np.savez_compressed(FIXTURES / "mxfp4_encoder.npz", **arrays)
+    np.savez_compressed(FIXTURES / "mxfp4_encoder.npz", allow_pickle=False, **arrays)
 
 
 def tiny_gpt_oss() -> GptOssForCausalLM:
@@ -197,7 +197,7 @@ def write_exchange_cases() -> None:
             arrays[name] = parameter.detach().numpy()
             arrays['grad.' + name] = parameter.grad.numpy()
         name = 'exchange_skewed' if skewed else 'exchange_random'
-        np.savez(FIXTURES / (name + '.npz'), **arrays)
+        np.savez(FIXTURES / (name + '.npz'), allow_pickle=False, **arrays)
     (FIXTURES / 'exchange_reference.json').write_text(json.dumps({
         **reference, 'seed': 141, 'dtype': 'float32', 'loss': 'mean(sin(output))',
         'hidden_size': 8, 'intermediate_size': 12, 'experts': 4, 'top_k': 2}, indent=2) + '\n')

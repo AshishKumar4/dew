@@ -58,6 +58,7 @@ from native_certificates import (
     truncating_step_ends,
 )
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32, TFLOAT32, Format, truncated
+from reference_error import ahead_arm
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, grouped_triton, tuning
 from dew.nn.kernels.templates.recurrence import mainloop
@@ -566,7 +567,9 @@ def mosaic_exp2(semantics: str):
                                       lowering_semantics=getattr(plgpu.LoweringSemantics, semantics))
         kernel = plgpu.kernel(body, out_type=(f32, f32), grid=(np.size(x) // 128,), grid_names=("x",),
                               compiler_params=params)
-        return tuple(np.asarray(out, np.float64) for out in jax.jit(kernel)(jnp.asarray(x, jnp.float32)))
+        # Compiled in a tier's prepare and run in its run, one label a shape (`ahead_arm`, row 8497).
+        ran = ahead_arm(jax.jit(kernel), f"Mosaic GPU's exp2, {semantics}, {np.size(x)} operands")
+        return tuple(np.asarray(out, np.float64) for out in ran(np.asarray(x, np.float32)))
 
     return run
 

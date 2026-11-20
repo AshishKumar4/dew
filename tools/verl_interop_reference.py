@@ -21,8 +21,15 @@ from importlib.metadata import distribution
 from pathlib import Path
 
 import pyarrow.parquet as pq
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_releases import commit
 
-REVISION = "12ebe0cb4d300c58449fb6c675379e8700015c51"
+COHORT = "verl-agentic"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
+REVISION = commit("verl-agentic", "verl")
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/rl"
 

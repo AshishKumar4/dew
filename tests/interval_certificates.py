@@ -14,6 +14,7 @@ import dataclasses
 from typing import Literal, NamedTuple
 
 import numpy as np
+import tier_wire
 from certified import allowance
 from native_certificates import TRUNCATING, tf32_operand, truncating_underflow
 from op_certificates import (
@@ -119,6 +120,8 @@ class Lane:
     """Whether the call is fp32's, its output stored fp32 and a one-part operand TF32."""
     pairing: int = 1
     """The parts a factored pair's fp32 operand takes (`intra.pairing_parts`, `operand`)."""
+    merged: int = 0
+    """The parts the doubling's merges take in fp32 (`mainloop._merged`): zero for fp16, else `merged`."""
     tf32: Literal["plain", "rna", "read"] = "read"
     """How a one-part fp32 operand reaches its product (`operand`), the issuer's: 'plain', as itself (an
     interpreted product, a plain fp32 dot: mosaic_sm80.py's and mosaic_sm90.py's interpreted branches);
@@ -277,12 +280,16 @@ def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:
     default the fractions `algebra.raised` and `algebra.decayed` take, (-2, 2); 2^17 of them, densely and
     drawn, the integers there (exact cases) among them. A zero is the flush `exp2` admits (its enclosure is
     zero where its lower end, that many steps down, falls below the normal range), not a step: measured
-    over the nonzero results, and a zero where that end is normal refuses the lane."""
+    over the nonzero results, and a zero where that end is normal refuses the lane. In a GPU tier's prepare,
+    whose arms give zeros and compute nothing (`reference_error.ahead_arm`), `native` is compiled at its
+    operands and no reach is read: none, so a cell's later arms are prepared too (row 8497)."""
     rng = np.random.default_rng(2084)
     whole = np.arange(np.ceil(low), np.floor(high) + 1, dtype=np.float32)
     x = np.concatenate([np.linspace(low, high, 1 << 16, dtype=np.float32), whole,
                         rng.uniform(low, high, (1 << 16) - len(whole)).astype(np.float32)])
     found, exact = np.asarray(native(x), np.float64), exp2_rounded(x, FLOAT32)
+    if tier_wire.preparing():
+        return 0
     flushed = found == 0
     reach = int(np.max(np.abs(grid_index(found) - grid_index(exact))[~flushed]))
     lowest = exact[flushed]

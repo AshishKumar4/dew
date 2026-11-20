@@ -31,6 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from map_judge import marked_seeds
 from port_support import row_names_port
 from reference_error import assert_as_exact, with_gradients
 from ssd_support import mamba_side
@@ -452,36 +453,58 @@ TPU_ACCELERATED = [pytest.param(name, regime, id=f'{name}-{regime}-tpu',
                    for name, regime in ACCELERATED]
 
 
-LONG_GRADIENT = [('rated', 'a fading memory')]
-"""The gradient's cases past two minutes in one process (246 s, train 270's CI on 66a222273, ledger 2125),
-their check 1's 256 draws run as armada's map tasks and a judge (`check1_shards`), each within two minutes."""
+CHECK1_SHARDS = {
+    "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[rated-a-fading-memory]":
+        {"seeds": 256, "per_task": 64},
+    "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences[turned-decays-near-zero]":
+        {"seeds": 128, "per_task": 32},
+}
+"""The gradient's cases past two minutes in one process (246 s, train 270's CI on 66a222273, ledger 2125; the
+turned state's decays near zero 167 s, train 1080's on 1ee8fe13e, ledger 8937), by node id, a literal the
+CI plan reads as it reads a mark's (tools/armada/ci.py): their check 1's draws, each its case's
+`GRADIENT_SEEDS`, run as armada's map tasks of a quarter of them and a judge. The one list of them: a case
+is long where its id is here (`long_gradient`)."""
+
+LONG_GRADIENT = "test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences"
+"""The long cases' test (`CHECK1_SHARDS`)."""
+
+
+def long_gradient(case) -> str | None:
+    """`case`'s (a `CASES` parameter's) node id among the long cases (`CHECK1_SHARDS`), None where it is
+    none."""
+    name, regime = case.values
+    node = f"{LONG_GRADIENT}[{name}-{regime.replace(' ', '-')}]"
+    return node if node in CHECK1_SHARDS else None
 
 
 @pytest.mark.parametrize('name, regime', [case for case in CASES + TPU_ACCELERATED
-                                          if tuple(case.values) not in LONG_GRADIENT])
+                                          if long_gradient(case) is None])
 def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
     """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
     token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""
     _gradient_holds_check_1(name, regime)
 
 
-@pytest.mark.parametrize('name, regime', LONG_GRADIENT)
-@pytest.mark.check1_shards(seeds=256, per_task=64)
-def test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences(name, regime):
-    """`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences` at its long cases (`LONG_GRADIENT`),
-    their draws in map tasks of 64."""
-    _gradient_holds_check_1(name, regime)
+@pytest.mark.parametrize('name, regime', [
+    pytest.param(*case.values, id=node.removeprefix(f"{LONG_GRADIENT}[").removesuffix("]"),
+                 marks=pytest.mark.check1_shards(**CHECK1_SHARDS[node]))
+    for case in CASES if (node := long_gradient(case)) is not None])
+def test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences(name, regime, request):
+    """`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences` at its long cases (`CHECK1_SHARDS`),
+    over the seeds their marks declare."""
+    _gradient_holds_check_1(name, regime, marked_seeds(request))
 
 
-def _gradient_holds_check_1(name, regime):
-    """A case's gradient check (`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences`)."""
+def _gradient_holds_check_1(name, regime, seeds: int | None = None):
+    """A case's gradient check (`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences`), over
+    `seeds`, its `GRADIENT_SEEDS` where None."""
     hooks = PORTABLE_SITES[name]
     assert_finite_and_on_par(
         with_gradients(restarting(
             functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK, **bounded(regime)), regime)),
         with_gradients(restarting(functools.partial(token_by_token, hooks), regime)),
         functools.partial(cotangents, hooks, regime), f"the portable math's gradient, {name} under {regime}",
-        seeds=GRADIENT_SEEDS[name, regime])
+        seeds=GRADIENT_SEEDS[name, regime] if seeds is None else seeds)
 
 
 def ssd_port(hooks, *args, **kwargs):
@@ -518,7 +541,8 @@ def _mamba_ssm(regime: str, draws, seeds: int, *, gradients: bool):
     block's draws are one call's heads (`mamba_side`), whose state passing launches a program each head on
     CUDA's grid z, at most 65,535 (a 512-seed block of `RATED_HEADS` 32,768; the staged 2,560 seeds' 163,840
     exceeded it). Its results are the port's tree: the output and final memory, and where `gradients`
-    every operand's gradient."""
+    every operand's gradient, on the host: a block's every seed's held on a GPU filled a tier process's share
+    (a fading memory's 256 seeds, 4.09 GiB, run JS-8497-alone-cb07e38b5-sm90; row 6755's theme)."""
 
     def run_block(drawn):
         operands = [args[0] for args in drawn]
@@ -534,12 +558,12 @@ def _mamba_ssm(regime: str, draws, seeds: int, *, gradients: bool):
                   np.zeros((len(drawn), batch, heads, operands[0].key.shape[-1], width), np.float32)))
         found = mamba_side({name: np.stack([getattr(each, name) for each in operands]) for name in names},
                            given, starts, CHUNK)
-        outputs = [(jnp.asarray(found["out"][index]), jnp.asarray(found["final"][index]))
+        outputs = [(np.asarray(found["out"][index]), np.asarray(found["final"][index]))
                    for index in range(len(drawn))]
         if not gradients:
             return outputs
-        return [(output, dataclasses.replace(each, **{name: jnp.asarray(found[f"d_{name}"][index],
-                                                                       getattr(each, name).dtype)
+        return [(output, dataclasses.replace(each, **{name: np.asarray(found[f"d_{name}"][index],
+                                                                      getattr(each, name).dtype)
                                                       for name in names}))
                 for index, (output, each) in enumerate(zip(outputs, operands, strict=True))]
 
