@@ -225,11 +225,10 @@ _PREFIX = "Programming Language :: Python :: "
 PYTHONS = tuple(sorted((classifier.removeprefix(_PREFIX) for classifier in _CLASSIFIERS
                         if re.fullmatch(re.escape(_PREFIX) + r"\d+\.\d+", classifier)),
                        key=lambda version: tuple(int(part) for part in version.split("."))))
-"""The tested versions pyproject.toml's classifiers declare, oldest first: the floor runs every
-test on every run, the newest every test on the census and on a pushed run, whatever its cache's
-policy, the files whose behaviour changed with it (`NEWEST_FILES`).
-`pythons` prints them for tools/armada/install.sh, and `pythons --check` holds .python-version
-and the environment's smoke (.armada.json) to them."""
+"""The tested versions pyproject.toml's classifiers declare, oldest first: the floor runs every test on every
+run, the newest every test on the census and on a pushed run, whatever its cache's policy, the files whose
+behaviour changed with it (`NEWEST_FILES`). `pythons` prints them for tools/armada/install.sh, and `pythons
+--check` holds .python-version and the environment's smoke (.armada.json) to them."""
 NEWEST_FILES = (
     # Annotations, which 3.14 evaluates lazily (PEP 649): records and their config (ec3c5fb54).
     "tests/test_config.py", "tests/test_encoders.py", "tests/test_registry_records.py",
@@ -470,12 +469,11 @@ def cpu_class() -> str:
 
 
 def device_class(network: bool = False) -> str:
-    """The class a task's results belong to: on a CUDA lane (`JAX_PLATFORMS`, as
-    tests/lane_environment.py reads it) the models of the GPUs it sees as the driver names them,
-    before the CPU's class, whose float32 the lane's CPU devices compute (`cpu_class`); else the
-    CPU's class alone. A network lane's (`gpu_lane`) is a class of its own, `network` after it: its
-    records hold the network-marked tests alone, run with the Hub open, apart from the same file's
-    other tests and their peaks."""
+    """The class a task's results belong to: on a CUDA lane (`JAX_PLATFORMS`, as tests/lane_environment.py
+    reads it) the models of the GPUs it sees as the driver names them, before the CPU's class, whose float32
+    the lane's CPU devices compute (`cpu_class`); else the CPU's class alone. A network lane's (`gpu_lane`) is
+    a class of its own, `network` after it: its records hold the network-marked tests alone, run with the Hub
+    open, apart from the same file's other tests and their peaks."""
     if "cuda" not in os.environ.get("JAX_PLATFORMS", "").split(","):
         held = cpu_class()
     else:
@@ -996,15 +994,14 @@ def draws_of(mark: Mark, per_task: int | None = None, weighed_per_task: int | No
 
 
 def cut_draws(mark: Mark, rates: Mapping[bool, "Cost | None"], target: float) -> list[tuple[int, int]]:
-    """The spans of a site's map tasks (`draws_of`): its declared per_task each, or fewer where its
-    measured cost (`site_rate`, the unweighted check's and the weighed check's apart, `rates` by whether
-    weighed) puts a task of its declared cut past `costs.SITE_TARGETS` of `target`: as many as they hold
-    past its setup (`Cost.fitting`), at least one, so no map task is the run's longest for its mark's cut
-    (row 4376: a 64-seed shard ran 966 s where every other group took 256 s or less), and none is cut down
-    to one target, each task paying the site's setup again. Its tasks' starts are among what the cost
-    measures, so a cut converges from above on the one that fills them. A kind whose finer cut would pass
-    what its judges' job takes (`MAX_INPUTS`, the two kinds' tasks together) keeps the finest of its own
-    within it."""
+    """The spans of a site's map tasks (`draws_of`): its declared per_task each, or fewer where its measured
+    cost (`site_rate`, the unweighted check's and the weighed check's apart, `rates` by whether weighed) puts
+    a task of its declared cut past `costs.SITE_TARGETS` of `target`: as many as they hold past its setup
+    (`Cost.fitting`), at least one, so no map task is the run's longest for its mark's cut (row 4376: a
+    64-seed shard ran 966 s where every other group took 256 s or less), and none is cut down to one target,
+    each task paying the site's setup again. Its tasks' starts are among what the cost measures, so a cut
+    converges from above on the one that fills them. A kind whose finer cut would pass what its judges' job
+    takes (`MAX_INPUTS`, the two kinds' tasks together) keeps the finest of its own within it."""
     most = target * costs.SITE_TARGETS
 
     def fitting(units: int, declared: int, cost: "Cost | None") -> int:
@@ -1404,19 +1401,23 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     return told(out, code)
 
 
+RED_EXIT = 3  # .armada.json's task.redExit: armada grades the rows as written, a packed task rerun alone.
+
+
 def told(out: Path, code: int) -> int:
-    """`code`, the task's verdict `out` said last: each red row, its name and its output's first lines (why
-    it is red, its signal and the file it reached: `tested`) and last (what pytest said last). armada keeps a
-    task's log tail beside its exit, and a map task's verdict reaches no report but its judge's red row, which
-    names that tail (Main, 2026-11-09: a map task "exited 1 after 437 s", its row's "pytest exited -9" kept
-    in its output alone)."""
-    for found in json.loads(out.read_text())["rows"]:
+    """`code`, else `RED_EXIT` where a row is red, the task's verdict `out` said last: each red row, its name
+    and its output's first lines (why it is red, its signal and the file it reached: `tested`) and last (what
+    pytest said last). armada keeps a task's log tail beside its exit, and a map task's verdict reaches no
+    report but its judge's red row, which names that tail (Main, 2026-11-09: a map task "exited 1 after 437
+    s", its row's "pytest exited -9" kept in its output alone)."""
+    rows = json.loads(out.read_text())["rows"]
+    for found in rows:
         if found["exitCode"]:
             lines = (found.get("output") or "").strip().splitlines()
             shown = (lines if len(lines) <= 2 * TOLD_LINES
                      else [*lines[:TOLD_LINES], "...", *lines[-TOLD_LINES:]])
             print("\n".join([f"RED {found['name']}", *(f"  | {line}" for line in shown)]), flush=True)
-    return code
+    return code or (RED_EXIT if any(found["exitCode"] for found in rows) else 0)
 
 
 TOLD_LINES = 5
@@ -1851,13 +1852,12 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
 
 
 def gpu_tier(python: str) -> dict[str, list[str]]:
-    """The test files that take another path on a GPU, each with its evidence: where its tests read
-    the backend and its marks of `session.MARKS`, over every record of its rows,
-    on every class, a split file's under each count of groups it was planned as. A file is out
-    only where every record is of these inputs (`fresh`), a CPU task's (`shared`) or a GPU lane's
-    (`lane_inputs`), and says neither, so a file whose inputs changed since it ran is in as "changed",
-    and one without a record, or with one the Worker did not return, as "unrecorded": a new file, or one
-    no green run of these tools has recorded."""
+    """The test files that take another path on a GPU, each with its evidence: where its tests read the
+    backend and its marks of `session.MARKS`, over every record of its rows, on every class, a split file's
+    under each count of groups it was planned as. A file is out only where every record is of these inputs
+    (`fresh`), a CPU task's (`shared`) or a GPU lane's (`lane_inputs`), and says neither, so a file whose
+    inputs changed since it ran is in as "changed", and one without a record, or with one the Worker did not
+    return, as "unrecorded": a new file, or one no green run of these tools has recorded."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
@@ -1991,23 +1991,22 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     (tests/tier_wire.py's PREPARE, under which tests/conftest.py has each test prepare its check-1 sites'
     truths and arms for the node's GPU rather than run, one that prepares none skipped) and its unit's name
     (UNIT): every test of the part, so a site its run reaches never goes unprepared, and its run calls stored
-    executables and compiles nothing while it holds the GPU (Main, 2026-11-17: the day's GPU jobs left 2034
-    of 3238 held GPU-minutes idle, tracing and compiling on the host),
-    at most `processes` at once, as its run will select and cut it (a group `<file>#G/N` holds in its prepare
-    the tests it holds in its run: the same selection, the same weights, DEW_SPLIT_DURATIONS), so each such
-    test computes what its run reads and must not compute while it holds the GPU, its float64 truths and
-    its programs compiled for the GPU the node's topology names (DEW_NODE_TOPOLOGY), into the store its
-    environment names (DEW_TIER_TRUTHS), which the run is given too. Their rows are written to `out` and
-    nothing is recorded, no test having run to its end: a prepare that fails is said in its row and exit;
-    its run is red for what it lacks, never computing it on the GPU. A file's process under other flags
-    (`lane_units`) prepares apart, under them, as it runs. First
+    executables and compiles nothing while it holds the GPU (Main, 2026-11-17: the day's GPU jobs left 2034 of
+    3238 held GPU-minutes idle, tracing and compiling on the host), at most `processes` at once, as its run
+    will select and cut it (a group `<file>#G/N` holds in its prepare the tests it holds in its run: the same
+    selection, the same weights, DEW_SPLIT_DURATIONS), so each such test computes what its run reads and must
+    not compute while it holds the GPU, its float64 truths and its programs compiled for the GPU the node's
+    topology names (DEW_NODE_TOPOLOGY), into the store its environment names (DEW_TIER_TRUTHS), which the run
+    is given too. Their rows are written to `out` and nothing is recorded, no test having run to its end: a
+    prepare that fails is said in its row and exit; its run is red for what it lacks, never computing it on
+    the GPU. A file's process under other flags (`lane_units`) prepares apart, under them, as it runs. First
     the pinned fixtures the tests read offline are fetched, as the run fetches them
     (tools/fetched_fixtures.py), so the run finds each whole and waits on no download with the GPU held.
     `deadline` is the whole prepare's: each process is given what is left of it as its turn comes, its own
-    end's allowance kept back, so the prepare ends within it however many files and waves it holds, and a
-    file it leaves no time is a red row of its own, never started (review: a deadline a process let five
-    files outlast the job's own prepare bound, whose session then ended the job and every file's prepare
-    with it); its fetch and its collection are within it too."""
+    end's allowance kept back, so the prepare ends within it however many files and waves it holds, and a file
+    it leaves no time is a red row of its own, never started (review: a deadline a process let five files
+    outlast the job's own prepare bound, whose session then ended the job and every file's prepare with it);
+    its fetch and its collection are within it too."""
     began = time.monotonic()
 
     def left() -> float:
