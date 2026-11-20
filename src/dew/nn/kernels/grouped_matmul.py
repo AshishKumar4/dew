@@ -1810,7 +1810,8 @@ class GroupedCase:
     """Its product's rows, depth and width (`_extents_of`): a kernel gradient's rows the ones it sums over,
     a product's those it walks (`_rows_of`)."""
     paired: bool = False
-    """Whether it multiplies its rows by a second matrix beside the first (`gmm_call`'s `paired`)."""
+    """Whether it is several products in one launch (`_compound`): a pair's (`gmm_call`'s `paired`), matrices
+    side by side (`beside`) or products chained (`chained`), which Mosaic GPU's launch alone takes."""
 
     @property
     def gathered(self) -> bool:
@@ -1918,8 +1919,8 @@ CUTLASS = _launch_kernel(CutlassGmm.name, DECLARED_ONLY)
 XLA = selection.Kernel[GroupedCase]('xla', (), generic=True)
 
 PRODUCTS_APART = selection.Kernel[GroupedCase](
-    APART.name, (_Need('single', lambda case: case.paired or case.kind.together, "the call is one product",
-                       row=INHERENT),), generic=True)
+    APART.name, (_Need('single', lambda case: case.paired, "the call is one product", row=INHERENT),),
+    generic=True)
 """A paired call's or products' in one launch: each product its own call (`APART`), the launches that take
 each its own."""
 
@@ -2053,7 +2054,8 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     formed = options['hooks'].prologue is not None and timed(formed=True)
     # Products side by side or chained are one launch's, a cell of their own, keyed by their joined matrix
     # where a receipt timed it (`TOGETHER`), whatever their first matrix's.
-    together = _together(call, matrix)
+    compound = _compound(call)
+    together = _together(compound, matrix)
     if together is not None:
         # Of the arithmetic the receipt timed: its operands' dtype too (base review b68fc2382 F4: an fp16
         # chain inherited the bf16 win).
@@ -2069,25 +2071,36 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
     # A pair, matrices side by side or chained products: Mosaic GPU's launch alone takes them (`_takes_pair`).
-    paired = any(bound.arguments.get('paired') is not None or bound.arguments.get('beside')
-                 or bound.arguments.get('chained') for _, bound in call.bound.values())
-    return GroupedCase(placed, whole, product, call, kind, extents, paired=paired)
+    return GroupedCase(placed, whole, product, call, kind, extents, paired=compound is not None)
 
 
-def _together(call, matrix: tuple[int, int] | None) -> tuple | None:
-    """Where `call` is several products in one launch, their geometry as a receipt keys it (`TOGETHER`):
-    the launch's form (`beside`, matrices side by side; `chained`, products over joined depths), the first's
-    `matrix`'s shared extent (`_matrix_of`: `[in, out]`; 0 where it is no dense product's) and each product's
-    own width in the launch's order, the replay's widths reading them so (base review a1ad2b4ca F4: a sum
-    of widths aliased two products and three); else None."""
+def _compound(call) -> tuple[str, tuple] | None:
+    """Where `call` is several products in one launch, its form and its further products, as its launches
+    bind them: `beside`, matrices side by side; `chained`, `(rows, matrix)` products over joined depths;
+    `paired`, a pair's second matrix (`gmm_call`'s), alone; else None. Read once a case, for its cell
+    (`_together`) and its launches (`GroupedCase.paired`)."""
     for _, bound in call.bound.values():
         for form in ('beside', 'chained'):
-            others = bound.arguments.get(form) or ()
-            if others:
-                depth, width = matrix or (0, 0)
-                matrices = others if form == 'beside' else tuple(each for _, each in others)
-                return form, depth, (width, *(each.shape[-1] for each in matrices))
+            if others := bound.arguments.get(form):
+                return form, tuple(others)
+        if (paired := bound.arguments.get('paired')) is not None:
+            return 'paired', (paired,)
     return None
+
+
+def _together(compound: tuple[str, tuple] | None, matrix: tuple[int, int] | None) -> tuple | None:
+    """Where a call is products side by side or chained (`compound`, `_compound`'s), their geometry as a
+    receipt keys it (`TOGETHER`): the launch's form (`beside`, matrices side by side; `chained`, products over
+    joined depths), the first's `matrix`'s shared extent (`_matrix_of`: `[in, out]`; 0 where it is no dense
+    product's) and each product's own width in the launch's order, the replay's widths reading them so (base
+    review a1ad2b4ca F4: a sum of widths aliased two products and three); else None (a pair's is one
+    product's cell)."""
+    if compound is None or compound[0] == 'paired':
+        return None
+    form, others = compound
+    depth, width = matrix or (0, 0)
+    matrices = others if form == 'beside' else tuple(each for _, each in others)
+    return form, depth, (width, *(each.shape[-1] for each in matrices))
 
 
 def _matrix_of(launches, arguments) -> tuple[int, int]:

@@ -874,16 +874,18 @@ def plan(launches, family: "Family", target, *, programs: int | None = None) -> 
         most = most if launch.most_programs is None else min(most, launch.most_programs)
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
         order = hidden(family, launch.consumers)
+        # Each ring depth's shared memory once a launch, however many residencies read it.
+        staged = functools.cache(lambda stages, launch=launch: shared_bytes(family, launch.scope(stages)))
         found = None
         for held in residencies:
             share = program_shared(block, held)
-            if shared_bytes(family, launch.scope(launch.floor)) > share:
+            if staged(launch.floor) > share:
                 continue
             stages = launch.floor
-            while stages < launch.most and shared_bytes(family, launch.scope(stages + 1)) <= share:
+            while stages < launch.most and staged(stages + 1) <= share:
                 stages += 1
             if found is None or order(held, stages) > order(found.programs, found.stages):
-                found = LaunchPlan(stages, held, shared_bytes(family, launch.scope(stages)))
+                found = LaunchPlan(stages, held, staged(stages))
         if found is None:
             return None
         plans.append(found)

@@ -822,16 +822,23 @@ class OuterProgram:
 
     def _lowered_aside(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
         """The call's program lowered, its launches certified aside while it traces
-        (`report.certifying_aside`), and lowered afresh (`_relowered`) for as long as a certification
-        refuses, each refused launch's derivation stepping past its config and certifying the next in
-        turn."""
+        (`report.certifying_aside`), and lowered afresh (`_relowered`) for as long as it launches a refused
+        config (`report.refused_in`), each refused launch's derivation stepping past its config and certifying
+        the next in turn: its own certifications' refusals, or another caller's committed after its trace took
+        the config (row 8603: another thread's drain left this program compiling at it). A relowering that
+        launches a config refused before again (a derivation reading no refusal, a pin's) is its compile's to
+        read (`report.settled`)."""
         from dew.nn.kernels.templates import report
 
         with report.certifying_aside() as aside:
             lowered = self.lower(*args, **kwargs)
-        while report.settled_aside(aside):
+        report.settled_aside(aside)
+        seen: set = set()
+        while (refused := report.refused_in(lowered)) and not refused & seen:
+            seen |= refused
             with report.certifying_aside() as aside:
                 lowered = self._relowered(args, kwargs, relowered)
+            report.settled_aside(aside)
         return lowered
 
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:

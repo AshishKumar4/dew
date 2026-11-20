@@ -78,7 +78,8 @@ with report.certifying(compile_only_gpus("sm90")[0]):
         # Certified aside as a compile's lowering is (`OuterProgram._lowered_aside`), settled at its end.
         with report.certifying_aside() as aside:
             text = step.trace(*shapes).lower().as_text()
-        assert not report.settled_aside(aside)
+        report.settled_aside(aside)
+        assert not report.refused_launches()
     found = [[each.op, each.stored] for each in report.certifications()]
 print(json.dumps({"text": text, "traced": len(traced), "certified": found,
                   "uncertified": [str(why) for why in report.uncertified().values()]}))
@@ -143,7 +144,8 @@ with report.certifying(compile_only_gpus("sm90")[0]):
     if sys.argv[1] == "captured":
         with report.certifying_aside() as aside:
             text = lowered_for(step, shapes, "sm90").as_text()
-        assert not report.settled_aside(aside)
+        report.settled_aside(aside)
+        assert not report.refused_launches()
     else:
         text = lowered_for(step, shapes, "sm90").as_text()
     found = sorted([each.op, each.pulled, sorted((name, held[0]) for name, held in each.kernels.items())]
