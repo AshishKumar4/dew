@@ -695,17 +695,23 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
         # Its lowering's own trace, whose constants are the program's held (a relowering's, past a spill,
         # derives its launches afresh: a halved chunk's sequence table), never the first trace's; refused
         # where they are other arguments than the program was compiled to take.
-        retraced = jax.make_jaxpr(traced_fn)(*jax.tree.unflatten(structure, flat))
+        with tuning.seen() as relaunched:
+            retraced = jax.make_jaxpr(traced_fn)(*jax.tree.unflatten(structure, flat))
         if [jax.typeof(constant) for constant in retraced.consts] != schema:
             raise ValueError(f"{name}: relowered, its program holds other constants than its first trace's, "
                              "which its compile ahead takes as its arguments")
+        # The launches of the lowering compiled, which its run reports (`CompiledTruths.ran`): a relowering
+        # past a spill takes another config than the first trace's.
         held[name]["constants"] = [*map(np.asarray, retraced.consts)]
+        held[name]["launches"] = relaunched.held()
         return retraced
 
-    _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
     # The routes its trace reported and the launches it took, which its run, calling the program and tracing
-    # none, reports at each call (`truths_ahead.CompiledTruths.ran`).
-    held[name]["routes"], held[name]["launches"] = list(reported), launched.held()
+    # none, reports at each call (`truths_ahead.CompiledTruths.ran`), until a lowering of it takes its own
+    # (`again`).
+    held_now = {"routes": list(reported), "launches": launched.held()}
+    _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
+    held[name].update(held_now)
     return shapes
 
 
@@ -1978,7 +1984,8 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
         with contextlib.nullcontext() if cpu is None else jax.default_device(cpu):
             placed = inputs if cpu is None else jax.device_put(inputs, cpu)
             # With `launched`, the launches of the program run: one lowering, traced where they are seen.
-            run = jax.jit(fn).lower(*placed).compile() if launched else fn
+            lowered = fn if hasattr(fn, "lower") else jax.jit(fn)
+            run = lowered.lower(*placed).compile() if launched else fn
             return run(*placed)
 
     def called(*inputs):
@@ -1999,6 +2006,8 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
                     shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
                 store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True),
                                    arms=True, host=host)
+            # The launches of the lowering compiled, as its run reports them (`CompiledTruths.ran`).
+            tuning.noted(held[named(role, inputs)]["launches"])
             # Zeros of the shapes its own trace gave, in the store's tracing: a jit of its own compiler
             # options traced again inside another, `eval_shape`'s, was refused.
             return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)
@@ -2011,8 +2020,6 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
         return called
 
     def with_launches(*inputs):
-        from dew.nn.kernels import tuning
-
         with tuning.seen() as found:
             outputs = called(*inputs)
         return outputs, found.held()

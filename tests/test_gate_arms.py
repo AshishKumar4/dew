@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_forms import without_ynn
 from contract_support import normal_drawn
 from reference_error import (
     GateFailure,
@@ -164,11 +165,14 @@ def test_the_arms_arithmetic_is_that_of_where_their_calls_are_placed():
     assert on_a_cpu == FP32_SUMS and on_a_gpu == jax.config.jax_default_matmul_precision
 
 
-def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran():
+def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran(tmp_path):
     """`ahead_arm(fn, label, launched=True)` outside a part returns its outputs and the launches the program
     it ran took, at every call: its one lowering's, each the launch a trace of the function takes, the second
     call's too, whose program a plain jit would take from its cache and trace no launch for a collector open
-    around it (row 9550: a witness retraced a program of its own to see them)."""
+    around it (row 9550: a witness retraced a program of its own to see them); a jit of its own compiler
+    options (`without_ynn`'s) lowered as itself, never nested in another; and prepared into a store and run
+    from it, its prepare's lowering's launches, its run's alike (a relowering past a spill, a GPU's, keeps its
+    own: `_arm_program`'s `again`)."""
     sizes = np.asarray([128, 128], np.int32)
     rng = np.random.default_rng(9550)
     x = rng.standard_normal((256, 128)).astype(np.float32)
@@ -179,11 +183,17 @@ def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran():
                            out_dtype=jnp.float32, precision="highest", interpret_on_cpu=True)
 
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="triton"):
-        arm = ahead_arm(gradient, "a kernel gradient and its launches", launched=True)
-        made = [arm(x, dy) for _ in range(2)]
+        made = [ahead_arm(arm, f"a kernel gradient and its launches, {at}", launched=True)(x, dy)
+                for at, arm in enumerate((gradient, gradient, without_ynn(gradient)))]
         with tuning.seen() as traced:
             jax.jit(gradient).trace(x, dy)
+        # Prepared and run from its store: the launches its prepare's lowering took, its run's alike.
+        stored = []
+        for prepare in (True, False):
+            with compiled_truths(tmp_path, prepare=prepare, stamp="launched"):
+                stored.append(ahead_arm(gradient, "a stored kernel gradient", launched=True)(x, dy)[1])
     expected = [type(op) for op, _ in traced]
-    assert expected and all([type(op) for op, _ in launches] == expected for _, launches in made)
+    assert expected and all([type(op) for op, _ in launches] == expected
+                            for launches in (*(found for _, found in made), *stored))
     np.testing.assert_array_equal(np.asarray(made[0][0]), np.asarray(made[1][0]))
 
