@@ -114,11 +114,15 @@ def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dim
     def multiply(inputs, kernel):
         return _product(layer, projections.extents(inputs.shape, kernel.shape, dimensions))
 
-    if bias is not None and taken is None and (taking := multiply(inputs, kernel))[1]:
-        # The product's own rule takes the bias, its gradient formed with the kernel's (row 6740).
-        return taking[0](inputs, kernel, dimensions, precision=layer.precision, bias=shaped(bias))
-    product = take(lambda inputs, kernel: multiply(inputs, kernel)[0](inputs, kernel, dimensions,
-                                                                      precision=layer.precision))
+    if taken is None:
+        product_of, takes_bias = multiply(inputs, kernel)
+        if bias is not None and takes_bias:
+            # The product's own rule takes the bias, its gradient formed with the kernel's (row 6740).
+            return product_of(inputs, kernel, dimensions, precision=layer.precision, bias=shaped(bias))
+        product = product_of(inputs, kernel, dimensions, precision=layer.precision)
+    else:
+        product = taken(lambda inputs, kernel: multiply(inputs, kernel)[0](inputs, kernel, dimensions,
+                                                                           precision=layer.precision))
     if bias is None:
         return product
     return biased(product, shaped(bias))
