@@ -1030,7 +1030,12 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
     None. A scalar decay's pairs decay the reads, then a product applies them; a decay a key dimension's
     factor around each sub-chunk's reference as `_factored`'s (`recurrence_algebra.SUB`): an earlier
     sub-chunk's keys decayed to the reference `p` before the row's sub-chunk and applied, the row's decay
-    from it after, each factor at most 1; a sub-chunk's own pairs elementwise over its keys."""
+    from it after, each factor at most 1; a sub-chunk's own pairs elementwise over its keys.
+
+    A read that overflows, formed before its decay (the token order's, row 5426's contract), reads zero
+    through a decay that underflows to zero, each key's within a sub-chunk and a pair's whole across one:
+    the term the recurrence decays to its range there, which float32's scores-then-decay order cannot form,
+    where infinity times that zero was NaN (rows 9547 and train 1079's review F1). A NaN read reads NaN."""
     from dew.nn.kernels import recurrence_algebra
 
     issue = issue or _issued
@@ -1043,18 +1048,28 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
         reads = reads * weights
     if scalar:
         return issue("apply", reads * between[..., 0], keys)
+    # Across sub-chunks an overflowed read through a whole decay of zero zero; a finite one keeps its factored
+    # decays' product, which its whole decay loses.
+    reads = jnp.where(jnp.all(between == 0, axis=-1) & jnp.isinf(reads), 0.0, reads)
     count = keys.shape[0]
     sub = recurrence_algebra.SUB
     rows = []
     for first in range(0, count, sub):
         own = slice(first, min(first + sub, count))
-        row = _portable_einsum("ij,jk,ijk->ik", reads[own, own], keys[own], between[own, own])
+        row = _portable_einsum("ijk,jk,ijk->ik", _kept(reads[own, own], between[own, own]), keys[own],
+                               between[own, own])
         if first:
             reference = first - 1
             earlier = issue("apply", reads[own, :first], keys[:first] * between[reference, :first])
             row = row + between[own, reference] * earlier
         rows.append(row)
     return jnp.concatenate(rows, axis=0)
+
+
+def _kept(reads, between):
+    """A sub-chunk's own pairs' reads `[R, C]` a key at a time `[R, C, K]`, an overflowed one zero where that
+    key's decay (`between` `[R, C, K]`) is zero (`spread`'s rule), selected before the decay multiplies it."""
+    return jnp.where(jnp.isinf(reads)[..., None] & (between == 0), 0.0, reads[..., None])
 
 
 def _lowered(overlaps):

@@ -581,6 +581,94 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
                          length=LENGTH, seeds=32)
 
 
+OJA = recurrence.Hooks(decay='vector', erase='values', scale=KEY_WIDTH ** -0.5)
+"""Oja's rule with a gate a value dimension (`Hooks.erase` 'values', fla's gated_oja_rule), row 9028."""
+
+
+def oja_token(state, query, key, value, log_decay, beta):
+    """A decode token of Oja's rule as its paper writes it, a value head per key head: the memory `S` `[R, H,
+    K, V]` decayed along its values and its values erased from it, then written, `S D (I - beta v v^T) + beta
+    k v^T`, `D = exp(log_decay)` `[R, H, V]`, read after, `q^T S'`."""
+    decayed = state * jnp.exp(log_decay)[..., None, :]
+    erased = jnp.einsum('rhkv,rhv->rhk', decayed, value)
+    beta_ = beta[..., None, None]
+    written = beta_ * key[..., :, None] * value[..., None, :]
+    updated = decayed - beta_ * erased[..., None] * value[..., None, :] + written
+    return jnp.einsum('rhk,rhkv->rhv', query, updated), updated
+
+
+def test_an_oja_decode_token_is_as_exact_as_its_formula():
+    """A decode token of Oja's rule (`OJA`, scale one) through the public step (`recurrence.step`): output,
+    memory and every gradient against the token as its paper writes it (`oja_token`) from float64 (check 1,
+    row 9028)."""
+    hooks = dataclasses.replace(OJA, scale=1.0)
+    rows, heads, keys, values = 8, 4, KEY_WIDTH, VALUE_WIDTH
+
+    def draw(seed):
+        rng = np.random.default_rng([9028, seed])
+        normal = rng.standard_normal
+        operands = (0.3 * normal((rows, heads, keys, values)), normal((rows, heads, keys)),
+                    unit(normal((rows, heads, keys))), unit(normal((rows, heads, values))),
+                    -rng.uniform(0, 1, (rows, heads, values)), rng.uniform(0, 1, (rows, heads)))
+        seeded = (normal((rows, heads, values)), normal((rows, heads, keys, values)))
+        return *(hosted(x) for x in operands), tuple(hosted(x) for x in seeded)
+
+    def stepped(state, query, key, value, log_decay, beta):
+        token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
+        out, _, updated = recurrence.step(hooks, token)
+        return out, updated
+
+    assert_as_exact(jax.jit(with_gradients(stepped)), jax.jit(with_gradients(oja_token)), draw,
+                    "an oja decode token", seeds=8)
+
+
+def oja_edge(state, key, value, beta):
+    """A decode token of Oja's rule over one key, a query of one, no decay and scale one, in fp32 (`OJA`'s
+    through `recurrence.step`): `(output, memory)` of a memory `state` `[Dv]`, a key `key` `[1]`, values
+    `value` `[Dv]` and a write gate `beta`."""
+    def held(x, *shape):
+        return jnp.reshape(jnp.asarray(x, jnp.float32), (1, 1, *shape))
+
+    token = recurrence.Step(held(state, 1, len(state)), query=held([1.0], 1), key=held(key, 1),
+                            value=held(value, len(value)), log_decay=jnp.zeros((1, 1), jnp.float32),
+                            beta=held(beta))
+    out, _, updated = recurrence.step(dataclasses.replace(OJA, decay='scalar', scale=1.0), token)
+    return out.ravel(), updated.ravel()
+
+
+@pytest.mark.parametrize(('state', 'key', 'value', 'beta', 'expected'), [
+    ([-2.0 ** 127], [2.0 ** 127], [1.0], 0.25, [-2.0 ** 126]),
+    ([2.0 ** 120, 0.0], [0.0], [2.0 ** -60, 1.0], 2.0 ** -100, [2.0 ** 120, -2.0 ** -40]),
+    ([2.0 ** 127] * 4, [0.0], [0.5] * 4, 0.25, [2.0 ** 127 - 2.0 ** 125] * 4)],
+    ids=['a correction past the largest', 'a gated value past the least', 'an ungated read past the largest'])
+def test_an_oja_decode_tokens_gate_scales_its_formed_correction(state, key, value, beta, expected):
+    """A decode token of Oja's rule (`oja_edge`), its memory and output exact in fp32: the gated correction
+    `beta k - beta v^T S^T` one exact sum, which neither its ungated parts past fp32's largest (2^128) nor
+    `beta v` past its least (2^-160) loses."""
+    out, updated = oja_edge(state, key, value, beta)
+    assert (out.tolist(), updated.tolist()) == (expected, expected)
+
+
+def test_an_oja_decode_tokens_gate_gradient_sums_its_terms_exactly():
+    """The gate's derivative of a decode token of Oja's rule (`oja_edge`) at a memory `[2^31, 2, 0, 0]`,
+    values of 1/2 and a key of 2^30: its write's `k` 2^30 and its erase's read `v^T S^T` 2^30 + 1, summed
+    exactly, give twice its second output's -1, where each rounded apart cancelled to zero."""
+    def second(beta):
+        return 2.0 * oja_edge([2.0 ** 31, 2.0, 0.0, 0.0], [2.0 ** 30], [0.5] * 4, beta)[0][1]
+
+    assert float(jax.grad(second)(jnp.float32(0.25))) == -1.0
+
+
+@pytest.mark.parametrize('form', [{'erase': 'values', 'delta': False}, {'erase': 'values', 'reads': 'before'},
+                                  {'erase': 'erasing'}],
+                         ids=['without the delta rule', 'read before', 'unknown'])
+def test_an_erase_outside_its_form_is_refused(form):
+    """An erase outside its form (`Hooks.erase`): along the values without the delta rule or read before its
+    token, or an unknown kind, a ValueError (row 9028)."""
+    with pytest.raises(ValueError):
+        recurrence.Hooks(decay='vector', **form)
+
+
 def test_a_turned_readout_before_its_tokens_turn_is_refused():
     """A turned state's readout reads it after its token's turn ('after' or 'apart', `Hooks.turns`): the
     chunked op's frames read each token's query in its own turn's frame, so a readout of the state before
@@ -1268,6 +1356,85 @@ def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alo
     # The gate widens the truth's inputs (`reference_error._truth_and_terms`).
     assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)), draw, site, seeds=seeds,
                     truth_fn=wide)
+
+
+def _measured_routes(choice, generation_name: str, run, *shapes, mesh=None) -> list:
+    """The routes `choice`'s selector reports for `run` over operands of `shapes` traced
+    (`jax.eval_shape`) on an assumed `generation_name`, under the abstract `mesh` where given: whether a
+    receipt-backed cell (`Op.declared`) overrode its kernels' order, its route's refusal 'measured'."""
+    with (generation.assumed(generation_name), generation.routes() as found,
+          contextlib.nullcontext() if mesh is None else jax.sharding.use_abstract_mesh(mesh)):
+        jax.eval_shape(run, *shapes)
+    return [(route.kernel, route.refusal is not None and route.refusal.kind == 'measured')
+            for route in found if route.choice == choice]
+
+
+@pytest.mark.parametrize(('rows', 'tokens', 'product', 'packed', 'mesh', 'ported'), [
+    (1, 4096, 'forward', False, None, True), (1, 4096, 'training', False, None, True),
+    (2, 4096, 'forward', False, None, False), (1, 8192, 'forward', False, None, False),
+    (1, 4096, 'forward', True, None, False), (2, 4096, 'forward', False, ('data', 2), True),
+    (1, 4096, 'forward', False, ('tensor', 2), False)],
+    ids=['timed forward', 'timed training', 'two rows', 'longer', 'packed', 'two rows split', 'heads split'])
+def test_a_b200s_port_cell_overrides_only_the_extent_its_receipt_timed(rows, tokens, product, packed, mesh,
+                                                                     ported):
+    """A bf16 gated delta net of Qwen3.5-27B's heads (16 key heads, 48 value heads, 128 wide) on a B200,
+    whose forward and training a receipt timed on fla's port at one unpacked row of 4096 tokens
+    (`recurrence_chunk.PORT_CELLS`, `TIMED`): the delta rule's selector runs the port by that receipt where
+    each launch's shard computes that (two rows split over two devices among them), and for more rows,
+    other tokens, packed documents or heads split apart no receipt overrides its kernels' order, where
+    every length, batch and split at those heads took the port (row 8991)."""
+    # A training step's mesh, its axes automatic: the rules place each operand (`sharding.grouped_heads`).
+    mesh = None if mesh is None else jax.sharding.AbstractMesh((mesh[1],), (mesh[0],),
+                                                               axis_types=(jax.sharding.AxisType.Auto,))
+    gates = (jax.ShapeDtypeStruct((rows, tokens, 48), jnp.float32),
+             jax.ShapeDtypeStruct((rows, tokens, 48), jnp.bfloat16))
+    shapes = [jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16) for heads in (16, 16, 48)]
+    starts = [jax.ShapeDtypeStruct((rows, tokens), jnp.bool_)] if packed else []
+
+    def forward(query, key, value, g, beta, *starts):
+        given = starts[0] if starts else None
+        return recurrence_chunk.chunk_gated_delta_rule(query, key, value, g, beta, starts=given)[0]
+
+    run = forward if product == 'forward' else jax.grad(lambda *o: forward(*o).astype(jnp.float32).sum(),
+                                                        argnums=(0, 1, 2))
+    found = _measured_routes(recurrence_chunk.GATED_DELTA.choice, 'sm100', run, *shapes, *gates, *starts,
+                             mesh=mesh)
+    assert all(measured == ported for _, measured in found) and found, found
+    assert not ported or {kernel for kernel, _ in found} == {'fla'}, found
+
+
+@pytest.mark.parametrize(('rows', 'tokens', 'packed', 'heads', 'width', 'chunk_size', 'keys', 'declared'), [
+    (1, 4096, False, 96, 80, 256, jnp.bfloat16, True), (1, 4096, False, 64, 64, 128, jnp.bfloat16, True),
+    (1, 4096, False, 96, 80, 256, jnp.float32, False), (2, 4096, False, 96, 80, 256, jnp.bfloat16, False),
+    (1, 2048, False, 96, 80, 256, jnp.bfloat16, False), (1, 4096, True, 96, 80, 256, jnp.bfloat16, False),
+    (1, 4096, False, 96, 96, 256, jnp.bfloat16, False), (1, 4096, False, 32, 64, 128, jnp.bfloat16, False),
+    (1, 4096, False, 64, 64, 256, jnp.bfloat16, False)],
+    ids=['4B', '30B', '4B of float32 keys', '4B of two rows', '4B shorter', '4B packed',
+         'heads padded to 4B\'s', 'another head count', 'another chunk'])
+def test_an_a100s_ssd_port_cells_override_only_the_geometries_their_receipt_timed(rows, tokens, packed, heads,
+                                                                                width, chunk_size, keys,
+                                                                                declared):
+    """An SSD's bf16 training on an A100, whose receipt timed mamba_ssm's port faster than the template on
+    Nemotron-H 4B's (96 heads of 80 and chunks of 256) and 30B's (64 heads of 64 and chunks of 128), each
+    eight groups of 128-wide states, at one unpacked row of 4096 tokens (`recurrence_chunk.SCAN_CELLS`): the
+    rated scan's selector runs the port by that receipt on those calls alone, and on another row count,
+    length, chunk or head count, packed documents, heads only padded to the port's width as 4B's are (96
+    wide), or float32 keys, whose call the scan launches in float32, no receipt overrides its kernels' order,
+    where every mma.sync training geometry took the port (row 8991)."""
+    def loss(x, B, C, dt, A, D, *starts):
+        operands = Chunk(C, B, x, beta=dt, rate=A, skip=D, starts=starts[0] if starts else None)
+        out, _ = chunk(FORMED[4], operands, chunk_size=chunk_size, dtype=jnp.float32)
+        return out.sum()
+
+    shapes = (jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16),
+              *[jax.ShapeDtypeStruct((rows, tokens, 8, 128), keys)] * 2,
+              jax.ShapeDtypeStruct((rows, tokens, heads), jnp.float32),
+              *[jax.ShapeDtypeStruct((heads,), jnp.float32)] * 2,
+              *([jax.ShapeDtypeStruct((rows, tokens), jnp.bool_)] if packed else []))
+    found = _measured_routes(recurrence_chunk.SCAN.choice, 'sm80', jax.grad(loss, argnums=(0, 1, 2, 3)),
+                             *shapes)
+    assert any(measured for _, measured in found) == declared, found
+    assert not declared or ('pallas', True) in found, found
 
 
 def test_the_ssd_port_refuses_a_forked_call_named_to_it():

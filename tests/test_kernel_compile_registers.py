@@ -1,7 +1,14 @@
 """The compile gate's reading of ptxas's notes: a kernel whose assembly ptxas notes a performance loss of
 fails it."""
+import jax
+import jax.numpy as jnp
 import kernel_compile as kc
 import pytest
+from fla_gdn_support import KernelCase
+from generation_support import lowers
+from jax.experimental.pallas import mosaic_gpu as plgpu
+
+from dew.nn.kernels.templates import report
 
 SERIALIZING = ("ptxas info    : (C7512) Potential Performance Loss: wgmma.mma_async instructions are "
                "serialized due to insufficient register resources for the function "
@@ -79,3 +86,45 @@ def test_a_gpu_environment_none_of_whose_builds_a_generation_runs_is_refused(mon
         kc.judged_builds("sm100")
     # The same environment judges a generation its build runs: the refusal is the generation's alone.
     assert kc.judged_builds("sm80") == ("cuda12",)
+
+
+def _register_bound_product(depth: int):
+    """A warpgroup's 64 x 128 product of a depth-`depth` operand it holds in registers by one staged in
+    shared memory, five blocks a multiprocessor (`min_blocks_per_sm`, a launch's register cap of 96), which
+    leaves its MMA pipeline short of registers: ptxas serializes it (FS-6456-SCAN5: C7511 spill-free at
+    depth 128, C7512 at 64)."""
+    from jax._src.pallas.mosaic_gpu import pallas_call as mosaic_pallas_call
+    from jax.experimental import pallas as pl
+
+    swizzled = (plgpu.TilingTransform((8, 64)), plgpu.SwizzleTransform(128))
+
+    def kernel(a_ref, b_ref, o_ref):
+        def scope(acc_ref):
+            plgpu.wgmma(acc_ref, a_ref[...], b_ref)
+            return acc_ref[...]
+
+        o_ref[...] = pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
+
+    return mosaic_pallas_call.pallas_call(
+        kernel,
+        in_specs=[plgpu.BlockSpec((64, depth), lambda: (0, 0), transforms=swizzled),
+                  plgpu.BlockSpec((depth, 128), lambda: (0, 0), transforms=swizzled)],
+        out_specs=plgpu.BlockSpec((64, 128), lambda: (0, 0)),
+        out_shape=jax.ShapeDtypeStruct((64, 128), jnp.float32),
+        compiler_params=plgpu.CompilerParams(min_blocks_per_sm=5))
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("depth", [128, 64])
+def test_a_kernel_ptxas_serializes_carries_ptxas_own_notes_in_its_binary(depth):
+    """A warpgroup product ptxas serializes, compiled by Dew's JAX build for a compile-only H100: the notes
+    its binary carries (`report.Binary.notes`, the native compile's own) are ptxas's of its PTX, the gate's
+    read of it, a serialization among them, so a run's certification refuses it on its binary's word (row
+    6456: the notes once read none, a serialized kernel passing `Binary.refused`)."""
+    shapes = (jax.ShapeDtypeStruct((64, depth), jnp.float16), jax.ShapeDtypeStruct((depth, 128), jnp.float16))
+    (record,) = kc.compile_mosaic_kernels(
+        [KernelCase("register_bound", lambda: (_register_bound_product(depth), shapes))], "sm90")
+    (kernel,) = record["kernels"]
+    assert set(kernel["losses"]) & report.SERIALIZED, kernel
+    assert tuple(kernel["binary_losses"]) == tuple(kernel["losses"]), kernel
+
