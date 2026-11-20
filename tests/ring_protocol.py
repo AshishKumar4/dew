@@ -64,6 +64,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax._src.state import discharge
+from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import core as jcore
 
 from dew.nn import derivatives
@@ -437,17 +438,26 @@ def _wgmma_product(self: _Interpreter, equation, values) -> list:
 
 def _tcgen05_product(self: _Interpreter, equation, values) -> list:
     """A tcgen05 product (`tcgen05_mma`): its operands, each at its slot, read asynchronously until the
-    completion of a commit of its thread after it (a `committed` event); its accumulator tensor memory's.
-    Refused where it arrives
-    at a barrier of its own once it completes (`arrive`), an asynchronous arrival the checker does not
-    order."""
+    completion of a commit of its thread after it (a `committed` event); its accumulator written in tensor
+    memory on that completion. A tensor-memory left operand (`WEIGHTS` over `LOGITS` or `QUERY`) is read as
+    filled, its latest overlapping writer before it not a product. Refused where it arrives at a barrier of
+    its own once it completes (`arrive`), an asynchronous arrival the checker does not order."""
     params = equation.params
     if params["arrive"]:
         raise ValueError("a tcgen05 product arriving at a barrier as it completes: the checker orders no "
                          "asynchronous arrival")
-    _, lhs, rhs, _ = values[:4]
+    acc, lhs, rhs, _ = values[:4]
     leaves = values[4 + 2 * int(params["scaled"]) + int(params["sparse"]):]
-    return self.emit("product", (), _operand_slots(params, lhs, rhs, leaves))
+    acc_tree = params["acc_transforms_tree"]
+    acc_count = acc_tree.num_leaves if acc_tree is not None else 0
+    destination = _slot(acc, acc_tree, leaves[:acc_count]) if isinstance(acc, Ref) else ()
+    slots = _operand_slots(params, lhs, rhs, leaves)
+    if isinstance(lhs, Ref) and equation.invars[1].aval.memory_space == plgpu.TMEM:
+        # Its left operand in tensor memory, its thread's or another's stores' (`_tmem_store`): a read of
+        # what a store or copy must have written last, landed before it (no store's, or overwritten since by
+        # an MMA through an aliased view, a read of nothing).
+        self.emit("read", slots[0], "filled")
+    return self.emit("product", destination, slots)
 
 
 _tcgen05_commit = _arrival("barrier_transforms_tree", "committed")
@@ -471,10 +481,43 @@ def _tmem_copy(self: _Interpreter, equation, values) -> list:
     return []
 
 
+def _tmem_store(self: _Interpreter, equation, values) -> list:
+    """`async_store_tmem`: registers written into tensor memory at its slot, visible to the tensor core's
+    products once its thread's next `commit_tmem` follows (`_tmem_commit`), where the write lands: a turn's
+    weights over their logits (`placed.Tcgen05Placed`), published by a commit and then an arrival
+    (`Tcgen05Issuer.published`)."""
+    ref = values[0]
+    if isinstance(ref, Ref):
+        self.emit("tmem_store", _slot(ref, equation.params["tree"], values[2:]))
+    return []
+
+
+def _tmem_load(self: _Interpreter, equation, values) -> list:
+    """`async_load_tmem`: tensor memory read into registers asynchronously at its slot until its thread's
+    next `wait_load_tmem` retires it (`_tmem_load_wait`)."""
+    ref = values[0]
+    if isinstance(ref, Ref):
+        self.emit("tmem_load", _slot(ref, equation.params["tree"], values[1:]))
+    return [None] * len(equation.outvars)
+
+
+def _tmem_load_wait(self: _Interpreter, equation, values) -> list:
+    """`wait_load_tmem`: retires every pending `async_load_tmem` read of its thread (`_tmem_load`)."""
+    del equation, values
+    return self.emit("tmem_load_wait")
+
+
+def _tmem_commit(self: _Interpreter, equation, values) -> list:
+    """`commit_tmem`: its thread's tensor-memory stores before it landed (`_tmem_store`)."""
+    del equation, values
+    return self.emit("tmem_commit")
+
+
 SYNC: dict[str, Callable] = {
     "barrier_wait": _wait, "barrier_arrive": _arrival("transforms_treedef"),
     "tcgen05_mma": _tcgen05_product, "tcgen05_commit_arrive": _tcgen05_commit,
-    "async_copy_smem_to_tmem": _tmem_copy, "copy_gmem_to_smem": _load,
+    "async_copy_smem_to_tmem": _tmem_copy, "async_store_tmem": _tmem_store, "async_load": _tmem_load,
+    "wait_load_tmem": _tmem_load_wait, "commit_tmem": _tmem_commit, "copy_gmem_to_smem": _load,
     "copy_smem_to_gmem": _store, "commit_group": _store_group, "wait_smem_to_gmem": _store_wait,
     "commit_smem": _commit,
     "get": _access("read", 1), "load": _access("read", 1), "swap": _access("write", 2),
@@ -852,14 +895,19 @@ def _races(threads, trace, arrivals) -> None:
             order.landed(thread, position, event)
         else:
             order.moved(thread, position, event)
+    for thread, entries in enumerate(order.pending):
+        for entry_kind, where, prior_event, *_ in entries:
+            if entry_kind == "tmem_load":
+                raise Violation("unordered", f"tmem_load of {where} never waited on",
+                                [(thread, prior_event)])
 
 
 class _Order:
     """An execution's happens-before order, built a move at a time: each thread's vector clock, each load's
     landing its own clock joined into its barrier's phase; each access of a location ordered after every
     write of it before (a read after the write lands) and each write after every read of it before (an
-    asynchronous read, a product's or a store's, until the wait that retires it); each store's source
-    fenced after its last generic write."""
+    asynchronous read, a product's, a store's or a tensor-memory load's, until the wait that retires it);
+    each store's source fenced after its last generic write."""
 
     def __init__(self, threads, arrivals):
         self.threads, self.arrivals = threads, arrivals
@@ -875,6 +923,7 @@ class _Order:
         self.committed: list = [[] for _ in threads]
         self.committing: dict = {}
         self.fills: dict = {}
+        self.stored: list = [[] for _ in threads]
 
     def arrived(self, at, clock, *, counted: bool, transaction: int) -> None:
         joined, count, flying = self.accumulating.get(at, ({}, 0, 0))
@@ -885,24 +934,39 @@ class _Order:
         else:
             self.accumulating[at] = (joined, count, flying)
 
-    def ordered(self, at, clock, event, *, write: bool) -> None:
+    def ordered(self, at, clock, event, *, write: bool, thread: int | None = None) -> None:
+        # Two tcgen05 products issued by the same warp are serialized by the tensor core pipeline.
+        def same_pipeline(prior_event: Event, prior_clock: dict | None, prior_thread: int | None) -> bool:
+            if event.kind != "product" or prior_event.kind != "product" or thread is None:
+                return False
+            if prior_thread is not None:
+                return prior_thread == thread
+            return any(key[0] == "completed" and key[1] == thread for key in (prior_clock or ()))
+
         for where, prior, prior_event in self.writes:
             if _overlaps(where, at) and not _before(prior, clock):
+                if same_pipeline(prior_event, prior, None):
+                    continue
                 raise Violation(
                     "unordered", f"{event.kind} of {at} unordered with the {prior_event.kind} of {where}",
                                 [(None, prior_event), (None, event)])
         if write:
             for where, prior, prior_event in self.reads:
                 if _overlaps(where, at) and not _before(prior, clock):
+                    if same_pipeline(prior_event, prior, None):
+                        continue
                     raise Violation(
                         "unordered", f"write of {at} unordered with the read of {where} before it",
                                     [(None, prior_event), (None, event)])
-            # A read still in flight (a product's or a store's not retired, a tcgen05 product no commit's
-            # completion has ended) ends after this write, whatever orders the write.
+            # A read still in flight (a product's, a store's or a tensor-memory load's not retired, a
+            # tcgen05 product no commit's completion has ended) ends after this write, whatever orders the
+            # write.
             flying = [entry for entries in self.pending for entry in entries]
             flying += [entry for products in self.committed for entry, done in products if done is None]
-            for _, where, prior_event, *_ in flying:
+            for _, where, prior_event, _, (prior_thread, _), _ in flying:
                 if _overlaps(where, at):
+                    if same_pipeline(prior_event, None, prior_thread):
+                        continue
                     said = f"write of {at} while the {prior_event.kind} reading {where} is in flight"
                     raise Violation("unordered", said, [(None, prior_event), (None, event)])
 
@@ -911,13 +975,18 @@ class _Order:
         if event.kind == "committed":
             # A commit's completion, after every product its thread issued before it completes. A product's
             # completion is its own: after its issue and its token (`completed`), no later event of its
-            # thread's, its reads ending there, whichever covering commit lands first; each commit's arrival
-            # joins the completions it covers.
+            # thread's, its reads ending and its tensor-memory accumulator write landing there, whichever
+            # covering commit lands first; each commit's arrival joins the completions it covers.
+            written = set()
             for product in self.committing.pop((thread, position)):
                 if product[1] is None:
                     _, source, read, issued, key, _ = product[0]
                     product[1] = _joined(issued, {("completed", *key): 1})
                     self.reads.append((source, product[1], read))
+                    if read.at and key not in written:
+                        written.add(key)
+                        self.ordered(read.at, product[1], read, write=True, thread=key[0])
+                        self.writes.append((read.at, product[1], read))
                 landing = _joined(landing, product[1])
             self.arrived(event.at, landing, counted=True, transaction=0)
             return
@@ -948,16 +1017,33 @@ class _Order:
             if event.argument and kind == "load":
                 self.arrived(event.argument, clock, counted=True, transaction=1)
         elif kind in ("read", "write"):
-            if kind == "read" and event.argument == "filled" and not any(
-                    where == event.at and _before(prior, clock) for where, prior, _ in self.writes):
-                raise Violation("unwritten", f"read of {event.at}, which no fill ordered before it wrote",
-                                [(thread, event)])
+            if kind == "read" and event.argument == "filled":
+                prior_writes = [(prior, writer) for where, prior, writer in self.writes
+                                if _overlaps(where, event.at) and _before(prior, clock)]
+                latest = [writer for prior, writer in prior_writes
+                          if not any(_before(prior, other) and not _before(other, prior)
+                                     for other, _ in prior_writes)]
+                if not latest or any(writer.kind == "product" for writer in latest):
+                    raise Violation("unwritten", f"read of {event.at}, which no fill ordered before it wrote",
+                                    [(thread, event)])
             self.ordered(event.at, clock, event, write=kind == "write")
             (self.writes if kind == "write" else self.reads).append((event.at, dict(clock), event))
             if kind == "write":
                 self.unfenced[thread].add(event.at)
         elif kind == "commit":
             self.unfenced[thread].clear()
+        elif kind == "tmem_store":
+            # Lands at its thread's next `tmem_commit` (`_tmem_store`).
+            self.stored[thread].append(event)
+        elif kind == "tmem_commit":
+            for store in self.stored[thread]:
+                self.ordered(store.at, clock, store, write=True)
+                self.writes.append((store.at, dict(clock), store))
+            self.stored[thread] = []
+        elif kind == "tmem_load":
+            self.asynchronous(thread, position, event, clock)
+        elif kind == "tmem_load_wait":
+            self.retired(thread, "tmem_load", 0, clock)
         elif kind == "committed":
             # Every product its thread issued before it, each a read and its completion (None until a commit
             # covering it lands, `landed`).
@@ -977,10 +1063,10 @@ class _Order:
             self.retired_groups(thread, int(event.argument), clock)
 
     def asynchronous(self, thread, position, event, clock) -> None:
-        """An asynchronous read issued: a store's source, fenced, or a product's operands, each read until
-        the wait that retires it (`retired`) or, a tcgen05 product's, its completion (`landed`); each held
-        with its issue's clock and place."""
-        sources = (event.at,) if event.kind == "store" else event.argument
+        """An asynchronous read issued: a store's source, fenced, a tensor-memory load's source, or a
+        product's operands, each read until the wait that retires it (`retired`) or, a tcgen05 product's, its
+        completion (`landed`); each held with its issue's clock and place."""
+        sources = (event.at,) if event.kind in ("store", "tmem_load") else event.argument
         if event.kind == "store" and any(_overlaps(event.at, at) for at in self.unfenced[thread]):
             raise Violation("unfenced", f"a store reads {event.at} past a generic write no fence follows",
                             [(thread, event)])
