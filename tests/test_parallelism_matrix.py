@@ -41,7 +41,6 @@ CELLS_ON_FOUR run on four of the eight, where four stages, or two beside a
 sequence axis of two, leave no axis for the rows: every device holds all of
 them."""
 
-import json
 import subprocess
 import sys
 
@@ -278,30 +277,30 @@ def test_each_split_draws_a_models_initial_parameters_as_one_device_does(model, 
     tool.held_draw(model, layout, seeds=DRAW_SEEDS, devices=devices)
 
 
-READ_BACK = ("mamba1_packed", "fsdp2_explicit")
+READ_BACK = "test_each_layout_of_a_model_matches_one_device_or_is_refused and mamba1_packed-fsdp2_explicit"
 """The cell whose step, read back from the persistent compilation cache, deadlocked its devices (row
-10128)."""
+10128), as pytest selects it."""
 
 
 def test_a_layouts_step_read_back_from_the_compilation_cache_runs_as_compiled(tmp_path):
-    """A packed Mamba's step on two fsdp devices of eight placed explicitly (`READ_BACK`), compiled fresh into
-    a persistent compilation cache by one process and read back by another, runs in each to its sample, held
-    to one device's (`layout_parity.ran`, `--seeds 0`), the second compiling nothing the first did not. Read
-    back on jax 0.12.0.1.post114, XLA:CPU's thunk deserializer gave each nested thunk sequence collective
-    resources of its own, losing every edge that ordered a while loop against the collectives beside it (417
-    of the step's 13,359), and its devices waited on each other for ever (rendezvous.cc:161; CI group
-    22/46, 22 aborts in 46 runs): each process is its own, and a hang times out."""
-    model, layout = READ_BACK
+    """A packed Mamba's step on two fsdp devices of eight placed explicitly, its matrix cell (`READ_BACK`),
+    run in a fresh process that compiles it into a persistent compilation cache and in another that reads it
+    back, passes in each, the second compiling nothing the first did not. Read back on jax 0.12.0.1.post114,
+    XLA:CPU's thunk deserializer gave each nested thunk sequence collective resources of its own, losing
+    every edge that ordered a while loop against the collectives beside it (417 of the step's 13,359), and its
+    devices waited on each other until XLA aborted them (rendezvous.cc:161; CI group 22/46, 22 aborts in 46
+    runs; this cell read back aborted 2 of 2 at post114, its tool run alone none). Each process is its own,
+    the suite's shared cache and options left out, and a hang times out."""
     cache = tmp_path / "cache"
-    environment = {**worker_env(8), "JAX_COMPILATION_CACHE_DIR": str(cache),
-                   "JAX_ENABLE_COMPILATION_CACHE": "true", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
-                   "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1"}
+    suites = ("PYTEST_ADDOPTS", "DEW_TEST_NO_CACHE", "DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN")
+    environment = {name: value for name, value in worker_env(8).items() if name not in suites}
+    environment.update(JAX_COMPILATION_CACHE_DIR=str(cache), JAX_ENABLE_COMPILATION_CACHE="true",
+                       XDG_CACHE_HOME=str(tmp_path), PYTHONPATH=f"{REPO_ROOT / 'src'}:{REPO_ROOT / 'tests'}")
     written = []
     for run in ("compiled", "read back"):
-        rows = tmp_path / f"{run}.json"
-        subprocess.run([sys.executable, "tools/layout_parity.py", "--models", model, "--layouts", layout,
-                        "--seeds", "0", "--out", str(rows)], env=environment, cwd=REPO_ROOT, check=True,
-                       timeout=600)
-        assert [row["status"] for row in json.loads(rows.read_text())] == ["works"], run
+        ran = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                              "tests/test_parallelism_matrix.py", "-k", READ_BACK], env=environment,
+                             cwd=REPO_ROOT, capture_output=True, text=True, timeout=600)
+        assert ran.returncode == 0, (run, ran.stdout[-2000:], ran.stderr[-2000:])
         written.append(sorted(path.name for path in cache.rglob("*-cache")))
     assert written[0] and written[1] == written[0], written
