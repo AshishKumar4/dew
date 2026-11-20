@@ -278,6 +278,8 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         unfitted = _unfitted_none
     mainloop = _mainloop(declined, spans, hooks, unfitted, uncertified=uncertified)
     if mainloop == 'mosaic':
+        from dew.nn.kernels.templates import attention_decode, attention_mosaic
+
         if decodes:
             # A memory-bound inference call (a decode step's, a verify block's) as the decode's work list.
             return attention_decode.attend(query, key, value, spans, hooks, scale=config.scale,
@@ -285,6 +287,8 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, in_key=config.in_key,
                                         **form)
     if mainloop == 'triton':
+        from dew.nn.kernels.templates import attention_triton
+
         return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=kept,
                                         **form)
     portable, plain = _plain()
@@ -374,9 +378,13 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         unfitted = _unfitted_none
     mainloop = _mainloop(declined, spans, hooks, unfitted, interpret=interpret, uncertified=uncertified)
     if mainloop == 'mosaic':
+        from dew.nn.kernels.templates import attention_mosaic
+
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, interpret=interpret,
                                          **form)
     if mainloop == 'triton':
+        from dew.nn.kernels.templates import attention_triton
+
         grads = attention_triton.backward(query, key, value, spans, _spread(hooks, query), dout,
                                           residuals=residuals, rounded=rounded, interpret=interpret, **form)
         return dataclasses.replace(grads, score_params=tuple(

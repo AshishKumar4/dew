@@ -36,7 +36,7 @@ from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
     DQ_GRADS,
-    DTYPES as DTYPES,
+    DTYPES,
     NATURAL,
     TRACED_TILE,
     AttentionLaunch,
@@ -65,6 +65,7 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.base import Template
 from dew.nn.precision import power2
+
 
 @dataclasses.dataclass(frozen=True, order=True)
 class Tiles:
