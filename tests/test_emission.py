@@ -540,3 +540,20 @@ def test_an_integer_operation_counts_on_the_integer_units_not_the_fp32_lanes():
         role = _emitted(operation, row).roles[0]
         assert (role.fixed.integer_operations, role.fixed.operations) == (128, 0), role.fixed
 
+
+@pytest.mark.parametrize("longest, span", [(None, 10 / 3), (4, 4)])
+def test_a_launchs_span_is_its_longest_programs_walk_where_its_programs_walk_unequal_shares(longest, span):
+    """A launch of three programs walking ten steps among them: its span, the dependent steps on its critical
+    path, is the most one program walks where the launch states it (`cost.Stated.longest`: a causal walk's
+    tiles split 3, 3 and 4), else their mean, where the mean of unequal walks read 10 / 3 (base review
+    14020e321 F3)."""
+    def body(x_ref, o_ref):
+        o_ref[...] = x_ref[...]
+
+    launch = plgpu.kernel(body, out_type=_ROW, grid=(3,), grid_names=("programs",))
+    stated = Stated(steps=10, bytes_accessed=0, longest=longest)
+    traced = jax.make_jaxpr(emission.costed(launch, stated))(_ROW)
+    (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
+                 if "cost_estimate" in equation.params]
+    assert emission.work_of(kernel).span == span
+
