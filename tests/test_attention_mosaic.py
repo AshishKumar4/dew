@@ -1239,6 +1239,7 @@ def test_the_training_forwards_rows_past_fp32s_largest_keep_their_mean_and_every
     assert (found_value[finite & (reference_value != 0)] != 0).all()
 
 
+@INTERPRETS
 @pytest.mark.parametrize("held", ["keys", "start"])
 def test_a_training_forwards_output_scales_exactly_with_its_values_however_large(held):
     """A training forward's head whose rows see 512 keys, the row's largest magnitude near fp32's largest
@@ -1619,6 +1620,7 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
                            training=_kept(launch), target=target)
 
 
+@INTERPRETS
 @pytest.mark.parametrize("unseen", UNSEEN)
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     """On a GPU no row measured the forward's and the backward's tiles come from the family's facts and the
