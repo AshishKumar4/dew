@@ -296,8 +296,9 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         indices = step.sample("student times", lambda key: jax.random.randint(key, (), 0, steps, jnp.int32),
                               rows=count)
         t = rows_taken(jnp.asarray(self.student_times), indices)
-        # Float32 draws, as the step's others are, at any precision, read at the step's (float32 at least).
-        dtype = at_least_fp32(samples.dtype)
+        # Float32 draws, as the step's others are, at any precision, read at the step's: its samples' and its
+        # student's parameters' widest, float32 at least.
+        dtype = at_least_fp32(jnp.result_type(samples, *jax.tree.leaves(variables["params"])))
         noise = step.sample("noise", jax.random.normal, samples.shape[1:], dtype=jnp.float32,
                             rows=count).astype(dtype)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,
@@ -323,7 +324,8 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         fake = self._features(teacher, renoised(clean), level, conditions)
         # The discriminator's pass reads the same features without the student's gradient.
         held = jax.tree.map(jax.lax.stop_gradient, fake)
-        condition = jax.lax.stop_gradient(self._condition(schedule.model_time(level), conditions, dtype))
+        condition = jax.lax.stop_gradient(self._condition(schedule.model_time(level), conditions,
+                                                          jnp.result_type(dtype, *real)))
         heads = variables["params"][DISCRIMINATOR]
 
         def score(head_params, spectral, features, *, update=False):
