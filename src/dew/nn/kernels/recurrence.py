@@ -573,18 +573,20 @@ def _values_erased(hooks: Hooks, given: dict, state, query, key, value, work):
     """A decode token of Oja's rule (`Hooks.erase` 'values'), in `work`: on the transposed state `S^T`, the
     delta rule of keys `v`, values `k` and a decay along its keys, the token's `log_decay` `[rows, Hv, Dv]`
     (a head's `[rows, Hv]` where scalar), read along the transposed state's values, `S'^T q`.
-    `(output, state')`. The write gate scales the correction's every term, `D S^T + v (beta (k - (D v)^T
-    S^T))^T`: corrected ungated, `k - (D v)^T S^T` passed fp32's largest at a memory of -2^127 and a key of
-    2^127 under a gate of 1/4, whose memory and output stay -2^126."""
+    `(output, state')`. The write gate scales each of the correction's terms once formed, `D S^T + v (beta k
+    - beta (v^T D S^T))^T`, as the token reads `S D` once: corrected ungated, `k - v^T D S^T` passed fp32's
+    largest at a memory of -2^127 and a key of 2^127 under a gate of 1/4, whose memory and output stay
+    -2^126; gated before its sum, `beta v` lost a value of 2^-60 under a gate of 2^-100 to underflow, its
+    read of a memory of 2^120 a normal -2^-40."""
     if hooks.decay == 'none':
         decay = jnp.ones(value.shape, work)
     else:
         decay = accurate_exp(given['log_decay'].astype(work))
         decay = jnp.broadcast_to(decay[..., None] if hooks.decay == 'scalar' else decay, value.shape)
     write = given['beta'].astype(work)[..., None]
-    transposed = jnp.swapaxes(state, -1, -2)
-    corrected = write * key - jnp.sum((write * value * decay)[..., :, None] * transposed, axis=-2)
-    transposed = decay[..., :, None] * transposed + value[..., :, None] * corrected[..., None, :]
+    decayed = decay[..., :, None] * jnp.swapaxes(state, -1, -2)
+    corrected = write * key - write * jnp.sum(value[..., :, None] * decayed, axis=-2)
+    transposed = decayed + value[..., :, None] * corrected[..., None, :]
     return jnp.sum(transposed * query[..., None, :], axis=-1), jnp.swapaxes(transposed, -1, -2)
 
 

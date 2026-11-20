@@ -480,17 +480,24 @@ def test_an_oja_decode_token_is_as_exact_as_its_formula():
                     "an oja decode token", seeds=8)
 
 
-def test_an_oja_decode_tokens_gate_precedes_its_correction():
-    """A decode token of Oja's rule at a memory of -2^127, a key of 2^127, a value and a query of one, no
-    decay and a write gate of 1/4: its memory and output -2^126, exact in fp32 (`oja_token`'s every term
-    normal), the gate scaling the correction `k - v^T S^T` (2^128) before it is formed."""
+@pytest.mark.parametrize(('state', 'key', 'value', 'beta', 'expected'), [
+    ([-2.0 ** 127], [2.0 ** 127], [1.0], 0.25, [-2.0 ** 126]),
+    ([2.0 ** 120, 0.0], [0.0], [2.0 ** -60, 1.0], 2.0 ** -100, [2.0 ** 120, -2.0 ** -40])],
+    ids=['a correction past the largest', 'a gated value past the least'])
+def test_an_oja_decode_tokens_gate_scales_its_formed_correction(state, key, value, beta, expected):
+    """A decode token of Oja's rule, one key and a query of one, no decay, its memory and output exact in
+    fp32 (`oja_token`'s every term normal): the gate scales the correction `k - v^T S^T` once formed, which
+    neither its sum past fp32's largest (2^128 ungated) nor `beta v` past its least (2^-160) loses."""
     hooks = dataclasses.replace(OJA, decay='scalar', scale=1.0)
-    one = jnp.ones((1, 1, 1), jnp.float32)
-    token = recurrence.Step(jnp.full((1, 1, 1, 1), -2.0 ** 127, jnp.float32), query=one, key=2.0 ** 127 * one,
-                            value=one, log_decay=jnp.zeros((1, 1), jnp.float32),
-                            beta=jnp.full((1, 1), 0.25, jnp.float32))
+
+    def held(x, *shape):
+        return jnp.asarray(x, jnp.float32).reshape(1, 1, *shape)
+
+    token = recurrence.Step(held(state, 1, len(state)), query=held([1.0], 1), key=held(key, 1),
+                            value=held(value, len(value)), log_decay=jnp.zeros((1, 1), jnp.float32),
+                            beta=jnp.full((1, 1), beta, jnp.float32))
     out, _, updated = recurrence.step(hooks, token)
-    assert (out.ravel().tolist(), updated.ravel().tolist()) == ([-2.0 ** 126], [-2.0 ** 126])
+    assert (out.ravel().tolist(), updated.ravel().tolist()) == (expected, expected)
 
 
 @pytest.mark.parametrize('form', [{'erase': 'values', 'delta': False}, {'erase': 'values', 'reads': 'before'},
