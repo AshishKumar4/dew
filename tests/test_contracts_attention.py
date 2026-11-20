@@ -209,9 +209,8 @@ def test_the_sparse_latent_kernel_holds_every_order(edge):
         return primals, direction, cotangent.astype(jnp.bfloat16)
 
     def sparse(absorbed, query_rot, latent, rot):
-        with generation.assumed("sm80"):
-            return sparse_selection.templated_context(scale, None, 4)(absorbed, query_rot, latent, rot,
-                                                                      selected)
+        return sparse_selection.templated_context(scale, None, 4)(absorbed, query_rot, latent, rot,
+                                                                  selected)
 
     def plain(absorbed, query_rot, latent, rot):
         at = jnp.maximum(selected, 0)
@@ -221,8 +220,9 @@ def test_the_sparse_latent_kernel_holds_every_order(edge):
         logits = jnp.where(selected[:, :, None, :] >= 0, logits, -jnp.inf)
         return jnp.einsum("bqhk,bqkr->bqhr", jax.nn.softmax(logits, axis=-1), keys)
 
-    assert_drawn_contract(sparse, inputs, EDGES[edge], f"the sparse latent kernel {edge}",
-                          truth_fn=plain, plain_fn=plain, seeds=8)
+    with generation.assumed("sm80"):
+        assert_drawn_contract(sparse, inputs, EDGES[edge], f"the sparse latent kernel {edge}",
+                              truth_fn=plain, plain_fn=plain, seeds=8)
 
 
 @pytest.mark.parametrize("edge", EDGES)
