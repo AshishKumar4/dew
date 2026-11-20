@@ -41,9 +41,14 @@ CELLS_ON_FOUR run on four of the eight, where four stages, or two beside a
 sequence axis of two, leave no axis for the rows: every device holds all of
 them."""
 
+import json
+import subprocess
+import sys
+
 import jax
 import pytest
 from map_judge import marked_seeds
+from process_support import REPO_ROOT, worker_env
 from tool_support import load
 
 CELLS: dict[str, tuple[str, ...]] = {
@@ -271,3 +276,32 @@ def test_each_split_draws_a_models_initial_parameters_as_one_device_does(model, 
     its own random bits, which every layout draws alike (`layout_parity.held_draw`)."""
     tool, _ = references
     tool.held_draw(model, layout, seeds=DRAW_SEEDS, devices=devices)
+
+
+READ_BACK = ("mamba1_packed", "fsdp2_explicit")
+"""The cell whose step, read back from the persistent compilation cache, deadlocked its devices (row
+10128)."""
+
+
+def test_a_layouts_step_read_back_from_the_compilation_cache_runs_as_compiled(tmp_path):
+    """A packed Mamba's step on two fsdp devices of eight placed explicitly (`READ_BACK`), compiled fresh into
+    a persistent compilation cache by one process and read back by another, runs in each to its sample, held
+    to one device's (`layout_parity.ran`, `--seeds 0`), the second compiling nothing the first did not. Read
+    back on jax 0.12.0.1.post114, XLA:CPU's thunk deserializer gave each nested thunk sequence collective
+    resources of its own, losing every edge that ordered a while loop against the collectives beside it (417
+    of the step's 13,359), and its devices waited on each other for ever (rendezvous.cc:161; CI group
+    22/46, 22 aborts in 46 runs): each process is its own, and a hang times out."""
+    model, layout = READ_BACK
+    cache = tmp_path / "cache"
+    environment = {**worker_env(8), "JAX_COMPILATION_CACHE_DIR": str(cache),
+                   "JAX_ENABLE_COMPILATION_CACHE": "true", "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
+                   "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1"}
+    written = []
+    for run in ("compiled", "read back"):
+        rows = tmp_path / f"{run}.json"
+        subprocess.run([sys.executable, "tools/layout_parity.py", "--models", model, "--layouts", layout,
+                        "--seeds", "0", "--out", str(rows)], env=environment, cwd=REPO_ROOT, check=True,
+                       timeout=600)
+        assert [row["status"] for row in json.loads(rows.read_text())] == ["works"], run
+        written.append(sorted(path.name for path in cache.rglob("*-cache")))
+    assert written[0] and written[1] == written[0], written
