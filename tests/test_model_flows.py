@@ -757,6 +757,27 @@ def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags(held):
     assert (opened.returncode, opened.stdout.split()[-1:]) == (0, ["1"]), opened.stderr[-2000:]
 
 
+def test_a_parts_prepare_collects_the_recurrence_tiers_files(tmp_path):
+    """A GPU part's prepare as its lane starts it (`lane_environment.configured`: `DEW_TIER_PREPARE=1` on the
+    node's CPU, the node an A100 by its serialized topology) collects the recurrence tier's files in a
+    process of its own: gpu_flow's import reads the node's generation (`generation_support.here`, at import)
+    with nothing of the flows' module, where that read imported it, met gpu_flow half initialized, and every
+    prepared file failed collection, the tier's whole prepare skipped (row 9540)."""
+    from jax.experimental import topologies
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    topology = tmp_path / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    prepare = lane_environment.configured({"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu",
+                                            tier_wire.PREPARE: "1", model_flows.TOPOLOGY: str(topology),
+                                            tier_wire.TRUTHS: str(tmp_path / "tier")})
+    collected = relayed([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
+                         "tests/test_gpu_recurrence.py", "tests/test_native_certificates.py"],
+                        {**os.environ, **prepare}, timeout=600)
+    assert collected.returncode == 0, collected.output[-3000:]
+
+
 def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
     """A GPU part's prepare on its node's CPU (`DEW_TIER_PREPARE=1`, the node an A100 by its serialized
     topology) runs every cell of a flow pinned to the node's generation, Mosaic's among them, as its run
