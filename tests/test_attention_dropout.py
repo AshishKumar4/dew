@@ -618,6 +618,45 @@ def test_a_mosaic_dropping_backwards_kept_anchor_keeps_its_tiny_product():
                     "a dropping kept anchor's tiny product", seeds=FEWEST_SEEDS)
 
 
+@pytest.mark.parametrize(("rate", "with_initial"), [(0.25, True), (1.0 - 3.0 * 2.0 ** -17, False)],
+                         ids=["fp16-rate0.25-initial", "fp16-rate-past-binade"])
+def test_a_mosaic_fp16_dropping_forward_with_initial_or_past_binade_is_eligible_and_on_par(
+        rate, with_initial):
+    """Row 9507: an fp16 Mosaic dropping forward at rate 0.25 with an initial state (non-power-of-two
+    multiplier beside a walk of no headroom) or at rate 1 - 3*2^-17 without one (weights past fp16's
+    largest binade, traced row-scaled `product.Scaled` parts) stays eligible on Hopper and holds check 1
+    interpreted against the float64 reference."""
+    words = jnp.asarray([3181759654, 0], jnp.uint32)
+    spans = template.spans(1, 2, 1)
+    sinks = jnp.array([0.5], jnp.float32) if with_initial else None
+    initial = None if sinks is None else template.sinks(sinks, 1, 1, WIDTH)
+    hooks = dataclasses.replace(hooked(words, 1, 1, rate), initial=initial)
+    with generation.assumed("sm90"):
+        query = jnp.zeros((1, 1, 1, WIDTH), jnp.float16).at[..., 0].set(1)
+        key = jnp.zeros((1, 2, 1, WIDTH), jnp.float16).at[0, 1, 0, 0].set(-0.5)
+        value = jnp.ones((1, 2, 1, WIDTH), jnp.float16)
+        op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        assert op.declined(ba, generation.gpu_target()) is None
+        assert op.derived(ba, generation.gpu_target()) is not None
+
+        def ours(q, k, v):
+            return attention_mosaic.forward(q, k, v, spans, hooks, interpret=True)[0]
+
+        def reference(q, k, v):
+            return template.reference(q, k, v, spans, hooks)
+
+        def draw(seed):
+            streams = jax.random.split(jax.random.key(seed), 3)
+            return tuple(jax.random.normal(s, shape, jnp.float16)
+                         for s, shape in zip(streams, ((1, 1, 1, WIDTH), (1, 2, 1, WIDTH),
+                                                       (1, 2, 1, WIDTH)), strict=True))
+
+        assert_as_exact(ours, reference, draw, f"fp16 mosaic drop rate={rate} initial={with_initial}",
+                        seeds=FEWEST_SEEDS)
+
+
 def three_identical_keys():
     """One zero query of width 16 over three identical keys (first coordinate 1), values (0.75, 3u, 0, ...)
     with u = 2^-23, and dO = (1, 1, 0, ...), in bf16: at a rate of 1/2 each kept product is 2 (0.75 + 3u)."""
