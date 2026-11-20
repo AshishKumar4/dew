@@ -306,7 +306,7 @@ def test_the_decoder_answers_its_models_generation_hooks():
     prompt = jnp.zeros((ROWS, PROMPT), jnp.int32)
     states, logits = decoding.apply(drawn_variables(0, model), prompt, jnp.full((ROWS,), PROMPT - 1),
                                     method="states_and_logits_at")
-    assert states.shape == (ROWS, PROMPT, model.emb_features) and logits.shape == (ROWS, model.vocab_size)
+    assert states is None and logits.shape == (ROWS, model.vocab_size)
 
 
 def test_what_an_adapting_decoder_cannot_draw_is_refused():

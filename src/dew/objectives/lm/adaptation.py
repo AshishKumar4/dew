@@ -923,22 +923,23 @@ class InContextDecoder(nn.Module):
         when it is read: decoding, past the rows' cache, else from a chain that has read nothing."""
         laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, valid=attention_mask,
                                  positions=positions, right_padded=right_padded)
-        return self._decoded(tokens, None, decode, laid, fields)[1]
+        return self._decoded(tokens, None, decode, laid, fields)
 
     def states_and_logits_at(self, tokens, slots, decode: bool = False, positions=None, segment_ids=None,
                              attention_mask=None, right_padded: bool = False, coordinates=None, **fields):
-        """The trunk's final states `[B, S, features]` and the logits at `slots` alone, one a row (`[rows]`)
-        or `[rows, K]` (`dew.nn.protocols.Selective`): a prefill's, whose first draw reads one slot a row,
-        keeps each read slot's states past the levels and runs the head over those alone."""
+        """No prediction states and the logits at `slots` alone, one a row (`[rows]`) or `[rows, K]`
+        (`dew.nn.protocols.Selective`): a prefill's, whose first draw reads one slot a row, keeps each read
+        slot's states past the levels and runs the head over those alone. Its states are a draft's, which a
+        decoder of no prediction depths gives none of (`CausalTransformer.states_and_logits_at`'s), and a
+        decoder drawing a row at a time drafts nothing (`DrawsAlone`): its decode steps carry none."""
         laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, valid=attention_mask,
                                  positions=positions, right_padded=right_padded)
         wanted = jnp.asarray(slots, jnp.int32).reshape(tokens.shape[0], -1)
-        hidden, logits = self._decoded(tokens, wanted, decode, laid, fields)
-        return hidden, logits[:, 0] if jnp.ndim(slots) == 1 else logits
+        logits = self._decoded(tokens, wanted, decode, laid, fields)
+        return None, logits[:, 0] if jnp.ndim(slots) == 1 else logits
 
-    def _decoded(self, tokens, wanted, decode: bool, laid, fields) -> tuple[jax.Array, jax.Array]:
-        """The trunk's final states and `__call__`'s logits, or at the slots `wanted` names alone
-        (`states_and_logits_at`)."""
+    def _decoded(self, tokens, wanted, decode: bool, laid, fields) -> jax.Array:
+        """`__call__`'s logits, or at the slots `wanted` names alone (`states_and_logits_at`)."""
         if laid is not None and (laid.starts is not None or laid.forks is not None):
             raise ValueError("a row decodes one document, its windows counted from its first real token: "
                              "a packed or forked request steps none")
@@ -965,7 +966,7 @@ class InContextDecoder(nn.Module):
             for name, entry in updated["cache"].items():
                 self.put_variable("cache", name, entry)
             self.put_variable("cache", IN_CONTEXT, held)
-        return jnp.asarray(hidden), logits
+        return logits
 
     def _scanned(self, held: dict, hidden, tokens, real, blocks, wanted) -> tuple[dict, jax.Array]:
         """The rows' chains `held` past `tokens`' slots, a slot at a time, and each slot's logits, or the
