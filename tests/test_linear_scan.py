@@ -397,10 +397,12 @@ def _blocked(expr, chunk: dict, bound: dict):
     return _BLOCKWISE[_name(expr)](chunk, *args)
 
 
-def _lead(chunk: dict) -> list:
-    """Each block's lead: the first block's whole decay before the second block of a two-block chunk."""
-    k = chunk["k"]
-    return [sympy.Identity(k)] if len(chunk["blocks"]) == 1 else [sympy.Identity(k), _operand("W", 1, k, k)]
+def _lead(chunk: dict, values: bool = False) -> list:
+    """Each block's lead: the first block's whole decay before the second block of a two-block chunk, along
+    the keys, or along the values where `values` (`V_1`)."""
+    width, name = (chunk["v"], "V") if values else (chunk["k"], "W")
+    return ([sympy.Identity(width)] if len(chunk["blocks"]) == 1
+            else [sympy.Identity(width), _operand(name, 1, width, width)])
 
 
 def _token_blocks(chunk: dict, name: str) -> _Rows:
@@ -443,18 +445,12 @@ def _across(chunk: dict, rows: _Rows, part: str) -> _Rows:
     """`_decayed_to`'s decay along the values."""
     sizes, v, blocks = chunk["sizes"], chunk["v"], chunk["blocks"]
     if part == "entering":
-        return _Rows([value * _lead_values(chunk)[i] for i, value in enumerate(rows)], inner=True)
+        return _Rows([value * _lead(chunk, values=True)[i] for i, value in enumerate(rows)], inner=True)
     if part != "to_last":
         raise TypeError(f"no blockwise product with the {part} decay along the values")
     wholes = [_operand("V", b, v, v) for b in blocks]
     return _Rows([functools.reduce(operator.mul, wholes[i:], _linear(f"KV_{b}", rows[i], sizes[b], v))
                   for i, b in enumerate(blocks)])
-
-
-def _lead_values(chunk: dict) -> list:
-    """Each block's lead along the values: the first block's whole decay along them before the second's."""
-    v = chunk["v"]
-    return [sympy.Identity(v)] if len(chunk["blocks"]) == 1 else [sympy.Identity(v), _operand("V", 1, v, v)]
 
 
 def _weighed(chunk: dict, scores: dict, given: _Rows, between):
@@ -466,7 +462,7 @@ def _weighed(chunk: dict, scores: dict, given: _Rows, between):
     sizes, v, blocks = chunk["sizes"], chunk["v"], chunk["blocks"]
     own = [_linear(f"Wd_{b}", given[i], sizes[b], v) for i, b in enumerate(blocks)]
     if len(blocks) == 2:
-        own[1] = own[1] + scores[1, 0] * _linear("KV_1", given[0], sizes[1], v) * _lead_values(chunk)[1]
+        own[1] = own[1] + scores[1, 0] * _linear("KV_1", given[0], sizes[1], v) * _lead(chunk, values=True)[1]
     return _Rows(own, inner=True)
 
 

@@ -1361,11 +1361,16 @@ def two_sided_values_read(h, q, k, v, g, e, beta):
     return h @ q
 
 
+APART = dataclasses.replace(TWO_SIDED_FORMS, reads="apart")
+"""Two-sided GLA read apart from its own write, which no form takes."""
+
+
 @pytest.mark.parametrize(("declared", "path"), [
-    (TWO_SIDED_FORMS._replace(reads="apart"), "prepare"), (TWO_SIDED_FORMS._replace(reads="apart"), "replay"),
-    (TWO_SIDED_FORMS._replace(update=corrected_two_sided), "prepare"),
-    (TWO_SIDED_FORMS._replace(readout=two_sided_values_read, operands={**TWO_SIDED, "q": ("time", "value")}),
-     "prepare")], ids=["apart, prepared", "apart, replayed", "corrected", "read along the values"])
+    (APART, "prepare"), (APART, "replay"),
+    (dataclasses.replace(TWO_SIDED_FORMS, update=corrected_two_sided), "prepare"),
+    (dataclasses.replace(TWO_SIDED_FORMS, readout=two_sided_values_read,
+                         operands={**TWO_SIDED, "q": ("time", "value")}), "prepare")],
+    ids=["apart, prepared", "apart, replayed", "corrected", "read along the values"])
 def test_a_two_sided_decay_outside_its_forms_is_refused(declared, path):
     """A decay along the state's values beside a readout apart from its group's writes, prepared or replayed,
     beside the delta rule's correction, or beside a readout along the values: refused (`scan.Refused`)."""
