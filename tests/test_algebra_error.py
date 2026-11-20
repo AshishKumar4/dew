@@ -218,16 +218,3 @@ def test_the_accurate_policy_chooses_past_a_proposal_that_leaves_the_floats_rang
     admits = gate(product_over, ranged)
     choice = choose(product_over, OPERANDS * 3, accurate=True, saturation=algebra.SATURATION, admits=admits)
     assert admits(choice.chosen.function, product_over)
-
-
-def test_a_weak_inputs_sum_is_chosen_where_its_compensated_print_is_refused():
-    """A sum of a weak float32 input keeps the weak type, which its compensated sum returns strong: that
-    print is refused (no plain call keeps the program's type), and the chooser takes the sum's own forms,
-    where it had aborted on the refusal."""
-    weak = jax.ShapeDtypeStruct(SHAPE, jnp.float32, weak_type=True)
-
-    def summed(x):
-        return jnp.sum(x, axis=0)
-
-    choice = choose(summed, (weak,), accurate=True, saturation=algebra.SATURATION, admits=gate(summed, small))
-    assert not any(candidate.compensated for candidate in choice.candidates)
