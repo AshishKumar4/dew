@@ -82,7 +82,33 @@ def grouped_kernel_gradient(x, w, bias, other):
     return jax.lax.ragged_dot_general(x, other, jnp.asarray(SIZES, jnp.int32), numbers)
 
 
-LAYERS = [biased, escaping, widened, chained, bare, kernel_gradient, grouped, grouped_kernel_gradient]
+def scaled_by_its_first_bias(x, w, bias, other):
+    """A projection times a scalar the program reads from its bias: an epilogue capturing an array that
+    follows no launch axis, which the template refuses, so its product is weighed alone (row 8996)."""
+    del other
+    return (x @ w) * bias[0]
+
+
+def formed_and_added_back(x, w, bias, other):
+    """Rows formed before a square projection (its prologue), its product scaled by a scalar after it (an
+    epilogue the template refuses) and the rows added back: the region without its epilogue keeps the rows
+    its restored consumer reads (row 8996's head review: it removed them)."""
+    del x, w
+    rows = other * jnp.bfloat16(2)
+    return (rows @ other) * bias[0] + rows
+
+
+def formed_and_returned(x, w, bias, other):
+    """Rows formed before a projection and returned beside it, its product scaled by a scalar after it: a
+    prologue the region replays though the program keeps it, whose operand the region without its epilogue
+    reads (row 8996's head review: its inputs missed it)."""
+    del other
+    rows = x * jnp.bfloat16(2)
+    return (rows @ w) * bias[0], rows
+
+
+LAYERS = [biased, escaping, widened, chained, bare, kernel_gradient, grouped, grouped_kernel_gradient,
+          scaled_by_its_first_bias, formed_and_added_back, formed_and_returned]
 
 
 def as_written(layer, *operands):
