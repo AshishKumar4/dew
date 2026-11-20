@@ -1387,8 +1387,8 @@ def _narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype
     return jnp.where(nudged, odd, out)
 
 
-narrowing_settled = surrogate(_narrowing_settled, lambda dtype, primals, tangents, value: tangents[0],
-                              nondiff_argnums=(3,))
+narrowing_settled = contracted("test_the_narrowing_settle_holds_every_order")(
+    surrogate(_narrowing_settled, lambda dtype, primals, tangents, value: tangents[0], nondiff_argnums=(3,)))
 """`out`, the sums `acc` over `divisor` as the finish formed it (fp32; a recovered subnormal's bits,
 `attention_algebra.quotient`), rounded to odd where it narrows to the 16-bit `dtype`: where it lands exactly
 between two values of `dtype` (`_between`) and is not the exact quotient, one fp32 ulp toward it, so the

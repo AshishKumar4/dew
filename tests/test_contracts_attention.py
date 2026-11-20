@@ -7,7 +7,7 @@ import itertools
 import jax
 import jax.numpy as jnp
 import pytest
-from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
+from contract_support import EDGES, REVERSE_ONLY, assert_contract, assert_drawn_contract, normal_draw
 
 from dew.nn import attention, kv_cache
 from dew.nn.kernels.templates import attention as template, attention_quantized
@@ -169,6 +169,28 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
 
     assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge} {kernel}",
                     truth_fn=plain, plain_fn=plain, draw=draw if edge == "normal" else None)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_narrowing_settle_holds_every_order(edge):
+    """`attention.narrowing_settled` (a surrogate whose derivative is its quotient's on every entry): every
+    order finite wherever float64 is a normal float32 and the plain quotient is, the quotient's own, over
+    drawn fp32 quotients of sums over a divisor of 3/2 as an fp16 output narrows them."""
+    divisor = jnp.full((9,), 1.5, jnp.float32)
+
+    def settled(out):
+        return template.narrowing_settled(out, out * divisor, divisor, jnp.float16)
+
+    def plain(out):
+        return out
+
+    def inputs(seed, scale):
+        """A seed's quotients and their direction at `scale`, and its cotangent."""
+        (out, along, cotangent) = normal_draw(seed, (9,), (9,), (9,), scale=scale)
+        return (out,), (along,), cotangent
+
+    assert_drawn_contract(settled, inputs, EDGES[edge], f"the narrowing settle {edge}", truth_fn=plain,
+                          plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
