@@ -1505,14 +1505,17 @@ def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Cal
     return run
 
 
-def _perturbed_tangent(portable: Callable, operands, live: Sequence[bool], moving):
+def _perturbed_tangent(portable: Callable, operands, live: Sequence[bool], moving, output=None):
     """`portable`'s tangent at `operands` along `moving`, the directions of the leaves `live` masks alone,
     the others held as constants: a zero direction would meet an infinite factor (inf * 0, NaN, where a
-    bias's own tangent was 1: rows 8757, 6740)."""
+    bias's own tangent was 1: rows 8757, 6740). With none live, `output`'s zeros, in its dtypes."""
     import jax
+    from jax.custom_derivatives import zero_from_primal
 
     from dew.nn import programs
 
+    if not any(live):
+        return zero_from_primal(output)
     perturbed, fill = programs.holes(operands, live)
     return jax.jvp(lambda *values: portable(*fill(values)), tuple(perturbed), tuple(moving))[1]
 
@@ -1562,9 +1565,9 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         output, saved = produced(*primals)
         directions = jax.tree.leaves(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [not isinstance(direction, SymbolicZero) for direction in directions]
-        moving = itertools.compress(directions, live)
+        moved = _perturbed_tangent(portable, primals, live, itertools.compress(directions, live), output)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
-        return (output, saved), (_perturbed_tangent(portable, primals, live, moving), zero_from_primal(saved))
+        return (output, saved), (moved, zero_from_primal(saved))
 
     def producing(*operands):
         return forward(*operands)
