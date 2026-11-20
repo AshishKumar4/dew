@@ -485,11 +485,11 @@ def _model_changes(saved: ModelConfig, before: JSON, now: JSON) -> list[str]:
 
 def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -> bool:
     """Whether an objective `now` trains what `before` trained: one class, every argument the same but
-    those its class lets a resume change (`dew.objectives.base.Objective.resumable`), a stated argument
+    those its class lets a resume change (`dew.objectives.base.Objective.resumed_freely`), a stated argument
     the same as the default it states again."""
     if before is None or now is None or before.name != now.name:
         return False
-    resumable = objectives[now.name].resumable
+    resumable = objectives[now.name].resumed_freely()
 
     def kept(config: ObjectiveConfig) -> dict:
         return {name: value for name, value in {**config.defaults, **config.fields}.items()
@@ -609,9 +609,13 @@ def _flag_json_or_text(text: str) -> JSON:
         return text
 
 
-def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
+def _within(node: dict[str, JSON], key: str, unset: JSON = None) -> dict[str, JSON]:
     """The record `node` holds under `key`. A field declaring a base or a
-    union records its value's class beside its fields, and this is the fields."""
+    union records its value's class beside its fields, and this is the fields.
+    An optional record `node` holds none of is set to `unset` first, its class's
+    default (`_unset_default`), where it has one."""
+    if node.get(key) is None and unset is not None:
+        node[key] = unset
     held = node[key]
     held = held["fields"] if isinstance(held, dict) and "class" in held else held
     if not isinstance(held, dict):
@@ -632,21 +636,37 @@ def _holds(config: "RunConfig", path: str) -> bool:
 
 def _recorded_at(config: "RunConfig", path: str) -> JSON:
     """The value `config`'s record holds at the dotted `path` (`_placed`), as `override` writes it."""
-    *groups, field = _placed(config, path)[0]
+    keys, _, unset = _placed(config, path)
+    *groups, field = keys
     node = config._fields_record()
     for group in groups:
-        node = _within(node, group)
+        node = _within(node, group, unset.get(group))
     return node.get(field)
 
 
-def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
-    """The keys of `path`'s value in `config`'s record, and the annotation it is read by."""
+def _unset_default(owner: "RunConfig | DataclassInstance | type[DataclassInstance]", group: str
+                   ) -> "DataclassInstance | None":
+    """The value an optional record field `group` of `owner` takes where it holds none and a path steps into
+    it (`trainer.layout.min_shard` of an unset `TrainerConfig.layout`): its one dataclass's defaults; None
+    for a field of no such type (row 9635: `--set` refused the path a flag sets)."""
+    annotation = registry.declared_type(owner if isinstance(owner, type) else type(owner), group)
+    kinds = [kind for kind in typing.get_args(annotation)
+             if isinstance(kind, type) and dataclasses.is_dataclass(kind)]
+    return kinds[0]() if len(kinds) == 1 and type(None) in typing.get_args(annotation) else None
+
+
+def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation, dict[str, JSON]]:
+    """The keys of `path`'s value in `config`'s record, the annotation it is read by, and the record of the
+    default each unset optional record along it takes (`_unset_default`), by its key."""
     *groups, field = path.split(".")
     held: object = config
+    unset: dict[str, JSON] = {}
     for group in groups:
         if not (dataclasses.is_dataclass(held) and group in _names(held)):
             raise KeyError(f"{path} names no group of the run record")
-        held = getattr(held, group)
+        owner, held = held, getattr(held, group)
+        if held is None and (default := _unset_default(owner, group)) is not None:
+            held, unset[group] = default, registry.to_record(default, type(default))
     if isinstance(held, Registered) and field not in _names(held):
         member = held.member
         # A flag's annotation types the value, as `--model.<field>` reads it;
@@ -654,10 +674,10 @@ def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
         annotation = declared_type(_member_flags(member, held.fields)[0], field)
         if annotation is None and field not in parameters(member)[0]:
             raise KeyError(f"{path} names no argument of {held.name}")
-        return [*groups, "fields", field], annotation
+        return [*groups, "fields", field], annotation, unset
     if not (dataclasses.is_dataclass(held) and field in _names(held)):
         raise KeyError(f"{path} names no field of the run record")
-    return [*groups, field], declared_type(type(held), field)
+    return [*groups, field], declared_type(type(held), field), unset
 
 
 def _names(held: "DataclassInstance | type[DataclassInstance]") -> set[str]:
@@ -860,10 +880,11 @@ class RunConfig:
         for path, value in point.items():
             if path in chained:
                 continue
-            *groups, field = _placed(self, path)[0]
+            keys, _, unset = _placed(self, path)
+            *groups, field = keys
             node = record
             for group in groups:
-                node = _within(node, group)
+                node = _within(node, group, unset.get(group))
             node[field] = value
         chains = _overridden({name: getattr(self, name) for name in CHAINS}, chained)
         # Built once, every field of the point in place, so its checks read the run it describes.
@@ -1642,7 +1663,9 @@ class RunConfig:
         resumed: dict[str, Mapping[str, object]] = {}
 
         def check_resumed() -> None:
-            if checkpoints.resumed(resume) is not None and (
+            from dew.training.startup import resumed_step
+
+            if resumed_step(built, resume) is not None and (
                     record := self._saved_record(checkpoints.directory, checkpoints)) is not None:
                 self.check_resume(record)
                 resumed["record"] = record
@@ -1669,7 +1692,7 @@ class RunConfig:
         trainer = self.trainer
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
-            layout=trainer.stated_layout(), accumulation=trainer.accumulation,
+            layout=trainer.layout, accumulation=trainer.accumulation,
             split=trainer.split,
             dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
                            else trainer.dynamic_scale), rollout=rollout,

@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-from dew._coordination import agreed_same, broadcast_from_process_zero
+from dew._coordination import broadcast_from_process_zero
 from dew._records import JSON, listed, record, text
 from dew.batch import FROZEN
 from dew.distributed.batches import placed_abstract, prefetched_bytes
@@ -283,10 +283,12 @@ def resumed_layout(trainer, resume) -> Layout | None:
     step every process agrees), the given one's with the host fields its rung recorded (`host`,
     `Trainer._checkpoint_envelope`); None for a fresh run. A checkpoint that recorded none trained on the
     devices."""
+    from dew.training.startup import resumed_step
+
     checkpoints = trainer.checkpoints
     if checkpoints is None or resume == "never":
         return None
-    step = agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume))
+    step = resumed_step(trainer, resume)
     if step is None:
         return None
     rung = checkpoints.rung(step)

@@ -2074,19 +2074,10 @@ def test_a_token_mixture_of_published_generations_weighs_the_targets_each_states
     states): no member is drawn while it leads the other by more of the targets drawn than one of the
     other's rows, each row weighing its own targets (its tokens less one), through a saved position and
     its resume, which reads on as an uninterrupted read does."""
-    from dew.data.cache import Cache
-    from dew.data.steps.text import CountTargets
     from dew.data.text import Tokenize
 
-    texts = {"short": " ".join(["short"] * 3), "long": " ".join(["long"] * 10)}
-
-    def published(name: str, tag: int) -> Pipeline:
-        rows = Memory([{"text": texts[name], "id": tag * 1000 + index} for index in range(16)], identity=name)
-        generation = publish(Pipeline(rows).map(Tokenize()).filter_map(CountTargets()),
-                             Cache(str(tmp_path / name)), read="indexed", loading=READ)
-        return Pipeline(generation.source(), name=name)
-
-    data = compile(mix([published("short", 1), published("long", 2)], by="tokens").repeat().batch(1),
+    data = compile(mix([published_tokens(tmp_path, "short", 1), published_tokens(tmp_path, "long", 2)],
+                       by="tokens").repeat().batch(1),
                    read="indexed", loading=READ)
 
     def read(count: int, state=None):
@@ -2104,7 +2095,7 @@ def test_a_token_mixture_of_published_generations_weighs_the_targets_each_states
     ids += read(21, state)[0]
     assert ids == read(44)[0] and len(ids) == 44
     # Each member's targets a row, its tokens less the one no target follows.
-    each = {name: len(Tokenize().map({"text": text})["text"]) - 1 for name, text in texts.items()}
+    each = {name: len(Tokenize().map({"text": text})["text"]) - 1 for name, text in TEXTS.items()}
     assert each["short"] < each["long"]
     # A member is drawn only while it leads the other by no more of their targets than one of the other's
     # rows: its targets held to its half however its rows' lengths differ, where a mix by rows would
@@ -2115,6 +2106,45 @@ def test_a_token_mixture_of_published_generations_weighs_the_targets_each_states
         assert drawn[name] <= drawn[other] + each[other], (identity, drawn)
         drawn[name] += each[name]
     assert drawn["short"] > 0 and drawn["long"] > 0
+
+
+def test_a_streamed_token_mix_of_stated_counts_draws_as_its_indexed_read(tmp_path):
+    """A mix by tokens of two published generations, each stating its rows and valid targets, its members
+    read as streams (prefetched), draws them as its indexed read does, each weighed by the counts its member
+    states (row 9010: the streams kept a deficit of the targets they read, whatever their members stated)."""
+    members = [published_tokens(tmp_path, "short", 1), published_tokens(tmp_path, "long", 2)]
+
+    from dew.data.analysis import STATED_SHARES
+
+    def read(how: str, chains: list[Pipeline]) -> tuple[list[int], str]:
+        loader = compile(mix(chains, weights=[1, 3], by="tokens").repeat().batch(1), read=how, loading=READ)
+        reader = loader.train(DataPartition())
+        try:
+            ids = [int(identity) for batch in itertools.islice(reader, 40) for identity in batch["id"]]
+        finally:
+            reader.close()
+        assert loader.plan is not None
+        return ids, str(loader.plan.order["shares"])
+
+    streamed, shares = read("streamed", [member.prefetch() for member in members])
+    assert shares == STATED_SHARES and streamed == read("indexed", members)[0]
+
+
+TEXTS = {"short": " ".join(["short"] * 3), "long": " ".join(["long"] * 10)}
+"""Two members' text, one word three times and another ten, each a row a published generation holds."""
+
+
+def published_tokens(directory, name: str, tag: int) -> Pipeline:
+    """A published generation of sixteen tokenized rows of `TEXTS[name]`, each stating its targets, whose ids
+    (`tag` thousands) name the member, read by its name."""
+    from dew.data.cache import Cache
+    from dew.data.steps.text import CountTargets
+    from dew.data.text import Tokenize
+
+    rows = Memory([{"text": TEXTS[name], "id": tag * 1000 + index} for index in range(16)], identity=name)
+    generation = publish(Pipeline(rows).map(Tokenize()).filter_map(CountTargets()),
+                         Cache(str(directory / name)), read="indexed", loading=READ)
+    return Pipeline(generation.source(), name=name)
 
 
 def _short_and_long() -> Pipeline:

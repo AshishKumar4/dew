@@ -21,6 +21,10 @@
 "tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
 "tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
 ],
+"tests/test_algebra_laws.py": [
+"tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[False-True-True]",
+"tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[True-True-False]"
+],
 "tests/test_algebra_scan.py": [
 "tests/test_algebra_scan.py::test_a_reset_walks_chunk_adjoint_is_the_token_scans_gradient[gated_delta-before]",
 "tests/test_algebra_scan.py::test_a_turned_scans_adjoint_is_the_token_scans_gradient[apart-ranks]",
@@ -1027,9 +1031,6 @@
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_backward_that_read_other_gradients",
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16"
 ],
-"tests/test_checkpoint_averaging.py": [
-"tests/test_checkpoint_averaging.py::test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read_where_it_keeps_one[stages]"
-],
 "tests/test_chunk_adaptation.py": [
 "tests/test_chunk_adaptation.py::test_a_chain_steps_each_level_as_equation_71_at_its_own_window[1-3-documents]",
 "tests/test_chunk_adaptation.py::test_a_damped_chain_steps_each_level_as_the_literal_loop[documents]",
@@ -1619,8 +1620,8 @@
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a small weight on a large value, bfloat16-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a subnormal share beside 255 equal weights, bfloat16-as drawn-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[a subnormal share of an overflowing row, float32-as drawn-fast]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[causal queries before every key-as drawn-accurate]",
-"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[keys near fp32's largest at equal logits-float16-accurate]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[an anchor-relative share beside an overflowing column-as drawn-fast]",
+"tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[keys an ulp apart, float32-float16-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[small values beside unseen ones near fp32's largest, float32-float16-accurate]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[ties at scale 1/4, cotangents near 2**125-float16-fast]",
 "tests/test_derived_stability.py::test_the_derived_attention_is_finite_where_the_truth_is_on_every_family[values near fp32's largest over 2 equal keys-float16-fast]"
@@ -2072,13 +2073,17 @@
 "tests/test_host_training.py::test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout",
 "tests/test_host_training.py::test_a_fit_whose_devices_hold_neither_step_searches_the_devices_once_before_placing",
 "tests/test_host_training.py::test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone",
+"tests/test_host_training.py::test_a_host_distillation_steps_as_the_device_layout_does",
+"tests/test_host_training.py::test_a_host_fits_misses_are_its_own_record_never_another_fits",
 "tests/test_host_training.py::test_a_host_step_read_in_a_stated_split_is_on_par_with_the_devices_split_step",
-"tests/test_host_training.py::test_a_ramped_fit_plans_and_compiles_its_first_step_once",
+"tests/test_host_training.py::test_a_part_stating_no_host_link_prices_no_streamed_step",
+"tests/test_host_training.py::test_a_resumed_run_continues_on_the_programs_its_first_process_compiled[device]",
 "tests/test_host_training.py::test_a_run_that_chose_to_stream_resumes_streamed_where_it_would_have_stood",
 "tests/test_host_training.py::test_a_shared_text_owner_sums_both_block_losses_through_one_bank[False]",
 "tests/test_host_training.py::test_a_streamed_step_one_process_cannot_compile_leaves_every_process_on_the_devices_plan",
-"tests/test_host_training.py::test_companion_pool_uses_one_global_optimizer_reduction",
-"tests/test_host_training.py::test_host_accumulation_replays_original_rng_and_mutable_snapshots[True]"
+"tests/test_host_training.py::test_an_inspecting_fits_streamed_step_is_admitted_with_its_sampled_step",
+"tests/test_host_training.py::test_an_inspecting_host_runs_sampled_and_unsampled_steps_compile_nothing",
+"tests/test_host_training.py::test_host_accumulation_replays_original_rng_and_mutable_snapshots[False]"
 ],
 "tests/test_hub_weight_sources.py": [
 "tests/test_hub_weight_sources.py::test_a_directory_without_weights_dew_reads_is_refused[GGUF alone]",
@@ -2746,6 +2751,9 @@
 "tests/test_mosaic_toolkit.py": [
 "tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm86-int8-unscaled]"
 ],
+"tests/test_mtp.py": [
+"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[mean_stream_trunk]"
+],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_site_is_on_par_with_its_reference[llama4]",
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[gemma3-inputs]",
@@ -2970,7 +2978,7 @@
 "tests/test_per_shard.py::test_a_kernel_runs_per_shard[attention-template-tensor]",
 "tests/test_per_shard.py::test_a_kernel_runs_per_shard[attention-triton-tensor]",
 "tests/test_per_shard.py::test_a_kernel_runs_per_shard[gated_delta_rule-fla-fsdp]",
-"tests/test_per_shard.py::test_a_kernel_runs_per_shard[grouped_matmul-mosaic-joined-data]",
+"tests/test_per_shard.py::test_a_kernel_runs_per_shard[grouped_matmul-mosaic-joined-fsdp]",
 "tests/test_per_shard.py::test_a_kernel_runs_per_shard[short_conv-mosaic_gpu-fsdp]",
 "tests/test_per_shard.py::test_a_kernel_runs_per_shard[ssd-pallas-data]"
 ],
@@ -3319,6 +3327,9 @@
 "tests/test_recurrent_sequence_split.py::test_a_recurrent_mixer_decodes_under_a_sequence_axis_as_on_one_device[mamba]",
 "tests/test_recurrent_sequence_split.py::test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device[kimi delta attention]",
 "tests/test_recurrent_sequence_split.py::test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device[mamba3]"
+],
+"tests/test_reference_runs.py": [
+"tests/test_reference_runs.py::test_packed_documents_give_every_step_the_work_counted_for_one"
 ],
 "tests/test_release_parity.py": [
 "tests/test_release_parity.py::test_each_release_answers_as_its_own_engine[joint joint_images]",
@@ -3781,6 +3792,9 @@
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[default-chunk]",
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk]"
 ],
+"tests/test_stage_blocks.py": [
+"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[jepa-stage2_sequence2]"
+],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
 "tests/test_stage_local.py::test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one",
@@ -3938,6 +3952,9 @@
 "tests/test_tier2_parts.py::test_each_code_folder_at_one_commit_is_verified_on_its_own",
 "tests/test_tier2_parts.py::test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_expert"
 ],
+"tests/test_tokens_embedded.py": [
+"tests/test_tokens_embedded.py::test_a_request_holding_an_id_outside_its_models_table_is_refused_by_a_task_and_a_server"
+],
 "tests/test_tools.py": [
 "tests/test_tools.py::test_layout_parity_anchors_a_model_on_the_references_own_sample[dense_sft]",
 "tests/test_tools.py::test_layout_parity_reaches_every_leaf_of_a_model_that_initializes_its_output_to_zeros",
@@ -4018,6 +4035,9 @@
 "tests/test_wan_vae.py": [
 "tests/test_wan_vae.py::test_a_walk_and_its_gradients_match_the_source[image]",
 "tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
+],
+"tests/test_weighed_check.py": [
+"tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
