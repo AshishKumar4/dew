@@ -771,10 +771,13 @@ def _wide(x):
     return jnp.promote_types(x.dtype, jnp.float32)
 
 
+SOFTCAP = 50.0
+
+
 def softcapped_attention(q, k, v):
     """Gemma 2's attention as a plain program writes it: scaled logits softcapped at 50, causal."""
     logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=_wide(q)) * q.shape[-1] ** -0.5
-    logits = 50.0 * jnp.tanh(logits / 50.0)
+    logits = SOFTCAP * jnp.tanh(logits / SOFTCAP)
     causal = jnp.tril(jnp.ones((q.shape[1], k.shape[1]), bool))
     weights = jax.nn.softmax(jnp.where(causal, logits, -jnp.inf), axis=-1).astype(v.dtype)
     return jnp.einsum("bhqk,bkhd->bqhd", weights, v)
@@ -821,41 +824,40 @@ def jax_nn_written(*, mask=None, bias=None, scale=1, causal=False, window=None):
     return attend
 
 
+WINDOW = 16
+"""The causal window's keys a query sees, itself among them (jax.nn's lookback of WINDOW - 1): one width its
+program, Dew's call and the oracle's keep set read."""
+
 FORMS = {
     "a mask of its inputs": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, mask=input_mask(q, k), implementation="xla"),
-        lambda q, k, v: {"mask": input_mask(q, k), "mask_fill": JAX_FILL}, jax_nn_written(mask=input_mask),
-        {}),
+        lambda q, k, v: {"mask": input_mask(q, k), "mask_fill": JAX_FILL}, jax_nn_written(mask=input_mask)),
     "a mask of its inputs filled with -inf": (
         masked_attention(keyed_mask), lambda q, k, v: {"mask": keyed_mask(q, k), "mask_fill": -jnp.inf},
-        masked_attention(keyed_mask), {}),
+        masked_attention(keyed_mask)),
     "a bias of its inputs": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, bias=input_bias(q, k), implementation="xla"),
-        lambda q, k, v: {"bias": input_bias(q, k)}, jax_nn_written(bias=input_bias), {}),
+        lambda q, k, v: {"bias": input_bias(q, k)}, jax_nn_written(bias=input_bias)),
     "twice the default scale": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, scale=2 * q.shape[-1] ** -0.5,
                                                      implementation="xla"),
-        None, jax_nn_written(scale=2), {}),
+        None, jax_nn_written(scale=2)),
     "a causal window": (
-        lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True, local_window_size=(15, 0),
-                                                     implementation="xla"),
-        lambda q, k, v: {"causal": True, "sliding_window": 16, "mask_fill": JAX_FILL},
-        jax_nn_written(causal=True, window=15), {"keep": {"causal": True, "window": (15, 0)}}),
+        lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True,
+                                                     local_window_size=(WINDOW - 1, 0), implementation="xla"),
+        lambda q, k, v: {"causal": True, "sliding_window": WINDOW, "mask_fill": JAX_FILL},
+        jax_nn_written(causal=True, window=WINDOW - 1)),
     "a softcap": (softcapped_attention,
-                  lambda q, k, v: {"causal": True, "softcap": 50.0, "mask_fill": -jnp.inf},
-                  softcapped_attention, {"keep": {"causal": True}, "softcap": 50.0}),
+                  lambda q, k, v: {"causal": True, "softcap": SOFTCAP, "mask_fill": -jnp.inf},
+                  softcapped_attention),
 }
 """Each plain program's attention under a form beside the default scale and a causal mask, the arguments
 Dew's own attention takes for it, its fill the program's (None where no call of Dew's computes it: a scale
 other than the default is another constant, which the compile point keeps as written), and the program
 whose run on float64 operands is its truth: itself where it is written at its operands' width, jax.nn's
-written out (`jax_nn_written`) where it is jax.nn's; and, where a query keeps one key (causality's first),
-the keys each query keeps (`attention_oracle.kept`'s structure) and the cap, by which check 1 sizes each
-row by the terms attention's gradients carry through their cancellation (`attention_on_par`): that query's
-logit gradient is float64 zero, which an H100's template forms from its rounded output as FlashAttention
-does (rows 9651, 9652). The masks leave rows partly masked (a window, causality, -inf's mask) and wholly
-masked (jax.nn's mask, uniform rows under its finite fill); a row -inf masks wholly is NaN, as written,
-which check 1 does not compare."""
+written out (`jax_nn_written`) where it is jax.nn's. The masks leave rows partly masked (a window,
+causality, -inf's mask) and wholly masked (jax.nn's mask, uniform rows under its finite fill); a row -inf
+masks wholly is NaN, as written, which check 1 does not compare."""
 
 
 @pytest.mark.parametrize("form", list(FORMS))
@@ -872,7 +874,7 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
     from dew.algebra.recognize import KEPT
     from dew.nn.attention import scaled_dot_product_attention
 
-    attend, arguments, exact, judged = FORMS[form]
+    attend, arguments, exact = FORMS[form]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
 
     def own(q, k, v):
@@ -883,12 +885,22 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
         expected = [] if arguments is None else [
             kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes)) if kernel not in KEPT]
         assert set(_attention_routes(lambda: dew.jit(attend).trace(*shapes))) == set(expected)
-    draw = normal_drawn(41, *((2, 64, 4, 32),) * 4, dtype=jnp.bfloat16)
+    drawn = (2, 64, 4, 32)
+    draw = normal_drawn(41, *(drawn,) * 4, dtype=jnp.bfloat16)
+    # The draw's rows by its declared shape, no draw computed: a GPU tier part's prepare computes nothing on
+    # its compile-only device (bible §8).
+    queries = keys = drawn[1]
+    # Size the structured masks' singleton rows by the terms the fast backward subtracts (dP and D),
+    # not by the written softmax's already-cancelled gradient. The causal window's finite fill contributes
+    # no weight on these draws.
+    if form == "a softcap":
+        oracle = {"keep": kept(queries, keys, causal=True), "softcap": SOFTCAP}
+    elif form == "a causal window":
+        oracle = {"keep": kept(queries, keys, causal=True, sliding_window=WINDOW)}
+    else:
+        oracle = {"truth": lambda *x: exact(*(a.astype(jnp.float64) for a in x))}
     with generation.chosen(attention="template"):
-        keep = judged.get("keep")
-        attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {form}",
-                         truth=lambda *x: exact(*(a.astype(jnp.float64) for a in x)),
-                         keep=None if keep is None else kept(64, 64, **keep), softcap=judged.get("softcap"))
+        attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {form}", **oracle)
 
 def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None,
                 root=None):

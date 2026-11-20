@@ -48,6 +48,7 @@ import test_contracts_attention as contracts
 import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
+import test_merged
 from gpu_flow import (
     BF16_PRODUCTS,
     Cell,
@@ -59,6 +60,8 @@ from gpu_flow import (
     run_cells,
     when,
 )
+from reference_error import as_given, assert_as_exact
+from test_merged import SPECS
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import bf16_dot_runs
@@ -308,6 +311,20 @@ def test_the_attention_matrix_holds_on_this_gpu():
     GPU, its other pairs the CPU's, without XLA's deterministic ops (a deterministic run never derives the
     one launch its cells pin)."""
     run_cells(kernel_matrix.seeded_cells("attention"))
+
+
+@pytest.mark.parametrize("form", sorted(SPECS))
+def test_a_split_steps_merge_and_its_state_are_on_par_on_this_gpu(form):
+    """A decode step's split slices merged as one launch on this GPU (`merged.merged_padded`, its Triton
+    kernel), its finished output, its state's mass and the output's gradient (its tangent the law's
+    path's) on par with the plain merge's from float64 (check 1, test_merged's draws): the kernel and the
+    law's composition it replaces are two programs, each held to the one truth (testing.md), never to each
+    other's bits."""
+    spec, ours, _ = test_merged._merges(form)
+    reference = as_given(test_merged.state_orders(test_merged._plain_state(spec)))
+    orders = jax.jit(test_merged.state_orders(test_merged.finished_state(ours, spec)))
+    assert_as_exact(orders, reference, test_merged._drawn, f"a padded merge on this gpu, {form}",
+                    seeds=test_merged.MERGE_SEEDS)
 
 
 def test_the_decode_matrix_holds_on_this_gpu():

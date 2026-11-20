@@ -481,7 +481,9 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
     paged, sources, parts = walk.paged, walk.sources, walk.parts
     walks = None if flags is None else flags
     blocks = _column_blocks(v, hooked, at.columns)
-    split = len(blocks) > 1 and hooks.output_mod is not None
+    plan = forward_block_plan(v.shape[-1], at.columns, out_dtype, has_output_mod=hooks.output_mod is not None,
+                              training=False)
+    split = plan.split
     # A scaled launch's keys' magnitudes the call's (`_largest`) but a cache walk's, which its value slots
     # give (a masked or paged walk's, or one over a cache's rows or codes, whose rows its views gather).
     if form.headroom and not walk.masked and paged is None and sources is None and hooked.scales is None:
@@ -501,7 +503,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         decides=walk.decides, tmem_columns=walk.tmem_columns,
                         products=block_products,
                         table=paged, sources=sources,
-                        out_dtype=jnp.float32 if split else out_dtype, walks=walks,
+                        out_dtype=plan.out_dtype, walks=walks,
                         shared_by=len(blocks),
                         column_width=(values.shape[-1] if into is not None and first is not None
                                       else None), flags=stated and len(blocks) == 1, **in_place)
@@ -525,18 +527,38 @@ def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, spli
     """The inference walk's outputs from its launches' (`_inference_walk`'s `finished`), unpadded to the
     call's `queries` and value `width`: the output, and with `rows` its finished maxima and denominators, an
     anchor key of none and the output as the split sums. A split launch's are its slices along the query
-    axis (`_launch`'s `splits`): `[B, S, Q, H, Dv]`, its rows `[B, H, S, Q]`, each slice's maxima and
-    denominators its own, which XLA merges (`attention_decode`)."""
+    axis (`_launch`'s `splits`) as its launch wrote them, padded: `[B, S, Qp, H, Dvp]`, and its maxima and
+    denominators stacked, `[2, B, H, S, Qp]`, each slice's its own, which its caller merges where they lie
+    (`merged.merged_split`)."""
     out, *rows_of = walked
     if splits > 1:
-        out = out.reshape(out.shape[0], splits, -1, *out.shape[2:])[:, :, :queries, :, :width]
-        maximum, total = (array.reshape(*array.shape[:2], splits, -1)[..., :queries] for array in rows_of[0])
-        return out, maximum, total
+        stacked = rows_of[0]
+        return (out.reshape(out.shape[0], splits, -1, *out.shape[2:]),
+                stacked.reshape(*stacked.shape[:3], splits, -1))
     out = out[:, :queries, :, :width]
     if not rows:
         return out
     maximum, total = (array[:, :, :queries] for array in rows_of[0])
     return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
+
+
+class BlockPlan(NamedTuple):
+    """How a forward value-column block runs (`forward_block_plan`): whether an inference call splits its
+    output hook into XLA past the block launches (`split`), the block launch's `out_dtype`, and whether an
+    output hook runs inside the kernel (`output_hook`). Shared by legality, residency, and emission
+    (row 9542)."""
+    split: bool
+    out_dtype: object
+    output_hook: bool
+
+
+def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
+                       training: bool) -> BlockPlan:
+    """Derive hook placement and block `out_dtype` from the call's value-column partition (`value_columns`):
+    an inference call whose columns split into multiple blocks runs its `output_mod` in XLA past the launches
+    and emits fp32 per block (row 9542)."""
+    split = not training and has_output_mod and value_columns(total_v, columns) < total_v
+    return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split)
 
 
 def column_slices(total: int, columns: int | None, *, whole: bool = True) -> list[tuple[int | None, int]]:
@@ -710,10 +732,9 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     # in fp32's normal range), no pass of XLA's over the queries before it (0.046 ms of Qwen3-8B's 0.66 ms
     # causal forward, ET-GQA1-h100). Its raw products can pass fp32 where the prescaled query's do not: a
     # row of them all past it below zero reads as a -inf maximum, which such a call's rows take as past the
-    # fold's reach (`reach_of`), so it walks again natural on the query taken by the power (`_rewalked`).
-    power, scale = prescale(query.dtype, query.shape[3], scale)
-    folding = algebra.folds(scale, power, natural=natural, score_mod=hooks.score_mod)
-    taken = power if folding and spans.form != "spans" else 1.0
+    # fold's reach (`reach_of`), so it walks again natural on the query taken by the power (`_rewalked`). A
+    # subtracted fold's (a decode step's, its full call's rows packed too, `attention_decode.packed`) scales
+    # its own raw products, its query taken by nothing (row 8981).
     unit = family.column_unit(query.dtype)
     if hooks.query_mod is not None and query.shape[3] % unit:
         # A query prologue over a width its swizzled rows pad (a norm over the zeros past it is another
@@ -728,19 +749,20 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                        query_block=tiles.consumers * tiles.block_q if inference else None,
                        widths=head_width)
     weights = query.dtype if scales is not None else value.dtype
-    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
-                           score_mod=hooks.score_mod, natural=natural, whole=spans.whole,
-                           # A quantized model's codes and values, each at most 127, sum far within fp32.
-                           headroom=scaled and hooks.rounds is None and algebra.headroom(weights),
-                           initial=hooks.initial is not None,
-                           queries=(call.queries if call.query.shape[1] > call.queries or call.per_span > 1
-                                    else None),
-                           prescale=power / taken, subtracted=subtracted, rounds=hooks.rounds,
-                           dropped=1.0 if hooks.drop is None else hooks.drop.bound,
-                           # Its sums hold the reach: no state beside a walk of no headroom (`refused`).
-                           units=sums_units(hooks.drop, headroom=algebra.headroom(weights),
-                                                    initial=hooks.initial is not None),
-                           largest=algebra.largest_of(weights, hooks))
+    spec, taken = folded_form(spans.form, spans.keys, ids=spans.query_ids is not None, dtype=query.dtype,
+                              width=query.shape[3], scale=scale, natural=natural, score_mod=hooks.score_mod,
+                              subtracted=subtracted,
+                              # A quantized model's codes and values, each at most 127, sum far within fp32.
+                              headroom=scaled and hooks.rounds is None and algebra.headroom(weights),
+                              initial=hooks.initial is not None,
+                              queries=(call.queries if call.query.shape[1] > call.queries or call.per_span > 1
+                                       else None),
+                              rounds=hooks.rounds,
+                              dropped=1.0 if hooks.drop is None else hooks.drop.bound,
+                              # Its sums hold the reach: no state beside a walk of no headroom (`refused`).
+                              units=sums_units(hooks.drop, headroom=algebra.headroom(weights),
+                                               initial=hooks.initial is not None),
+                              largest=algebra.largest_of(weights, hooks))
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     hooked = _hooked_of(hooks, call, unit)
     if scales is not None:
@@ -766,6 +788,21 @@ def _powered_in_kernel(family: mosaic.Family, dtype, hooks: Hooks, *, parts: int
         return True
     return (jnp.dtype(dtype).itemsize == 2 and family.fixes_up
             and not family.places_on_role and query_swizzle(family) is not None)
+
+
+def folded_form(form: str, keys: int, *, ids: bool, dtype, width: int, scale: float | None, natural: bool,
+                score_mod, subtracted: bool, **fields) -> tuple[algebra.Forward, float]:
+    """A forward's form (`algebra.Forward`, `fields` its others) at the scale its launch takes, and the power
+    of two (`prescale`'s) it took into that scale, 1 where it takes none: a call every row of which sees a
+    key ('full', 'causal') whose fold is no subtracted one (a decode step's scales its own raw products,
+    `algebra.Forward.subtracted`) takes it, its prescale the rest. The one builder its launch (`_prepared`),
+    its planning (`MosaicForward._unrewalked`) and a decode step's merge (`attention_decode._spec`) take, so
+    their scales and prescales are one (the head reviews of 0a8c9658b and 3846f5bfd, F3)."""
+    power, factor = prescale(dtype, width, scale)
+    folding = algebra.folds(factor, power, natural=natural, score_mod=score_mod)
+    taken = power if folding and form != "spans" and not subtracted else 1.0
+    return algebra.Forward(form, keys, ids=ids, scale=factor * taken, score_mod=score_mod, natural=natural,
+                           prescale=power / taken, subtracted=subtracted, **fields), taken
 
 
 def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, taken: float, hooks: Hooks,
@@ -1108,9 +1145,11 @@ def _status_stored(family: mosaic.Family, spec: algebra.Forward, state: algebra.
     maximum = jnp.where(algebra.no_keys(state.total), -jnp.inf, state.m)
     status = (maximum,)
     if len(status_views) == 3:
-        # Its rows' queries where it walks padding (`algebra.padded_queries`), a tile's places reduced along
-        # its columns, as `algebra.Coords.query_places` forms them (a row's iota takes no row layout).
-        queries = (jnp.max(first + family.iota(state.acc.shape, 0), axis=-1)
+        # Its rows' queries where it walks padding (`algebra.padded_queries`), formed in the rows' layout
+        # (`Family.as_row`): a tile's places reduced along its columns left mma.sync's tile layout for the
+        # solver to infer backwards from the row it reduced to, which it does not (a full decode step's
+        # packed rows, padded to 16, failed to lower; row 8981).
+        queries = (family.as_row(first + family.iota(maximum.shape, 0))
                    if algebra.padded_queries(spec) is not None else None)
         rewalked = algebra.rewalks(spec, maximum, queries)[0]
         # Its block's flag a vote of its warpgroup's predicates (`bar.red.or.pred`), no reduction scratch.
@@ -1186,7 +1225,7 @@ def _dot(family: mosaic.Family, interpret: bool, lhs: jax.Array, rhs) -> jax.Arr
         return _parted_products(family, None, None, lhs, rhs, interpret, shape=(lhs.shape[0], rhs.shape[1]))
     return family.registers_product(lhs, rhs)
 
-def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, stored: Callable,
+def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored: Callable,
               q_smem, q_loaded, out_stage: Callable, row_smem, streams, views: dict, turn, streamed: tuple,
               first, spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks, training: bool,
               anchors: tuple | None = None, interpret: bool, certified: tuple | None = None, kept=None,
@@ -1293,16 +1332,16 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         return state, trained, bound
 
     store = functools.partial(_store_consumer, program, hooked, (row, head, first), hooks=hooks,
-                              training=training, out=(out_view, out_stage), rows=(stored, row_smem),
+                              training=training, out_stage=out_stage, rows=(stored, row_smem),
                               kept=kept, interpret=interpret)
     _walks_stored(walk, store, spec, consumer, turn, decided=decided, past=past_walks, streamed=streamed)
 
 
 def _store_consumer(program: _Program, hooked: _Hooked, place: tuple, spec: algebra.Forward,
-                    state: algebra.Partial, trained, *, hooks: Hooks, training: bool, out: tuple,
+                    state: algebra.Partial, trained, *, hooks: Hooks, training: bool, out_stage: Callable,
                     rows: tuple, kept, interpret: bool) -> None:
     """Store a consumer's finished walk state and optional split sums (`_consumer`'s store callback)."""
-    family, (out_view, out_stage), (stored, row_smem) = program.family, out, rows
+    family, (stored, row_smem) = program.family, rows
     keep = None if kept is None else _kept_of(program, kept, rows=place)
     if training:
         def split_sums(stage):
@@ -1312,7 +1351,7 @@ def _store_consumer(program: _Program, hooked: _Hooked, place: tuple, spec: alge
         out_stage(split_sums)
     _status_stored(family, spec, state, stored().status, row_smem, place[2])
     _stored_walk(program, spec, state, trained, hooked, place, hooks=hooks, training=training,
-                 out=(out_view, out_stage), rows=(stored, row_smem), keep=keep, interpret=interpret)
+                 out_stage=out_stage, rows=(stored, row_smem), keep=keep, interpret=interpret)
 
 
 def _bound_unit(spec: algebra.Forward, drop, decided: after_walk.Decided | None) -> float | None:
@@ -1479,18 +1518,21 @@ def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
 
 
 def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partial, trained: tuple | None,
-                 hooked: _Hooked, place: tuple, *, hooks: Hooks, training: bool, out: tuple, rows: tuple,
-                 keep: jax.Array | None = None, interpret: bool = False) -> None:
-    """A consumer's walk's result stored (`_consumer`): its output under the output hook through `out` (its
-    view and its stage's `out_stage`), its finished rows through `rows` (the views `stored()` forms where
-    each is stored, `_written_views`', its finished rows None where the launch finishes none, and their
-    stage); a training walk's (`trained`, its anchor's terms) its residual rows and anchor keys instead, no
-    output. `place` its batch row, head and first query; with `keep`, each written
+                 hooked: _Hooked, place: tuple, *, hooks: Hooks, training: bool, out_stage: Callable,
+                 rows: tuple, keep: jax.Array | None = None, interpret: bool = False) -> None:
+    """A consumer's walk's result stored (`_consumer`): its output under the output hook through
+    `out_stage`, its finished rows through their stage (`rows`), each view formed where it is written
+    (`stored()`, `_written_views`'); a training walk's (`trained`, its anchor's terms) its residual rows and
+    anchor keys instead, no output. `place` its batch row, head and first query; with `keep`, each written
     at those rows alone, every other row of its view as it was (`_kept_rows`)."""
     family = program.family
     row, head, first = place
-    (out_view, out_stage), (stored, row_smem) = out, rows
+    stored, row_smem = rows
     if not training or trained is None:
+        # The output's view formed where it is stored, its block's indices read afresh (`_Block.afresh`), as
+        # its rows' are: formed before the walk, its query block's base was held across it (a B200's scaled
+        # fp32 walk at 64 x 64, two consumers, spilled 12 bytes).
+        out_view = stored().out
         out_params = tuple(_param(family, ref, param.kind, row, head, first, state.acc)
                            for ref, param in zip(hooked.output, hooks.output_params, strict=True))
         if isinstance(state.acc, mosaic.Kept):
@@ -1996,15 +2038,15 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
                                        stages=tuple(stage.at[index] for stage in refs.stages),
                                        training=training, finishes=finishes, columns_at=columns_at,
                                        certified=certified)
-            # The output's tile view and a certified walk's, read through the walk, formed with it; its rows'
-            # outputs each formed where it is stored (`afresh`).
-            ahead = viewed(block)
+            # A certified walk's view read through the walk, formed with it; the output's and the rows' each
+            # formed where it is stored (`afresh`).
+            certificate = viewed(block).certify if certified else None
             out_stage = functools.partial(staged_after, after, None if after else refs.out_smem, index)
-            _consumer(program, spec, index, q_view, ahead.out,
+            _consumer(program, spec, index, q_view,
                       lambda: viewed(afresh()), *stages, out_stage, refs.row_smem.at[index], streams, views,
                       turn, streamed, block.first, read.spans, read.hooked,
                       (row, head, lax.div(head, group)), hooks=hooks, training=training,
-                      anchors=read.anchors, interpret=interpret, certified=ahead.certify,
+                      anchors=read.anchors, interpret=interpret, certified=certificate,
                       kept=read.kept, first_at=lambda: afresh().first,
                       relay=None if refs.relay is None else refs.relay.at[index],
                       codes=None if refs.converted is None or read.hooked.scales is None else _Codes.of(
@@ -2018,8 +2060,12 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
             # Where its consumers decide a second walk, the same steps again once any takes it.
             family.stream(streams, views, *own, again=refs.decided)
 
-        # Each role forms what it reads (`_placed`), one switch's branch (`exclusive`).
+        # Each role forms what it reads (`_placed`), one switch's branch (`exclusive`); a family scoping its
+        # products each consumer a branch of its own, its index static, so no selector of it stays live
+        # across the register move (a B200's dropping split forward's natural walk at width 128 spilled 20
+        # bytes, its warpgroup selector and walk bound held across setmaxnreg; none so; row 9526).
         family.scheduled(consumers, _per_role(family, consumers, consumer), producer, exclusive=True,
+                         static_consumers=scopes_products(family),
                          issuer=_issuer(program, streams, refs, placed),
                          joined=_correction(program, placed, value_width, joined))
     return body
@@ -2093,7 +2139,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by,
-                                in_key=value_columns is not None)
+                                in_key=value_columns is not None, splits=splits)
     grid = (heads, queries // pair * splits, batch)
     reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
@@ -2215,7 +2261,7 @@ def _program_views(program: _Program, refs, read: _Read, *, peaks: bool, group: 
 
 def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, value, keys_count: int,
                   value_width: int, tiles: Tiles, *, peaks: bool, training: bool, counted: bool,
-                  shared_by: int, in_key: bool) -> tuple:
+                  shared_by: int, in_key: bool, splits: int = 1) -> tuple:
     """A launch's cost and the model's FLOPs it owns (`_launched`'s `cost` and `model_flops`): its walk's
     statement, its work its emission's (`stated`), and the model's products it owns (`modelled`): the
     forward's two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of
@@ -2231,7 +2277,7 @@ def _launch_flops(spec: algebra.Forward, family: mosaic.Family, query, key, valu
     streamed = (query, key) if in_key else (query, key, value)
     cost = (stated(spec, batch, heads, *streamed,
                    tile_walk=TileWalk((queries, keys_count), (tiles.block_q, tiles.block_k), tiles.consumers,
-                                      common=family.feeds_itself)) if counted
+                                      common=family.feeds_itself, splits=splits)) if counted
             else estimate(0))
     query_share = modelled(spec, batch, heads, spec.queries or queries, owned_query)
     value_share = modelled(spec, batch, heads, spec.queries or queries, owned_value)

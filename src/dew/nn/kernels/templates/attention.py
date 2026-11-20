@@ -75,17 +75,13 @@ class KeySpans:
     then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), or a
     call's every query where lengths and starts alone bound its keys (`spans`), which a program reads by
     position (`per_query` repeats them)."""
-    whole: bool = dataclasses.field(default=False, metadata={"static": True})
-    """Whether every query sees every key, known at trace time, of spans that hold intervals: a full call's
-    rows packed (`attention_decode.packed`), whose launches state their work as the full call's
-    (`algebra.Forward.whole`), their programs reading the intervals as ever."""
 
     def per_query(self) -> "KeySpans":
         """These spans an interval a query (`per_span` 1)."""
         if self.per_span == 1:
             return self
         start, end = (jnp.repeat(bound, self.per_span, axis=1) for bound in (self.start, self.end))
-        return KeySpans(start, end, self.query_ids, self.key_ids, self.keys, self.form, whole=self.whole)
+        return KeySpans(start, end, self.query_ids, self.key_ids, self.keys, self.form)
 
 
 def within(keys: jax.Array, start: jax.Array, end: jax.Array,
@@ -538,15 +534,18 @@ def _uniform_doc(ids: jax.Array | None, block: int) -> jax.Array | None:
     return jnp.where(jnp.all(blocks == first, axis=-1), first[..., 0], 0)
 
 
-def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int) -> tuple:
+def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int, *,
+              minimum: Callable = jnp.minimum, div: Callable = jax.lax.div) -> tuple:
     """The key tiles `[lo, hi)` a query block of `block_q` queries from `first_query` walks in a call of no
     spans, by its form (`attention_algebra.Forward.form`): under the causal one the tiles at or before its
-    last query, else every tile of the `keys`. A call of spans walks its `BlockMap`'s (`block_map`)."""
+    last query, else every tile of the `keys`, by `minimum` and `div` (a traced walk's; a price's integers'
+    `min` and `operator.floordiv`, `attention_mosaic_program.walks`). A call of spans walks its
+    `BlockMap`'s (`block_map`)."""
     tiles = -(-keys // block_k)
     if form == "causal":
         # Its queries' first place is no negative number: a truncating division rounds it up, as every
         # kernel language lowers.
-        return 0, jnp.minimum(jax.lax.div(first_query + block_q + block_k - 1, block_k), tiles)
+        return 0, minimum(div(first_query + block_q + block_k - 1, block_k), tiles)
     return 0, tiles
 
 
@@ -1499,6 +1498,19 @@ def blocked(depth: int) -> bool:
     return depth % FP32_BLOCK == 0 and blocks >= 2 and not blocks & (blocks - 1)
 
 
+def _compensated_blocks(lefts: list[jax.Array], rights: list[jax.Array],
+                        reduce_block: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
+    """Sum `reduce_block(left, right)` across `FP32_BLOCK`-deep blocks with TwoSum compensation
+    (`compensated_total`), shared by `kernel_dot` and `kernel_rows`."""
+    from dew.nn.precision import compensated_total, two_sum
+
+    total, carried = two_sum(reduce_block(lefts[0], rights[0]), reduce_block(lefts[1], rights[1]))
+    for left, right in zip(lefts[2:], rights[2:], strict=True):
+        total, dropped = two_sum(total, reduce_block(left, right))
+        carried = carried + dropped
+    return compensated_total((total, carried), total)
+
+
 def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     """`a @ b` accumulated in fp32 as a template's Triton kernels issue it: bf16's and fp16's own product;
     for fp32 operands IEEE fp32 products, a contraction of blocks (`blocked`) summed a block at a time, each
@@ -1512,20 +1524,26 @@ def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
         return interpreted_dot(a, b)
     from jax.experimental.pallas import triton as plgpu
 
-    from dew.nn.precision import compensated_total, two_sum
-
-    def dot(a, b):
-        return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+    def dot(x, y):
+        return plgpu.dot(x, y, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
 
     if a.dtype != jnp.float32 or b.dtype != jnp.float32 or not blocked(a.shape[-1]):
         return dot(a, b)
     blocks = a.shape[-1] // FP32_BLOCK
-    lefts, rights = jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=0)
-    total, carried = two_sum(dot(lefts[0], rights[0]), dot(lefts[1], rights[1]))
-    for left, right in zip(lefts[2:], rights[2:], strict=True):
-        total, dropped = two_sum(total, dot(left, right))
-        carried = carried + dropped
-    return compensated_total((total, carried), total)
+    return _compensated_blocks(jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=0), dot)
+
+
+def kernel_rows(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
+    """Each row's `a · b` over the last axis as a Triton kernel forms D and the anchor's `v_c · dO`
+    (`attention_triton._dq_kernel`, rows 9113, 9114, 9610, 9611): `interpreted_rows` when interpreted, else
+    `FP32_BLOCK`-blocked TwoSum compensation matching `kernel_dot` on fp32 operands."""
+    if interpret:
+        return interpreted_rows(a, b)
+    if a.dtype != jnp.float32 or b.dtype != jnp.float32 or not blocked(a.shape[-1]):
+        return jnp.sum(a * b, axis=-1)
+    blocks = a.shape[-1] // FP32_BLOCK
+    return _compensated_blocks(jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=-1),
+                               lambda x, y: jnp.sum(x * y, axis=-1))
 
 
 def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:

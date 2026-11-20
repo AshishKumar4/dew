@@ -20,7 +20,8 @@ from reference_error import (
     seeds_for,
 )
 from test_reference_error import exact_rows, noised_draw, stacked_arm, stacked_examples
-from truths_ahead import compiled_truths
+from test_reference_error_written import _cancelling, _combined
+from truths_ahead import UNPREPARED, compiled_truths
 
 from dew.nn.kernels import gemm, generation, tuning
 
@@ -120,6 +121,20 @@ def test_a_prepared_sites_arms_report_the_routes_their_unprepared_run_reports(tm
     unprepared = reported()
     reported(prepare=True)
     assert unprepared and reported(prepare=False) == unprepared, unprepared
+
+
+def test_a_prepared_sites_reference_as_written_is_prepared_and_fails_dews_arm_in_its_run(tmp_path):
+    """The combination XLA's fusions rewrite (`test_reference_error_written._combined`, row 6909), one
+    function as both arms, its site prepared into a store (`truths_ahead.compiled_truths`, a GPU tier part's)
+    and run from it: its reference compiled as written (`arm_forms._written_twin`) is prepared beside its arms
+    compiled alike (`arm_store.armed`), and the run, calling that program, fails Dew's arm against it as a
+    site run unprepared does, nothing of the site run unprepared."""
+    label = "a prepared combination XLA's fusions rewrite"
+    with compiled_truths(tmp_path, prepare=True, stamp="here"):
+        assert_as_exact(_combined, _combined, _cancelling, label, seeds=8)
+    with compiled_truths(tmp_path, prepare=False, stamp="here"), pytest.raises(GateFailure):
+        assert_as_exact(_combined, _combined, _cancelling, label, seeds=8)
+    assert not (tmp_path / UNPREPARED).exists()
 
 
 def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed():

@@ -33,9 +33,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
 
-from dew.algebra import derive
+from dew.algebra import derive, means
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
-from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, raised_exactly
 from dew.nn.kernels.templates import bodies, layout, product
 from dew.nn.kernels.templates.attention import (
@@ -124,8 +123,6 @@ class Forward:
     def reach(self) -> float:
         """The power of two a dropping call's kept weights are narrowed at (`Dropout.reach`)."""
         return dropped_reach(self.dropped)
-    whole: bool = False
-    """Whether a spans call's every query sees every key (`attention.KeySpans.whole`): priced as full."""
 
     @property
     def raw(self) -> bool:
@@ -569,19 +566,25 @@ def slice_state(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.Ar
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
     keeps them) and its denominator its mass, kept apart: folded into the maximum (`m + log(total)`) it
     rounded away at a large one (row 4646: at 2^30, fp32's spacing 128, slices of denominators 128 and 64
-    merged half and half). A slice of no key the walk's start (`LEAST`), its mass 0. A row or a launch's
-    block of rows alike."""
-    seen = total > 0
-    return Partial(out, jnp.where(seen, maximum, LEAST), jnp.where(seen, total, 0.0))
+    merged half and half). Its maximum as given where finite, the walk's start (`LEAST`) where not, and its
+    mass as given, 0 where not a number: a slice of zero total keeps the maximum its keys had and its total
+    itself, so the merge's derivative along that total is its weight's, where the walk's start in its place
+    weighed it at the floor and a select of 0 at a zero total held that derivative at 0 (row 7124). A slice
+    of no key holds the walk's start already. A row or a launch's block of rows alike."""
+    return Partial(out, jnp.where(jnp.isfinite(maximum), maximum, LEAST), jnp.where(total >= 0, total, 0.0))
 
 
 def initial_state(spec: Forward, initial: Partial) -> Partial:
     """A call's initial state (its sums unnormalized, its maximum natural) as a finished slice's
     (`slice_state`): normalized where it holds mass, its maximum in `spec`'s units, saturated where a raw
     fold's passes fp32's largest (`raw_maximum`, as `resumed` takes it: a finite maximum of 1e38 at a scale
-    of 1/8 was infinite, and its merge's mass NaN)."""
-    held = initial.total > 0
-    out = jnp.where(held[..., None], initial.acc / jnp.where(held, initial.total, 1.0)[..., None], 0.0)
+    of 1/8 was infinite, and its merge's mass NaN). Where it holds mass the law's reading says
+    (`means.holding`: a subnormal total's too, which a comparison on a lane that flushes it read as none
+    while the law's merge weighed it, an output of 1 merged to 2/3, the merge P0's head review 3)."""
+    held = means.holding(initial.total)
+    # The law's finish (`means.finished`): a division by a broadcast total flushed past 2^126 (a total of
+    # 1.5 x 2^126 left its output 0, train 931's review).
+    out = jnp.where(held[..., None], means.finished(initial.acc, initial.total), 0.0)
     maximum = raw_maximum(initial.m, spec.scale) if spec.raw else initial.m
     return slice_state(spec, out, maximum, initial.total)
 
@@ -617,95 +620,50 @@ def resumable(spec: Forward, state: Partial) -> Partial:
     call's initial state takes it (`initial_state`'s inverse): its sums unnormalized at its natural maximum,
     a state of no mass the walk's start, which adds nothing to a merge."""
     held = state.total > 0
-    return Partial(state.acc * state.total[..., None], jnp.where(held, spec.naturalized(state.m), LEAST),
+    return Partial(means.resumed(state.acc, state.total), jnp.where(held, spec.naturalized(state.m), LEAST),
                    state.total)
+
+
+def _units(spec: Forward) -> means.Units:
+    """The units a finished form's states merge in (`means.Units`), its factor `carried`'s: the accurate
+    form's exponential of the anchors' difference taken exactly, at its raw products' scale where it keeps
+    them; a raw fold's of that difference times `scale log2(e)` rounded, as its walk weighs a key."""
+    if spec.natural:
+        return means.Units(scale=spec.scale if spec.raw else 1.0)
+    return means.Units(scale=spec.scale, compensated=False)
 
 
 def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     """Finished states over disjoint keys (`slice_state`'s, their outputs normalized, or merges of them)
-    stacked on `axis` as one merge of them: their outputs' convex combination, each weighed by its mass at
-    the largest of their maxima (`merge`'s factors) over those weights' sum before its product, so the merged
-    output is bounded by its states' (their factors' products summed first passed fp32's largest where 8
-    slices' outputs near 3e38 merged, row 4526), its denominator those weights' sum, never folded into its
-    maximum again (a fold a merge rounds away at a large maximum loses the mass). Its output is its sums
-    (`finish`'s `normalized`); a state of no key adds nothing."""
-    m = jnp.max(stacked.m, axis=axis)
-    weights = carried(spec, stacked.m, jnp.expand_dims(m, axis)) * stacked.total
-    largest, summed = _normalized(weights, axis)
-    return Partial(_mean(weights, stacked.acc, axis), m, largest * summed)
+    stacked on `axis` as one merge of them, the algebra's law of finished means (`dew.algebra.means`, its
+    derivative the law's own): their outputs' convex combination, each weighed by its mass at the largest of
+    their maxima (in the walk's own factor's units, `_units`), its total the masses' sum at that maximum;
+    where that sum passes fp32's largest, the sum at the maximum the law lands it at instead
+    (`means.merged_state`'s anchor, past the largest by at least the powers of two it moves, exactly at any
+    maximum: moved by a power of two's log at a maximum of 2^30, whose spacing is 128, the maximum rounded
+    back and half the mass went). Its output is its sums (`finish`'s `normalized`); a state of no key adds
+    nothing; a row of no mass is at the law's anchor of its states (their largest finite maximum, chosen
+    before its mass or tangent is taken, `means.merged_state`)."""
+    output, total, anchor = means.merged_state(stacked.acc, stacked.total, stacked.m, _units(spec), axis)
+    return Partial(output, anchor, total)
 
 
-def _normalized(weights: jax.Array, axis: int) -> tuple[jax.Array, jax.Array]:
-    """`weights`' largest on `axis` and their sum over it, each weight over the largest first, so the sum is
-    at most their count whatever the masses (1 where none holds mass)."""
-    largest = jnp.max(weights, axis=axis)
-    largest = jnp.where(largest > 0, largest, 1.0)
-    return largest, jnp.sum(weights / jnp.expand_dims(largest, axis), axis=axis)
 
 
-def _mean_value(weights: jax.Array, outputs: jax.Array, axis: int) -> jax.Array:
-    """`outputs` (each state's, `[..., Dv]`) weighed by their states' masses `weights` (`[...]`, each a
-    carried factor times a denominator) over their sum on `axis`: the merge's convex combination
-    (`_convex`). Its derivative is the mean's own (`_mean_tangent`), not its sum's roundings' and holds'."""
-    largest, summed = _normalized(weights, axis)
-    shares = weights / jnp.expand_dims(largest * jnp.where(summed > 0, summed, 1.0), axis)
-    return _convex(expand(shares, outputs), outputs, axis)
+def finished_merged_chunked(spec: Forward, load: Callable[[jax.Array], tuple], chunks: int) -> Partial:
+    """`finished_merged` of a row's slices `load(c)` gives `means.CHUNK` at a time along axis 0 (a kernel's
+    loads of its refs: the decode merge's, `merged`), `chunks` of them: each chunk's outputs, maxima,
+    denominators and the slots it holds (`valid`, laid as the denominators are), its slices' states as
+    `slice_state` takes them, merged by the law's chunked merge (`means.merged_state_chunked`, the value
+    `finished_merged`'s merge computes, bit for bit where its chunks hold the same slices, a row of no mass
+    at the law's anchor of its slices)."""
+    def states(c):
+        out, maximum, total, valid = load(c)
+        state = slice_state(spec, out, maximum, total)
+        return state.acc, state.total, state.m, valid
 
-
-def _mean_tangent(axis: int, primals: tuple, tangents: tuple) -> tuple[jax.Array, jax.Array]:
-    """The mean's derivative, d out = sum(dw (o - out)) / W + sum(w do) / W, its masses' coefficients
-    (o - out) / W formed from the primals at a scale that passes fp32's largest only where they do: a gap
-    of an output or the mean reaching `HALVED` at half its size, doubled after; the rest exact; each over
-    the largest mass and their normalized sum (`_normalized`), whose product is W, by the one of them at
-    least 1 first, so no quotient on the way passes the coefficient (eight masses of 1/8 under outputs of
-    alternate signs at 2^127: their gaps over 1/8 first reached 2^129 before the sum 8 took them back, row
-    6886). A coefficient as to a mass, never as to a weight over the largest, which passes fp32 where outputs
-    of both signs are near it (row 6827). Each case's operands are selected before its arithmetic."""
-    weights, outputs = primals
-    dweights, doutputs = tangents
-    out = _mean(weights, outputs, axis)
-    largest, summed = _normalized(weights, axis)
-    largest, summed = (jnp.expand_dims(x, axis) for x in (largest, jnp.where(summed > 0, summed, 1.0)))
-    mean = jnp.broadcast_to(jnp.expand_dims(out, axis), outputs.shape)
-    large = (jnp.abs(outputs) >= HALVED) | (jnp.abs(mean) >= HALVED)
-    halved = (jnp.where(large, outputs, 0.0) * 0.5 - jnp.where(large, mean, 0.0) * 0.5)
-    exact = jnp.where(large, 0.0, outputs) - jnp.where(large, 0.0, mean)
-    over_largest, over_summed = expand(largest, outputs), expand(summed, outputs)
-    # The summed count is at least 1; the largest mass first only where it is too.
-    first = jnp.where(over_largest >= 1, over_largest, over_summed)
-    second = jnp.where(over_largest >= 1, over_summed, over_largest)
-    coefficients = jnp.where(large, halved / first / second * 2, exact / first / second)
-    shares = weights / (largest * summed)
-    return out, (jnp.sum(expand(dweights, outputs) * coefficients, axis=axis)
-                 + jnp.sum(expand(shares, outputs) * doutputs, axis=axis))
-
-
-_mean = contracted("test_the_finished_merges_mean_holds_every_order")(
-    declared_tangent(Protected(), _mean_value, _mean_tangent, nondiff_argnums=(2,)))
-
-
-def _convex(shares: jax.Array, outputs: jax.Array, axis: int) -> jax.Array:
-    """`outputs` weighed by `shares` (summing to 1 on `axis`, or all 0) and summed: a convex combination,
-    bounded by the outputs of some share. Its sum's roundings may pass that bound, and past fp32's largest
-    where outputs are near it (two slices' outputs at fp32's largest, shares 29/30 and 1/30, summed to inf):
-    the terms of outputs whose magnitude reaches `HALVED` are summed at half their size, exact, apart from
-    the rest, which are summed as they are (a term near fp32's least normal keeps its bits), and the two
-    joined as the half sum twice over the rest, then held at the outputs' bounds by selection, so a rounding
-    passes neither. Each case's operands are selected before its arithmetic."""
-    some = shares > 0
-    high = jnp.max(jnp.where(some, outputs, -jnp.inf), axis=axis)
-    low = jnp.min(jnp.where(some, outputs, jnp.inf), axis=axis)
-    held = jnp.any(some, axis=axis)
-    large = jnp.abs(outputs) >= HALVED
-    half = jnp.sum(shares * jnp.where(large, outputs * 0.5, 0.0), axis=axis)
-    rest = jnp.sum(shares * jnp.where(large, 0.0, outputs), axis=axis)
-    out = half + (half + rest)
-    return jnp.where(held & (out > high), high, jnp.where(held & (out < low), low, out))
-
-
-HALVED = 2.0 ** 126
-"""The magnitude from which a convex combination's terms are summed at half their size (`_convex`): the
-terms of smaller outputs sum below fp32's largest."""
+    output, total, anchor = means.merged_state_chunked(states, chunks, _units(spec), 0)
+    return Partial(output, anchor, total)
 
 
 def rewalks(spec: Forward, maxima: jax.Array, rows: jax.Array | None = None) -> tuple[jax.Array, Forward]:

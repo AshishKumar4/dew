@@ -1265,11 +1265,10 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         # the whole buffer through the cache.
         # Without command buffers, which CUPTI does not read whole (`benchmark.Ungraphed`).
         lowered = owned_program(behind(launched), step=UNGRAPHED_OPTIONS).lower(flush, (arrays,))
-        # In one of this process's compile slots, as every compile of Dew's is (`report.compile_slots`): a
-        # step's launch waits on its measurement.
-        with report.compile_slots().held(background=False):
-            middle = time.perf_counter()
-            executable = lowered.compile()
+        # Through Dew's one call of XLA's compile (`report.xla_compiled`): in one of this process's compile
+        # slots, a step's launch waiting on its measurement, under the options its target takes (`targeted`).
+        middle = time.perf_counter()
+        executable = report.xla_compiled(lowered, None)
         return executable, (middle - start) * 1e3, (time.perf_counter() - middle) * 1e3
 
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}

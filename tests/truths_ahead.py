@@ -539,7 +539,7 @@ _log = logging.getLogger(__name__)
 
 
 def arm_role(role: str, fn, label: str) -> str | None:
-    """An arm's role in its site's store (`reference_error._compile_arms`) with what it computes as Dew states
+    """An arm's role in its site's store (`arm_store._compile_arms`) with what it computes as Dew states
     an identity (`dew._stated.stated`, one form in every process that holds an equal value): a run that passes
     the site another computation under that role finds none (`MissingTruth`), never the prepare's run in its
     place. None for an arm no statement holds (`Unestablished`), which runs unprepared, named

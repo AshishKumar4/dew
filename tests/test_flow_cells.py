@@ -238,9 +238,9 @@ def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unreco
     a cell whose site's prepare did not finish, its compile raised, its arm's trace raised after its
     truths were written, or a second check's truth trace raised after a first was prepared whole, is
     deferred, its failure recorded where it raised (the review)."""
+    import arm_store
     import jax
     import numpy as np
-    import reference_error
     import tier_wire
     from reference_error import ahead_arm, assert_as_exact
     from truths_ahead import DEFERRED, UNPREPARED, CompiledTruths, compiled_truths
@@ -273,7 +273,7 @@ def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unreco
                         lambda seed: (np.full(3, seed, np.float32),), "a product whose arm failed", seeds=8)
 
     with monkeypatch.context() as failing:
-        failing.setattr(reference_error, "_arm_program", traced_badly)
+        failing.setattr(arm_store, "_arm_program", traced_badly)
         with compiled_truths(tmp_path / "arms", prepare=True, stamp="a"):
             run_cells([Cell("traces its arm badly", site)])
     assert (tmp_path / "arms" / DEFERRED).is_file()

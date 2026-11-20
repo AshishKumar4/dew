@@ -2,15 +2,23 @@
 mode, its kernels' reverse rules, the paged decode kernel, a head's sinks (ledger 2641; the harness is
 tests/contract_support.py)."""
 
+import functools
 import itertools
 
 import jax
 import jax.numpy as jnp
 import pytest
-from contract_support import EDGES, REVERSE_ONLY, assert_drawn_contract, normal_draw
+from attention_oracle import plain_merged
+from contract_support import EDGES, ORDER_SETS, REVERSE_ONLY, assert_drawn_contract, normal_draw
+from reference_error import FEWEST_SEEDS
 
 from dew.nn import attention, kv_cache
-from dew.nn.kernels.templates import attention as template, attention_quantized
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    attention_quantized,
+    merged,
+)
 from dew.nn.sharding import manual_map
 
 
@@ -30,6 +38,17 @@ def attention_inputs(salt: int, shape: tuple):
                 normal_draw([salt + 2, seed], shape)[0])
 
     return inputs
+
+
+@pytest.fixture(autouse=True)
+def _released_as_each_test_ends():
+    """Each test's compiled executables released as it ends (`conftest.release`), where the file's releases
+    them at its end alone: a group of its cells holding every earlier cell's programs, each order's on a
+    mesh and its check-1 seeds', was killed at 10 GiB on armada."""
+    import conftest
+
+    yield
+    conftest.release()
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -151,6 +170,34 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
                           truth_fn=plain, plain_fn=plain, seeds=8)
 
 
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_padded_merges_derivatives_are_the_laws(edge, taken):
+    """`merged.merged_padded` (a split decode step's slices merged where its launch wrote them; its value one
+    launch on a GPU, its tangent the law's path's, a custom JVP): every order runs, finite wherever float64
+    is a normal float32 and the plain merge (`attention_oracle.plain_merged`, independent of the law) is, at
+    padded outputs and maxima near float32's ends, two slices' totals drawn positive, the plain merge its
+    truth; each order set a case of its own (`ORDER_SETS`: every order in one case, the law's path its plain
+    formula and truth, held its group to 1,798 s)."""
+    spec = algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True))
+
+    def inputs(seed: int, scale: float) -> tuple:
+        # Two slices' padded outputs (three rows of which two are queries, 12 columns of which 8 are its
+        # width) and maxima at `scale`, totals drawn positive, their directions and a cotangent.
+        padded, maxima, totals = normal_draw([7124, seed], (1, 2, 3, 1, 12), (1, 1, 2, 3), (1, 1, 2, 3),
+                                             scale=scale)
+        direction = normal_draw([7125, seed], (1, 2, 3, 1, 12), (2, 1, 1, 2, 3), scale=scale)
+        (cotangent,) = normal_draw([7126, seed], (1, 2, 1, 8))
+        return (padded, jnp.stack([maxima, jnp.abs(totals)])), direction, cotangent
+
+    def merge(padded, stacked):
+        return merged.merged_padded(spec, padded, stacked, queries=2, width=8).acc
+
+    plain = functools.partial(plain_merged, rate=1.0, queries=2, width=8)
+    assert_drawn_contract(merge, inputs, EDGES[edge], f"a padded merge {edge} ({taken})", truth_fn=plain,
+                          plain_fn=plain, seeds=FEWEST_SEEDS, taking=ORDER_SETS[taken])
+
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_narrowing_settle_holds_every_order(edge):
     """`attention.narrowing_settled` (a surrogate whose derivative is its quotient's on every entry): every
@@ -201,24 +248,3 @@ def test_a_sink_softmax_holds_every_order(edge):
     assert_drawn_contract(sink_softmax, inputs, EDGES[edge], f"a sink softmax {edge}",
                           plain_fn=lambda logits, sinks: _weights(logits, sinks, None))
 
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_the_finished_merges_mean_holds_every_order(edge):
-    """The finished merge's mean of its states' outputs by their masses (`attention_algebra._mean`, a
-    declared tangent: the mean's own derivative, its coefficients formed at a scale that passes fp32 only
-    where they do, row 6827): every order, forward and reverse, finite wherever float64 is a normal float32
-    and the plain mean, sum(w o) / sum(w), is, its outputs at `edge` over masses of every size."""
-    from dew.nn.kernels.templates.attention_algebra import _mean
-
-    def inputs(seed: int, scale: float) -> tuple:
-        # Masses of every size from a quarter up, outputs and their directions at `scale`.
-        weights, outputs = normal_draw([6827, seed], (3, 4), (3, 4, 8))
-        direction = normal_draw([6828, seed], (3, 4), (3, 4, 8))
-        return ((jnp.abs(weights) + 0.25, outputs * scale), (direction[0], direction[1] * scale),
-                normal_draw([6829, seed], (4, 8))[0])
-
-    def plain(weights, outputs):
-        return jnp.sum(weights[..., None] * outputs, axis=0) / jnp.sum(weights, axis=0)[..., None]
-
-    assert_drawn_contract(lambda weights, outputs: _mean(weights, outputs, 0), inputs, EDGES[edge],
-                          f"the finished merge's mean {edge}", plain_fn=plain)

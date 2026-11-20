@@ -473,6 +473,8 @@ because its Python API is still marked as subject to change.
 | `dew.algebra.generate` | The dev-time generator (§6.11): `Cases`, `StableForm`, `DECLARATIONS`, `generate` and its `--check` |
 | `dew.algebra.acceptance` | §1.5's acceptance cases, declared stable forms, generated beside it (`acceptance_derived.py`) |
 | `dew.algebra.bits` | Bit-level forms (§7): a declared GF(2)-linear transform of a stored word, its cheapest instruction form over the integer pipes and its proof |
+| `dew.algebra.scaled` | The scaled value (§6.12): a float32 as its significand in [1, 2) and its int32 exponent, its products, quotients, sums, landing and compensated sum, each bound proven as it is formed |
+| `dew.algebra.means` | The convex mean (§6.12): finished states' merge, finish and resumption over scaled values, and its derivative |
 
 ### 6.2 Terms
 
@@ -1333,6 +1335,125 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
   generated code, with no step of the lint lane's own.
 - Sampling is seeded and its families fixed, so generation is deterministic on one platform; the module
   records the platform it was measured on (armada's CPU, the one CI pins).
+
+### 6.12 Scaled values and the convex mean
+
+A form whose terms' factors span more than its format's range, where its value does not, is written over
+**scaled values** (`dew.algebra.scaled`): a float carried as its significand in [1, 2) (zero for zero), of its
+own format (float32, or float64 where a truth runs the same form, `Format`), and its int32 exponent. A product
+or quotient multiplies or divides the significands (within [1, 4) or (1/2, 2)) and adds or subtracts the
+exponents; a sum aligns its operands to the larger exponent by an exact power of two, at most the format's
+`shift` places (float32's 64), past which the shifted operand lies inside half a unit of the sum's last place;
+a value becomes a float once, at its landing (`landed`), or as the product of a float by it (`applied`), each
+a chain of factors of one direction, so no intermediate leaves the normal range where the result does not.
+Each value carries the bound its exponent is proven within (`Scaled.reach`), formed with it: a float32's 150, a
+product's its operands' sum and two, a sum's the larger, the format's shift and its significand's bits and two;
+a form past `REACH` (2^24) is refused, never emitted, so every int32 sum of two exponents it computes is exact.
+A divisor's significand has a normal reciprocal, so no compiler's rewrite of a division through its reciprocal
+(XLA:CPU's, openxla/xla#51148) flushes it, and (A/B)/C rewritten as A/(B C) divides by a product below 4. The
+construct is values alone: no program differentiates through a scaled value. A float tangent of a scaled value
+is lost wherever it leaves the format, in either reading of it: in its significand's units (`dx 2^-e`) it
+overflowed where a tangent passed its primal by the format's range and flushed where it fell below, in its
+value's a coefficient's tangent flushed beside the terms it cancels against (the degenerate sweep,
+tests/test_algebra_scaled_edges.py, found the class at about thirty cells an operation). A law over scaled
+values states its derivatives as one of its own operations whose derivative is that operation again.
+
+The merge of finished states is its first user (`dew.algebra.means`). A finished state of a row is `(o, m, l)`:
+its output, a mean over its channels, its anchor and its total there. States of disjoint walks join as
+
+    merged((o_k, m_k, l_k)_k) = (sum_k w_k o_k / W, M, W),   w_k = l_k f_k,   W = sum_k w_k,
+
+`M` the largest anchor and `f_k = exp(s (m_k - M))` the walk's own factor from `m_k` to it in its units
+(`means.Units`), a scaled value aligned once: its base-2 exponent, the anchors' difference taken exactly and
+converted exactly in the accurate form (a fold's rounded as its kernels round it; a difference past the format
+whose scaled value lies within it taken at half each and doubled after, the same bits), split into its nearest
+integer, the value's power of two, and its remainder in [-1/2, 1/2], whose exponential is the significand, so a
+factor is held exactly to `2^-65536` and is zero below it (`means.FLOOR`). The law is one **ratio of sums of
+products** of its float operands, an operation of its own (`means.ratio_p`, its form `means.Ratio`):
+`sum_k o_k l_k f_k / sum_k l_k f_k`. Each term is formed exactly as a double float at a power of two (each
+factor's significand times the running product by an exact product, `two_product`, its residual carried), the
+terms are formed once (materialized before any sum reads them: a compiler fusing the exact products into each
+reduction formed them four times, and XLA:CPU's loop vectorizer held such a program past 240 s, row 7925),
+placed at the power of two that puts the sum of their magnitudes a binade beneath their format's largest power
+(so no partial sum passes the format, and a term `2^-252` of that sum keeps its value: V4's tiny output beside
+its cancelling neighbours at its own power; float64's, a truth's, at float64's), summed compensated
+(`compensated`, Ogita, Rump and Oishi's Sum2), the numerator's sum divided by the denominator's with the
+quotient's residual carried, and landed once. The mean is held to the hull of the outputs of positive mass
+(its value alone). The merged total is the ratio of no denominator at the anchor it lands at (`merged_total`),
+that anchor read off the same ratio's sum at the joined anchor, as it would land there (one sum: a sequential
+rounded one lost masses the ratio keeps and landed it past the format), a walk's own finish `o = acc / l` and a
+resumed state's `acc = o l` ratios of one state each.
+
+**The law's domain.** A merge's mass at its joined anchor lies within the format at that anchor's resolution:
+where the masses' sum passes the format's largest, the anchor moves to land it (`_landing`), and an anchor's
+next float is at most the move the total needs. Its one caller is attention (`attention_algebra.merged_state`,
+the split walk's and the decode's merge), whose every total is a softmax denominator: a sum of factors
+`exp(s (x - m)) <= 1` over its keys, at most their count, so a merge's mass is at most a sequence's length,
+far inside the format at any anchor. Outside the domain (two totals of `2^127` at an anchor of `2^31`, whose
+next float 256 past it flushes their mass) the merged total lands infinite, never a finite wrong mass, so a
+run's finiteness checks catch it (`_in_domain`, the base review's F2); a caller whose mass could pass it
+carries an exponent of its own beside the total. A ratio's numerator is in general a sum of products of sums,
+`P = sum_t c_t prod_j S_tj` (`Ratio.products`, each sum a `Summed` over the states or a state at a time), over
+its denominator's sum raised, `D^q`; one sum alone is the law's own forms. Its derivative is a ratio again, over
+its operands and their tangents, by the products' rule and, where the denominator moves, the quotient's closed
+rule, no quotient in it:
+
+    d (P / D^q) = (dP D - q P dD) / D^(q+1),   dP = sum_t c_t sum_j dS_tj prod_(l != j) S_tl,
+
+each term's derivative its product rule's (an exponential's `s f` times its anchor's tangent, the units' scale a
+factor of its own so its powers multiply exactly), each sum formed once and unlanded (`_products_summed`: a
+double float at its power of two, the products multiplied and joined so, `_times`), so its work is each sum's
+states, no grid of them, and no quotient, nor a tangent of one, is a float landed apart from the terms it
+cancels against (a quotient of `2^-156`, landed, lost a derivative of `-2^-66`; the merge P0's base reviews 4
+and 9). Every term of it holds one tangent, so it is linear in them and its transpose is a ratio again
+(`_ratio_jvp`, `_ratio_transpose`), its tangent's sum taken a state at a time, summed over the axes its operand
+is broadcast along and landed once: within that sum where the form sums its terms each over its own extent
+(`Ratio.over`, every other factor one along them), else its quotients' sum, `sum_c N_c / D_c`, each quotient
+unlanded until the sum lands (`Ratio.across`). A derivative keeps its operands' whole domain, an operand none of
+its terms reads kept where it alone spans it (`_compacted`). Every order of the law,
+forward and reverse, is so one ratio, no tangent a float formed apart from its sum: terms past the format
+that cancel are its value (masses along a common scaling of themselves under outputs `c +- s`, `s` 2^100: terms
+2^199 apart, the derivative 0; a zero total's derivative along its total through a second merge, -1/4), the
+anchor `M` reading no tangent (the mean is the same at any anchor). The ratio lowers through XLA as its value,
+batches along its axis, keeps its operands' weak type and sharding, and runs eagerly as one dispatch.
+
+**The proof of the emitted arithmetic.** With `u = 2^-24` and `gamma_n = n u / (1 - n u)`: each term is within
+`gamma_(K+5)` of its real value (a mass's three products, the total's `K - 1` sums, the correctly rounded
+quotient, the product by the output and its landing); the compensated sum `S` of the terms is within `u |S| +
+gamma_(K-1) sum |e_i|` of their exact sum, `e_i` its partial sums' exact errors, each within `u` of its partial
+sum; landed at `2^s` and back, the terms and the sum move by an exact power of two, so the bound is the
+same, `S` read at `2^s`. The power `2^s` is each output element's own, from its terms' magnitudes summed, a
+binade beneath the format's largest, so no channel moves by another's; the terms it places beneath the
+format's normals are summed apart at their own power and the two sums joined, so no term is read as zero for
+its place beside larger ones (a least-normal output beside a pair of `+-2^127` that cancel exactly was, row
+7980). An LSE-scaled combine (FlashAttention's split-KV) scales
+each split by one scalar, so each channel keeps its own exponent but rounds each split's product and each
+partial sum, and XLA:CPU flushes its subnormal products; the law keeps every bit it keeps. A power shared by
+a row's channels, or taken from its coefficients alone, would not: at eight and sixteen equal-LSE splits, a
+channel near the least normal beside one near the largest lost 20 to 30% of itself, its terms left subnormal
+(tests/test_algebra_scaled.py's edge witnesses hold each channel to one rounding, jitted and as written).
+The real terms' sum is the mean, within the outputs' hull, so `S` lies
+within the hull widened by
+`B = gamma_(K+5) sum_k s_k |o_k| + u |S| + gamma_(K-1) (K - 1) u (1 + gamma_(K+5)) sum_k s_k |o_k|` (`s_k` the
+real shares), and the hull clip moves it by no more than `B`. Exactly opposite terms (equal masses, exactly
+opposite outputs) round to exactly opposite floats; where the compensated sum adds no more than one other
+term's error beside them (V4's three states), their errors' sum is exact and the others' sum one rounding of
+itself in any order, V4's `t / 3` beside `+-L / 3` kept within `gamma_(K+5)` of itself (and, the least normal's
+own place beneath the pair's, by the band summed apart: `+-2^127 (1 + 2^-23)` beside `3 2^-126` merge to
+`2^-126`, tests/test_algebra_scaled_edges.py's cancelling states); where more errors meet, their plain sum
+rounds, and the others' sum is held within the compensated sum's bound alone (`[2^100, 1, 2^-30, -1, -2^100,
+-2^-30]` sums to `-2^-30`, the law's review of row 7980). Terms that cancel without being exactly opposite keep their residual within `B`, as
+any arithmetic that rounds its terms does. Each order of the derivative is exact at its stated inputs (its
+operands, its factors as formed, and the order beneath it as landed) to within `u^2` of its terms before its
+one landing: so within `u |d| + gamma_n u sum |terms| / |W|` of that, plus `u |R| |dW / W|` an order where the
+order beneath it is read as landed (`R`). A landing below the least normal is read as zero where XLA:CPU
+flushes it, op by op: within `K 2^-126` of the bound. tests/test_algebra_scaled.py holds every case of the
+merge's five review rounds (V1-V8, D1-D13) against the law in float64, jitted and op by op, forward and
+reverse, and any drawn merge to its hull and value bound; tests/test_algebra_scaled_edges.py holds each of
+the law's operations at its degenerate inputs (zero, minus zero, a subnormal, the least normal, the format's
+largest, past its range, zero and subnormal totals, mixed scales, outputs an ulp apart, an inexact scale's
+products feeding a compensated sum under a jit), value and first two derivatives, to its contract bit for bit;
+the template's check-1 cells hold them through the gate.
 
 ## 7. Bit-level forms
 

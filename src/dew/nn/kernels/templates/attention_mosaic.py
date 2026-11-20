@@ -64,6 +64,8 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _trained_forward,
     certified_walk,
     column_slices,
+    folded_form,
+    forward_block_plan,
     forward_products,
     logits_ahead,
 )
@@ -277,8 +279,6 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     (`attention_decode`), whose walk the memory bounds."""
     per_span: int = 1
     """The queries each of the spans' intervals holds (`KeySpans.per_span`)."""
-    whole: bool = False
-    """Whether the spans' every query sees every key (`KeySpans.whole`), which its launches' costs state."""
 
     @property
     def score_types(self) -> tuple:
@@ -287,7 +287,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def spans(self, start, end, query_ids, key_ids) -> KeySpans:
         """The call's spans from its arrays and the op's static form, key count and queries an interval."""
-        return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span, whole=self.whole)
+        return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span)
 
     UNBUNDLED: ClassVar[str] = "the Mosaic mainloop has no bundle for {name} yet"
     """Why a launch runs on no device of a family it has no bundle of (`declined`)."""
@@ -507,9 +507,9 @@ class MosaicForward(_Mainloop[Tiles]):
                             arguments.get("drop"))
 
     def _decided_model(self, query, value, score_params, residuals: Kept | None, config: Tiles,
-                       table=None, sources=None, scales=None, initial=None, drop=None, *, peaks: bool = False,
-                       columns: int | None = None, decides: bool | None = None, priced: bool = True
-                       ) -> tuple[bool, ForwardRegisters, int | None]:
+                       table=None, sources=None, scales=None, initial=None, drop=None, *,
+                       peaks: bool = False, columns: int | None = None, decides: bool | None = None,
+                       priced: bool = True) -> tuple[bool, ForwardRegisters, int | None]:
         """Resolve whether `config` decides its scaled walk, its `ForwardRegisters`, and (when `priced`) its
         register count in one pass (row 8843): builds the register facts once and reuses the scaled price so
         planning, residency and emission agree without double-pricing prologues."""
@@ -920,12 +920,10 @@ class MosaicForward(_Mainloop[Tiles]):
         query = ba.arguments["query"]
         if self._natural(query):
             return True
-        power, scale = prescale(query.dtype, query.shape[3], self.scale)
-        taken = power if self.form != "spans" else 1.0
         subtracted = self.subtracted and ba.arguments.get("residuals") is not Kept.SPLIT
-        return not algebra.Forward(self.form, self.keys, ids=False, scale=scale * taken,
-                                   score_mod=self.score_mod, natural=self.natural, prescale=power / taken,
-                                   subtracted=subtracted).reaches
+        return not folded_form(self.form, self.keys, ids=False, dtype=query.dtype, width=query.shape[3],
+                               scale=self.scale, natural=self.natural, score_mod=self.score_mod,
+                               subtracted=subtracted)[0].reaches
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
                      decides: bool | None = None) -> int:
@@ -938,17 +936,19 @@ class MosaicForward(_Mainloop[Tiles]):
                       products: tuple, decides: bool | None = None) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
-        width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
+        width, full_v = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         # A launch of a block of the value columns (`Tiles.columns`) stages that block.
-        value_width = value_columns(value_width, config.columns)
+        value_width = value_columns(full_v, config.columns)
         steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
+        training = ba.arguments.get("residuals") is Kept.SPLIT
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
+        plan = forward_block_plan(full_v, config.columns, out_dtype,
+                                  has_output_mod=self.output_mod is not None, training=training)
         # A paged call's key tile of several pages loaded as its launch loads it (`paged_reads`).
         page = _page(ba)
         deciding = self.deciding(ba, config) if decides is None else decides
-        allocations = _forward_allocations(family, config, width, value_width, query.dtype,
-                                           ba.arguments.get("residuals") is Kept.SPLIT,
-                                           min(config.stages, steps), out_dtype=out_dtype, page=page,
+        allocations = _forward_allocations(family, config, width, value_width, query.dtype, training,
+                                           min(config.stages, steps), out_dtype=plan.out_dtype, page=page,
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
                                            parts=self.parts, params=self.score_types,
                                            in_key=self.reads_key_slot(family), decides=deciding)
@@ -957,7 +957,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # (`reducing`).
         arguments = ba.arguments
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
-        reduced = reducing(family, config.consumers, self.score_reduces or self.output_mod is not None,
+        reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
         return resources.shared_bytes(family, launch_scope(family, allocations, reduced,
                                                            reduces=forward_reduces(family, reduced),
@@ -1057,8 +1057,8 @@ class MosaicForward(_Mainloop[Tiles]):
         return self._decided_model(arguments["query"], arguments["value"], arguments["score_params"],
                                    arguments.get("residuals"), config, arguments.get("table"),
                                    arguments.get("sources"), arguments.get("scales"),
-                                   arguments.get("initial"), arguments.get("drop"), peaks=peaks,
-                                   columns=columns, decides=decides)[2]
+                                   arguments.get("initial"), arguments.get("drop"),
+                                   peaks=peaks, columns=columns, decides=decides)[2]
 
     def registered(self, query, value, score_params, residuals, table=None, sources=None,
                    scales=None, initial=None, drop=None) -> ForwardRegisters:
@@ -1075,6 +1075,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                 if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span,
                                 merged=initial is not None and residuals is not Kept.SPLIT,
                                 started=initial is not None and residuals is Kept.SPLIT,
+                                dropped=drop is not None,
                                 weight_parts=2 if drop is not None and value.dtype == jnp.float16 else 1,
                                 prologue=(None if self.query_mod is None
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)))
@@ -1218,13 +1219,15 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `value` `[R, K, Hk, D]`: a serving step's work list over its cache's rows, no row copied. `subtracted`
     an inference walk's fold of raw products (`MosaicForward.subtracted`). With `splits`, each query tile's
     keys are cut into that many slices, every output the slices' own along the query axis
-    (`MosaicForward.splits`), which XLA merges (`attention_decode`). With `scales` (an inference walk's),
-    `key` and `value` are quantized codes, int8 or an FP8, and `scales` the keys' and the values'
-    `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads the keys and values they
-    dequantize to, each converted to the query's dtype in its program (`_Codes`). `scaled` launches the
-    scaled op whatever the call's values (`MosaicForward.scaled`: a mainloop whose own kernel holds no scale
-    gives it a call some row of which can be scaled); `bounded` the unscaled
-    one, a cache's call too, where its caller bounded its values (`MosaicForward.bounded`). `in_key` states
+    (`MosaicForward.splits`): with `Kept.OUTPUT`, two arrays in place of the five, the slices' padded
+    outputs and their stacked maxima and denominators (`attention_mosaic_forward._walked_outputs`), which its
+    caller merges where they lie (`merged.merged_split`). With `scales`
+    (an inference walk's), `key` and `value` are quantized codes, int8 or an FP8, and `scales` the keys' and
+    the values' `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads the keys and
+    values they dequantize to, each converted to the query's dtype in its program (`_Codes`). `scaled`
+    launches the scaled op whatever the call's values (`MosaicForward.scaled`: a mainloop whose own kernel
+    holds no scale gives it a call some row of which can be scaled); `bounded` the unscaled one, a cache's
+    call too, where its caller bounded its values (`MosaicForward.bounded`). `in_key` states
     `value` its keys' leading columns (`MosaicForward.in_key`): its programs read them from the key's slot,
     and the value array, a view of the key's, is no operand of the launch.
     """
@@ -1351,7 +1354,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
-                       splits=splits, subtracted=subtracted, per_span=spans.per_span, whole=spans.whole,
+                       splits=splits, subtracted=subtracted, per_span=spans.per_span,
                        parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded, in_key=in_key,
                        query_mod=hooks.query_mod,
                        query_kinds=tuple(param.kind for param in hooks.query_params),

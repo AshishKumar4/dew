@@ -105,7 +105,7 @@ def float64_terms(fn, *args):
     branches and loops walked as their values pick. The operations and their
     order are the walk's, compiled where the walk dispatched each alone."""
     tree, values, squares = _termed(fn, args, power=2)
-    root = jnp.sqrt if _tracing(args) else np.sqrt
+    root = jnp.sqrt if _traced_values(jax.tree.leaves(args)) else np.sqrt
     return tree.unflatten(values), tree.unflatten([root(square) for square in squares])
 
 
@@ -145,21 +145,15 @@ def float64_signed_sums(fn, *args):
             tree.unflatten([negative for _, negative in pairs]))
 
 
-def _tracing(args) -> bool:
-    """Whether `args` are a trace's (`jax.core.Tracer`s): a program calling `float64_terms` traced whole, as
-    a site's terms program its prepare compiles (`reference_error._held_program`)."""
-    return any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(args))
-
-
 def _termed(fn, args, *, power: int):
     """`fn(*args)`'s outputs' tree, their values and each one's terms summed at `power` (`POWER`: their
-    squares, or their magnitudes), the evaluation `float64_terms` describes. Under a trace (`_tracing`: a
-    site's terms program traced whole) its compiled evaluation inlined into the trace, its outputs the
+    squares, or their magnitudes), the evaluation `float64_terms` describes. Under a trace (`_traced_values`:
+    a site's terms program traced whole) its compiled evaluation inlined into the trace, its outputs the
     trace's own, nothing on the host, a branch its platform picks read for the platform of the store's
     device its prepare compiles for (`truths_ahead.CompiledTruths.device`), which the program lowers for. A
     trace outside a store's prepare, whose lowering's platform no trace states (a CPU's inputs under a GPU's
     default), and a program whose values steer it (`static` none), which no trace holds, are refused."""
-    if _tracing(args):
+    if _traced_values(jax.tree.leaves(args)):
         store = STORE.get()
         if store is None or not store.prepare:
             raise TypeError("float64_terms: a traced call reads the branches its platform picks for the "
@@ -742,7 +736,9 @@ def _stacked(*steps):
 
 
 def _traced_values(values) -> bool:
-    """Whether any of `values` is a tracer: a walk inside a trace (a compiled span, a jit of the walk)."""
+    """Whether any of `values` is a tracer: a walk inside a trace (a compiled span, a jit of the walk), a
+    program calling `float64_terms` traced whole (a site's terms program its prepare compiles,
+    `reference_error._held_program`)."""
     return any(isinstance(value, jax.core.Tracer) for value in values)
 
 
@@ -1009,5 +1005,5 @@ def _or_own(energy, value):
 def _or_size(energy, value):
     """An output's energy: the one its sums carried, else its own size's (`_sized`)."""
     if not jnp.issubdtype(jnp.result_type(value), jnp.inexact):
-        return jnp.zeros(np.shape(value)) if isinstance(value, jax.core.Tracer) else np.zeros(np.shape(value))
+        return jnp.zeros(np.shape(value)) if _traced_values([value]) else np.zeros(np.shape(value))
     return _measured(value) if energy is None else energy

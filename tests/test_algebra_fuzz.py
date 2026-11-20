@@ -128,6 +128,10 @@ def _declared(hook: str, outputs: tuple[str, ...], base):
 # A base-2 log-sum-exp under a bias: its `log2` was outside the language, kept as an opaque value the finish
 # evaluated from the whole operands.
 @hypothesis.example(hook="bias", outputs={"lse"}, base=2, merged=False)
+# Every output of a merged walk: XLA's fusion, rounding each exponential's argument once where the walk as
+# written rounds it twice, puts its total 1.76 times its own error as written, past PARITY of the declaration
+# as written and within the bound of an accuracy claim against it (`dew.parity.WRITTEN`).
+@hypothesis.example(hook="none", outputs={"values", "lse", "peak", "total"}, base="e", merged=True)
 def test_a_derived_walk_is_on_par_with_its_declaration(hook, outputs, base, merged):
     """Any softmax walk the grammar draws derives, and its derived walk, over the key tiles in order or in two
     halves merged, is on par with the declared function against the float64 truth."""

@@ -394,6 +394,75 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
     assert not called
 
 
+def test_split_output_hook_forward_plans_and_emits_fp32_block_smem_residency():
+    """Row 9542: an H100 FP16 forward with Q/K width 64, V width 128, a 64x64 one-consumer pin, 6 stages,
+    `columns=64`, and an `output_mod` splits the output hook into XLA past the launches and emits fp32 per
+    block (~121 KiB, across the 113 KiB two-CTA budget). Legality, residency, and emission derive from one
+    `forward_block_plan`, so both `op.resident` and the emitted `RegisterModel.most` are 1 (not 2)."""
+    from dew.nn.kernels.templates import report
+
+    target = generation.gpu_target("sm90")
+    spans = template.spans(128, 384, 1)
+    q = jnp.ones((1, 128, 1, 64), jnp.float16)
+    k = jnp.ones((1, 384, 1, 64), jnp.float16)
+    v = jnp.ones((1, 384, 1, 128), jnp.float16)
+    hooks = template.Hooks(output_mod=lambda o: o * 2.0)
+    pinned = attention_mosaic.Tiles(64, 64, 6, 1, family="wgmma", columns=64)
+    with generation.assumed("sm90"), _pinned(pinned):
+        op, args = attention_mosaic._forward_call(q, k, v, spans, hooks, scale=None, natural=True)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        assert op.staged_bytes(ba, pinned, target) > target.shared_limit // 2
+        assert op.resident(ba, pinned, target) == 1
+        traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
+            q, k, v, spans, hooks, natural=True, interpret=False))(q, k, v).jaxpr
+    emitted = [record.kernels[kernel]
+               for eq in programs.equations(traced)
+               if isinstance(name := eq.params.get("name"), str)
+               for kernel, launch in [report.kernel_of(name)[:2]]
+               if launch is not None and (record := report.traced(launch)) is not None
+               and kernel in record.kernels]
+    assert emitted and all(model.most == 1 for model in emitted), emitted
+
+    # Row 9526: BF16 H100 inference with dropout at 64x64 1-consumer WGMMA pushes scaled registers past 248,
+    # so `deciding` is False and its full-width natural rewalk stays legal (not rejected as deciding=True);
+    # `certified()` also emits the dropout-priced register count matching the planner.
+    drop = template.Dropout(jax.random.key_data(jax.random.key(0)),
+                            jnp.arange(1, dtype=jnp.int32), jnp.arange(4, dtype=jnp.int32), 0.1)
+    drop_hooks = template.Hooks(drop=drop)
+    q_bf = jnp.ones((1, 128, 4, 64), jnp.bfloat16)
+    k_bf = jnp.ones((1, 256, 2, 64), jnp.bfloat16)
+    drop_spans = template.spans(128, 256, 1)
+    one_wgmma = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")
+    with generation.assumed("sm90"):
+        op_bf, args_bf = attention_mosaic._forward_call(q_bf, k_bf, k_bf, drop_spans, drop_hooks,
+                                                        scale=None, natural=False)
+        ba_bf = op_bf.bind(*args_bf, residuals=template.Kept.NONE, interpret=False)
+        assert not op_bf.deciding(ba_bf, one_wgmma)
+        completed = op_bf.completed(ba_bf, one_wgmma)
+        assert completed.relaunch_k == 64 and completed.relaunch_columns is None
+        rewalk_bytes = op_bf.staged_bytes(ba_bf, completed.relaunch, target)
+        assert op_bf.legal(ba_bf, completed, dataclasses.replace(target, shared_limit=rewalk_bytes))
+        q_f16 = jnp.ones((1, 128, 4, 64), jnp.float16)
+        k_f16 = jnp.ones((1, 256, 2, 64), jnp.float16)
+        op_f16, args_f16 = attention_mosaic._forward_call(q_f16, k_f16, k_f16, drop_spans, drop_hooks,
+                                                          scale=None, natural=False)
+        ba_f16 = op_f16.bind(*args_f16, residuals=template.Kept.NONE, interpret=False)
+        cfg_f16 = op_f16.derived(ba_f16, target)
+        assert cfg_f16 is not None
+        planned_regs = op_f16.registers(ba_f16, cfg_f16)
+        with report.launching(op_f16, ba_f16, cfg_f16):
+            cert_traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.certified(
+                q, k, v, drop_spans, drop_hooks, interpret=False)[1])(q_f16, k_f16, k_f16).jaxpr
+    cert_models = [record.kernels[kernel]
+                   for eq in programs.equations(cert_traced)
+                   if isinstance(name := eq.params.get("name"), str)
+                   for kernel, launch in [report.kernel_of(name)[:2]]
+                   if launch is not None and (record := report.traced(launch)) is not None
+                   and kernel in record.kernels]
+    assert cert_models and all(model.registers == planned_regs for model in cert_models), (
+        planned_regs, cert_models)
+
+
 @INTERPRETS
 @pytest.mark.parametrize("tokens", [64, 128, 256, 320])
 def test_the_forward_on_tcgen05s_rows_holds_check_1_over_short_walks_interpreted(tokens):
