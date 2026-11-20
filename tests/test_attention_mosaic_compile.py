@@ -548,7 +548,7 @@ def test_a_deterministic_backward_holds_check_1_interpreted(call, with_determini
 def test_a_deterministic_backward_compiles_spill_free_as_its_model_decides(width, with_deterministic_ops):
     """The backward under --xla_gpu_deterministic_ops at its derived tiles of a causal call `width` wide,
     lowered and compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing."""
-    _check_backward_batch("sm90", width, False, ("none",))
+    _check_backward_batch("sm90", width, accurate=False, hooks_batch=("none",))
 
 
 @COMPILES_ON_CPU
