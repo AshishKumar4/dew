@@ -16,8 +16,11 @@ uses; the preview hook limits itself to the display count.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import weakref
 from abc import abstractmethod
-from collections.abc import Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
@@ -37,6 +40,7 @@ from dew.diffusion.schedules.source import SourceGrid
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inference.images import ImageSettings, TextToImage
 from dew.inputs import InputSpec, encode_conditions, unit_range
+from dew.inputs.condition import ConditionEncoder
 from dew.lora import unadapted
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
@@ -66,6 +70,7 @@ from dew.objectives.base import (
     ProgramModule,
     Ratio,
     Step,
+    TracedSetting,
     model_rngs,
 )
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
@@ -257,8 +262,54 @@ def _trains_its_grid(source: PipelineSource, process, grid) -> bool:
             and (grid is OMITTED or grid is source.grid))
 
 
+def _averaged(decay: float | optax.Schedule | None) -> EMASpec | None:
+    """A diffusion objective's average of its parameters at `decay`, a constant one stating itself
+    (`EMASpec.stated`), so the trace keys by it (row 6297); a schedule, a function, states none."""
+    if decay is None:
+        return None
+    if callable(decay):
+        return EMASpec(decay=decay, select=under("params"))
+    return EMASpec(decay=optax.constant_schedule(decay), select=under("params"),
+                   stated=("constant", decay, "params"))
+
+
+def _keyed_inputs(inputs: InputSpec) -> TracedSetting:
+    """`inputs` as a trace key states it (`DiffusionObjective.traced_by`): its sample, its mask and each
+    condition's field and unconditional datum by value, its encoder by its value too (`_encoder_value`),
+    whose parameters its encoding closes over: two objectives over encoders of one record and one set of
+    weights key alike, built anew or not, and two of other weights apart."""
+    return (inputs.sample, inputs.mask,
+            tuple(sorted((name, condition.field, condition.unconditional, _encoder_value(condition.encoder))
+                         for name, condition in inputs.conditions.items())))
+
+
+_ENCODER_VALUES: dict[int, tuple[str, str, str]] = {}
+"""Each live encoder's value (`_encoder_value`), by its identity, dropped as the encoder goes."""
+
+
+def _encoder_value(encoder: ConditionEncoder) -> tuple[str, str, str]:
+    """`encoder` as a trace key states it: its class, the record a run keeps of it (`recorded_fields`) and a
+    digest of its parameters, each leaf's path, dtype, shape and bytes, which its encoding closes over as
+    constants. Taken once an encoder object, read off the host once."""
+    held = _ENCODER_VALUES.get(id(encoder))
+    if held is None:
+        digest = hashlib.sha256()
+        for path, leaf in jax.tree_util.tree_flatten_with_path(encoder.params)[0]:
+            array = np.asarray(leaf)
+            digest.update(f"{jax.tree_util.keystr(path)}:{array.dtype}:{array.shape}".encode())
+            digest.update(array.tobytes())
+        held = (f"{type(encoder).__module__}.{type(encoder).__qualname__}",
+                json.dumps(encoder.recorded_fields(), sort_keys=True, default=repr), digest.hexdigest())
+        _ENCODER_VALUES[id(encoder)] = held
+        weakref.finalize(encoder, _ENCODER_VALUES.pop, id(encoder), None)
+    return held
+
+
 class DiffusionObjective(Objective[Ratio]):
     """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "_grid": "derived from `_inputs`' sample shape, which the key holds"}
 
     saved_task = TextToImage
     settings = ImageSettings
@@ -374,6 +425,15 @@ class DiffusionObjective(Objective[Ratio]):
             raise MissingFlopsCount(f"{type(model).__name__} has no declared image_flops geometry")
         return model.image_flops(model.image_lengths(self.latent_shape, rows),
                                   self.latent_shape[-1], features), encoded
+
+    def traced_by(self, settings: TracedSetting) -> Hashable | None:
+        """`Objective.traced_by` with its inputs (`_inputs`) keyed as its loss reads them (`_keyed_inputs`):
+        each condition's encoder by the object itself, whose parameters its encoding closes over (row
+        6297: an encoder's arrays stated no value, and no key was kept)."""
+        match settings:
+            case {"_inputs": InputSpec() as inputs}:
+                settings = {**settings, "_inputs": _keyed_inputs(inputs)}
+        return super().traced_by(settings)
 
     @property
     def inputs(self) -> InputSpec:
@@ -500,9 +560,7 @@ class DiffusionObjective(Objective[Ratio]):
         self.steps = steps
         self.grid = grid
         self.grid_process = grid_process
-        self.ema = (None if ema_decay is None else EMASpec(
-            decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
-            select=under("params")))
+        self.ema = _averaged(ema_decay)
         self._grid = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
 
     @property
@@ -1000,6 +1058,11 @@ class FlowDistillationObjective(DiffusionObjective):
 
     network: ClassVar[str]
     """The network the loss trains beside the student under `params`."""
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "teacher_variables": "the teacher's tree, which the held tree the key states by its shapes holds "
+                             "under its own name (`held_variables`'s `TEACHER`), its arrays passed as "
+                             "arguments"}
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
                  teacher: nn.Module | None = None, teacher_variables: Variables | None = None,

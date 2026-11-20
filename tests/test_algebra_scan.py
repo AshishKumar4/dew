@@ -1528,6 +1528,28 @@ def test_a_steep_chunks_split_decays_keep_the_state_it_enters_and_leaves():
                         "a steep last chunk's split decays", seeds=16)
 
 
+@pytest.mark.parametrize(("update_fn", "operands"), [(scalar_gla, GATED), (gla, KIMI)],
+                         ids=["a decay a head's", "a decay a key's"])
+def test_a_nan_key_reads_nan_through_a_decay_that_underflows(update_fn, operands):
+    """GLA's dual form (an H100's) over one chunk whose every log decay is -80, so the span from token 0 to
+    token 2 underflows to a live zero, and whose first key is NaN: token 2 reads NaN, as the recurrence does
+    (its state NaN from token 0 on), the pair kept where only a crossed decay (`scan._crossed`'s negative
+    zero) drops one, never one that underflows (row 8808: a pair dropped on any zero read finite)."""
+    declared = scan.Scan(update_fn, gated_readout, operands, walked="time", state=((KEY, VALUE), jnp.float32))
+    rng = np.random.default_rng(8808)
+    keys = rng.standard_normal((CHUNK, KEY))
+    keys[0] = np.nan
+    values = {"q": jnp.asarray(rng.standard_normal((CHUNK, KEY)), jnp.float32),
+              "k": jnp.asarray(keys, jnp.float32),
+              "v": jnp.asarray(rng.standard_normal((CHUNK, VALUE)), jnp.float32),
+              "g": jnp.full((CHUNK,) + (() if operands is GATED else (KEY,)), -80.0, jnp.float32),
+              "beta": jnp.full((CHUNK,), 0.5, jnp.float32)}
+    with generation.assumed("sm90"):
+        forms = scan.derive_scan(declared, saturation=SATURATION)
+        outputs = forms.mapped(forms.prepare(values), forms.init({}))
+    assert np.isnan(np.asarray(outputs[2])).all()
+
+
 def corrected_two_sided(h, q, k, v, g, e, beta):
     """A two-sided decay beside the delta rule's correction, which no chunk form takes."""
     del q
