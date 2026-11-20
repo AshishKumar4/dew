@@ -142,8 +142,10 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
     query = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     key = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
-    threads, arrivals = programs(_placed_forward(tiles, spans), query, key,
-                                 threads=tiles.consumers + 1, rare=False)
+    threads, arrivals = programs(
+        _placed_forward(tiles, spans), query, key,
+        threads=tiles.consumers + 1 + len(placed.correction_roles(placed.ROWS, tiles.consumers, width)),
+        rare=False)
     (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
     q_smem = _consumer_q_smem(threads, tiles.consumers)
     # Map each consumer-exclusive barrier name to its consumer index so each score MMA's `scored` arrival
@@ -250,6 +252,53 @@ def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
     for thread in threads_e:
         assert _tmem_q_copies(thread) == []
     assert explore(threads_e, arrivals_e) > 0
+
+
+@pytest.mark.parametrize("moves", [False, True], ids=["kept", "moved"])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_correction_warpgroup_at_d256_holds_protocol_in_every_interleaving(call, moves):
+    """Row 5368: at d256 on 1-consumer `tcgen05.rows`, the dedicated `CORRECTION` warpgroup rescales kept
+    sums in TMEM off the softmax warpgroup's critical path: every interleaving of consumer, correction, and
+    producer/issuer holds without deadlock or race over 5 steps (reusing both factor slots) and at 0- and
+    1-step reaches, both when rescales are skipped (`kept`) and taken (`moved`), and dropping a `factor_ready`
+    wait before reading `factors` is caught as a race."""
+    from ring_protocol import Violation, explore, programs
+
+    query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 320, 1, 256), jnp.bfloat16)
+    spans = template.spans(256, 320, 1, **CALLS[call])
+    threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key, threads=3, rare=moves)
+    consumer_writes = {e.at[0] for e in threads[0] if e.kind == "write" and e.at[0].startswith("smem")}
+    factor_reads = [e for e in threads[1] if e.kind == "read" and e.at[0] in consumer_writes]
+    assert factor_reads, "correction factor load must be traced"
+    assert explore(threads, arrivals) > 0
+    # Negative control: dropping the correction warpgroup's factor_ready waits lets the factor read race
+    # with the consumer's factor write.
+    factor_ready = next(e.at[0] for e in threads[1] if e.kind == "wait")
+    mutated = list(threads)
+    mutated[1] = [e for e in threads[1] if not (e.kind == "wait" and e.at[0] == factor_ready)]
+    with pytest.raises(Violation):
+        explore(mutated, arrivals)
+    if call == "full" and not moves:
+        q1, k1 = jnp.ones((1, 128, 1, 256), jnp.bfloat16), jnp.ones((1, 128, 1, 256), jnp.bfloat16)
+        for steps in (0, 1):
+            short = template.KeySpans(start=jnp.zeros((1, 128), jnp.int32),
+                                      end=jnp.full((1, 128), steps * 64, jnp.int32),
+                                      query_ids=None, key_ids=None, keys=128)
+            short_maps = {5: np.array([[0]], np.int32), 6: np.array([[steps]], np.int32),
+                          7: np.array([[0]], np.int32), 8: np.array([[steps]], np.int32)}
+            short_threads, short_arrivals = programs(_placed_forward(ROWS_TILES, short), q1, k1, threads=3,
+                                                     rare=False,
+                                                     known=lambda idx, _aval, m=short_maps: m.get(idx))
+            assert explore(short_threads, short_arrivals) > 0
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_correction_warpgroup_at_d256_holds_check_1_interpreted(call):
+    """Row 5368: 1-consumer d256 `tcgen05.rows` with the dedicated `CORRECTION` warpgroup holds check 1
+    against the reference under the interpreter (full and causal)."""
+    _check_forward(call, jnp.bfloat16, (1, 256, 2, 1), natural=False, interpret=True, width=256,
+                   value_width=256, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
 
 
 def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
