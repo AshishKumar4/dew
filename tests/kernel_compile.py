@@ -194,7 +194,7 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             ("shared bytes", shared is not None and binary is not None and binary.shared is not None),
             ("tensor memory columns", tmem), ("binary", binary),
             ("machine code", binary is None or binary.sass is not None)) if not read)
-        kernel, launch = report.kernel_of(name)
+        kernel, launch, _ = report.kernel_of(name)
         found_reports.append(Report(
             kernel, binary.shared if binary is not None else None,
             sum(map(int, tmem.groups())) if tmem else None,

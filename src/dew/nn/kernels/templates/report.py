@@ -71,16 +71,15 @@ KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
 (jax/experimental/mosaic/gpu/core.py) and GPU outlining's `_kernel`."""
 
 
-def kernel_of(name: str) -> tuple[str, str | None]:
-    """`(kernel, identity)` of a kernel's `name` as it traced (`named`), its function in its binary or its PTX
-    entry (`KERNEL_FUNCTION`) or its call's location: its name less its suffix, and the suffix's digest
-    (`LAUNCH_SUFFIX`: its launch's, where its launch states no kernel's part; a Mosaic GPU call carries its
-    launch beside, `launch_metadata`), None where it carries none."""
+def kernel_of(name: str) -> tuple[str, str | None, str | None]:
+    """`(kernel, identity, index)` of a kernel's `name` as it traced (`named`), its function in its binary
+    or its PTX entry (`KERNEL_FUNCTION`) or its call's location: its name less its suffix, the suffix's
+    digest (`LAUNCH_SUFFIX`), and any XLA uniquification index (`__<digits>`), None where absent."""
     function = KERNEL_FUNCTION.fullmatch(name)
     kernel = function.group("kernel") if function else name
     if not (launch := LAUNCH_SUFFIX.search(kernel)):
-        return kernel, None
-    return kernel[:launch.start()], launch.group(1)
+        return kernel, None, None
+    return kernel[:launch.start()], launch.group(1), launch.group(2)
 KERNEL_PROTO_VERSION = 4
 """The `MosaicGpuKernelProto` version jaxlib serializes (mosaic/gpu/custom_call.cc), which it alone reads."""
 MOSAIC_TARGET = b"mosaic_gpu_v2"
@@ -2257,9 +2256,8 @@ def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = Fal
     decreased, raised = (None, None) if listing is None else reconfigured(listing)
     sass = (None if listing is None else sass_findings_of(listing)) if decoded else ()
     uses_tmem = None if listing is None else _uses_tmem(listing)
-    matched = LAUNCH_SUFFIX.search(function)
-    index = matched.group(2) if matched is not None else None
-    return Binary(*kernel_of(function), stated[REGISTER_COUNT], frame, kind=kind, sass=sass,
+    kernel, launch, index = kernel_of(function)
+    return Binary(kernel, launch, stated[REGISTER_COUNT], frame, kind=kind, sass=sass,
                   spilled_in=(None if listing is None else spilled_roles(listing)) if frame else (),
                   threads=stated.get(MAX_THREADS), decreased=decreased, raised=raised,
                   uses_tmem=uses_tmem, index=index)

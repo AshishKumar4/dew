@@ -140,10 +140,12 @@ def test_a_triton_template_binary_in_compile_mosaic_kernels_reports_shared_regis
     and mark TMEM unread when `uses_tmem` is True or None."""
     import dataclasses
 
-    assert report.kernel_of("probe__l0123456789__1") == ("probe", "0123456789")
-    assert report.kernel_of("probe__1__l0123456789") == ("probe__1", "0123456789")
-    assert report.launch_name("probe", "0123456789", "1") == "probe__l0123456789__1"
-    assert report.launch_name("probe__1", "0123456789") == "probe__1__l0123456789"
+    assert report.kernel_of("probe") == ("probe", None, None)
+    assert report.kernel_of("probe__l0123456789") == ("probe", "0123456789", None)
+    assert report.kernel_of("probe__l0123456789__1") == ("probe", "0123456789", "1")
+    assert report.kernel_of("probe__1__l0123456789") == ("probe__1", "0123456789", None)
+    for name in ("probe", "probe__l0123456789", "probe__l0123456789__1", "probe__1__l0123456789"):
+        assert report.launch_name(*report.kernel_of(name)) == name
 
     clean = report.Binary("attention_forward", "0123456789", 64, 0, "triton",
                           shared=16384, sass=(), uses_tmem=False)
