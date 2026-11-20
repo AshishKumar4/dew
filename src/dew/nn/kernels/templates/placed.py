@@ -127,10 +127,9 @@ class Tcgen05Placed(Tcgen05Rings):
         """Whether this launch places its sums' rescales on a dedicated `CORRECTION` warpgroup (rows 5368,
         9788): derived from the launch's facts (`consumers == 1` and rounded TMEM allocation already capping
         residency to 1 CTA/SM against `tmem_limit`, so joining `CORRECTION` costs zero residency)."""
-        allocated = resources.tensor_memory_allocated(tmem_columns)
-        return (self.rescales_kept and consumers == 1 and tmem_limit > 0 and allocated > 0
-                and tmem_limit // allocated <= 1)
-
+        if not (self.rescales_kept and consumers == 1 and 0 < tmem_columns <= tmem_limit):
+            return False
+        return tmem_limit // resources.tensor_memory_allocated(tmem_columns) <= 1
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
                     walk: Callable[..., R], *, between=None, counted=0) -> R:
         # Its consumer reads no ring (its issuer does): no step it passes.

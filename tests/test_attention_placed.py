@@ -424,6 +424,8 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
         assert block_copies(tail_traced) == expected_blocks
     # Row 9788: CORRECTION is derived from TMEM-capped residency (192 cols -> 352 TMEM -> 512 rounded = 1
     # CTA/SM joins CORRECTION; 128 cols -> 256 TMEM -> 2 CTAs/SM does not).
+    from dew.nn.kernels.templates import placed
+
     v192 = jnp.ones((1, 256, 1, 192), jnp.float16)
     op_192 = attention_mosaic.MosaicForward(scale=64 ** -0.5, keys=256, form="full", natural=True)
     ba_192 = op_192.bind(q64, k64, v192, None, None, None, None, (), (), None,
@@ -432,7 +434,6 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
         assert op_192.joined_roles(ba_192, dataclasses.replace(ROWS_TILES, columns=192), target) == (
             (placed.CORRECTION, 1),)
         assert op_192.joined_roles(ba_192, dataclasses.replace(ROWS_TILES, columns=128), target) == ()
-
     # Rank-only `proposes` must short-circuit before calling `held` (row 9477).
     bwd = attention_mosaic.MosaicBackward(scale=128 ** -0.5, keys=256, form="full")
     called = False
