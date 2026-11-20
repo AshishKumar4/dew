@@ -170,6 +170,10 @@ FOREIGN |= {"dew.quantization": ("dew.training",),
             **dict.fromkeys(("dew.inputs.condition", "dew.inputs.diffusion", "dew.inputs.encoders",
                              "dew.inputs.spec"), ("dew.interop",))}
 
+# An activation's every user (a schedule's flow among them) loads no kernel until it asks a fused product
+# (`dew.nn.activations.gated_product`), so a toolkit edit re-keys none of its tests (row 6740's cache warmth).
+FOREIGN |= {"dew.nn.activations": ("dew.nn.kernels",)}
+
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))
 def test_a_module_imports_its_own_domain_alone(module):
