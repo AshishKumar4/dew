@@ -57,6 +57,7 @@ from dew.nn.inputs import (
     intersected_runs,
 )
 from dew.nn.inspection import QK
+from dew.nn.joined import side_by_side
 from dew.nn.kernels.selection import select
 from dew.nn.kernels.templates import attention as template
 from dew.nn.kv_cache import (
@@ -1058,17 +1059,23 @@ class CausalSelfAttention(nn.Module):
         which the reference marks "unlike olmo, only on the head dim" (modeling_qwen3_moe.py:147)."""
         return self.ctx.qk_norm and self.ctx.qk_norm_scope == 'projection'
 
-    def _query(self, x):
+    def _query(self, x, keys: bool = True):
         """The query heads of `x` `[B, S, E]`, `[B, S, heads, head_dim]`, normed as the layer norms
         them and column-parallel under a tensor axis (each shard a run of whole heads); the output gate
-        where it gates, else None; and the keys and values `qkv_proj` packs beside the query, else
-        None. The projections carry the names a remat policy saves or offloads
+        where it gates, else None; and the keys and values projected with the query, else None: those
+        `qkv_proj` packs beside it, or, where `keys` asks for them, its own three projections' side by
+        side (`joined.side_by_side`: one launch, their input gradient chained, where its selector takes
+        them). The projections carry the names a remat policy saves or offloads
         (residuals.RESIDUALS)."""
         B, S, _ = x.shape
         projected_kv = None
         group = self._group()
         if group is not None and self._packed():
             projected, key, value = group.split(self.qkv_proj(x))
+            projected_kv = (key, value)
+        elif keys and group is not None and (
+                plan := side_by_side((self.q_proj, self.k_proj, self.v_proj), x)) is not None:
+            projected, key, value = plan()
             projected_kv = (key, value)
         else:
             projected = self.q_proj(x)
@@ -1108,7 +1115,7 @@ class CausalSelfAttention(nn.Module):
         projected and normed as its own call does them, scaled to the logit scale its checkpoint asks
         for, and placed nowhere: a context has no positions to rotate by, nor a temperature a place
         tunes. With the output gate, None where it gates none."""
-        query, gate, _ = self._query(x)
+        query, gate, _ = self._query(x, keys=False)
         if self.qk_norm_after_rotary:
             # Normed where a rotation would have turned it, before its scale, as the layer's own call.
             query = self.q_norm(query, axes=HEADS)

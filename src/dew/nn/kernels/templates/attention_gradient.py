@@ -268,14 +268,26 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
 
     def centred(others: jax.Array, unit) -> tuple[jax.Array, jax.Array, jax.Array]:
         # D's centre and numerators about it and about 0, each term in the units `unit` of `others`, the
-        # anchor's value taken to them before its product with dO (after it, 2^-126 times 2^-40 rounded to 0
-        # before a power of 2^53, the base review of 6a57b66de, F1).
+        # anchor's product scaled on whichever factor cannot overflow `unit` (row 9096: 2^80 * 2^53 -> inf
+        # before a zero or tiny dO, while 2^-126 * 2^-40 rounded to 0 before 2^53, 6a57b66de F1).
         own_held, others_held = own * over * unit, others_total * over * unit
-        held_value = anchor_value if isinstance(unit, float) else anchor_value * expand(unit, anchor_value)
-        anchor = rows(held_value, cotangent)
-        about_zero = rows(read(split_output(others, own_held, anchor_value), cotangent), cotangent)
-        off_anchor = others - expand(others_held, anchor_value) * anchor_value
-        return anchor, rows(read(off_anchor, cotangent), cotangent) - state_weight * anchor, about_zero
+        if isinstance(unit, float):
+            anchor = rows(read(anchor_value, cotangent), cotangent)
+        else:
+            scale = expand(unit, anchor_value)
+            small = jnp.abs(anchor_value) < 1.0
+            lhs = jnp.where(small, anchor_value * scale, anchor_value)
+            rhs = jnp.where(small, cotangent, cotangent * scale)
+            anchor = rows(read(lhs, rhs), rhs)
+        others_dot = rows(read(others, cotangent), cotangent)
+        about_zero_combined = rows(read(split_output(others, own_held, anchor_value), cotangent), cotangent)
+        about_zero = jnp.where(finite(about_zero_combined), about_zero_combined,
+                               others_dot + (own * over) * anchor)
+        off_anchor_combined = rows(
+            read(others - expand(others_held, anchor_value) * anchor_value, cotangent), cotangent)
+        off_anchor = jnp.where(finite(off_anchor_combined), off_anchor_combined,
+                               others_dot - (others_total * over) * anchor)
+        return anchor, off_anchor - state_weight * anchor, about_zero
 
     if dropped == 1.0:
         return nearer_centre(*centred(mean, 1.0), key_index)

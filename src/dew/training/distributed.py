@@ -452,6 +452,11 @@ def _held_leaves(tree) -> list:
     return jax.tree.leaves(tree, is_leaf=lambda leaf: leaf is None)
 
 
+START_PROGRAM = "joined"
+"""The name a fresh state's start program traces and compiles under (`start_program`), by which a plan's
+seconds tell its work from the step's (`dew.training.ahead.AheadOfTime.planned_parts`' `start`)."""
+
+
 def start_program[Held, Result](function: Callable[[Held, jax.Array], Result], shardings: Placements,
                                 like: Held) -> OuterProgram:
     """The program `taking_over` runs, over the held tree's two trees as their leaves (`_held_leaves`) and
@@ -464,6 +469,8 @@ def start_program[Held, Result](function: Callable[[Held, jax.Array], Result], s
     def joined(taken: list, kept: list, key: jax.Array) -> Result:
         return function(jax.tree.unflatten(structure, [other if one is None else one
                                                        for one, other in zip(taken, kept, strict=True)]), key)
+
+    assert joined.__name__ == START_PROGRAM
 
     return owned_program(joined, out_shardings=shardings, donate_argnums=0)
 

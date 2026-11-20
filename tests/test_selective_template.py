@@ -143,20 +143,23 @@ def test_a_rate_past_float32s_range_scans_as_the_recurrence_interpreted(case):
 
 
 @pytest.mark.parametrize("case", ("normal step", "zero step", "skip cancelling",
-                                  "subnormal skip cancelling"))
+                                  "subnormal skip cancelling", "subnormal step",
+                                  "decaying skip cancelling"))
 def test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted(case):
     """Large `B` across four states on a selector-supported shape (`length=32`, `states=4`) through the
     public `recurrence_chunk.selective_scan` route (`mosaic_gpu`) with normal (`2^-4`), zero (`0.0`),
-    skip-cancelling (`dt = 1`, `D = -2^127`), or subnormal skip-cancelling (`dt = 2^-110`, `D = -2^-10`,
-    `B = (2^100, 2^70)`) steps: its output, final state and every input's gradient on par from float64 with
-    `selective_support.stepwise` (check 1; row 8722, base reviews b9f004f74 F7, da734bf54 F3)."""
-    cases = ("normal step", "zero step", "skip cancelling", "subnormal skip cancelling")
+    skip-cancelling (`dt = 1`, `D = -2^127`, `A = 0` or `-3`), subnormal skip-cancelling (`dt = 2^-110`,
+    `D = -2^-10`, `B = (2^100, 2^71)`), or subnormal (`dt = 2^-130`, `B = (2^120, 0)`) steps: its output,
+    final state and every input's gradient on par from float64 with an independent range-safe reference
+    (check 1; rows 8722, 9072, 9089, base reviews b9f004f74 F7, da734bf54 F3, c486fe8d7 F1)."""
+    cases = ("normal step", "zero step", "skip cancelling", "subnormal skip cancelling", "subnormal step",
+             "decaying skip cancelling")
 
     def draw(seed):
         rng = np.random.default_rng([8722, seed, cases.index(case)])
         length, channels, states = 32, 128, 4
         x = np.zeros((1, length, channels), np.float32)
-        a = np.zeros((channels, states), np.float32)
+        a = np.full((channels, states), -3.0 if case == "decaying skip cancelling" else 0.0, np.float32)
         scale = rng.uniform(0.5, 1.0, (1, length, 2)).astype(np.float32)
         b = np.zeros((1, length, states), np.float32)
         b[:, :, :2] = (2.0 ** 127) * scale
@@ -169,17 +172,23 @@ def test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted(
         elif case == "zero step":
             dt = np.zeros((1, length, channels), np.float32)
             skip = np.zeros((channels,), np.float32)
-        elif case == "skip cancelling":
+        elif case in ("skip cancelling", "decaying skip cancelling"):
             factor = np.float32(rng.uniform(0.5, 1.0))
             dt = np.ones((1, length, channels), np.float32)
             skip = np.full((channels,), -(2.0 ** 127) * factor, np.float32)
             b[:, :, :2] = (2.0 ** 127) * factor
+        elif case == "subnormal step":
+            factor = np.float32(rng.uniform(0.5, 1.0))
+            dt = np.full((1, length, channels), 2.0 ** -130, np.float32)
+            skip = np.zeros((channels,), np.float32)
+            b[:, :, 0] = (2.0 ** 120) * factor
+            b[:, :, 1] = 0.0
         else:
             factor = np.float32(rng.uniform(0.5, 1.0))
             dt = np.full((1, length, channels), 2.0 ** -110, np.float32)
             skip = np.full((channels,), -(2.0 ** -10) * factor, np.float32)
             b[:, :, 0] = (2.0 ** 100) * factor
-            b[:, :, 1] = (2.0 ** 70) * factor
+            b[:, :, 1] = (2.0 ** 71) * factor
         dy = np.zeros((1, length, channels), np.float32)
         dy[:, -1, :] = 1.0
         dfinal = np.zeros((1, channels, states), np.float32)
@@ -191,7 +200,13 @@ def test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted(
             return recurrence_chunk.selective_scan(*operands, None, portable=portable)
 
     exact = jax.jit(with_gradients(stepwise))
-    assert_as_exact(jax.jit(with_gradients(routed)), exact, draw,
+
+    def range_safe(*operands):
+        with jax.enable_x64(new_val=True):
+            out = exact(*jax.tree.map(lambda arr: arr.astype(jnp.float64), operands))
+        return jax.tree.map(lambda arr: arr.astype(jnp.float32), out)
+    reference = range_safe if case in ("subnormal skip cancelling", "subnormal step") else exact
+    assert_as_exact(jax.jit(with_gradients(routed)), reference, draw,
                     f"the selective template at large B, {case}", seeds=FEWEST_SEEDS, truth_fn=exact)
 
 

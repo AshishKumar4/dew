@@ -36,8 +36,8 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.typing import DTypeLike
 
 from dew.nn import derivatives
+from dew.nn.aligned import aligned_cotangents
 from dew.nn.kernels import launches
-from dew.nn.precision import aligned_sum
 
 from ..precision import exact_float32
 from . import generation
@@ -394,17 +394,20 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_re
 
             @pl.when(load >= jnp.int32(0))
             def _():
+                from dew.nn.kernels.chunked_launch import entry_terms
+
                 key, value, weight = (ref[document] for ref in entries)
                 dkey, dvalue, dweight = gradients
-                # Each term's gradients, its key row's, its value column's and the weight's, each a sum of
-                # three-factor products summed aligned to the largest (`precision.aligned_sum`).
-                rows = range(key.shape[0])
-                dkey[document] = dkey[document] + jnp.concatenate(
-                    [aligned_sum([(weight, value[:, r:r + 1], dmemory)], axis=0) for r in rows], axis=0)
-                dvalue[document] = dvalue[document] + jnp.concatenate(
-                    [aligned_sum([(weight, key[r:r + 1, :], dmemory)], axis=1) for r in rows], axis=1)
-                dweight[document] = dweight[document] + aligned_sum(
-                    [(value[:, r:r + 1], key[r:r + 1, :], dmemory) for r in rows], axis=(0, 1))
+                # The entry write's transpose in its own layout (`entry_terms`), each distinct factor's
+                # cotangent in order of first appearance (`aligned_cotangents`): the shared weight's one, its
+                # terms' products summed aligned before they round (each term's rounded apart, two past
+                # fp32's largest that cancel gave inf - inf), then each term's value column's and key row's.
+                # A write of rank zero, none: its gradients none, its weight's zero (row 8967).
+                if terms := entry_terms(key, value, weight, values_first=True):
+                    weighed, *factors = aligned_cotangents(terms, dmemory)
+                    dkey[document] = dkey[document] + jnp.concatenate(factors[1::2], axis=0)
+                    dvalue[document] = dvalue[document] + jnp.concatenate(factors[0::2], axis=1)
+                    dweight[document] = dweight[document] + weighed
         return (jnp.where(inside, dx + wx, dx), jnp.where(inside, db + wb, db),
                 jnp.where(inside, dc + wc, dc), jnp.where(within, da + wa, da),
                 jnp.where(load < jnp.int32(0), dmemory, dprev))

@@ -70,7 +70,7 @@ from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, owned_program, shapes_of
 from dew.nn.kernels.templates import report
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import Link, Schedule, boxed, tracing
+from dew.nn.sharding import Link, Schedule, boxed, explicit_placement, tracing
 from dew.objectives.base import (
     Aux,
     Held,
@@ -911,8 +911,8 @@ class Trainer(Generic[Loss, Effects]):
             return model_batch(batch)
         traced, shapes = jax.make_jaxpr(self._model_batch, return_shape=True)(batch)
         return jax.tree.map(lambda aval: jax.ShapeDtypeStruct(
-            aval.shape, aval.dtype, sharding=aval.sharding if aval.sharding.mesh.explicit_axes else None,
-            weak_type=aval.weak_type), jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
+            aval.shape, aval.dtype, sharding=explicit_placement(aval), weak_type=aval.weak_type),
+            jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals))
 
     def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1, *,
                     objective: Objective[Loss, Effects]):

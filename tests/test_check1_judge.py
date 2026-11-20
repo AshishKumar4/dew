@@ -120,6 +120,32 @@ def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whol
         as_test("one_site", halved, pool=str(tmp_path / "pythons"))
 
 
+def test_a_pool_of_map_tasks_on_two_host_classes_is_refused(tmp_path, monkeypatch):
+    """A site's map tasks each record the host class they ran on (`map_judge.host_class`): one class's pool
+    is judged, and a pool of two (train 1089's image SFT site: 165 map tasks on one CPU class, 7 on another,
+    whose unweighed judge escalated on their difference) is refused (`PoolRefused`), naming them, never
+    judged."""
+    import os
+
+    import reference_error
+    from check1_wire import DRAWS
+    from map_judge import PoolRefused
+
+    def on(classes):
+        def site():
+            span = os.environ.get(DRAWS)
+            if span is not None:
+                monkeypatch.setattr(reference_error, "host_class", lambda: classes[span], raising=False)
+            assert_as_exact(jnp.matmul, jnp.matmul, a_product_draw, "a product", seeds=16)
+        return site
+
+    sharded_site(monkeypatch, tmp_path / "one class", [(0, 40), (40, 80)],
+                 on({"0:40": "AuthenticAMD-25-17", "40:80": "AuthenticAMD-25-17"}))
+    with pytest.raises(PoolRefused):
+        sharded_site(monkeypatch, tmp_path / "two classes", [(0, 40), (40, 80)],
+                     on({"0:40": "AuthenticAMD-25-17", "40:80": "AuthenticAMD-26-17"}))
+
+
 def test_a_record_holding_fewer_draws_than_its_seeds_is_refused(tmp_path, monkeypatch):
     """A map task's record of a site's seeds 0 to 80 whose draws hold one seed (a record cut short) is
     refused by its judge (`PoolRefused`, no unit held before it), never judged as the seeds it names: one

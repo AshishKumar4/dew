@@ -40,6 +40,7 @@ from dew.nn.kernels.templates import (
     mosaic,
     operands,
     outputs,
+    placed as placed_mod,
     product,
     resources,
     rings,
@@ -480,7 +481,9 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
     paged, sources, parts = walk.paged, walk.sources, walk.parts
     walks = None if flags is None else flags
     blocks = _column_blocks(v, hooked, at.columns)
-    split = len(blocks) > 1 and hooks.output_mod is not None
+    plan = forward_block_plan(v.shape[-1], at.columns, out_dtype, has_output_mod=hooks.output_mod is not None,
+                              training=False)
+    split = plan.split
     # A scaled launch's keys' magnitudes the call's (`_largest`) but a cache walk's, which its value slots
     # give (a masked or paged walk's, or one over a cache's rows or codes, whose rows its views gather).
     if form.headroom and not walk.masked and paged is None and sources is None and hooked.scales is None:
@@ -500,7 +503,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         decides=walk.decides, tmem_columns=walk.tmem_columns,
                         products=block_products,
                         table=paged, sources=sources,
-                        out_dtype=jnp.float32 if split else out_dtype, walks=walks,
+                        out_dtype=plan.out_dtype, walks=walks,
                         shared_by=len(blocks),
                         column_width=(values.shape[-1] if into is not None and first is not None
                                       else None), flags=stated and len(blocks) == 1, **in_place)
@@ -524,18 +527,38 @@ def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, spli
     """The inference walk's outputs from its launches' (`_inference_walk`'s `finished`), unpadded to the
     call's `queries` and value `width`: the output, and with `rows` its finished maxima and denominators, an
     anchor key of none and the output as the split sums. A split launch's are its slices along the query
-    axis (`_launch`'s `splits`): `[B, S, Q, H, Dv]`, its rows `[B, H, S, Q]`, each slice's maxima and
-    denominators its own, which XLA merges (`attention_decode`)."""
+    axis (`_launch`'s `splits`) as its launch wrote them, padded: `[B, S, Qp, H, Dvp]`, and its maxima and
+    denominators stacked, `[2, B, H, S, Qp]`, each slice's its own, which its caller merges where they lie
+    (`merged.merged_split`)."""
     out, *rows_of = walked
     if splits > 1:
-        out = out.reshape(out.shape[0], splits, -1, *out.shape[2:])[:, :, :queries, :, :width]
-        maximum, total = (array.reshape(*array.shape[:2], splits, -1)[..., :queries] for array in rows_of[0])
-        return out, maximum, total
+        stacked = rows_of[0]
+        return (out.reshape(out.shape[0], splits, -1, *out.shape[2:]),
+                stacked.reshape(*stacked.shape[:3], splits, -1))
     out = out[:, :queries, :, :width]
     if not rows:
         return out
     maximum, total = (array[:, :, :queries] for array in rows_of[0])
     return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
+
+
+class BlockPlan(NamedTuple):
+    """How a forward value-column block runs (`forward_block_plan`): whether an inference call splits its
+    output hook into XLA past the block launches (`split`), the block launch's `out_dtype`, and whether an
+    output hook runs inside the kernel (`output_hook`). Shared by legality, residency, and emission
+    (row 9542)."""
+    split: bool
+    out_dtype: object
+    output_hook: bool
+
+
+def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
+                       training: bool) -> BlockPlan:
+    """Derive hook placement and block `out_dtype` from the call's value-column partition (`value_columns`):
+    an inference call whose columns split into multiple blocks runs its `output_mod` in XLA past the launches
+    and emits fp32 per block (row 9542)."""
+    split = not training and has_output_mod and value_columns(total_v, columns) < total_v
+    return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split)
 
 
 def column_slices(total: int, columns: int | None, *, whole: bool = True) -> list[tuple[int | None, int]]:
@@ -1954,7 +1977,8 @@ def declared(ahead: bool, *, peaks: bool = False) -> tuple[mosaic.Product, ...]:
 
 def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks, *, group: int,
                  page: int | None, batch: int, queries: int, kinds: tuple, peaks: bool, training: bool,
-                 finishes: bool, certified: bool, interpret: bool, value_width: int) -> Callable:
+                 finishes: bool, certified: bool, interpret: bool, value_width: int,
+                 joined: tuple = ()) -> Callable:
     """`_launched`'s kernel body: its rings opened, each consumer's walk over its query block and the
     producer's loads, the roles scheduled as its family runs them."""
     family, tiles, parts = program.family, program.tiles, program.parts
@@ -2018,9 +2042,8 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
 
         # Each role forms what it reads (`_placed`), one switch's branch (`exclusive`).
         family.scheduled(consumers, _per_role(family, consumers, consumer), producer, exclusive=True,
-                         issuer=_issuer(program, streams, refs, placed))
-
-
+                         issuer=_issuer(program, streams, refs, placed),
+                         joined=_correction(program, placed, value_width, joined))
     return body
 
 
@@ -2079,9 +2102,10 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                      relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None,
                      bool(after), decides)
 
+    joined = placed_mod.correction_roles(family, consumers, value_width)
     body = _launch_body(program, layout, spec, hooks, group=group, page=page, batch=batch, queries=queries,
                         kinds=kinds, peaks=peaks, training=training, finishes=finishes, certified=certified,
-                        interpret=interpret, value_width=value_width)
+                        interpret=interpret, value_width=value_width, joined=joined)
 
     products = (products if products is not None else
                 forward_products(family, tiles, value_width, query.dtype, peaks=peaks, parts=parts,
@@ -2095,7 +2119,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     grid = (heads, queries // pair * splits, batch)
     reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
-                       magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None)
+                       magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None,
+                       joined=joined)
     reduces = forward_reduces(family, reduced)
     tmem = family.product_columns(products) if scopes_products(family) else 0
     shared = (resources.shared_bytes(family, launch_scope(family, (scoped, rings, after), reduced,
@@ -2107,8 +2132,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                          interpret=interpret,
                          approx_math=spec.approximate, name=name, cost=cost, model_flops=model,
                          registers=registers, shared=shared, tmem=tmem, reducing_warpgroups=reduced,
-                         reduces=reduces)(query, key, value, *leaves)
-
+                         reduces=reduces, joined=joined)(query, key, value, *leaves)
 
 def _per_role(family: mosaic.Family, consumers: int, consumer: Callable) -> Callable:
     """`consumer(index)` as `family`'s roles run it: each consumer built at its static role where its issuer
@@ -2139,6 +2163,18 @@ def _issuer(program: _Program, streams, refs, placed: Callable) -> Callable | No
                                          row)[:2] for consumer in served))
 
     return issuer
+
+
+def _correction(program: _Program, placed_at: Callable, value_width: int, joined: tuple) -> tuple:
+    """Bind `Tcgen05Placed.correcting` to the planned `joined` correction role tuple (row 5368)."""
+    family = program.family
+    if not joined or not isinstance(family, placed_mod.Tcgen05Placed):
+        return ()
+
+    def body(_index):
+        *_, (lo, hi) = placed_at()
+        family.correcting(lo, hi, value_width)
+    return tuple((role, count, body) for role, count in joined)
 
 
 def _written_refs(written: tuple, read: _Read) -> tuple:

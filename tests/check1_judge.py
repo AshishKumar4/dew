@@ -60,13 +60,16 @@ def _with_mode(findings: list, refused: str | None) -> list:
 @dataclasses.dataclass(frozen=True)
 class Verdict:
     """What a check-1 site's verdict reads beside its draws (`_verdicts`): its declared `seeds`, its
-    `labels` (the site's own, then one against each further reference, `also`, in its draws' order),
-    whether a `library` arm stands in for the reference on some leaves, and the site's weighed check
-    (`_deferred`) it `defers_to` where it stays undecided. A map task records it with its draws (`_recorded`),
-    and the judge reads that record (`judged_from_records`): one object, whichever process judges."""
+    `labels` (the site's own, then one against each further reference, `also`, then one against each of
+    those its accuracy claim holds as written, in its draws' order), the `powers` of check 1's factors each
+    is judged at (`_staged`'s: one, or WRITTEN as written), whether a `library` arm stands in for the
+    reference on some leaves, and the site's weighed check (`_deferred`) it `defers_to` where it stays
+    undecided. A map task records it with its draws (`_recorded`), and the judge reads that record
+    (`judged_from_records`): one object, whichever process judges."""
 
     seeds: int
     labels: tuple[str, ...]
+    powers: tuple[int, ...]
     library: bool
     defers_to: str | None = None
 
@@ -78,7 +81,8 @@ def _narrow(draws: _Draws) -> list[str]:
 
 def _verdicts(drawn_for, verdict: Verdict, narrow_leaves: list[str], mode: Callable[[], str | None]) -> None:
     """Each reference's check 1 over its draws (`_staged`, `drawn_for(index)` the draws against reference
-    `index`, judged under `verdict.labels[index]` over its declared seeds), each logged (STAGES_LOG) with
+    `index`, judged under `verdict.labels[index]` over its declared seeds, its factors to
+    `verdict.powers[index]`), each logged (STAGES_LOG) with
     whether its reference equalled the truth on every first-stage seed, unknown (None) for the first where a
     `library` arm's error stands in for its reference's on some leaves, and the arms' YNNPACK mode (`mode`,
     read once they have run); a GateFailure where any leaf is over, else an Inconclusive where any is left
@@ -86,10 +90,11 @@ def _verdicts(drawn_for, verdict: Verdict, narrow_leaves: list[str], mode: Calla
     reference is judged on its full range (`parity.needs_second_stage`), so a comparison that passed at the
     first stage beside one drawing the second has its added rows judged too (spec alignment, 9006)."""
     overs, unresolveds, seeds = [], [], verdict.seeds
-    further = any(needs_second_stage(drawn_for(index)(0, seeds), named)
+    further = any(needs_second_stage(drawn_for(index)(0, seeds), named, power=verdict.powers[index])
                   for index, named in enumerate(verdict.labels))
     for index, named in enumerate(verdict.labels):
-        over, unresolved, stage = _staged(drawn_for(index), seeds, named, further=further)
+        over, unresolved, stage = _staged(drawn_for(index), seeds, named, power=verdict.powers[index],
+                                          further=further)
         exact = (None if verdict.library and not index
                  else _exact(drawn_for(index)(0, seeds).theirs))
         _logged(named, stage, _verdict(over, unresolved), narrow_leaves, mode(), exact)
@@ -103,7 +108,8 @@ def _verdicts(drawn_for, verdict: Verdict, narrow_leaves: list[str], mode: Calla
 
 def _pooled_draws(label: str, references: int):
     """A judge's draws (`pooled_units`) and the YNNPACK mode its map tasks ran the arms in, which must be
-    one: `drawn_for(index)` over its map tasks' records of this site, `drawn(start, stop)` the pooled draws
+    one, as must the host class they ran on (`map_judge.host_class`) and, weighed, their classes' digest:
+    `drawn_for(index)` over its map tasks' records of this site, `drawn(start, stop)` the pooled draws
     of those seeds, refused past the seeds the records hold from seed 0 on."""
     pieces = pooled_units(label)
     held = pieces[-1][1]
@@ -115,6 +121,14 @@ def _pooled_draws(label: str, references: int):
     if len({payload.get("heavy") for _, _, payload in pieces}) > 1:
         raise PoolRefused(f"{label}: the map tasks weighed by different classes (`Conditioning.digest`)",
                           held)
+    # A verdict belongs to the host class whose arithmetic drew it: a pool of two pooled one class's draws
+    # into another's and escalated on their difference (train 1089's image SFT, 165 tasks on one class, 7 on
+    # another), weighed or not.
+    hosts = {payload.get("host") for _, _, payload in pieces}
+    if len(hosts) > 1:
+        raise PoolRefused(f"{label}: the map tasks ran on more than one host class, "
+                          f"{sorted(map(str, hosts))}; one verdict pools one class's draws "
+                          f"(`map_judge.host_class`)", held)
     if refused is not None:
         SWITCHED.append({"label": label, "refused": refused})
     for start, stop, payload in pieces:

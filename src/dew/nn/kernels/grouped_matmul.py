@@ -45,10 +45,10 @@ from .grouped_cells import (
     M_EM_52,
     M_EM_65,
     M_EM_67,
-    M_EM_73,
     MEASURED,
     NORMED_08B,
     NORMED_4B_8B,
+    TOGETHER,
     Kind,
     Made,
 )
@@ -1917,7 +1917,25 @@ CUTLASS = _launch_kernel(CutlassGmm.name, DECLARED_ONLY)
 """CUTLASS's launches, on their declared cells alone (`DECLARED_ONLY`)."""
 XLA = selection.Kernel[GroupedCase]('xla', (), generic=True)
 
+PRODUCTS_APART = selection.Kernel[GroupedCase](
+    APART.name, (_Need('single', lambda case: case.paired or case.kind.together, "the call is one product",
+                       row=INHERENT),), generic=True)
+"""A paired call's or products' in one launch: each product its own call (`APART`), the launches that take
+each its own."""
+
+
+def _grouped_preferred(case: GroupedCase) -> str | None:
+    """The kernel `GROUPED` prefers for `case`: products in one launch (`Kind.together`) each its own call
+    (`APART`), a policy, not a measurement, so its route claims none (base review 3f38bf20d F3: an
+    unmeasured apart declared as a receipt's cell reported a measured win), the template's where a receipt
+    timed it winning its declared cell alone (`DECLARED`, `grouped_cells.TOGETHER`; base review 9d013a4b9
+    F2); every other call none, the selector's own (base review 0991196fb F3)."""
+    return APART.name if case.kind.together else None
+
 DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {
+    **{(receipt.family, Kind(dense=True, made=receipt.made, together=True, matrix=matrix)): (
+        {MOSAIC.name: MOSAIC}[receipt.winner], receipt.evidence)
+       for receipt in TOGETHER for matrix in receipt.timed.matrices},
     **{(family, Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_65)
        for family in ('mma.sync', 'wgmma') for made in (Made.FORWARD, Made.KERNEL_GRADIENT)
        for matrix in NORMED_08B},
@@ -1945,7 +1963,6 @@ DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str
         (XLA, "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
         (XLA, "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
-    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, together=True)): (MOSAIC, M_EM_73),
     ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 9216))): (
         MOSAIC, f"{M_EM_36}: the template 0.866x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(9216, 2560))): (
@@ -1993,10 +2010,7 @@ call the template cannot run (its legality) takes the next route in `GROUPED`'s 
 this list."""
 
 GROUPED: selection.Op[GroupedCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
-    MOSAIC, TRITON, CUTLASS,
-    selection.Kernel[GroupedCase](APART.name, (_Need('single', lambda case: case.paired,
-                                                "the call is one product", row=INHERENT),), generic=True),
-    XLA), declared=DECLARED)
+    MOSAIC, TRITON, CUTLASS, PRODUCTS_APART, XLA), preferred=_grouped_preferred, declared=DECLARED)
 """The grouped selector, in a fixed order, the template first (owner, bible da64ae5): Mosaic GPU's launch
 where it takes the call, the TPU's launch on a TPU, Triton's where they refuse, else XLA's program, but a
 declared cell runs its old route (`DECLARED`); CUTLASS's launches on their declared cells and by name
@@ -2037,12 +2051,20 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
                                           for timed in MEASURED.get((family, made, formed), ()))
 
     formed = options['hooks'].prologue is not None and timed(formed=True)
-    # Products side by side or chained are one launch's, a cell of their own whatever their first matrix.
-    together = any(bound.arguments.get('beside') or bound.arguments.get('chained')
-                   for _, bound in call.bound.values())
+    # Products side by side or chained are one launch's, a cell of their own, keyed by their joined matrix
+    # where a receipt timed it (`TOGETHER`), whatever their first matrix's.
+    together = _together(call, matrix)
+    if together is not None:
+        # Of the arithmetic the receipt timed: its operands' dtype too (base review b68fc2382 F4: an fp16
+        # chain inherited the bf16 win).
+        arithmetic = (family, made, jnp.dtype(arguments[0].dtype).name)
+        timed_together = any(receipt.timed.holds(together, rows) for receipt in TOGETHER
+                             if (receipt.family, receipt.made, receipt.dtype) == arithmetic)
+        matrix_of = together if timed_together else None
+    else:
+        matrix_of = matrix if formed or timed(formed=False) else None
     kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered,
-                matrix=None if together or not (formed or timed(formed=False)) else matrix, formed=formed,
-                together=together)
+                matrix=matrix_of, formed=formed, together=together is not None)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
@@ -2050,6 +2072,22 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     paired = any(bound.arguments.get('paired') is not None or bound.arguments.get('beside')
                  or bound.arguments.get('chained') for _, bound in call.bound.values())
     return GroupedCase(placed, whole, product, call, kind, extents, paired=paired)
+
+
+def _together(call, matrix: tuple[int, int] | None) -> tuple | None:
+    """Where `call` is several products in one launch, their geometry as a receipt keys it (`TOGETHER`):
+    the launch's form (`beside`, matrices side by side; `chained`, products over joined depths), the first's
+    `matrix`'s shared extent (`_matrix_of`: `[in, out]`; 0 where it is no dense product's) and each product's
+    own width in the launch's order, the replay's widths reading them so (base review a1ad2b4ca F4: a sum
+    of widths aliased two products and three); else None."""
+    for _, bound in call.bound.values():
+        for form in ('beside', 'chained'):
+            others = bound.arguments.get(form) or ()
+            if others:
+                depth, width = matrix or (0, 0)
+                matrices = others if form == 'beside' else tuple(each for _, each in others)
+                return form, depth, (width, *(each.shape[-1] for each in matrices))
+    return None
 
 
 def _matrix_of(launches, arguments) -> tuple[int, int]:
@@ -2091,11 +2129,7 @@ def launched(launches, arguments, options, *, product: Product, whole: bool,
     route a caller's own selection of this call found unreported (a reverse pass's one launch for several
     products, `gemm._one_launch`): taken and reported as it is, the call selected once (row 8735)."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
-    if selected is None:
-        route = selection.select(GROUPED, case)
-    else:
-        route = selected
-        generation.reported((route,))
+    route = selection.select(GROUPED, case) if selected is None else generation.published(selected)
     if route.kernel in ('xla', APART.name):
         return None if route.kernel == 'xla' else APART
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)

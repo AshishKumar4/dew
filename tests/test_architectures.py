@@ -445,6 +445,9 @@ SHARDED_CELLS = [*THREE_D_UNET_CELLS, *UNET_CELLS, *HIERARCHICAL_MMDIT_CELLS, *Q
 UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell not in SHARDED_CELLS]
 
 
+# A selecting case's two cells share its compiled selection capture (`selections_forward`), one a process.
+@pytest.mark.shared_setup("selections_forward",
+                          by=r"causal_transformer\+(?:moe|deepseek_v2|llama4|gemma3n)(?=-)")
 @pytest.mark.parametrize(("case", "steps", "layout"), UNSHARDED_CELLS, ids=cell_ids(UNSHARDED_CELLS))
 def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """One device and a layout, 8x1 data parallelism (every parameter

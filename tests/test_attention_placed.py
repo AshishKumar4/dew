@@ -142,8 +142,10 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
     query = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     key = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
-    threads, arrivals = programs(_placed_forward(tiles, spans), query, key,
-                                 threads=tiles.consumers + 1, rare=False)
+    threads, arrivals = programs(
+        _placed_forward(tiles, spans), query, key,
+        threads=tiles.consumers + 1 + len(placed.correction_roles(placed.ROWS, tiles.consumers, width)),
+        rare=False)
     (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
     q_smem = _consumer_q_smem(threads, tiles.consumers)
     # Map each consumer-exclusive barrier name to its consumer index so each score MMA's `scored` arrival
@@ -252,6 +254,53 @@ def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
     assert explore(threads_e, arrivals_e) > 0
 
 
+@pytest.mark.parametrize("moves", [False, True], ids=["kept", "moved"])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_correction_warpgroup_at_d256_holds_protocol_in_every_interleaving(call, moves):
+    """Row 5368: at d256 on 1-consumer `tcgen05.rows`, the dedicated `CORRECTION` warpgroup rescales kept
+    sums in TMEM off the softmax warpgroup's critical path: every interleaving of consumer, correction, and
+    producer/issuer holds without deadlock or race over 5 steps (reusing both factor slots) and at 0- and
+    1-step reaches, both when rescales are skipped (`kept`) and taken (`moved`), and dropping a `factor_ready`
+    wait before reading `factors` is caught as a race."""
+    from ring_protocol import Violation, explore, programs
+
+    query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 320, 1, 256), jnp.bfloat16)
+    spans = template.spans(256, 320, 1, **CALLS[call])
+    threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key, threads=3, rare=moves)
+    consumer_writes = {e.at[0] for e in threads[0] if e.kind == "write" and e.at[0].startswith("smem")}
+    factor_reads = [e for e in threads[1] if e.kind == "read" and e.at[0] in consumer_writes]
+    assert factor_reads, "correction factor load must be traced"
+    assert explore(threads, arrivals) > 0
+    # Negative control: dropping the correction warpgroup's factor_ready waits lets the factor read race
+    # with the consumer's factor write.
+    factor_ready = next(e.at[0] for e in threads[1] if e.kind == "wait")
+    mutated = list(threads)
+    mutated[1] = [e for e in threads[1] if not (e.kind == "wait" and e.at[0] == factor_ready)]
+    with pytest.raises(Violation):
+        explore(mutated, arrivals)
+    if call == "full" and not moves:
+        q1, k1 = jnp.ones((1, 128, 1, 256), jnp.bfloat16), jnp.ones((1, 128, 1, 256), jnp.bfloat16)
+        for steps in (0, 1):
+            short = template.KeySpans(start=jnp.zeros((1, 128), jnp.int32),
+                                      end=jnp.full((1, 128), steps * 64, jnp.int32),
+                                      query_ids=None, key_ids=None, keys=128)
+            short_maps = {5: np.array([[0]], np.int32), 6: np.array([[steps]], np.int32),
+                          7: np.array([[0]], np.int32), 8: np.array([[steps]], np.int32)}
+            short_threads, short_arrivals = programs(_placed_forward(ROWS_TILES, short), q1, k1, threads=3,
+                                                     rare=False,
+                                                     known=lambda idx, _aval, m=short_maps: m.get(idx))
+            assert explore(short_threads, short_arrivals) > 0
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_correction_warpgroup_at_d256_holds_check_1_interpreted(call):
+    """Row 5368: 1-consumer d256 `tcgen05.rows` with the dedicated `CORRECTION` warpgroup holds check 1
+    against the reference under the interpreter (full and causal)."""
+    _check_forward(call, jnp.bfloat16, (1, 256, 2, 1), natural=False, interpret=True, width=256,
+                   value_width=256, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
+
+
 def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
     """Placed-forward derivation uses rounded TMEM and SMEM residency (`resources.register_model`) when
     deciding whether to place Q in TMEM, proved through the public `attention_mosaic.forward` route and its
@@ -343,6 +392,75 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
 
     assert bwd.proposes(ba, KEYS_TILES["fused"], target, held=boom) is True
     assert not called
+
+
+def test_split_output_hook_forward_plans_and_emits_fp32_block_smem_residency():
+    """Row 9542: an H100 FP16 forward with Q/K width 64, V width 128, a 64x64 one-consumer pin, 6 stages,
+    `columns=64`, and an `output_mod` splits the output hook into XLA past the launches and emits fp32 per
+    block (~121 KiB, across the 113 KiB two-CTA budget). Legality, residency, and emission derive from one
+    `forward_block_plan`, so both `op.resident` and the emitted `RegisterModel.most` are 1 (not 2)."""
+    from dew.nn.kernels.templates import report
+
+    target = generation.gpu_target("sm90")
+    spans = template.spans(128, 384, 1)
+    q = jnp.ones((1, 128, 1, 64), jnp.float16)
+    k = jnp.ones((1, 384, 1, 64), jnp.float16)
+    v = jnp.ones((1, 384, 1, 128), jnp.float16)
+    hooks = template.Hooks(output_mod=lambda o: o * 2.0)
+    pinned = attention_mosaic.Tiles(64, 64, 6, 1, family="wgmma", columns=64)
+    with generation.assumed("sm90"), _pinned(pinned):
+        op, args = attention_mosaic._forward_call(q, k, v, spans, hooks, scale=None, natural=True)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        assert op.staged_bytes(ba, pinned, target) > target.shared_limit // 2
+        assert op.resident(ba, pinned, target) == 1
+        traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
+            q, k, v, spans, hooks, natural=True, interpret=False))(q, k, v).jaxpr
+    emitted = [record.kernels[kernel]
+               for eq in programs.equations(traced)
+               if isinstance(name := eq.params.get("name"), str)
+               for kernel, launch in [report.kernel_of(name)[:2]]
+               if launch is not None and (record := report.traced(launch)) is not None
+               and kernel in record.kernels]
+    assert emitted and all(model.most == 1 for model in emitted), emitted
+
+    # Row 9526: BF16 H100 inference with dropout at 64x64 1-consumer WGMMA pushes scaled registers past 248,
+    # so `deciding` is False and its full-width natural rewalk stays legal (not rejected as deciding=True);
+    # `certified()` also emits the dropout-priced register count matching the planner.
+    drop = template.Dropout(jax.random.key_data(jax.random.key(0)),
+                            jnp.arange(1, dtype=jnp.int32), jnp.arange(4, dtype=jnp.int32), 0.1)
+    drop_hooks = template.Hooks(drop=drop)
+    q_bf = jnp.ones((1, 128, 4, 64), jnp.bfloat16)
+    k_bf = jnp.ones((1, 256, 2, 64), jnp.bfloat16)
+    drop_spans = template.spans(128, 256, 1)
+    one_wgmma = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")
+    with generation.assumed("sm90"):
+        op_bf, args_bf = attention_mosaic._forward_call(q_bf, k_bf, k_bf, drop_spans, drop_hooks,
+                                                        scale=None, natural=False)
+        ba_bf = op_bf.bind(*args_bf, residuals=template.Kept.NONE, interpret=False)
+        assert not op_bf.deciding(ba_bf, one_wgmma)
+        completed = op_bf.completed(ba_bf, one_wgmma)
+        assert completed.relaunch_k == 64 and completed.relaunch_columns is None
+        rewalk_bytes = op_bf.staged_bytes(ba_bf, completed.relaunch, target)
+        assert op_bf.legal(ba_bf, completed, dataclasses.replace(target, shared_limit=rewalk_bytes))
+        q_f16 = jnp.ones((1, 128, 4, 64), jnp.float16)
+        k_f16 = jnp.ones((1, 256, 2, 64), jnp.float16)
+        op_f16, args_f16 = attention_mosaic._forward_call(q_f16, k_f16, k_f16, drop_spans, drop_hooks,
+                                                          scale=None, natural=False)
+        ba_f16 = op_f16.bind(*args_f16, residuals=template.Kept.NONE, interpret=False)
+        cfg_f16 = op_f16.derived(ba_f16, target)
+        assert cfg_f16 is not None
+        planned_regs = op_f16.registers(ba_f16, cfg_f16)
+        with report.launching(op_f16, ba_f16, cfg_f16):
+            cert_traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.certified(
+                q, k, v, drop_spans, drop_hooks, interpret=False)[1])(q_f16, k_f16, k_f16).jaxpr
+    cert_models = [record.kernels[kernel]
+                   for eq in programs.equations(cert_traced)
+                   if isinstance(name := eq.params.get("name"), str)
+                   for kernel, launch in [report.kernel_of(name)[:2]]
+                   if launch is not None and (record := report.traced(launch)) is not None
+                   and kernel in record.kernels]
+    assert cert_models and all(model.registers == planned_regs for model in cert_models), (
+        planned_regs, cert_models)
 
 
 @INTERPRETS

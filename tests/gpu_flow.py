@@ -135,7 +135,7 @@ def _device() -> str:
     return jax.devices()[0].device_kind
 
 
-def _begun() -> frozenset[str] | None:
+def _tried() -> frozenset[str] | None:
     """The sites the store of a GPU tier part's prepare has tried to prepare
     (`truths_ahead.CompiledTruths.preparing`), read before a cell runs (`_deferred`); none outside one."""
     import tier_wire
@@ -146,25 +146,25 @@ def _begun() -> frozenset[str] | None:
 
 
 def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
-              begun: frozenset[str] | None) -> bool:
+              tried_before: frozenset[str] | None) -> bool:
     """Whether a cell that raised is deferred to its run (`run_cells`): in a GPU tier part's prepare
-    (`begun`, its store's sites tried before the cell, `_begun`), where nothing computes. A cell that tried
-    no site before it raised, or one its check's prepare did not finish whole (a trace or a compile that
-    raised, an arm's after its site's truths were written: `truths_ahead.CompiledTruths.preparing`),
-    computed past or failed within the programs its prepare holds, and is recorded deferred
-    (`truths_ahead.DEFERRED`, where it raised and why), its run computing and judging it with the flow's
-    other cells served by the store and naming the test unprepared (tests/conftest.py); one whose every site
-    it began its prepare finished, and then raised, checked what its prepare gives in their place (an
-    `ahead_arm`'s zeros: a later failure in its prepare judges nothing) and passes its prepare unrecorded,
-    its run judging it (row 8555: every such cell was named unprepared, falsely)."""
+    (`tried_before`, its store's sites tried before the cell, `_tried`), where nothing computes. A cell that
+    tried no site before it raised, or one its check's prepare did not finish whole (a trace or a compile that
+    raised, an arm's after its site's truths were written: `truths_ahead.CompiledTruths.preparing`), computed
+    past or failed within the programs its prepare holds, and is recorded deferred (`truths_ahead.DEFERRED`,
+    where it raised and why), its run computing and judging it with the flow's other cells served by the store
+    and naming the test unprepared (tests/conftest.py); one whose every site it began its prepare finished,
+    and then raised, checked what its prepare gives in their place (an `ahead_arm`'s zeros: a later failure in
+    its prepare judges nothing) and passes its prepare unrecorded, its run judging it (row 8555: every such
+    cell was named unprepared, falsely)."""
     import os
 
     import truths_ahead
 
-    if begun is None:
+    if tried_before is None:
         return False
     store = truths_ahead.COMPILED.get()
-    new = store.tried - begun
+    new = store.tried - tried_before
     if not new or not new <= store.done:
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {_raised(error)[:400]}",
@@ -194,7 +194,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 skipped.append(cell.label)
                 continue
             print(f"cell: {cell.label}", flush=True)
-            begun = _begun()
+            tried_before = _tried()
             running = RUNNING.set(cell.label)
             try:
                 cell.run()
@@ -206,7 +206,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 # `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end
                 # the flow: kept with its label, and raised with every other cell's after the last.
                 text, frames = _reported(error)
-                if _deferred(cell.label, error, frames, begun):
+                if _deferred(cell.label, error, frames, tried_before):
                     deferred += 1
                 else:
                     failed.append((cell.label, text, frames))

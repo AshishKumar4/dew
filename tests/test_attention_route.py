@@ -1341,7 +1341,7 @@ def test_backward_route_declines_and_runs_with_its_rounded_flag():
     row = jnp.zeros((1, 1, 64), jnp.float32)
     acc = jnp.zeros((1, 1, 64, 64), jnp.float32)
     residuals = (row, jnp.ones_like(row), jnp.zeros((1, 1, 64), jnp.int32),
-                 template.Split(acc, acc, jnp.ones_like(row), row))
+                 template.Split(acc, row, jnp.ones_like(row), row))
     with generation.assumed("sm90"):
         assert attention_mosaic.backward_declined(q, q, q, spans, template.Hooks(), q, residuals=residuals,
                                                   rounded=False) is None

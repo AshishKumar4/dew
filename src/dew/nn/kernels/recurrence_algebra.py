@@ -27,7 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn import derivatives
-from dew.nn.float_bits import TWO_FACTOR_REACH, exact_power2
+from dew.nn.float_bits import TWO_FACTOR_REACH, exact_power2, raised_exactly
 from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
@@ -1264,16 +1264,10 @@ def selective_token(states: list, decays: list, written, b: list) -> list:
     return [decay * state + written * b_n for state, decay, b_n in zip(states, decays, b, strict=True)]
 
 
-def pairwise_sum(terms, *, combine=operator.add):
-    """Sum `terms` (a sequence of values, or an array along its last axis) as an adjacent-pair balanced
-    tree with odd-tail carry, shared by `selective_read`, the portable Mamba scan, and decode (`step.py`,
-    base review da734bf54 F6)."""
-    if not isinstance(terms, (list, tuple)):
-        if terms.shape[-1] == 0:
-            return jnp.zeros(terms.shape[:-1], terms.dtype)
-        parts = [terms[..., i] for i in range(terms.shape[-1])]
-    else:
-        parts = list(terms)
+def pairwise_sum(terms: Sequence, *, combine=operator.add):
+    """Sum nonempty `terms` as an adjacent-pair balanced tree with odd-tail carry, shared by
+    `selective_read` and decode (`step.py`, base review da734bf54 F6, row 9080)."""
+    parts = list(terms)
     while len(parts) > 1:
         paired = [combine(x, y) for x, y in zip(parts[::2], parts[1::2], strict=False)]
         parts = [*paired, *parts[len(parts) // 2 * 2:]]
@@ -1294,15 +1288,16 @@ _SELECTIVE_DX_SCALE = 2.0 ** 64
 
 def selective_dx_scale(skip, dy, step):
     """Derive once per block `(dx_init, dx_step, inv_scale)` for a selective scan backward's `dx` state sum:
-    on subnormal-step lanes (`|step| < 2^-100`) whose `skip * dy` fits below `2^60`, scale both `skip * dy`
-    and `step` by `2^64` (exact exponent shift) and return `inv_scale = 2^-64`; otherwise return
-    `(skip * dy, step, 1.0)` (row 8722, base reviews da734bf54 F3, b65e3cab4 F8, b0601005b F6)."""
+    on subnormal-step lanes (`|step| < 2^-100`) whose `skip * dy` fits below `2^60`, lift both `skip * dy`
+    and `step` by `2^64` via `float_bits.raised_exactly` (bit-safe on flush-to-zero backends, row 9089) and
+    return `inv_scale = 2^-64`; otherwise return `(skip * dy, step, 1.0)` (row 8722, base reviews da734bf54
+    F3, b65e3cab4 F8, b0601005b F6)."""
     base = skip * dy
     scaled = ((jnp.abs(step) < jnp.float32(_SELECTIVE_SUBNORMAL_STEP))
               & (jnp.abs(base) < jnp.float32(2.0 ** 60)))
-    scale = jnp.float32(_SELECTIVE_DX_SCALE)
-    return (jnp.where(scaled, base * scale, base),
-            jnp.where(scaled, step * scale, step),
+    shift = jnp.where(scaled, jnp.int32(64), jnp.int32(0))
+    return (raised_exactly(base, shift),
+            raised_exactly(step, shift),
             jnp.where(scaled, jnp.float32(1.0 / _SELECTIVE_DX_SCALE), jnp.float32(1.0)))
 
 
