@@ -497,11 +497,12 @@ def _merges(call: Call) -> tuple:
 
 def _merged(call: Call) -> Operand:
     """The form the doubling's merges take the inverse and its power in (`_merges`): an fp32 call's; a
-    `ranged` 16-bit call's fp32 in its fast forms' parts (`_fast_parts`), fp32's range at TF32's precision or
-    past it; else one fp16 part."""
+    `ranged` or `bfloat16` 16-bit call's fp32 in its fast forms' parts (`_fast_parts`), fp32's range at
+    TF32's precision or past it (fp16 underflows tiny write gates below 2^-24, zeroing a bf16 chunk inverse
+    under faint cross terms, row 8569); else one fp16 part."""
     if call.held.dtype == jnp.float32:
         return call.held
-    if call.ranged:
+    if call.ranged or call.held.dtype == jnp.bfloat16:
         return Operand(call.rows, _fast_parts(call.family), jnp.dtype(jnp.float32))
     return Operand(call.rows, 1, jnp.dtype(jnp.float16))
 
@@ -1040,7 +1041,7 @@ def _solved_resources(call: Call, *, keeps: bool, applies: bool, narrow: bool) -
     held = dataclasses.replace(call.held, rows=call.rows)
     # The keys' products and the inverse's doubling, then the inverse against each key and value block.
     model = (2 * chunk * chunk * width + _inverse_flops(chunk)
-             + 2 * chunk * chunk * (width + value_width))
+             + (2 * chunk * chunk * (width + value_width) if applies else 0))
     # The keys' products' sum and the system's pairs; then the doubling's inverse, power and product, beside
     # the masks (an fp32 call's merges split the inverse and the power into their parts); then the inverse
     # held beside a block's product, its decay and its keys or values.
@@ -1172,16 +1173,20 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
                            | vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
                            stages=1, live=chunk_liveness(7), steps=1, model=model, held=held_tiles,
                            staging=staging, landing=landing,
-                           persistent=True, reduces=False)(k, v, hi, lo, beta, hi, lo, taken)
+                           persistent=not (family.operands_in_registers
+                                           and _merged(call).dtype == jnp.float32),
+                           reduces=False)(k, v, hi, lo, beta, hi, lo, taken)
     return solved if keeps else (None, *solved)
 
 
 def _solves_apart(call: Call) -> bool:
     """Whether a decay a head's solve leaves its inverse's application to `_weighted`: where the doubling's
-    merges take parts (`_merged`). Beside the application's tiles the solve spilled 1168 bytes a thread in
-    an fp32 call's two parts and 196 in a ranged bf16 call's on an H100 (fast32-sm90 at 09bfe984c,
-    Qwen3.5-27B's gated delta net)."""
-    return _merged(call).parts > 1
+    merges take multiple fp32 parts (`_merged`, bf16 parts on wgmma) or fp32 TF32 on `mma.sync`
+    (`Family.operands_in_registers`). Beside the application's tiles the solve spilled on H100
+    (fast32-sm90 at 09bfe984c) and exceeded 99 KB SMEM on consumer mma.sync GPUs (sm86/sm89/sm120, row 8569),
+    while 1-part TF32 on `tcgen05` (B200) stays fused and spill-free."""
+    merged = _merged(call)
+    return merged.parts > 1 or (call.family.operands_in_registers and merged.dtype == jnp.float32)
 
 
 def whole_blocks(width: int, block: int) -> list[int]:

@@ -2211,32 +2211,20 @@ a zero-row share staged anyway writes a buffer another tile's store may still re
 store before a tile's first: base review 68e1f210f F3)."""
 
 
-@pytest.mark.parametrize("staging", [stores.staged_chunks, stores.staged], ids=["skipped", "staged"])
-def test_a_share_storing_no_rows_stages_no_chunk_between_stored_tiles(staging):
+def test_a_share_storing_no_rows_stages_no_chunk_between_stored_tiles():
     """Three tiles of an output staged through two chunk buffers at the derived waits, the second tile's share
     storing no rows (`SKIPPED`), under the GPU interpreter's race detection: `stores.staged_chunks` stages
-    nothing for it, so each buffer is rewritten once its last store has read it and the output holds the
-    first and third tiles' values. Staged anyway (`stores.staged`, its chunks written but no copy issued),
-    a wait counts a group it never issued and a buffer is rewritten under the first tile's store, which the
-    detector names (base review 5b513e9af F1)."""
-    from jax._src.pallas.mosaic_gpu.interpret.interpret_pallas_call import reset_gpu_interpret_mode_state
-
+    nothing for it, no race is named and the output holds the first and third tiles' values. The race a
+    zero-row share staged anyway makes is the protocol checker's, which counts store groups (the next
+    test; base review 5028c8148 F2)."""
     rows, width, _ = STAGED
     chunks = len(SKIPPED_WAITS)
     assert SKIPPED_WAITS == (1, 1)
-    kernel = _staged_launch(SKIPPED_WAITS, SKIPPED, staging,
-                            interpret=plgpu.InterpretGPUParams(detect_races=True))
-    if staging is stores.staged_chunks:
-        out = np.asarray(kernel())
-        columns = np.broadcast_to(np.arange(chunks * width, dtype=np.float32), (rows, chunks * width))
-        np.testing.assert_array_equal(out[:rows], columns)
-        np.testing.assert_array_equal(out[2 * rows:], columns + 2000.0)
-        return
-    try:
-        with pytest.raises(jax.errors.JaxRuntimeError):
-            kernel()
-    finally:
-        reset_gpu_interpret_mode_state()
+    kernel = _staged_launch(SKIPPED_WAITS, SKIPPED, interpret=plgpu.InterpretGPUParams(detect_races=True))
+    out = np.asarray(kernel())
+    columns = np.broadcast_to(np.arange(chunks * width, dtype=np.float32), (rows, chunks * width))
+    np.testing.assert_array_equal(out[:rows], columns)
+    np.testing.assert_array_equal(out[2 * rows:], columns + 2000.0)
 
 
 @pytest.mark.parametrize("staging", [stores.staged_chunks, stores.staged], ids=["skipped", "staged"])

@@ -108,7 +108,7 @@ def test_two_instances_of_an_overriding_trainer_each_build_their_own_state():
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=8)
     # One objective and one optimizer, so the two trainers' steps trace alike (`Trainer._step_key`) and
-    # their starts are kept as one would be (`traced_start`).
+    # their starts are kept as one would be (`traced_draw`).
     objective, optimizer = LMObjective(model, seq_len=8), optax.adam(1e-3)
     trainers = [Offset(objective, optimizer, key=jax.random.key(0), offset=offset) for offset in (1, 2)]
     assert [int(trainer.place()[0].step) for trainer in trainers] == [1, 2]
@@ -156,3 +156,19 @@ def test_an_initial_state_from_another_initializer_draws_that_initializer():
     other = jax.tree.leaves(trainer.initial_state(Partial(sevens)).variables["params"])
     assert not all(bool(jnp.all(leaf == 7.0)) for leaf in own)
     assert all(bool(jnp.all(leaf == 7.0)) for leaf in other)
+
+
+def test_a_draw_that_passes_every_leaf_through_runs_no_program():
+    """A draw whose every leaf is a held array passed through as it is, and whose rest holds none, returns
+    those arrays without compiling or running a program (row 9069: it compiled one that computed nothing)."""
+    from dew._cache import uncached
+    from dew.objectives.drawn import WHOLE, drawn_once
+
+    def kept(tree, key):
+        return tree
+
+    held = {"a": jnp.full(3, 1.0), "b": jnp.full(2, 4.0)}
+    with uncached(), Compiles(None) as compiles:
+        drawn = drawn_once(kept, held, jax.random.key(0), WHOLE)
+    assert drawn["a"] is held["a"] and drawn["b"] is held["b"]
+    assert compiles.count == 0, compiles.count

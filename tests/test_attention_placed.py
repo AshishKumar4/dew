@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 from test_attention_mosaic import (
     CALLS,
@@ -24,6 +24,7 @@ from test_attention_mosaic import (
 )
 from test_attention_template import CASES, arguments, geometry as core_geometry
 
+from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic
 
@@ -36,7 +37,7 @@ a step."""
 
 
 @INTERPRETS
-@pytest.mark.parametrize("width", [64, 128])
+@pytest.mark.parametrize("width", [64, 128, 256])
 @pytest.mark.parametrize("natural", [True, False], ids=["natural", "folded"])
 @pytest.mark.parametrize("call", ["full", "causal"])
 def test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted(call, natural, width):
@@ -49,6 +50,299 @@ def test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted(call, natural, w
     reference (check 1)."""
     _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=natural, interpret=True, width=width,
                    value_width=width, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
+
+
+ROWS_PAIR_TILES = attention_mosaic.Tiles(128, 64, 2, 2, family="tcgen05.rows")
+"""tcgen05's rows at two consumers: two query tiles of 128 rows a program over its one key walk, their
+products issued in turn (FlashAttention 4's two softmax warpgroups), each turn's weights over its logits."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("tokens", [192, 320])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_forward_on_tcgen05s_rows_at_two_consumers_holds_check_1_interpreted(call, tokens):
+    """The forward on a B200's tcgen05 rows at two consumers (`ROWS_PAIR_TILES`: the issuer serving each
+    consumer's logits and weighted values in turn on one key and value slot a step, a causal walk's later
+    query tile walking more of the program's keys than its partner, `placed.issuing`'s `reaches`), its
+    query tiles padded, under the interpreter, which models tensor memory and its turns' weights over their
+    logits: on par with the reference (check 1)."""
+    _check_forward(call, jnp.bfloat16, (1, tokens, 2, 1), natural=False, interpret=True, width=64,
+                   value_width=64, tiles=ROWS_PAIR_TILES, target=generation.gpu_target("sm100"))
+
+
+def _placed_forward(tiles: attention_mosaic.Tiles, spans: template.KeySpans):
+    """A traced sm100 forward call pinned at `tiles` over `spans` for `ring_protocol.programs`."""
+    def forward(query, key):
+        with generation.assumed("sm100"), _pinned(tiles):
+            return attention_mosaic.forward(query, key, key, spans, interpret=False)
+
+    return forward
+
+
+@pytest.mark.parametrize("moves", [False, True], ids=["kept", "moved"])
+@pytest.mark.parametrize("call", ["full", "causal"])
+@pytest.mark.parametrize("tiles", [ROWS_TILES, ROWS_PAIR_TILES], ids=["one", "two"])
+def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving(tiles, call, moves):
+    """The forward's launch on a B200's tcgen05 rows at one consumer and two, traced as a B200 builds it over
+    256 queries and 256 keys, the full call's and the causal's (each consumer's own key walk): every
+    interleaving of its consumers and its producer's and issuer's warps explored (`ring_protocol.explore`),
+    no deadlock and every barrier's phase whole and observed, every step's factor keeping its sums or moving
+    them (`moves`, a step whose maximum moves, the rare span). A step waits on the weighted values of the
+    step before only where its factor moves some row's sums (`placed.Tcgen05Placed.accumulating`), its
+    weights' turn freed by the product two steps back."""
+    from ring_protocol import explore, programs
+
+    query, key = jnp.ones((1, 256, 1, 128), jnp.bfloat16), jnp.ones((1, 256, 1, 128), jnp.bfloat16)
+    spans = template.spans(256, 256, 1, **CALLS[call])
+    threads, arrivals = programs(_placed_forward(tiles, spans), query, key,
+                                 threads=tiles.consumers + 1, rare=moves)
+    assert explore(threads, arrivals) > 0
+
+
+def _tmem_q_copies(issuer) -> list[tuple[int, object, object]]:
+    """Each `(position, tmem_dst, smem_src)` pair emitted by `async_copy_smem_to_tmem` in `issuer`."""
+    copies = []
+    for i, event in enumerate(issuer):
+        if (event.kind == "write" and i + 1 < len(issuer)
+                and issuer[i + 1].kind == "product" and len(issuer[i + 1].argument) == 1):
+            copies.append((i, event.at, issuer[i + 1].argument[0]))
+    return copies
+
+
+def _consumer_q_smem(threads, consumers: int) -> dict[int, object]:
+    """Each consumer `c`'s Q SMEM ref from its `copy_gmem_to_smem` load event."""
+    found = {}
+    for c in range(consumers):
+        loads = [event.at for event in threads[c] if event.kind == "load"]
+        assert len(loads) == 1, f"consumer {c} expected one Q load, got {loads}"
+        found[c] = loads[0]
+    return found
+
+
+@pytest.mark.parametrize(("tiles", "width"), [(ROWS_TILES, 256), (ROWS_PAIR_TILES, 64)],
+                         ids=["one-d256", "two-d64"])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_interleaving(tiles, width, call):
+    """The forward on a B200's tcgen05 rows where Q fits in TMEM (1-consumer d256 and 2-consumer d64, rows
+    5368, 9103-9105, 9474): every interleaving explored (`ring_protocol.explore`), each consumer's own SMEM Q
+    copied to a TMEM ref before any score MMA for that consumer reads it, and every score MMA signaling a
+    consumer reading the TMEM tile filled from that consumer's own SMEM Q."""
+    from ring_protocol import explore, programs
+
+    from dew.nn.kernels.templates import attention_mosaic_forward as forward_mod, placed
+
+    tmem = generation.gpu_target("sm100").tmem_columns
+    for candidate, cand_width, expected in ((ROWS_TILES, 256, True), (ROWS_PAIR_TILES, 64, True),
+                                            (ROWS_PAIR_TILES, 128, False)):
+        products = forward_mod.forward_products(placed.ROWS, candidate, cand_width, jnp.bfloat16, ahead=True,
+                                                query_width=cand_width, tmem_columns=tmem)
+        assert (placed.QUERY in placed.ROWS.product_scratch(*products)) is expected
+        assert placed.ROWS.product_columns(products) <= tmem
+
+    query = jnp.ones((1, 256, 1, width), jnp.bfloat16)
+    key = jnp.ones((1, 256, 1, width), jnp.bfloat16)
+    spans = template.spans(256, 256, 1, **CALLS[call])
+    threads, arrivals = programs(_placed_forward(tiles, spans), query, key,
+                                 threads=tiles.consumers + 1, rare=False)
+    (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
+    q_smem = _consumer_q_smem(threads, tiles.consumers)
+    # Map each consumer-exclusive barrier name to its consumer index so each score MMA's `scored` arrival
+    # identifies which consumer receives that MMA's logits (row 9474).
+    waiters: dict[object, set[int]] = {}
+    for c in range(tiles.consumers):
+        for event in threads[c]:
+            if event.kind == "wait":
+                waiters.setdefault(event.at[0], set()).add(c)
+    owner_of = {barrier: next(iter(owners)) for barrier, owners in waiters.items() if len(owners) == 1}
+    committed_bars = {event.at[0] for event in issuer if event.kind == "committed"}
+    # Each consumer's first exclusive waited barrier that the issuer commits to is its `scored` barrier
+    # (`placed.py:321`; excluding the Q-load barrier which the issuer waits on but never commits to).
+    scored_of = {
+        next(event.at[0] for event in threads[c]
+             if event.kind == "wait" and owner_of.get(event.at[0]) == c and event.at[0] in committed_bars): c
+        for c in range(tiles.consumers)}
+
+    copies = _tmem_q_copies(issuer)
+    assert len(copies) == tiles.consumers
+    written_at = {dst: pos for pos, dst, _ in copies}
+    tmem_source = {dst: src for _, dst, src in copies}
+    assert set(tmem_source.values()) == set(q_smem.values())
+
+    # Identify every score MMA independently by its following `scored` commit (so a score MMA reading Q
+    # directly from SMEM cannot be filtered out), and verify it reads the TMEM tile copied from its
+    # consumer's own Q SMEM ref (row 9474).
+    score_mmas = []
+    for i, event in enumerate(issuer):
+        if event.kind == "product" and len(event.argument) == 2:
+            next_commit = next((later for later in issuer[i + 1:] if later.kind == "committed"), None)
+            if next_commit is not None and next_commit.at[0] in scored_of:
+                score_mmas.append((i, event, scored_of[next_commit.at[0]]))
+    assert len(score_mmas) >= tiles.consumers
+    seen_consumers = set()
+    for i, event, consumer in score_mmas:
+        q_srcs = [src for src in event.argument if src in written_at]
+        assert len(q_srcs) == 1 and written_at[q_srcs[0]] < i
+        assert tmem_source[q_srcs[0]] == q_smem[consumer]
+        seen_consumers.add(consumer)
+    assert seen_consumers == set(range(tiles.consumers))
+    assert explore(threads, arrivals) > 0
+
+
+@INTERPRETS
+def test_two_consumers_with_distinct_queries_on_tcgen05s_rows_match_reference_interpreted():
+    """Two consumers on `tcgen05.rows` width 64 (Q in TMEM) given distinct query tiles produce each
+    consumer's own output: swapping `lefts` in `placed.py:350` fails numerically (row 9474)."""
+    def draw(seed: int):
+        rng = np.random.default_rng(9474 + seed)
+        q0 = rng.standard_normal((1, 128, 1, 64)) + 1.0
+        q1 = rng.standard_normal((1, 128, 1, 64)) - 1.0
+        query = jnp.asarray(np.concatenate([q0, q1], axis=1), jnp.bfloat16)
+        key = jnp.asarray(rng.standard_normal((1, 128, 1, 64)), jnp.bfloat16)
+        value = jnp.asarray(rng.standard_normal((1, 128, 1, 64)), jnp.bfloat16)
+        return query, key, value
+
+    def ours(query, key, value):
+        spans = template.spans(256, 128, 1)
+        with generation.assumed("sm100"), _pinned(ROWS_PAIR_TILES):
+            return attention_mosaic.forward(query, key, value, spans, interpret=True)
+
+    def theirs(query, key, value):
+        return template.reference(query, key, value, template.spans(256, 128, 1))
+
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw,
+                    "two-consumer tcgen05.rows distinct Q in TMEM", seeds=SEEDS)
+
+
+def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
+    """Concrete empty and live reaches traced with `ring_protocol.programs`: only the live consumer issues
+    `async_copy_smem_to_tmem`, while an empty consumer issues none (changing `placed.py:349` `<` to `<=`
+    fails, row 9473)."""
+    from ring_protocol import explore, programs
+
+    query = jnp.ones((1, 256, 1, 64), jnp.bfloat16)
+    key = jnp.ones((1, 256, 1, 64), jnp.bfloat16)
+    # Consumer 0 empty (0..0), consumer 1 live (0..2 tiles of 64 keys).
+    spans_mixed = template.KeySpans(
+        start=jnp.zeros((1, 256), jnp.int32),
+        end=jnp.concatenate([jnp.zeros((1, 128), jnp.int32), jnp.full((1, 128), 128, jnp.int32)], axis=1),
+        query_ids=None, key_ids=None, keys=256)
+    mixed_maps = {5: np.array([[0, 0]], np.int32), 6: np.array([[0, 2]], np.int32),
+                  7: np.array([[0, 0]], np.int32), 8: np.array([[0, 2]], np.int32)}
+    threads, arrivals = programs(_placed_forward(ROWS_PAIR_TILES, spans_mixed), query, key,
+                                 threads=ROWS_PAIR_TILES.consumers + 1, rare=False,
+                                 known=lambda idx, _aval: mixed_maps.get(idx))
+    (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
+    q_smem = _consumer_q_smem(threads, ROWS_PAIR_TILES.consumers)
+    copies = _tmem_q_copies(issuer)
+    assert len(copies) == 1 and copies[0][2] == q_smem[1] and copies[0][2] != q_smem[0]
+    assert explore(threads, arrivals) > 0
+
+    # All-empty 1-consumer walk: zero Q copies issued.
+    q1 = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
+    k1 = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
+    spans_empty = template.KeySpans(start=jnp.zeros((1, 128), jnp.int32), end=jnp.zeros((1, 128), jnp.int32),
+                                    query_ids=None, key_ids=None, keys=128)
+    empty_maps = {5: np.array([[0]], np.int32), 6: np.array([[0]], np.int32),
+                  7: np.array([[0]], np.int32), 8: np.array([[0]], np.int32)}
+    threads_e, arrivals_e = programs(_placed_forward(ROWS_TILES, spans_empty), q1, k1,
+                                     threads=ROWS_TILES.consumers + 1, rare=False,
+                                     known=lambda idx, _aval: empty_maps.get(idx))
+    for thread in threads_e:
+        assert _tmem_q_copies(thread) == []
+    assert explore(threads_e, arrivals_e) > 0
+
+
+def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
+    """Placed-forward derivation uses rounded TMEM and SMEM residency (`resources.register_model`) when
+    deciding whether to place Q in TMEM, proved through the public `attention_mosaic.forward` route and its
+    emitted `RegisterModel` (rows 9105, 9475, 9479, 9527, 9530):
+    - `q64/v32` (`columns=32`, 48 KiB SMEM): 160 base cols -> 256 rounded, 192 with Q -> 256 rounded; raw
+      `512 // 160 = 3` vs rounded `512 // 256 = 2`; keeps Q in TMEM and emits `RegisterModel.most == 2`.
+    - `q128/v128` (256 base cols -> 256 rounded = 2 CTAs/SM, 320 with Q -> 512 rounded = 1 CTA/SM): drops
+      residency 2 -> 1, so Q stays in SMEM and emits `RegisterModel.most == 2`.
+    - `q128/v64` (`stages=5`, >120 KiB K/V rings): 192 base cols -> 256 with Q (2 CTAs/SM by TMEM and
+      registers) while SMEM caps residency at 1; keeps Q in TMEM and emits `RegisterModel.most == 1`."""
+    from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
+
+    from dew.nn.kernels.templates import report
+
+    def has_tmem_copy(jaxpr) -> bool:
+        return any(eq.primitive is gpu_primitives.async_copy_smem_to_tmem_p
+                   for eq in programs.equations(jaxpr))
+
+    def traced_models(jaxpr) -> list:
+        found = []
+        for eq in programs.equations(jaxpr):
+            name = eq.params.get("name")
+            if isinstance(name, str):
+                kernel, launch = report.kernel_of(name)
+                if (launch is not None and (record := report.traced(launch)) is not None
+                        and getattr(record.config, "family", None) == "tcgen05.rows"
+                        and kernel in record.kernels):
+                    found.append(record.kernels[kernel])
+        return found
+
+    target = generation.gpu_target("sm100")
+    spans = template.spans(128, 256, 1)
+    v32_tiles = dataclasses.replace(ROWS_TILES, columns=32)
+    smem_tiles = dataclasses.replace(ROWS_TILES, stages=5)
+    # q64/v32 (48 KiB SMEM, 4 CTAs/SM SMEM cap): 160 base cols -> 256 rounded (2 CTAs) vs raw 512//160=3;
+    # 192 with Q -> 256 rounded (2 CTAs) vs raw 512//192=2; distinguishes rounded from raw residency.
+    # q128/v128: 256 base cols (2 CTAs) vs 320 with Q -> 512 rounded (1 CTA); rejects Q in TMEM.
+    # q128/v64 (stages=5, >120 KiB rings): TMEM (192->256) and registers allow 2 CTAs, SMEM caps to 1.
+    for q_width, v_width, pinned, expect_cols, expect_copy, expect_most in (
+            (64, 32, v32_tiles, 192, True, 2), (128, 128, ROWS_TILES, 256, False, 2),
+            (128, 64, smem_tiles, 256, True, 1)):
+        q = jnp.ones((1, 128, 1, q_width), jnp.bfloat16)
+        k = jnp.ones((1, 256, 1, q_width), jnp.bfloat16)
+        v = jnp.ones((1, 256, 1, v_width), jnp.bfloat16)
+        op = attention_mosaic.MosaicForward(scale=q_width ** -0.5, keys=256, form="full", natural=True)
+        ba = op.bind(q, k, v, None, None, None, None, (), (), None,
+                     residuals=template.Kept.NONE, interpret=False)
+        with generation.assumed("sm100"), _pinned(pinned):
+            assert op.tmem_columns(ba, pinned, target) == expect_cols
+            assert op.resident(ba, pinned, target) == expect_most
+            traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
+                q, k, v, spans, natural=True, interpret=False))(q, k, v).jaxpr
+        assert has_tmem_copy(traced) is expect_copy
+        models = traced_models(traced)
+        assert models and all(model.most == expect_most for model in models), models
+
+    def block_copies(jaxpr) -> dict[int, bool]:
+        """Map each tcgen05.rows kernel's V-block width (operand 2's last dim) to whether it copies Q."""
+        return {
+            eq.invars[2].aval.shape[-1]: any(
+                has_tmem_copy(sub) for sub in jax.extend.core.jaxprs_in_params(eq.params))
+            for eq in programs.equations(jaxpr)
+            if (isinstance(name := eq.params.get("name"), str)
+                and (launch := report.kernel_of(name)[1]) is not None
+                and (record := report.traced(launch)) is not None
+                and getattr(record.config, "family", None) == "tcgen05.rows")}
+
+    # Nonuniform legal column pins:
+    # - q64/v192 (padded 256, columns=192 -> blocks 192 and 64): both 192 and 64 tail place Q in TMEM.
+    # - q64/v320 (padded 320, columns=192 -> blocks 192 and 128): 192 copies Q (1 CTA/SM), 128 tail omits Q
+    #   (96 KiB SMEM -> 2 CTAs/SM, 256 -> 288 TMEM cols would drop residency 2 -> 1).
+    q64 = jnp.ones((1, 128, 1, 64), jnp.float16)
+    k64 = jnp.ones((1, 256, 1, 64), jnp.float16)
+    for v_width, expected_blocks in ((192, {192: True, 64: True}), (320, {192: True, 128: False})):
+        v_arr = jnp.ones((1, 256, 1, v_width), jnp.float16)
+        with generation.assumed("sm100"), _pinned(dataclasses.replace(ROWS_TILES, columns=192)):
+            tail_traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
+                q, k, v, spans, natural=True, interpret=False))(q64, k64, v_arr).jaxpr
+        assert block_copies(tail_traced) == expected_blocks
+
+    # Rank-only `proposes` must short-circuit before calling `held` (row 9477).
+    bwd = attention_mosaic.MosaicBackward(scale=128 ** -0.5, keys=256, form="full")
+    called = False
+
+    def boom() -> bool:
+        nonlocal called
+        called = True
+        return False
+
+    assert bwd.proposes(ba, KEYS_TILES["fused"], target, held=boom) is True
+    assert not called
 
 
 @INTERPRETS
@@ -272,6 +566,30 @@ def test_the_walked_backward_at_width_256_holds_check_1_interpreted(call):
                  pins=(None, tiles), target=generation.gpu_target("sm100"))
 
 
+@pytest.mark.parametrize("name", ["sm100", "sm90"])
+def test_a_tcgen05_devices_backward_derives_its_walked_launches(name):
+    """Qwen3-8B's heads (32 query heads over 8, width 128, 2 x 4096 causal bf16) derive their backward on a
+    B200 as the walked placements take it (`MosaicBackward.derived` is `walked`'s config, its dK/dV keys
+    first on tcgen05: M-ET-74's 0.18 of the mma.sync two launches' time, row 6918), where an H100, whose
+    walks place on no role, derives its own and has no walked config."""
+    tokens, heads, kv_heads, width = 4096, 32, 8, 128
+    spans = template.spans(tokens, tokens, 2, causal=True)
+    query = jax.ShapeDtypeStruct((2, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, tokens, kv_heads, width), jnp.bfloat16)
+    with generation.assumed(name):
+        residuals = jax.eval_shape(lambda q, k, v: attention_mosaic.forward(
+            q, k, v, spans, residuals=template.Kept.SPLIT), query, key, key)[1:]
+        op, args = attention_mosaic._backward_call(query, key, key, spans, None, query, tuple(residuals),
+                                                   scale=None, natural=attention_mosaic.NATURAL,
+                                                   accurate=False)
+        ba, target = op.bind(*args, interpret=False), generation.gpu_target()
+        walked, derived = op.walked(ba, target), op.derived(ba, target)
+    if name == "sm100":
+        assert walked is not None and derived == walked and derived.dkv_family == "tcgen05.keys", derived
+    else:
+        assert walked is None and derived is not None, (walked, derived)
+
+
 @pytest.mark.parametrize("form", ["two launches", "fused", "walked dq"])
 def test_the_walked_backward_states_each_product_its_issuers_walk(form):
     """A bf16 call's backward over 256 queries and keys, every pair reached, with its dK/dV keys first on a
@@ -319,3 +637,64 @@ def test_a_walked_placement_takes_only_the_launch_it_is_written_for(pin):
         ba, target = op.bind(*args, interpret=False), generation.gpu_target()
         assert op.legal(ba, KEYS_TILES["two launches"], target)
         assert not op.legal(ba, pin, target)
+
+
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_interleaving(call):
+    """The fused keys-first dK/dV launch on a B200 (`KEYS_TILES["fused"]` at width 64: each compute
+    warpgroup's step's dQ filled a slot at a time into its ring, which its reducer warp's TMA adds read, a
+    slot's fill and free a barrier's phase each, `attention_mosaic_dkv._PlacedDq`), traced as a B200 builds
+    it over 128 keys and two query steps, the full call's and the causal's (whose program walks fewer):
+    every interleaving of its compute warpgroups, its load, issuer and two reducer warps and its copies'
+    landings explored (`ring_protocol.explore`), no deadlock, every barrier's phase whole and observed, and
+    no slot written while an add still reads it. Two query steps, each its dQ's chunks through the two slots
+    (three's and four's interleavings passed the checker's bound once its stores' groups and fills were
+    events)."""
+    from ring_protocol import explore, programs
+
+    tokens, width = 128, 64
+    query = jnp.ones((1, tokens, 1, width), jnp.bfloat16)
+    key = jnp.ones((1, 128, 1, width), jnp.bfloat16)
+    spans = template.spans(tokens, 128, 1, **CALLS[call])
+    with generation.assumed("sm100"):
+        _, *residuals = jax.eval_shape(lambda q, k, v: attention_mosaic.forward(
+            q, k, v, spans, None, residuals=template.Kept.SPLIT), query, key, key)
+
+    def backward(query, key, dout, residuals):
+        with generation.assumed("sm100"), _pinned(backward=KEYS_TILES["fused"]):
+            return attention_mosaic.backward(query, key, key, spans, None, dout, residuals=residuals,
+                                             accurate=False, interpret=False)
+
+    residuals = jax.tree.map(lambda shaped: jnp.zeros(shaped.shape, shaped.dtype), tuple(residuals))
+    threads, arrivals = programs(backward, query, key, query, residuals, threads=3)
+    assert explore(threads, arrivals) > 0
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+def test_a_fused_walk_and_its_dq_reducer_compile_spill_free_on_a_b200(width):
+    """The fused keys-first backward (`KEYS_TILES["fused"]`: its dQ rings drained by their reducer warps' TMA
+    adds, `attention_mosaic_dkv._PlacedDq`) at widths 64 and 128 over 512 causal tokens, four query heads
+    over two, compiled by ptxas for a compile-only B200: its launch lowers, the reducer's barrier waits,
+    adds and arrivals among it, and spills nothing (`mosaic_failures`)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    tokens = 512
+    spans = template.spans(tokens, tokens, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, tokens, 4, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, 2, width), jnp.bfloat16)
+
+    def trained(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.SPLIT)
+
+    def step(query, key, value, dout):
+        _, *residuals = trained(query, key, value)
+        return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=tuple(residuals),
+                                         accurate=False)
+
+    with generation.assumed("sm100"), _pinned(backward=KEYS_TILES["fused"]):
+        case = KernelCase("fused", lambda: (step, (query, key, key, query)))
+        found = compile_mosaic_kernels([case], "sm100")
+    failed = mosaic_failures(found)
+    assert not failed, "\n".join(failed)

@@ -18,6 +18,7 @@ own dot."""
 
 import functools
 import math
+import operator
 from collections.abc import Callable, Sequence
 from typing import NamedTuple, Protocol
 
@@ -26,9 +27,9 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn import derivatives
+from dew.nn.float_bits import TWO_FACTOR_REACH, exact_power2
 from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
-from dew.nn.kernels.templates.attention_algebra import exact_power2, power2
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import (
     compensated_add,
@@ -36,6 +37,7 @@ from dew.nn.precision import (
     exact_float32,
     float32_einsum,
     float32_matmul,
+    power2,
     two_product,
 )
 
@@ -134,16 +136,16 @@ def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk
 
 def raised(whole, part):
     """`exp2(whole + part)` of a compensated base-2 exponent to fp32's resolution at any size: its integer
-    `n = floor(whole)` an exact power of two (`attention_algebra.power2`, the attention template's) and its
+    `n = floor(whole)` an exact power of two (`precision.power2`) and its
     fraction `(whole - n) + part`, near [0, 1), through exp2. The exponent rounded to one fp32 lost up to half
     its ulp, 1.9e-6 near -43 (a pair of tokens at -30 a token), a decay's relative 1.3e-6, which put the
     port's decay gradient under decays near zero 7 to 10 times the token-by-token recurrence's distance from
     float64; and exp2 of a whole exponent, which a CPU takes as `exp(x ln 2)`, rounds its product with ln 2
-    the same way. Its power of two within twice 127 (`power2`'s two factors): the fraction's exp2 lies in
-    [1, 2), so `n` past fp32's exponents gives zero or infinity at any reach, and the two factors held an
-    A100's query_key launch spill-free where three spilled it (ledger 2519)."""
+    the same way. Its power of two within `TWO_FACTOR_REACH` (`power2`'s two factors, both normal powers): the
+    fraction's exp2 lies in [1, 2), so `n` past fp32's exponents gives zero or infinity at any reach, and the
+    two factors held an A100's query_key launch spill-free where three spilled it (ledger 2519)."""
     n = _floor(whole)
-    return power2(jnp.exp2((whole - n) + part), n, reach=2 * 127)
+    return power2(jnp.exp2((whole - n) + part), n, reach=TWO_FACTOR_REACH)
 
 
 def _floor(x):
@@ -1005,25 +1007,37 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
     rows, _ = _grid(d_key.shape)
     d_decay = d_decay - keyed + jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0)
     d_weight = summed([("memory_dw", value_grads(j), entered(j).T) for j in range(blocks)])
-    # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`.
-    d_gated = -(d_weight + issue("weights_merge", lower.T, d_weight.astype(dtype)))
+    # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`: cast `dw` once before both the diagonal and off-diagonal
+    # terms (and `d_system`) so its narrow rounding cancels across `(I + L)^T` and between `dbeta_m` and
+    # `dbeta_p` as fla's `dw = -dw.astype(dtype)` does (row 8716).
+    d_weight_narrow = d_weight.astype(dtype)
+    d_gated = -(d_weight_narrow.astype(jnp.float32) + issue("weights_merge", lower.T, d_weight_narrow))
     emit("dk", d_key + d_gated * decays * betas[:, None])
     gated = keys * decays
     gated_rows = Transposed(write_gated(gated, betas).astype(dtype))
-    system = system - issue("weights_merge", d_weight.astype(dtype), gated_rows)
+    system = system - issue("weights_merge", d_weight_narrow, gated_rows)
     emit("dg", d_decay + gated * d_gated * betas[:, None])
     d_betas = jnp.sum(d_gated * gated, axis=1)
     return system, d_betas
+
+
+def _wy_inverse_adjoint(d_system, lower, dtype, issue: Issue, *, right_label: str,
+                        left_label: str) -> jax.Array:
+    """Strictly lower `-(I + L)^T tril(d_system, -1) (I + L)^T`, casting each factor once before both its
+    diagonal identity and off-diagonal `lower.T` product so bf16 rounding cancels (row 8716, base review
+    b9f004f74 F5)."""
+    strict = _lags(d_system.shape) > 0
+    d_system = jnp.where(strict, d_system, 0.0).astype(dtype)
+    right = (d_system.astype(jnp.float32) + issue(right_label, d_system, lower.T)).astype(dtype)
+    return jnp.where(strict, -(right.astype(jnp.float32) + issue(left_label, lower.T, right)), 0.0)
 
 
 def key_system_back(d_system, lower: Tile, dtype, issue: Issue) -> jax.Array:
     """The keys' system's gradient `[C, C]` fp32 of a chunk's from its inverse's `d_system` (`I + L`, `L`
     `lower`): `-(I + L)^T dA (I + L)^T`, strictly lower, each side's identity outside its product
     ('system_merge'), as fla_kda's wy_dqkg forms its `dA`."""
-    lag = _lags(d_system.shape)
-    d_system = jnp.where(lag > 0, d_system, 0.0)
-    right = d_system + issue("system_merge", d_system.astype(dtype), lower.T)
-    return jnp.where(lag > 0, -(right + issue("system_merge", lower.T, right.astype(dtype))), 0.0)
+    return _wy_inverse_adjoint(d_system, lower, dtype, issue, right_label="system_merge",
+                               left_label="system_merge")
 
 
 def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.Array], columns: int,
@@ -1217,10 +1231,6 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     they give are `keys_gradient`'s and `values_gradient`'s. `dX`'s key and value blocks issued into one
     accumulator (`summed`, the mainloop's): an accumulator a block, an H100's launch at keys and values 256
     wide spilled 264 bytes a thread (wide-sm90 at 8d1145e66)."""
-    def transposed_inverse(m):
-        """`X^T m`, the diagonal outside the product."""
-        return m + issue("inverse_t", lower.T, m.astype(dtype))
-
     decay = raised(gate, low)
 
     def scaled(load, scale):
@@ -1230,13 +1240,10 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
              for c in range(columns)]
     valued = [("inverse_du", u_grads(j), scaled(functools.partial(values, j), beta)) for j in range(blocks)]
     d_x = summed(keyed + valued, shape=(lower.shape[0],) * 2)
-    lag = _lags(d_x.shape)
-    strict = lag > 0
-    d_x = jnp.where(strict, d_x, 0.0)
-    d_x = d_x + issue("inverse_l", d_x.astype(dtype), lower.T)
-    d_x = transposed_inverse(d_x)
+    strict = _lags(d_x.shape) > 0
+    d_l = _wy_inverse_adjoint(d_x, lower, dtype, issue, right_label="inverse_l", left_label="inverse_t")
     column_gate, column_low = (gate, low) if laid is None else laid
-    return jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
+    return jnp.where(strict, d_l * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
 def selective_decay(step, rate, kept=None):
@@ -1257,27 +1264,59 @@ def selective_token(states: list, decays: list, written, b: list) -> list:
     return [decay * state + written * b_n for state, decay, b_n in zip(states, decays, b, strict=True)]
 
 
+def pairwise_sum(terms, *, combine=operator.add):
+    """Sum `terms` (a sequence of values, or an array along its last axis) as an adjacent-pair balanced
+    tree with odd-tail carry, shared by `selective_read`, the portable Mamba scan, and decode (`step.py`,
+    base review da734bf54 F6)."""
+    if not isinstance(terms, (list, tuple)):
+        if terms.shape[-1] == 0:
+            return jnp.zeros(terms.shape[:-1], terms.dtype)
+        parts = [terms[..., i] for i in range(terms.shape[-1])]
+    else:
+        parts = list(terms)
+    while len(parts) > 1:
+        paired = [combine(x, y) for x, y in zip(parts[::2], parts[1::2], strict=False)]
+        parts = [*paired, *parts[len(parts) // 2 * 2:]]
+    return parts[0]
+
+
 def selective_read(states: list, c: list, skip, value):
     """A token's output of the selective scan, `y = sum_n C_n h_n + D x`, the states' terms summed as a
     balanced tree, its depth log2 of their count: summed in turn, the readout's 16 states put an fp32 scan's
     output 1.68 times the portable scan's distance from float64 where every decay is near zero, its own
     write the whole state (the interpreted regime test)."""
-    terms = [c_n * state for c_n, state in zip(c, states, strict=True)]
-    while len(terms) > 1:
-        paired = [x + y for x, y in zip(terms[::2], terms[1::2], strict=False)]
-        terms = [*paired, *terms[len(terms) // 2 * 2:]]
-    return terms[0] + skip * value
+    return pairwise_sum([c_n * state for c_n, state in zip(c, states, strict=True)]) + skip * value
 
 
-def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rate) -> tuple:
+_SELECTIVE_SUBNORMAL_STEP = 2.0 ** -100
+_SELECTIVE_DX_SCALE = 2.0 ** 64
+
+
+def selective_dx_scale(skip, dy, step):
+    """Derive once per block `(dx_init, dx_step, inv_scale)` for a selective scan backward's `dx` state sum:
+    on subnormal-step lanes (`|step| < 2^-100`) whose `skip * dy` fits below `2^60`, scale both `skip * dy`
+    and `step` by `2^64` (exact exponent shift) and return `inv_scale = 2^-64`; otherwise return
+    `(skip * dy, step, 1.0)` (row 8722, base reviews da734bf54 F3, b65e3cab4 F8, b0601005b F6)."""
+    base = skip * dy
+    scaled = ((jnp.abs(step) < jnp.float32(_SELECTIVE_SUBNORMAL_STEP))
+              & (jnp.abs(base) < jnp.float32(2.0 ** 60)))
+    scale = jnp.float32(_SELECTIVE_DX_SCALE)
+    return (jnp.where(scaled, base * scale, base),
+            jnp.where(scaled, step * scale, step),
+            jnp.where(scaled, jnp.float32(1.0 / _SELECTIVE_DX_SCALE), jnp.float32(1.0)))
+
+
+def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rate, *, dx_step=None) -> tuple:
     """One state's gradients of the selective scan through a token, from the cotangent the token's state
     takes `cotangent` (`g_t = C_t dy_t + a_{t+1} g_{t+1}`, its read and what the tokens after pass back),
     the state before it `before` (`h_{t-1}`), its `decay` (`selective_decay`'s), `written` (`dt x B`), and the
     token's `step`, `value`, `b`, `dy` and the state's `rate` `A`: `(dx, ddt, dB, dC, drate)`, the rate's
     a token's term its schedule sums. `exp(dt A)`'s derivative in `dt` is `A` times it, in `A` `dt` times
-    it."""
+    it. Where `dx_step` is given (`selective_dx_scale`), it scales only `dx`'s `step` factor so per-state
+    terms and `skip * dy` stay normal across the state sum (row 8722, base review b0601005b F6)."""
     through = cotangent * before * decay
-    return (cotangent * b * step, cotangent * b * value + through * rate,
+    d_written = cotangent * b
+    return (d_written * (step if dx_step is None else dx_step), d_written * value + through * rate,
             cotangent * step * value, dy * (decay * before + written), through * step)
 
 

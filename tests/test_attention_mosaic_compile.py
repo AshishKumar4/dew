@@ -155,8 +155,6 @@ FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for gener
 FORWARD_GATE = [(*case, jnp.bfloat16) for case in FORWARD_GATE]
 FORWARD_GATE += [(generation_name, width, training, "none", jnp.float16) for generation_name in GATED
                  for width in (64, 128) for training in (template.Kept.NONE, template.Kept.SPLIT)]
-FORWARD_GATE += [("sm100", width, training, "none", jnp.bfloat16) for width in (64, 128)
-                 for training in (template.Kept.NONE, template.Kept.SPLIT)]
 """The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
 head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
 split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set

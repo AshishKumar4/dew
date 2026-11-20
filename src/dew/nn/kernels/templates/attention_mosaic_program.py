@@ -44,6 +44,7 @@ from dew.nn.kernels.templates.attention import (
     Param,
     block_map,
     differentiable,
+    drops_in_place,
     floating_params,
     head_width,
     kept_dtype,
@@ -144,11 +145,13 @@ def backward_layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family,
 
 
 def scheduled_roles(family: mosaic.Family, consumers: int, consumer: Callable[[int], tuple | None],
-                    producer: Callable[[], None], issued: Callable[[placed.Tcgen05Walked], None]):
+                    producer: Callable[[], None], issued: Callable[[placed.Tcgen05Walked], None], *,
+                    reducer: Callable[[int], None] | None = None):
     """A backward launch's roles (`Family.scheduled`): its consumers, its producer's loads, and where its
     family places its products on a role (`placed.Tcgen05Walked`) its compute warpgroups `consumer(role)`,
-    each built at its static role, its turns and its store its own (`mosaic.per_role`), and its issuer
-    (`issued(family)`)."""
+    each built at its static role, its turns and its store its own (`mosaic.per_role`), its issuer
+    (`issued(family)`) and its reducers, `reducer(role)`, where it hands its adds to them
+    (`handoffs.REDUCER`)."""
     if not family.places_on_role:
         return family.scheduled(consumers, consumer, producer)
     walked = placed.walked(family)
@@ -158,7 +161,7 @@ def scheduled_roles(family: mosaic.Family, consumers: int, consumer: Callable[[i
         consumer(role)
 
     return walked.scheduled(consumers, functools.partial(mosaic.per_role, roles=consumers, run=compute),
-                            producer, issuer=lambda: issued(walked))
+                            producer, issuer=lambda: issued(walked), reducer=reducer)
 
 
 def placed_scratch(family: mosaic.Family, walked: int, dtype, fused: tuple[int, ...], kept: tuple[int, ...]
@@ -484,7 +487,7 @@ def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int
 
 
 def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
-                 products: tuple | None = None) -> resources.Scope:
+                 products: tuple | None = None, over_rings: bool = False) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
     walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), its issuer's product scratch
     where its `products` take one (`Family.product_held`, its tensor memory's addresses
@@ -493,9 +496,13 @@ def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups:
     (`resources.Scope`)."""
     scoped, streams, *after = allocations
     held, walks = family.lifetimes(streams)
-    return resources.Scope(program=(scoped, *family.product_held(products), *held), walks=walks,
-                           after=tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ())),
-                           reduces=reduces, reducing_warpgroups=reducing_warpgroups,
+    tiles = tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ()))
+    # The tiles after the walks over the rings' slots where the launch asks it and its family stages them so
+    # (`Family.scoped`'s `over_rings`, `stages_over_rings`).
+    over = held if tiles and over_rings and family.stages_over_rings and not family.walks_scoped else ()
+    return resources.Scope(program=(scoped, *family.product_held(products), *(() if over else held)),
+                           walks=walks, after=tiles, over=over, reduces=reduces,
+                           reducing_warpgroups=reducing_warpgroups,
                            addresses=family.product_addresses(products))
 
 
@@ -590,9 +597,18 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if hooks.rounds is not None and (backward or hooks.drop is not None or hooks.initial is not None):
         return ROUNDED
-    if hooks.drop is not None and not algebra.drops_in_place(dtype, hooks.drop.bound):
-        # Dropped weights past the dtype's largest take scaled parts (`algebra.dropped_parts`), which the
-        # mainloop's sums in place do not take back (`mosaic.unscaled_part`).
+    if (hooks.drop is not None and hooks.initial is not None and not algebra.headroom(dtype)
+            and hooks.drop.bound != hooks.drop.reach):
+        # A state's sums beside a walk of no headroom hold the multiplier itself, each tile's products taken
+        # down to it where it is no power of two (`sums_units`; a rate of 1/2 takes none, the base review of
+        # e2b671ce9, F3), which sums accumulated in place do not take: the plain-JAX mainloop takes the call.
+        # A scaled walk for such a call (its state's own headroom) would take it.
+        return Refusal('dropout_rate', f"the Mosaic dropping walk takes no initial state beside "
+                       f"{jnp.dtype(dtype).name} values, whose walk has no headroom")
+    if hooks.drop is not None and not drops_in_place(dtype, hooks.drop.reach):
+        # Dropped weights past the dtype's largest binade would take scaled parts (the forward's in its sums'
+        # units, `algebra.kept_parts`; the backward's for dV's product), which its sums in place do not take
+        # back (`mosaic.unscaled_part`).
         return Refusal('dropout_rate', f"the Mosaic dropping walk takes {jnp.dtype(dtype).name} weights "
                        f"within its range, not a multiplier of {hooks.drop.bound:g} (a rate of "
                        f"{hooks.drop.rate:g})")
@@ -622,20 +638,29 @@ def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differ
     return not any(_primitives(jaxpr) & emission.APPROXIMATED for jaxpr in traced)
 
 
-def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, flagged: bool = False,
-             scaled: bool = False, magnitudes: bool = False) -> int:
+def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, scaled: bool = False,
+             magnitudes: bool = False) -> int:
     """The warpgroups of a launch of `consumers` whose arithmetic may reduce across warps implicitly, each
     reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a
     `hooked` launch's hook's (`hook_reduces`: a unit row, which the fork selects by a reduction across warps,
-    ledger 1428; an output hook's, untraced), a `flagged` launch's rows reduced to their block's flag (the
-    plain launch that flags its rows, `attention_mosaic_forward._Flags`), a `scaled` step's tile reduced
-    to its largest across the warps holding its rows (`algebra.running_parts`, an fp16 fused backward's), or
-    a scaled walk's keys' value `magnitudes`, its value tile's columns reduced across the warps holding them
-    (`Family.key_magnitudes`, `algebra.SCALED_WALK`), so every warpgroup of a launch that runs such a hook,
-    flags or scales; none otherwise."""
-    if flagged or scaled or magnitudes or hooked:
+    ledger 1428; an output hook's, untraced), a `scaled` step's tile reduced to its largest across the warps
+    holding its rows (`algebra.running_parts`, an fp16 fused backward's), or a scaled walk's keys' value
+    `magnitudes`, its value tile's columns reduced across the warps holding them (`Family.key_magnitudes`,
+    `algebra.SCALED_WALK`), so every warpgroup of a launch that runs such a hook or scales; none otherwise.
+    A launch's rows flagged to their block's flag reserve none: the flag is its warpgroup's vote
+    (`attention_mosaic_forward._status_stored`, `bar.red.or.pred`)."""
+    if scaled or magnitudes or hooked:
         return family.warpgroups(consumers)
     return 0
+
+
+def forward_reduces(family: mosaic.Family, reducing_warpgroups: int) -> bool:
+    """Whether a forward launch's arithmetic reduces across warps, reserving its family's reduction scratch
+    (`Family.kernel`'s `reduces`, `resources.Scope.reduces`): where its warps split its rows' columns
+    (`Issuer.rows_whole`: mma.sync's warps along the keys), or a warpgroup of it reduces implicitly
+    (`reducing`). Its rows' maxima and sums each warp's own otherwise, and its flags and verdicts its
+    warpgroup's votes: sm120's forward at width 256 fits whole without the 2,048 bytes."""
+    return not family.rows_whole or reducing_warpgroups > 0
 
 
 def hook_reduces(hooks: Hooks | None) -> bool:
@@ -908,7 +933,7 @@ def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -
             if not eqn.primitive.inlined_call or not all(
                     _entrywise(inner, set(read), tile) for inner in nested):
                 return False
-        elif not layout.entrywise(eqn):
+        elif not (layout.entrywise(eqn) or layout.placed(eqn)):
             return False
         tainted.update(eqn.outvars)
     return True
@@ -1145,8 +1170,8 @@ def reached(spec: algebra.Forward, queries: int) -> int | None:
     """The query and key pairs a call of `queries` queries (unpadded) reaches, by its form: every pair of a
     full call; a causal call's, each query's keys up to its own place (`algebra.seen`'s `k_pos <= q_pos`,
     the first key aligned to the first query); None for a spans call, whose pairs its arrays decide, which
-    no launch states before it runs."""
-    if spec.form == "full":
+    no launch states before it runs, but one whose every query sees every key (`algebra.Forward.whole`)."""
+    if spec.form == "full" or spec.whole:
         return queries * spec.keys
     if spec.form == "causal":
         return sum(min(spec.keys, row + 1) for row in range(queries))
@@ -1180,8 +1205,9 @@ def walked_steps(spec: algebra.Forward, tile_walk: TileWalk) -> int | None:
     at 2048 queries and 128-row tiles: 6.25% past its reached pairs, row 3948), and a common walk's every
     tile for each holder, one wholly past the keys too (`algebra.Forward.walked_keys`); None for a spans
     call. The work a consumer's step emits (`emission.Role.step`) times these is its walks'
-    (`cost.Stated.steps`, `emission.Emitted.issued`)."""
-    if spec.form == "spans":
+    (`cost.Stated.steps`, `emission.Emitted.issued`); a spans call's every key seen, known at trace time
+    (`algebra.Forward.whole`), a full call's."""
+    if spec.form == "spans" and not spec.whole:
         return None
     (queries, keys), (block_q, block_k) = tile_walk.extents, tile_walk.blocks
     query_tiles, causal = queries // block_q, spec.form == "causal"
@@ -1784,12 +1810,15 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     block_q, block_k = tiles.block_q, tiles.block_k
     if family.places_on_role:
         # A consumer of products a role issues (`Issuer.places_on_role`, tcgen05's rows): its rows' maxima
-        # and denominators carried, and at a step's widest its logits read from tensor memory beside their
-        # weights, fp32 (its sums kept there, rescaled a block of columns at a time once the weights are
-        # written; its mask's places a row's scalar beside constant columns). A thread holds its row: ptxas
-        # held the 4B call's 128 x 64 walk at width 256 in 196 registers (et-rows-abi).
+        # and denominators carried, and at a step's widest its logits read from tensor memory, fp32, beside
+        # their weights narrowed to the operands' dtype for the product, two to a register where 16-bit (its
+        # sums kept there, rescaled a block of columns at a time once the weights are written; its mask's
+        # places a row's scalar beside constant columns). A thread holds its row: ptxas held the 4B call's
+        # 128 x 64 walk at width 256 in 196 registers (et-rows-abi), and the 8B's at width 128 in 176 at
+        # 128 x 64 and 248 at 128 x 128, spilling none (et-sm100-128), where two fp32 tiles priced the
+        # 128-key tile past its budget.
         return resources.live_registers(family, [(block_q, 1, jnp.float32)] * 2,
-                                        [(block_q, block_k, jnp.float32)] * 2)
+                                        [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)])
     hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
@@ -1986,7 +2015,6 @@ class ForwardRegisters:
     prologue: tuple | None = None
     """The query prologue its consumers take on their query tiles (`MosaicForward.query_mod`), with its
     parameters' kinds and dtypes, `(hook, kinds, dtypes)`; None where it has none."""
-
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None) -> int | None:
         """A consumer's registers at `tiles` on `family`: its walk's over the values' columns its launch
@@ -2000,12 +2028,18 @@ class ForwardRegisters:
                   else prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue))
         if peaks:
             return max(before, peaks_registers(family, tiles, self.dtype, params=self.params, width=width))
-        value_width = columns or tiles.columns or _width(self.value_width, family, self.dtype)
+        value_width = value_columns(_width(self.value_width, family, self.dtype), columns or tiles.columns)
         return max(before, forward_registers(
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
             scaled=self.scaled, codes=self.codes,
             positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started))
+
+
+def value_columns(padded: int, columns: int | None) -> int:
+    """The value columns a launch emits for padded width `padded` and optional block cap `columns`:
+    capped at `padded` so slicing, resource planning and register sizing agree on oversized pins."""
+    return min(columns, padded) if columns else padded
 
 
 def prologue_registers(family: mosaic.Family, block_q: int, width: int, dtype, hook: Callable,

@@ -231,15 +231,17 @@ def loaded_once(rings: dict, views: dict) -> None:
         ring.load(ring.turn(0), ring.viewed(views[name], 0))
 
 
-def streamed(rings: tuple, views, lo, hi) -> None:
-    """A producer's loads of steps `lo` to `hi` into `rings`, each ring's step counted from `lo` and loaded
-    from its view of `views(step)`, then each ring drained."""
+def streamed(rings: tuple, views, lo, hi, *, counted=0) -> None:
+    """A producer's loads of steps `lo` to `hi` into `rings`, each ring's step counted from `lo`, `counted`
+    turns past the ring's first (a walk of the same steps again, its rotation continuing), and loaded from
+    its view of `views(step)`, then each ring drained."""
     @pl.loop(lo, hi)
     def _(index):
         given = dict(zip(_keyed(rings), views(index), strict=True))
-        stepped_in(_keyed(rings), lambda key, ring: ring.turn(index - lo), lambda key, ring: given[key])
+        stepped_in(_keyed(rings), lambda key, ring: ring.turn(index - lo + counted),
+                   lambda key, ring: given[key])
 
-    drain(rings, hi - lo)
+    drain(rings, counted + hi - lo)
 
 
 def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:

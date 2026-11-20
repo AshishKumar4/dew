@@ -79,6 +79,20 @@ def test_nvfp4_words_stored_in_the_forms_layout_decode_to_their_codes_in_order()
     np.testing.assert_array_equal(got, expected)
 
 
+def test_a_decoded_value_restored_narrow_is_its_float32_restoring_rounded_once():
+    """`bits.restored` in float16 and bfloat16 is its float32 restoring rounded once to the format, at every
+    16-bit pattern, a NaN as a NaN: formed in float32 and cast, where a fraction field cast to float16 first
+    overflowed (the half code, `0x0040`, read as infinity, not 0.5: row 8660's head review)."""
+    patterns = jnp.arange(1 << 16, dtype=jnp.uint32)
+    narrow = np.asarray(jax.jit(bits.restored)(patterns))
+    for dtype in (jnp.float16, jnp.bfloat16):
+        made = np.asarray(jax.jit(lambda pattern, dtype=dtype: bits.restored(pattern, dtype))(patterns))
+        numbers = ~np.isnan(narrow)
+        np.testing.assert_array_equal(np.isnan(made.astype(np.float32)), ~numbers)
+        np.testing.assert_array_equal(made[numbers].view(np.uint16),
+                                      narrow[numbers].astype(dtype).view(np.uint16))
+
+
 def test_a_decoded_value_restored_wide_is_its_float32_restoring_widened():
     """`bits.restored` in float64, a float64 truth's, is its float32 restoring widened exactly (NumPy's
     widening on the host, a float32 subnormal kept), bit for bit, at every 16-bit pattern, a NaN as a NaN:

@@ -36,10 +36,15 @@ class Kind(NamedTuple):
     the algebra's recognition fused into the product, `fused_gemm`), its call one that reads the rows the
     prologue forms them from: a forward's or a kernel gradient's, a cell of its own where a receipt timed one
     (`MEASURED`)."""
+    together: bool = False
+    """Whether it is several products in one launch: matrices side by side (`gmm_call`'s `beside`, a layer's
+    query, key and value), or their input gradient's products chained over their joined depths (`chained`),
+    a cell of its own, which no one product's receipt times (head review of 4ddd0d7ea F1: the ordinary
+    products' cells stood for them)."""
 
     def __str__(self) -> str:
         parts = (('fp8',) * self.fp8 + ('gathered',) * self.gathered + ('scattered',) * self.scattered
-                 + ('formed',) * self.formed)
+                 + ('formed',) * self.formed + ('together',) * self.together)
         timed = () if self.matrix is None else ('x'.join(map(str, self.matrix)),)
         return ' '.join(('dense' if self.dense else 'grouped', self.made.value, *parts, *timed))
 
@@ -94,6 +99,12 @@ cell of its own (`Kind.matrix`), which its receipt's winner holds, each receipt 
 every other product its kind's. The
 receipts timed 24,576 tokens (M-EM-36, M-EM-52, em35d); the 4B step's 49,152 (four rows) held the same
 cells at parity with cuBLASLt (M-EM-54, interleaved in one session: 3,418.7 against 3,416.9 ms)."""
+
+M_EM_73 = ("M-EM-73-gh200 (a GH200, base/kernels b1ab251ac, CUPTI medians of 5 rounds): three projections' "
+           "input gradient chained in one launch against XLA's (cuBLAS's) three products, 0.80x at "
+           "Qwen3.5-4B's 4 x 3072 rows and 0.87x at Llama-3.1-8B's, and 0.837x the template's three "
+           "products each added in the next's epilogue at the 8B's (0.815 against 0.974 ms); 1.32x XLA's at "
+           "Qwen3.5-4B's 1 x 2048, provisional (n=5, spreads to 26%)")
 
 M_EM_36 = ("M-EM-36-gh200 (a GH200, base/kernels df82480cb5c, CUPTI medians of 5 rounds, cuBLASLt autotuned "
            "at run, 24,576 tokens)")
