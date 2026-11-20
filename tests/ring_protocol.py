@@ -58,7 +58,7 @@ configuration."""
 import dataclasses
 import itertools
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -884,7 +884,7 @@ class _State:
             return None
         return made
 
-    _EFFECTS: dict[str, Callable] = {
+    _EFFECTS: ClassVar[dict[str, Callable]] = {
         "wait": _step_wait, "arrive": _step_arrive, "expect": _step_expect,
         "load": _step_transfer, "copy": _step_transfer, "committed": _step_committed,
         "fill": _step_fill, "fill_wait": _step_fill_wait,
