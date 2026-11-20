@@ -1265,16 +1265,10 @@ def selective_token(states: list, decays: list, written, b: list) -> list:
     return [decay * state + written * b_n for state, decay, b_n in zip(states, decays, b, strict=True)]
 
 
-def pairwise_sum(terms, *, combine=operator.add):
-    """Sum `terms` (a sequence of values, or an array along its last axis) as an adjacent-pair balanced
-    tree with odd-tail carry, shared by `selective_read`, the portable Mamba scan, and decode (`step.py`,
-    base review da734bf54 F6)."""
-    if not isinstance(terms, (list, tuple)):
-        if terms.shape[-1] == 0:
-            return jnp.zeros(terms.shape[:-1], terms.dtype)
-        parts = [terms[..., i] for i in range(terms.shape[-1])]
-    else:
-        parts = list(terms)
+def pairwise_sum(terms: Sequence, *, combine=operator.add):
+    """Sum nonempty `terms` as an adjacent-pair balanced tree with odd-tail carry, shared by
+    `selective_read` and decode (`step.py`, base review da734bf54 F6, row 9080)."""
+    parts = list(terms)
     while len(parts) > 1:
         paired = [combine(x, y) for x, y in zip(parts[::2], parts[1::2], strict=False)]
         parts = [*paired, *parts[len(parts) // 2 * 2:]]
