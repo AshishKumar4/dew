@@ -743,6 +743,31 @@ def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[i
     return spans
 
 
+class _GroupedRows(_WrappingDataset):
+    """A batched step that keeps its rows (`Batched.same_rows`) over an indexed order: each record read as
+    its group of `size` consecutive records of the order makes it (`BatchedGroups`), the group the record's
+    place decides, so the rows are the same however many readers share the order and wherever a read
+    resumes (row 9007: grouped after the share cut, each reader's groups were its own). The last group read
+    is kept, as a reader reads its records in order."""
+
+    def __init__(self, parent: pygrain.MapDataset, groups: BatchedGroups, size: int):
+        super().__init__(parent)
+        self._groups, self._size = groups, size
+        self._held: tuple[int, Sequence[Record]] | None = None
+
+    def __len__(self) -> int:
+        return len(self._parent)
+
+    def record(self, index: int) -> Batch:
+        group = index // self._size
+        if self._held is None or self._held[0] != group:
+            first = group * self._size
+            members: list[Record] = [self._parent[place]
+                                     for place in range(first, min(first + self._size, len(self)))]
+            self._held = group, self._groups.flat_map(members)
+        return record(self._held[1][index % self._size], "batched row")
+
+
 class _TokenSplit(_WrappingDataset):
     """A token split of a finite indexed order, such as a shuffled corpus:
     the spans `_token_spans` keeps, computed once over the order as it reads, or those resolved
@@ -2031,6 +2056,9 @@ class _Build:
             # A Grain step reads cache fills through an iterator that owns them (`_Filled`).
             given = _as_iter(rows, self.loading) if _fills(rows) else rows
             rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
+        elif isinstance(stage, Batched) and stage.same_rows and isinstance(rows, pygrain.MapDataset):
+            # Its groups the order's own consecutive records, whatever reads them (row 9007).
+            rows = _GroupedRows(rows, BatchedGroups(stage), stage.size)
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))

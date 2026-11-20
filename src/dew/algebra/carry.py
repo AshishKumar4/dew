@@ -312,8 +312,7 @@ def _products(graph: EGraph, region: terms.Region) -> None:
         if slack is None or not graph.check_bool(rules.plain(i64(index))):
             continue
         # The plain product multiplies the transposed one's operands (`terms.Region.products`).
-        made = region.interned(primitive, {**params, "dimension_numbers": plain}, region.products.get(index),
-                               region.made.get(index))
+        made = region.interned(primitive, {**params, "dimension_numbers": plain}, region.products.get(index))
         swapped = region.interned(jax.lax.transpose_p, {"permutation": (1, 0)})
         graph.register(rules.plain(i64(made)), rules.matrix_product(i64(made)),
                        set_(rules.mode_power(i64(made))).to(i64(slack)),

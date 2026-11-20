@@ -834,9 +834,7 @@ class Decide(SavedRunTask, InItsForm):
         if contexts is not None:
             raise ValueError("one request reads its context in context=; contexts= is a batch's, each "
                              "request's own")
-        if images:
-            return _told(*self._seen(state, questions, images, context, request=request))
-        return _told(*self._answered([self._encoded(state, questions, context=context, request=request)],
+        return _told(*self._answered([self._laid(state, questions, images, context, request=request)],
                                      [questions])[0])
 
     def _requests_answered(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]],
@@ -847,34 +845,47 @@ class Decide(SavedRunTask, InItsForm):
         server (`_rows_scored`), text rows packed into passes and rows of alike images joined in theirs, as a
         server of Jev bodies scores them (row 9634: each request of images ran a pass of its own)."""
         shown = list(images) if images else [()] * len(requests)
-        held = [None] * len(requests) if contexts is None else list(contexts)
-        if len(shown) != len(requests) or len(held) != len(requests):
-            raise ValueError(f"{len(shown)} requests' images and {len(held)} contexts for {len(requests)} "
-                             "requests")
-        laid = [[_Row(*self._shown(state, questions, seen, context))] if seen
-                else [_Row(row) for row in self._encoded(state, questions, context=context)]
+        if len(shown) != len(requests):
+            raise ValueError(f"{len(shown)} requests' images for {len(requests)} requests")
+        held = self._contexts(requests, contexts)
+        laid = [self._laid(state, questions, seen, context)
                 for (state, questions), seen, context in zip(requests, shown, held, strict=True)]
-        scores = iter(self._rows_scored([row for rows in laid for row in rows]))
-        return [self._replied(questions, [row.encoded for row in rows], [next(scores) for _ in rows])
-                for (_, questions), rows in zip(requests, laid, strict=True)]
+        return self._answered(laid, [questions for _, questions in requests])
 
     def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
              contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
         """Each request's rows as a call scores them: its state and questions laid out, with its
         context (`contexts`, in order, or None for none) beside them."""
-        contexts = [None] * len(requests) if contexts is None else list(contexts)
-        if len(contexts) != len(requests):
-            raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
-        return [self._encoded(state, questions, context=context)
-                for (state, questions), context in zip(requests, contexts, strict=True)]
+        return [[row.encoded for row in self._laid(state, questions, (), context)]
+                for (state, questions), context in zip(requests, self._contexts(requests, contexts),
+                                                       strict=True)]
 
-    def _answered(self, encoded: Sequence[Sequence[Encoded]], asked: Sequence[Mapping[str, Question]]
-                ) -> list[tuple[dict[str, Answer], Usage]]:
-        """Each request's answers and usage, from the rows it encodes to (`_encoded`) and its
-        questions, every request's rows scored together within the budget."""
-        requests = list(zip(encoded, asked, strict=True))
-        logits = iter(self.logits([row for own, _ in requests for row in own]))
-        return [self._replied(questions, own, [next(logits) for _ in own]) for own, questions in requests]
+    @staticmethod
+    def _contexts(requests: Sequence[object], contexts: Sequence[JSON | None] | None) -> list[JSON | None]:
+        """Each request's context, in order (`contexts`), none for each where none is given."""
+        held: list[JSON | None] = [None] * len(requests) if contexts is None else list(contexts)
+        if len(held) != len(requests):
+            raise ValueError(f"{len(held)} contexts for {len(requests)} requests")
+        return held
+
+    def _laid(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image] = (),
+              context: JSON | None = None, *, request: Mapping[str, Question] | None = None,
+              tokens: Sequence[int] | None = None) -> list["_Row"]:
+        """A request's rows as one server scores them (`_Row`): its one row with its images laid out before
+        its state (`_shown`), or its text rows (`_encoded`)."""
+        if images:
+            return [_Row(*self._shown(state, questions, images, context, request=request))]
+        return [_Row(row) for row in self._encoded(state, questions, context=context, request=request,
+                                                   tokens=tokens)]
+
+    def _answered(self, laid: Sequence[Sequence["_Row"]], asked: Sequence[Mapping[str, Question]]
+                  ) -> list[tuple[dict[str, Answer], Usage]]:
+        """Each request's answers and usage, from its rows (`_laid`) and its questions: every request's
+        rows, text and images alike, scored by one server of the task's passes (`_rows_scored`), alike
+        image rows joined in a pass (rows 9634, 9661: a request of images ran a pass of its own)."""
+        scores = iter(self._rows_scored([row for rows in laid for row in rows]))
+        return [self._replied(questions, [row.encoded for row in rows], [next(scores) for _ in rows])
+                for rows, questions in zip(laid, asked, strict=True)]
 
     def _replied(self, questions: Mapping[str, Question], rows: Sequence[Encoded],
                  scores: Sequence[np.ndarray]) -> tuple[dict[str, Answer], Usage]:
@@ -1028,13 +1039,6 @@ class Decide(SavedRunTask, InItsForm):
         window, which the shortest length (`pass_shapes`) is."""
         return self.layout.rows(self.tokenizer, self.specials, "", {"q": Choice("x", ["0"])})
 
-    def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
-              context: JSON | None = None, *, request: Mapping[str, Question] | None = None
-              ) -> tuple[dict[str, Answer], Usage]:
-        """One request's answers and usage, its images laid out in its one row, its questions asked from
-        `request` where they are a part of it."""
-        return self._looked(questions, *self._shown(state, questions, images, context, request=request))
-
     def _shown(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
                context: JSON | None = None, *, request: Mapping[str, Question] | None = None
                ) -> tuple[Encoded, Images]:
@@ -1046,11 +1050,6 @@ class Decide(SavedRunTask, InItsForm):
         if len(rows) != 1:
             raise ValueError("a request's images go in a layout of one row")
         return rows[0], media
-
-    def _looked(self, questions: Mapping[str, Question], row: Encoded, media: Images
-                ) -> tuple[dict[str, Answer], Usage]:
-        """A request's answers and usage from its one row and images (`_shown`), by a pass of its own."""
-        return self._replied(questions, [row], self._seen_pass([(row, media)]))
 
     def _seen_pass(self, rows: Sequence[tuple[Encoded, Images]],
                    variables: Variables | None = None) -> list[np.ndarray]:
@@ -1230,9 +1229,9 @@ class Decide(SavedRunTask, InItsForm):
         names = {key: key.rsplit("/", 1)[0] for key in played}
         # The state's tokens encoded once for every group's row (`Layout.state`).
         tokens = self.layout.state(self.tokenizer, self.specials, state)
-        encoded = [self._encoded(state, {names[key]: question}, request=request, tokens=tokens)
-                   for key, question in played.items()]
-        answered = self._answered(encoded, [{names[key]: question} for key, question in played.items()])
+        laid = [self._laid(state, {names[key]: question}, request=request, tokens=tokens)
+                for key, question in played.items()]
+        answered = self._answered(laid, [{names[key]: question} for key, question in played.items()])
         return {key: answers[names[key]] for key, (answers, _) in zip(played, answered, strict=True)}
 
     def _finalists(self, state: JSON, questions: Mapping[str, Question], rounds: Finalists

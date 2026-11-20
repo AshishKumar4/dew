@@ -127,6 +127,10 @@ class Chunk(recurrence.Gated):
     `[B, Hv, Dk, Dv]` is the memory entering, zero where None, and `starts` `[B, S]` marks packed
     documents' first tokens, each from a zero memory, `firsts` their rows' documents' first slots as the
     batch built them (`dew.batch.Coordinates.firsts`; the kernels sort them from `starts` where None).
+    Under `Hooks.substeps` (DeltaProduct's) `key`, `value` and `beta` hold a token's `m` updates in turn,
+    `[B, S m, ...]`, and every other operand its `S` tokens.
+    Under Oja's rule (`recurrence.Hooks.erase` 'values') `log_decay` is `[B, S, Hv, Dv]`, a decay along the
+    values.
     `erase_key` and `erase_read` `[B, S, Hk, Dk]` are an erase of its own's vectors (`recurrence.Hooks.erase`
     'untied' or 'additive'), `value_decay` `[B, S, Hv, Dv]` the log decay along the values
     (`Hooks.value_decay`); under Oja's rule (`Hooks.erase` 'values') `log_decay` is `[B, S, Hv, Dv]`, a
@@ -169,11 +173,8 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
     `corrected_by`, `D h + beta k (v + c^T D h)^T`): the first the token's decay and its erase, keys `a`,
     values zero, gate `beta` and reader `c = -b`; the second no decay and its write, keys `k`, values `v`,
     gate `beta`, no correction; its query on the second, a packed document from its first. The erase vectors
-    each key head's over its value heads.
-    `(query, key, value, g, beta, correction, starts, firsts)`, laid `[B, 2S, ...]`, its second token's
-    output the call's; a call of the keys' own erase as given, no correction."""
-    if hooks.erase != 'untied':
-        return query, key, value, g, beta, None, starts, firsts
+    each key head's over its value heads. `(query, key, value, g, beta, correction, starts, firsts)`, laid
+    `[B, 2S, ...]`, its second token's output the call's (`_laid`)."""
     heads = value.shape[2]
     a, b = (jnp.repeat(given[name], heads // given[name].shape[2], axis=2).astype(g.dtype)
             for name in ('erase_key', 'erase_read'))
@@ -209,6 +210,15 @@ def _read_checked(hooks: recurrence.Hooks, operands: Chunk) -> dict:
     if 'log_decay' in given and given['log_decay'].ndim != ranks[hooks.decay]:
         raise ValueError(f"a {hooks.decay} decay is {ranks[hooks.decay]}-dimensional, [B, S, Hv"
                          f"{', Dk' * (hooks.decay == 'vector')}], not {given['log_decay'].shape}")
+    tokens = given['query'].shape[1]
+    stepped = {name: given[name].shape[1] for name in ('key', 'value', 'beta') if name in given}
+    held = {name: given[name].shape[1] for name in ('log_decay', 'z') if name in given}
+    if operands.starts is not None:
+        held['starts'] = operands.starts.shape[1]
+    if any(length != tokens * hooks.substeps for length in stepped.values()) or any(
+            length != tokens for length in held.values()):
+        raise ValueError(f"{tokens} tokens of {hooks.substeps} updates each take keys, values and write "
+                         f"gates of {tokens * hooks.substeps} and a decay of {tokens}, not {stepped | held}")
     return given
 
 
@@ -228,7 +238,9 @@ def _prologue_of(hooks: recurrence.Hooks, operands: Chunk, dtype) -> tuple:
         query, key = (l2norm(x.astype(work)).astype(x.dtype) for x in (query, key))
     scale = (key.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
     g, beta = recurrence.log_gates(hooks, given, work)
-    g = jnp.zeros(value.shape[:3], work) if g is None else g
+    # No decay a token's (the queries' tokens: a token of updates, `Hooks.substeps`, decays once), and every
+    # update's own write gate of one.
+    g = jnp.zeros((*query.shape[:2], value.shape[2]), work) if g is None else g
     beta = jnp.ones(value.shape[:3], work) if beta is None else beta
     return given, query, key, value, g, beta, scale, dtype, work
 
@@ -266,9 +278,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # at a time until the algebra corrects the memory before its decay (row 9670).
         return _token_loop(hooks, operands, dtype=dtype)
     given, query, key, value, g, beta, scale, dtype, work = _prologue_of(hooks, operands, dtype)
-    state, starts, firsts = operands.state, operands.starts, operands.firsts
-    query, key, value, g, beta, correction, starts, firsts = _erases_laid(hooks, query, key, value, g, beta,
-                                                                           given, starts, firsts)
+    state = operands.state
+    (query, key, value, g, beta, correction, starts, firsts, max_segments), stride = _laid(
+        hooks, (query, key, value, g, beta), given, operands.starts, operands.firsts, max_segments)
     forked = None
     if operands.loads is not None:
         forked = Forked.of(operands, starts, firsts, work)
@@ -348,9 +360,45 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                   state, starts, firsts, given.get('turn'), correction,
                                   given['value_decay'].astype(work) if hooks.value_decay else None,
                                   *(() if forked is None else forked.walked), parameters=(5,))
-    # An erased token's output its second laid token's; the epilogue in work, the output rounded once.
-    out = out if correction is None else out[:, 1::2]
+    # A token's output its last laid token's (`_laid`); the epilogue in work, the output rounded once.
+    out = out[:, stride - 1::stride]
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
+
+
+def _laid(hooks: recurrence.Hooks, tokens: tuple, given: dict, starts, firsts, max_segments: int | None):
+    """A call's `tokens` `(query, key, value, g, beta)` laid as the op's tokens: a token's updates in turn
+    (`_substeps_laid`, `Hooks.substeps`), an erase of its own's two tokens (`_erases_laid`), or as given,
+    each a form of its own (`recurrence.Hooks`' validation). `((query, key, value, g, beta, correction,
+    starts, firsts, max_segments), stride)`: the laid tokens a call's token takes, its output its last's."""
+    query, key, value, g, beta = tokens
+    if hooks.substeps > 1:
+        query, g, starts, firsts, max_segments = _substeps_laid(hooks.substeps, query, g, starts, firsts,
+                                                                max_segments)
+        return (query, key, value, g, beta, None, starts, firsts, max_segments), hooks.substeps
+    if hooks.erase == 'untied':
+        return (*_erases_laid(hooks, query, key, value, g, beta, given, starts, firsts), max_segments), 2
+    return (query, key, value, g, beta, None, starts, firsts, max_segments), 1
+
+
+def _substeps_laid(substeps: int, query, g, starts, firsts, max_segments: int | None):
+    """A call of `substeps` delta-rule updates a token (`Hooks.substeps`, DeltaProduct's) as the op's tokens,
+    its keys', values' and write gates' own in turn: each token's query on its last update (zeros on the
+    others, whose outputs the op drops) and its decay on its first (zeros, no decay, on the others), a packed
+    document from its first token's first update, fla's `chunk_gated_delta_product`'s layout; a row of
+    packed documents at most a document a token where `max_segments` bounds none, its updates holding none
+    of their own."""
+    if starts is not None and max_segments is None:
+        max_segments = starts.shape[1]
+    def spread(x, at: int):
+        # Padded beside each token on an axis of its own, so the laid operand keeps the token's placement.
+        before = at % substeps
+        widths = ((0, 0), (0, 0), (before, substeps - 1 - before)) + ((0, 0),) * (x.ndim - 2)
+        laid = jnp.pad(x[:, :, None], widths)
+        return laid.reshape(x.shape[0], x.shape[1] * substeps, *x.shape[2:])
+
+    return (spread(query, -1), None if g is None else spread(g, 0),
+            None if starts is None else spread(starts, 0), None if firsts is None else firsts * substeps,
+            max_segments)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -647,10 +695,9 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 row=INHERENT, kind='measured'),
     Requirement('backward', lambda case: case.product != 'training' or _trains(case.call),
                 "a gradient the template's fast backward does not take (`mainloop_backward."
-                "fast_backward_form`): fp32 operands in three bf16 parts (under the accurate forms, or "
-                "without the delta rule under either, `chunk_rounding`: their training the portable math's "
-                "until the template's fp32 backward, row 2076), an fp16 call without the delta rule, a decay "
-                "a key dimension without it; or launches past the device's registers or shared memory at the "
+                "fast_backward_form`): an fp32 decay a key dimension in three bf16 parts, an fp16 call "
+                "without the delta rule, a decay a key dimension without it, or a bf16 unrounded call with "
+                "a wide fp32 output; or launches past the device's registers or shared memory at the "
                 "call's tiles (`template.backward_holds`)", row='ledger 1294'),
     Requirement('precision', lambda case: exact_products(None, case.dtype),
                 "a dot algorithm the run declares that narrows the operands' products (TF32's, bf16 parts of "
