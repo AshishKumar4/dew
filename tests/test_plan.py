@@ -1794,22 +1794,23 @@ def fitted_once(trainer: Trainer) -> None:
 @functools.cache
 def muon_needs() -> tuple[int, int, JSON]:
     """The rooms the cells below free for the Muon step (`muon_lm`) before its state is placed
-    (`free_until_placed`), and the parted step's remat. Each is beyond what the step needs beside what a
-    device holds with its Newton-Schulz stacks joined, short of it, and holds the bytes of the arguments the
-    devices hold none of yet, which a fit plans its step beside before placing them: the first is half way to
-    what it needs with them parted (`ns_group` 1), the second half way to the most of that and of what it
-    needs with its stacks grouped by four recomputing 'minimal', the rung a stated group's climb reaches
-    first that frees anything. Freed as `free` frees, without the arguments and never taken by them, no rung
-    of that plan fitted and the placed devices' room passed the joined step: the fit searched its ladder
-    again once placed (row 8606: 129 s a cell). Measured once."""
+    (`free_until_placed`), and the parted step's remat. Each holds the bytes of the arguments the devices
+    hold none of yet, which a fit plans its step beside before placing them, and lies past what the step
+    needs beside what a device holds with its Newton-Schulz stacks parted (`ns_group` 1): the first half way
+    from there to what it needs with them joined, the second half way from the most of that and of what it
+    needs with them grouped by four recomputing 'minimal', the first rung of that group's climb that frees
+    anything, to what it needs grouped by four. Freed as `free` frees, without the arguments and never taken
+    by them, no rung of that plan fitted and the placed devices' room passed the joined step: the fit
+    searched its ladder again once placed (row 8606: 129 s a cell). Measured once."""
     with pytest.MonkeyPatch.context() as monkeypatch:
         joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
+        grouped = needs(monkeypatch, trainer := muon_lm(ns_group=4), lambda: fitted_once(trainer))
         recomputing = needs(monkeypatch, trainer := muon_lm("minimal", ns_group=4),
                             lambda: fitted_once(trainer))
         parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
-    assert max(parted, recomputing) < joined, (parted, recomputing, joined)
+    assert parted < joined and max(parted, recomputing) < grouped, (parted, recomputing, grouped, joined)
     arguments = trainer.plan["probes"][0]["argument"]
-    return ((joined + parted) // 2 + arguments, (joined + max(parted, recomputing)) // 2 + arguments,
+    return ((joined + parted) // 2 + arguments, (grouped + max(parted, recomputing)) // 2 + arguments,
             trainer.plan["remat"])
 
 
