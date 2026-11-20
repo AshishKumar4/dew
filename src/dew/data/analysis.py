@@ -708,7 +708,7 @@ def _cache_view(stages: Sequence[Stage]) -> str | None:
             continue
         if not _cacheable(stage):
             return f"{type(stage).__name__} is no deterministic record step a cache can key"
-        if index < last and (_drops(stage) or isinstance(stage, FlatMap)):
+        if index < last and (_drops(stage, stages[index + 1:]) or isinstance(stage, FlatMap)):
             view = type(stages[last]).__name__
             return (f"{type(stage).__name__} before {view} drops or expands records, so the view orders "
                     "other rows than the source's inputs (expansions and drops before a view: roadmap 803b)")
@@ -728,8 +728,9 @@ def _one_to_one(stages: Sequence[Stage]) -> bool:
     order (`dew.data.lowering._Inputs`); one that drops or expands is read as a stream, per share. A
     step a run's facts haven't bound yet (`Configured`) may drop records once bound, so it counts as
     one that does unless it states it keeps one for each (`Configured.one_to_one`)."""
-    return not any(_drops(stage) or (isinstance(stage, Configured) and not stage.one_to_one)
-                   for stage in stages)
+    return not any(_drops(stage, stages[index + 1:])
+                   or (isinstance(stage, Configured) and not stage.one_to_one)
+                   for index, stage in enumerate(stages))
 
 
 def _indexed_cache(prefix: Sequence[Stage], read: Read) -> bool:
@@ -761,12 +762,14 @@ def _volatile(stage: Stage) -> bool:
     return ran is not None and isinstance(ran.step, Volatile) and ran.step.volatile
 
 
-def _drops(stage: Stage) -> bool:
+def _drops(stage: Stage, after: Sequence[Stage] = ()) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
     the rows before it, one for one: a batched step that keeps its rows' count (`Batched.same_rows`) is
-    none, its groups formed in the order's own records (row 9007)."""
+    none, its groups formed in the order's own consecutive records (row 9007), where nothing `after` it
+    reads them out of their order (a global shuffle, whose random reads would each make a row's whole
+    group again, row 9711): it then reads as a stream, as one that drops does."""
     if isinstance(stage, Batched):
-        return not stage.same_rows
+        return not stage.same_rows or any(isinstance(later, Shuffle) for later in after)
     return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native)) or rejects(stage)
 
 
@@ -1158,7 +1161,8 @@ def _checked(
             random = _identity(stage).name
             if validation and not canonical:
                 raise ValueError(f"validation random step {random} must use the canonical record index")
-        reorders = isinstance(stage, (Shuffle, Repeat, Slice, Limit)) or _drops(stage)
+        drops = _drops(stage, pipeline.stages[index + 1:])
+        reorders = isinstance(stage, (Shuffle, Repeat, Slice, Limit)) or drops
         canonical = canonical and not reorders
         if isinstance(stage, Artifact):
             if random is not None:
@@ -1194,13 +1198,13 @@ def _checked(
         # share.
         on_pool = pooled(stage) and index >= eager
         streams = isinstance(stage, (Interleave, Workers, BatchStage, TokenBudget)) or (
-            _drops(stage) and index >= eager
+            drops and index >= eager
         ) or on_pool
         # A cache reads as the stages it holds would: by index and in one order where they keep one
         # record for each input, as a stream and per share where they drop or expand them.
         streamed_cache = isinstance(stage, Artifact) and not _indexed_cache(prefix, read)
         indexed = indexed and not (streams or (streamed_cache and read != "memory"))
-        shared = _drops(stage) or isinstance(stage, (Interleave, TokenBudget)) or streamed_cache or on_pool
+        shared = drops or isinstance(stage, (Interleave, TokenBudget)) or streamed_cache or on_pool
         per_share = per_share or shared or (isinstance(stage, Workers) and not batched)
         batched = _check_batch(stage, batched=batched, name=name)
         if isinstance(stage, Workers):
@@ -1257,7 +1261,8 @@ def _measured_members(pipeline: Pipeline) -> list[Source]:
     if isinstance(source, Mixture) and source.seed is None and source.tokens is None:
         found += [child.source for child in source.pipelines
                   if not isinstance(child.source, Combined)
-                  and not any(isinstance(stage, Repeat) or _drops(stage) for stage in child.stages)]
+                  and not any(isinstance(stage, Repeat) or _drops(stage, child.stages[index + 1:])
+                              for index, stage in enumerate(child.stages))]
     return found
 
 
