@@ -169,7 +169,23 @@ FOREIGN |= {"dew.registry": (
 FOREIGN |= {"dew.quantization": ("dew.training",),
             **dict.fromkeys(("dew.inputs.condition", "dew.inputs.diffusion", "dew.inputs.encoders",
                              "dew.inputs.spec"), ("dew.interop",))}
-
+# Attention routing and linear layers load no GPU template mainloop or ring machinery on import: the
+# mainloops import inside the functions that derive or launch them (FS-IMPORT-CHAIN).
+_ATTENTION_MAINLOOPS = (
+    "dew.nn.kernels.templates.mosaic",
+    "dew.nn.kernels.templates.bundles",
+    "dew.nn.kernels.templates.rings",
+    "dew.nn.kernels.templates.bodies",
+    "dew.nn.kernels.templates.attention_mosaic",
+    "dew.nn.kernels.templates.attention_decode",
+    "dew.nn.kernels.templates.attention_triton",
+    "dew.nn.kernels.templates.attention_portable",
+)
+FOREIGN |= dict.fromkeys(
+    ("dew.nn.attention", "dew.nn.attention_kernels", "dew.nn.kernels.templates.attention_route",
+     "dew.nn.linear"),
+    _ATTENTION_MAINLOOPS,
+)
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))
 def test_a_module_imports_its_own_domain_alone(module):
