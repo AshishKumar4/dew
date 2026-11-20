@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from arm_forms import ROUNDED
 from check1_wire import CENSUS
 from gate_cases import a_product_draw, cancelling, cancelling_draw, product_draws
 from one_draw import assert_as_exact_as_the_reference
@@ -725,6 +726,57 @@ def test_a_whole_recording_with_pilots_is_sized_against_itself_on_its_pilots_alo
 
     seeds_for(reference, counted, "a whole recording's pilots", truth_fn=truth, most=8)
     assert min(asked) >= SIZING_FROM
+
+
+def _tripled(seed):
+    return (np.random.default_rng(seed).standard_normal(64).astype(np.float32), np.int32(seed))
+
+
+def test_a_site_held_to_its_truth_rounded_once_evaluates_no_truth_of_its_own():
+    """`ROUNDED`, the reference of draws whose truth float32 rounds once: float32's own product of x by three,
+    one rounding of the exact product, passes against its float64 truth rounded once, the truth evaluated as
+    often as at a site whose reference is a function (no second float64 run of it, rows 9481, 9515, 9532);
+    an arm an ulp past it everywhere fails."""
+    counted = []
+
+    def truth(x, seed):
+        counted.append(int(seed))
+        return np.asarray(x, np.float64) * 3.0
+
+    def calls(reference_fn) -> int:
+        counted.clear()
+        assert_as_exact(lambda x, seed: x * 3, reference_fn, _tripled, "x thrice", seeds=8,
+                        truth_fn=as_given(truth))
+        return len(counted)
+
+    assert calls(ROUNDED) == calls(lambda x, seed: x * 3)
+    with pytest.raises(AssertionError):
+        assert_as_exact(lambda x, seed: jnp.nextafter(x * 3, jnp.inf), ROUNDED, _tripled,
+                        "an ulp past x thrice", seeds=8, truth_fn=as_given(truth))
+
+
+def test_a_sites_held_condition_meets_every_result_of_dews_arm_and_fails_it():
+    """A site's `held(outputs, inputs)` is called on each result of Dew's arm the gate draws, its draws'
+    every seed among them, and its failure is the site's."""
+    seen = set()
+
+    def held(outputs, inputs):
+        np.testing.assert_array_equal(np.asarray(outputs), np.asarray(inputs[0]) * 3)
+        seen.add(int(inputs[1]))
+
+    assert_as_exact(lambda x, seed: x * 3, lambda x, seed: x * 3, _tripled, "x thrice, held", seeds=8,
+                    held=held)
+    assert seen == set(range(8))
+
+    class Refused(AssertionError):
+        """The condition's failure."""
+
+    def refusing(outputs, inputs):
+        raise Refused
+
+    with pytest.raises(Refused):
+        assert_as_exact(lambda x, seed: x * 3, lambda x, seed: x * 3, _tripled, "x thrice, refused",
+                        seeds=8, held=refusing)
 
 
 def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():

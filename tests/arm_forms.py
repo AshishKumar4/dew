@@ -4,6 +4,8 @@ YNNPACK's fusions (`without_ynn`, `_arms`) or as Dew's users compile them, a ref
 (`windows`, `over_windows`) and declared to vary from run to run (`run_to_run`), each an adapter
 `reference_error`'s check 1 reads through (`_layers`)."""
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import os
@@ -190,6 +192,66 @@ def as_recorded[Arm: Callable](fn: Arm, pilots: range | None = None) -> Arm:
     if pilots is not None:
         vars(fn)["pilots"] = pilots
     return fn
+
+
+
+HELD: contextvars.ContextVar[Callable | None] = contextvars.ContextVar("held", default=None)
+"""The site's `held` (`reference_error.assert_as_exact`), called on every result of Dew's arm a draw of it
+makes (`_drawn`), wherever check 1 draws it: a stage, a sizing, a map task, a prepared run."""
+
+
+@contextlib.contextmanager
+def holding(held: Callable | None):
+    """`held` (`HELD`) for the site judged within, where given."""
+    token = HELD.set(held)
+    try:
+        yield
+    finally:
+        HELD.reset(token)
+
+
+class _RoundedTruth:
+    """`ROUNDED`, a reference that is check 1's own float64 truth of each draw (its live or prepared run,
+    `reference_error._draw_truth`) rounded once to float32 (`rounded_like`), formed from that truth by the
+    gate (`reference_error._arm_ran`) and never run: an arm run as given, so Dew's arm compiles as its users
+    run it, with the fusions (`_arms`), and holds no program a store compiles. The reference of draws whose
+    truth float32 holds exactly or rounds once, which Dew must equal: a second float64 run of the truth,
+    computed under the arms' arithmetic preset (a CPU's float32 sums), was a second owner of check 1's truth
+    and computed it otherwise (rows 9481, 9515, 9532)."""
+
+    as_given, recorded, rounded, programs = True, False, True, None
+
+    def __repr__(self) -> str:
+        return "ROUNDED"
+
+    def __call__(self, *inputs, **options):
+        raise TypeError("ROUNDED is check 1's own truth of a draw rounded once, which the gate forms from "
+                        "that truth (`reference_error._arm_ran`); it is never run")
+
+
+ROUNDED = _RoundedTruth()
+
+
+def rounded_like(truth, made):
+    """`truth`'s float64 leaves each rounded once to float32 (NumPy's cast: to nearest, ties to even), the
+    dtype of `made`'s leaf there (Dew's arm's result), whose tree it is: refused for a leaf of another dtype,
+    which no one rounding of a float64 reaches as a float32's does."""
+    def once(true, leaf):
+        if np.dtype(leaf.dtype) != np.float32:
+            raise TypeError(f"ROUNDED rounds a float64 truth to float32 once; Dew's leaf is {leaf.dtype}")
+        return np.asarray(true, np.float64).astype(np.float32)
+
+    return jax.tree.map(once, truth, made)
+
+
+def refuse_rounded(label: str, reference_fn, *, truth_fn, followed, conditioning) -> None:
+    """Refuse `ROUNDED` as `label`'s reference without the `truth_fn` it rounds (it has none of its own),
+    beside `followed` roundings (each arm's own truth) or a weighed check (`conditioning`, its reference's
+    own rounding)."""
+    if reference_fn is ROUNDED and (truth_fn is None or followed is not None or conditioning is not None):
+        raise ValueError(f"{label}: ROUNDED is the site's float64 truth rounded once: it takes `truth_fn`, "
+                         f"and no followed roundings or weighed check, whose truths or scales are no one "
+                         f"truth")
 
 
 def as_given(fn, programs: Callable | None = None):

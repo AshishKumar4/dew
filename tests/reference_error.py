@@ -78,6 +78,7 @@ import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import FORMATTED, Truth, rounds_nothing, summed_as_run, unrewritten, widened
 from arm_forms import (
+    HELD,
     _arms,
     _arms_with,
     _declared,
@@ -95,7 +96,10 @@ from arm_forms import (
     as_recorded as as_recorded,
     dew_path as dew_path,
     dew_programs as dew_programs,
+    holding,
     over_windows as over_windows,
+    refuse_rounded,
+    rounded_like,
     run_to_run as run_to_run,
     stacked_on_host as stacked_on_host,
     windows as windows,
@@ -507,6 +511,20 @@ def _arm_name(arm, reference_fn, library_fn, at_arm: int) -> str:
     reference by its place among the arms."""
     return ("the reference" if arm is reference_fn else "the library arm" if arm is library_fn
             else f"reference {at_arm}")
+
+
+def _arm_ran(label: str, arm, dew_fn, dew, here, mine_at, true_here, name: str | None):
+    """An arm's result on `here` beside Dew's (`dew`, on `mine_at`): Dew's own where the arm is Dew's on its
+    inputs, check 1's own truth of `here` rounded once (`true_here`, `rounded_like`) where it is `ROUNDED`,
+    else the arm run, and with a `name` (the draw's first, its own order) held to be a function of its inputs
+    (`_of_its_inputs`), as every arm whose result enters the verdict is: the reference, the library arm and
+    each further reference, each run again."""
+    if getattr(arm, "rounded", False):
+        return rounded_like(true_here, dew)
+    other = dew if dew_fn is arm and here is mine_at else arm(*here)
+    if name is not None and arm is not dew_fn:
+        _of_its_inputs(label, name, arm, here, other)
+    return other
 
 
 def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
@@ -1211,6 +1229,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 if not at and mine_at is ordered[0][0]:
                     _of_its_inputs(label, "Dew's arm", dew_fn, mine_at, dew)
             dew = dew if ran is None else ran.judged
+            if (held := HELD.get()) is not None:
+                held(dew, mine_at)
             # The leaves judged: a weighed arm's split into its heavy and light classes (`Weighed.classed`).
             if names is None:
                 names, widths = _judged_leaves(dew, None if weighed is None else weighed[id(truth)])
@@ -1223,12 +1243,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 here, true_here, terms_here = ((theirs_at, their_truth, their_terms) if arm is reference_fn
                                                else (mine_at, truth, terms))
                 with summed_as_run():
-                    other = dew if dew_fn is arm and here is mine_at else arm(*here)
-                    # Every arm whose result enters the verdict is a function of its inputs: the
-                    # reference, the library arm and each further reference, each run again.
-                    if not at and arm is not dew_fn and mine_at is ordered[0][0]:
-                        _of_its_inputs(label, _arm_name(arm, reference_fn, library_fn, at_arm), arm, here,
-                                       other)
+                    other = _arm_ran(label, arm, dew_fn, dew, here, mine_at, true_here, None if at or (
+                        mine_at is not ordered[0][0]) else _arm_name(arm, reference_fn, library_fn, at_arm))
                 other, true_here = _own_truth(prepared_followed, followed, other, here, true_here, arm)
                 shared = true_here is truth
                 if weighed is not None:
@@ -1371,7 +1387,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
                     terms: bool | Callable | None = None, examples: bool = False,
                     conditioning: int | None = None, conditioning_scale: Callable | None = None,
-                    followed: Callable | None = None) -> None:
+                    followed: Callable | None = None, held: Callable | None = None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1389,16 +1405,12 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     paired with the reference does. The gate compiles the two functions (`_arms`), once for every seed:
     two Dew paths without YNNPACK's fusions, a Dew arm beside an arm run `as_given` with them.
 
-    Where a computation has an orbit of summation orders, `orders(inputs)` lists a draw's inputs at K
-    of them, the draw itself first: an exact symmetry of the result (a batch's rows in another order
-    under a mean, a sum's terms in another), so one truth holds at every order. Both arms run at every
-    one (`_drawn`), and each one's worst row is its worst over them, compared alike; the pooled ratio,
-    the rows of float64 zero and the sizing stay the draw's own order's. A row that nearly cancels
-    rounds worst at some orders and well at others, so one order's worst row is no measure of it, and
-    the reference's luckiest order would fail an equally exact Dew; over the orbit Dew's worst is held
-    within ROW_FACTOR of the reference's worst at any of the same orders, which is as strict as the
-    reference is spread over them: a Dew worse than the reference at every order still fails, and one
-    the reference is exact against at every order fails at any order it is not.
+    `orders(inputs)` lists a draw's inputs at K orders of an orbit of summation orders, the draw's own first
+    (`_judged_site`). `ROUNDED` as the reference (`arm_forms.ROUNDED`, with `truth_fn`) holds Dew to check
+    1's own float64 truth of each draw rounded once, no evaluation of its own: the reference of draws whose
+    truth float32 holds exactly or rounds once, which Dew must equal (rows 9481, 9515, 9532). `held(outputs,
+    inputs)`, where given, is called on every result of Dew's arm a draw of the site's makes (its stages, a
+    sizing's and a map task's draws, a prepared run's), its AssertionError the site's failure.
 
     A leaf passes when its pooled ratio (`_pooled`) is at most PARITY and its seeds resolve it: the
     ratio's bootstrap interval over them (tails LOWER_TAIL and UPPER_TAIL, widened to hold the ratio)
@@ -1468,6 +1480,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     # are the plain pair's still: sizing reads no terms, so such a site sized nothing and never went stale
     # (spec alignment, 9044).
     plain = not (library_fn or also or callable(terms) or conditioning)
+    refuse_rounded(label, reference_fn, truth_fn=truth_fn, followed=followed, conditioning=conditioning)
     store = COMPILED.get()
     if store is not None and conditioning is not None:
         raise ValueError(f"{label}: a weighed site reads its reference's own rounding at its truth's inputs, "
@@ -1477,21 +1490,33 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
             _compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn,
                           terms=terms, also=also, orders=orders, plain=plain, library_fn=library_fn)
         return
-    if os.environ.get(QUALIFY) and not (drawing() or judging()):
-        _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
-                   examples=examples, plain=plain, followed=followed)
-    with judged(label):
-        _judged_site(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
-                     library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
-                     terms=terms, examples=examples, conditioning=conditioning,
-                     conditioning_scale=conditioning_scale, followed=followed)
+    with holding(held):
+        if os.environ.get(QUALIFY) and not (drawing() or judging()):
+            _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
+                       examples=examples, plain=plain, followed=followed)
+        with judged(label):
+            _judged_site(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
+                         library_fn=library_fn, library_row=library_row, library_leaves=library_leaves,
+                         also=also, terms=terms, examples=examples, conditioning=conditioning,
+                         conditioning_scale=conditioning_scale, followed=followed)
 
 
 def _judged_site(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
                  library_row, library_leaves, also, terms, examples, conditioning, conditioning_scale,
                  followed) -> None:
     """`assert_as_exact`'s site judged, deferred to the weighed check where it states `conditioning`: its
-    truths computed by the programs a store compiled ahead where one is read (`truths_ahead.running`)."""
+    truths computed by the programs a store compiled ahead where one is read (`truths_ahead.running`).
+
+    Where a computation has an orbit of summation orders, `orders(inputs)` lists a draw's inputs at K
+    of them, the draw itself first: an exact symmetry of the result (a batch's rows in another order
+    under a mean, a sum's terms in another), so one truth holds at every order. Both arms run at every
+    one (`_drawn`), and each one's worst row is its worst over them, compared alike; the pooled ratio,
+    the rows of float64 zero and the sizing stay the draw's own order's. A row that nearly cancels
+    rounds worst at some orders and well at others, so one order's worst row is no measure of it, and
+    the reference's luckiest order would fail an equally exact Dew; over the orbit Dew's worst is held
+    within ROW_FACTOR of the reference's worst at any of the same orders, which is as strict as the
+    reference is spread over them: a Dew worse than the reference at every order still fails, and one
+    the reference is exact against at every order fails at any order it is not."""
     if conditioning is not None:
         _deferred(dew_fn, reference_fn, draw, label, seeds=seeds, conditioning=conditioning,
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
