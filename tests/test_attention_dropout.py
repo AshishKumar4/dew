@@ -638,16 +638,16 @@ def test_split_delta_keeps_tiny_others_when_anchor_times_multiplier_overflows():
     anchor, delta, chosen = attention_gradient.split_delta(
         others, own, others_total, total, state_total, anchor_value, dout_zero, key_index, shift,
         rows=attention_gradient.summed_rows, dropped=power, power=power)
-    truth_delta = (weight * (2.0 ** -126) * (2.0 ** 20) * power) / (1.0 + weight)
+    expected_delta = np.float32(weight * 2.0 ** -126 * power) * np.float32(2.0 ** 20)
     assert float(anchor[0, 0, 0]) == 0.0
     assert int(chosen[0, 0, 0]) == 0
-    np.testing.assert_allclose(float(delta[0, 0, 0]), truth_delta, rtol=1e-6)
+    assert float(delta[0, 0, 0]) == float(expected_delta)
     dout_small = jnp.array([[[[2.0 ** -40, 2.0 ** 20]]]], jnp.float32)
     anchor2, delta2, _ = attention_gradient.split_delta(
         others, own, others_total, total, state_total, anchor_value, dout_small, key_index, shift,
         rows=attention_gradient.summed_rows, dropped=power, power=power)
     assert np.isfinite(float(anchor2[0, 0, 0])) and np.isfinite(float(delta2[0, 0, 0]))
-    np.testing.assert_allclose(float(anchor2[0, 0, 0]), 2.0 ** 93, rtol=1e-6)
+    assert float(anchor2[0, 0, 0]) == 2.0 ** 93
 
 
 def test_a_mosaic_dropping_backwards_large_anchor_does_not_flush_tiny_others():
