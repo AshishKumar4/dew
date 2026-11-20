@@ -889,7 +889,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
                             sampling=self.sampled(Sampling() if samples is None else samples.sampling),
                             **processor_settings(self.processor), prefix=self.prefix,
-                            adaptation=None if self.adaptation is None else to_record(self.adaptation))
+                            adaptation=None if self.adaptation is None else to_record(self.adaptation,
+                                                                                       ChunkAdaptation))
 
     def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
         """Refuse a batch's blocks where no trunk layer reads them, where prediction depths would read

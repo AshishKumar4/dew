@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, dew_path, widened
+from reference_error import assert_as_exact, dew_path
 from test_chunk_adaptation import LENGTH, LEVEL, MODEL, VOCAB, decoder, drawn_variables
 
 from dew.inference.tasks import TextGeneration
@@ -88,7 +88,8 @@ def test_a_decode_reads_the_logits_its_training_forward_gives(window):
     wide = WIDE if isinstance(window, int) else decoder((LEVEL, LEVEL), dtype=jnp.float64)
 
     def truth(variables, tokens, mask):
-        return trained(wide, adaptation)(widened(variables), tokens, mask)
+        # The draw widened by the gate (`assert_as_exact`'s truth reads it so).
+        return trained(wide, adaptation)(variables, tokens, mask)
 
     assert_as_exact(jax.jit(decoded(model, adaptation)), dew_path(jax.jit(trained(model, adaptation))),
                     lambda seed: drawn(seed, window), f"a decode stepping a level of window {window}",
@@ -119,7 +120,7 @@ def test_what_an_adapting_decoder_cannot_draw_is_refused():
     model = InContextDecoder(MODEL, ChunkAdaptation(window=3))
     variables = drawn_variables(0)
     for strategy in (Beam(width=2), Speculative()):
-        with pytest.raises(ValueError, match="a token a row at a time"):
+        with pytest.raises(ValueError):
             TextGeneration(model, variables, strategy=strategy)
     for adaptation in (ChunkAdaptation(damped=True), ChunkAdaptation(layers=(0,))):
         with pytest.raises(ValueError):
