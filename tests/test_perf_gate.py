@@ -594,7 +594,7 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path
     assert mixed[dense] == 32.0 and not gate.measured(mixed[f"{dense} step"])
     table = tmp_path / "table.md"
     gate.report(SimpleNamespace(results=out, table=str(table), claim=False, verdicts=None))
-    [line] = [line for line in table.read_text().splitlines() if line.startswith(f"| {dense} ")]
+    [line] = [line for line in table.read_text().splitlines() if line.startswith(f"| {dense} |")]
     assert "start 2.00/18.00" in line and "compiled 18.00/18.00" in line
     a100 = SimpleNamespace(**{**vars(args), "kind": "a100", "rounds": 1, "only": ["finetune"],
                               "out": str(tmp_path / "a100.json")})
