@@ -1962,7 +1962,7 @@ class Binary:
     them (`reconfigured`: USETMAXREG's deallocation and allocation, its PTX's `setmaxnreg.dec` and `.inc`);
     None where it reconfigures none that way, or no disassembler read it."""
     uses_tmem: bool | None = None
-    """Whether its decoded SASS issues any Blackwell tensor-memory instruction (`_uses_tmem`); None undecoded."""
+    """Whether its decoded SASS issues Blackwell tensor-memory ops (`_uses_tmem`); None undecoded."""
     index: str | None = None
     """XLA uniquification suffix (`__1`) where a second cubin shares `(kernel, launch)`; None otherwise."""
 
@@ -2228,7 +2228,7 @@ _RECONFIGURED = re.compile(r"\bUSETMAXREG\.(DEALLOC|ALLOC|TRY_ALLOC)\S*\s+(?:UP\
 
 
 def _uses_tmem(listing: str) -> bool:
-    """Whether nvdisasm's `listing` issues any Blackwell tensor-memory instruction (`LDTM`, `STTM`, `UTC*`)."""
+    """Whether nvdisasm's `listing` issues Blackwell tensor-memory ops (`LDTM`, `STTM`, `UTC*`)."""
     return any(_parsed(found.group(2))[0].split(".")[0].startswith(("LDTM", "STTM", "UTC"))
                for line in listing.splitlines() if (found := _INSTRUCTION.search(line)))
 
