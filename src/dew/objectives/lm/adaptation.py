@@ -51,6 +51,7 @@ from dew.batch import (
     document_starts,
     prefix_sum,
     real_slots,
+    thaw,
     token_coordinates,
     token_layout,
 )
@@ -864,8 +865,9 @@ class InContextDecoder(nn.Module):
         self.put_variable("cache", IN_CONTEXT, self._opened(batch_size))
 
     def _read(self) -> dict:
-        """The variables `model` reads, its decode cache apart."""
-        return {name: tree for name, tree in self.variables.items() if name != "cache"}
+        """The variables `model` reads, its decode cache apart, its frozen leaves among its parameters
+        (`thaw`), as its training forward reads them."""
+        return thaw({name: tree for name, tree in self.variables.items() if name != "cache"})
 
     def _chain(self, rows: int) -> _Chain:
         """The training scan's chain over `rows` rows (`adapted_scores`'s) at `model`'s variables, a

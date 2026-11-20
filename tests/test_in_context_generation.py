@@ -213,6 +213,27 @@ def test_an_adapting_run_draws_what_its_saved_task_draws(tmp_path):
         np.testing.assert_array_equal(np.asarray(getattr(ran, field)), np.asarray(getattr(again, field)))
 
 
+def test_a_server_draws_what_its_adapting_task_draws():
+    """A server of an adapting decoder's task (`Server.from_task`), two slots for three requests so a
+    slot a finished request held seats another, draws each request's tokens as the task alone does: a
+    seated row's levels start from the run's, its chain the cache's own row (row 9066)."""
+    from dew.inference.serving import Server
+
+    model = InContextDecoder(plain(jnp.float32), ChunkAdaptation(window=3, rate=0.1))
+    task = TextGeneration(model, drawn_variables(0), sampling=Sampling(temperature=0, eos_token_ids=None))
+    rng = np.random.default_rng(5)
+    prompts = tuple(rng.integers(0, VOCAB, length).astype(np.int32) for length in (4, 2, 6))
+    server = Server.from_task(task, slots=2, capacity=32, admission=2)
+    assert server.mixed_refusal == model.mixed_admission_refusal()
+    tickets = [server.submit(prompt, length, key=index)
+               for index, (prompt, length) in enumerate(zip(prompts, (5, 3, 7), strict=True))]
+    server.run()
+    for index, (ticket, prompt, length) in enumerate(zip(tickets, prompts, (5, 3, 7), strict=True)):
+        served, alone = ticket.result().host(), task(prompt[None], length, key=index).host()
+        np.testing.assert_array_equal(served.tokens, alone.tokens)
+        np.testing.assert_array_equal(served.lengths, alone.lengths)
+
+
 def test_the_decoder_answers_its_models_generation_hooks():
     """The adapting decoder answers the hooks a generation reads as its model does (`dew.nn.protocols`):
     its bounds, its cache's layout and capacity, its LongRoPE rebuild, its projections, its blocks, its
