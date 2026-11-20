@@ -1543,8 +1543,8 @@ def _divided(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
     significand, residual = _rounded_significand(top, bottom)
     exponent = top_field - bottom_field - lowered
     bits = jax.lax.bitcast_convert_type(significand, jnp.int32)
-    # The rounded significand's biased exponent once scaled (`raw_fields`, row 9468): 1 to 254 is normal.
-    field = raw_fields(significand)[2].astype(jnp.int32) + exponent
+    # The rounded significand's biased exponent once scaled: 1 to 254 is a normal float.
+    field = ((bits >> 23) & 0xFF) + exponent
     normal = jax.lax.bitcast_convert_type(bits + (exponent << 23), jnp.float32)
     # Below the normal range: the significand on the grid of 2^-149, a value under 2^23 whose
     # integer part and half are exact in fp32; within the float32 range scaled by 2^shift.
