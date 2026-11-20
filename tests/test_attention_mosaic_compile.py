@@ -98,6 +98,9 @@ def _gated_hooks(hooks: str, queries: int, width: int):
     parameters' first draw (`score_hooks`), as `template.Hooks`; None for none."""
     if hooks == "none":
         return None
+    if hooks == "dropout":
+        return template.Hooks(drop=template.Dropout(jnp.zeros((2,), jnp.uint32), jnp.zeros((1,), jnp.int32),
+                                                    jnp.arange(4, dtype=jnp.int32), 0.1))
     score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, queries, width, rows=1, heads=4)
     params, initial = draw_hooks(0)
     return template.Hooks(score_mod, tuple(template.Param(value, kind) for value, kind in zip(params, kinds,
@@ -145,6 +148,12 @@ def _least_beyond(op, ba, generation_name: str):
     return derived(high)
 
 
+DROPPING = tuple(generation_name for generation_name in GATED
+                 if (family := bundles.of(generation_name, jnp.float16, scoped=True, tpu=True)) is not None
+                 and not family.places_on_role)
+"""`GATED`'s GPUs whose family's mainloop drops: every one but those whose products a role places, whose walk
+takes no dropout (`MosaicForward._placed_refusal`)."""
+
 FORWARD_GATE = [(generation_name, width, training, "none") for generation_name in GATED
                 for width in (64, 128, 256)
                 for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)]
@@ -153,13 +162,16 @@ FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name i
                  for hooks in COMPILED_HOOKS]
 FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
 FORWARD_GATE = [(*case, jnp.bfloat16) for case in FORWARD_GATE]
-FORWARD_GATE += [(generation_name, width, training, "none", jnp.float16) for generation_name in GATED
-                 for width in (64, 128) for training in (template.Kept.NONE, template.Kept.SPLIT)]
+FORWARD_GATE += [(generation_name, width, training, hooks, jnp.float16) for generation_name in GATED
+                 for width in (64, 128) for training in (template.Kept.NONE, template.Kept.SPLIT)
+                 for hooks in ("none", "dropout") if hooks == "none" or generation_name in DROPPING]
 """The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
 head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
 split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set
 beside the walk's), a softcap's inference forward 256 wide (Gemma's), all in bf16, and fp16's inference and
-training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes); and a B200's
+training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes), hookless and
+dropping where the mainloop drops (`DROPPING`: its kept weights in two parts, `algebra.dropped_parts`, row
+9505); and a B200's
 bf16 forwards on tcgen05's chunks (products into scoped tensor memory, read back into registers, the
 weights staged for the values' product: the Blackwell fold's H1)."""
 

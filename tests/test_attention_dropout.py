@@ -736,6 +736,65 @@ def test_an_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(rate, logit,
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+@pytest.mark.parametrize(("weight", "multiplier"), [(0.4999, 3.00085), (0.5002, 2.9998)],
+                         ids=["rounded-at-its-reach", "rounded-with-its-multiplier"])
+def test_an_fp16_kept_weight_near_fp16s_largest_keeps_its_output_finite(weight, multiplier, training):
+    """Two fp16 keys at logits 0 and log(`weight`), the first dropped and the second kept at the multiplier
+    z, values 0 and fp16's largest: the output z w 65504 / (1 + w), 65513.82 and 65517.09, is below the
+    65520 that rounds to inf, finite and on par with the reference (check 1) on both walks, where one fp16
+    rounding of the kept weight put it past: at the multiplier's reach of 4, 4w to 2 (the base review of
+    70c1aa096, F1); with the multiplier, z w to 1.500977 (row 9505). The logit is two fp16 entries of the
+    key, their sum in fp32 log(`weight`)."""
+    rate = 1.0 - 1.0 / multiplier
+    words = first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1]))
+    logit = np.float32(np.log(weight))
+    high = np.float16(logit)
+    query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[..., :2].set(1)
+    key = (jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(high)
+           .at[0, 1, 0, 1].set(np.float16(logit - np.float32(high))))
+    value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1].set(jnp.finfo(jnp.float16).max)
+    spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
+
+    def walked(query, key, value):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks, scale=1.0, residuals=training)
+        return out[0] if training else out
+
+    assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
+                                                                         scale=1.0),
+                    lambda seed: (query, key, value), "an fp16 kept weight near fp16's largest",
+                    seeds=FEWEST_SEEDS)
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+def test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term(training):
+    """One fp16 query over a sink at 18 and two keys at logits -1 and 0, values 0 and 2^15, at a rate of
+    1 - 2^-14 under a draw dropping the first key and keeping the second, the row's anchor: its weight e^-18
+    is below fp16's least subnormal, its term times the multiplier 2^14 is not, so the output is about
+    8.18, on par with the reference (check 1) on both walks, where the training walk's split sums rounded
+    the anchor's own weight to fp16 before the multiplier took it, 0 (the base review of 70c1aa096, F2;
+    row 9506)."""
+    rate = 1.0 - 2.0 ** -14
+    words = first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1]))
+    query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[..., 0].set(1)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 0, 0, 0].set(-1)
+    value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1].set(2.0 ** 15)
+    spans = template.spans(1, 2, 1)
+    hooks = template.Hooks(initial=template.sinks(jnp.asarray([18.0], jnp.float16), 1, 1, 8),
+                           drop=dropout_of(words, 1, 1, rate))
+
+    def walked(query, key, value):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks, scale=1.0, residuals=training)
+        return out[0] if training else out
+
+    assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
+                                                                         scale=1.0),
+                    lambda seed: (query, key, value), "a kept anchor below fp16's least subnormal",
+                    seeds=FEWEST_SEEDS)
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16], ids=["fp32", "fp16"])
 @pytest.mark.parametrize("bits", [32, 48, 53])
 def test_a_resumed_states_small_sums_are_kept_under_a_near_total_draw(bits, dtype, training):

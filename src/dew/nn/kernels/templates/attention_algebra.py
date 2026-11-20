@@ -1263,12 +1263,25 @@ def kept_parts(p: jax.Array, multiplier: jax.Array | None, reach: float, dtype) 
     """Weights `p` as the parts of their product with values of `dtype`, a dropout draw's (`multiplier`) kept
     keys' alone taken by its `reach` before the narrowing, past the dtype's largest binade at their row's
     power of two (at a power below, e^-17.34 at 256/129 and e^-28 at 2^17 rounded to 0, the base reviews of
-    4e2eb287e and a648b3279, F1, F3)."""
-    if multiplier is None or drops_in_place(dtype, reach):
+    4e2eb287e and a648b3279, F1, F3); fp16's two parts at one scale (`dropped_parts`)."""
+    if multiplier is None or jnp.dtype(dtype) != jnp.dtype(jnp.float16):
         return (narrow(kept(p, multiplier, reach), dtype),)
+    if drops_in_place(dtype, reach):
+        return dropped_parts(kept(p, multiplier, reach))
     # Its row's power of two along the product's columns, as the rows' product reads it.
-    value, exponent = _fp16_scaled(kept(p, multiplier, reach), rows=True)
-    return (product.Scaled(value, exponent[:, None]),)
+    value, exponent = _scaled(kept(p, multiplier, reach), rows=True)
+    return tuple(product.Scaled(part, exponent[:, None]) for part in dropped_parts(value))
+
+
+def dropped_parts(weights: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """An fp16 dropping call's kept weights (fp32, within fp16's range, `kept_parts`) as two fp16 parts at
+    their scale, the weights rounded and what that rounding lost rounded, 22 bits, whose products issue into
+    one accumulator, a remainder below fp16's least normal kept to its least subnormal, 2^-24. A dropping
+    call's output is no mean of its values: one rounding of a weight, up to 2^-11 of it, carried it past
+    fp16's largest where the exact output is within it (a weight rounded up to 2, 65526.93 where the float64
+    output is 65513.82, the base review of 70c1aa096, F1; row 9505)."""
+    high = weights.astype(jnp.float16)
+    return high, (weights - high.astype(jnp.float32)).astype(jnp.float16)
 
 
 def in_units(spec: "Forward", products: jax.Array) -> jax.Array:
@@ -1534,16 +1547,18 @@ def _split_tile(keys: Keys, p: jax.Array, dtype, anchor: Argmax, multiplier: jax
         # where its weights' sum times fp32's largest passes 2^127, so that weight is at least 2^-(1 + log2
         # n) of n keys, and the scale at most 2^-(2 + log2 n)): a small weight is another key's.
         small = jnp.where(at_anchor, 0.0, small)
-    others, own_tile = anchor_split(narrow(p, dtype), at_anchor)
+    others, own_tile = anchor_split(p, at_anchor, dtype)
     lowered = () if small is None else small_parts(small, dtype)
 
     def rest() -> jax.Array:
-        # The other keys' narrowed weights' sum (a dropping call's at its reach, as `kept_parts`' products',
-        # so a kept key's cancels), a scaled tile's small ones' taken back beside it, after the products.
-        dropping = multiplier is not None and small is None and drops_in_place(dtype, reach)
-        narrowed = narrow(jnp.where(at_anchor, 0.0, p) * np.float32(reach), dtype) if dropping else others
-        summed = narrowed.astype(jnp.float32).sum(axis=-1) * np.float32(1 / reach if dropping else 1)
-        return summed if small is None else summed + taken_back(small.sum(axis=-1), float(-SMALL_SHIFT))
+        # The other keys' narrowed weights' sum, after the products: a dropping call's as its products take
+        # them (`kept_parts`, every key's as a kept one's, so a kept key's cancels) over its reach, a scaled
+        # tile's small ones' taken back beside it.
+        if multiplier is None or small is not None:
+            summed = others.astype(jnp.float32).sum(axis=-1)
+            return summed if small is None else summed + taken_back(small.sum(axis=-1), float(-SMALL_SHIFT))
+        taken = kept_parts(jnp.where(at_anchor, 0.0, p), jnp.ones_like(p), reach, dtype)
+        return functools.reduce(jnp.add, map(_summed_row, taken)) * np.float32(1 / reach)
     if multiplier is None or keys.coords.drop is None:
         return (others, *lowered), rest, own_tile, anchor
     apart = jnp.where(at_anchor, 0.0, p)
@@ -1731,12 +1746,21 @@ def argmax(state: Argmax, logits: jax.Array, k_pos: jax.Array) -> Argmax:
                   jnp.where(tile_peak > state.peak, first.astype(jnp.int32), state.key))
 
 
-def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """A tile's narrowed weights split at the anchor key (`at_anchor`): the others, the left operand of
-    the product that adds to `B = sum_{j != c} e_j v_j`, and the anchor's own weight `[bq]`, fp32."""
-    zero = jnp.zeros_like(narrowed)
-    return (jnp.where(at_anchor, zero, narrowed),
-            jnp.where(at_anchor, narrowed, zero).astype(jnp.float32).sum(axis=-1))
+def anchor_split(p: jax.Array, at_anchor: jax.Array, dtype) -> tuple[jax.Array, jax.Array]:
+    """A tile's weights `p` (fp32) split at the anchor key (`at_anchor`): the others narrowed to `dtype`, the
+    left operand of the product that adds to `B = sum_{j != c} e_j v_j`, and the anchor's own weight `[bq]`
+    as it is, fp32, which enters no product, only the output's join (`joined`) and D (`split_delta`), so no
+    narrowing loses it: rounded to fp16, an anchor's e^-18 beside a sink was 0 before a dropping call's
+    multiplier of 2^14 took it, and with it an output of 8.18 (the base review of 70c1aa096, F2; row
+    9506)."""
+    return (narrow(jnp.where(at_anchor, 0.0, p), dtype), jnp.where(at_anchor, p, 0.0).sum(axis=-1))
+
+
+def _summed_row(part: jax.Array | product.Scaled) -> jax.Array:
+    """A product's part's rows' sums `[bq]`, fp32, a scaled one's taken back by its row's power of two."""
+    if isinstance(part, product.Scaled):
+        return taken_back(part.value.astype(jnp.float32).sum(axis=-1), part.exponent[:, 0])
+    return part.astype(jnp.float32).sum(axis=-1)
 
 
 def split_term(own: jax.Array, moved: jax.Array, old_value: jax.Array,
