@@ -1481,8 +1481,10 @@ def steep_last_draw(seed: int):
 
 
 def late_reads(run):
-    """`run`'s outputs of the last chunk's readers after its gates and its final state, and their tangent
-    and every operand's gradient (`jax.jvp`, `jax.vjp`)."""
+    """`run`'s outputs of the last chunk's readers after its gates and its final state, their tangent along
+    every operand (`jax.jvp`) and their gradient by the log decays (`jax.vjp`): the split decays' own
+    (`scan._split_term`). A reader's gradient by its query, its cotangent times the decay before the state it
+    reads, is a product's range, fla's (row 2344)."""
     def late(*primals):
         outputs, final = run(*primals)
         return outputs[TOKENS - CHUNK + 4:], final
@@ -1490,7 +1492,8 @@ def late_reads(run):
     def ran(*primals):
         value, pull = jax.vjp(late, *primals)
         tangents = tuple(jnp.full_like(x, 1e-2) for x in primals)
-        return {"late": value[0], "final": value[1], "gradients": pull(tuple(map(jnp.ones_like, value))),
+        decays = pull(tuple(map(jnp.ones_like, value)))[3]
+        return {"late": value[0], "final": value[1], "decays' gradient": decays,
                 "tangent": jax.jvp(late, primals, tangents)[1]}
 
     return ran
@@ -1499,8 +1502,9 @@ def late_reads(run):
 def test_a_steep_chunks_split_decays_keep_the_state_it_enters_and_leaves():
     """GLA under a decay a head's (`scalar_gla`), its dual form (an H100's), the state entering its last chunk
     about 2^90 and that chunk's three gates of -40 (`steep_last_draw`): its readers after the gates (through
-    `entering`) and the state it leaves (through `whole`), their tangent and every gradient through the
-    forms' own derivatives, on par with the token scan's from float64 (check 1), each standalone decay
+    `entering`) and the state it leaves (through `whole`), their tangent and their gradient by the decays
+    through the forms' own derivatives (`late_reads`), on par with the token scan's from float64 (check 1),
+    each standalone decay
     (`e^-120`) taken as two normal factors (`scan._Split`), where whole it underflowed to zero and read the
     state as none (row 9660)."""
     declared = scan.Scan(scalar_gla, gated_readout, GATED, walked="time", state=((KEY, VALUE), jnp.float32))
