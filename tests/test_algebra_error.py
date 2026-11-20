@@ -189,3 +189,27 @@ def test_the_accurate_policy_takes_a_compensated_sum_where_every_form_rounds_its
     choice = choose(three_terms, OPERANDS * 3, accurate=True, saturation=algebra.SATURATION, admits=admits)
     assert choice.chosen.compensated
     assert not admits(three_terms, choice.chosen.function)
+
+
+def ranged(seed):
+    """Operands whose product rounds in range and is brought back by its divisor, `a = c` of `1e-20`, `b`
+    of `1e20`: the form as written, `(a b) / c`, is finite, where the regrouped `a (b / c)` passes float32's
+    largest."""
+    rng = np.random.default_rng(seed)
+    small = (rng.uniform(1.0, 2.0, SHAPE) * 1e-20).astype(np.float32)
+    large = (rng.uniform(1.0, 2.0, SHAPE) * 1e20).astype(np.float32)
+    return jnp.asarray(small), jnp.asarray(large), jnp.asarray(small)
+
+
+def product_over(a, b, c):
+    """`(a b) / c`, the stable set's regrouping's left side."""
+    return (a * b) / c
+
+
+def test_the_accurate_policy_chooses_past_a_proposal_that_leaves_the_floats_range():
+    """`(a b) / c` where `a (b / c)` overflows: the regrouped proposal is not as exact as the form as
+    written, so it raises no bar under the accurate policy, which chooses a form as exact as the written
+    (it raised, every finite form failing against the infinite one)."""
+    admits = gate(product_over, ranged)
+    choice = choose(product_over, OPERANDS * 3, accurate=True, saturation=algebra.SATURATION, admits=admits)
+    assert admits(choice.chosen.function, product_over)

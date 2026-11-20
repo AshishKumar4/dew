@@ -6,6 +6,8 @@ error decides (`dew.algebra.acceptance`)."""
 
 import functools
 import importlib
+import subprocess
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -25,11 +27,29 @@ def _derived(name: str):
     return getattr(importlib.import_module(f"{module}_derived"), function)
 
 
-def test_the_written_modules_are_what_generation_writes():
+@pytest.fixture
+def on_its_platform():
+    """The platform a generated module was measured on, which its header names and its regeneration
+    measures on again: armada's CPU, the one CI pins."""
+    if jax.default_backend() != "cpu":
+        pytest.skip("a generated module was measured on the CPU, and regenerates as its header says there")
+
+
+def test_the_written_modules_are_what_generation_writes(on_its_platform):
     """Every declaring module's generated module, regenerated in memory, is the one written (`--check`): a
     changed rule, declaration or chooser lands as a reviewed diff of generated code."""
     made = generate.generate(check=True)
     assert {name for found in made for name in found.declarations} == set(generate.DECLARATIONS)
+
+
+def test_the_command_checks_the_declaring_modules_own_declarations(on_its_platform):
+    """`python -m dew.algebra.generate --check`, run as a script (its module `__main__`, beside the one the
+    declaring modules register with), checks the declarations they register, each named: it had held an
+    empty registry of its own, which knew none of them (and passed checking nothing where none was
+    named)."""
+    done = subprocess.run([sys.executable, "-m", "dew.algebra.generate", "--check",
+                           *sorted(generate.DECLARATIONS)], check=False)
+    assert done.returncode == 0
 
 
 @pytest.mark.parametrize(("name", "policy"), FORMS, ids=[f"{name}-{policy}" for name, policy in FORMS])
@@ -49,12 +69,18 @@ def nested(x, y):
     return jax.jit(lambda a: jnp.tanh(a) @ table)(x) + y
 
 
+PAYLOAD = np.frombuffer(np.uint32(0x7FC00001).tobytes(), np.float32)[0]
+"""A float32 NaN of a payload of its own, not the canonical one."""
+
+
 PROGRAMS = {
     "products and reductions": lambda x, y: (jnp.dot(x, y.T), jnp.sum(x * 2.5, axis=1), jnp.max(y, axis=0)),
     "a nested call and a constant": nested,
     "selection, powers and casts": lambda x, y: jnp.where(x > y, x ** 3,
                                                           x.astype(jnp.bfloat16).astype(jnp.float32)),
     "a sort's several results": lambda x, y: jax.lax.sort((x, y), num_keys=1),
+    "a sort's one result": lambda x, y: jax.lax.sort(x),
+    "a NaN's payload": lambda x, y: jax.lax.bitcast_convert_type(jnp.full_like(x, PAYLOAD), jnp.int32),
 }
 
 
@@ -70,6 +96,7 @@ def test_a_printed_program_computes_what_its_jaxpr_does_bit_for_bit(name):
     assert not compensated
     got = printed.loaded(text, "program")(*operands)
     expected = jax.core.eval_jaxpr(closed.jaxpr, closed.consts, *operands)
+    assert len(got) == len(expected)
     for ours, theirs in zip(got, expected, strict=True):
         ours, theirs = np.asarray(ours), np.asarray(theirs)
         assert (ours.dtype, ours.shape) == (theirs.dtype, theirs.shape)
@@ -92,6 +119,31 @@ def test_a_compensated_print_keeps_what_its_sums_round_away():
     difference, total = printed.loaded(text, "kept")(a, b, row)
     assert float(jax.jit(lambda a, b: (a + b) - a)(a, b)) == 0.0
     assert (float(difference), float(total)) == (0.75, 1.0)
+
+
+def test_a_nested_program_called_twice_is_printed_with_each_calls_own_operands():
+    """One nested program called on two operands (its one trace read by both calls), printed plain and
+    compensated: each call adds one to its own operand, the second's never the first's (a name, a double
+    word or a read of the first call's left bound to the second's)."""
+    inner = jax.jit(lambda x: x + 1.0)
+
+    def twice(a, b, c):
+        return inner(a + b), inner(c)
+
+    operands = (jnp.float32(2.0), jnp.float32(3.0), jnp.float32(7.0))
+    closed = jax.make_jaxpr(twice)(*operands)
+    for compensated in (False, True):
+        text, _ = printed.source(closed, "twice", compensated=compensated)
+        assert [float(value) for value in printed.loaded(text, "twice")(*operands)] == [6.0, 8.0]
+
+
+def test_an_output_whose_weak_type_a_plain_call_cannot_keep_is_refused():
+    """A program returning a Python float, a literal it holds weak: its printed literal is a typed array,
+    strong, so the printed program's output is not the program's and it is refused, never printed with
+    another type."""
+    closed = jax.make_jaxpr(lambda x: (x, 1.0))(jnp.ones((4,), jnp.float32))
+    with pytest.raises(printed.Unprintable):
+        printed.source(closed, "weak")
 
 
 def test_an_equation_no_plain_call_writes_is_refused():
