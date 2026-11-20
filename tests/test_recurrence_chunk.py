@@ -10,6 +10,7 @@ import functools
 import itertools
 import logging
 import math
+import re
 from collections.abc import Callable
 
 import jax
@@ -2454,6 +2455,9 @@ def test_a_forked_training_walk_traces_once_under_every_route_receipt(caplog):
         with jax.explain_cache_misses(new_val=True), caplog.at_level(logging.WARNING):
             caplog.clear()
             rerouted = traced()
+    # The walk's own misses, not those JAX explains of the rules it calls as it linearizes the walk's one
+    # trace under the second receipt (their miss located in the walk, the function missed theirs).
     walks = [record for record in caplog.records
-             if "TRACING CACHE MISS" in record.getMessage() and "recurrence_walk" in record.getMessage()]
+             if re.search(r"TRACING CACHE MISS[^\n]*\n\s*(for |never seen function:\s*)recurrence_walk\b",
+                          record.getMessage())]
     assert (walks, bool(routed), routed == rerouted) == ([], True, True)
