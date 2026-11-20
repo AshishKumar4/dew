@@ -484,27 +484,31 @@ def test_projections_side_by_side_on_a_mesh_splitting_their_rows_take_each_devic
     assert gathered == (axis == "fsdp"), axis
 
 
-def test_projections_whose_kernels_vary_over_a_shard_map_run_apart():
+def test_projections_whose_kernels_vary_over_a_checked_shard_map_run_side_by_side():
     """Llama-3.1-8B's attention layer (`_llama_8b`) over 12,288 bf16 rows applied inside a checked shard_map
     over two devices, its rows replicated, on an assumed H100, nothing named but the attention kernel: with
-    its parameters whole its query, key and value run side by side (the receipt's geometry); with them
-    varying over the axis (`jax.lax.pcast`) a launch sees its kernels not whole, as `gemm`'s forward and
-    input gradient read them, so they run apart, where the rows alone seen whole admitted them side by side
-    and no compound launch ran (head review of b68fc2382)."""
+    its parameters whole or varying over the axis (`jax.lax.pcast`), each device's launch reads its own rows
+    and kernels, its results typed as they vary (row 9808), so its query, key and value run side by side
+    (the receipt's geometry), one forward launch taking them as the selector admitted them (head review of
+    b68fc2382: an admission and its launch read one condition, no automatic mesh axis)."""
     from jax.sharding import Mesh, PartitionSpec
+
+    from dew.nn.kernels import tuning
 
     mesh = Mesh(np.array(jax.devices()[:2]), ("data",))
     layer = _llama_8b()
     x = jax.ShapeDtypeStruct((3, 4096, 4096), jnp.bfloat16)
     params = jax.eval_shape(layer.init, jax.random.key(0), x)
-    for varying, kernel in ((False, "joined"), (True, "apart")):
+    for varying in (False, True):
         def applied(params, x, varying=varying):
             return layer.apply(jax.lax.pcast(params, ("data",), to="varying") if varying else params, x)
 
         mapped = jax.shard_map(applied, mesh=mesh, in_specs=(PartitionSpec(), PartitionSpec()),
                                out_specs=PartitionSpec("data") if varying else PartitionSpec())
         under = (generation.assumed("sm90"), generation.chosen(attention="xla"))
-        assert _qkv_routes(layer, params, x, *under, apply=mapped)[:1] == [kernel], varying
+        with tuning.seen() as launches:
+            assert _qkv_routes(layer, params, x, *under, apply=mapped)[:1] == ["joined"], varying
+        assert any(bound.arguments.get("beside") for _, bound in launches.taken), varying
 
 
 def test_projections_that_cast_their_input_run_apart():
