@@ -30,7 +30,8 @@ def released(device: str):
     """The released checkpoint on `device`, its experts dequantized to bf16, eager attention and experts
     (`eager_experts`)."""
     import torch
-    from transformers import GptOssForCausalLM, Mxfp4Config
+    from transformers import GptOssForCausalLM
+    from transformers.utils.quantization_config import Mxfp4Config
 
     repo, revision = RELEASED
     model = GptOssForCausalLM.from_pretrained(repo, revision=revision, dtype=torch.bfloat16,

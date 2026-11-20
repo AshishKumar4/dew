@@ -50,6 +50,7 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -88,7 +89,7 @@ def decoder(out: Path) -> None:
     _random_b(model, 1)
     model.eval()
     adapter = out / "adapter"
-    model.save_pretrained(adapter)
+    model.save_pretrained(str(adapter))
     (adapter / "README.md").unlink()
     # The config names the machine the adapter was made on; the fixture
     # names the repository's copy.
@@ -106,7 +107,9 @@ def decoder(out: Path) -> None:
     for name, parameter in trained.named_parameters():
         if parameter.requires_grad:
             key = name.removeprefix("base_model.model.").replace(".default", "")
-            arrays["grad/" + key] = parameter.grad.numpy().copy()
+            grad = parameter.grad
+            assert grad is not None  # A trainable parameter after the backward pass.
+            arrays["grad/" + key] = grad.numpy().copy()
     optimizer = torch.optim.SGD([p for p in trained.parameters() if p.requires_grad], lr=LEARNING_RATE)
     optimizer.step()
     with torch.no_grad():
@@ -119,7 +122,7 @@ def decoder(out: Path) -> None:
     with torch.no_grad():
         arrays["merged_logits"] = merged(input_ids).logits.numpy()
     for name, parameter in merged.named_parameters():
-        if any(name.endswith(f"{target}.weight") for target in config.target_modules):
+        if any(name.endswith(f"{target}.weight") for target in _target_modules(config)):
             arrays["merged/" + name] = parameter.detach().numpy().copy()
     np.testing.assert_allclose(arrays["merged_logits"], arrays["adapted_logits"], atol=1e-5)
     np.savez_compressed(out / "reference.npz", **arrays)
@@ -133,11 +136,21 @@ def _peft_version() -> str:
     return peft.__version__
 
 
+def _target_modules(config) -> list[str] | set[str]:
+    """A LoRA config's target modules, which every config here names as a list."""
+    targets = config.target_modules
+    assert isinstance(targets, list | set)
+    return targets
+
+
 @contextlib.contextmanager
 def _tiny_sd():
     """The `sd` pipeline of the bundle, in torch, for the duration of the block."""
     import transformers
-    from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+    from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+    from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+    from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionPipeline
+    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
     from reference_releases import require
     from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -150,10 +163,13 @@ def _tiny_sd():
         unet = UNet2DConditionModel.from_pretrained(root, subfolder="unet", torch_dtype=torch.float32)
         text_encoder = CLIPTextModel.from_pretrained(root, subfolder="text_encoder")
         tokenizer = CLIPTokenizer.from_pretrained(root, subfolder="tokenizer")
-        yield StableDiffusionPipeline(
+        # No safety checker or feature extractor, which the pipeline takes as None though its signature
+        # names none, and DDIM, which it takes though its signature names a scheduler enum.
+        components: dict[str, Any] = dict(
             vae=AutoencoderKL.from_pretrained(root, subfolder="vae"), text_encoder=text_encoder,
             tokenizer=tokenizer, unet=unet, scheduler=DDIMScheduler.from_pretrained(root, subfolder="scheduler"),
             safety_checker=None, feature_extractor=None, requires_safety_checker=False)
+        yield StableDiffusionPipeline(**components)
 
 
 def pipeline(out: Path) -> None:
@@ -173,9 +189,11 @@ def pipeline(out: Path) -> None:
         # The configs name the temporary directory the pipeline was read
         # from; the file names no base.
         metadata = [{**config.to_dict(), "base_model_name_or_path": None} for config in (unet_config, text_config)]
-        pipe.save_lora_weights(out, unet_lora_layers=get_peft_model_state_dict(unet),
-                               text_encoder_lora_layers=get_peft_model_state_dict(text_encoder),
-                               unet_lora_adapter_metadata=metadata[0], text_encoder_lora_adapter_metadata=metadata[1])
+        # The state dicts of the adapters, which save_lora_weights takes though its signature names modules.
+        layers: dict[str, Any] = dict(unet_lora_layers=get_peft_model_state_dict(unet),
+                                      text_encoder_lora_layers=get_peft_model_state_dict(text_encoder))
+        pipe.save_lora_weights(out, **layers, unet_lora_adapter_metadata=metadata[0],
+                               text_encoder_lora_adapter_metadata=metadata[1])
 
         prompt_ids = tokenizer(["a cat"], padding="max_length", max_length=tokenizer.model_max_length,
                                return_tensors="pt").input_ids
@@ -199,7 +217,7 @@ def pipeline(out: Path) -> None:
         for component, module, config in (("unet", unet, unet_config), ("text_encoder", text_encoder, text_config)):
             for name, parameter in module.named_parameters():
                 name = name.replace(".base_layer", "")
-                if "lora" not in name and any(name.endswith(f"{t}.weight") for t in config.target_modules):
+                if "lora" not in name and any(name.endswith(f"{t}.weight") for t in _target_modules(config)):
                     arrays[f"merged/{component}.{name}"] = parameter.detach().numpy().copy()
     np.savez_compressed(out / "reference.npz", **arrays)
     (out / "meta.json").write_text(json.dumps({"peft": _peft_version(), "transformers": transformers.__version__,

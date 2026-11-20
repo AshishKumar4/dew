@@ -35,6 +35,7 @@ import struct
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import requests
@@ -54,6 +55,10 @@ from modelopt_worker import author_models, author_weight
 from safetensors.torch import save_file
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from triton.language.extra.cuda import libdevice
+
+COHORT = "modelopt-nvfp4"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "modelopt"
 REPO = "nvidia/Qwen3-14B-NVFP4"
@@ -91,8 +96,9 @@ def validate_conversion() -> None:
     tensor = torch.from_numpy(values).cuda()
     global_scale = torch.tensor([1 / 6], device="cuda", dtype=torch.float32)
     output = torch.empty_like(tensor)
+    # Triton's compile-time arguments, typed tl.constexpr by its signature and taken as values at launch.
     conversion_probe[(triton.cdiv(tensor.numel(), 256),)](
-        tensor, output, global_scale, tensor.numel(), BLOCK=256)
+        tensor, output, global_scale, tensor.numel(), **dict[str, Any](BLOCK=256))
     expected = tensor.clamp(max=448).to(torch.float8_e4m3fn).float() * global_scale
     np.testing.assert_array_equal(output.cpu().numpy().view(np.uint32),
                                   expected.cpu().numpy().view(np.uint32))
@@ -118,8 +124,9 @@ def author_qdq(x: torch.Tensor, global_scale: torch.Tensor, *, corrected: bool =
     kernel = fp4_fake_quant_kernel if corrected else sm89_kernel
     kernel[(triton.cdiv(rows, 4), triton.cdiv(columns, 128))](
         values, out, rows, columns, global_scale, values.stride(0), values.stride(1),
-        out.stride(0), out.stride(1), BLOCK_SIZE=16, TILE_M=4, TILE_N=128,
-        NUM_FP4_BLOCKS=8, OUT_DTYPE={torch.float32: tl.float32, torch.bfloat16: tl.bfloat16}[values.dtype])
+        out.stride(0), out.stride(1), **dict[str, Any](
+            BLOCK_SIZE=16, TILE_M=4, TILE_N=128, NUM_FP4_BLOCKS=8,
+            OUT_DTYPE={torch.float32: tl.float32, torch.bfloat16: tl.bfloat16}[values.dtype]))
     return out.reshape(shape)
 
 
@@ -133,7 +140,11 @@ def tiny(*, mixed: bool = False) -> None:
     config._attn_implementation = "eager"
     config.architectures = ["Qwen3ForCausalLM"]
     ids = torch.tensor([[2, 8, 17, 5, 23, 9, 51, 43], [31, 16, 3, 19, 42, 11, 78, 39]], device="cuda")
-    model = Qwen3ForCausalLM(config).to("cuda", dtype=torch.bfloat16).eval()
+    model = Qwen3ForCausalLM(config)
+    # Moved in place by its own `to` (PreTrainedModel's), whose functools.wraps hides its signature: untyped.
+    placed: Any = model
+    placed.to("cuda", dtype=torch.bfloat16)
+    model = model.eval()
     scheme = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
     if mixed:
         scheme = {'algorithm': 'max', 'quant_cfg': [
@@ -177,7 +188,7 @@ def tiny(*, mixed: bool = False) -> None:
             arrays[stem + "/qdq"] = author_qdq(probe, overall).cpu().numpy()
             arrays[stem + "/qdq_bf16"] = author_qdq(probe.bfloat16(), overall).float().cpu().numpy()
             arrays[stem + "/sm89_qdq"] = author_qdq(probe, overall, corrected=False).cpu().numpy()
-    np.savez(directory / "reference.npz", **arrays)
+    np.savez(directory / "reference.npz", allow_pickle=False, **arrays)
     print("tiny", directory, "reference RMS", float(np.sqrt(np.mean(
         (arrays["logits"] - arrays["logits_f64"]) ** 2))))
     differences = {stem: int(np.count_nonzero(

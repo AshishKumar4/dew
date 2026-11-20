@@ -111,7 +111,7 @@ def _once(records: Sequence[Drawn], units: int) -> float:
         return 0.0
     weighing = sum(record.get("weighing", 0.0) for record in records)
     drawing = sum(record["draws"] for record in records) - weighing
-    first = sum(record["first"] for record in records)
+    first = sum(record.get("first", 0.0) for record in records)
     if units < 2:
         # Compiles reported at the whole draw or more (another thread's among them) leave no draw to tell.
         compiled = sum(record.get("compiled", 0.0) for record in records)

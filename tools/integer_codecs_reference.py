@@ -51,6 +51,10 @@ from gptqmodel.utils.model import convert_gptq_v1_to_v2_format_module, convert_g
 from reference_source import package, published_files, saved_fixture
 from safetensors.numpy import load_file
 
+COHORT = "gptqmodel"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "integer.npz"
 GPTQMODEL = "7.5.0"
@@ -113,14 +117,21 @@ def gptq_packed(weight, scales, zeros, g_idx, bits, group, *, sym: bool, act: bo
     return module
 
 
+def held(buffer: torch.Tensor | None) -> torch.Tensor:
+    """A packed Linear's buffer, which packing makes."""
+    assert buffer is not None
+    return buffer
+
+
 def gptq_pack(weight, scales, zeros, g_idx, bits, group, *, sym: bool, act: bool):
     """gptqmodel's packing of one Linear, its v1 zeros, and both dequantizations."""
     module = gptq_packed(weight, scales, zeros, g_idx, bits, group, sym=sym, act=act, extension=False)
     native = gptq_packed(weight, scales, zeros, g_idx, bits, group, sym=sym, act=act, extension=True)
-    if not (torch.equal(native.qweight, module.qweight) and torch.equal(native.qzeros, module.qzeros)):
+    if not (torch.equal(held(native.qweight), held(module.qweight))
+            and torch.equal(held(native.qzeros), held(module.qzeros))):
         raise RuntimeError("pack_block's native extension parts from its Python path")
-    record = {"qweight": module.qweight.numpy().copy(), "qzeros": module.qzeros.numpy().copy(),
-              "scales": module.scales.numpy().copy(), "g_idx": module.g_idx.numpy().copy()}
+    record = {"qweight": held(module.qweight).numpy().copy(), "qzeros": held(module.qzeros).numpy().copy(),
+              "scales": held(module.scales).numpy().copy(), "g_idx": held(module.g_idx).numpy().copy()}
     record["dequantized"] = PackableQuantLinear.dequantize_weight(module).float().numpy()
     cached = TorchLinear.dequantize_weight(module.eval()).float().numpy()
     if not np.array_equal(cached, record["dequantized"]):
@@ -128,7 +139,7 @@ def gptq_pack(weight, scales, zeros, g_idx, bits, group, *, sym: bool, act: bool
     v1 = copy.deepcopy(module)
     config = QuantizeConfig(bits=bits, group_size=group, sym=sym, desc_act=act, offload_to_disk=False)
     convert_gptq_v2_to_v1_format_module(v1, config)
-    record["qzeros_v1"] = v1.qzeros.numpy().copy()
+    record["qzeros_v1"] = held(v1.qzeros).numpy().copy()
     convert_gptq_v1_to_v2_format_module(v1, bits=bits, pack_dtype=torch.int32)
     record["dequantized_v1"] = PackableQuantLinear.dequantize_weight(v1).float().numpy()
     return record
