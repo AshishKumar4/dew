@@ -329,7 +329,7 @@ def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     if (frames := _traceback(value)) is not None:
         return frames
     if isinstance(value, type(jax.tree.structure(()))):
-        return _tree(value, at, again)
+        return tree_shape(value, at, again)
     if isinstance(value, Format):
         return ["format", again(value.layout, at=f"{at}.layout"), again(value.sharding, at=f"{at}.sharding")]
     if value is Layout.AUTO:
@@ -488,16 +488,17 @@ def _module_state(module: types.ModuleType, at: str, known: Mapping[int, JSON],
     return _members(module, at, known, (*walking, id(module)))
 
 
-def _tree(tree, at: str, again: Callable[..., JSON]) -> JSON:
+def tree_shape(tree, at: str, again: Callable[..., JSON]) -> JSON:
     """A tree's structure node by node: a leaf, or a node's type, the data it holds beside its children (a
-    mapping's keys, a custom node's static fields) and its children. Never as JAX prints it, which holds a
-    node's data by its printed form."""
+    mapping's keys, a custom node's static fields) and its children, each type and datum as `again` states
+    it (`stated`'s, or a kept draw's key's, `dew.objectives.drawn.held_signature`). Never as JAX prints it,
+    which holds a node's data by its printed form."""
     node = tree.node_data()
     if node is None:
         return "leaf" if tree.num_leaves else "none"
     kind, held = node
     return ["node", again(kind, at=at), again(held, at=f"{at} (a {kind.__qualname__}'s node data)"),
-            [_tree(child, at, again) for child in tree.children()]]
+            [tree_shape(child, at, again) for child in tree.children()]]
 
 
 def source_digest(path: Path) -> str:
