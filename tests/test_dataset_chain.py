@@ -1851,7 +1851,7 @@ def test_a_batched_map_that_keeps_its_rows_groups_the_order_whatever_reads_it(re
 
     whole = read_by(DataPartition())
     grouped = whole == [(index, index // 4 * 4) for index in range(24)]
-    assert grouped, whole[:12]
+    assert grouped, (len(whole), [pair for pair in whole if pair[1] != pair[0] // 4 * 4][:4])
     shares = sorted(read_by(DataPartition(0, 2)) + read_by(DataPartition(1, 2)))
     alike = shares == whole
-    assert alike, shares[:12]
+    assert alike, (len(shares), [pair for pair in shares if pair not in whole][:4])
