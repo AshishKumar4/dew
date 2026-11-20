@@ -36,6 +36,7 @@ from dew.nn.attention import reference_attention, scaled_dot_product_attention
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
     attention as template,
+    attention_gradient,
     attention_mosaic,
     attention_portable,
     attention_route,
@@ -658,6 +659,55 @@ def test_a_mosaic_fp16_dropping_forward_with_initial_or_past_binade_is_eligible_
             return q, k, v
         assert_as_exact(ours, reference, draw, f"fp16 mosaic drop rate={rate} initial={with_initial}",
                         seeds=FEWEST_SEEDS)
+
+
+def test_split_delta_keeps_tiny_others_when_anchor_times_multiplier_overflows():
+    """Row 9096: at rate 1 - 2^-53 (`dropped = power = 2^53`), an anchor value `[2^80, 0]` whose product with
+    the multiplier passes fp32's largest must not overflow before contracting with `dO = [0, 2^20]` (nor
+    with `dO = [2^-40, 2^20]`): `split_delta` keeps the other kept key's `[0, 2^-126]` at weight `e^-22`
+    in `in_units` (`~2^-84.7`) instead of overflowing to NaN or flushing to 0 in `plain`."""
+    power = 2.0 ** 53
+    weight = np.exp(-22.0)
+    others = jnp.array([[[[0.0, np.float32(weight * 2.0 ** -126 * power)]]]], jnp.float32)
+    own = jnp.array([[[1.0]]], jnp.float32)
+    others_total = jnp.array([[[np.float32(weight)]]], jnp.float32)
+    total = own + others_total
+    state_total = jnp.zeros_like(total)
+    anchor_value = jnp.array([[[[2.0 ** 80, 0.0]]]], jnp.float32)
+    key_index = jnp.zeros((1, 1, 1), jnp.int32)
+    shift = jnp.zeros((1, 1, 1), jnp.int32)
+    dout_zero = jnp.array([[[[0.0, 2.0 ** 20]]]], jnp.float32)
+    anchor, delta, chosen = attention_gradient.split_delta(
+        others, own, others_total, total, state_total, anchor_value, dout_zero, key_index, shift,
+        rows=attention_gradient.summed_rows, dropped=power, power=power)
+    expected_delta = np.float32(weight * 2.0 ** -126 * power) * np.float32(2.0 ** 20)
+    assert float(anchor[0, 0, 0]) == 0.0
+    assert int(chosen[0, 0, 0]) == 0
+    assert float(delta[0, 0, 0]) == float(expected_delta)
+    dout_small = jnp.array([[[[2.0 ** -40, 2.0 ** 20]]]], jnp.float32)
+    anchor2, delta2, _ = attention_gradient.split_delta(
+        others, own, others_total, total, state_total, anchor_value, dout_small, key_index, shift,
+        rows=attention_gradient.summed_rows, dropped=power, power=power)
+    assert np.isfinite(float(anchor2[0, 0, 0])) and np.isfinite(float(delta2[0, 0, 0]))
+    assert float(anchor2[0, 0, 0]) == 2.0 ** 93
+
+
+def test_a_mosaic_dropping_backwards_large_anchor_does_not_flush_tiny_others():
+    """Row 9096 end-to-end: a bf16 Mosaic call interpreted for an H100 at rate 1 - 2^-3 (`bound = 8`)
+    keeping both keys, where the anchor's `[2^126, 0]` times `8` passes fp32's largest under an orthogonal
+    `dO = [0, 2^20]` while the other kept key holds `[0, 2^-126]` at logit -17. `split_delta` keeps the tiny
+    contribution in `in_units` so the gradients hold check 1 against float64."""
+    rate = 1.0 - 2.0 ** -3
+    words = first_seed(rate, 2, lambda kept: bool(kept[0]) and bool(kept[1]))
+    hooks, spans = hooked(words, 1, 1, rate), template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(1).at[..., 2].set(1)
+    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 1, 0, 0].set(-16).at[0, 1, 0, 2].set(-1)
+    value = (jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 0].set(2.0 ** 126)
+             .at[0, 1, 0, 1].set(2.0 ** -126))
+    dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 1].set(2.0 ** 20)
+    ours, reference = _mosaic_gradients(spans, hooks)
+    assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
+                    "a dropping large anchor beside tiny other values", seeds=FEWEST_SEEDS)
 
 
 def three_identical_keys():
