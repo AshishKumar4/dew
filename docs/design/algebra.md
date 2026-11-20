@@ -286,7 +286,10 @@ fitted to them, and a rule set ships only with measured receipts.
   output. Built today (`dew.algebra.fusion`): each product the GEMM template takes (x @ W, dy @ Wᵀ, xᵀ @ dy, and
   `ragged_dot_general`'s grouped forms), alone or with its elementwise consumers, is substituted at the compile
   point where its selector gives the template the launch, its consumers into the epilogue where fused prices
-  less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450). A
+  less; where a stage refuses or does not pay, the product is weighed with fewer (without its prologue,
+  without its epilogue, alone), the stage left as the program wrote it, so a refused consumer leaves no
+  product a plain dot (row 8996); so a plain JAX program compiled through Dew runs the templates its products
+  match (row 3450). A
   region's written program, Dew's call traced over its inputs' types, is traced once a process for the region's
   identity in the context a kernel is chosen in (`fusion.choice_context`: the state a trace reads,
   `dew.nn.kernels.options.trace_context`, XLA's deterministic-ops flag among it, complete by default: a value it leaves
