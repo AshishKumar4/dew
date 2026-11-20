@@ -734,16 +734,15 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
     JAX's own default precision as a model trains it: `chunk_forward.kept_forward` at the tiles the route
     takes (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
-    build is the production program), on the device's bundle, interpreted off a GPU. A call no gradient
-    follows runs another program, its states and output in one walk that never stores the states it reads
-    (`chunk_forward.forward`), which this witness does not hold. Operands `[1, T, ...]`. With `carried`, each
-    chunk's fp32 memory leaving it: the same launches at the same tiles over the chunks up to it, whose final
-    memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`, each chunk's:
-    end_j == start_{j+1}); without, the initial and the final memories alone. A packed call's documents
-    (`starts` `[1, T]`) lay their own chunks (`laid_chunks`), a document beginning inside a chunk included,
-    its first chunk entering the zero memory. Without the `delta` rule, the template's op as the SSD's route
-    calls it (`recurrence_chunk.template_rule`, scale 1, its output in the operands' dtype), `rounded` as the
-    route's fast forms round it unless given (a 16-bit call's keys then take the write gate,
+    build is production's), on the device's bundle, interpreted off a GPU; not a call no gradient follows
+    (`chunk_forward.forward`, one walk that stores no state it reads). Operands `[1, T, ...]`. With `carried`,
+    each chunk's fp32 memory leaving it: the same launches at the same tiles over the chunks up to it, whose
+    final memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`, each
+    chunk's: end_j == start_{j+1}); without, the initial and the final memories alone. A packed call's
+    documents (`starts` `[1, T]`) lay their own chunks (`laid_chunks`), a document beginning inside a chunk
+    included, its first chunk entering the zero memory. Without the `delta` rule, the template's op as the
+    SSD's route calls it (`recurrence_chunk.template_rule`, scale 1, its output in the operands' dtype),
+    `rounded` as the route's fast forms round it unless given (a 16-bit call's keys then take the write gate,
     `mainloop.Call.gated_keys`; unrounded, Lightning's, its values held in parts). An fp32 call's operands and
     passed values are held in parts as the mainloop holds them (`Lane.held`, `Lane.given`), each record their
     sum. `walked`, the inference forward no gradient follows: a 16-bit call's under a decay a head runs its
