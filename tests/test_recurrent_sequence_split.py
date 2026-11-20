@@ -78,6 +78,15 @@ HEADS_BEFORE_TIME = (("activation_heads", ("tensor", "sequence")),)
 """A rule under which the heads would take the sequence axis too: the split keeps it the sequence's."""
 
 
+def heads_rules(rules: tuple) -> tuple:
+    """`rules` before the default table, the heads' own alone where `rules` give them any: no fallback of the
+    defaults' to a tensor split of their own."""
+    from dew.mesh import DEFAULT_RULES
+
+    given = {name for name, _ in rules}
+    return (*rules, *(rule for rule in DEFAULT_RULES if rule[0] not in given))
+
+
 @pytest.mark.mesh
 @pytest.mark.parametrize(("mixers", "rules"), [(MIXERS, ()), (WIDE_HEADS, HEADS_BEFORE_TIME)],
                          ids=["default rules", "heads before time, four key heads"])
@@ -91,12 +100,10 @@ def test_a_delta_rule_split_over_the_sequence_and_its_heads_runs_its_rows_as_who
     cut, one carrying a document's conv and memory across it past padding, under the default rules and
     under rules giving the heads the sequence axis too (four key heads, which both axes would divide), which
     the split keeps the sequence's."""
-    from dew.mesh import DEFAULT_RULES
-
     module = mixers[name]
     hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
     variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
-    with nn.logical_axis_rules((*rules, *DEFAULT_RULES)):
+    with nn.logical_axis_rules(heads_rules(rules)):
         assert_split_as_whole(module, variables, row, SEEDS[row], f"{name} split over the sequence and its "
                               f"heads, {row}, {rules}", width=WIDTH, shards=2, tensor=2)
 
@@ -110,9 +117,7 @@ def test_a_delta_rule_split_over_the_sequence_divides_its_heads_work_over_a_tens
     sequence_delta_rule`): each device's compiled forward and backward on the host's devices (XLA's count of
     the portable math's every dot) does under three quarters of the work it does with no tensor axis, its
     scan's and conv's half (row 1437: each device ran every head, 0.99 of it), and so under rules giving the
-    heads the sequence axis too where the tensor axis alone divides them (two key heads)."""
-    from dew.mesh import DEFAULT_RULES
-
+    heads the sequence axis too, and no other, where the tensor axis alone divides them (two key heads)."""
     module = mixers[name]
     hidden = jnp.asarray(np.random.default_rng(0).standard_normal((2, 32, WIDTH)), jnp.float32)
     variables = module.init(jax.random.key(7), hidden)
@@ -124,7 +129,7 @@ def test_a_delta_rule_split_over_the_sequence_divides_its_heads_work_over_a_tens
     def work(tensor: int) -> float:
         # On the host's devices, which take the portable math, whose every dot XLA's count holds.
         mesh = MeshSpec(sequence=2, tensor=tensor).build(jax.devices("cpu")[:2 * tensor])
-        with jax.set_mesh(mesh), nn.logical_axis_rules((*rules, *DEFAULT_RULES)):
+        with jax.set_mesh(mesh), nn.logical_axis_rules(heads_rules(rules)):
             return jax.jit(step).lower(variables, hidden).compile().cost_analysis()["flops"]
 
     assert work(2) < 0.75 * work(1)

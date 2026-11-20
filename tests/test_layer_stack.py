@@ -1008,6 +1008,48 @@ def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spe
     assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
 
 
+FUSED_DELTA_HYBRID = {"layer_types": ("linear_attention", "full_attention") * 2, "kinds": {
+    "linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
+        "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4, "fused_in_proj": True}}}}}
+"""Gated delta nets on Qwen3-Next's fused projections beside full attention, two of each, at a tiny width."""
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_pipeline_of_delta_nets_split_over_the_sequence_leaves_the_stage_axis_to_its_vmap():
+    """Two stages beside a sequence axis of two, under rules giving the heads the stage axis, train a hybrid
+    decoder's gated delta nets (their fused projections, which place no heads) split over the sequence as
+    the plain step does: the split places their heads over the axes the rows, the sequence and the stage's
+    vmap leave (`linear.sequence_delta_rule`), where a placement naming the stage axis is one the stage's
+    vmapped map refuses (row 1437 link 2's head review). Loss and gradients check 1's against the plain step
+    from float64."""
+    from dew.mesh import DEFAULT_RULES
+
+    model = tiny(max_seq_len=16, **FUSED_DELTA_HYBRID)
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 16), jnp.int32)))
+    four = jax.devices()[:4]
+    with jax.enable_x64(new_val=True):
+        twin, wide = tiny(max_seq_len=16, dtype=jnp.float64, **FUSED_DELTA_HYBRID), float64_held(variables)
+
+    def stepped(model, variables, spec, microbatches=None):
+        # Each arm placed and compiled on its own mesh, called as given (`loss_and_grads` sets its mesh).
+        @as_given
+        def step(text):
+            loss, _, grads = loss_and_grads(LMObjective(model, 16), spec, variables, {"text": text}, four,
+                                            microbatches)
+            return np.float32(loss) if model is not twin else np.float64(loss), grads
+
+        return step
+
+    def draw(seed):
+        return (np.random.default_rng([0x5EA, seed]).integers(0, VOCAB, size=(BATCH, 17)).astype(np.int32),)
+
+    with nn.logical_axis_rules((("activation_heads", "stage"), *DEFAULT_RULES)):
+        assert_as_exact(stepped(model, variables, MeshSpec(stage=2, sequence=2), 4),
+                        stepped(model, variables, MeshSpec()), draw, "delta nets piped over the sequence",
+                        seeds=FEWEST_SEEDS, truth_fn=stepped(twin, wide, MeshSpec()))
+
+
 @mesh_lane
 def test_a_pipeline_past_a_dense_prefix_scans_its_stages_and_keeps_every_layers_statistics():
     """A dense first layer before eight routed ones over four stages runs the prefix beside the pipeline
