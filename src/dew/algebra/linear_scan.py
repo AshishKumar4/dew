@@ -154,11 +154,13 @@ class Affine(Expr):
                   correction: Token) -> Affine: ...
     """`D h + left (right + correction^T (D h))^T`: an input and the corrections along one vector."""
 
+    @method(cost=2)
     @classmethod
     def corrected_before(cls, base2: i64Like, per_key: i64Like, exponent: Token, left: Token, right: Token,
                          correction: Token) -> Affine: ...
     """`D h + left (right + correction^T h)^T`: `corrected`'s, its corrections reading the state the token
-    enters, before its decay (RWKV7's erase, `-a (b^T S)` beside `D S`)."""
+    enters, before its decay (RWKV7's erase, `-a (b^T S)` beside `D S`). Priced past `corrected`, so an
+    update a scalar decay lets read either way (`D` commuting into the read) keeps the after-decay form."""
 
     @classmethod
     def readout(cls, reader: Token, free: Token) -> Affine: ...
