@@ -12,6 +12,7 @@ import contextlib
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.core import ShapedArray
 from jax.typing import DTypeLike
 
 
@@ -178,16 +179,21 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
         with jax.enable_x64(new_val=True) if resolved == np.dtype(np.float64) else contextlib.nullcontext():
             return _widened_bits(moving, resolved)
 
-    def pulled(_, cotangent):
-        # The cast's own transpose, which keeps the source's type, its weakness included.
-        (back,) = jax.linear_transpose(lambda moving: moving.astype(resolved),
+    # Its type strong, as an explicit conversion's: a weak one would yield to a strong float32 it meets.
+    return linear_map(apply, lambda _, cotangent: cast_back(cotangent, source), (), x,
+                      out_aval=source.update(dtype=resolved, weak_type=False), summed_first=True)
+
+
+def cast_back(cotangent: jax.Array, source: ShapedArray) -> jax.Array:
+    """The cotangent of a cast from `source` (an aval) to `cotangent`'s type, as JAX transposes the cast: in
+    `source`'s type, its weakness kept, traced in x64 where the cotangent is float64, whatever x64 scope a
+    pullback runs in."""
+    wide = cotangent.dtype == np.dtype(np.float64)
+    with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
+        (back,) = jax.linear_transpose(lambda moving: moving.astype(cotangent.dtype),
                                        jax.ShapeDtypeStruct(source.shape, source.dtype,
                                                             weak_type=source.weak_type))(cotangent)
-        return back
-
-    # Its type strong, as an explicit conversion's: a weak one would yield to a strong float32 it meets.
-    return linear_map(apply, pulled, (), x, out_aval=source.update(dtype=resolved, weak_type=False),
-                      summed_first=True)
+    return back
 
 
 def _widens(source: np.dtype, target: np.dtype) -> bool:
