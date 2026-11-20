@@ -1338,18 +1338,23 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     return (out, safe, total) if residuals else out
 
 
-def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
+def mean_held(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
     """`out`, the weighted values `sums` over their denominator, held at `dtype`'s largest where it passes it
     from finite sums: a mean of finite values of `dtype` is within it, so one past it is its weights'
-    rounding, as the kernels hold it (`attention_algebra.quotient`): narrowed to fp16 for their product, the
-    weights round up by as much as 2^-11 of each where the denominator sums them unrounded, the mean of 1001
-    values of 65504 at 65522, inf in fp16 (row 9519). An infinite or NaN sum's (an infinite value's) stays
-    as it is. Its derivative is the mean's, `out`'s: the held value is `out` and its difference from it,
-    which no derivative reads, exact, both within a factor of two of the largest."""
-    largest = float(jnp.finfo(dtype).max)
-    past = jnp.isfinite(sums) & (jnp.abs(out) > largest)
-    held = jnp.where(out > 0, largest, -largest).astype(out.dtype)
-    return jnp.where(past, out + jax.lax.stop_gradient(held - out), out)
+    rounding (narrowed to fp16 for their product, the weights round up by as much as 2^-11 of each where the
+    denominator sums them unrounded, the mean of 1001 values of 65504 at 65522, inf in fp16, row 9519). An
+    infinite or NaN sum's (an infinite value's) stays as it is. The one hold every mainloop's quotient
+    (`attention_algebra.quotient`) and the reference (`held_mean`) take."""
+    largest = jnp.finfo(dtype).max
+    past = (jnp.abs(sums) < jnp.inf) & (jnp.abs(out) > largest)
+    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
+
+
+def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
+    """The reference's `mean_held`: its value, its derivative the mean's, `out`'s (the held value is `out` and
+    its difference from it, which no derivative reads, exact, both within a factor of two of the
+    largest)."""
+    return out + jax.lax.stop_gradient(mean_held(out, sums, dtype) - out)
 
 
 def output_hooked(out: jax.Array, output_mod: Callable | None, output_params: tuple[Param, ...]) -> jax.Array:

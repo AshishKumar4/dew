@@ -339,6 +339,9 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
     """Whether its kernel walks scaled (`algebra.SCALED_WALK`): the op a call some row of which can be scaled
     launches in its common op's place (`_fwd`, `algebra.may_scale`), its own tiles derived from its own
     registers and shared memory (`registers`, `staged_bytes`)."""
+    valueless: bool = False
+    """Whether the call's initial state is a sink's, its numerator zeros (`Initial.valueless`): its output a
+    mean of its values beside zeros, held at their largest (`algebra.largest_of`)."""
 
     def launched_ops(self, dtype) -> tuple["TritonForward", ...]:
         """The ops a call of values `dtype` launches (`_fwd`): this op, and where it walks unscaled and the
@@ -434,8 +437,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, scale,
                                self.score_mod, self.natural, headroom, initial,
                                compensated=algebra.compensates(value.dtype), prescale=power,
-                               # A state the op does not tell from a sink's (`Initial.valueless`): unheld.
-                               largest=None if initial else algebra.largest_of(value.dtype, Hooks()),
+                               largest=None if initial and not self.valueless
+                               else algebra.largest_of(value.dtype, Hooks()),
                                narrowed=algebra.narrowed_of(query.dtype))
         kernel = functools.partial(
             _forward_kernel, score_kinds=self.score_kinds, output_kinds=self.output_kinds, initial=initial,
@@ -721,7 +724,8 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
                        output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
-                       keys=spans.keys, natural=natural)
+                       keys=spans.keys, natural=natural,
+                       valueless=initial is not None and initial.valueless)
     return op, (call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
                 call.score_params, call.output_params, m0, total0, acc0), call.queries
 

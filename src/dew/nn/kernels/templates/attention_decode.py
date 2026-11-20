@@ -111,7 +111,8 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
             shaped = jnp.swapaxes(shaped, 2, 3)
             return shaped.reshape(batch, kv_heads, positions * group, *x.shape[3:])
 
-        initial = Initial(heads_rows(initial.m), heads_rows(initial.total), heads_rows(initial.acc))
+        initial = dataclasses.replace(initial, m=heads_rows(initial.m), total=heads_rows(initial.total),
+                                      acc=heads_rows(initial.acc))
     return rows, spans, initial
 
 
