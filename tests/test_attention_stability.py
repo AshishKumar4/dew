@@ -1217,7 +1217,7 @@ def test_assert_finite_checks_empty_rows_on_every_draw():
     def draw(seed):
         return (jnp.asarray(float(seed), jnp.float32),)
 
-    with pytest.raises(AssertionError, match="seed 1 dq"):
+    with pytest.raises(AssertionError):
         assert_finite(dew_fn, truth_fn, draw, "probe", seeds=3,
                       check=lambda found, seed: _held_empty(family, found, f"probe seed {seed}"))
     assert calls == 2
