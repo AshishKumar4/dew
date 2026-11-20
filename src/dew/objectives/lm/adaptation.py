@@ -892,14 +892,14 @@ class InContextDecoder(nn.Module):
         # A model whose every mixer is tokenwise keeps no cache (`dew.sampling.text.empty_cache`).
         for name, entry in dict(opened).get("cache", {}).items():
             self.put_variable("cache", name, entry)
-        self.put_variable("cache", IN_CONTEXT, self._opened(batch_size))
+        self.put_variable("cache", IN_CONTEXT, self._decode_opened(batch_size))
 
     def _read(self) -> Variables:
         """The variables `model` reads, its decode cache apart, its frozen leaves among its parameters
         (`thaw`), as its training forward reads them."""
         return thaw({name: tree for name, tree in self.variables.items() if name != "cache"})
 
-    def _chain(self, rows: int) -> _Chain:
+    def _decode_chain(self, rows: int) -> _Chain:
         """The training scan's chain over `rows` rows (`adapted_scores`'s) at `model`'s variables, a
         block a slot: no window opens inside one."""
         variables = self._read()
@@ -909,11 +909,11 @@ class InContextDecoder(nn.Module):
         return _Chain(self.model, variables, names, starts, self.adaptation, straddles=False, predict=False,
                       rows=rows)
 
-    def _opened(self, rows: int) -> dict:
+    def _decode_opened(self, rows: int) -> dict:
         """Each row's chain before its first real token (`_Chain.first`), no slot waiting: its states in
         the widest float this process holds, which any final states' dtype round-trips through."""
         widest = jax.dtypes.canonicalize_dtype(jnp.float64)
-        return {"chain": self._chain(rows).first(jnp.float32),
+        return {"chain": self._decode_chain(rows).first(jnp.float32),
                 "pending": jnp.zeros((rows, self.model.emb_features), widest),
                 "block": jnp.full((rows,), -1, jnp.int32), "count": jnp.zeros((rows,), jnp.int32)}
 
@@ -956,7 +956,7 @@ class InContextDecoder(nn.Module):
             hidden = jnp.asarray(self.model.apply(self._read(), tokens, coordinates=laid,
                                                   method="hidden_states", **fields))
             updated = None
-            held = self._opened(tokens.shape[0])
+            held = self._decode_opened(tokens.shape[0])
         real = real_slots({} if laid is None else {COORDINATES_FIELD: laid}, tokens.shape[:2])
         blocks = fields.get(BLOCKS_FIELD)
         blocks = (jnp.full(tokens.shape[:2], -1, jnp.int32) if blocks is None
@@ -972,7 +972,7 @@ class InContextDecoder(nn.Module):
         """The rows' chains `held` past `tokens`' slots, a slot at a time, and each slot's logits, or the
         logits at the slots `wanted` (`[rows, K]`) names alone."""
         rows, width = tokens.shape
-        chain = self._chain(rows)
+        chain = self._decode_chain(rows)
         windows = self.adaptation.windows(len(chain.starts))
         nothing = jnp.zeros((rows, 1), hidden.dtype)
         runs = jnp.ones((rows, 1), jnp.int32)
