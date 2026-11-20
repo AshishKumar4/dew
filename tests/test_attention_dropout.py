@@ -720,10 +720,23 @@ def test_an_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(rate, logit,
     rate whose kept key no first `2^16` draws keep takes its `seed`."""
     words = (first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1])) if seed is None
              else jnp.asarray([seed, 0], jnp.uint32))
-    query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[..., 0].set(1)
-    key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(logit)
-    value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(2.0 ** 15)
     spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
+
+    def draw(draw_seed: int):
+        keys = jax.random.split(jax.random.PRNGKey(draw_seed), 4)
+        sign = jnp.where(jax.random.bernoulli(keys[0]), jnp.float16(1.0), jnp.float16(-1.0))
+        query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[..., 0].set(sign)
+        key_tail = jax.random.normal(keys[1], (1, 2, 1, 7), jnp.float16)
+        key = (jnp.zeros((1, 2, 1, 8), jnp.float16).at[:, :, :, 1:].set(key_tail)
+               .at[0, 1, 0, 0].set(sign * jnp.float16(logit)))
+        dropped_v = jax.random.normal(keys[2], (1, 1, 1, 8), jnp.float16) * jnp.float16(2.0 ** 14)
+        kept_signs = jnp.where(jax.random.bernoulli(keys[3], shape=(1, 1, 1, 8)),
+                               jnp.float16(1.0), jnp.float16(-1.0))
+        kept_mag = jax.random.uniform(jax.random.fold_in(keys[3], 1), (1, 1, 1, 8),
+                                      jnp.float16, minval=0.5, maxval=1.0)
+        kept_v = kept_signs * kept_mag * jnp.float16(2.0 ** 15)
+        value = jnp.concatenate([dropped_v, kept_v], axis=1)
+        return query, key, value
 
     def walked(query, key, value):
         out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
@@ -732,28 +745,45 @@ def test_an_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(rate, logit,
 
     assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
                                                                          scale=1.0),
-                    lambda seed: (query, key, value), "a small kept fp16 weight", seeds=FEWEST_SEEDS)
+                    draw, "a small kept fp16 weight", seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16], ids=["fp32", "fp16"])
 @pytest.mark.parametrize("bits", [32, 48, 53])
 def test_a_resumed_states_small_sums_are_kept_under_a_near_total_draw(bits, dtype, training):
-    """An fp32 state of maximum 0, denominator 1 and sums 2^-120 resumed over one key of logit 0 and value 0
-    of `dtype` at a rate of `1 - 2^-bits`, under an output hook taking it by 2^125, whatever the draw: the
-    output is the state's sums over the joint denominator 2 by it, exactly 16, where the state's sums taken
-    down into the walk's flushed to 0: by the whole multiplier at 2^-32 (the base review of 56a716c95, F2),
-    by its rest past a power capped at 2^32 at 2^-53 and past fp16's 2^15 at 2^-48 (of 4e2eb287e and
-    b872d1849, F2)."""
+    """An fp32 state of maximum 0, denominator 1 and sums ~2^-120 resumed over one key of logit 0 and value
+    0 of `dtype` at a rate of `1 - 2^-bits`, under an output hook taking it by 2^125, whatever the draw: on
+    par with the independent attention reference (check 1), where the state's sums taken down into the walk's
+    flushed to 0: by the whole multiplier at 2^-32 (the base review of 56a716c95, F2), by its rest past a
+    power capped at 2^32 at 2^-53 and past fp16's 2^15 at 2^-48 (of 4e2eb287e and b872d1849, F2)."""
     rate = 1.0 - 2.0 ** -bits
-    query, key, value = (jnp.zeros((1, 1, 1, 8), dtype) for _ in range(3))
-    state = template.Initial(jnp.zeros((1, 1, 1)), jnp.ones((1, 1, 1)), jnp.full((1, 1, 1, 8), 2.0 ** -120))
-    hooks = template.Hooks(initial=state, output_mod=lambda out: out * 2.0 ** 125,
-                           drop=dropout_of(seed_words(0), 1, 1, rate))
-    walked = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value,
-                                             template.spans(1, 1, 1), hooks, residuals=training)
-    out = walked[0] if training else walked
-    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full(out.shape, 16.0, np.float32))
+    spans = template.spans(1, 1, 1)
+    drop = dropout_of(seed_words(0), 1, 1, rate)
+
+    def hooks_of(state_m, state_total, state_acc):
+        return template.Hooks(initial=template.Initial(state_m, state_total, state_acc),
+                              output_mod=lambda out: out * 2.0 ** 125, drop=drop)
+
+    def draw(draw_seed: int):
+        keys = jax.random.split(jax.random.PRNGKey(draw_seed), 2)
+        query, key, value = (jnp.zeros((1, 1, 1, 8), dtype) for _ in range(3))
+        signs = jnp.where(jax.random.bernoulli(keys[0], shape=(1, 1, 1, 8)), 1.0, -1.0)
+        mag = jax.random.uniform(keys[1], (1, 1, 1, 8), jnp.float32, minval=0.5, maxval=1.5)
+        state_m = jnp.zeros((1, 1, 1), jnp.float32)
+        state_total = jnp.ones((1, 1, 1), jnp.float32)
+        state_acc = (signs * mag * jnp.float32(2.0 ** -120)).astype(jnp.float32)
+        return query, key, value, state_m, state_total, state_acc
+
+    def walked(query, key, value, state_m, state_total, state_acc):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks_of(state_m, state_total, state_acc), residuals=training)
+        return out[0] if training else out
+
+    def reference(query, key, value, state_m, state_total, state_acc):
+        return template.reference(query, key, value, spans, hooks_of(state_m, state_total, state_acc))
+
+    assert_as_exact(walked, reference, draw, "resumed small sums under near-total draw", seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
@@ -777,18 +807,35 @@ def test_a_kept_fp32_key_near_fp32s_largest_keeps_its_finite_output(training):
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
 def test_a_large_state_beside_an_fp16_walk_keeps_its_finite_output(training):
-    """An fp32 state of maximum 0, denominator 2^120 and sums 3 2^126 resumed over one fp16 key of logit 0
-    and value 0 at a rate of 1/4, whatever the draw: the output is the state's sums over the joint
-    denominator, 192, where the state's sums taken up into the walk's units by 1.5 overflowed (the base
-    review of a648b3279, F2)."""
-    query, key, value = (jnp.zeros((1, 1, 1, 8), jnp.float16) for _ in range(3))
-    state = template.Initial(jnp.zeros((1, 1, 1)), jnp.full((1, 1, 1), 2.0 ** 120),
-                             jnp.full((1, 1, 1, 8), 3 * 2.0 ** 126))
-    hooks = template.Hooks(initial=state, drop=dropout_of(seed_words(0), 1, 1, 0.25))
-    walked = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value,
-                                             template.spans(1, 1, 1), hooks, residuals=training)
-    out = walked[0] if training else walked
-    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full(out.shape, 192.0, np.float32))
+    """An fp32 state of maximum 0, denominator 2^120 and sums ~3 2^126 resumed over one fp16 key of logit 0
+    and value 0 at a rate of 1/4, whatever the draw: on par with the independent attention reference (check
+    1), where the state's sums taken up into the walk's units by 1.5 overflowed (the base review of
+    a648b3279, F2)."""
+    spans = template.spans(1, 1, 1)
+    drop = dropout_of(seed_words(0), 1, 1, 0.25)
+
+    def hooks_of(state_m, state_total, state_acc):
+        return template.Hooks(initial=template.Initial(state_m, state_total, state_acc), drop=drop)
+
+    def draw(draw_seed: int):
+        keys = jax.random.split(jax.random.PRNGKey(draw_seed), 2)
+        query, key, value = (jnp.zeros((1, 1, 1, 8), jnp.float16) for _ in range(3))
+        signs = jnp.where(jax.random.bernoulli(keys[0], shape=(1, 1, 1, 8)), 1.0, -1.0)
+        mag = jax.random.uniform(keys[1], (1, 1, 1, 8), jnp.float32, minval=2.7, maxval=3.0)
+        state_m = jnp.zeros((1, 1, 1), jnp.float32)
+        state_total = jnp.full((1, 1, 1), 2.0 ** 120, jnp.float32)
+        state_acc = (signs * mag * jnp.float32(2.0 ** 126)).astype(jnp.float32)
+        return query, key, value, state_m, state_total, state_acc
+
+    def walked(query, key, value, state_m, state_total, state_acc):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks_of(state_m, state_total, state_acc), residuals=training)
+        return out[0] if training else out
+
+    def reference(query, key, value, state_m, state_total, state_acc):
+        return template.reference(query, key, value, spans, hooks_of(state_m, state_total, state_acc))
+
+    assert_as_exact(walked, reference, draw, "large state beside fp16 walk", seeds=FEWEST_SEEDS)
 
 
 def _portable_gradients(spans, hooks, scale: float = 1.0):
