@@ -67,6 +67,19 @@ def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array
             bits & word.type((1 << limits.nmant) - 1))
 
 
+def split_bits(dtype) -> tuple[type, int, int]:
+    """A float's significand split for `precision.two_product`'s `bit_split` and `aligned_sum`'s digits: its
+    unsigned bits' type, the mask keeping its high part and the low bits masked, `p - floor(p / 2)` of its
+    `p`, so its high part holds `floor(p / 2)` bits. An even `p`'s truncated remainder holds the other half
+    (fp32's 12, bfloat16's 4); an odd `p`'s would hold one bit more (float64's 27, float16's 6), its low
+    parts' product past `p` bits, so the cut rounds to nearest there (`precision`'s `_odd`), its remainder
+    signed and at most half the high part's last bit: every product of two parts exact (Dekker's)."""
+    limits = jnp.finfo(dtype)
+    unsigned = np.dtype(f"uint{limits.bits}").type
+    low = (limits.nmant + 2) // 2
+    return unsigned, ~((1 << low) - 1) & np.iinfo(unsigned).max, low
+
+
 def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
     """A float `x` of IEEE's binary formats (fp16, bfloat16, fp32, float64) from its bits, each a signed
     integer of its width: its sign bit, its biased exponent, its fraction, its fraction normalized as a
