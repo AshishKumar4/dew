@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 import ring_protocol
 from gathered_walks import gathered_kernel, tile_value
-from ring_protocol import Event, Violation, explore, programs
+from ring_protocol import Event, Violation, _Splat, explore, programs
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic_sm90, rings
@@ -577,17 +577,36 @@ def _other_half_filled(filled):
     return mutated
 
 
+def _ahead_other_parity(call):
+    """`gathered.Gathers.__call__` mutated where it hands its step's operands on: the parity it reads its
+    entries ahead at (`gathered.Held.read`) the other step's."""
+    from jax.extend.mlir import ir
+    from jax.extend.mlir.dialects import arith
+
+    from dew.nn.kernels.templates import gathered
+
+    def mutated(self, ctx, *operands):
+        *given, entries, parity = operands
+        other = arith.subi(gathered.mgpu_utils.c(1, ir.IntegerType.get_signless(32)),
+                           gathered.splat_value(parity))
+        return call(self, ctx, *given, entries, _Splat(other))
+
+    return mutated
+
+
 @pytest.mark.parametrize("mutation", [None, "no-wait", "no-warp-barrier", "one-in-flight", "other-parity",
-                                      "other-half-filled"])
+                                      "other-half-filled", "ahead-other-parity"])
 def test_a_load_warp_reading_its_entries_before_their_fills_land_is_caught(mutation):
     """The gathered walk as the kernel builds it, every interleaving holding; and built with its load warps'
     entries mutated in the kernel, each read from its lowered bodies' ops (`_lowered`, `_lowered_reads`):
     their wait for their entries' cp.async groups removed, or leaving one group in flight
     (`cp_async_wait_group(1)`), or the warp not meeting after it (each lane's copy its own till then, base
     review 760be77fe F4), a step's read may come before the fill it needs lands; their loads reading
-    the other step's half of the entries, or their copies filling it, a read no fill of its step wrote. The
-    explorer finds each (row 8657; base reviews 0991196fb F2 and 9d013a4b9 F1: the checker read the wait,
-    the read and the fill's half from the body's fields, so each mutated kernel passed)."""
+    the other step's half of the entries, or their copies filling it, or their gathers handing the read the
+    other step's parity, a read no fill of its step wrote. The explorer finds each (row 8657; base reviews
+    0991196fb F2 and 9d013a4b9 F1: the checker read the wait, the read and the fill's half from the body's
+    fields, so each mutated kernel passed; head review of 0099a4701 F2: it read the entries from a Held of
+    its own, so a gather handing on another parity passed)."""
     from dew.nn.kernels.templates import gathered
 
     wait = gathered.mgpu_nvvm.cp_async_wait_group
@@ -595,7 +614,9 @@ def test_a_load_warp_reading_its_entries_before_their_fills_land_is_caught(mutat
                "no-warp-barrier": (gathered.mgpu_utils, "warp_barrier", lambda: None),
                "one-in-flight": (gathered.mgpu_nvvm, "cp_async_wait_group", lambda count: wait(1)),
                "other-parity": (gathered.Held, "entry", _other_parity),
-               "other-half-filled": (gathered, "filled", _other_half_filled(gathered.filled))}
+               "other-half-filled": (gathered, "filled", _other_half_filled(gathered.filled)),
+               "ahead-other-parity": (gathered.Gathers, "__call__",
+                                      _ahead_other_parity(gathered.Gathers.__call__))}
     gathered_walk.cache_clear()
     with pytest.MonkeyPatch.context() as patch:
         if mutation is not None:
