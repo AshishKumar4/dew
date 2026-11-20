@@ -54,11 +54,11 @@ class NvFp4:
         if isinstance(target, jax.Array):
             found: set[str] = set()
             for shard in target.addressable_shards:
-                data = np.asarray(shard.data)
-                if data.shape[-1] != FORM.size:
+                held = np.asarray(shard.data)
+                if held.shape[-1] != FORM.size:
                     raise ValueError(f"NVFP4 form digest sharded across its {FORM.size} bytes "
-                                     f"(shard shape {data.shape}); pass the gathered form to checked()")
-                found.update(bytes(row).hex() for row in data.reshape(-1, FORM.size))
+                                     f"(shard shape {held.shape}); pass the gathered form to checked()")
+                found.update(bytes(row).hex() for row in held.reshape(-1, FORM.size))
         else:
             found = {bytes(row).hex() for row in np.asarray(target).reshape(-1, FORM.size)}
         if found != {FORM.tobytes().hex()}:
