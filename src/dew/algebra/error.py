@@ -56,7 +56,9 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     reference)`, whether `candidate` is as exact as `reference` from the float64 truth;
     docs/design/algebra.md §1.5, §6.5): under default numerics against
     the form as written, so one is always admitted; under the accurate numerics (`precision="accurate"`)
-    against every other candidate, so a choice is never less accurate than any form proposed."""
+    against the form as written and every other candidate as exact as it, so a choice is never less
+    accurate than any admissible form proposed, and a form that is not (one past the float's range) blocks
+    none."""
     closed, shaped = jax.make_jaxpr(function, return_shape=True)(*operands)
     region = terms.region(closed)
     graph, bundle, roots = program.graphed(region)
@@ -86,7 +88,10 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     candidates += [found for candidate in candidates
                    if (found := compensated(candidate, operands, tree)) is not None]
     candidates.sort(key=lambda candidate: (candidate.compensated, candidate.seconds))
-    references = candidates if accurate else [written]
+    # Under the accurate numerics, every candidate as exact as the form as written is a reference: one
+    # that is not (a regrouping past the float's range where the form as written is finite) raises no bar.
+    references = [written, *(candidate for candidate in candidates if candidate is not written
+                             and admits(candidate.function, written.function))] if accurate else [written]
     for candidate in candidates:
         if all(candidate is reference or admits(candidate.function, reference.function)
                for reference in references):

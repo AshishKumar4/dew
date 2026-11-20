@@ -104,7 +104,33 @@ def source(closed: core.Jaxpr, name: str, *, compensated: bool = False) -> tuple
     _body(printer, closed.jaxpr)
     outputs = [printer.atom(atom) for atom in closed.jaxpr.outvars]
     returned = wrapped("    return (", outputs, ",)" if len(outputs) == 1 else ")")
-    return "\n".join([f"def {name}({', '.join(inputs)}):", *printer.lines, *returned]) + "\n", printer.used
+    text = "\n".join([f"def {name}({', '.join(inputs)}):", *printer.lines, *returned]) + "\n"
+    _held(text, name, closed)
+    return text, printer.used
+
+
+def _typed(aval: ShapedArray | jax.ShapeDtypeStruct) -> tuple:
+    return tuple(aval.shape), np.dtype(aval.dtype), bool(aval.weak_type)
+
+
+def _shaped(atom) -> ShapedArray:
+    """A program's value's abstract value, an array's, else refused."""
+    if not isinstance(atom.aval, ShapedArray):
+        raise Unprintable(f"no plain call writes a {type(atom.aval).__name__} value")
+    return atom.aval
+
+
+def _held(text: str, name: str, closed: core.Jaxpr) -> None:
+    """Refuses a printed text whose outputs are not the program's in shape, dtype and weak type (a literal
+    the program holds weak, printed strong, that reaches an output): what a plain call cannot write as the
+    jaxpr holds it."""
+    shaped = jax.eval_shape(loaded(text, name), *(
+        jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type)
+        for aval in map(_shaped, closed.jaxpr.invars)))
+    found = [_typed(leaf) for leaf in shaped]
+    expected = [_typed(_shaped(atom)) for atom in closed.jaxpr.outvars]
+    if found != expected:
+        raise Unprintable(f"its printed outputs are {found}, the program's {expected}")
 
 
 def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
@@ -119,6 +145,7 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
             # A program's own constants with it (JAX's closed program is its jaxpr's alias).
             body: core.Jaxpr = inner.jaxpr
             consts = inner.consts
+            _forget(printer, body)
             for var, value in zip(body.constvars, consts, strict=True):
                 printer.names[var] = printer.fresh("c")
                 printer.lines.extend(_constant(printer.names[var], np.asarray(value)))
@@ -138,7 +165,9 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
             printer.names[var] = named
         arguments = [printer.atom(atom) for atom in equation.invars]
         arguments += [f"{key}={_param(value)}" for key, value in equation.params.items()]
-        target = ", ".join(outputs) if primitive.multiple_results else outputs[0]
+        # A primitive of several results binds a sequence, unpacked even where it holds one.
+        target = (", ".join(outputs) + ("," if len(outputs) == 1 else "") if primitive.multiple_results
+                  else outputs[0])
         printer.emit(target, f"lax.{primitive.name}_p.bind", arguments)
 
 
@@ -153,6 +182,16 @@ def _inlined(printer: _Printer, equation: jcore.JaxprEqn) -> tuple:
     if platforms is not None and None in platforms:
         return equation.params["branches"][platforms.index(None)], equation.invars[1:]
     return None, ()
+
+
+def _forget(printer: _Printer, body: core.Jaxpr) -> None:
+    """Every value of `body` unnamed before it is printed in place, so a body inlined again (one nested
+    program called twice) binds its own names, pairs and reads afresh, none of an earlier call's."""
+    for var in (*body.constvars, *body.invars, *(var for equation in body.eqns for var in equation.outvars)):
+        printer.names.pop(var, None)
+        printer.pairs.pop(var, None)
+        printer.platforms.pop(var, None)
+        printer.read.discard(var)
 
 
 def _alias(printer: _Printer, var: jcore.Var, atom) -> None:
@@ -247,8 +286,11 @@ def _value(value, dtype) -> str:
         return f"np.array({bool(held)}, dtype={named})"
     if jnp.issubdtype(dtype, jnp.integer):
         return f"np.array({int(held)}, dtype={named})"
-    if jnp.issubdtype(dtype, jnp.floating):
+    if jnp.issubdtype(dtype, jnp.floating) and not np.isnan(held):
         return f"np.array({_float(float(held))}, dtype={named})"
+    if jnp.issubdtype(dtype, jnp.floating):
+        # A NaN by its bits, its payload kept.
+        return _bytes(held)
     raise Unprintable(f"no literal form of a {np.dtype(dtype).name} value")
 
 

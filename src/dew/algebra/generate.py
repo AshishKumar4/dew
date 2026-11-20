@@ -107,7 +107,7 @@ def admits(function: Callable, operands: tuple[jax.ShapeDtypeStruct, ...], cases
             with algebra.passes(on=False):
                 mine, other = ours(*values), theirs(*values)
                 with jax.enable_x64(new_val=True):
-                    true = truth(*(jnp.asarray(value, jnp.float64) for value in values))
+                    true = truth(*map(_widened, values))
             return mine, other, true
 
         try:
@@ -116,6 +116,14 @@ def admits(function: Callable, operands: tuple[jax.ShapeDtypeStruct, ...], cases
             return False
         return True
     return admitted
+
+
+def _widened(value) -> jax.Array:
+    """A truth's operand: a real float's in float64, a complex one's in complex128, any other as it is."""
+    value = jnp.asarray(value)
+    if jnp.issubdtype(value.dtype, jnp.complexfloating):
+        return value.astype(jnp.complex128)
+    return value.astype(jnp.float64) if jnp.issubdtype(value.dtype, jnp.floating) else value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -236,6 +244,9 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
     writes."""
     for module in DECLARING:
         importlib.import_module(module)
+    if not DECLARATIONS:
+        raise ValueError(f"no declarations: none of {DECLARING} declared a stable form here (a registry "
+                         f"other than the declaring modules' own reads none)")
     chosen = sorted(names or DECLARATIONS)
     unknown = [name for name in chosen if name not in DECLARATIONS]
     if unknown:
@@ -277,4 +288,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Run as a script this file is `__main__`, a module of its own beside the one the declaring modules
+    # register with: the command is that module's.
+    from dew.algebra import generate as declared
+
+    sys.exit(declared.main())
