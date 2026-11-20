@@ -16,14 +16,17 @@ import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 
+from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
     attention_decode,
     attention_mosaic,
+    attention_mosaic_forward,
     bundles,
     cost,
+    emission,
     report,
 )
 
@@ -938,6 +941,58 @@ def test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_ste
     # Its seconds on the device (`cost.seconds`), the server's comparison, grow with the keys it reads.
     target = generation.gpu_target("sm90")
     assert cost.seconds(longer, target) > cost.seconds(dense, target) > 0
+
+
+SPLIT_SPANS = {
+    "ten tiles in three": ("full", 64, 640, 1, "wgmma", 3, 4, (10, 10)),
+    "a causal pair in two": ("causal", 256, 256, 2, "wgmma", 2, 3, (10, 10)),
+}
+"""Each split launch's spans' form, queries, keys, consumers a program and family, slices, the span its
+longest program walks, and its consumers' steps a head beside its unsplit launch's: ten 64-key tiles a query
+tile, split three ways, slices of 3, 3 and 4 tiles, ten steps either way; a causal 256 by 256 call at 64 by
+64 tiles, two consumers a program, two slices, whose last pair's consumers reach 3 and 4 tiles, their
+second slices [1, 3) and [2, 4), which its producer streams as one, [1, 4) (the base review of 71686face,
+F3), each consumer walking its own slices, 10 steps either way. A forward on a layout whose consumers feed
+their own rings (`TileWalk.common`) takes one consumer (`MosaicForward.legal`, row 2599), so no split
+launch's holders walk a common envelope."""
+
+
+def _split_work(form: str, queries: int, keys: int, consumers: int, family: str, splits: int):
+    """The work of a launch over `form`'s spans of `queries` and `keys` at 64 by 64 tiles, `consumers` a
+    program on `family`'s walk, in `splits` slices, traced for an H100 as its costed launch counts it
+    (`emission.work_of`): its walk's launch, beside the guard's natural rewalk
+    (`attention_mosaic_forward.NATURAL_NAME`)."""
+    query = jnp.zeros((1, queries, 2, 64), jnp.bfloat16)
+    key = jnp.zeros((1, keys, 2, 64), jnp.bfloat16)
+    spans = template.spans(queries, keys, 1, causal=form == "causal")
+    with generation.assumed("sm90"):
+        op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None, natural=False,
+                                                  splits=splits, out_dtype=jnp.float32)
+        tiles = attention_mosaic.Tiles(64, 64, 2, consumers, family=family)
+        with tuning.pinned({attention_mosaic.MosaicForward: tiles}):
+            # A split launch's slices keep their rows, which the step's merge reads (`attention_decode`).
+            kept = template.Kept.OUTPUT if splits > 1 else template.Kept.NONE
+            traced = jax.make_jaxpr(lambda *operands: op(*operands, residuals=kept, interpret=False))(*args)
+    (work,) = [emission.work_of(equation) for equation in programs.equations(traced.jaxpr)
+               if equation.primitive in programs.NATIVE_KERNELS
+               and attention_mosaic_forward.NATURAL_NAME not in equation.params["name"]]
+    assert work is not None
+    return work
+
+
+@pytest.mark.parametrize(("form", "queries", "keys", "consumers", "family", "splits", "span", "steps"),
+                         SPLIT_SPANS.values(), ids=SPLIT_SPANS.keys())
+def test_a_split_launchs_span_is_its_longest_slice(form, queries, keys, consumers, family, splits, span,
+                                                   steps):
+    """A split launch (`MosaicForward.splits`, `_Program._sliced`) traced for an H100 at 64 by 64 tiles: its
+    work as its costed launch counts it (`_split_work`) spans its longest program's walk
+    (`cost.Stated.longest`), where its programs' mean was 10/3 for ten tiles in three (row 8844; the base
+    review of 31b5fe85b, F2), and issues its consumers' steps as the kernel slices and streams them, its
+    unsplit launch's tensor work by their ratio to its steps (`attention_mosaic_program.walks`)."""
+    split = _split_work(form, queries, keys, consumers, family, splits)
+    unsplit = _split_work(form, queries, keys, consumers, family, 1)
+    assert split.span == span
+    assert split.flops * steps[1] == unsplit.flops * steps[0]
 
 
 def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():

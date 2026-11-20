@@ -70,8 +70,8 @@ def test_the_derived_attention_is_finite_where_the_truth_is_on_every_family(name
         natural, accurate = attention_route.run_forms()
         mainloops = attention_suite._mainloops(family, {"natural": natural, "accurate": accurate})
         differentiated = jax.jit(with_gradients(mainloops["portable"]))
-        attention_suite.assert_finite(differentiated, truth, draw, label, seeds=attention_suite.SEEDS[name])
-        attention_suite._held_empty(family, differentiated(*draw(0)), label)
+        attention_suite.assert_finite(differentiated, truth, draw, label, seeds=attention_suite.SEEDS[name],
+                                      empty=family.empty)
 
 
 def _rows(rows, dtype, width: int = 8):
