@@ -172,7 +172,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post114 and, on Linux x86_64 and aarch64, its own jaxlib build
+- Dew requires its JAX build 0.12.0.1.post115 and, on Linux x86_64 and aarch64, its own jaxlib build
   0.12.0.1.post114, with its CUDA and PJRT plugins 0.12.0.1.post114 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
@@ -211,8 +211,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   labeled one apart from its unlabeled twin, so `jax.extend.backend.no_contract_attribute()` names the label on
   this jaxlib (rows 8554, 8638); XLA:GPU's small-dot rewrite multiplies as an F16, BF16, F64 or F8 precision
   algorithm states, where it refused such a dot (row 8554); and a program's Mosaic GPU kernels instantiating at
-  once leave the compile threads free while they wait on LLVM's options lock (row 8602). Elsewhere jaxlib stays the
-  stock 0.12.0.1.
+  once leave the compile threads free while they wait on LLVM's options lock (row 8602); and a Mosaic GPU kernel's
+  lowering cache keys its placement only where the kernel reads it, so a kernel that reads no mesh is one cache entry
+  under any mesh (row 8793). Elsewhere jaxlib stays the stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes
