@@ -97,22 +97,22 @@ def attending(length, rope=ROPE, **options):
     return sparse, dense
 
 
+def _pulled(attend):
+    """The operands' gradients under the drawn cotangent, through the gate's pullback."""
+    def run(*drawn):
+        *operands, indices, cotangent = drawn
+        return with_gradients(lambda *pieces: attend(*pieces, indices))(*operands, cotangent)
+    return jax.jit(run)
+
+
 def test_the_selection_attends_as_the_masked_expanded_reference():
     """Forward and every input gradient at fp32. A query whose causal set is
     smaller than k carries unselected slots, which read nothing. The block
     size of 5 splits 23 queries unevenly, so padding rides the last block."""
     length, top_k = 23, 6
-
-    def pulled(attend):
-        # The operands' gradients under the drawn cotangent, through the gate's pullback.
-        def run(*drawn):
-            *operands, indices, cotangent = drawn
-            return with_gradients(lambda *pieces: attend(*pieces, indices))(*operands, cotangent)
-        return jax.jit(run)
-
     sparse, dense = attending(length, block=5)
-    assert_as_exact(pulled(sparse), pulled(dense), selection_draw(length, top_k, cotangent=True), 'selection',
-                    seeds=SEEDS['selection'])
+    assert_as_exact(_pulled(sparse), _pulled(dense), selection_draw(length, top_k, cotangent=True),
+                    'selection', seeds=SEEDS['selection'])
 
 
 def test_the_template_reads_the_selection_as_the_masked_expanded_reference():
@@ -122,17 +122,9 @@ def test_the_template_reads_the_selection_as_the_masked_expanded_reference():
     mask (check 1), exercising both batch page offsets and a query whose causal set is smaller than k
     reading its named slots alone (row 9023)."""
     length, top_k = 2, 2
-
-    def pulled(attend):
-        # The operands' gradients under the drawn cotangent, through the gate's pullback.
-        def run(*drawn):
-            *operands, indices, cotangent = drawn
-            return with_gradients(lambda *pieces: attend(*pieces, indices))(*operands, cotangent)
-        return jax.jit(run)
-
     sparse, dense = attending(length, rope=32)
     with generation.assumed("sm80"), generation.chosen(sparse_attention="template"):
-        assert_as_exact(pulled(sparse), pulled(dense),
+        assert_as_exact(_pulled(sparse), _pulled(dense),
                         selection_draw(length, top_k, cotangent=True, dtype=jnp.bfloat16, batch=2, rank=32,
                                        rope=32),
                         'templated selection', seeds=SEEDS['templated selection'])

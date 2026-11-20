@@ -196,7 +196,7 @@ class SparseCase:
     rows: int
     pool_keys: int
     scale: float
-    precision: object = None
+    precision: jax.lax.PrecisionLike = None
 
 
 def _template_tiles(case: SparseCase) -> bool:

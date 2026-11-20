@@ -666,7 +666,7 @@ class Tcgen05Walked(Tcgen05Placed):
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
                         ahead: tuple[int, ...] = (), sums: tuple[int, ...] = (),
-                        together: tuple[int, ...] = ()) -> dict:
+                        together: tuple[int, ...] = (), tmem_limit: int | None = None) -> dict:
         # The program's two turns of the scores and of their cotangents (`ahead`'s widths, a step's walked
         # tile), a packed 16-bit view over each (`lefts`' dtype: the narrowed lefts over the turn's first
         # half), the kept sums (`sums`, `kept_sums`'), and the hand-offs: the scores' (`scored`, two turns,
@@ -676,7 +676,7 @@ class Tcgen05Walked(Tcgen05Placed):
         # its turns, a half of its columns over each (a 64-row accumulator of them, half a column's lanes
         # each, `Tcgen05ChunksIssuer`'s), and its hand-offs: the issuer's commit (`dq_ready`) and the
         # compute warpgroup's read of it, its turns free (`freed`).
-        del consumers, together
+        del consumers, together, tmem_limit
         ((scores, cotangents), (left,)) = ahead, tuple(dict.fromkeys(lefts))
         rows, (_, dtype) = self.rows, left
 
