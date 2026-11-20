@@ -104,7 +104,8 @@ def test_a_tile_layout_takes_a_placement_inside_a_nested_call_as_the_identity():
     trace of a plain program's attention holds a reshard in its score hook: rows 9570 and 9571) is held
     transposed as the function without it: the placement binds nothing, the tile being placed already, so
     the transposed program holds none for a kernel's lowering to meet; and as a score hook the Mosaic
-    backward takes it (`transposable`), its placement one entry at a time (head review)."""
+    backward takes a reshard (`transposable`), which its queries-first walks, running the hook as written,
+    lower too, and refuses a sharding constraint, which no Mosaic rule lowers (head review)."""
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("rows",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
@@ -117,7 +118,16 @@ def test_a_tile_layout_takes_a_placement_inside_a_nested_call_as_the_identity():
     traced = jax.make_jaxpr(held)(tile.T)
     assert not any(eqn.primitive in (jax.lax.sharding_constraint_p, primitives.reshard_p)
                    for eqn in traced.jaxpr.eqns)
-    # The Mosaic backward's legality of such a score hook: transposed, and one entry at a time in its logits.
-    hooks = attention.Hooks(score_mod=lambda logits, q_pos, k_pos: scored(logits))
-    assert attention_mosaic_program.transposable(hooks)
+    # As a score hook the Mosaic backward takes a reshard, which a tile run as written lowers too, and
+    # refuses a sharding constraint, which none does (head review).
+    explicit = jax.make_mesh((1,), ("rows",), axis_types=(jax.sharding.AxisType.Explicit,))
+
+    def resharded(logits, q_pos, k_pos):
+        return jax.jit(lambda t: jax.sharding.reshard(
+            t * 2.0, jax.sharding.NamedSharding(explicit, jax.sharding.PartitionSpec())))(logits)
+
+    with jax.set_mesh(explicit):
+        assert attention_mosaic_program.transposable(attention.Hooks(score_mod=resharded))
+    assert not attention_mosaic_program.transposable(
+        attention.Hooks(score_mod=lambda logits, q_pos, k_pos: scored(logits)))
 

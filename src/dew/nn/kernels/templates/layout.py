@@ -86,15 +86,16 @@ def _along(key: str) -> Callable:
 _cumulated = _along("axis")
 PLACEMENTS = (jax_core.primitives.reshard_p, jax.lax.sharding_constraint_p)
 """The operations that place a value on a mesh and leave it as it is (each output its operand): a tile is
-placed already, so each is the identity where one is transposed (`_placed`) or walked (`dew.algebra.forms`),
-and one entry at a time where a tile's legality is checked (`placed`, the Mosaic backward's `_entrywise`): a
-GPU's trace of a plain program's attention holds a reshard in its score hook's nested call (rows 9570 and
+placed already, so each is the identity where one is transposed (`_placed`) or walked (`dew.algebra.forms`):
+a GPU's trace of a plain program's attention holds a reshard in its score hook's nested call (rows 9570 and
 9571)."""
 
 
 def placed(eqn) -> bool:
-    """Whether `eqn` places a value on a mesh and leaves it as it is (`PLACEMENTS`)."""
-    return eqn.primitive in PLACEMENTS
+    """Whether `eqn` is a placement a hook may hold where a tile also runs it as written, one entry at a time
+    in a tile's legality (`_axis_free`, the Mosaic backward's `_entrywise`): a reshard, which JAX's Mosaic
+    rules lower; a sharding constraint has none, so a hook holding one stays refused there."""
+    return eqn.primitive is jax_core.primitives.reshard_p
 
 
 @_rule(*PLACEMENTS)
