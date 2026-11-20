@@ -199,9 +199,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     def prepare(chunk, issue=None, transition: bool = False, window=None):
         affine, (exponent, *values) = parts(chunk, window)
-        decays = _decays(exponent, affine.base2)
-        natural = _walked(exponent, affine.base2)
         read = declaration if window is None else _unreset(declaration)
+        decays = _started(_decays(exponent, affine.base2), None if read.reset is None else chunk[read.reset])
+        natural = _walked(exponent, affine.base2)
         tokens, entering = _read_entering(read, chunk, dict(zip(TOKENS, values, strict=True)))
         apart = _apart(declaration, affine, tokens["B"].shape[0])
         extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1],
@@ -410,8 +410,9 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             read = h if declaration.reset is None else jnp.where(step[declaration.reset], 0.0, h)
             entering = _read(read, q, affine.values_read, affine.reader_scale) + r
         # A correction reading the state the token enters (`linear_scan.Parts.before`) reads a document's
-        # start's zero (`RESET_DECAY`) and a key whose decay alone vanishes whole, as its forms read them.
-        entered = jnp.where(_reset(z)[:, None], 0.0, h) if affine.before else None
+        # start's zero and a key whose decay alone vanishes whole, as its forms read them (`_started`).
+        entered = (None if not affine.before else h if declaration.reset is None
+                   else jnp.where(step[declaration.reset], 0.0, h))
         _, cut = vanished(z, affine.base2)
         h = jnp.where(cut[:, None], 0.0, h)
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
@@ -455,10 +456,12 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             output = _read(h, q, affine.values_read, affine.reader_scale) + r
         return (h, apart, index + 1), output if entering is None else entering
 
-    # The state carried in the type its tokens' operands and itself widen to (a float32 state's replay over
-    # a float64 erase vector, x64's), as the token loop carries it.
-    carried = at_least_fp32(jnp.result_type(h, *(x for x in along.values()
-                                                 if jnp.issubdtype(x.dtype, jnp.floating))))
+    # The state carried in the type its update's parts and itself widen to, as the token loop carries it (a
+    # float32 state's replay under a float64 erase vector, x64's; a readout's parts widen none of it).
+    z, b, u, strength, c, _, _, across, erase = jax.eval_shape(
+        lambda step: _at_token(declaration, names, affine, step), jax.tree.map(lambda x: x[0], along))
+    updating = (z, b, u, strength, c, across, erase)
+    carried = at_least_fp32(jnp.result_type(h, *(part.dtype for part in updating)))
     h = h.astype(carried)
     if walked is None:
         (h, _, _), outputs = lax.scan(token, (h, h, 0), along)
@@ -1473,7 +1476,6 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     holding -2**127 twice is -inf; one holding -2**70 loses a later -1 to its rounding, its decay 1 in place
     of `exp(-1)`), and each span through one is zero."""
     live, cut = vanished(exponents, base2)
-    reset = _reset(exponents)
     high, low = compensated(live, restarts=cut)
     segments = jnp.cumsum(cut.astype(jnp.int32), axis=0)
     count = exponents.shape[0]
@@ -1491,18 +1493,24 @@ def _decays_value(exponents, base2: bool) -> _Decays:
                    to_last=_two_factors(base2, (high[-1] - high) + (low[-1] - low), ending),
                    whole=_two_factors(base2, high[-1] + low[-1], started[-1]), between=between,
                    # A token back, `entering`'s and `between`'s shifted a row: through the tokens before the
-                   # reader's, cut where the reader's own token is a document's start (`_reset`) alone, so
-                   # its correction reads the state it enters, a reset's zero, and a key whose decay alone
-                   # vanishes at it whole.
-                   entering_before=_Split(jnp.where(reset, -0.0, _back(entering.first, first=1.0)),
-                                          jnp.where(reset, 1.0, _back(entering.rest, first=1.0))),
-                   between_before=jnp.where(reset[:, None], -0.0, _back(between, first=-0.0)))
+                   # reader's alone, so a key whose decay vanishes at the reader is read whole (a document's
+                   # start cuts them where the walk declares its resets, `_started`).
+                   entering_before=_Split(_back(entering.first, first=1.0), _back(entering.rest, first=1.0)),
+                   between_before=_back(between, first=-0.0))
 
 
-def _reset(exponents) -> jax.Array:
-    """Where a token's exponent is a document's start's (`RESET_DECAY`, `_at_token`'s) or past it: the one
-    cut of a read of the state a token enters, which a decay that vanishes alone leaves whole."""
-    return exponents <= RESET_DECAY
+def _started(decays: _Decays, resets) -> _Decays:
+    """`decays` with their token-back decays (`entering_before`, `between_before`) cut at each document's
+    start, `resets` `[C]` the walk's declared reset operand (`Scan.reset`; none where None): a correction
+    reading the state a token enters reads a reset's zero, where its own exponent (`RESET_DECAY`) is no
+    mark of one, a saturated gate's as deep."""
+    if resets is None:
+        return decays
+    at = jnp.asarray(resets, bool)[:, None]
+    entering = decays.entering_before
+    return decays._replace(entering_before=_Split(jnp.where(at, -0.0, entering.first),
+                                                  jnp.where(at, 1.0, entering.rest)),
+                           between_before=jnp.where(at[:, None], -0.0, decays.between_before))
 
 
 def _back(array, first):

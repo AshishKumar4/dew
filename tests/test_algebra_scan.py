@@ -417,6 +417,10 @@ def rwkv_draw(seed, per_key: bool = False):
 VANISHED = -200.0
 """A log decay that vanishes alone (`exp(-200)`, zero in float32), no document's start."""
 
+SATURATED = scan.RESET_DECAY
+"""A gate saturated at a document's start's own exponent (`scan.RESET_DECAY`), no document's start: RWKV7's
+`-exp(x)` past it at `x` of about 9.2."""
+
 
 def rwkv_forms(operands: dict, **declared):
     """RWKV7's token's derived forms over `operands` (`RWKV`'s or `RWKV_KEYED`'s), `declared` the rest of its
@@ -425,31 +429,30 @@ def rwkv_forms(operands: dict, **declared):
                                       state=((KEY, VALUE), jnp.float32), **declared), saturation=SATURATION)
 
 
-def rwkv_entering_draw(seed, per_key: bool = False):
-    """`rwkv_draw`'s operands and a state entering of unit normals, a decay vanishing alone (`VANISHED`, one
-    key's where `per_key`) at the second chunk's first token, inside it, and at its sub-chunk's start."""
-    q, k, v, g, beta, a, c = rwkv_draw(seed, per_key)
-    g = np.array(g)
-    for token, key in ((CHUNK, 0), (CHUNK + 5, 3), (CHUNK + CHUNK // 2, KEY - 1)):
-        g[(token, key) if per_key else token] = VANISHED
-    h0 = np.random.default_rng([seed, 6755]).standard_normal((KEY, VALUE))
-    return q, k, v, jnp.asarray(g, jnp.float32), beta, a, c, jnp.asarray(h0, jnp.float32)
+def rwkv_tokenwise(q, k, v, g, beta, a, c):
+    """RWKV7's token scan from a zero state: its outputs and final state."""
+    return scanned(rwkv_erase, rwkv_readout)(q, k, v, g, beta, a, c, jnp.zeros((KEY, VALUE), q.dtype))
 
 
-def rwkv_tokenwise(q, k, v, g, beta, a, c, h0=None):
-    """RWKV7's token scan from `h0` (zero where None): its outputs and final state."""
-    def one(h, token):
-        h = rwkv_erase(h, *token)
-        return h, rwkv_readout(h, *token)
+def scanned(update_fn, readout_fn):
+    """`update_fn`'s token scan, each token reading the state after it (`readout_fn`), from the state given
+    after its operands: its outputs and final state."""
+    def run(*xs):
+        *tokens, h0 = xs
 
-    entering = jnp.zeros((KEY, VALUE), q.dtype) if h0 is None else h0
-    final, outputs = jax.lax.scan(one, entering, (q, k, v, g, beta, a, c))
-    return outputs, final
+        def one(h, token):
+            h = update_fn(h, *token)
+            return h, readout_fn(h, *token)
+
+        final, outputs = jax.lax.scan(one, h0, tuple(tokens))
+        return outputs, final
+
+    return run
 
 
-def rwkv_walked(forms, operands: dict, entering: bool = False):
-    """`forms`' chunks walked over RWKV7's operands from a zero state, or from the state given after them
-    where `entering`: outputs and final state."""
+def walked_of(forms, operands: dict, entering: bool = False):
+    """`forms`' chunks walked over `operands` from a zero state, or from the state given after them where
+    `entering`: outputs and final state."""
     def walked(*xs):
         values = dict(zip(operands, xs[:len(operands)], strict=True))
         state = forms.init({})
@@ -460,9 +463,9 @@ def rwkv_walked(forms, operands: dict, entering: bool = False):
     return walked
 
 
-def rwkv_replayed(forms, operands: dict):
-    """`forms`' token walk (`Derived.replay`) chunk by chunk over RWKV7's operands from the state given after
-    them, as the chunked op's walk takes its tangent: outputs and final state."""
+def replayed_of(forms, operands: dict):
+    """`forms`' token walk (`Derived.replay`) chunk by chunk over `operands` from the state given after them,
+    as the chunked op's walk takes its tangent: outputs and final state."""
     def replayed(*xs):
         values, h = dict(zip(operands, xs[:-1], strict=True)), xs[-1]
         outputs = []
@@ -1096,6 +1099,42 @@ def test_a_corrections_read_before_or_after_its_decay_reaches_its_own_form(updat
     assert update_parts(update_fn, operands).before == before
 
 
+PRE_DECAY = {
+    "rwkv7": (rwkv_erase, rwkv_readout, RWKV, RWKV_KEYED, rwkv_draw),
+    "delta_before": (delta_before, gated_readout, GATED, KIMI,
+                     lambda seed, per_key: (kimi_draw if per_key else gated_draw)(seed)),
+}
+"""The forms correcting the state a token enters: RWKV7's erase along its own vector (`rwkv_erase`, rank two,
+`linear_scan.Affine.erased_before`) and the delta rule's along its write's (`delta_before`, rank one,
+`Affine.corrected_before`), each its update, readout, operands (a head's decay, a key's) and draw."""
+
+
+def pre_decay(rule: str, per_key: bool):
+    """`rule`'s (`PRE_DECAY`) derived forms, operands, token scan from a state entering (`scanned`) and its
+    draw from one (`entering_of`)."""
+    update_fn, readout_fn, scalar, keyed, draw_fn = PRE_DECAY[rule]
+    operands = keyed if per_key else scalar
+    forms = scan.derive_scan(scan.Scan(update_fn, readout_fn, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    return forms, operands, scanned(update_fn, readout_fn), entering_of(draw_fn, per_key)
+
+
+def entering_of(draw_fn, per_key: bool):
+    """`draw_fn`'s operands (its log decays the fourth) and a state entering of unit normals, a decay
+    vanishing alone (`VANISHED`, one key's where `per_key`) at the second chunk's first token and at its
+    sub-chunk's start, and a gate saturated at a reset's exponent (`SATURATED`, no reset) inside it."""
+    def drawn(seed):
+        q, k, v, g, *rest = draw_fn(seed, per_key)
+        g = np.array(g)
+        for token, key, exponent in ((CHUNK, 0, VANISHED), (CHUNK + 5, 3, SATURATED),
+                                     (CHUNK + CHUNK // 2, KEY - 1, VANISHED)):
+            g[(token, key) if per_key else token] = exponent
+        h0 = np.random.default_rng([seed, 6755]).standard_normal((KEY, VALUE))
+        return q, k, v, jnp.asarray(g, jnp.float32), *rest, jnp.asarray(h0, jnp.float32)
+
+    return drawn
+
+
 @pytest.mark.parametrize(("update_fn", "operands", "readout_fn", "erased"), [
     (rwkv_erase, RWKV, rwkv_readout, True), (rwkv_erase, RWKV_KEYED, rwkv_readout, True),
     (delta_before, GATED, gated_readout, False)],
@@ -1117,7 +1156,7 @@ def test_an_erase_along_its_own_vectors_chunks_compute_their_token_scan(per_key,
     operands = RWKV_KEYED if per_key else RWKV
     with generation.assumed(target):
         forms = rwkv_forms(operands)
-        assert_as_exact(jax.jit(rwkv_walked(forms, operands)), jax.jit(rwkv_tokenwise),
+        assert_as_exact(jax.jit(walked_of(forms, operands)), jax.jit(rwkv_tokenwise),
                         functools.partial(rwkv_draw, per_key=per_key), f"rwkv7 on {target}", seeds=16)
 
 
@@ -1153,54 +1192,53 @@ def pushed(run):
 
 @pytest.mark.parametrize("target", ["sm86", "sm90"])
 @pytest.mark.parametrize("per_key", [False, True], ids=["a head's decay", "a key's"])
-def test_an_erase_along_its_own_vectors_walk_from_a_state_entering_holds_its_token_scans_gradient(per_key,
-                                                                                                    target):
-    """RWKV7's chunks (the token loop an A10's extraction takes, the dual form an H100's) walked from a state
-    entering, a decay vanishing alone at a chunk's first token, inside it and at its sub-chunk's start
-    (`rwkv_entering_draw`), differentiated through the forms' own derivatives (the decays' `_decays_backward`,
-    the decays a token back transposed as their shift): outputs, final state and every gradient, the entering
-    state's among them, on par with the token scan's from float64 (check 1). A key whose decay vanishes at
-    the erasing token is erased from the state it enters, as the recurrence erases it: a document's start
-    alone reads it zero."""
-    operands = RWKV_KEYED if per_key else RWKV
-
-    def draws(seed):
-        return *rwkv_entering_draw(seed, per_key), *cotangents_of(seed, (TOKENS, VALUE), (KEY, VALUE))
-
+@pytest.mark.parametrize("rule", PRE_DECAY)
+def test_a_pre_decay_walk_from_a_state_entering_holds_its_token_scans_gradient(rule, per_key, target):
+    """Each form correcting the state a token enters (`PRE_DECAY`: RWKV7's rank-two erase, the delta rule's
+    rank-one correction), its chunks (the token loop an A10's extraction takes, the dual or WY form an
+    H100's) walked from a state entering, its decays vanishing alone and saturated at a reset's exponent
+    with no reset declared (`entering_of`), differentiated through the forms' own derivatives (the decays'
+    `_decays_backward`, the decays a token back transposed as their shift): outputs, final state and every
+    gradient, the entering state's among them, on par with the token scan's from float64 (check 1). A key
+    whose decay vanishes at the correcting token is read from the state it enters, as the recurrence reads
+    it: a declared document's start alone reads it zero."""
     with generation.assumed(target):
-        forms = rwkv_forms(operands)
-        assert_as_exact(jax.jit(pulled(rwkv_walked(forms, operands, entering=True))),
-                        jax.jit(pulled(rwkv_tokenwise)), draws, f"rwkv7 entering on {target}", seeds=16)
+        forms, operands, tokenwise, drawn = pre_decay(rule, per_key)
+
+        def draws(seed):
+            return *drawn(seed), *cotangents_of(seed, (TOKENS, VALUE), (KEY, VALUE))
+
+        assert_as_exact(jax.jit(pulled(walked_of(forms, operands, entering=True))),
+                        jax.jit(pulled(tokenwise)), draws, f"{rule} entering on {target}", seeds=16)
 
 
 @pytest.mark.parametrize("per_key", [False, True], ids=["a head's decay", "a key's"])
-def test_an_erase_along_its_own_vectors_adjoint_from_a_state_entering_is_the_token_scans_gradient(per_key):
-    """RWKV7's chunk adjoint (`backward`, its token update replayed) walked back to a state entering, a decay
-    vanishing alone at a chunk's first token, inside it and at its sub-chunk's start (`rwkv_entering_draw`):
-    each token operand's gradient and the entering state's on par with the token scan's from float64 (check
-    1)."""
-    operands = RWKV_KEYED if per_key else RWKV
-    assert_adjoint(rwkv_forms(operands), rwkv_tokenwise, (*operands, "h0"),
-                   functools.partial(chunk_of, axes=operands),
-                   functools.partial(rwkv_entering_draw, per_key=per_key), ((TOKENS, VALUE), (KEY, VALUE)),
-                   "rwkv7 adjoint entering", 16)
+@pytest.mark.parametrize("rule", PRE_DECAY)
+def test_a_pre_decay_adjoint_from_a_state_entering_is_the_token_scans_gradient(rule, per_key):
+    """Each pre-decay form's chunk adjoint (`backward`, its token update replayed) walked back to a state
+    entering, its decays vanishing alone and saturated with no reset (`entering_of`): each token operand's
+    gradient and the entering state's on par with the token scan's from float64 (check 1)."""
+    forms, operands, tokenwise, drawn = pre_decay(rule, per_key)
+    assert_adjoint(forms, tokenwise, (*operands, "h0"), functools.partial(chunk_of, axes=operands), drawn,
+                   ((TOKENS, VALUE), (KEY, VALUE)), f"{rule} adjoint entering", 16)
 
 
 @pytest.mark.parametrize("per_key", [False, True], ids=["a head's decay", "a key's"])
-def test_an_erase_along_its_own_vectors_replay_takes_its_token_scans_tangent(per_key):
-    """RWKV7's token walk (`Derived.replay`) chunk by chunk from a state entering, as the chunked op's walk
-    takes its tangent at every order (`recurrence_chunk._walk`), a decay vanishing alone at a chunk's first
-    token, inside it and at its sub-chunk's start (`rwkv_entering_draw`): outputs, final state and their
-    tangent along every operand on par with the token scan's from float64 (check 1)."""
-    operands = RWKV_KEYED if per_key else RWKV
+@pytest.mark.parametrize("rule", PRE_DECAY)
+def test_a_pre_decay_replay_takes_its_token_scans_tangent(rule, per_key):
+    """Each pre-decay form's token walk (`Derived.replay`) chunk by chunk from a state entering, as the
+    chunked op's walk takes its tangent at every order (`recurrence_chunk._walk`), its decays vanishing alone
+    and saturated with no reset (`entering_of`): outputs, final state and their tangent along every operand
+    on par with the token scan's from float64 (check 1)."""
+    forms, operands, tokenwise, drawn = pre_decay(rule, per_key)
 
     def draws(seed):
-        drawn = rwkv_entering_draw(seed, per_key)
+        primals = drawn(seed)
         rng = np.random.default_rng([seed, 1])
-        return *drawn, *(jnp.asarray(rng.standard_normal(x.shape), jnp.float32) for x in drawn)
+        return *primals, *(jnp.asarray(rng.standard_normal(x.shape), jnp.float32) for x in primals)
 
-    assert_as_exact(jax.jit(pushed(rwkv_replayed(rwkv_forms(operands), operands))),
-                    jax.jit(pushed(rwkv_tokenwise)), draws, "rwkv7 replay tangent", seeds=16)
+    assert_as_exact(jax.jit(pushed(replayed_of(forms, operands))), jax.jit(pushed(tokenwise)), draws,
+                    f"{rule} replay tangent", seeds=16)
 
 
 def rwkv_values_readout(h, q, k, v, g, beta, a, c):
@@ -1229,19 +1267,32 @@ def test_an_erase_along_its_own_vector_beside_a_readout_no_form_takes_is_refused
             forms.replay(chunk, jnp.zeros((KEY, VALUE), jnp.float32))
 
 
-def test_an_erase_vector_wider_than_its_tokens_widens_its_loop_and_its_replay():
-    """RWKV7's token over float32 operands but its erase vector `a` float64 (x64's), walked by a token loop
-    (a v5e's) and replayed (`Derived.replay`): each carries its state widened to float64 once, its outputs
-    and the state it leaves float64, where a carry typed without the erase vector changed type mid-scan,
-    which `lax.scan` refuses."""
+def rwkv_widened(h, q, k, v, g, beta, a, c):
+    """`rwkv_erase` erasing along `a` times a float64 vector it closes over (x64's): its erase part wider than
+    every operand."""
+    return rwkv_erase(h, q, k, v, g, beta, a * np.ones(KEY, np.float64), c)
+
+
+@pytest.mark.parametrize(("update_fn", "wide", "carried"), [
+    (rwkv_erase, "a", jnp.float64), (rwkv_widened, None, jnp.float64), (rwkv_erase, "q", jnp.float32)],
+    ids=["an erase vector given wide", "an erase part widened in the update", "a query given wide"])
+def test_a_pre_decay_walks_carry_follows_its_updates_parts(update_fn, wide, carried):
+    """RWKV7's token over float32 operands, its erase vector given in float64, or widened in its update by a
+    float64 vector it closes over, or its query given in float64 (x64's), walked by a token loop (a v5e's)
+    and replayed (`Derived.replay`): each carries its state in the type its update's parts widen it to,
+    float64 where its erase part is, float32 where a readout's operand alone is (the loop's and the replay's
+    alike), where the replay's carry typed by its state alone changed type mid-scan, which `lax.scan`
+    refuses."""
     with jax.enable_x64(new_val=True), program.passes(target="v5e"):
-        forms = rwkv_forms(RWKV)
+        forms = scan.derive_scan(scan.Scan(update_fn, rwkv_readout, RWKV, walked="time",
+                                           state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
         drawn = dict(zip(RWKV, rwkv_draw(0), strict=True))
-        chunk = chunk_of({**drawn, "a": drawn["a"].astype(jnp.float64)}, 0, RWKV)
-        prepared = forms.prepare(chunk)
-        found = (forms.mapped(prepared, forms.init({})), forms.step(forms.init({}), prepared)[1],
-                 *forms.replay(chunk, jnp.zeros((KEY, VALUE), jnp.float32)))
-    assert [x.dtype for x in found] == [jnp.dtype(jnp.float64)] * 4
+        if wide is not None:
+            drawn[wide] = drawn[wide].astype(jnp.float64)
+        chunk = chunk_of(drawn, 0, RWKV)
+        looped = forms.step(forms.init({}), forms.prepare(chunk))[1]
+        _, replayed = forms.replay(chunk, jnp.zeros((KEY, VALUE), jnp.float32))
+    assert (looped.dtype, replayed.dtype) == (jnp.dtype(carried),) * 2
 
 
 def test_an_erases_document_after_a_nonfinite_one_is_its_own():
@@ -1276,8 +1327,8 @@ def test_an_erases_document_after_a_nonfinite_one_is_its_own():
 
     with generation.assumed("sm86"):
         forms = rwkv_forms(operands, reset="first")
-        for arm, label in ((rwkv_walked(forms, operands, entering=True), "loop"),
-                           (rwkv_replayed(forms, operands), "replay")):
+        for arm, label in ((walked_of(forms, operands, entering=True), "loop"),
+                           (replayed_of(forms, operands), "replay")):
             assert_as_exact(jax.jit(later(arm)), jax.jit(tokens), draw_inf, f"rwkv7 after inf, {label}",
                             seeds=16)
 
