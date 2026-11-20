@@ -480,6 +480,19 @@ def test_an_oja_decode_token_is_as_exact_as_its_formula():
                     "an oja decode token", seeds=8)
 
 
+def test_an_oja_decode_tokens_gate_precedes_its_correction():
+    """A decode token of Oja's rule at a memory of -2^127, a key of 2^127, a value and a query of one, no
+    decay and a write gate of 1/4: its memory and output -2^126, exact in fp32 (`oja_token`'s every term
+    normal), the gate scaling the correction `k - v^T S^T` (2^128) before it is formed."""
+    hooks = dataclasses.replace(OJA, decay='scalar', scale=1.0)
+    one = jnp.ones((1, 1, 1), jnp.float32)
+    token = recurrence.Step(jnp.full((1, 1, 1, 1), -2.0 ** 127, jnp.float32), query=one, key=2.0 ** 127 * one,
+                            value=one, log_decay=jnp.zeros((1, 1), jnp.float32),
+                            beta=jnp.full((1, 1), 0.25, jnp.float32))
+    out, _, updated = recurrence.step(hooks, token)
+    assert (out.ravel().tolist(), updated.ravel().tolist()) == ([-2.0 ** 126], [-2.0 ** 126])
+
+
 @pytest.mark.parametrize('form', [{'erase': 'values', 'delta': False}, {'erase': 'values', 'reads': 'before'},
                                   {'erase': 'erasing'}],
                          ids=['without the delta rule', 'read before', 'unknown'])

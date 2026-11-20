@@ -572,17 +572,20 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
 def _values_erased(hooks: Hooks, given: dict, state, query, key, value, work):
     """A decode token of Oja's rule (`Hooks.erase` 'values'), in `work`: on the transposed state `S^T`, the
     delta rule of keys `v`, values `k` and a decay along its keys, the token's `log_decay` `[rows, Hv, Dv]`
-    (a head's `[rows, Hv]` where scalar; `update`), read along the transposed state's values, `S'^T q`.
-    `(output, state')`."""
+    (a head's `[rows, Hv]` where scalar), read along the transposed state's values, `S'^T q`.
+    `(output, state')`. The write gate scales the correction's every term, `D S^T + v (beta (k - (D v)^T
+    S^T))^T`: corrected ungated, `k - (D v)^T S^T` passed fp32's largest at a memory of -2^127 and a key of
+    2^127 under a gate of 1/4, whose memory and output stay -2^126."""
     if hooks.decay == 'none':
         decay = jnp.ones(value.shape, work)
     else:
         decay = accurate_exp(given['log_decay'].astype(work))
         decay = jnp.broadcast_to(decay[..., None] if hooks.decay == 'scalar' else decay, value.shape)
     write = given['beta'].astype(work)[..., None]
-    # Its own read unused (the values as its queries, of their shape): the transposed state's is the token's.
-    _, transposed = update(jnp.swapaxes(state, -1, -2), value, value, key, decay, write, delta=True)
-    return jnp.einsum('...vk,...k->...v', transposed, query), jnp.swapaxes(transposed, -1, -2)
+    transposed = jnp.swapaxes(state, -1, -2)
+    corrected = write * key - jnp.sum((write * value * decay)[..., :, None] * transposed, axis=-2)
+    transposed = decay[..., :, None] * transposed + value[..., :, None] * corrected[..., None, :]
+    return jnp.sum(transposed * query[..., None, :], axis=-1), jnp.swapaxes(transposed, -1, -2)
 
 
 def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):

@@ -412,13 +412,21 @@ SSD_PORT_FORKED = Refusal('forked', "a forked call (`Chunk.loads`), whose docume
                           "chunk alone: the template and the portable math walk it", row=INHERENT)
 """Why mamba_ssm's port takes no forked call, inherently: it takes memories at chunks' edges alone."""
 
+TRANSPOSED = Requirement('transposed', lambda case: not case.transposed, TRANSPOSED_HANDOFF, row=INHERENT,
+                         kind='handoff')
+"""A call erasing along the values handed to the portable math before any kernel's needs are asked: a
+kernel a call names refuses no Oja call (`selection`'s order)."""
+
+VARYING = Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822')
+
 PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
+    TRANSPOSED,
     Requirement('gated', lambda case: case.delta and case.decayed,
                 "a recurrence other than the gated delta rule, which the rule's kernels run (fla's "
                 "chunk_gated_delta_rule and chunk_kda, the template's delta-rule mainloop): no delta rule (a "
                 "gated linear attention, a rated scan with its keys normed or scaled) or no decay (the plain "
                 "delta rule), which the portable math runs", row=INHERENT, kind='handoff'),
-    Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822'),
+    VARYING,
     Requirement('float64', lambda case: case.dtype != jnp.float64,
                 "float64 operands, whose rule is the reference math itself", row=INHERENT),
     Requirement('key_width', lambda case: case.key_width <= case.widest,
@@ -431,8 +439,6 @@ PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     Requirement('forked', lambda case: not case.forked, PORT_FORKED.detail, row=INHERENT),
     Requirement('readout', lambda case: case.readout, READOUT_HANDOFF, row=INHERENT, kind='handoff'),
     Requirement('turns', lambda case: not case.turns, TURN_HANDOFF, row=INHERENT, kind='handoff'),
-    Requirement('transposed', lambda case: not case.transposed, TRANSPOSED_HANDOFF, row=INHERENT,
-                kind='handoff'),
 )
 """What the port (`fla_rule`) needs of a rule's call: the gated delta rule, a decay with the delta rule (the
 other forms hand over to the portable math, the call's route reporting it); a GPU Dew's Triton kernels run on,
@@ -602,8 +608,7 @@ call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Tem
 widths, a bundle for the device's family, a config that fits), a GPU, and for
 a training product its fast backward (`Mosaic.trains`; the rule's gradient takes no other, row 1926)."""
 
-MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (*PORT_SUPPORTS[1:2], PORT_SUPPORTS[-1],
-                                                      *TEMPLATE_SUPPORTS)
+MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (TRANSPOSED, VARYING, *TEMPLATE_SUPPORTS)
 """What the recurrence template needs of a delta rule's call: the port's placement (a Pallas call's results),
 and `TEMPLATE_SUPPORTS`, a forked call's (`Chunk.loads`) as another's, its walk keeping the call's table, in
 every form its mainloop implements, the delta rule with a decay or without one and the forms without the
@@ -697,10 +702,9 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         tokens = forked.tokens(length)
         starts = tokens[0] >= 0
     width = key.shape[-1]
-    declared = (_delta_forms, (("delta", delta), ("scale", scale), ("per_key", g.ndim == 4),
-                                ("width", width), ("columns", columns), ("work", jnp.dtype(work)),
-                                ("reset", starts is not None), ("bound", bound), ("reads", reads),
-                                ("own", own is not None), ("group", group), ("values_read", values_read)))
+    facts = (("delta", delta), ("scale", scale), ("per_key", g.ndim == 4), ("width", width),
+             ("columns", columns), ("work", jnp.dtype(work)), ("reset", starts is not None), ("bound", bound),
+             ("reads", reads), ("own", own is not None), ("group", group), ("values_read", values_read))
     held = 0 if forked is None else forked.held
     # Each token's read's width: the memory's values', or its keys' read along its values (`values_read`).
     read = width if values_read else columns
@@ -729,7 +733,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
                   *(() if forked.turning is None else
                     (varying_like(jnp.moveaxis(part, 2, 1).astype(work), *varying)
                      for part in forked.turning)))
-        outputs, final = _walk_once(*declared, width=width, recomputed=recomputed_memory(), held=held,
+        outputs, final = _walk_once(facts, width=width, recomputed=recomputed_memory(), held=held,
                                     documents=forked.loads.shape[1], added=forked.adds is not None,
                                     turned=forked.turning is not None,
                                     context=derive.context())(operands, walked)
@@ -738,7 +742,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), value) if state is None
                             else state.astype(work), *varying)
 
-    outputs, final = _walk_once(*declared, width=width, recomputed=recomputed_memory(), held=0,
+    outputs, final = _walk_once(facts, width=width, recomputed=recomputed_memory(), held=0,
                                 context=derive.context())(operands, entering)
     out = outputs.reshape(*outputs.shape[:2], -1, read)
     return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), final
@@ -788,9 +792,9 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
 
 
 @functools.lru_cache(maxsize=FORMS_HELD)
-def _walk_once(declare: Callable, facts: tuple, *, width: int, recomputed: bool, held: int, context: tuple,
-               documents: int = 0, added: bool = False, turned: bool = False):
-    """The walk (`_walk`) by the forms `declare(**dict(facts))` derives (`_delta_forms`) as one
+def _walk_once(facts: tuple, *, width: int, recomputed: bool, held: int, context: tuple, documents: int = 0,
+               added: bool = False, turned: bool = False):
+    """The walk (`_walk`) by the forms `_delta_forms(**dict(facts))` derives as one
     nested program (`dew.nn.nested`), traced once for equal shapes within a trace (`jax.jit`'s cache, keyed
     on the function and its operands' types) and compiled by the enclosing program, the latest `FORMS_HELD`
     kept. Keyed on every fact the walk reads: its declaration's, `width`, `recomputed`, `held`, `documents`
@@ -800,7 +804,7 @@ def _walk_once(declare: Callable, facts: tuple, *, width: int, recomputed: bool,
     Traced at every call, each layer's walk took 0.65 s of a trace again (jsf-gdn-layers: 8 equal layers'
     training step 5.2 s, 1 layer's 0.63 s)."""
     del context
-    walked = _walk(declare(**dict(facts)), width, recomputed, held, documents, added, turned)
+    walked = _walk(_delta_forms(**dict(facts)), width, recomputed, held, documents, added, turned)
 
     def recurrence_walk(operands, h):
         return walked(operands, h)
@@ -1188,6 +1192,11 @@ def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta,
         # Oja's rule: on the transposed memory the delta rule of keys `v`, values `k` and a decay along its
         # keys, read along its values (`_delta_forms`' `values_read`), each key head's over its value heads.
         _, _, query, key = _grouped(query, key, value, dtype)
+        if forked is not None and forked.entry is not None:
+            # A document's entry write `w sum_r k_r v_r^T` on the transposed memory, `w sum_r v_r k_r^T`.
+            entry_key, entry_value, weight = forked.entry
+            entry_key = jnp.repeat(entry_key, value.shape[2] // entry_key.shape[3], axis=3)
+            forked = dataclasses.replace(forked, entry=(entry_value, entry_key, weight))
         out, final = xla_mainloop(tiles, query, value, key, g, beta,
                                   None if state is None else jnp.swapaxes(state, -1, -2), starts, firsts,
                                   scale=scale, delta=True, dtype=dtype, forked=forked, values_read=True)
@@ -1818,7 +1827,7 @@ class ScanCell(NamedTuple):
 
 
 SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
-    Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822'),
+    VARYING,
     Requirement('float64', lambda case: case.dtype != jnp.float64,
                 "float64 operands, whose scan is the reference math itself", row=INHERENT),
     Requirement('widths', lambda case: all(width >= 16 and width & (width - 1) == 0 for width in case.widths),
@@ -2077,7 +2086,7 @@ registers (its rates, cotangents and the rates' gradients): its backward at Mamb
 thread on an H100 (sel-ptxas2-sm90 at e3b43f7d6)."""
 
 SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
-    Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822'),
+    VARYING,
     Requirement('gpu', lambda case: case.family is not None,
                 "no GPU of an instruction family the template's bundles cover: off one the template "
                 "interprets, as the CPU suite runs it where a call names it", row=INHERENT, kind='measured'),

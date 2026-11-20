@@ -171,9 +171,10 @@ def test_the_decay_takes_the_same_tangent_forward_as_backward():
 def factored_draw(seed: int):
     """A per-key spread's operands of two sub-chunks (`recurrence_algebra.SUB`) and its exponents: a reader
     at the second's first token and a write two tokens earlier, in the first, of keys 2^100 to 2^126, under
-    integer base-2 log decays of -60 to -89 a key at the two tokens between them, so the pair's whole decay
-    underflows float32 where its factors to and from the reference do not; its decays exact powers of two
-    of the exponents' differences (`np.ldexp`, no `scan.between`)."""
+    integer base-2 log decays of -75 to -89 a key at the two tokens between them, summing to -150 or below,
+    so the pair's whole decay underflows float32 where its factors to and from the reference do not; its
+    decays exact powers of two of the exponents' differences (`np.ldexp`, no `scan.between`), a future
+    pair's negative zero, which a live span's underflow is not (`scan._crossed`)."""
     from dew.nn.kernels.recurrence_algebra import SUB
 
     rng = np.random.default_rng([9549, seed])
@@ -182,11 +183,11 @@ def factored_draw(seed: int):
     keys, exponents = np.zeros((chunk, width), np.float32), np.zeros((chunk, width), np.int32)
     readers[SUB], values[SUB - 2] = 1.0, 1.0
     keys[SUB - 2] = np.ldexp(np.float32(1.0), rng.integers(100, 127, width))
-    exponents[SUB - 1:SUB + 1] = -rng.integers(60, 90, (2, width))
+    exponents[SUB - 1:SUB + 1] = -rng.integers(75, 90, (2, width))
     total = np.cumsum(exponents, axis=0)
     lower = np.tri(chunk, dtype=bool)[..., None]
     decays = np.ldexp(np.float32(1.0), total[:, None] - total[None, :])
-    between = np.where(lower, decays, 0.0).astype(np.float32)
+    between = np.where(lower, decays, -0.0).astype(np.float32)
     return readers, values, keys, between, exponents.astype(np.float32)
 
 

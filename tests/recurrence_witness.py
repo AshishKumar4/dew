@@ -64,6 +64,7 @@ from interval_certificates import (
 from native_certificates import TRUNCATING, truncating_underflow
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 
+from dew._hashing import array_fingerprint
 from dew.nn.kernels import recurrence_algebra, tables
 from dew.nn.kernels.templates import product
 from dew.nn.kernels.templates.recurrence import chunk_forward, intra, mainloop, template
@@ -626,16 +627,6 @@ def launched(program, operands: tuple, role: str):
     return found
 
 
-def digested(array) -> str:
-    """A fingerprint of `array`, its dtype, shape and elements (`dew._hashing.array_fingerprint`), which names
-    a value a program closes over."""
-    from dew._hashing import array_fingerprint
-
-    hasher = hashlib.sha1()
-    array_fingerprint(hasher, np.asarray(array))
-    return hasher.hexdigest()[:16]
-
-
 def _through(operands: tuple, starts, last: int) -> tuple:
     """A call's operands and documents (`recorded`'s) with every token past `last` the identity (no decay,
     key, value or write, no document begun), at the call's own shape, in NumPy: its walk past `last` leaves
@@ -770,9 +761,13 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                                                        write_bound=1.0)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
-        # The options the call's programs close over, which name their launches (`launched`).
+        # The options the call's programs close over, which name their launches (`launched`): the starts by
+        # their dtype, shape and elements' fingerprint.
+        hasher = hashlib.sha1()
+        if starts is not None:
+            array_fingerprint(hasher, np.asarray(starts))
         form = (f"delta {delta}, rounded {rounded}, walked {walked}, segments {max_segments}, starts "
-                f"{None if starts is None else digested(starts)}")
+                f"{None if starts is None else hasher.hexdigest()[:16]}")
         o, final, tiles, trained = _route_forward(route, operands, walked, form)
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's
         # (`Tiles.forward`, the template's primal), which a call its fast backward takes narrows apart.
