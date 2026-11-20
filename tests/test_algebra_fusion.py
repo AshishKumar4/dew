@@ -4,6 +4,7 @@ compile-time pass, where the template takes the product and its price says fused
 computes what it does as written, its gradients too, whatever the pass fuses."""
 
 import contextlib
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -18,12 +19,29 @@ from dew.nn.precision import Numerics
 
 def draw(seed: int = 7):
     """Integer operands whose sums pass bf16's 256, so a dot's own rounding to bf16 matters, every product
-    and fp32 sum exact."""
-    keys = jax.random.split(jax.random.key(seed), 4)
-    return (jax.random.randint(keys[0], (256, 512), -7, 8).astype(jnp.bfloat16),
-            jax.random.randint(keys[1], (512, 256), -7, 8).astype(jnp.bfloat16),
-            jax.random.randint(keys[2], (256,), -3, 4).astype(jnp.bfloat16),
-            jax.random.randint(keys[3], (256, 256), -3, 4).astype(jnp.bfloat16))
+    and fp32 sum exact: host arrays, NumPy's, which a GPU tier part's prepare places nowhere (bible §8: a
+    draw of JAX's ran on its compile-only device, rows 10096 on)."""
+    rng = np.random.default_rng(seed)
+    return (rng.integers(-7, 8, (256, 512)).astype(jnp.bfloat16),
+            rng.integers(-7, 8, (512, 256)).astype(jnp.bfloat16),
+            rng.integers(-3, 4, (256,)).astype(jnp.bfloat16),
+            rng.integers(-3, 4, (256, 256)).astype(jnp.bfloat16))
+
+
+def ran(fn, label: str, *operands):
+    """`fn` jitted over host arrays `operands`, as a GPU tier part's prepare compiles it ahead and its run
+    runs it (`reference_error.ahead_arm`: a bitwise check's program, computing nothing in the prepare);
+    outside a part, run as it is."""
+    from reference_error import ahead_arm
+
+    return ahead_arm(jax.jit(fn), label)(*operands)
+
+
+def _passed(fn, *operands, kernels: bool = True):
+    """`fn` under the algebra pass (`algebra.rewritten`, its kernels too where `kernels`), made where it is
+    traced: a program of it is stated by `fn` (`truths_ahead.arm_role`), where the pass's own closure holds
+    JAX's token, which no statement holds."""
+    return algebra.rewritten(fn, kernels=kernels)(*operands)
 
 
 def biased(x, w, bias, other):
@@ -112,11 +130,14 @@ LAYERS = [biased, escaping, widened, chained, bare, kernel_gradient, grouped, gr
 
 
 def as_written(layer, *operands):
-    return jax.jit(layer)(*operands)
+    """`layer` as written over `operands`, prepared ahead where a part prepares (`ran`)."""
+    return ran(layer, f"{layer.__name__} as written", *operands)
 
 
 def rewritten(layer, *operands):
-    return jax.jit(algebra.rewritten(layer, kernels=True))(*operands)
+    """`layer` under the pass with its kernels over `operands`, prepared ahead where a part prepares
+    (`ran`)."""
+    return ran(functools.partial(_passed, layer), f"{layer.__name__} under the pass", *operands)
 
 
 def assert_equal(got, expected):
@@ -150,9 +171,9 @@ def test_a_program_writing_a_ref_inside_a_nested_body_computes_as_written():
         jax.lax.cond(jnp.all(jnp.isfinite(x)), anchored, lambda: None)
         return jax.freeze(out) * 2
 
-    x = jnp.asarray(np.random.default_rng(4783).standard_normal((4, 8)), jnp.float32)
+    x = np.random.default_rng(4783).standard_normal((4, 8)).astype(np.float32)
     with generation.assumed("sm90"):
-        assert_equal(rewritten(written, x), jax.jit(written)(x))
+        assert_equal(rewritten(written, x), as_written(written, x))
 
 
 @pytest.mark.parametrize("layer", LAYERS, ids=lambda layer: layer.__name__)
@@ -171,14 +192,16 @@ def test_a_layers_gradient_under_the_pass_is_its_gradient_as_written(layer):
     """The gradient of each layer's sum against a fixed cotangent, under the pass on a GPU whose template a
     call names (its backward's products candidates of their own), is the gradient as written, bitwise."""
     operands = draw()
-    cotangent = jax.random.randint(jax.random.key(11), (256, 256), -2, 3).astype(jnp.bfloat16)
+    cotangent = np.random.default_rng(11).integers(-2, 3, (256, 256)).astype(jnp.bfloat16)
 
     def loss(f):
         return lambda *xs: jnp.sum((f(*xs) * cotangent).astype(jnp.float32))
 
     grad = jax.grad(loss(layer), argnums=(0, 1, 2))
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        assert_equal(jax.jit(algebra.rewritten(grad))(*operands), jax.jit(grad)(*operands))
+        assert_equal(ran(functools.partial(_passed, grad, kernels=False), "the gradient under the pass",
+                         *operands),
+                     ran(grad, "the gradient as written", *operands))
 
 
 @pytest.mark.parametrize("forms", ["fast", "accurate"])
@@ -244,7 +267,7 @@ def test_a_norms_normalization_runs_in_its_projections_prologue(layer):
                                   dtype=jnp.bfloat16)
         # Each projection's own output and gradient, a cotangent of its own: two outputs swapped or one
         # returned twice fail where their sum would not.
-        assert_as_exact(jax.jit(with_gradients(algebra.rewritten(layer, kernels=True))),
+        assert_as_exact(jax.jit(with_gradients(functools.partial(_passed, layer))),
                         jax.jit(with_gradients(layer)),
                         lambda seed: (*operands(seed), jax.tree.unflatten(jax.tree.structure(outputs),
                                                                           list(cotangents(seed)))),
@@ -345,7 +368,7 @@ def test_a_named_products_consumers_are_its_epilogue_its_name_the_launchs_residu
                     if equation.primitive is jax.lax.dot_general_p]
         operands = normal_drawn(5098, (256, 512), (512, 256), (256, 256), dtype=jnp.bfloat16)
         cotangent = normal_drawn(5099, (256, 256), dtype=jnp.bfloat16)
-        assert_as_exact(jax.jit(with_gradients(algebra.rewritten(named_gate, kernels=True))),
+        assert_as_exact(jax.jit(with_gradients(functools.partial(_passed, named_gate))),
                         jax.jit(with_gradients(named_gate)),
                         lambda seed: (*operands(seed), *cotangent(seed)), "a named gate under the pass",
                         seeds=8,
@@ -394,7 +417,7 @@ def test_a_models_gated_product_is_its_gate_projections_epilogue():
 
     # Run as the H100's routes on this CPU: their kernels interpreted where it places them.
     with generation.assumed("sm90", interpreted=True), generation.chosen(grouped_matmul="mosaic"):
-        assert_as_exact(jax.jit(with_gradients(algebra.rewritten(gated_mlp_product, kernels=True))),
+        assert_as_exact(jax.jit(with_gradients(functools.partial(_passed, gated_mlp_product))),
                         jax.jit(with_gradients(gated_mlp_product)),
                         lambda seed: (*operands(seed), *cotangent(seed)),
                         "a model's gated product under the pass", seeds=8, truth_fn=with_gradients(wide))
@@ -407,13 +430,14 @@ def test_a_gated_product_of_no_product_stays_its_region():
     from dew.nn import activations, derivatives
 
     product = activations.gated_product("swiglu")
-    gate, up = (jax.random.normal(jax.random.key(seed), (256, 256)).astype(jnp.bfloat16) for seed in (1, 2))
+    gate, up = (np.random.default_rng(seed).standard_normal((256, 256)).astype(jnp.bfloat16)
+                for seed in (1, 2))
     with generation.assumed("sm90"):
         traced = jax.jit(algebra.rewritten(product, kernels=True)).trace(gate, up)
         assert [equation for equation in traced.jaxpr.jaxpr.eqns
                 if isinstance(equation.params.get("kind"), derivatives.Activation)]
-    np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(product, kernels=True))(gate, up),
-                                             np.float32), np.asarray(jax.jit(product)(gate, up), np.float32))
+    assert_equal(ran(functools.partial(_passed, product), "a SwiGLU under the pass", gate, up),
+                 ran(product, "a SwiGLU as written", gate, up))
 
 
 def named_rows(x, w):
@@ -551,14 +575,15 @@ def test_a_product_of_two_16_bit_formats_is_jaxs_own_through_dew_jit(order):
     promotion of the pair raised (base review 0b8b7ed98 F1)."""
     import dew
 
-    small, large = jnp.full((256, 512), 2.0 ** -8, jnp.float16), jnp.full((512, 256), 2.0 ** 16, jnp.bfloat16)
+    small, large = np.full((256, 512), 2.0 ** -8, np.float16), np.full((512, 256), 2.0 ** 16, jnp.bfloat16)
     left, right = (small, large) if order == "float16 by bfloat16" else (large.T, small.T)
 
     def product(left, right):
         return jax.lax.dot_general(left, right, (((1,), (0,)), ((), ())))
 
     made = jax.eval_shape(product, left, right)
-    value = np.asarray(dew.jit(product)(left, right), np.float64)
+    value = np.asarray(ran(dew.jit(product), f"a mixed product through dew.jit, {order}", left, right),
+                       np.float64)
     assert (value.shape, value.min(), value.max()) == (made.shape, 2.0 ** 17, 2.0 ** 17)
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
           generation.routes() as passed):
@@ -616,7 +641,7 @@ def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew
     import dew
 
     operands = draw()
-    cotangent = jax.random.randint(jax.random.key(11), (256, 256), -2, 3).astype(jnp.bfloat16)
+    cotangent = np.random.default_rng(11).integers(-2, 3, (256, 256)).astype(jnp.bfloat16)
 
     def loss(x, w, bias, other):
         del bias, other
@@ -629,9 +654,9 @@ def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew
         assert not _template_routes(lambda: jax.jit(plain).trace(*operands))
         assert _template_routes(lambda: outside.trace(*operands))
         assert _template_routes(lambda: inside.trace(*operands))
-        expected = jax.jit(plain)(*operands)
-        assert_equal(outside(*operands), expected)
-        assert_equal(inside(*operands), expected)
+        expected = ran(plain, "the gradient as written", *operands)
+        assert_equal(ran(outside, "the gradient of the compiled loss", *operands), expected)
+        assert_equal(ran(inside, "the compiled gradient", *operands), expected)
 
 
 def jax_attention(*, causal: bool):
@@ -1013,6 +1038,16 @@ def dews_gated_product(a, b):
     return silu(a) * b
 
 
+def _norms_rewritten(fn, *operands):
+    """`fn` with its norms written as the compile point writes them on an H100 (`_norms_written`), its first
+    output, made where it is traced at `operands`' shapes: a program of it is stated by `fn`
+    (`truths_ahead.arm_role`), where the written jaxpr's function holds JAX's token, which no statement
+    holds."""
+    shapes = [jax.ShapeDtypeStruct(jnp.shape(x), jnp.result_type(x)) for x in operands]
+    written, _ = _norms_written(fn, *shapes)
+    return written(*operands)[0]
+
+
 def _norms_written(fn, *shapes):
     """`fn` with each RMSNorm and SwiGLU the compile point takes on an H100 written as Dew's norm
     (`recognize.recognized`), decided under the H100 and written on this host, whose norms run their portable
@@ -1124,9 +1159,10 @@ def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
         assert set(fused(lambda: dew.jit(program).trace(*shapes))) == expected
     output = jax.eval_shape(program, *shapes).shape
     draw = normal_drawn(43, *sizes, output, dtype=jnp.bfloat16)
-    written, found = _norms_written(program, *shapes)
+    _, found = _norms_written(program, *shapes)
     assert found == 1
-    assert_as_exact(jax.jit(with_gradients(lambda *x: written(*x)[0])), jax.jit(with_gradients(program)),
+    assert_as_exact(jax.jit(with_gradients(functools.partial(_norms_rewritten, program))),
+                    jax.jit(with_gradients(program)),
                     draw, f"dew.jit {form}", seeds=8, truth_fn=with_gradients(
                         lambda *x: program(*(a.astype(jnp.float64) for a in x))))
 
@@ -1297,10 +1333,9 @@ def test_a_norm_of_a_stopped_row_passes_no_gradient_to_it():
     def program(x, w):
         return _norm_of(jax.lax.stop_gradient(x), w).astype(jnp.float32).sum()
 
-    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.float32), jax.ShapeDtypeStruct((256,), jnp.float32))
-    written, _ = _norms_written(program, *shapes)
     x, w = normal_draw(4785, (256, 256), (256,))
-    assert not np.any(np.asarray(jax.grad(lambda x, w: written(x, w)[0])(x, w)))
+    grad = jax.grad(functools.partial(_norms_rewritten, program))
+    assert not np.any(np.asarray(ran(grad, "a stopped row's gradient, its norm written", x, w)))
 
 
 def test_a_gate_less_a_negative_zero_keeps_its_sign_as_written():
@@ -1310,12 +1345,12 @@ def test_a_gate_less_a_negative_zero_keeps_its_sign_as_written():
         gate = g - jnp.asarray(-0.0, g.dtype)
         return gated_product_of(gate, u)
 
-    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),) * 2
-    written, _ = _norms_written(program, *shapes)
-    g = jnp.full((256, 256), -0.0, jnp.bfloat16)
-    u = jnp.ones((256, 256), jnp.bfloat16)
-    np.testing.assert_array_equal(np.signbit(np.asarray(written(g, u)[0])),
-                                  np.signbit(np.asarray(program(g, u))))
+    g = np.full((256, 256), -0.0, jnp.bfloat16)
+    u = np.ones((256, 256), jnp.bfloat16)
+    np.testing.assert_array_equal(
+        np.signbit(np.asarray(ran(functools.partial(_norms_rewritten, program), "the gate, its norm written",
+                                  g, u))),
+        np.signbit(np.asarray(ran(program, "the gate as written", g, u))))
 
 
 @jax.custom_jvp
@@ -1336,11 +1371,11 @@ def test_a_norm_of_a_row_under_its_own_derivative_rule_keeps_the_rule():
     def program(x, w):
         return _norm_of(jax.jit(_doubled_identity)(x), w).astype(jnp.float32)[0, 0]
 
-    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
-    written, _ = _norms_written(program, *shapes)
     x, w = normal_draw(4786, (256, 256), (256,), dtype=jnp.bfloat16)
-    np.testing.assert_array_equal(np.asarray(jax.grad(lambda x, w: written(x, w)[0])(x, w)),
-                                  np.asarray(jax.grad(program)(x, w)))
+    np.testing.assert_array_equal(
+        np.asarray(ran(jax.grad(functools.partial(_norms_rewritten, program)),
+                       "the row's gradient, its norm written", x, w)),
+        np.asarray(ran(jax.grad(program), "the row's gradient as written", x, w)))
 
 
 def test_a_norm_of_a_row_an_effect_reads_keeps_the_effect():
@@ -1360,9 +1395,8 @@ def test_a_norm_of_a_row_an_effect_reads_keeps_the_effect():
     def program(x, w):
         return _norm_of(jax.jit(recorded)(x), w)
 
-    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
-    written, _ = _norms_written(program, *shapes)
-    written(jnp.ones((256, 256), jnp.bfloat16), jnp.ones((256,), jnp.bfloat16))
+    ran(functools.partial(_norms_rewritten, program), "a recorded row's norm, written",
+        np.ones((256, 256), jnp.bfloat16), np.ones((256,), jnp.bfloat16))
     assert calls
 
 
@@ -1382,9 +1416,8 @@ def test_a_plain_program_near_a_norm_computes_as_written(program):
 
     fn = NEAR_NORMS[program]
     draw = normal_drawn(47, (256, 256), (256,), (256, 256), dtype=jnp.bfloat16)
-    written, _ = _norms_written(fn, jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
-                                jax.ShapeDtypeStruct((256,), jnp.bfloat16))
-    assert_as_exact(jax.jit(with_gradients(lambda *x: written(*x)[0])), jax.jit(with_gradients(fn)), draw,
+    assert_as_exact(jax.jit(with_gradients(functools.partial(_norms_rewritten, fn))),
+                    jax.jit(with_gradients(fn)), draw,
                     f"dew.jit {program}", seeds=8,
                     truth_fn=with_gradients(lambda *x: fn(*(a.astype(jnp.float64) for a in x))))
 
@@ -1401,8 +1434,8 @@ def test_a_norm_whose_epsilon_an_enclosing_trace_closes_over_compiles_through_de
         inverse = jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + epsilon)
         return (widened * inverse * w).astype(x.dtype)
 
-    x = jax.random.normal(jax.random.key(5), ROWS, jnp.bfloat16)
-    w = jax.random.normal(jax.random.key(6), WEIGHT, jnp.bfloat16)
+    x = np.random.default_rng(5).standard_normal(ROWS).astype(jnp.bfloat16)
+    w = np.random.default_rng(6).standard_normal(WEIGHT).astype(jnp.bfloat16)
 
     def enclosed(compiled):
         """The enclosing program, its norm compiled by `compiled` over the epsilon it traces."""
@@ -1414,10 +1447,11 @@ def test_a_norm_whose_epsilon_an_enclosing_trace_closes_over_compiles_through_de
         return jax.jit(jax.grad(lambda epsilon: normed(epsilon).astype(jnp.float32).sum()))
 
     through, written = enclosed(dew.jit), enclosed(jax.jit)
-    epsilon = jnp.float32(1e-6)
+    epsilon = np.float32(1e-6)
     with generation.assumed("sm90"):
         through.trace(epsilon)
-    np.testing.assert_array_equal(np.asarray(through(epsilon)), np.asarray(written(epsilon)))
+    np.testing.assert_array_equal(np.asarray(ran(through, "the norm through dew.jit", epsilon)),
+                                  np.asarray(ran(written, "the norm as written", epsilon)))
 
 
 def _held_logistic(x):

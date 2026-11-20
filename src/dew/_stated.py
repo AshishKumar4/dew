@@ -98,7 +98,8 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     value among `known` (by its `id`) is what its caller says of it.
 
     An array of JAX's is its values and sharding (`_jax_array`); a function `jax.jit` wraps, what it wraps
-    and its options (`_jitted`). Refused, naming `at` and the value's type, for anything else: an object
+    and its options (`_jitted`); a program Dew's compile point compiles (`dew.jit`'s), its function and its
+    arguments (`_outer_program`). Refused, naming `at` and the value's type, for anything else: an object
     with no such form could differ between two processes with nothing in the identity to show it."""
     return _stated(value, at, known, ())
 
@@ -200,10 +201,13 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
 
 def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """One of JAX's values a program computes from or with: an array (`_jax_array`), a function `jax.jit`
-    wraps, by its module's name for it where a library's (`_named`), else by what it wraps (`_jitted`); None
-    for any other."""
+    wraps, by its module's name for it where a library's (`_named`), else by what it wraps (`_jitted`), and
+    a program Dew's compile point compiles, by its function and arguments (`_outer_program`); None for any
+    other."""
     if isinstance(value, jax.Array):
         return _jax_array(value, at, again)
+    if (program := _outer_program(value, at, again)) is not None:
+        return program
     if isinstance(value, PjitFunction):
         # A library's jitted function its module names (`jax.nn.silu`) is that name, as the library's code
         # is its version's; one wrapping the user's code is what it wraps, with its options.
@@ -211,6 +215,21 @@ def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
             return named
         return _jitted(value, at, again)
     return None
+
+
+def _outer_program(value, at: str, again: Callable[..., JSON]) -> JSON | None:
+    """A program Dew's compile point compiles (`dew.nn.kernels.options.OuterProgram`: `dew.jit`'s,
+    `program`'s) by its kind, the function it compiles and the jit arguments it compiles it under (its
+    compiler options among them), each stated as any value is, and refused naming that part where it has no
+    form: never what it holds as it runs (its jit, its executables, their cache and its lock), which a process
+    holds of its own and which two equal programs hold apart. None for any other value."""
+    # The kernels' options read where a value calls for them, never at load (the algebra's account below).
+    from dew.nn.kernels.options import OuterProgram
+
+    if not isinstance(value, OuterProgram):
+        return None
+    return ["outer program", again(value.function, at=f"{at} (its function)"),
+            again(value.arguments, at=f"{at} (its arguments)")]
 
 
 def _jitted(value, at: str, again: Callable[..., JSON]) -> JSON:
