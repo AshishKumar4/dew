@@ -40,7 +40,8 @@ from jax.interpreters import batching, mlir
 
 from dew.algebra.forms import Refused
 from dew.nn.derivatives import contracted
-from dew.nn.precision import correctly_rounded_divide, two_product, two_sum
+from dew.nn.float_bits import exact_power2
+from dew.nn.precision import correctly_rounded_divide, power2, two_product, two_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,31 +122,6 @@ def _held(reach: int) -> int:
         raise Refused(f"a scaled form's exponents reach 2^{reach}, past the {REACH} their int32 sums hold "
                       f"exactly")
     return reach
-
-
-def power2(exponent: jax.Array, dtype) -> jax.Array:
-    """`2.0 ** exponent` in `dtype` for an int32 exponent within its normal range, exactly, from its bits:
-    the one owner of an exact power of two (a template's among its callers)."""
-    form = format_of(dtype)
-    return lax.bitcast_convert_type((exponent + form.largest).astype(form.word) << form.mantissa, dtype)
-
-
-def scaled_by(x: jax.Array, exponent: jax.Array, reach: int) -> jax.Array:
-    """`x * 2**exponent` as products by normal powers of two of the exponent's sign in turn (as many as
-    `|exponent| <= reach` takes, or the format's `saturating` where that is less), each exact but the one
-    where the product leaves the normal range: the value moves one way, so no intermediate passes the range
-    where the result does not. An exponent past `saturating` lands any finite `x` past the format, 0 or
-    infinite as it is, and is taken at it: a law's factor held exactly to 2^-65536 (`means.FLOOR`) would
-    otherwise unroll 521 products a landing, every compile of the law the slower (a merge kernel's, a split
-    decode's)."""
-    form = format_of(x.dtype)
-    saturating = (form.largest + 1) - (form.least - form.mantissa) + 2
-    exponent = jnp.clip(exponent, -saturating, saturating)
-    for _ in range(max(1, math.ceil(min(reach, saturating) / -form.least))):
-        part = jnp.clip(exponent, form.least, form.largest)
-        x = x * power2(part, x.dtype)
-        exponent = exponent - part
-    return x
 
 
 def _split_value(x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -348,7 +324,7 @@ def _aligned(a: Scaled, to: jax.Array) -> jax.Array:
     """`a`'s significand at the exponent `to`, at least its own: shifted down by their difference, at most
     its format's `shift`, exact (`Format.shift`'s account)."""
     shift = a.format.shift
-    return a.significand * power2(jnp.clip(a.exponent - to, -shift, 0), a.significand.dtype)
+    return a.significand * exact_power2(jnp.clip(a.exponent - to, -shift, 0), a.significand.dtype)
 
 
 def add(a: Scaled, b: Scaled) -> Scaled:
@@ -393,7 +369,7 @@ def _chain(x: jax.Array, significand: jax.Array, exponent: jax.Array, reach: int
     growing = exponent >= 0
     last = jnp.where(growing, significand, 0.5 * significand)
     rest = jnp.where(growing, exponent, exponent + 1)
-    product = scaled_by(x, rest, reach + 1) * last
+    product = power2(x, rest, reach=reach + 1) * last
     # A zero +0, its sign none (the module's account): a flushed landing's or a zero factor's alike.
     return jnp.where(product == 0, jnp.zeros_like(product), product)
 
