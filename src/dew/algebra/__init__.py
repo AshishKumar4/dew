@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import functools
 import importlib
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from types import ModuleType
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     from dew.algebra import cost, derive, error, forms, program, rules, scan, terms
@@ -30,8 +32,8 @@ if TYPE_CHECKING:
     from dew.algebra.scan import Scan
 
     SATURATION: Saturation
-    rewritten: functools.partial
-    rewritten_program: functools.partial
+    rewritten: Callable[..., Callable]
+    rewritten_program: Callable[..., object]
 
 _SUBMODULES = frozenset({"cost", "derive", "error", "forms", "program", "rules", "scan", "terms"})
 """The submodules the package names (`__all__`), each imported where it is first read."""
@@ -41,7 +43,16 @@ _NAMED = {"Reduction": "derive", "Derived": "forms", "Refused": "forms", "Algebr
 """Each name the package re-exports, by the submodule that defines it."""
 
 
-def _limited() -> dict[str, Any]:
+class _Limited(NamedTuple):
+    """The engine's limits (§6.6) and the rewrite at them (`_limited`)."""
+
+    SATURATION: Saturation
+    rewritten: Callable[..., Callable]
+    rewritten_program: Callable[..., object]
+
+
+@functools.cache
+def _limited() -> _Limited:
     """The engine's limits (§6.6) and the rewrite at them. `SATURATION`: above every compile-time fixpoint
     measured, none of the 756 windows of a UNet's fsdp2 x tensor2 matrix cell and benchmark_step's cpu-smoke
     steps reached either limit, the largest using under a quarter of each, and none gained at four times
@@ -49,22 +60,19 @@ def _limited() -> dict[str, Any]:
     `rewritten_program`: `program.rewritten_program` at them, a jit's own trace of a program, rewritten."""
     program = importlib.import_module(f"{__name__}.program")
     saturation = program.Saturation(growth=64, depth=4)
-    return {"SATURATION": saturation,
-            "rewritten": functools.partial(program.rewritten, saturation=saturation),
-            "rewritten_program": functools.partial(program.rewritten_program, saturation=saturation)}
+    return _Limited(saturation, functools.partial(program.rewritten, saturation=saturation),
+                    functools.partial(program.rewritten_program, saturation=saturation))
 
 
-def __getattr__(name: str) -> object:
+def __getattr__(name: str) -> ModuleType | type | Callable[..., object] | Saturation:
     """`name` of the package, loaded where it is first read and held from then on, so each read after the
     first is the same object (the module's own attribute)."""
     if name in _SUBMODULES:
         return importlib.import_module(f"{__name__}.{name}")
     if name in _NAMED:
         found = getattr(importlib.import_module(f"{__name__}.{_NAMED[name]}"), name)
-    elif name in ("SATURATION", "rewritten", "rewritten_program"):
-        made = _limited()
-        globals().update(made)
-        return made[name]
+    elif name in _Limited._fields:
+        found = getattr(_limited(), name)
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = found
