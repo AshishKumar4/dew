@@ -309,7 +309,8 @@ FORM_IDS = [f"{'wy' if corrects else 'plain'}-{'per_key' if per_key else 'scalar
 
 def _form_identities(corrects: bool, per_key: bool, values_read: bool, across: bool, before: bool) -> list:
     """The identities the engine saturates for a form (`linear_scan._identities`)."""
-    return _declared(linear_scan._identities(corrects, not per_key, values_read, across=across, before=before))
+    return _declared(linear_scan._identities(corrects, not per_key, values_read, across=across,
+                                             before=before))
 
 
 CHUNK_IDENTITIES = [(*form, index, rule) for form in CHUNK_FORMS
@@ -320,7 +321,8 @@ CHUNK_IDENTITIES = [(*form, index, rule) for form in CHUNK_FORMS
                          CHUNK_IDENTITIES,
                          ids=[f"{named}[{index}]" for form, named in zip(CHUNK_FORMS, FORM_IDS, strict=True)
                               for index, _ in enumerate(_form_identities(*form))])
-def test_every_chunk_identity_holds_over_the_reals(corrects, per_key, values_read, across, before, index, rule):
+def test_every_chunk_identity_holds_over_the_reals(corrects, per_key, values_read, across, before, index,
+                                                   rule):
     """The identity's two sides equal exactly over a symbolic chunk of three tokens, its decays a scalar's
     or each key's, along the values too where `across`, its readout along the state's keys or its values,
     each under the identities the engine saturates for them (`linear_scan._identities`): every entry of
@@ -439,18 +441,21 @@ def _decayed_to(chunk: dict, rows: _Rows, part: str):
     h`); a token's rows forward from its block's start, the second block's led by the first's whole. Along
     the values (`_Across`), its reads elementwise after its `entering` decay as a read along the values' are
     (the second block's led by the first's whole `V_1`), or a write's rows decayed `to_last`: back to its
-    block's start (`KV_b`, linear in them), then through every whole from its block on."""
+    block's start (`KV_b`, linear in them), then through every whole from its block on. A token back
+    (`entering_before`: through the token before each, `E(X)_b`) as `entering`'s, the second block's first
+    row its lead alone."""
     if isinstance(part, _Across):
         return _across(chunk, rows, part)
-    if part != "entering":
+    if part not in ("entering", "entering_before"):
         raise TypeError(f"no blockwise product with the {part} decay")
     lead, sizes, k = _lead(chunk), chunk["sizes"], chunk["k"]
+    forward = "F" if part == "entering" else "E"
     if rows.inner:
         return _Rows([part * lead[i] for i, part in enumerate(rows)], inner=True)
     if rows.read is not None:
-        return _Rows([_operand(f"F{rows.read}", b, sizes[b], k) * lead[i] * chunk["h"]
+        return _Rows([_operand(f"{forward}{rows.read}", b, sizes[b], k) * lead[i] * chunk["h"]
                       for i, b in enumerate(chunk["blocks"])])
-    return _Rows([_operand(f"F{rows.token}", b, sizes[b], k) * lead[i]
+    return _Rows([_operand(f"{forward}{rows.token}", b, sizes[b], k) * lead[i]
                   for i, b in enumerate(chunk["blocks"])])
 
 
@@ -494,14 +499,16 @@ def _product(chunk: dict, left, right):
 
 
 def _gram(chunk: dict, left: _Rows, right: _Rows, strict, between):
-    """Each block's own masked pairs, and the pairs across the split decayed through it."""
-    del between
+    """Each block's own masked pairs, and the pairs across the split decayed through it: the row's decay
+    from its block's start through it (`F`), or through the token before where its pairs' decays are a token
+    back (`between_before`, `E`), the key's back to its own block's start (`K`)."""
     sizes, k, blocks = chunk["sizes"], chunk["k"], chunk["blocks"]
-    own = {(i, i): _operand(f"G{left.token}{right.token}{strict}", b, sizes[b], sizes[b])
-           for i, b in enumerate(blocks)}
+    back = between == "between_before"
+    pairs = f"G{left.token}{right.token}{strict}{'b' if back else ''}"
+    own = {(i, i): _operand(pairs, b, sizes[b], sizes[b]) for i, b in enumerate(blocks)}
     if len(blocks) == 2:
         across = _operand(f"K{right.token}", 1, sizes[1], k).T
-        own[1, 0] = _operand(f"F{left.token}", 2, sizes[2], k) * _lead(chunk)[1] * across
+        own[1, 0] = _operand(f"{'E' if back else 'F'}{left.token}", 2, sizes[2], k) * _lead(chunk)[1] * across
     return own
 
 
@@ -629,9 +636,7 @@ def _in_turn(first, second):
     return _Rows([*first, *second], inner=first.inner)
 
 
-@pytest.mark.parametrize(("corrects", "per_key", "values_read", "across", "before"),
-                         [form for form in CHUNK_FORMS if not form[4]],
-                         ids=[named for form, named in zip(CHUNK_FORMS, FORM_IDS, strict=True) if not form[4]])
+@pytest.mark.parametrize(("corrects", "per_key", "values_read", "across", "before"), CHUNK_FORMS, ids=FORM_IDS)
 def test_every_chunk_identitys_right_side_composes_over_two_blocks_of_any_sizes(corrects, per_key,
                                                                                  values_read, across, before):
     """Each chunk identity's right side as declared (`linear_scan._identities`: the dual form, and where
