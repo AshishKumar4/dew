@@ -1998,8 +1998,8 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     test computes what its run reads and must not compute while it holds the GPU, its float64 truths and
     its programs compiled for the GPU the node's topology names (DEW_NODE_TOPOLOGY), into the store its
     environment names (DEW_TIER_TRUTHS), which the run is given too. Their rows are written to `out` and
-    nothing is recorded, no test having run to its end: a prepare that fails is said in its row, and its run
-    is red for what it lacks, never computing it on the GPU. A file's process under other flags
+    nothing is recorded, no test having run to its end: a prepare that fails is said in its row and exit;
+    its run is red for what it lacks, never computing it on the GPU. A file's process under other flags
     (`lane_units`) prepares apart, under them, as it runs. First
     the pinned fixtures the tests read offline are fetched, as the run fetches them
     (tools/fetched_fixtures.py), so the run finds each whole and waits on no download with the GPU held.
@@ -2036,9 +2036,9 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:
             done.result()
-    out.write_text(json.dumps({"rows": [row_ for verdict in verdicts.values()
-                                        for row_ in json.loads(verdict.read_text())["rows"]]}))
-    return 0
+    rows = [row_ for verdict in verdicts.values() for row_ in json.loads(verdict.read_text())["rows"]]
+    out.write_text(json.dumps({"rows": rows}))
+    return int(any(row_["exitCode"] != 0 for row_ in rows))  # Row 9541: an uncollected file's exit 0 hid it.
 
 
 def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str,
