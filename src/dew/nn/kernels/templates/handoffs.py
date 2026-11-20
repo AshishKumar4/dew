@@ -24,12 +24,13 @@ class Role:
     """One of a program's roles (`Schedule`): `count` units, warpgroups or (`warp`) warps of the program's
     last warpgroup (`places`), each running the body `Schedule.run` binds to `name` at its index among them;
     `weight` its warpgroups' share of
-    the registers the program's raises divide (`resources.role_registers`), 0 lowering them to setmaxnreg's
-    least (the last warpgroup's). Warp roles share their warpgroup, so its least too."""
+    the registers the program's raises divide (`resources.role_registers`), a fraction of a consumer's where a
+    role holds fewer (a correction warpgroup's half), 0 lowering them to setmaxnreg's least (the last
+    warpgroup's). Warp roles share their warpgroup, so its least too."""
     name: str
     count: int = 1
     warp: bool = False
-    weight: int = 1
+    weight: float = 1
 
     @property
     def arrivals(self) -> int:
