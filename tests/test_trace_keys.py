@@ -2,6 +2,7 @@
 a refit or a resume in the same process reads the step its equal traced (row 3873), and apart for one
 whose loss reads another setting, module or held tree, or a head at another policy."""
 
+import collections
 import copy
 import dataclasses
 import functools
@@ -18,6 +19,7 @@ from dew.decision import DecisionObjective, Specials
 from dew.decision.layout import SegmentLayout
 from dew.diffusion.discrete import MDLM
 from dew.nn.backbones import CausalTransformer
+from dew.nn.kernels import generation, recurrence_chunk
 from dew.objectives.base import HELD, UNKEYED, Objective, frozen_value, stated_trace
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm.objective import LMObjective
@@ -471,3 +473,47 @@ def test_a_diffusion_process_states_its_value():
         built = build_process(preset)
         assert isinstance(built, Process) and built == build_process(preset), preset
         assert hash(built) == hash(build_process(preset)) and built != build_process(other), preset
+
+
+def walk_programs(jaxpr) -> list:
+    """Every forked walk's program (`recurrence_chunk._walk_once`'s nested `recurrence_walk`) a traced
+    program calls, at any depth, as its calls hold them."""
+    found = []
+    for eqn in jaxpr.eqns:
+        inner = [value for value in eqn.params.values() if isinstance(value, jax.extend.core.ClosedJaxpr)]
+        if eqn.params.get("name") == "recurrence_walk":
+            found.extend(inner)
+        for program in inner:
+            found.extend(walk_programs(program.jaxpr))
+    return found
+
+
+def test_a_forked_walk_traces_once_under_every_route_receipt():
+    """A forked call (documents taking their memories up, three layers of it) traced twice, each under a route
+    receipt of its own (`generation.routes`), on the portable math: every call of its walk in the second
+    trace holds the very program its call held in the first (`_walk_once`'s, run unrecorded, its trace
+    cached), its routes recorded alike by both receipts, where each receipt's identity keyed the walk a
+    trace of its own (row 6740: a decision step's walk traced twice, 0.84 s of its lowering against 0.30;
+    its body run twice over two receipts' training on main, once on this fix, jsf-walktr)."""
+    sig = jax.ShapeDtypeStruct
+    queries, values = sig((4, 2048, 1, 8), jnp.float32), sig((4, 2048, 3, 8), jnp.float32)
+    gates, state = sig((4, 2048, 3), jnp.float32), sig((4, 1, 3, 8, 8), jnp.float32)
+    starts, slots = sig((4, 2048), jnp.bool_), sig((4, 7), jnp.int32)
+
+    def layers(q, k, v, g, beta, state, starts, loads, stores):
+        for _ in range(3):
+            v, _ = recurrence_chunk.chunk_gated_delta_rule(q, k, v, g, beta, state, starts=starts,
+                                                           loads=loads, stores=stores, held=3,
+                                                           write_bound=1.0)
+        return v
+
+    def traced():
+        with generation.routes() as found:
+            program = jax.make_jaxpr(layers)(queries, queries, values, gates, gates, state, starts, slots,
+                                             slots)
+        return walk_programs(program.jaxpr), collections.Counter(found)
+
+    with generation.chosen(gated_delta_rule='xla'):
+        (first, routed), (second, rerouted) = traced(), traced()
+    held = [one is other for one, other in zip(first, second, strict=True)]
+    assert (len(first), all(held), bool(routed), routed == rerouted) == (3, True, True, True)
