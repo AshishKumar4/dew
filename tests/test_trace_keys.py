@@ -98,6 +98,8 @@ def built_objectives(tmp_path_factory):
                  else WorldModelObjective(dynamics, tokenizer, tokens))
         return built, None
 
+    root = tmp_path_factory.mktemp("guided")
+
     def guided():
         # Guidance distillation over a guidance-embedded denoiser (a tiny Flux), which the recipe's DiT is
         # not, its teacher the same objective at its draw, so both stability cells trace and refit it
@@ -117,8 +119,9 @@ def built_objectives(tmp_path_factory):
         from dew.registry import ModelConfig
         from dew.sampling import Euler
 
-        root = tmp_path_factory.mktemp("guided")
-        extract_fixture(FIXTURES / "flux_source.tar.xz", root / "flux")
+        # One text pipeline for every build, as its path is part of its encoder's record.
+        if not (root / "flux").exists():
+            extract_fixture(FIXTURES / "flux_source.tar.xz", root / "flux")
         config = DiffusionRunConfig(
             model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
             data=TFDS("dew_images", path=str(IMAGES), split="all").pipe(presets.images, 8, batch=2,
