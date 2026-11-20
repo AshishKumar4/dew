@@ -196,11 +196,12 @@ def packed_sequences(starts, firsts, bound: int, *, chunk: int) -> Sequences:
 
 
 def entry_terms(key, value, weight, *, values_first: bool = False) -> list[tuple]:
-    """A forked document's entry write's terms (`entry_write`'s), each `(weight, key_r, value_r)` as the
-    write lays them: `key` `[..., R, Dk]` and `value` `[..., R, Dv]` a key column and a value row a term, or
-    with `values_first` `value` `[..., Dv, R]`, a value column and a key row (the TPU forked scan's layout);
-    the one layout the write's sum (`entry_write`) and its transpose (`dew.nn.aligned.aligned_cotangents`,
-    the TPU forked scan's backward) take (row 8666). Of rank zero, none."""
+    """A forked document's entry write's terms (`entry_write`'s) as the write lays them: from `key`
+    `[..., R, Dk]` and `value` `[..., R, Dv]` each `(weight, key_r [..., Dk, 1], value_r [..., 1, Dv])`, or
+    with `values_first` from `value` `[..., Dv, R]` each `(weight, value_r [..., Dv, 1], key_r [..., 1,
+    Dk])` (the TPU forked scan's layout): the one layout the write's sum (`entry_write`) and its transpose
+    (`dew.nn.aligned.aligned_cotangents`, the TPU forked scan's backward) take (row 8666). Of rank zero,
+    none."""
     rank = key.shape[-2]
     if values_first:
         return [(weight, value[..., :, r:r + 1], key[..., r:r + 1, :]) for r in range(rank)]
