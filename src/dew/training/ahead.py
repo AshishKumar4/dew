@@ -1175,8 +1175,14 @@ class AheadTarget:
         stated_limit(list(trainer.device_mesh.devices.flat))
         batch = first_step_batch(trainer, loader, steps, examples, resume)
         if trainer.host_master:
-            with report.for_devices():
-                return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
+            # Into a cache a device run reads as tuned, as a device step's (below): a program no device run
+            # has tuned is counted, its run compiling it on its GPU, never a traceback (row 9693).
+            try:
+                with report.for_devices():
+                    return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
+            except report.Untuned as refused:
+                _log.warning("a host step is not preparable here: %s", refused)
+                return CompiledAhead(None, None, (program_digest(refused.lowered),))
         topology = None if self.topology is None else Path(self.topology).read_bytes()
         if self.path is not None and not self.phases:
             # Over a host's own GPUs (`topology`), as its run compiles it: every tuned choice the GPU kind's
