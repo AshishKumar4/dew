@@ -1112,7 +1112,8 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     device memory `memory` where a build states it, else the least of the target's parts (`GpuTarget.memory`),
     never none: XLA's memory-driven passes compiled a recurrence's gradient for a GPU of 0 bytes to values
     O(1) wrong (a GH200 running a step compiled ahead for compile-only sm90 GPUs of no stated memory, row
-    8768)."""
+    8768). Its L2 where the target states it (`l2_bytes`): XLA fuses by it, and a compile-only A100 stating
+    none fused a recurrence gradient's sums apart from its host's compile of it (row 9609)."""
     generation = target.generation
     version = capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
@@ -1125,6 +1126,7 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
         raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
     major, minor = version
     multiprocessor = target.multiprocessor
+    l2 = "" if target.l2_bytes is None else f"\n  l2_cache_size: {target.l2_bytes}"
     return f"""gpu_device_info {{
   threads_per_block_limit: {multiprocessor.block_threads}
   threads_per_warp: {multiprocessor.warp_threads}
@@ -1136,7 +1138,7 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
   block_dim_limit_x: 2147483647
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
-  memory_bandwidth: {int(bandwidth)}
+  memory_bandwidth: {int(bandwidth)}{l2}
   device_memory_size: {memory}
   clock_rate_ghz: {clock / 1e9}
   shared_memory_per_block_optin: {shared}
