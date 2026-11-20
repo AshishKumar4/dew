@@ -1023,7 +1023,7 @@ def test_a_pipeline_of_delta_nets_split_over_the_sequence_leaves_the_stage_axis_
     step does: the split places their heads over the axes the rows, the sequence and the stage's
     vmap leave (`linear.sequence_delta_rule`), where a placement naming the stage axis is one the stage's
     vmapped map refuses (row 1437 link 2's head review). Loss and gradients check 1's against the plain step
-    from float64."""
+    from float64 on the host (no accelerator's emulated float64)."""
     from dew.mesh import DEFAULT_RULES
 
     model = tiny(max_seq_len=16, **FUSED_DELTA_STACK)
@@ -1032,11 +1032,11 @@ def test_a_pipeline_of_delta_nets_split_over_the_sequence_leaves_the_stage_axis_
     with jax.enable_x64(new_val=True):
         twin, wide = tiny(max_seq_len=16, dtype=jnp.float64, **FUSED_DELTA_STACK), float64_held(variables)
 
-    def stepped(model, variables, spec, microbatches=None):
+    def stepped(model, variables, spec, microbatches=None, devices=four):
         # Each arm placed and compiled on its own mesh, called as given (`loss_and_grads` sets its mesh).
         @as_given
         def step(text):
-            loss, _, grads = loss_and_grads(LMObjective(model, 16), spec, variables, {"text": text}, four,
+            loss, _, grads = loss_and_grads(LMObjective(model, 16), spec, variables, {"text": text}, devices,
                                             microbatches)
             return np.float32(loss) if model is not twin else np.float64(loss), grads
 
@@ -1048,7 +1048,8 @@ def test_a_pipeline_of_delta_nets_split_over_the_sequence_leaves_the_stage_axis_
     with nn.logical_axis_rules((("activation_heads", "stage"), *DEFAULT_RULES)):
         assert_as_exact(stepped(model, variables, MeshSpec(stage=2, sequence=2), 4),
                         stepped(model, variables, MeshSpec()), draw, "delta nets piped over the sequence",
-                        seeds=FEWEST_SEEDS, truth_fn=stepped(twin, wide, MeshSpec()))
+                        seeds=FEWEST_SEEDS,
+                        truth_fn=stepped(twin, wide, MeshSpec(), devices=jax.devices("cpu")[:1]))
 
 
 @mesh_lane
