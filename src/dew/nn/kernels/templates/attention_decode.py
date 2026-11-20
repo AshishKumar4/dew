@@ -25,7 +25,7 @@ algebra's.
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Literal, NamedTuple, overload
 
@@ -325,13 +325,17 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
         # A launch whose work its emission does not count leaves the step's price unknown, never 0 (the base
         # review of 56a716c95, F3: a full step's spans launch priced none, and a step of no split Work()).
         return None
-    merges = [merged.launch_work(
-        equation.params["spec"],
-        jax.ShapeDtypeStruct(equation.invars[0].aval.shape, equation.invars[0].aval.dtype),
-        jax.ShapeDtypeStruct(equation.invars[1].aval.shape, equation.invars[1].aval.dtype),
-        equation.params["queries"], equation.params["width"], target)
-        for equation in programs.equations(traced.jaxpr)
-        if equation.primitive is merged.merged_padded_p and equation.invars[1].aval.dtype == jnp.float32]
+    merges: list[Work] = []
+    for equation in programs.equations(traced.jaxpr):
+        if equation.primitive is not merged.merged_padded_p:
+            continue
+        padded_aval, stacked_aval = equation.invars[0].aval, equation.invars[1].aval
+        if (isinstance(padded_aval, jax.core.ShapedArray) and isinstance(stacked_aval, jax.core.ShapedArray)
+                and stacked_aval.dtype == jnp.float32):
+            merges.append(merged.launch_work(
+                equation.params["spec"], jax.ShapeDtypeStruct(padded_aval.shape, padded_aval.dtype),
+                jax.ShapeDtypeStruct(stacked_aval.shape, stacked_aval.dtype),
+                equation.params["queries"], equation.params["width"], target))
     all_launches = launches + merges
     return dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches))
 

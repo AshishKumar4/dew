@@ -236,8 +236,9 @@ def launch_work(spec: algebra.Forward, padded: jax.ShapeDtypeStruct, stacked: ja
 
 def _kernel(padded, stacked, *, spec: algebra.Forward, queries: int, width: int):
     """`_value` as one launch (`_launch`), a program a row's block of channels (`_channel_block`)."""
-    shaped = tuple(jax.ShapeDtypeStruct(operand.shape, operand.dtype) for operand in (padded, stacked))
-    block = _channel_block(spec, *shaped, queries, width, generation.gpu_target())
+    padded_s, stacked_s = (jax.ShapeDtypeStruct(operand.shape, operand.dtype)
+                           for operand in (padded, stacked))
+    block = _channel_block(spec, padded_s, stacked_s, queries, width, generation.gpu_target())
     return _launch(padded, stacked, spec=spec, queries=queries, width=width, block=block)
 
 
