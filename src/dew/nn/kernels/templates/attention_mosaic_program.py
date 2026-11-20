@@ -25,6 +25,7 @@ from dew.nn.kernels.templates import (
     axes,
     bundles,
     emission,
+    handoffs,
     layout,
     mosaic,
     operands,
@@ -160,8 +161,9 @@ def scheduled_roles(family: mosaic.Family, consumers: int, consumer: Callable[[i
         del index
         consumer(role)
 
+    reducers = () if reducer is None else ((handoffs.REDUCER, consumers, reducer),)
     return walked.scheduled(consumers, functools.partial(mosaic.per_role, roles=consumers, run=compute),
-                            producer, issuer=lambda: issued(walked), reducer=reducer)
+                            producer, issuer=lambda: issued(walked), joined=reducers)
 
 
 def placed_scratch(family: mosaic.Family, walked: int, dtype, fused: tuple[int, ...], kept: tuple[int, ...]

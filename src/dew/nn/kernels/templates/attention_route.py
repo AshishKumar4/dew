@@ -329,12 +329,12 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     device in effect's (`generation.assumed`'s `interpreted`), where an interpreted call is chosen for."""
     call = (query, key, value, spans, hooks, dout)
     form = {"scale": scale, "natural": natural, "accurate": accurate}
-    declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form)
+    declined = (attention_mosaic.backward_declined(*call, residuals=residuals, rounded=rounded, **form)
                 if _on_mosaic() or interpret else None)
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
         attention_triton.backward_unfitted, *call, residuals=residuals, **form), interpret=interpret,
         uncertified=functools.partial(attention_mosaic.backward_declined, *call, residuals=residuals,
-                                      certified=True, **form))
+                                      rounded=rounded, certified=True, **form))
     if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, interpret=interpret,
                                          **form)

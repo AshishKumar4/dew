@@ -44,7 +44,13 @@ from reference_error import (
     with_gradients,
 )
 
-from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
+from dew.nn.kernels import (
+    chunked_launch,
+    generation,
+    recurrence,
+    recurrence_algebra as algebra,
+    recurrence_chunk,
+)
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kernels.templates import bundles
 from dew.nn.precision import l2norm
@@ -173,6 +179,11 @@ independently by `seeds_for` on armada (2026-10-21; the readouts apart 2026-11-1
 memory entering and a document starting on a chunk's first token."""
 
 
+PACKED_DOCUMENTS = ((0, 23, 40), (9, 48))
+"""`draw`'s packed documents, the turned and transition sites' too: each row's documents' first tokens, a
+row's first continuing its given memory."""
+
+
 def marked(documents, length: int) -> np.ndarray:
     """Each row's `documents` (its documents' first tokens) as the `[rows, length]` marks of those tokens."""
     starts = np.zeros((len(documents), length), bool)
@@ -271,7 +282,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     if hooks.output is not None:
         epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
-    starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), length)) if packed else None
+    starts = jnp.asarray(marked(PACKED_DOCUMENTS, length)) if packed else None
     own = {'own': hosted(0.5 * normal((value_heads, KEY_WIDTH))[..., key_order])} if hooks.own_weight else {}
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
@@ -536,18 +547,14 @@ and angles to bf16 (mamba_ssm/ops/triton/mamba3/mamba3_siso_combined.py:384-392)
 layer sites are held to it recorded (row 7923)."""
 
 
-TURNED_DOCUMENTS = ((0, 23, 40), (9, 48))
-"""The turned sites' packed documents' first tokens: a row's first continuing its given memory."""
-
-
 def steep_draw(seed: int):
-    """`draw`'s operands for `TURNED` and cotangents, each row's even documents (`TURNED_DOCUMENTS`) decaying
+    """`draw`'s operands for `TURNED` and cotangents, each row's even documents (`PACKED_DOCUMENTS`) decaying
     steeply, each token's log decay in (-120, -60), its others mildly, in (-1, 0): a chunk's earlier
     document's prefix past its later one's by more than fp32's exponents span."""
     (operands,) = draw(TURNED, packed=False, seed=seed)
     tokens = np.arange(LENGTH)
     steep = np.stack([np.sum(tokens[:, None] >= np.asarray(begins)[None, :], axis=1) % 2 == 1
-                      for begins in TURNED_DOCUMENTS])
+                      for begins in PACKED_DOCUMENTS])
     rng = np.random.default_rng([seed, 8288])
     mild = rng.uniform(-1.0, 0.0, operands.log_decay.shape)
     log_decay = np.where(steep[..., None], rng.uniform(-120.0, -60.0, operands.log_decay.shape), mild)
@@ -557,7 +564,7 @@ def steep_draw(seed: int):
 
 VANISHED = (5, 9, 30, 33)
 """The tokens whose decays vanish in `vanishing`'s draws: two in one chunk of each row's first two
-documents (`TURNED_DOCUMENTS`, `CHUNK`)."""
+documents (`PACKED_DOCUMENTS`, `CHUNK`)."""
 
 
 def vanishing(operands):
@@ -600,7 +607,7 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
         return operands, cotangents(operands, seed)
 
     drawing = {None: drawn, 'steep': steep_draw, 'vanishing': vanishing_draw}[regime]
-    assert_packed_on_par(turned, tokens, drawing, f'{TURNED}', packed=packed, documents=TURNED_DOCUMENTS,
+    assert_packed_on_par(turned, tokens, drawing, f'{TURNED}', packed=packed, documents=PACKED_DOCUMENTS,
                          length=LENGTH, seeds=32)
 
 
@@ -742,7 +749,7 @@ def test_a_transitions_chunks_are_as_exact_as_its_tokens(hooks, packed):
         return token_by_token(hooks, dataclasses.replace(operands, starts=starts))
 
     assert_packed_on_par(ours, tokens, functools.partial(transition_draw, hooks), f'{hooks}', packed=packed,
-                         documents=TURNED_DOCUMENTS, length=LENGTH, seeds=8)
+                         documents=PACKED_DOCUMENTS, length=LENGTH, seeds=8)
 
 
 def transition_token(kind: str, state, query, key, value, log_decay, beta, a, b, e):
@@ -844,6 +851,34 @@ def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
     for got in found:
         assert np.isfinite(np.asarray(got)).all()
         assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
+
+
+@pytest.mark.parametrize('documents', [3, 0], ids=['three slots a row', 'none'])
+def test_a_forked_calls_token_maps_keep_its_rows_on_an_explicit_axis(documents):
+    """A forked call's token maps (`chunked_launch.Forked.tokens`: each token's load, store and document)
+    over ten tokens, its rows split over an Explicit mesh axis: a row of three documents and one of two, its
+    third slot unused (its start the call's length, its load and store nonzero, dropped), or a table of no
+    documents, each map a row's own exactly (a document's first token its load and number, its last its
+    store, every other token -1 or zero), int32 and placed as its rows are (row 9690: scattered into whole
+    buffers by a row index, JAX refused indices and updates split on an Explicit axis)."""
+    firsts = np.asarray([[0, 3, 7], [0, 5, 10]], np.int32)[:, :documents]
+    loads = np.asarray([[1, 0, 2], [0, 3, 4]], np.int32)[:, :documents]
+    stores = np.asarray([[1, 2, 3], [3, 1, 5]], np.int32)[:, :documents]
+    expected = (np.full((2, 10), -1, np.int32), np.zeros((2, 10), np.int32), np.zeros((2, 10), np.int32))
+    if documents:
+        for row, (begins, ends) in enumerate((([0, 3, 7], [2, 6, 9]), ([0, 5], [4, 9]))):
+            live = len(begins)
+            expected[0][row, begins], expected[1][row, ends] = loads[row, :live], stores[row, :live]
+            expected[2][row, begins] = range(live)
+    mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, P('data'))
+        placed = (jax.device_put(x, rows) for x in (firsts, loads, stores))
+        forked = chunked_launch.Forked(*placed, entry=None, held=3)
+        found = jax.jit(lambda forked: forked.tokens(10))(forked)
+    for got, want in zip(found, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), want, strict=True)
+        assert jax.typeof(got).sharding.spec[0] == 'data'
 
 
 @pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['laid', 'a token at a time'])

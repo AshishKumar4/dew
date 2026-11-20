@@ -24,7 +24,6 @@ from attention_oracle import attention_terms
 from fla_gdn_support import KernelCase
 from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS
-from jax.extend import core as jcore
 from jax.sharding import Mesh
 from kernel_compile import compile_mosaic_kernels, mosaic_failures
 from reference_error import assert_as_exact, widened
@@ -39,6 +38,7 @@ from test_attention_triton import (
     score_hooks,
 )
 
+from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
@@ -752,21 +752,6 @@ def test_an_absorbed_mla_forward_of_576_wide_keys_and_512_wide_values_is_on_par_
                    value_width=512, target=generation.gpu_target("sm90"))
 
 
-def _kernels(jaxpr) -> list:
-    """Every kernel equation of `jaxpr` that states its cost (its `cost_estimate`), through the programs that
-    hold them."""
-    found = []
-    for equation in jaxpr.eqns:
-        if equation.params.get("cost_estimate") is not None:
-            found.append(equation)
-        for param in equation.params.values():
-            for inner in param if isinstance(param, tuple | list) else (param,):
-                held = getattr(inner, "jaxpr", inner)
-                if isinstance(held, jcore.Jaxpr):
-                    found += _kernels(held)
-    return found
-
-
 def test_an_absorbed_mla_forward_states_its_key_buffer_once_under_jit():
     """A forward whose values are its keys' leading 512 columns (`MosaicForward.in_key`), traced for an H100,
     streams its key buffer once, and each launch that states its bytes states its query and key operands
@@ -779,8 +764,9 @@ def test_an_absorbed_mla_forward_states_its_key_buffer_once_under_jit():
         return attention_mosaic.forward(query, key, key[..., :512], spans, natural=False, in_key=True)
 
     with generation.assumed("sm90"):
-        stating = [equation for equation in _kernels(jax.make_jaxpr(jax.jit(forward))(query, key).jaxpr)
-                   if equation.params["cost_estimate"].bytes_accessed]
+        traced = jax.make_jaxpr(jax.jit(forward))(query, key).jaxpr
+        stating = [equation for equation in programs.equations(traced)
+                   if (cost := equation.params.get("cost_estimate")) is not None and cost.bytes_accessed]
     assert stating
     for equation in stating:
         operands = sum(int(np.prod(var.aval.shape)) * var.aval.dtype.itemsize for var in equation.invars[:2])
@@ -1240,6 +1226,7 @@ def test_the_training_forwards_rows_past_fp32s_largest_keep_their_mean_and_every
     assert (found_value[finite & (reference_value != 0)] != 0).all()
 
 
+@INTERPRETS
 @pytest.mark.parametrize("held", ["keys", "start"])
 def test_a_training_forwards_output_scales_exactly_with_its_values_however_large(held):
     """A training forward's head whose rows see 512 keys, the row's largest magnitude near fp32's largest
@@ -1620,6 +1607,7 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
                            training=_kept(launch), target=target)
 
 
+@INTERPRETS
 @pytest.mark.parametrize("unseen", UNSEEN)
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     """On a GPU no row measured the forward's and the backward's tiles come from the family's facts and the
