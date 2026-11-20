@@ -1,9 +1,10 @@
 """Error-aware extraction (docs/design/algebra.md §1.5), at dev time: a function's equal forms the e-graph
 holds under every rule set, the stable ones among them (`rules.admitted(dev=True)`), proposed as candidates
-(the form as written, the cheapest by time, the one the stable proposal prices cheapest), each admitted by the
-accuracy gate its caller holds (`admits`, check 1 over its draws, the one owner of the policy), and the
-cheapest admitted chosen. Error is a candidate's, never an e-class fact: the forms of one class are equal in
-the reals and differ in error, which depends on every operand form a candidate reads."""
+(the form as written, the cheapest by time, the one the stable proposal prices cheapest), and each one's sums
+compensated (the error-free derivation, §6.9: `printed.source`'s), each admitted by the accuracy gate its
+caller holds (`admits`, check 1 over its draws, the one owner of the policy), and the cheapest admitted
+chosen. Error is a candidate's, never an e-class fact: the forms of one class are equal in the reals and
+differ in error, which depends on every operand form a candidate reads."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from collections.abc import Callable, Hashable, Sequence
 import jax
 from egglog import DagCostModel, Vec
 
-from dew.algebra import cost, extract, forms, program, rules, terms
+from dew.algebra import cost, extract, forms, printed, program, rules, terms
 from dew.nn import programs
 
 
@@ -25,6 +26,12 @@ class Candidate:
     name: str
     seconds: float
     function: Callable
+    compensated: bool = False
+    """Whether its sums are compensated (`printed.source`'s error-free derivation): proposed after every
+    uncompensated form, each at its own form's price, its compensation in spans protected from the pass that
+    no price reads (`compensated`)."""
+    form: Callable | None = None
+    """The uncompensated form it compensates; None for an uncompensated candidate, its own `function`."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,9 +51,10 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
            saturation: program.Saturation, admits: Callable[[Callable, Callable], bool]) -> Choice:
     """`function`'s form chosen for operands of `operands`' shapes and dtypes: its candidates proposed in
     order of price (the form as written, the cheapest and the most stable extractions, and each root's
-    forms beside the others' cheapest, `VARIANTS`, each distinct one priced as a whole, `_priced`), and the
-    first the gate admits chosen (`admits(candidate, reference)`, whether `candidate` is as exact as
-    `reference` from the float64 truth; docs/design/algebra.md §1.5, §6.5): under default numerics against
+    forms beside the others' cheapest, `VARIANTS`, each distinct one priced as a whole, `_priced`), then each
+    one's sums compensated (`compensated`), and the first the gate admits chosen (`admits(candidate,
+    reference)`, whether `candidate` is as exact as `reference` from the float64 truth;
+    docs/design/algebra.md §1.5, §6.5): under default numerics against
     the form as written, so one is always admitted; under the accurate numerics (`precision="accurate"`)
     against every other candidate, so a choice is never less accurate than any form proposed."""
     closed, shaped = jax.make_jaxpr(function, return_shape=True)(*operands)
@@ -72,13 +80,37 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
         candidates.append(Candidate(name, _priced(region, chosen, timed),
                                     _valued(region, closed.consts, dict(zip(map(terms.key, roots), chosen,
                                                                             strict=True)), tree)))
-    candidates.sort(key=lambda candidate: candidate.seconds)
+    candidates += [found for candidate in candidates
+                   if (found := compensated(candidate, operands, tree)) is not None]
+    candidates.sort(key=lambda candidate: (candidate.compensated, candidate.seconds))
     references = candidates if accurate else [written]
     for candidate in candidates:
         if all(candidate is reference or admits(candidate.function, reference.function)
                for reference in references):
             return Choice(candidate, tuple(candidates))
     raise ValueError("no candidate is as exact as every other: the gate admits none")
+
+
+def compensated(candidate: Candidate, operands: Sequence[jax.ShapeDtypeStruct], tree) -> Candidate | None:
+    """`candidate` with its float sums compensated (`printed.source`, the error-free derivation, §6.9): each
+    addition and subtraction a double word, each sum's reduction compensated, both in spans the pass never
+    rewrites, returning its outputs in their structure `tree`; None where it holds no sum, or an equation
+    no plain call writes (`printed.Unprintable`). The e-graph holds no such form: its equality is the
+    reals', in which an addition's rounding error is zero, so extraction would cancel what the derivation
+    keeps. Proposed after every uncompensated form at its own form's price (`Candidate.compensated`): its
+    compensation's arithmetic lies in protected spans, which the cost model prices as the values they
+    make."""
+    try:
+        text, used = printed.source(jax.make_jaxpr(candidate.function)(*operands), "compensated",
+                                    compensated=True)
+    except printed.Unprintable:
+        return None
+    if not used:
+        return None
+    flat = printed.loaded(text, "compensated")
+    return Candidate(f"{candidate.name}, compensated", candidate.seconds,
+                     lambda *values: jax.tree.unflatten(tree, list(flat(*values))), compensated=True,
+                     form=candidate.function)
 
 
 def product_precision(rows: int, depth: int, columns: int, dtype, *,

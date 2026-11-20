@@ -364,6 +364,9 @@ class Region[Node: (Term, Skeleton)]:
     """What the jaxpr proves of each value beside its magnitude (`Apart`: a number, finite, its side and
     floor) by the variable that names it: with `held`, what a window cut from the jaxpr declares of its
     inputs (`Proven`)."""
+    floors: dict[Hashable, Apart] = dataclasses.field(default_factory=dict)
+    """`apart` of each term held away from zero, by term text: a number whose floor (`Apart.floor`) is
+    known, the floor and side a guarded reuse reads of a divisor (`rules.log2_floor`, `rules.positive`)."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -741,7 +744,9 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                   max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
                   frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed,
                   {var: magnitudes.get(key(node)) for var, node in env.items()},
-                  {var: apart.get(var, NOWHERE) for var in env})
+                  {var: apart.get(var, NOWHERE) for var in env},
+                  {key(node): held for var, node in env.items()
+                   if (held := apart.get(var, NOWHERE)).number and held.floor is not None})
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)
@@ -1359,17 +1364,29 @@ def _typed(dtypes: dict, magnitudes: dict, term: Term | Skeleton, atom, magnitud
     magnitudes.setdefault(named, magnitude)
 
 
+WIDENED = (jnp.bfloat16, jnp.float16)
+"""The floats narrower than float32 a widened sum adds in float32 (`rules.narrowed`), each one's conversion
+back stocked (`stocked`)."""
+
+
 @functools.cache
 def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
     """The primitives a stable rule writes where the program held none (`rules.stock`), each at the
-    parameters JAX binds it with by default, read from JAX's own trace of them."""
+    parameters JAX binds it with by default, read from JAX's own trace of them, by its symbol; a conversion
+    by its target's name (`convert_float32`: a widened sum's, and each of `WIDENED`'s, its result's)."""
     # An abstract scalar: the pass reads a jit's trace after it is made, where a process compiling for a
     # device it does not hold (a compile-only GPU) places no array.
     scalar = jax.ShapeDtypeStruct((), jnp.float32)
     traced = jax.make_jaxpr(lambda a: (a / a, a - a, a + a, a * a, jnp.maximum(a, a), jnp.exp(a),
-                                       jnp.log1p(a), jnp.expm1(a)))(scalar)
-    return {OPERATIONS[equation.primitive].symbol: (equation.primitive, dict(equation.params))
-            for equation in traced.jaxpr.eqns}
+                                       jnp.log1p(a), jnp.expm1(a),
+                                       *(a.astype(narrow).astype(jnp.float32) for narrow in WIDENED)))(scalar)
+    found = {}
+    for equation in traced.jaxpr.eqns:
+        symbol = OPERATIONS[equation.primitive].symbol
+        if equation.primitive is jax.lax.convert_element_type_p:
+            symbol = f"convert_{np.dtype(equation.params['new_dtype']).name}"
+        found.setdefault(symbol, (equation.primitive, dict(equation.params)))
+    return found
 
 
 def written_as(constructor: str, named: str | None = None) -> str | None:

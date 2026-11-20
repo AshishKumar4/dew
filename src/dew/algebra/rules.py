@@ -105,6 +105,33 @@ what a reordering rule states of the intermediate it makes (`made`). A value no 
 
 
 @function(merge=lambda old, new: old)
+def log2_floor(term: Term) -> i64: ...
+"""A value's floor away from zero's power of two, `2**floor <= |x|` of a number (`terms.Apart.floor`, the
+region's `floors`, `program.stated`): what its reciprocal is at most, which a guarded reuse reads (`_reuse`).
+A value nothing holds away from zero has none."""
+
+
+@function
+def positive(term: Term) -> Unit: ...
+"""Holds where a value is above zero (`terms.Apart.positive`): a root's operand, and its reciprocal root's,
+in their domain."""
+
+
+@function(merge=lambda old, new: old)
+def least() -> i64: ...
+"""The least power of two a normal value of the program's narrowest float takes (`program.stated`): a
+reciprocal under it would flush to zero on a lane that flushes, where the quotient it replaces keeps its
+value (§6.3)."""
+
+
+@function(merge=lambda old, new: old)
+def narrowed(term: Term) -> i64: ...
+"""The index of the conversion back to a value's own float (`stock`'s `convert_<dtype>`), stated of a value
+of a float narrower than float32 (`terms.WIDENED`, `program.stated`): a widened sum's result returned in
+it."""
+
+
+@function(merge=lambda old, new: old)
 def reach() -> i64: ...
 """The largest power of two a value of the program may take finite, the narrowest float's (`program.stated`):
 a reordering's new intermediate under it is finite wherever the program is, as a bound of numbers alone holds
@@ -364,6 +391,21 @@ _POSITIVE = Drawn(((64, 1024), ()), scale=lambda rng, shape, drawn: (
 _ROW_SCALED = Drawn(((64, 1024), (64,), (64, 1024)))
 
 
+_LOGITS = Drawn(((64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: rng.standard_normal(shape) * 10.0)
+"""Logits of a spread of ten, whose exponentials and their quotients stay in float32's range: a logarithm
+of them is the logit, which the form in log space keeps and the exponential rounds."""
+_NEAR = Drawn(((64, 1024), (64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: (
+    rng.standard_normal(shape) * (1e4 if not drawn else 1.0)))
+"""A large term and two small ones: the large one's rounding is what a sum of each carries, which their
+difference cancels exactly where the large one is taken out."""
+_CONTRACTED_SCALE = Drawn(((64, 128), (128,), (128, 32)), scale=lambda rng, shape, drawn: (
+    rng.uniform(1.0, 1e3, shape) if len(shape) == 1 else rng.standard_normal(shape)))
+"""A matrix product's operands and a positive scale along its contraction (a softmax's totals, each at least
+one): the scale on either operand's contracted axis."""
+_NARROW = Drawn(((64, 4096),))
+"""Rows long enough that a sum of a narrow float's terms rounds in its own precision at every step."""
+
+
 def _stable() -> tuple[RuleFamily, ...]:
     """Stable forms (docs/design/algebra.md §1.5): `exp(x - (m + log t))` as `exp(x - m) / t`, so the
     logarithm of a sum is never rounded into a value as large as the logits (a derived attention backward's
@@ -392,7 +434,151 @@ def _stable() -> tuple[RuleFamily, ...]:
         RuleFamily("one less than the exponential", (
             rewrite(x.unary("exp", exped).binary("sub", one, subbed)).to(
                 x.unary("expm1", minus_one), unit(one), plain(subbed), eq(minus_one).to(stock("expm1"))),),
-            (lambda x: jnp.exp(x) - 1, jnp.expm1, _SMALL)))
+            (lambda x: jnp.exp(x) - 1, jnp.expm1, _SMALL)),
+        *_log_space(), *_cancelled(), *_ranged(), *_moved_scales(), *_widened())
+
+
+def _log_space() -> tuple[RuleFamily, ...]:
+    """Logarithms of exponentials taken in log space (§1.4's log-space divergences: a KL's `log(p / q)` of
+    two softmaxes' exponentials): `log(exp(a))` as `a`, `log(exp(a) / exp(b))` as `a - b` and
+    `log(exp(a) exp(b))` as `a + b`, finite wherever the form as written is and wherever an exponential
+    leaves the float's range."""
+    a, b = vars_("a b", Term)
+    exped, other, logged, joined, written = vars_("exped other logged joined written", i64)
+    families = [RuleFamily("a logarithm of an exponential", (
+        rewrite(a.unary("exp", exped).unary("log", logged)).to(a),),
+        (lambda a, b: jnp.log(jnp.exp(a)), lambda a, b: a, _LOGITS))]
+    for name, between, made, of, as_written in (
+            ("a quotient", "div", "sub", lambda a, b: jnp.log(jnp.exp(a) / jnp.exp(b)), lambda a, b: a - b),
+            ("a product", "mul", "add", lambda a, b: jnp.log(jnp.exp(a) * jnp.exp(b)), lambda a, b: a + b)):
+        families.append(RuleFamily(f"a logarithm of {name} of exponentials", (
+            rewrite(a.unary("exp", exped).binary(between, b.unary("exp", other), joined).unary("log", logged))
+            .to(a.binary(made, b, written), plain(joined), eq(shape(a)).to(shape(b)),
+                eq(written).to(stock(made))),), (of, as_written, _LOGITS)))
+    return tuple(families)
+
+
+def _cancelled() -> tuple[RuleFamily, ...]:
+    """Differences of near-equal sums rearranged to cancel exactly (§1.4): `(x + y) - (x + z)` as `y - z` and
+    `(x + y) - x` as `y`, the shared term's rounding in each sum never made (addition's commutativity, an
+    aid, finds the other orders)."""
+    x, y, z = vars_("x y z", Term)
+    added, other, subbed = vars_("added other subbed", i64)
+    return (
+        RuleFamily("a difference of sums sharing a term", (
+            rewrite(x.binary("add", y, added).binary("sub", x.binary("add", z, other), subbed)).to(
+                y.binary("sub", z, subbed), plain(added), plain(other), plain(subbed),
+                eq(shape(x)).to(shape(y)), eq(shape(x)).to(shape(z))),),
+            (lambda x, y, z: (x + y) - (x + z), lambda x, y, z: y - z, _NEAR)),
+        RuleFamily("a sum less its own term", (
+            rewrite(x.binary("add", y, added).binary("sub", x, subbed)).to(
+                y, plain(added), plain(subbed), eq(shape(x)).to(shape(y))),),
+            (lambda x, y, z: (x + y) - x, lambda x, y, z: y, _NEAR)))
+
+
+def _ranged() -> tuple[RuleFamily, ...]:
+    """Products and quotients regrouped to stay in range (§1.4): `(a b) / c` as `a (b / c)` and `a / (b c)`
+    as `(a / b) / c`, each over one shape, whichever keeps its intermediates in the float's range measured
+    (`dew.algebra.error.choose`)."""
+    a, b, c = vars_("a b c", Term)
+    multiplied, divided = vars_("multiplied divided", i64)
+    same = (eq(shape(a)).to(shape(b)), eq(shape(a)).to(shape(c)))
+    return (
+        RuleFamily("a product's quotient as a product of a quotient", (
+            rewrite(a.binary("mul", b, multiplied).binary("div", c, divided)).to(
+                a.binary("mul", b.binary("div", c, divided), multiplied), plain(multiplied), plain(divided),
+                *same),),
+            (lambda a, b, c: (a * b) / c, lambda a, b, c: a * (b / c), _ROWS)),
+        RuleFamily("a quotient by a product as two quotients", (
+            rewrite(a.binary("div", b.binary("mul", c, multiplied), divided)).to(
+                a.binary("div", b, divided).binary("div", c, divided), plain(multiplied), plain(divided),
+                *same),),
+            (lambda a, b, c: a / (b * c), lambda a, b, c: (a / b) / c, _ROWS)))
+
+
+def _moved_scales() -> tuple[RuleFamily, ...]:
+    """A scale along a matrix product's contraction moved to its other operand (§1.5's first acceptance
+    case: a softmax's normalization before an attention backward's dV product or after it on the cotangent,
+    1.64 times the oracle's error against on par): `(x op s) @ y` as `x @ (y op s)`, `s` broadcast along
+    `x`'s contracted axis and laid along `y`'s, `op` a product or a quotient, and back; each reorders its
+    rounding, and dev time measures which is kept."""
+    x, y, s, t = vars_("x y s t", Term)
+    params, laid, scaled, spread = vars_("params laid scaled spread", i64)
+    families = []
+    for op, scale_of in (("mul", lambda v, s: v * s), ("div", lambda v, s: v / s)):
+        moved = []
+        for on_left in (True, False):
+            # The scale lies along the scaled operand's contracted axis (the left's columns, the right's
+            # rows): its broadcast misses the other axis, and its new one lies along the other operand's.
+            source, target = (x, y) if on_left else (y, x)
+            before = source.binary(op, s.shaped("broadcast_in_dim", laid), scaled)
+            after = target.binary(op, s.shaped("broadcast_in_dim", spread), scaled)
+            written, made = (before.dot(y, params), x.dot(after, params)) if on_left else (
+                x.dot(before, params), after.dot(y, params))
+            moved.append(rule(
+                eq(t).to(written), matrix_product(params), plain(scaled), matrix(x), matrix(y),
+                along(laid, i64(0 if on_left else 1)),
+                eq(spread).to(lifted(shape(target), i64(0 if on_left else 1)))).then(
+                union(t).with_(made), set_(shape(s.shaped("broadcast_in_dim", spread))).to(shape(target))))
+        families.append(RuleFamily(
+            f"a {'scale' if op == 'mul' else 'divisor'} along a contraction moved to the other operand",
+            tuple(moved), (lambda x, s, y, scale_of=scale_of: jnp.dot(scale_of(x, s[None, :]), y),
+                           lambda x, s, y, scale_of=scale_of: jnp.dot(x, scale_of(y, s[:, None])),
+                           _CONTRACTED_SCALE)))
+    return tuple(families)
+
+
+def _widened() -> tuple[RuleFamily, ...]:
+    """A sum of a float narrower than float32 added in float32 and returned in its own (§1.4's widened sums,
+    `terms.WIDENED`): each of its additions rounds in float32's precision, its result once in its own."""
+    x = var("x", Term)
+    axes = var("axes", Vec[i64])
+    params, wide, back = vars_("params wide back", i64)
+    return (RuleFamily("a narrow float's sum added in float32", (
+        rewrite(x.reduce("sum", axes, params)).to(
+            x.convert(wide).reduce("sum", axes, params).convert(back), eq(back).to(narrowed(x)),
+            eq(wide).to(stock("convert_float32"))),),
+        (lambda x: jnp.sum(x.astype(jnp.bfloat16), -1),
+         lambda x: jnp.sum(x.astype(jnp.bfloat16).astype(jnp.float32), -1).astype(jnp.bfloat16), _NARROW)),)
+
+
+_FLOORED = Drawn(((64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: (
+    rng.standard_normal(shape) if not drawn else np.maximum(np.abs(rng.standard_normal(shape)), 1e-3)))
+"""A dividend and a divisor held away from zero (a norm floored by its epsilon, `max(|y|, 1e-3)`)."""
+
+
+def _reuse() -> tuple[RuleFamily, ...]:
+    """A value the program already computed read in a new one's place (§1.4's reuse): a quotient by a value
+    whose reciprocal the program holds, `a / y` as `a (1 / y)`, and by a root whose reciprocal root it holds,
+    `a / sqrt(v)` as `a rsqrt(v)` (a normalization's `x / max(|y|, eps)` beside its reciprocal, a norm's
+    `rsqrt(mean(x^2) + eps)`). Each reorders a rounding, and each fires only where the reciprocal is a
+    normal finite float and the product finite (§6.3's dominance rule): the divisor held away from zero
+    (`log2_floor`: its reciprocal at most `2**-floor`, under the program's reach), and bounded (`log2_bound`:
+    its reciprocal at least `2**-bound`, above the narrowest float's least normal power, so no flushing lane
+    reads it as zero), and the dividend's bound with the reciprocal's under the reach. A reciprocal of an
+    unguarded divisor overflows where the quotient is finite (a subnormal one) and makes a NaN of a zero
+    dividend, so it is never shared (the reuse probe, 2026-11-05)."""
+    a, y, v, one, t, r = vars_("a y v one t r", Term)
+    divided, inverted, rooted, reciprocal, multiplied = vars_("divided inverted rooted reciprocal multiplied",
+                                                              i64)
+    floor, bound, held, reached, lowest = vars_("floor bound held reached lowest", i64)
+    guarded = (eq(reached).to(reach()), eq(lowest).to(least()), eq(held).to(log2_bound(a)),
+               eq(multiplied).to(stock("mul")), plain(divided), eq(shape(a)).to(shape(t)))
+    return (
+        RuleFamily("a quotient by a value whose reciprocal the program holds", (rule(
+            eq(t).to(a.binary("div", y, divided)), eq(r).to(one.binary("div", y, inverted)), unit(one),
+            plain(inverted), eq(shape(r)).to(shape(t)), eq(floor).to(log2_floor(y)),
+            eq(bound).to(log2_bound(y)), *guarded, i64(0) - floor <= reached,
+            lowest <= i64(0) - bound - 1, held - floor <= reached).then(
+            union(t).with_(a.binary("mul", r, multiplied))),),
+            (lambda a, y: a / y, lambda a, y: a * (1 / y), _FLOORED)),
+        RuleFamily("a quotient by a root whose reciprocal the program holds", (rule(
+            eq(t).to(a.binary("div", v.unary("sqrt", rooted), divided)),
+            eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(t)),
+            eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *guarded, i64(0) - floor <= reached,
+            lowest <= i64(0) - bound - 1, held + (i64(0) - floor).max(i64(0)) <= reached).then(
+            union(t).with_(a.binary("mul", r, multiplied))),),
+            (lambda a, v: a / jnp.sqrt(v), lambda a, v: a * jax.lax.rsqrt(v), _FLOORED)))
 
 
 def _linear() -> tuple[RuleFamily, ...]:
@@ -702,6 +888,10 @@ register(Rules.declared("stable", "bounded", _stable(),
 register(Rules.declared("linear", "reorders", _linear(),
                         "docs/design/algebra.md §1; ledger 1308; measured M-DC-3 (six GPU flows' training "
                         "and decode programs, GH200 and A100): within each cell's A/A"))
+register(Rules.declared("reuse", "reorders", _reuse(),
+                        "docs/design/algebra.md §1.4; the reuse probe of 2026-11-05 (benchmark_step and the "
+                        "parallelism matrix: 42 to 452 of 423 to 794 divisions a suite share a divisor), "
+                        "each reciprocal guarded by its divisor's floor and bound (row 9035)"))
 register(Rules.declared("joined", "reorders", _joined(),
                         "docs/design/algebra.md §1; ledger 1308; the rule-set survey of 2026-11-14: it "
                         "changes no shipped program, and the pass runs 12% slower without it (13,604 "
