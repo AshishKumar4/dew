@@ -17,6 +17,7 @@ import dataclasses
 import enum
 import functools
 import inspect
+import itertools
 import logging
 import os
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
@@ -1646,9 +1647,11 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
     derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
     avals like it), which `apply` is then traced for only where forward mode runs it. With `zero_cotangents`,
     a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros. With
-    `traced_tangent`, its tangent is one jvp of `apply` in the residuals and moving leaves a tangent reaches,
-    the others held as constants: an `apply` whose own derivative sums both in one (an aligned sum's, whose
-    two parts added overflowed to inf - inf, and a zero direction met an infinite factor, NaN; row 8757)."""
+    `traced_tangent`, for an `apply` whose derivatives at every order are declared (an aligned sum's), its
+    tangent is one jvp of `apply` in the residuals and moving leaves a tangent reaches, the others held as
+    constants, and reverse mode past the map's own transpose (`pullback`'s) that tangent's, `apply`'s
+    declared ones: split into the map and its residuals' part, an aligned sum's two parts added overflowed to
+    inf - inf, and a zero direction met an infinite factor, NaN (row 8757)."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
@@ -1670,6 +1673,8 @@ def _linear_primitive() -> type:
     import numpy as np
     from jax.experimental import hijax
 
+    from dew.nn import programs
+
     def zero(leaf) -> bool:
         return isinstance(leaf, hijax.Zero)
 
@@ -1684,25 +1689,18 @@ def _linear_primitive() -> type:
         """A tangent of `out_aval`'s type no direction reaches: its symbolic zeros."""
         return jax.tree.map(lambda aval: hijax.Zero(aval.to_tangent_aval()), out_aval)
 
-    def held_jvp(apply, primals, tangents, out_aval):
+    def held_jvp(apply, structure, primals, tangents, out_aval):
         """`apply(*primals)`'s tangent in the leaves `tangents` reaches (neither None nor a symbolic zero,
-        paired by the primals' structure, which raises where theirs differs), the others held as constants:
-        a zero tangent's leaf beside an infinite one was a 0 inf, NaN (row 8757)."""
-        flat, tree = jax.tree.flatten(primals)
-        directions = tree.flatten_up_to(tangents)
-        live = [index for index, direction in enumerate(directions)
-                if direction is not None and not zero(direction)]
-        if not live:
+        paired by `structure`, the primals' own the primitive holds, which raises where theirs differs),
+        the others held as constants: a zero tangent's leaf beside an infinite one was a 0 inf, NaN (row
+        8757). The primals are flattened once, by `programs.holes`, which selects and rebuilds them."""
+        directions = structure.flatten_up_to(tangents)
+        live = [direction is not None and not zero(direction) for direction in directions]
+        moving, fill = programs.holes(primals, live)
+        if not moving:
             return nothing(out_aval)
-
-        def moved(*held):
-            leaves = list(flat)
-            for index, leaf in zip(live, held, strict=True):
-                leaves[index] = leaf
-            return apply(*jax.tree.unflatten(tree, leaves))
-
-        return jax.jvp(moved, tuple(flat[index] for index in live),
-                       tuple(directions[index] for index in live))[1]
+        return jax.jvp(lambda *moved: apply(*fill(moved)), tuple(moving),
+                       tuple(itertools.compress(directions, live)))[1]
 
     def unbatched(cotangent):
         """An unbatched operand's cotangent: its batch's sum."""
@@ -1744,14 +1742,15 @@ def _linear_primitive() -> type:
             residuals, moving = primals
             d_residuals, d_moving = tangents
             if self.traced_tangent:
-                return self(residuals, moving), held_jvp(self.apply, primals, tangents, self.out_aval)
+                return self(residuals, moving), held_jvp(self.apply, self.in_tree, primals, tangents,
+                                                         self.out_aval)
             terms = []
             if not all_zero(d_moving):
                 terms.append(self(residuals, instantiated(d_moving)))
             if not all_zero(d_residuals):
                 # The residuals' own, the moving leaves held still (base review 0c6ef9c11 F2).
                 held = (d_residuals, jax.tree.map(lambda _: None, moving))
-                terms.append(held_jvp(self.apply, primals, held, self.out_aval))
+                terms.append(held_jvp(self.apply, self.in_tree, primals, held, self.out_aval))
             if not terms:
                 return self(residuals, moving), nothing(self.out_aval)
             # Added only where two parts are: a lone part's sign kept (`0 + -0.0` is positive zero).

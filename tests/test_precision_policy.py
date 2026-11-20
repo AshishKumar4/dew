@@ -9,6 +9,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from contract_support import CANCELLING_LEVELS, MOST
+from low_precision_support import edge_values
 from reference_error import assert_as_exact, assert_fp32_reduction_bound, dot_precisions
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -16,6 +18,14 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dense import Dense
 from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
+from dew.nn.float_bits import (
+    TWO_FACTOR_REACH,
+    binade_of,
+    float_bits,
+    lowered_rounded,
+    raised_exactly,
+    raw_fields,
+)
 from dew.nn.kernels import generation
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
@@ -27,20 +37,17 @@ from dew.nn.precision import (
     Numerics,
     _rounded_significand,
     aligned_sum,
-    binade_of,
     compensated_add,
     compensated_difference,
     exact_products,
-    float_bits,
     fp32_result_dot_general,
-    raised_exactly,
     two_product,
     two_sum,
 )
 from dew.telemetry.instrumentation import hlo_instructions
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
-SEEDS = {"auto": 8, "local auto": 8}
+SEEDS = {"auto": 8, "local auto": 8, "default": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (paired, on armada): the most any
 of a site's cases took."""
 
@@ -199,15 +206,22 @@ def test_local_attention_under_auto_computes_the_precision_it_is_asked_for(span)
                     truth_fn=call("reference"))
 
 
-@pytest.mark.parametrize("precision", [None, jax.lax.Precision.DEFAULT, "default"])
-def test_fused_attention_default_precision_matches_the_attention_equation(precision):
-    query, key, value = jax.random.normal(
-        jax.random.key(0), (3, *BF16_QKV), dtype=jnp.float32)
-    scores = jnp.einsum("bqhd,bkhd->bhqk", query, key) / jnp.sqrt(query.shape[-1])
-    expected = jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(scores, axis=-1), value)
-    actual = scaled_dot_product_attention(
-        query, key, value, precision=precision, implementation="xla")
-    assert jnp.max(jnp.abs(actual - expected)) < 1e-5
+def test_fused_attention_default_precision_matches_the_attention_equation():
+    """XLA's attention at the default precision on par with the attention equation, the reference path run
+    in float64 its truth (check 1); `Precision.DEFAULT` and "default" spell that default alike, each the same
+    program as no precision given, bit for bit on one draw."""
+    draw = qkv_draws(jnp.float32)
+
+    def attended(precision):
+        return jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, precision=precision,
+                                                                    implementation="xla"))
+
+    assert_as_exact(attended(None), jax.jit(reference_attention), draw, "xla at the default precision",
+                    seeds=SEEDS["default"], truth_fn=reference_attention)
+    operands = draw(0)
+    for alias in (jax.lax.Precision.DEFAULT, "default"):
+        np.testing.assert_array_equal(np.asarray(attended(alias)(*operands)),
+                                      np.asarray(attended(None)(*operands)))
 
 
 @pytest.mark.parametrize("helper", ["rounded_operand", "rounded_to"])
@@ -1155,10 +1169,8 @@ ALIGNED_CASES = {
     "a band below two that cancel": ([(2.0 ** 100, 2.0 ** 27, 1.0), (2.0 ** 100, -(2.0 ** 27), 1.0),
                                       (2.0 ** 25, 1.0, 1.0), (-(2.0 ** 24), 1.0, 1.0),
                                       (-(2.0 ** 24), 1.0, 1.0), (2.0 ** -50, 2.0 ** -50, 1.0)], 2.0 ** -100),
-    "three levels cancelling beside the largest": (
-        [(2.0 ** 100, 2.0 ** 53, 1.0), (2.0 ** 100, 2.0 ** 28, 1.0), (-(2.0 ** 100), 2.0 ** 3, 1.0),
-         (-(2.0 ** 100), 2.0 ** 28, 1.0), (2.0 ** 100, 2.0 ** 3, 1.0), (-(2.0 ** 100), 2.0 ** 53, 1.0),
-         (float(np.finfo(np.float32).max), 1.0, 1.0)], float(np.finfo(np.float32).max)),
+    "three levels cancelling beside the largest": ([(key, value, 1.0) for key, value in CANCELLING_LEVELS],
+                                                   MOST),
     "cancelling past twice the precision": ([(2.0 ** 80, 1.0, 1.0), (2.0 ** 50, 1.0, 1.0), (1.0, 1.0, 1.0),
                                              (-(2.0 ** 50), 1.0, 1.0), (-1.0, 1.0, 1.0),
                                              (-(2.0 ** 80), 1.0, 1.0)], 0.0),
@@ -1168,7 +1180,7 @@ order of summing (their sum a float32): a term more than float32's exponent rang
 where the largest cancel (base review 224fcf53a F1), and a lower band's rounding, -2^25 - 2 a tie, kept
 where its rounded sum cancels a higher band's (base review 644ef5535 F1), a third band's 2^-100 kept
 where the two above it cancel (base review f5e6e678d F1), and three levels of cancelling terms beside the
-largest, `[2^153, 2^128, -2^103, -2^128, 2^103, -2^153, fp32's largest]` the largest, not inf, and
+largest (`contract_support.CANCELLING_LEVELS`) the largest, not inf, and
 `2^80 + 2^50 + 1 - 2^50 - 1 - 2^80` zero, which floats summed in some order lose (row 8757)."""
 
 
@@ -1370,6 +1382,39 @@ def test_an_aligned_sums_second_order_keeps_a_lone_parts_sign():
     assert found == 0.0 and np.signbit(found)
 
 
+def test_an_aligned_sums_tangents_value_and_gradient_keeps_its_joint_tangent():
+    """The tangent along `(0, -2^70, 2^70 (1 + k 2^-23), 0)` at `(2^70, 2^70, 2^70, 0)`, `k` each of 0 to 8
+    in check 1's first stage (the seed's modulo `offsets`, its seeds; rows 9087, 9091), of the value of
+    `aligned_sum([(a, b)])`'s tangent's value-and-gradient, `da vb + vda b`: `k 2^117`, its two products each
+    2^140 past float32's largest, cancelling exactly at `k` zero, held by check 1 against the formula in
+    float64 rounded once (exact, so Dew must be) where an untraced map's parts, rounded apart, added to inf -
+    inf, NaN (rows 8757, 8975)."""
+    from arm_forms import as_given
+
+    big, offsets = 2.0 ** 70, 9
+
+    def draw(seed):
+        k = seed % offsets
+        point, direction = (big, big, big, 0.0), (0.0, -big, big * (1 + k * 2.0 ** -23), 0.0)
+        return tuple(np.float32(x) for x in (*point, *direction))
+
+    def tangent(a, b, da, db):
+        return jax.jvp(lambda a, b: aligned_sum([(a, b)]), (a, b), (da, db))[1]
+
+    def ours(*inputs):
+        def value(*point):
+            return jax.value_and_grad(tangent)(*point)[0]
+
+        return jax.jvp(value, inputs[:4], inputs[4:])[1]
+
+    def formula(a, b, da, db, va, vb, vda, vdb):
+        return vda * b + da * vb + va * db + a * vdb
+
+    rounded = as_given(lambda *inputs: np.float32(formula(*(np.float64(x) for x in inputs))))
+    assert_as_exact(jax.jit(ours), rounded, draw, "an aligned sum's tangent's value and gradient",
+                    seeds=offsets, truth_fn=jax.jit(formula))
+
+
 def test_an_aligned_sums_tangent_pulls_back_inside_its_sum():
     """The gradient in `b` of `aligned_sum([(a, b), (v,)])`'s tangent along `a`'s direction a quarter, `v`
     a constant `[0, 0]`, under a cotangent of `[fp32's largest] * 2`: half the largest, where the tangent
@@ -1413,6 +1458,26 @@ def test_an_aligned_sum_over_one_long_axis_lowers(length):
     lowered = jax.jit(lambda x: aligned_sum([(x,)], axis=0)).trace(
         jax.ShapeDtypeStruct((length,), jnp.float32)).lower()
     assert lowered.out_info.shape == (1,)
+
+
+def test_an_aligned_sums_tangent_leaks_no_tracer():
+    """The tangent and the gradient of `aligned_sum([(a, b)])` under `jax.checking_leaks`: no tracer kept,
+    where its tangent's map, a primitive's static parameter, closed over its traced value (row 8757)."""
+    one = jnp.float32(1.0)
+    with jax.checking_leaks():
+        jax.jvp(lambda a: aligned_sum([(a, one)]), (one,), (one,))
+        jax.grad(lambda a: aligned_sum([(a, one)]))(one)
+
+
+@pytest.mark.parametrize("axis", [2, -3, (0, 0), (1, -1), 2 ** 31, (0, 2 ** 31)],
+                         ids=["past the rank", "before it", "repeated", "repeated by its sign",
+                              "past a C int", "one of them past a C int"])
+def test_an_aligned_sum_refuses_an_axis_its_term_has_not(axis):
+    """`aligned_sum([(x,)], axis)` of a `[2, 3]` term over an axis past its rank or repeated: a ValueError, as
+    `jnp.sum`'s, where the axis wrapped by the rank reduced another (row 8837), and one past a C int's range,
+    where numpy's conversion of it raised an OverflowError (row 9086)."""
+    with pytest.raises(ValueError):
+        aligned_sum([(jnp.ones((2, 3), jnp.float32),)], axis=axis)
 
 
 def test_an_aligned_sum_over_an_empty_axis_is_positive_zero():
@@ -1733,15 +1798,179 @@ def test_an_exact_product_at_a_dtypes_edge_keeps_its_residual(dtype, left, right
         product, residual = two_product(a, b, bit_split=True)
         exact = Fraction(float(a)) * Fraction(float(b))
         assert Fraction(float(product)) + Fraction(float(residual)) == exact
-def _edge_values(dtype) -> np.ndarray:
-    """A dtype's normal, subnormal and zero values of both signs: its least and largest normals, values
-    between, its least subnormal and subnormals of every leading bit's place."""
-    limits = np.finfo(dtype)
-    width = limits.nmant
-    subnormals = [float(limits.smallest_subnormal) * 2.0 ** i * (1 + (i % 3) / 4) for i in range(width)]
-    normals = [float(limits.tiny), 1.0, 1.5, 3.0 ** 5, float(limits.max), 2.0 ** -100, 2.0 ** 100 * 1.25]
-    values = np.asarray([0.0, *subnormals, *normals], np.float64).astype(dtype)
-    return np.concatenate([values, -values])
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
+                                   jnp.float8_e5m2, jnp.float6_e2m3fn, jnp.float6_e3m2fn, jnp.float4_e2m1fn])
+def test_an_exact_power_of_two_is_set_in_its_formats_exponent_bits(dtype):
+    """`dew.nn.float_bits.exact_power2` is `2^n` in its format, bit for bit, at every normal exponent from the
+    least to the largest, and +0 one below them (a zero a caller encodes so), compiled, a sub-byte format's
+    too (FP6, FP4: base review d47c0d69c F1); an exponent of a narrow integer type is its value, where an
+    unsigned 2-bit 1 read as the E3M2 sentinel -3's wrap and gave +0 (base review 1e030145c F1)."""
+    from dew.nn.float_bits import exact_power2
+
+    # Each exponent type's values: int32's every one here, int4's and an unsigned 2-bit's narrow.
+    held = {jnp.int32: (-(2 ** 31), 2 ** 31 - 1), jnp.int4: (-8, 7), jnp.uint2: (0, 3)}
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        limits = jnp.finfo(dtype)
+        exponents = np.arange(limits.minexp - 1, limits.maxexp)
+        taken = {exponent: (low <= exponents) & (exponents <= high) for exponent, (low, high) in held.items()}
+        found = {exponent: np.asarray(jax.jit(lambda n: exact_power2(n, dtype))(
+            jnp.asarray(exponents[within], exponent))) for exponent, within in taken.items()}
+    expected = np.asarray([0.0, *(2.0 ** int(n) for n in exponents[1:])], np.float64).astype(dtype)
+    # A sub-byte format's value is held in a byte (ml_dtypes'): its storage's bits.
+    stored = f"uint{8 * np.dtype(dtype).itemsize}"
+    for exponent, within in taken.items():
+        assert found[exponent].dtype == dtype, exponent
+        np.testing.assert_array_equal(found[exponent].view(stored), expected[within].view(stored),
+                                      err_msg=str(exponent))
+
+
+def test_an_exact_power_of_two_in_e8m0_is_every_biased_exponent():
+    """`exact_power2` in E8M0 (an MX block's scale) is `2^n` at every exponent from its least, `2^-127`, its
+    biased exponent 0 a power and no zero, to its largest, `2^127`, compiled, bit for bit the byte MXFP8's
+    encode wrote as `n + 127` (row 8832)."""
+    from dew.nn.float_bits import exact_power2
+
+    exponents = np.arange(-127, 128)
+    found = np.asarray(jax.jit(lambda n: exact_power2(n, jnp.float8_e8m0fnu))(
+        jnp.asarray(exponents, jnp.int32)))
+    assert found.dtype == jnp.float8_e8m0fnu
+    np.testing.assert_array_equal(found.view(np.uint8), (exponents + 127).astype(np.uint8))
+    np.testing.assert_array_equal(found.astype(np.float64), np.exp2(exponents.astype(np.float64)))
+
+
+def power2_rounds_a_subnormal_result_once():
+    """`dew.nn.precision.power2` by `2^o 2^(k-2o) 2^o` rounds a result below the least normal once, at its
+    last factor, on a device that keeps subnormals (a GPU's XLA, whose fp32 arithmetic keeps them where
+    XLA:CPU's flushes them): `(0.5 + 2^-24) 2^-149` is `2^-149`, where a whole factor first rounded the
+    partial product to `2^-127` and the remainder's then rounded its tie to zero (base review 54bb1f61a F2).
+    Its pullback applies the factors in reverse and rounds once too, a broadcast operand's cotangent summed
+    after each term is scaled: the cotangent `0.5 + 2^-24` to `1` by `2^-149` is `2^-149`, and to a scalar by
+    two such terms `2^-148`, where the remainder applied last rounded it to zero (base review 44e282c4f F1).
+    A GPU numerics cell (tests/test_gpu_numerics.py), one program prepared as an arm is in a GPU tier part
+    (`ahead_arm`, base review 85b5535a6 F4)."""
+    from reference_error import ahead_arm
+
+    from dew.nn.precision import power2
+
+    def scaled(x, one, cotangent, exponents):
+        pulled = [jax.vjp(lambda y, k=k: power2(y, k), one)[1](jnp.broadcast_to(cotangent, k.shape))[0]
+                  for k in (exponents[0], exponents)]
+        return power2(x, exponents[0]), *pulled
+
+    tiny = np.float32(0.5 + 2.0 ** -24)
+    found = ahead_arm(jax.jit(scaled), "a power of two's scaling and its pullback")(
+        tiny, np.float32(1.0), tiny, np.full((2,), -149, np.int32))
+    # Each one correctly rounded answer: the least subnormal's bits, twice it summed.
+    for value, bits in zip(found, (1, 1, 2), strict=True):
+        value = np.asarray(value)
+        assert value.dtype == np.float32 and value.view(np.uint32) == bits, value.view(np.uint32)
+
+
+def test_a_python_integer_exponent_past_float32_saturates():
+    """`dew.nn.precision.power2` holds a Python integer exponent within its reach before converting it:
+    `2^(±10^400)` of `1` is infinite and zero, where `10^400` raised in its host conversion to float32 (base
+    review 44e282c4f F2)."""
+    from dew.nn.precision import power2
+
+    found = [np.asarray(power2(np.float32(1.0), sign * 10 ** 400)) for sign in (1, -1)]
+    assert [value.dtype for value in found] == [np.float32] * 2
+    assert np.isposinf(found[0]) and found[1] == 0, found
+
+
+def test_an_exact_power_of_two_in_a_python_float_is_jaxs_float():
+    """`exact_power2` of a Python `float` destination is JAX's float (float32 where x64 is off), its layout
+    that dtype's: `2^0` is float32's 1.0, the sentinel below the normals (`2^-127`) its zero (base review
+    43f53b12f F1)."""
+    from dew.nn.float_bits import exact_power2
+
+    found = np.asarray(jax.jit(lambda n: exact_power2(n, float))(jnp.asarray([0, 3, -126, -127], jnp.int32)))
+    assert found.dtype == np.float32
+    np.testing.assert_array_equal(found, np.asarray([1.0, 8.0, 2.0 ** -126, 0.0], np.float32))
+
+
+def test_a_stated_reach_past_two_normal_halves_scales_a_large_operand_exactly():
+    """`dew.nn.precision.power2` at a reach past `TWO_FACTOR_REACH` (254, float32's twice its largest
+    exponent) takes `2^127` and `1.5 2^127` by `2^-253` to the normal `2^-126` and `1.5 2^-126` exactly,
+    compiled: two halves there hold a -127, no normal power, whose encoding is +0, and gave zero."""
+    from dew.nn.precision import power2
+
+    found = np.asarray(jax.jit(lambda x, k: power2(x, k, reach=2 * 127))(
+        jnp.asarray([2.0 ** 127, 1.5 * 2.0 ** 127, 2.0 ** 127], jnp.float32), jnp.asarray([-253, -253, 254])))
+    np.testing.assert_array_equal(found, np.asarray([2.0 ** -126, 1.5 * 2.0 ** -126, np.inf], np.float32))
+
+
+@pytest.mark.parametrize(("dtype", "reach", "exponent"), [
+    (jnp.float32, None, jnp.int32), (jnp.float32, TWO_FACTOR_REACH, jnp.int32),
+    (jnp.float32, None, jnp.int8), (jnp.float32, TWO_FACTOR_REACH, jnp.int8), (jnp.float32, None, jnp.uint8),
+    (jnp.float32, None, jnp.float32), (jnp.float64, None, jnp.int32), (jnp.bfloat16, None, jnp.int32),
+    (jnp.float8_e4m3fn, None, jnp.int32), (jnp.float8_e5m2, TWO_FACTOR_REACH, jnp.int32)])
+def test_a_power_of_two_scales_exactly_under_jit_at_every_exponent(dtype, reach, exponent):
+    """`dew.nn.precision.power2` (the one owner of scaling by a power of two: a kernel template's, a scaled
+    value's, an aligned sum's) scales by powers of two exactly wherever the operand and the result are
+    normal values of its format (`x`'s, at least float32), compiled (where XLA computes `exp2` as an inexact
+    `exp` and fuses a product of them into one `exp`, past the format), at every integral exponent its type
+    holds past the format's range both ways against exact rational scaling, equal parts by default and a
+    stated reach's two halves within it, operands at both ends of the normal range among them, an 8-bit
+    float's in float32 (`at_least_fp32`, which no implicit promotion reaches; base review a7c5428ef F1); zero
+    stays zero, and a result past the format is infinite."""
+    from dew.nn.precision import at_least_fp32, power2
+
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        wide = at_least_fp32(dtype)
+        limits = np.finfo(wide)
+        span = int(limits.maxexp - limits.minexp + limits.nmant) + 8 if reach is None else reach
+        held = np.iinfo(exponent) if jnp.issubdtype(exponent, jnp.integer) else np.finfo(exponent)
+        exponents = np.arange(max(-span, int(held.min)), min(span, int(held.max)) + 1)
+        operands = [0.0, 0.5, 0.75, 1.0, -0.6, 1.0 + 2.0 ** -7, float(jnp.finfo(dtype).tiny),
+                    -1.5 * 2.0 ** (jnp.finfo(dtype).maxexp - 2)]
+        found = np.asarray(jax.jit(lambda x, k: power2(x[:, None], k[None, :], reach))(
+            jnp.asarray(operands, dtype), jnp.asarray(exponents, exponent)))
+    assert found.dtype == wide
+    taken = np.asarray(np.asarray(operands, np.float64).astype(dtype), np.float64)
+    exact = [[Fraction(float(x)) * Fraction(2) ** int(k) for k in exponents] for x in taken]
+    normal = np.asarray([[value == 0 or limits.tiny <= abs(value) <= limits.max for value in row]
+                         for row in exact])
+    expected = np.asarray([[float(value) if normal[i, j] else 0.0 for j, value in enumerate(row)]
+                           for i, row in enumerate(exact)], wide)
+    np.testing.assert_array_equal(found[normal], expected[normal])
+    np.testing.assert_array_equal(found[0], 0.0)
+    past = np.asarray([[abs(value) > limits.max for value in row] for row in exact])
+    assert np.all(np.isinf(found[past]))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, jnp.bfloat16, jnp.float16, jnp.float8_e4m3fn,
+                                   jnp.float8_e5m2])
+def test_a_floats_raw_fields_are_its_bits(dtype):
+    """`raw_fields` of a format's edge values of both signs, compiled: its bits as the unsigned integer of its
+    width, its sign bit in place, its biased exponent and its fraction, each NumPy's reading of the same
+    bits, and the three fields recompose the bits."""
+    with jax.enable_x64(new_val=dtype == np.float64):
+        values = edge_values(dtype)
+        bits, sign, biased, fraction = (np.asarray(field)
+                                        for field in jax.jit(raw_fields)(jnp.asarray(values)))
+    limits = jnp.finfo(dtype)
+    word = np.dtype(f"uint{limits.bits}")
+    expected = values.view(word)
+    assert {field.dtype for field in (bits, sign, biased, fraction)} == {word}
+    np.testing.assert_array_equal(bits, expected)
+    np.testing.assert_array_equal(sign, expected & word.type(1 << (limits.bits - 1)))
+    # The exponent field's own width (`nexp`): E4M3's top binade holds finite values.
+    np.testing.assert_array_equal(biased, (expected >> limits.nmant) & word.type((1 << limits.nexp) - 1))
+    np.testing.assert_array_equal(sign | (biased << limits.nmant) | fraction, expected)
+
+
+def test_e8m0s_raw_fields_hold_no_sign():
+    """`raw_fields` of E8M0 (an MX block's scale, unsigned, no fraction): no sign bit, every bit its biased
+    exponent, where the sign's mask read its top exponent bit (base review ed11c8e4e F3)."""
+    codes = np.arange(255, dtype=np.uint8)
+    bits, sign, biased, fraction = (np.asarray(field) for field in jax.jit(raw_fields)(
+        jnp.asarray(codes.view(jnp.float8_e8m0fnu))))
+    np.testing.assert_array_equal(bits, codes)
+    np.testing.assert_array_equal(sign, 0)
+    np.testing.assert_array_equal(biased, codes)
+    np.testing.assert_array_equal(fraction, 0)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64], ids=["fp32", "float64"])
@@ -1750,7 +1979,7 @@ def test_a_floats_bits_read_as_its_exponent_and_significand(dtype):
     `floor(log2 |x|)` (numpy's `frexp`, less one) and its normalized fraction with the implicit bit the
     value's significand, the value exactly their product, a subnormal's read from its bits."""
     with jax.enable_x64(new_val=dtype == np.float64):
-        values = _edge_values(dtype)
+        values = edge_values(dtype)
         _, _, _, normalized, exponent = (np.asarray(part) for part in float_bits(jnp.asarray(values)))
     nonzero = values != 0
     expected = np.frexp(values.astype(np.float64))[1] - 1
@@ -1759,27 +1988,6 @@ def test_a_floats_bits_read_as_its_exponent_and_significand(dtype):
     significand = (normalized.astype(np.float64) + 2.0 ** nmant) / 2.0 ** nmant
     rebuilt = np.copysign(np.ldexp(significand, exponent.astype(np.int64)), values.astype(np.float64))
     np.testing.assert_array_equal(rebuilt[nonzero], values.astype(np.float64)[nonzero])
-
-
-def test_binade_of_reads_an_fp32s_exponent_minus_1024_at_zero():
-    """`binade_of` of fp32's normal, subnormal and zero values: numpy's `frexp` exponent less one, a
-    subnormal's by its leading bit, -1024 at zero, int32."""
-    values = _edge_values(np.float32)
-    found = np.asarray(binade_of(jnp.asarray(values)))
-    expected = np.where(values == 0, -1024, np.frexp(values.astype(np.float64))[1] - 1)
-    assert found.dtype == np.int32
-    np.testing.assert_array_equal(found, expected)
-
-
-def test_raised_exactly_raises_an_fp32_by_a_power_of_two_without_a_flush():
-    """`raised_exactly` of fp32's normal, subnormal and zero values by powers of two to its largest: each
-    `x 2^k` exactly (numpy's `ldexp` in float64, every one an fp32), a subnormal raised from its bits, where
-    a multiply XLA's CPU flushes read zero, zero kept zero."""
-    values = _edge_values(np.float32)
-    exponents = np.where(values == 0, -1024, np.frexp(values.astype(np.float64))[1] - 1)
-    raises = np.clip(127 - np.maximum(exponents, -149), 0, 60).astype(np.int32)
-    found = np.asarray(raised_exactly(jnp.asarray(values), jnp.asarray(raises)), np.float64)
-    np.testing.assert_array_equal(found, np.ldexp(values.astype(np.float64), raises))
 
 
 TWO_PI_SPLIT = (np.float32(6.2831855), np.float32(-1.7484555e-07))
@@ -1911,3 +2119,30 @@ def test_a_sum_of_products_rounded_once_keeps_its_residuals_apart_from_its_runni
 def test_a_compensated_primitive_under_jit_is_its_eager_arithmetic(shape):
     """`compensated_primitives_hold_under_jit` on the CPU (a GPU's in tests/test_gpu_numerics.py)."""
     compensated_primitives_hold_under_jit(shape)
+
+
+def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flushing_cpu():
+    """On XLA's CPU, whose fp32 multiply flushes a subnormal operand and result (row 4023):
+    `dew.nn.float_bits.raised_exactly` is `x * 2^k` and `lowered_rounded` `x * 2^-k` rounded once to nearest
+    even, bitwise numpy's IEEE `ldexp`, across every binade, subnormals both ways, at shifts 0 to 300, zero
+    kept zero; and `binade_of` is `floor(log2|x|)`, -1024 at zero, int32 (row 6302's finish,
+    `algebra.quotient`, and an initial state's gradient)."""
+    values = edge_values(np.float32)
+    shifts = np.asarray([0, 1, 2, 23, 24, 25, 63, 64, 126, 127, 149, 150, 151, 252, 300], np.int32)
+    on_cpu = jax.devices("cpu")[0]
+    x, k = (jax.device_put(each, on_cpu) for each in (values[:, None], shifts[None, :]))
+    lowered = np.asarray(jax.jit(lowered_rounded)(x, k))
+    rounded = np.ldexp(values[:, None], -shifts[None, :]).astype(np.float32)
+    np.testing.assert_array_equal(lowered.view(np.uint32), rounded.view(np.uint32))
+    raised = np.asarray(jax.jit(raised_exactly)(x, k))
+    assert raised.dtype == np.float32
+    exact = np.ldexp(values[:, None].astype(np.float64), shifts[None, :])
+    held = np.abs(exact) <= np.finfo(np.float32).max
+    expected = exact[held].astype(np.float32)
+    np.testing.assert_array_equal(raised[held].view(np.uint32), expected.view(np.uint32))
+    binades = np.asarray(jax.jit(binade_of)(jax.device_put(values, on_cpu)))
+    assert binades.dtype == np.int32
+    nonzero = values != 0
+    np.testing.assert_array_equal(binades[nonzero],
+                                  np.floor(np.log2(np.abs(values[nonzero].astype(np.float64)))).astype(np.int32))
+    np.testing.assert_array_equal(binades[~nonzero], -1024)

@@ -204,10 +204,46 @@ def _floor_gate_sites() -> dict[str, Site]:
     return {FLOOR_GATES: Site(hooks, gradient)}
 
 
+FAINT_CROSS = "kda/a faint cross term/gradient"
+"""Kimi delta attention's site of faint write gates beside large ones over one key (`_faint_cross_sites`)."""
+
+
+def _faint_cross_sites() -> dict[str, Site]:
+    """Kimi delta attention (test_recurrence_stability's 'vector delta') with every token's key and value the
+    unit `e0`, no decay, write gates alternating faint (2^-U(20, 40)) and large (U[1/2, 1]), the queries
+    `e0` but each faint token's zero, in 16 bits with their cotangents: each large token's own pair beside
+    the faint cross term the token before left, which its log decay's gradient takes once its own pair is
+    summed apart (row 7906; its cell compared one gradient bitwise outside the gate, row 8569)."""
+    import test_recurrence_chunk as chunked
+    import test_recurrence_stability as stability
+    import test_recurrence_template_stability as template_stability
+
+    hooks = stability.SITES['vector delta']
+
+    def gradient(seed):
+        operands, (out, final) = stability.cotangents(hooks, 'the decay bound', seed)
+        rng = np.random.default_rng([seed, 8569])
+        unit = np.zeros(operands.key.shape)
+        unit[..., 0] = 1.0
+        faint = np.arange(operands.beta.shape[1])[None, :, None] % 2 == 0
+        beta = np.where(faint, 2.0 ** -rng.uniform(20.0, 40.0, operands.beta.shape),
+                        rng.uniform(0.5, 1.0, operands.beta.shape))
+        query = np.where(faint[..., None], 0.0, unit)
+        value = np.zeros(operands.value.shape)
+        value[..., 0] = 1.0
+        operands = dataclasses.replace(
+            operands, query=chunked.hosted(query), key=chunked.hosted(unit), value=chunked.hosted(value),
+            log_decay=chunked.hosted(np.zeros(operands.log_decay.shape)), beta=chunked.hosted(beta))
+        return template_stability.bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
+
+    return {FAINT_CROSS: Site(hooks, gradient)}
+
+
 @functools.cache
 def sites() -> dict[str, Site]:
     """Every recorded site by name."""
-    return {**_mosaic_sites(), **_stability_sites(), **_rwkv6_sites(), **_floor_gate_sites()}
+    return {**_mosaic_sites(), **_stability_sites(), **_rwkv6_sites(), **_floor_gate_sites(),
+            **_faint_cross_sites()}
 
 
 def the_template_is_as_exact_as_fla(rule: Callable[[Chunk], tuple], site: str,

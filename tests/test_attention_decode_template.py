@@ -23,6 +23,7 @@ from dew.nn.kernels.templates import (
     attention_decode,
     attention_mosaic,
     bundles,
+    cost,
     report,
 )
 
@@ -74,6 +75,61 @@ def _operands(query_shape: tuple[int, ...], keys: int):
         return query, key, value
 
     return draw
+
+
+@INTERPRETS
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_decode_steps_rows_whose_sums_pass_fp32s_largest_walk_again_scaled_interpreted(device):
+    """A bf16 decode step (`attention_decode.attend`) whose first row's values are positive and near 2^124, so
+    its walk's unscaled sums over its 200 keys pass fp32's largest, each value within bf16's, beside a row of
+    ordinary values, interpreted as an H100 or an A100 runs it: on par with the reference path at a scale its
+    sums hold (check 1), the first row's programs walking their keys again scaled in their launch
+    (`after_walk.Decided`) and the second's not, with no pass over the values before the launch to choose its
+    walk."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    drawn = _drawn(positions, heads, kv_heads, jnp.bfloat16)
+
+    def draw(seed: int):
+        query, key, value, _ = drawn(seed)
+        return query, key, value.at[0].set(jnp.abs(value[0]) * jnp.bfloat16(2.0 ** 124))
+
+    def ours(query, key, value):
+        with generation.assumed(device):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    def reference(query, key, value):
+        # The reference path's first row's sums pass fp32's largest too: that row run at its values' scale
+        # (2^-124 each, exact) and its output taken back by it, the same path at a scale its sums hold.
+        scaled = value.at[0].multiply(jnp.asarray(2.0 ** -124, value.dtype))
+        out = template.reference(query, key, scaled, spans)
+        return out.at[0].multiply(jnp.asarray(2.0 ** 124, out.dtype))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template decode {device} past fp32's largest",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_decode_step_over_a_value_it_reads_not_a_number_is_the_references_interpreted(device):
+    """A bf16 decode step whose first row reads a value of NaN at one key: its rows' sums are no number, so
+    its programs walk their keys again scaled, and the step's output is NaN where the reference path's is,
+    never made finite; the second row, its values ordinary, bit for bit its own without the NaN beside it."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    poisoned = value.at[0, 5, 0, 3].set(jnp.nan)
+    ours = np.asarray(_assumed_attend(device, query, key, poisoned, spans), np.float32)
+    theirs = np.asarray(template.reference(query, key, poisoned, spans), np.float32)
+    np.testing.assert_array_equal(np.isnan(ours), np.isnan(theirs))
+    assert np.isnan(theirs[0]).any() and not np.isnan(theirs[1]).any()
+    alone = np.asarray(_assumed_attend(device, query, key, value, spans), np.float32)
+    np.testing.assert_array_equal(ours[1].view(np.uint32), alone[1].view(np.uint32))
+
+
+def _assumed_attend(device: str, query, key, value, spans):
+    with generation.assumed(device):
+        return attention_decode.attend(query, key, value, spans, interpret=True)
 
 
 @INTERPRETS
@@ -860,3 +916,62 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
             with tuning.pinned({attention_mosaic.MosaicForward: again.config}):
                 chosen = op.taken(launch)
     assert chosen != refused
+
+
+@COMPILES_ON_CPU
+def test_a_decode_steps_price_reads_its_keys_and_a_paged_pool_walks_no_fewer_steps():
+    """A decode step's price (`attention_decode.priced_step`: its launches' work as their emission counts it,
+    `cost.seconds` its seconds) for one row of 8 query heads over 2 key heads 128 wide in bf16 on an H100:
+    twice the keys read more device bytes, walk at least as many steps and take longer, and the same keys
+    from a paged pool of 64-key pages walk no fewer steps than from a dense cache, every step's tile within a
+    page (row 7420: a server's choice between the two reads what each costs)."""
+    def priced(keys, page_size=None):
+        return attention_decode.priced_step(generation.gpu_target("sm90"), rows=1, queries=1, keys=keys,
+                                            heads=8, kv_heads=2, width=128, dtype=jnp.bfloat16,
+                                            page_size=page_size)
+
+    dense, longer, paged = priced(4096), priced(8192), priced(4096, page_size=64)
+    assert dense is not None and longer is not None and paged is not None
+    assert dense.kernels >= 1 and dense.device_bytes > 0
+    assert longer.device_bytes > dense.device_bytes and longer.span >= dense.span
+    assert paged.span >= dense.span
+    # Its seconds on the device (`cost.seconds`), the server's comparison, grow with the keys it reads.
+    target = generation.gpu_target("sm90")
+    assert cost.seconds(longer, target) > cost.seconds(dense, target) > 0
+
+
+def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
+    """A decode step of 256 rows of one query, 8 heads over 2 key heads 128 wide in bf16, on an H100 over
+    4096 keys (`attention_decode.priced_step`): its programs, 512, pass the multiprocessors' count, so no
+    split merge's reads hide its walk's, which price at least its keys and values read once, where its
+    launch, packed into spans of every key, stated none and the step's price was Work() (the base review of
+    56a716c95, F3)."""
+    rows, keys, kv_heads, width = 256, 4096, 2, 128
+    priced = attention_decode.priced_step(generation.gpu_target("sm90"), rows=rows, queries=1, keys=keys,
+                                          heads=8, kv_heads=kv_heads, width=width, dtype=jnp.bfloat16)
+    assert priced is not None
+    assert priced.device_bytes >= 2 * rows * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [128, 256])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
+def test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides(generation_name, width):
+    """A bf16 inference forward compiled for a compile-only A100, H100, B200 and RTX PRO 6000
+    (`kernel_compile.compile_mosaic_kernels`): every kernel spills nothing, whether its launch decides its
+    scaled walk itself (`MosaicForward.decided`: the scaled walk's registers held at the unscaled walk's
+    config, priced at them) or takes the fallback, the scaled op its own launch (row 5274)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    query = jax.ShapeDtypeStruct((1, 256, 8, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 2048, 2, width), jnp.bfloat16)
+    spans = template.spans(256, 2048, 1, causal=False)
+
+    def forward(q, k, v):
+        return attention_mosaic.forward(q, k, v, spans, natural=False)
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels([KernelCase("inference", lambda: (forward, (query, key, key)))],
+                                       generation_name)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)

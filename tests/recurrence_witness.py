@@ -83,7 +83,7 @@ PAIR_FRACTION = 2.0 ** -21
 distance from its floor rounds), their difference and its sum with the low halves', each under 2."""
 ZERO_WHOLE = -127
 """A pair whose integers differ by this or less weighs zero (`algebra.between`'s exact power of two at its
-zero exponent bits, `attention_algebra.exact_power2`)."""
+zero exponent bits, `float_bits.exact_power2`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -128,7 +128,7 @@ class Exponents:
 def raised_exponent(exponents: Iv, lane: Lane) -> Iv:
     """`exp2` of a base-2 exponent within `exponents` as `algebra.raised` forms it: its fraction's exp2 at the
     lane's reach (`exp2`, the fraction an fp32 under 2) scaled by its integer part's power of two
-    (`attention_algebra.power2`), whose last product rounds once to nearest on fp32's grid, below its normal
+    (`precision.power2`), whose last product rounds once to nearest on fp32's grid, below its normal
     range among its subnormals unless the lane flushes them (`fp32`); each end at its own floor (`exp2(x)` is
     monotone in `x`). Taken as one fp32 operand of exp2, an exponent near -40 sat on a grid 2^-18 apart, past
     the fraction's own: legal decays the algebra forms between its points lay outside (778 of 1024 at decays
@@ -181,13 +181,15 @@ def solved(system: Iv, lane: Lane) -> Iv:
     first = (rows % 2 == 1) & (cols == rows - 1)
     current = Iv(identity + np.where(first, lower_a.lo, 0.0), identity + np.where(first, lower_a.hi, 0.0))
 
-    # A 16-bit call's merges in fp16; an fp32 call's as it holds its values (`mainloop._merged`).
+    # Each call's doubling merges as `mainloop._merged`: fp16 where `lane.merged` is zero, else fp32 parts.
+    merge_lane = dataclasses.replace(lane, held=lane.merged, wide=True) if lane.merged else None
+
     def merge(x: Iv) -> Iv:
-        return staged(x, lane) if lane.wide else cast(x, FLOAT16)
+        return staged(x, merge_lane) if merge_lane is not None else cast(x, FLOAT16)
 
     def merged(x: Iv, y: Iv) -> Iv:
-        if lane.wide:
-            return dot(x, y, lane, parts=(lane.held, lane.held))
+        if merge_lane is not None:
+            return dot(x, y, merge_lane, parts=(lane.merged, lane.merged))
         return dot(x, y, lane, FLOAT16)
 
     width = 2
@@ -555,6 +557,8 @@ class Run:
     """Whether it is the fused inference walk's (`walk_enclosures`), its records `WALKED`'s."""
     pairing: int
     """The parts a factored pair's fp32 operand takes (`Lane.pairing`, `intra.pairing_parts`)."""
+    merged: int
+    """The parts the doubling's merges take in fp32 (`Lane.merged`, `mainloop._merged`): zero for fp16."""
     tf32: Literal["plain", "rna", "read"]
     """How a one-part fp32 operand reaches its product (`Lane.tf32`): its family's issuer's, or plain where
     the launches were interpreted."""
@@ -704,6 +708,16 @@ def laid_chunks(length: int, starts, max_segments: int | None, chunk: int) -> np
     return np.stack([chunks.start[kept], chunks.taken[kept]], axis=1)
 
 
+def _merged_parts(family, dtype, held: int, wide: bool) -> int:
+    """The doubling's merge parts (`Lane.merged`, `mainloop._merged`): `held` for fp32, `_fast_parts` for
+    bf16, and zero (fp16) for fp16."""
+    import jax.numpy as jnp
+
+    if wide:
+        return held
+    return mainloop._fast_parts(family) if dtype == np.dtype(jnp.bfloat16) else 0
+
+
 def call_form(family, *, wide: bool, delta: bool, rounded: bool) -> tuple[int, int, str]:
     """The parts a call's operands and passed values take (`chunk_forward.prepared`'s `given` and `held`):
     one of a 16-bit value; an fp32 one's three, or under the fast forms its `family`'s
@@ -839,7 +853,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide), walked=walked,
-               pairing=intra.pairing_parts(family, held),
+               pairing=intra.pairing_parts(family, held), merged=_merged_parts(family, dtype, held, wide),
                tf32=tf32_conversion(family), trained=bool(trained),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
@@ -900,7 +914,7 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
     enclose = functools.partial(walk_enclosures, write=run.write) if run.walked else writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               tf32=run.tf32)
+                               merged=run.merged, tf32=run.tf32)
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
@@ -1314,9 +1328,9 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
     valued = staged(fp32(mul(v, point(beta)), lane), lane)
     d_x = dot(point(step.dv), tr(valued), lane, parts=(held, held),
               into=dot(point(step.dw), tr(keyed), lane, parts=(held, held)))
-    d_x = where(lag > 0, d_x, zeros)
-    d_x = fp32(add(d_x, dot(staged(d_x, lane), lower_t, lane, parts=(held, held))), lane)
-    d_x = fp32(add(d_x, dot(lower_t, staged(d_x, lane), lane, parts=(held, held))), lane)
+    d_x = staged(where(lag > 0, d_x, zeros), lane)
+    d_x = staged(fp32(add(d_x, dot(d_x, lower_t, lane, parts=(held, held))), lane), lane)
+    d_x = fp32(add(d_x, dot(lower_t, d_x, lane, parts=(held, held))), lane)
     d_l = staged(where(lag > 0, neg(fp32(mul(d_x, pairs), lane)), zeros), lane)
     du_held = point(step.dv)
     values = fp32(add(du_held, dot(lower_t, staged(du_held, lane), lane, parts=(held, held))), lane)
@@ -1463,7 +1477,7 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     it (the initial memory's, `dh0`, for the first)."""
     run = back.run
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               tf32=run.tf32)
+                               merged=run.merged, tf32=run.tf32)
 
     def stored(iv: Iv, dtype) -> Iv:
         """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where
@@ -1669,9 +1683,9 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
     spread = bound[-1][None, :] + bound + 2.0 ** -46 * (np.abs(exact[-1])[None, :] + np.abs(exact)) + FRACTION
     to_last = exp2(outward(exact[-1][None, :] - exact - spread, exact[-1][None, :] - exact + spread), lane)
     d_key = fp32(mul(dot(point(step.c), tr(point(step.dh)), lane), to_last), lane)
-    d_weight = dot(point(step.dv), tr(point(step.h)), lane)
+    d_weight = staged(dot(point(step.dv), tr(point(step.h)), lane), lane)
     lower_t = tr(point(step.a))
-    d_gated = neg(fp32(add(d_weight, dot(lower_t, staged(d_weight, lane), lane)), lane))
+    d_gated = neg(fp32(add(d_weight, dot(lower_t, d_weight, lane)), lane))
     dk_memory = fp32(add(d_key, fp32(mul(fp32(mul(d_gated, raised), lane), point(beta)), lane)), lane)
     du = point(step.dv)
     values = fp32(mul(fp32(add(du, dot(lower_t, du, lane)), lane), point(beta)), lane)

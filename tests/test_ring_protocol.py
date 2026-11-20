@@ -12,6 +12,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 import ring_protocol
 from ring_protocol import Event, Violation, explore, programs
@@ -600,3 +601,34 @@ def test_a_gathered_load_warp_skipping_its_slots_release_wait_is_caught():
     assert len(mutated[loaders[1]]) < len(program)
     with pytest.raises(Violation):
         explore(mutated, arrivals)
+
+
+def test_a_gathered_index_ends_a_locations_known_prefix():
+    """The checker's locator (`ring_protocol._located`) over a ref's indexer as a kernel's trace states it,
+    a buffer laid `[role, slot, column]`: a role's slot, `[0, 1]`, located at both indices, its columns
+    whole; the role's slots gathered by an array of indices, `[0, [0, 2]]`, at the role alone, the prefix it
+    knows (the base review of 56a716c95, F6: a gathered index of several entries raised)."""
+    from jax._src.state.indexing import NDIndexer
+
+    ref, shape = ring_protocol.Ref("ring", barrier=False, num_arrivals=0), (2, 4, 8)
+    assert ring_protocol._located(ref, [NDIndexer.from_indices_shape((0, 1), shape)]) == ("ring", 0, 1)
+    gathered = NDIndexer.from_indices_shape((0, np.asarray([0, 2], np.int32)), shape)
+    assert ring_protocol._located(ref, [gathered]) == ("ring", 0)
+
+
+@pytest.mark.parametrize("waits", [True, False], ids=["ordered", "unordered"])
+def test_a_slot_under_a_roles_index_is_ordered_against_a_read_of_the_roles_whole(waits):
+    """A write of a role's ring's slot (`[0, 1]` of a buffer laid `[role, slot]`) and a read of the role's
+    every slot (`[0]`): one location under the other (`_located`'s leading indices, `_overlaps`), so the
+    read is ordered after the write by the barrier its thread waits on, and caught where it waits on none.
+    The role's other slot (`[0, 0]`) is a location apart from the write's, read unordered with it."""
+    writer = [Event("write", ("ring", 0, 1)), Event("arrive", ("filled", 1))]
+    apart = [Event("read", ("ring", 0, 0))]
+    reader = [Event("wait", ("filled", 1), 0)] if waits else []
+    reader.append(Event("read", ("ring", 0)))
+    if waits:
+        assert explore([writer, apart, reader], {"filled": 1}) > 0
+    else:
+        with pytest.raises(Violation) as found:
+            explore([writer, apart, [*reader, Event("wait", ("filled", 1), 0)]], {"filled": 1})
+        assert found.value.kind == "unordered"

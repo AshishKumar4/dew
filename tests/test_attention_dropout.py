@@ -414,19 +414,29 @@ def test_a_near_total_fp16_draw_keeps_its_one_kept_weight_finite_on_every_path(f
 
 def test_the_mosaic_dropping_walk_refuses_fp16_weights_past_fp16s_largest():
     """At the fp16 witness's rate, 1 - 2^-16, a kept weight's multiplier, 2^16, passes fp16's largest, which
-    the Mosaic dropping walk's sums in place take no scaled part of (`algebra.dropped_parts`): its legality
-    rule refuses an fp16 call there, forward and backward, and takes a bf16 one and an fp16 one at an
-    ordinary rate (the plain-JAX mainloop takes the witness, above)."""
+    the Mosaic dropping backward's dV sums in place take no scaled part of (`attention.drops_in_place`): its
+    legality rule refuses an fp16 call there, forward and backward, and takes a bf16 one and an fp16 one at an
+    ordinary rate (the plain-JAX mainloop takes the witness, above); it refuses an fp16 call from a state
+    whose multiplier is no power of two and takes a bf16 one and an fp16 one at a rate of 1/2."""
     near_total = hooked(seed_words(0), ROWS, HEADS, 1.0 - 2.0 ** -16)
 
     def refusal(dtype, hooks, backward):
         return attention_mosaic.refused(dtype, WIDTH, WIDTH, hooks, backward=backward,
                                         family=mosaic_sm90.WGMMA)
 
+    # A state beside an fp16 walk, which has no headroom, holds the multiplier itself (`sums_units`), each
+    # tile's products taken down to it, which sums accumulated in place do not take.
+    state = template.Initial(jnp.zeros((ROWS, HEADS, 1)), jnp.ones((ROWS, HEADS, 1)),
+                             jnp.zeros((ROWS, HEADS, 1, WIDTH)))
+    resumed = dataclasses.replace(hooked(seed_words(0), ROWS, HEADS), initial=state)
+    halved = dataclasses.replace(hooked(seed_words(0), ROWS, HEADS, 0.5), initial=state)
     for backward in (False, True):
         assert refusal(jnp.float16, near_total, backward).code == "dropout_rate"
         assert refusal(jnp.bfloat16, near_total, backward) is None
         assert refusal(jnp.float16, hooked(seed_words(0), ROWS, HEADS), backward) is None
+        assert refusal(jnp.float16, resumed, backward).code == "dropout_rate"
+        assert refusal(jnp.bfloat16, resumed, backward) is None
+        assert refusal(jnp.float16, halved, backward) is None
 
 
 def identical_keys(seed: int, queries: int, keys: int, dtype):
@@ -521,7 +531,7 @@ def test_the_mosaic_walk_drops_a_slice_at_its_global_places(training, sliced):
     at a rate of 1/2, its launches' tiles past the call's eight queries reading padded places. Its logits all
     zero and its values the identity, each output entry is its query's and key's multiplier over the keys'
     count, 2 / 32 kept and 0 dropped, exact in bf16; under training the first key is each row's anchor,
-    whose multiplier the walk takes after it (`algebra.anchor_multipliers`), and the backward under a
+    whose multiplier the walk takes after it (`attention.anchor_multipliers`), and the backward under a
     cotangent of the identity gives each value's gradient the same entries transposed (the dK/dV launch's
     own draw)."""
     queries, keys, rate = 8, WIDTH, 0.5
@@ -547,6 +557,63 @@ def test_the_mosaic_walk_drops_a_slice_at_its_global_places(training, sliced):
     if grads is not None:
         value_grads = np.asarray(grads.value, np.float32)[..., :queries]
         np.testing.assert_array_equal(value_grads.transpose(0, 2, 3, 1), expected)
+
+
+def _mosaic_gradients(spans, hooks):
+    """A training Mosaic call's gradients interpreted for an H100 (`attention_mosaic.backward` from its
+    split forward's residuals, `D` from them, `attention_gradient.split_delta`) and the reference's
+    (`template.reference` under `jax.vjp`), of `(query, key, value, dout)` at scale 1, for check 1."""
+    def ours(query, key, value, dout):
+        with generation.assumed("sm90", interpreted=True):
+            _, *residuals = attention_mosaic.forward(query, key, value, spans, hooks, scale=1.0,
+                                                     residuals=template.Kept.SPLIT, interpret=True)
+            grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                              scale=1.0, interpret=True)
+        return grads.query, grads.key, grads.value
+
+    def reference(query, key, value, dout):
+        _, pull = jax.vjp(lambda *qkv: template.reference(*qkv, spans, hooks, scale=1.0), query, key, value)
+        return pull(dout)
+
+    return ours, reference
+
+
+def test_a_mosaic_dropping_backwards_tiny_split_mean_keeps_its_query_gradient():
+    """A bf16 Mosaic call interpreted for an H100, with logits 0 and -22, values 0 and 2^-126, dO 2^73,
+    and dropout at rate 1 - 2^-53 keeping only the second key. Its split mean is below fp32's least
+    subnormal once the power of 2^53 comes out, so D contracts it with dO in the power its sums hold
+    (`attention_gradient.split_delta`): dQ's second coordinate is about -2.79e-10, where it was 0
+    (the base review of eb3ab2670, F1). The -22 logit is a sum of powers of two so the gradients'
+    products do not add a second rounding to the fast form's bf16 score cotangents."""
+    rate = 1.0 - 2.0 ** -53
+    words = jnp.asarray([3181759654, 0], jnp.uint32)
+    hooks, spans = hooked(words, 1, 1, rate), template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(1).at[..., 2:4].set(1)
+    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 1].set(1).at[0, 1, 0, 0].set(-16)
+    key = key.at[0, 1, 0, 2].set(-4).at[0, 1, 0, 3].set(-2)
+    value = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 1, 0, 0].set(2.0 ** -126)
+    dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(2.0 ** 73)
+    ours, reference = _mosaic_gradients(spans, hooks)
+    assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
+                    "a dropping split mean below fp32's least subnormal", seeds=FEWEST_SEEDS)
+
+
+def test_a_mosaic_dropping_backwards_kept_anchor_keeps_its_tiny_product():
+    """A bf16 Mosaic call interpreted for an H100 at logits -0.5 and 0, dropout at rate 1 - 2^-53 keeping
+    only the anchor, whose value is 2^-126 under a dO of 2^-40. Its product 2^-166 needs the power of 2^53
+    before the contraction (`attention_gradient.split_delta`), or dQ's second coordinate is -6.86e-36
+    instead of +1.13e-35 (the base review of 6a57b66de, F1). In the score cotangents the anchor's
+    self-difference is exactly zero even though the tile's unscaled product rounds to zero, or the
+    anchor's key gradient has the wrong sign. Both gradients are on par with the reference (check 1)."""
+    words = jnp.asarray([3181759654, 0], jnp.uint32)
+    hooks, spans = hooked(words, 1, 1, 1.0 - 2.0 ** -53), template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 1].set(1)
+    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 1].set(-0.5)
+    value = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 1, 0, 0].set(2.0 ** -126)
+    dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(2.0 ** -40)
+    ours, reference = _mosaic_gradients(spans, hooks)
+    assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
+                    "a dropping kept anchor's tiny product", seeds=FEWEST_SEEDS)
 
 
 def three_identical_keys():
@@ -635,6 +702,161 @@ def test_a_resumed_state_of_a_large_denominator_keeps_a_finite_dropping_backward
     np.testing.assert_array_equal(np.asarray(grads.query), 0)
     np.testing.assert_array_equal(np.asarray(grads.key), 0)
     assert bool(np.all(np.isfinite(np.asarray(grads.value))))
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+@pytest.mark.parametrize(("rate", "logit", "seed"),
+                         [(1.0 - 2.0 ** -14, -18.0, None), (127 / 256, -17.34375, None),
+                          (2 / 3, -18.25, None), (1.0 - 2.0 ** -17, -28.0, 355564)],
+                         ids=["near-total", "below-two", "below-four", "past-fp16s-binade"])
+def test_an_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(rate, logit, seed, training):
+    """Two keys at logits 0 and `logit`, the first dropped and the second kept, values 0 and 2^15, in fp16:
+    the kept weight is below fp16's least subnormal (or rounds to 0 at it) where its weight times the draw's
+    multiplier z does not, so the output is z e^logit 2^15 / (1 + e^logit), as the reference's narrowed
+    coefficient gives it, on par with the reference (check 1) on the inference walk and the training walk
+    alike. Narrowed without z, e^-18 at z = 2^14 flushed to 0 (the base review of 56a716c95, F1); taken by
+    the power of two below z, e^-17.34 at z = 256/129 and e^-18.25 at z = 3 did too (the base reviews of
+    4e2eb287e and b872d1849, F1), and e^-28 at z = 2^17 taken by fp16's 2^15 alone (of a648b3279, F3). A
+    rate whose kept key no first `2^16` draws keep takes its `seed`."""
+    words = (first_seed(rate, 2, lambda kept: not bool(kept[0]) and bool(kept[1])) if seed is None
+             else jnp.asarray([seed, 0], jnp.uint32))
+    query = jnp.zeros((1, 1, 1, 8), jnp.float16).at[..., 0].set(1)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(logit)
+    value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(2.0 ** 15)
+    spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
+
+    def walked(query, key, value):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks, scale=1.0, residuals=training)
+        return out[0] if training else out
+
+    assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
+                                                                         scale=1.0),
+                    lambda seed: (query, key, value), "a small kept fp16 weight", seeds=FEWEST_SEEDS)
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16], ids=["fp32", "fp16"])
+@pytest.mark.parametrize("bits", [32, 48, 53])
+def test_a_resumed_states_small_sums_are_kept_under_a_near_total_draw(bits, dtype, training):
+    """An fp32 state of maximum 0, denominator 1 and sums 2^-120 resumed over one key of logit 0 and value 0
+    of `dtype` at a rate of `1 - 2^-bits`, under an output hook taking it by 2^125, whatever the draw: the
+    output is the state's sums over the joint denominator 2 by it, exactly 16, where the state's sums taken
+    down into the walk's flushed to 0: by the whole multiplier at 2^-32 (the base review of 56a716c95, F2),
+    by its rest past a power capped at 2^32 at 2^-53 and past fp16's 2^15 at 2^-48 (of 4e2eb287e and
+    b872d1849, F2)."""
+    rate = 1.0 - 2.0 ** -bits
+    query, key, value = (jnp.zeros((1, 1, 1, 8), dtype) for _ in range(3))
+    state = template.Initial(jnp.zeros((1, 1, 1)), jnp.ones((1, 1, 1)), jnp.full((1, 1, 1, 8), 2.0 ** -120))
+    hooks = template.Hooks(initial=state, output_mod=lambda out: out * 2.0 ** 125,
+                           drop=dropout_of(seed_words(0), 1, 1, rate))
+    walked = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value,
+                                             template.spans(1, 1, 1), hooks, residuals=training)
+    out = walked[0] if training else walked
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full(out.shape, 16.0, np.float32))
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+def test_a_kept_fp32_key_near_fp32s_largest_keeps_its_finite_output(training):
+    """One fp32 query over one kept key of value 2^127 at a rate of 1/4: the output is 2^127 4/3, finite,
+    on par with the reference (check 1), where the quotient taken before the multiplier's rest was 2^128
+    (the base review of a648b3279, F1)."""
+    words = first_seed(0.25, 1, lambda kept: bool(kept[0]))
+    query, key = (jnp.zeros((1, 1, 1, 8), jnp.float32) for _ in range(2))
+    value = jnp.full((1, 1, 1, 8), 2.0 ** 127, jnp.float32)
+    spans, hooks = template.spans(1, 1, 1), hooked(words, 1, 1, 0.25)
+
+    def walked(query, key, value):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks, residuals=training)
+        return out[0] if training else out
+
+    assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks),
+                    lambda seed: (query, key, value), "a kept key near fp32's largest", seeds=FEWEST_SEEDS)
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+def test_a_large_state_beside_an_fp16_walk_keeps_its_finite_output(training):
+    """An fp32 state of maximum 0, denominator 2^120 and sums 3 2^126 resumed over one fp16 key of logit 0
+    and value 0 at a rate of 1/4, whatever the draw: the output is the state's sums over the joint
+    denominator, 192, where the state's sums taken up into the walk's units by 1.5 overflowed (the base
+    review of a648b3279, F2)."""
+    query, key, value = (jnp.zeros((1, 1, 1, 8), jnp.float16) for _ in range(3))
+    state = template.Initial(jnp.zeros((1, 1, 1)), jnp.full((1, 1, 1), 2.0 ** 120),
+                             jnp.full((1, 1, 1, 8), 3 * 2.0 ** 126))
+    hooks = template.Hooks(initial=state, drop=dropout_of(seed_words(0), 1, 1, 0.25))
+    walked = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value,
+                                             template.spans(1, 1, 1), hooks, residuals=training)
+    out = walked[0] if training else walked
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full(out.shape, 192.0, np.float32))
+
+
+def _portable_gradients(spans, hooks, scale: float = 1.0):
+    """The portable backward's gradients of a call (`attention_portable.backward`) and the reference's
+    (`template.reference` under `jax.vjp`), of `(query, key, value, dout)`, for check 1."""
+    def ours(query, key, value, dout):
+        tiles = attention_portable.Tiles(8, 8, attention_triton.BLOCK)
+        grads = attention_portable.backward(tiles, query, key, value, spans, hooks, dout, scale=scale)
+        return grads.query, grads.key, grads.value
+
+    def reference(query, key, value, dout):
+        _, pull = jax.vjp(lambda *qkv: template.reference(*qkv, spans, hooks, scale=scale), query, key, value)
+        return pull(dout)
+
+    return ours, reference
+
+
+def test_a_dropping_backward_of_opposite_products_near_fp32s_largest_is_finite():
+    """One fp32 query over two kept keys at logits 0 and -1.25, rate 1/2, their dropped products 5 2^125 and
+    -5 2^125: each centred about the other passes fp32's largest, where dQ is about 9.2e37. Held at a quarter
+    and taken back after their weight (`attention_backward_algebra.softmax_cotangents`), the gradients are on
+    par with the reference's (check 1), where they were not finite (the base review of e2b671ce9, F1)."""
+    words = first_seed(0.5, 2, lambda kept: bool(kept[0]) and bool(kept[1]))
+    query = jnp.zeros((1, 1, 1, 8), jnp.float32).at[..., 0].set(1)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float32).at[0, 1, 0, 0].set(-1.25)
+    value = jnp.zeros((1, 2, 1, 8), jnp.float32).at[0, 0, 0, 1].set(5 * 2.0 ** 124).at[0, 1, 0, 1].set(
+        -5 * 2.0 ** 124)
+    dout = jnp.zeros((1, 1, 1, 8), jnp.float32).at[..., 1].set(1)
+    ours, reference = _portable_gradients(template.spans(1, 2, 1), hooked(words, 1, 1, 0.5))
+    assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
+                    "dropped products about one another near fp32's largest", seeds=FEWEST_SEEDS)
+
+
+def test_a_dropping_backwards_split_mean_past_fp32s_largest_before_its_power_is_finite():
+    """A bf16 row of four keys at equal logits, rate 1/4, three kept, values 3 2^126, dO 2^-125: the forward's
+    split sums at the multiplier's reach of 2, over their total of 4, pass fp32's largest before the reach
+    comes out, where D is 6. Taken out in one division with the total (`attention_gradient.split_delta`),
+    the gradients of a Mosaic call interpreted for an H100, whose backward takes D from them, are on par
+    with the reference's (check 1), where D was not finite (the base review of e2b671ce9, F2; the portable
+    backward takes its own pass, of 6a57b66de, F2)."""
+    words = first_seed(0.25, 4, lambda kept: int(np.sum(kept)) == 3)
+    query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 1].set(1)
+    key = jnp.zeros((1, 4, 1, WIDTH), jnp.bfloat16)
+    value = jnp.zeros((1, 4, 1, WIDTH), jnp.bfloat16).at[:, :, :, 0].set(3 * 2.0 ** 126)
+    dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(2.0 ** -125)
+    ours, reference = _mosaic_gradients(template.spans(1, 4, 1), hooked(words, 1, 1, 0.25))
+    assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
+                    "a dropping split mean past fp32's largest", seeds=FEWEST_SEEDS)
+
+
+def test_a_dropping_backward_centres_its_d_at_the_rows_heaviest_key():
+    """One fp32 query e0 over 16 keys in tiles of 8 at scale 1: key 0 at logit -64 with value 2^64 e0, key 1
+    at -65, key 8 at 0 with value e0, the rest at -128 and value 0, dO e0, at a rate of 1/4 keeping keys 0
+    and 8. Key 8 holds the row's weight, so D is about its product, 4/3: centred at the first tile's
+    heaviest product, 2.46e19, D cancelled to 0 and the query's gradient was about 4/3 where it is -3.94e-9
+    (the base review of 4e2eb287e, F4). The portable backward's dQ on par with the reference's (check 1)."""
+    rate = 0.25
+    words = first_seed(rate, 16, lambda kept: bool(kept[0]) and bool(kept[8]))
+    query = jnp.zeros((1, 1, 1, 8), jnp.float32).at[..., 0].set(1)
+    key = (jnp.zeros((1, 16, 1, 8), jnp.float32).at[0, :, 0, 0].set(-128).at[0, 0, 0, 0].set(-64)
+           .at[0, 1, 0, 0].set(-65).at[0, 8, 0, 0].set(0).at[0, 8, 0, 1].set(1))
+    value = jnp.zeros((1, 16, 1, 8), jnp.float32).at[0, 0, 0, 0].set(2.0 ** 64).at[0, 8, 0, 0].set(1)
+    dout = jnp.zeros((1, 1, 1, 8), jnp.float32).at[..., 0].set(1)
+    spans, hooks = template.spans(1, 16, 1), hooked(words, 1, 1, rate)
+
+    ours, reference = _portable_gradients(spans, hooks)
+    assert_as_exact(ours, reference, lambda seed: (query, key, value, dout),
+                    "a dropping query gradient about its heaviest key", seeds=FEWEST_SEEDS)
 
 
 def test_the_reference_scales_a_dropped_weight_at_float64_precision():

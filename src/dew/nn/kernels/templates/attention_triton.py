@@ -62,6 +62,7 @@ from dew.nn.kernels.templates.attention import (
     within,
 )
 from dew.nn.kernels.templates.base import Template
+from dew.nn.precision import power2
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The operand dtypes the kernels take, one on queries, keys and values alike."""
@@ -811,7 +812,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     else:
         state = program.off_anchor_pass(bounds_ref[0], bounds_ref[1], formed, before, maximum, key_index,
                                         shift, how, product)
-        prior = algebra.power2(state.total, shift)
+        prior = power2(state.total, shift)
         anchor, delta, key_index = gradient.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
                                                             shares[1], key_index, shift,
                                                             rows=row_products)
