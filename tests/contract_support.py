@@ -75,11 +75,12 @@ class Entries(NamedTuple):
 
 def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values: int) -> Entries:
     """Entry writes of `CANCELLING_LEVELS`' seven products on their keys' first dimension for a forked call
-    over `FORKED`'s table, as its route and its oracle read them alike: each head's first value column
+    over `FORKED`'s table, as its route and its oracle read them alike: the first head's first value column
     scaled by a drawn sign and a power of two of 2^-28 to 2^-33 a draw, so even a row's three writes' terms
     sum inside float32's range, as the gates' sums must (testing.md's derivative contracts), their ties kept,
-    and its other columns zero, so an entry key's gradient is one product of the levels' (rounded once, as
-    float64's; over many columns float32's sum of them rounded at each, an ulp off it); weights of
+    and every other column zero, so an entry key's gradient is one product of the levels' (rounded once, as
+    float64's: summed over a key head's value heads and columns, float32 rounded each term, 1.9 to 2.6 times
+    the rounded truth's distance); weights of
     another, each document's signed by the memory it enters (`_entered_signs`), so every memory is zero, one
     or two writes, a stored one cancelled exactly among them; and cotangents (`Entries.signed`) of one power
     of two a draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds once, as
@@ -90,7 +91,7 @@ def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values:
     key = np.zeros((rows, documents, len(factors), key_heads, keys), np.float32)
     key[..., 0] = factors[:, None]
     columns = np.zeros((heads, values))
-    columns[:, 0] = rng.choice([-1.0, 1.0], heads) * 2.0 ** -int(rng.integers(28, 34))
+    columns[0, 0] = rng.choice([-1.0, 1.0]) * 2.0 ** -int(rng.integers(28, 34))
     value = np.broadcast_to(levels[:, None, None] * columns, (rows, documents, len(levels), heads, values))
     signs = _entered_signs(rng.choice([-1.0, 1.0], (rows, heads)))
     scale = 2.0 ** -int(rng.integers(10, 15))
