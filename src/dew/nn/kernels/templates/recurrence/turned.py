@@ -305,8 +305,8 @@ def _halves(query, key, phi, value, d_out, log, beta, ids, teams, *, scale: floa
     holds no pair a readout apart keeps: the levels stop there (a rank-four call's two smallest, each three
     small products a chunk). `query` and `key` `[..., C, 2 A]` unrotated, `phi` the chunk's within-chunk
     double-float turn prefix `(high, low)` `[..., C, A]`, `value` and `d_out` `[..., C, V]`, `log` the log
-    decays' prefix `G` as a double float (`_between`) and `beta` `[..., C]`, `ids` and `teams` `[..., C]`
-    broadcast against them."""
+    decays' prefix `G` as a double float (`precision.compensated_difference` its pairs') and `beta` `[...,
+    C]`, `ids` and `teams` `[..., C]` broadcast against them."""
     length = query.shape[-2]
     total = jnp.zeros((*query.shape[:-1], query.shape[-1] // 2), query.dtype)
     size = length
@@ -347,13 +347,13 @@ def _halves(query, key, phi, value, d_out, log, beta, ids, teams, *, scale: floa
         k_inv = jnp.where(jax.lax.stop_gradient(jnp.abs(k_earlier) <= limit), k_earlier * inv_k, k_earlier)
         k_side = (jnp.einsum('...ij,...jk->...ik', p_small_k, k_earlier)
                   + jnp.einsum('...ij,...jk->...ik', p_big, k_inv))
-        later = suffix_sums(_crossed(q_later, k_side) * inv_q)
+        later = suffix_sums(_crossed(q_later, k_side) * inv_q, scanned=True)
         p_small_q = jnp.where(small_p, pairs * inv_q, 0.0)
         q_inv = jnp.where(jax.lax.stop_gradient(jnp.abs(q_later) <= limit), q_later * inv_q, q_later)
         q_side = (jnp.einsum('...ij,...ik->...jk', p_small_q, q_later)
                   + jnp.einsum('...ij,...ik->...jk', p_big, q_inv))
         terms = _crossed(q_side, k_earlier) * inv_k
-        earlier = sums_before(terms)
+        earlier = sums_before(terms, scanned=True)
         level = jnp.stack([earlier, later], axis=-3)
         total = total + jnp.reshape(level, (*level.shape[:-4], length, level.shape[-1]))
         size = half
@@ -393,10 +393,12 @@ def turn_gradient(query, key, value, d_out, g, beta, state, d_final, turn, start
     read_out = jnp.where(reads[..., None], do, 0.0)
     written_in = jnp.where(writes[..., None], v, 0.0)
     read_mat, read_post = _scaled_einsum(memories, read_out, rem_q * mem_scales)
-    entered = suffix_sums(_crossed(readers, read_mat) * read_post)
+    # Scanned: a token's sum meets no term of the tokens before it, a nonfinite one among them (an entering
+    # memory of 2^126 times its cotangent) left out, where a triangle's dot multiplied it by zero.
+    entered = suffix_sums(_crossed(readers, read_mat) * read_post, scanned=True)
     write_mat, write_post = _scaled_einsum(leaving, written_in, rem_k * cot_scales)
     terms = -(_crossed(writers, write_mat) * write_post)
-    left = sums_before(terms)
+    left = sums_before(terms, scanned=True)
     c_cos, c_sin = chunk_rot
     decayed = passes * memories
     p_fac, p_inv = _rotated_scale(jnp.swapaxes(decayed, -1, -2))
