@@ -579,7 +579,9 @@ def _values_erased(hooks: Hooks, given: dict, state, query, key, value, work):
     v^T D S^T` passed fp32's largest at a memory of -2^127 and a key of 2^127 under a gate of 1/4, whose
     memory and output stay -2^126; gated before its sum, `beta v` lost a value of 2^-60 under a gate of
     2^-100 to underflow, its read of a memory of 2^120 a normal -2^-40; gated after it, four values of 1/2
-    read a memory of 2^127 as 2^128, where the gated read of 1/4 is 2^126."""
+    read a memory of 2^127 as 2^128, where the gated read of 1/4 is 2^126. The gate's gradient sums its
+    write's and its erase's exactly: apart, each rounded, a key of 2^30 and a read of 2^30 + 1 cancelled to
+    zero where it is -1/2."""
     if hooks.decay == 'none':
         decay = jnp.ones(value.shape, work)
     else:
@@ -587,7 +589,8 @@ def _values_erased(hooks: Hooks, given: dict, state, query, key, value, work):
         decay = jnp.broadcast_to(decay[..., None] if hooks.decay == 'scalar' else decay, value.shape)
     decayed = decay[..., :, None] * jnp.swapaxes(state, -1, -2)
     gate = given['beta'].astype(work)[..., None, None]
-    terms = [(gate, key[..., None, :]), (-gate, value[..., :, None], decayed)]
+    # The gate one factor of both terms, so its gradient is one aligned sum of theirs.
+    terms = [(gate, key[..., None, :]), (gate, -value[..., :, None], decayed)]
     corrected = aligned_sum(terms, axis=-2)[..., 0, :]
     transposed = decayed + value[..., :, None] * corrected[..., None, :]
     return jnp.sum(transposed * query[..., None, :], axis=-1), jnp.swapaxes(transposed, -1, -2)
