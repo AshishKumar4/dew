@@ -8,7 +8,9 @@ trainer has just written.
 """
 
 import dataclasses
+import datetime
 import json
+import logging
 import types
 from pathlib import Path
 
@@ -363,6 +365,150 @@ def test_an_lm_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
     checkpoints.wait()
     restored = TextGeneration.from_run(str(tmp_path / "run"))(prompt, 6, key=7).host()
     np.testing.assert_array_equal(restored.lengths, expected)
+
+
+@dataclasses.dataclass(frozen=True)
+class PrefixedBytes:
+    """A processor of a user's own (row 9065): byte ids of its text with `prefix` before it, a dataclass a
+    run's record describes by its import path and its one field."""
+
+    prefix: str
+
+    @property
+    def _bytes(self) -> RunProcessor:
+        return RunProcessor(ByteTokenizer())
+
+    def __call__(self, text, *, images=None):
+        texts = [text] if isinstance(text, str) else list(text)
+        return self._bytes([self.prefix + each for each in texts], images=images)
+
+    def decode(self, tokens):
+        return self._bytes.decode(tokens)
+
+    def encode(self, text, *, specials):
+        return self._bytes.encode(self.prefix + text, specials=specials)
+
+    def spelling(self, ids):
+        return self._bytes.spelling(ids)
+
+    def chat(self, messages):
+        return self._bytes.chat(messages)
+
+    @property
+    def bos_id(self):
+        return self._bytes.bos_id
+
+
+@dataclasses.dataclass(frozen=True)
+class Named(PrefixedBytes):
+    """A processor of a user's own that keeps a dtype's name as its record states it (row 9065's review)."""
+
+    dtype: str = "bfloat16"
+
+
+@dataclasses.dataclass(frozen=True)
+class PositionalOnly(PrefixedBytes):
+    """A processor whose constructor takes its field positionally alone, which no record's keywords build."""
+
+    def __init__(self, prefix, /):
+        object.__setattr__(self, "prefix", prefix)
+
+
+def _tiny_lm(processor):
+    """A tiny byte-level decoder's LM objective over `processor`, its state as a trainer starts it."""
+    from dew.objectives.lm import LMObjective
+
+    model = ModelConfig("causal_transformer", {"vocab_size": 256, "emb_features": 16, "num_layers": 1,
+                                               "num_heads": 2, "head_dim": 8, "mlp_features": 32,
+                                               "max_seq_len": 16, "dtype": "float32",
+                                               "attention_impl": "reference"}).build()
+    objective = LMObjective(model, 8, ema_decay=None, processor=processor)
+    return objective, Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(0)).initial_state()
+
+
+def test_a_saved_runs_own_processor_reloads_and_reads_text_as_the_live_one(tmp_path):
+    """A run trained over a processor of its user's own that a record describes (a dataclass at module
+    level) saves it beside its model, and the task its saved run loads under the package it trusts holds an
+    equal processor, which reads text to the ids the live task's reads it to, where the run recorded none
+    and its task took ids alone (row 9065)."""
+    objective, state = _tiny_lm(PrefixedBytes("> "))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    task = TextGeneration.from_run(str(tmp_path / "run"), trust=(PrefixedBytes.__module__,))
+    assert task.processor == PrefixedBytes("> ")
+    live = objective.pipeline(state, ema=False)
+    np.testing.assert_array_equal(np.asarray(task.processor("hi").tokens),
+                                  np.asarray(live.processor("hi").tokens))
+
+
+def test_a_saved_runs_processor_no_record_describes_saves_without_it(tmp_path, caplog):
+    """A run over a processor no record describes (a class made inside a function, which no import path
+    names) saves without raising, recording why, and its run loads its model with no processor, as every
+    such run did, the load saying why once (row 9065)."""
+
+    class Opaque(PrefixedBytes):
+        pass
+
+    objective, state = _tiny_lm(Opaque("> "))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    with caplog.at_level(logging.WARNING, logger="dew.inference.tasks"):
+        assert TextGeneration.from_run(str(tmp_path / "run")).processor is None
+    said = [record.getMessage() for record in caplog.records if "was not recorded" in record.getMessage()]
+    assert len(said) == 1 and "Opaque" in said[0], said
+
+
+def test_a_saved_runs_processor_record_builds_a_trusted_processor_class_alone(tmp_path):
+    """A saved run's processor record that names a function, or a class whose instances are not called, is
+    refused at its load, naming the processor and `trust=`, where a record that builds by running what it
+    names would have run it (row 9065's review)."""
+    from dew.inference.tasks import saved_custom
+
+    for named in ("os:getcwd", "dew.data.text:ByteTokenizer"):
+        with pytest.raises(ValueError):
+            saved_custom({"class": named, "fields": {}})
+
+
+def test_a_saved_runs_processor_keeps_its_fields_as_recorded_and_its_settings_hash(tmp_path):
+    """A saved run's processor whose field is a dtype's name rebuilds holding that name (the task record's
+    `dtype` policy), and the run's task settings hash beside its record (row 9065's review)."""
+    objective, state = _tiny_lm(Named("> "))
+    hash(objective.task_settings())
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    task = TextGeneration.from_run(str(tmp_path / "run"), trust=(Named.__module__,))
+    assert task.processor == Named("> ") and task.processor.dtype == "bfloat16"
+
+
+@dataclasses.dataclass(frozen=True)
+class Timed(PrefixedBytes):
+    """A processor of a user's own holding a duration and a text shaped as an import path."""
+
+    timeout: datetime.timedelta = dataclasses.field(default_factory=lambda: datetime.timedelta(seconds=3))
+    label: str = "tests.label: text"
+
+
+def test_a_saved_runs_processor_reads_its_durations_and_texts_back(tmp_path):
+    """A saved run's processor holding a duration and a text shaped as an import path rebuilds holding the
+    duration and the text, where the duration read back as its text and the text was imported as a module
+    (row 9065's review)."""
+    objective, state = _tiny_lm(Timed("> "))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    task = TextGeneration.from_run(str(tmp_path / "run"), trust=("tests", Timed.__module__))
+    assert task.processor == Timed("> ")
+
+
+def test_a_processor_its_record_builds_none_of_saves_unrecorded():
+    """A processor whose constructor takes its field positionally alone records why it went unrecorded, not
+    a record no rebuild reads (row 9065's review)."""
+    from dew.inference.tasks import recorded_custom, unrecorded_custom
+
+    assert "PositionalOnly" in unrecorded_custom(recorded_custom(PositionalOnly("> ")))
 
 
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=None):

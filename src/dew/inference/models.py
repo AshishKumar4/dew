@@ -152,7 +152,7 @@ class ReleasedRun(SavedRun):
         """The run step the release in `directory` holds, the packages `trust` names that its record imports
         imported first (`dew.registry.import_trusted`), as a run's are (`SavedRun.at`); a directory that
         holds none is refused."""
-        from dew.inference.tasks import earlier_shapes
+        from dew.inference.tasks import earlier_shapes, scanned_artifact
         from dew.interop.release_record import Release
         from dew.registry import import_trusted
 
@@ -162,7 +162,7 @@ class ReleasedRun(SavedRun):
             raise ValueError(f"{directory} holds no native release: its release record states no run "
                              "(`dew export` of a run writes one)")
         record = named_fields(task["run"], "run")
-        import_trusted(record, trust)
+        import_trusted(scanned_artifact(record), trust)
         held = cls.declared(str(directory), earlier_shapes(record), integer(task.get("step", 0), "step"))
         return replace(held, average=task.get("averaged") is True,
                        unstated=text(task.get("unstated", ""), "unstated"))
