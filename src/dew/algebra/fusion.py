@@ -106,14 +106,18 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
         weighed = _decided(identity, lambda found=found: _takes(fused_gemm, jaxpr, found))
         if weighed.taken:
             identities[found] = identity
-        elif found.prologue and weighed.launchable:
-            # A region its prologue keeps from fusing is weighed without it, its product and its epilogue:
-            # unless its launch is XLA's for a reason no prologue enters (`_xla_whatever_its_prologue`, the
-            # call's naming it), on which the region without it fails too, a second analysis wasted.
-            bare = _bare(jaxpr, found)
-            identity = _identity(jaxpr, bare)
-            if _decided(identity, lambda bare=bare: _takes(fused_gemm, jaxpr, bare)).taken:
-                identities[bare] = identity
+        elif weighed.launchable:
+            # A region a stage keeps from fusing (a prologue or an epilogue the template refuses, or one that
+            # does not pay) is weighed with fewer (`_fewer`), its product the template's where it can be and
+            # the stage left as the program wrote it, XLA's beside the launch: unless its launch is XLA's for
+            # a reason no stage enters (`_xla_whatever_its_prologue`, the call's naming it), on which each
+            # region with fewer fails too, an analysis wasted (row 8996: a refused epilogue left the
+            # product a plain dot).
+            for fewer in _fewer(index, found, epilogue=weighed.launched):
+                identity = _identity(jaxpr, fewer)
+                if _decided(identity, lambda fewer=fewer: _takes(fused_gemm, jaxpr, fewer)).taken:
+                    identities[fewer] = identity
+                    break
     products = list(identities)
     # A norm a product's prologue replays is the product's (`_prologue`), as an epilogue's norm is.
     held |= {place for region in products for place in region.replayed}
@@ -126,10 +130,28 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     return _spliced(jaxpr, written)
 
 
-def _bare(jaxpr: jcore.Jaxpr, region: Region) -> Region:
-    """`region` without its prologue: its product and its epilogue, reading the product's rows as given."""
-    places = tuple(place for place in region.places if place not in region.prologue)
-    return Region(places, region_inputs(jaxpr, places), region.outputs, region.at)
+def _fewer(index: Index, region: Region, *, epilogue: bool) -> list[Region]:
+    """`region` with fewer stages, the most first, each where the region has the stages it drops: without its
+    prologue (its product and its epilogue, reading the product's rows as given), and where `epilogue` (its
+    launch the template's or undecided, `RegionDecision.launched`) without its epilogue (its prologue and its
+    product, before the first of its consumers, which read the product's value as the program wrote them)
+    and its product alone."""
+    jaxpr = index.jaxpr
+
+    def of(places: tuple[int, ...], outputs: tuple, at: int, prologue: tuple[int, ...] = ()) -> Region:
+        return Region(places, region_inputs(jaxpr, places), outputs, at, prologue)
+
+    (product,) = (place for place in region.places if _form(jaxpr.eqns[place]) is not None)
+    staged = tuple(place for place in region.places if place in region.prologue)
+    fewer = [of(tuple(place for place in region.places if place not in region.prologue), region.outputs,
+                region.at)] if region.prologue else []
+    if epilogue and len(region.places) > len(staged) + 1:
+        made = tuple(jaxpr.eqns[product].outvars)
+        first = min(place for var in made for place in index.readers[var])
+        if region.prologue:
+            fewer.append(of((*staged, product), made, first, region.prologue))
+        fewer.append(of((product,), made, first))
+    return fewer
 
 
 def region_inputs(jaxpr: jcore.Jaxpr, places: Sequence[int]) -> tuple[jcore.Var, ...]:
@@ -425,14 +447,17 @@ def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
 
 
 class RegionDecision(NamedTuple):
-    """A product region's weighing (`_takes`): whether it is fused, and whether its product's launch may be
-    the template's without its prologue, so the region without it could be (`fused_program`): unless its
-    launch is XLA's for a reason no prologue enters (`_xla_whatever_its_prologue`). A launch XLA's because the
+    """A product region's weighing (`_takes`): whether it is fused; whether its product's launch may be the
+    template's without its prologue, so the region without it could be (`fused_program`): unless its launch
+    is XLA's for a reason no prologue enters (`_xla_whatever_its_prologue`). A launch XLA's because the
     prologue's resources refused the template, or one no analysis reached (a stage refused first,
-    `fused_gemm.Analysis.refused`), may be."""
+    `fused_gemm.Analysis.refused`), may be. And whether its launch is the template's or undecided
+    (`launched`), so the region without its epilogue could be: an epilogue keys no launch's cell, so a launch
+    the selector gave XLA is XLA's without it too."""
 
     taken: bool
     launchable: bool
+    launched: bool
 
 
 _held: collections.OrderedDict[Hashable, RegionDecision] = collections.OrderedDict()
@@ -488,10 +513,11 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
         return route is not None and route.refusal is None and route.kernel != "xla"
 
     launchable = not _xla_whatever_its_prologue(found.launch)
+    launched = found.launch is None or kernel(found.launch)
     routes = [found.launch, *([found.prologue] if region.prologue else [])]
     if found.epilogue is None and not region.prologue:
         # No stage to weigh (a bare product, a kernel gradient's): its launch's selector decides alone.
-        return RegionDecision(all(map(kernel, routes)), launchable)
+        return RegionDecision(all(map(kernel, routes)), launchable, launched)
     # A prologue the template refuses (a row normalized from float32 to bfloat16, `dtype_changes`) is no
     # region's: the region without it is weighed instead (`fused_program`). Each stage it holds is weighed by
     # price, a prologue's as an epilogue's (`fused_gemm.priced`: the operand formed in the launch, not
@@ -499,7 +525,7 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     stages = (*routes, *([found.epilogue] if found.epilogue is not None else []))
     priced = found.fused_seconds is not None and found.unfused_seconds is not None
     return RegionDecision(all(map(kernel, stages)) and priced and found.fused_seconds < found.unfused_seconds,
-                          launchable)
+                          launchable, launched)
 
 
 def _xla_whatever_its_prologue(launch) -> bool:
