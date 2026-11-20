@@ -775,13 +775,15 @@ def groups_held(after: Sequence[Stage], size: int, threads: int) -> int:
     """The groups of `size` a same-rows batched step's read holds at once (`dew.data.lowering._GroupedRows`):
     a window shuffle's after it and the read's threads'; a global shuffle refused, naming its reads (row
     9784)."""
+    threaded = 2 * max(1, threads)
     shuffled = next((stage for stage in after if isinstance(stage, Shuffle)), None)
-    if shuffled is not None and shuffled.window is None:
+    if shuffled is None:
+        return threaded
+    if shuffled.window is None:
         raise ValueError("a global shuffle after a batched map reads each row's group anew on an indexed "
                          "read: read it in memory (read='memory'), shuffle within a window (window=), or "
                          "shuffle before the map")
-    window = 0 if shuffled is None else -(-shuffled.window // size) + 1
-    return window + 2 * max(1, threads)
+    return -(-shuffled.window // size) + 1 + threaded
 
 
 def rejects(stage: Stage) -> bool:
