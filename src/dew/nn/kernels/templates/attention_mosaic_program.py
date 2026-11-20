@@ -1861,7 +1861,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         # their parts and the parts' accumulator.
         phases.append([logits] * 2 + [bits] + ([*core, *scaled_terms] if scaled else []))
         if residuals:
-            phases.append([logits, weights, weights, bits, bits])
+            phases.append([logits, weights, weights, bits, bits] + ([bits, logits] if dropped else []))
     kept = residuals and family.keeps_sums(value_width)
     if scopes_products(family):
         phases = _scoped_phases(phases, logits, weights, (block_q, value_width, jnp.float32), kept=kept,
