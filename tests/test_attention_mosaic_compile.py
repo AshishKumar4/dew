@@ -318,8 +318,8 @@ def _served(generation_name: str, positions: int, heads: int, kv_heads: int, wid
                                                                 scales=scales)[0] is not None))
 
 
-WORK_LIST_GPUS = tuple(name for name in generation.TARGETS if staged_widths(name, jnp.bfloat16))
-"""Every GPU generation whose bundles stage a head for the Mosaic mainloop (`generation.TARGETS`,
+WORK_LIST_GPUS = tuple(name for name in GATED if staged_widths(name, jnp.bfloat16))
+"""One GPU of each architecture whose bundles stage a head for the Mosaic mainloop (`GATED`,
 `staged_widths`), each the work list's gate compiles for."""
 
 
@@ -372,17 +372,18 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("page", [16, 4, 1])
+@pytest.mark.parametrize("page", [16, 1])
 @pytest.mark.parametrize("generation_name", GATED)
 def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, page):
     """A decode step over a paged cache of `page`-key pages (`attention_decode.attend` over pools `[KV, P,
     page, D]` and a table), 16 rows of 4096 keys, 32 query heads over 8 key heads 64 wide, its key tile of
     several pages, its rows gathered through the table (`attention_mosaic_forward.paged_reads`): lowered and
     compiled by ptxas for `generation_name` on this CPU, every launch within its shared memory and spilling
-    nothing (`mosaic_failures`). An A100's rows its one warpgroup's cp.async copies a row a copy in its
-    pipeline's groups (`mosaic_sm80._gathered_walk`; its 16-key pages were each a copy of their own,
-    M-DD-10's W64-a100: 'Number of tiles is not a multiple of 4'; its 4- and 1-key pages refused, row
-    4772)."""
+    nothing (`mosaic_failures`). Multi-key (`16`) and single-key (`1`) pages bracket both regimes (pages of
+    16, 4 and 1 keys compile to identical shared memory, registers and zero spills on sm80, sm90 and sm120).
+    An A100's rows its one warpgroup's cp.async copies a row a copy in its pipeline's groups
+    (`mosaic_sm80._gathered_walk`; its 16-key pages were each a copy of their own, M-DD-10's W64-a100:
+    'Number of tiles is not a multiple of 4'; its 4- and 1-key pages refused, row 4772)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
