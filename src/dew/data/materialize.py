@@ -48,6 +48,8 @@ from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
     Artifact,
+    Batched,
+    BatchedGroups,
     Combined,
     Concatenated,
     FlatMap,
@@ -280,6 +282,14 @@ def _memory_stages(
                                       stage.fields[0], rule)
         elif isinstance(stage, Pack):
             rows, targets, documents = _memory_pack(stage, rows, source, counter, derived, consumed - placed)
+        elif isinstance(stage, Batched):
+            # A same-rows batched step (`analysis` runs no other here) over the source's own consecutive
+            # records, each row keeping its identity, so a global shuffle after it reads them (row 9784).
+            groups = BatchedGroups(stage)
+            rows = [(identifier, value) for start in range(0, len(rows), stage.size)
+                    for (identifier, _), value in zip(
+                        rows[start:start + stage.size],
+                        groups.flat_map([value for _, value in rows[start:start + stage.size]]), strict=True)]
         else:
             if isinstance(stage, FlatMap) and stage.examples and examples is None:
                 # The corpus counts its source examples, so its counts are taken here, before an
