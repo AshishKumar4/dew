@@ -567,18 +567,23 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
 
 def _substeps(hooks: Hooks, given: dict, work):
     """A decode token's `hooks.substeps` delta-rule updates in turn (`Hooks.substeps`, DeltaProduct's) in
-    `work`, the state held there between them: each update's keys, values and write gates `given`'s at its
-    substep, its decay before the first alone. `(output, last keys, last values, state)`, the output the
-    state after the last read by the query."""
-    state = given['state'].astype(work)
-    for substep in range(hooks.substeps):
-        taken = {**given, **{name: given[name][:, substep] for name in ('key', 'value', 'beta')
-                             if name in given}}
-        if substep and 'log_decay' in given:
-            taken['log_decay'] = jnp.zeros_like(given['log_decay'])
-        query, key, value, _ = _prologue(hooks, taken, work)
-        decay, write = _gates(hooks, taken, work, state.shape[2])
-        out, state = update(state, query, key, value, decay, write[..., None], delta=True, reads='after')
+    `work`, the state held there between them (`_substep`). `(output, last keys, last values, state)`, the
+    output the state after the last read by the query."""
+    found = _substep(hooks, given, work, given['state'].astype(work), 0)
+    for substep in range(1, hooks.substeps):
+        found = _substep(hooks, given, work, found[3], substep)
+    return found
+
+
+def _substep(hooks: Hooks, given: dict, work, state, substep: int):
+    """One of a decode token's delta-rule updates (`_substeps`) on `state`: its keys, values and write gates
+    `given`'s at `substep`, its decay the token's on the first alone. `(output, keys, values, state)`."""
+    taken = {**given, **{name: given[name][:, substep] for name in ('key', 'value', 'beta') if name in given}}
+    if substep and 'log_decay' in given:
+        taken['log_decay'] = jnp.zeros_like(given['log_decay'])
+    query, key, value, _ = _prologue(hooks, taken, work)
+    decay, write = _gates(hooks, taken, work, state.shape[2])
+    out, state = update(state, query, key, value, decay, write[..., None], delta=True, reads='after')
     return out, key, value, state
 
 
