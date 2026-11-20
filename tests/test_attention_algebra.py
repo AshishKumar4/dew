@@ -43,6 +43,17 @@ TILES = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4,
 
 
 @pytest.fixture(autouse=True)
+def _released_as_each_test_ends():
+    """Each test's compiled executables released as it ends (`conftest.release`), where the file's releases
+    them at its end alone: a group of its merge cells holding every earlier cell's compiled programs, each a
+    jit and an as-written program over its seeds, was killed at 10 GiB on armada."""
+    import conftest
+
+    yield
+    conftest.release()
+
+
+@pytest.fixture(autouse=True)
 def _interpreted_as_an_a100():
     """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the frozen
     Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
