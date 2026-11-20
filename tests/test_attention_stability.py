@@ -1212,7 +1212,7 @@ def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_refere
         ctx = generation.assumed("sm90") if INTERPRETED else contextlib.nullcontext()
         with ctx, generation.chosen(attention_mainloop="mosaic"):
             spans = _spans(family, query, key)
-            return attention_route.attend(query, key, value, spans, None, interpret=INTERPRETED)
+            return attention_route.attend(query, key, value, spans, None)
 
     with generation.routes() as routes:
         assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
