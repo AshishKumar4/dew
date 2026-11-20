@@ -1267,6 +1267,57 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
             ci.plan(300.0, {})
 
 
+def test_a_parameters_shared_setup_keeps_its_tests_together_across_functions_and_parts_one_too_heavy(
+        ci, tmp_path):
+    """Tests marked shared_setup with `by` share the setup their parameter ids' first match keys, across test
+    functions, a model's ids though they hold dashes and another parameter's id beside them: a cut keeps each
+    key's tests in one group, so the model's programs are compiled once (Main, 2026-11-20: 7 model files cut
+    in node-id order paid each model's compile in every group). A key heavier than a group's share of its file
+    runs in consecutive parts, each within it, so it is never the longest group; a test the record lacks joins
+    its key's first recorded test, each recorded one staying in its planned group. A `by` that is no literal
+    regular expression refuses the file."""
+    session = ci.session
+    (tmp_path / "tests/test_models.py").write_text(
+        "import pytest\n"
+        "@pytest.mark.shared_setup('models', by=r'm-\\w+-tiny')\n"
+        "@pytest.mark.parametrize('name', ['m-a-tiny', 'm-b-tiny', 'm-c-tiny'])\n"
+        "def test_forward(name):\n    pass\n"
+        "@pytest.mark.shared_setup('models', by=r'm-\\w+-tiny')\n"
+        "@pytest.mark.parametrize('name', ['m-a-tiny', 'm-b-tiny', 'm-c-tiny'])\n"
+        "@pytest.mark.parametrize('dtype', ['f32', 'bf16'])\n"
+        "def test_gradient(dtype, name):\n    pass\n"
+        "def test_plain():\n    pass\n")
+    node = "tests/test_models.py::{}"
+    forward = [node.format(f"test_forward[m-{key}-tiny]") for key in "abc"]
+    # Stacked parameters' ids as pytest joins them, the decorator nearest the function's first.
+    gradient = [node.format(f"test_gradient[{dtype}-m-{key}-tiny]") for key in "abc" for dtype in ("bf16", "f32")]
+    plain = node.format("test_plain")
+    nodes = sorted([*forward, *gradient, plain])
+    weights = dict.fromkeys(nodes, 10.0)
+    by_key = {key: {each for each in nodes if f"m-{key}-tiny" in each} for key in "abc"}
+    groups = session.cut(nodes, [weights[each] for each in nodes], 3)
+    for key in "abc":
+        assert sum(by_key[key] <= set(group) for group in groups) == 1, groups
+    # Model a's tests weigh twice the rest together: in two consecutive parts, each within a group's share.
+    heavy = {**weights, **{each: 100.0 for each in by_key["a"]}}
+    groups = session.cut(nodes, [heavy[each] for each in nodes], 4)
+    share = sum(heavy.values()) / 4
+    holding = [group for group in groups if set(group) & by_key["a"]]
+    assert len(holding) == 2 and all(sum(heavy[each] for each in group) <= share for group in holding), groups
+    # A new parameter of model a joins its first recorded test's group; each recorded test keeps its own.
+    new = node.format("test_forward[m-a-tiny-new]")
+    collected = sorted([*nodes, new])
+    first = next(index for index, group in enumerate(groups) if min(by_key["a"]) in group)
+    assert session.kept(collected, groups, 10.0) == [
+        sorted([*group, *([new] if index == first else [])]) for index, group in enumerate(groups)]
+    for refused in ("by=NAME", "by=r'['", "by='x', other='y'"):
+        (tmp_path / "tests/test_refused.py").write_text(
+            f"import pytest\nNAME = 'x'\n@pytest.mark.shared_setup('s', {refused})\n"
+            "def test_one():\n    pass\n")
+        with pytest.raises(SystemExit):
+            session.shared_setups("tests/test_refused.py")
+
+
 def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does(ci, tmp_path):
     """Every row's shared key holds the SHARED harness modules by their code (`code_of`): an edit to what one
     says of itself, a comment or a docstring, reuses every row, as it changes no run (row 2730: a docstring

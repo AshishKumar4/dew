@@ -10,6 +10,7 @@ import ast
 import bisect
 import functools
 import json
+import math
 import os
 import re
 import subprocess
@@ -194,7 +195,12 @@ class-scoped fixture's making: `@pytest.mark.shared_setup("name")` on each test'
 literal name, as the plan reads it from the source (`shared_setups`). A split file's tests of one name
 run in one group (`cut`), so the setup is paid once; a fixture that only cleans up, or one every test
 takes (autouse), is no reason to mark (Main, 2026-11-02: the joint release's fit and an admitted plan,
-45-95 s each, paid twice where a cut parted their tests)."""
+45-95 s each, paid twice where a cut parted their tests). With `by`, a literal regular expression, the
+setup is one a parameter's: the tests of one name whose parameter ids its first match keys alike share
+it, across test functions (`setup_key`), as a model's compiled programs a process caches are (Main,
+2026-11-20: 7 model files cut in node-id order paid each model's load, trace and compile in every
+group its 8-20 tests fell in, ~16,000 s a run). A setup's tests heavier than a group's share of the
+file run in consecutive parts of it (`parted`), so one setup is never the longest group."""
 
 
 def test_name(node: str) -> str:
@@ -344,12 +350,13 @@ def site_name(node: str, sites: Container[str]) -> str:
     return held if held in sites else named
 
 
-def shared_setups(name: str) -> dict[str, str]:
+def shared_setups(name: str) -> dict[str, tuple[str, str | None]]:
     """Test file `name`'s tests marked `SHARED_SETUP`, each by its name in the file (`test_name`) with
-    the setup it names. Read from the source, as the plan runs under a Python with no pytest and imports
-    no test: a mark written elsewhere than a test's own decorator (on a class or a module, in a
-    parameter's marks), or of a name not a literal string, would be cut apart by the plan and kept
-    together by nothing it can read, so the file is refused, by the line that holds it."""
+    the setup it names and its `by` (None where it has none). Read from the source, as the plan runs under
+    a Python with no pytest and imports no test: a mark written elsewhere than a test's own decorator (on
+    a class or a module, in a parameter's marks), of a name not a literal string, or of a `by` not a
+    literal regular expression, would be cut apart by the plan and kept together by nothing it can read,
+    so the file is refused, by the line that holds it."""
     path = Path(name)
     text = path.read_text() if path.is_file() else ""
     return marked_setups(name, text) if SHARED_SETUP in text else {}
@@ -369,36 +376,59 @@ def decorated_tests(body: list[ast.stmt], prefix: str = "") -> Iterator[tuple[st
 
 
 @functools.cache
-def marked_setups(name: str, text: str) -> dict[str, str]:
+def marked_setups(name: str, text: str) -> dict[str, tuple[str, str | None]]:
     """`shared_setups` of test file `name`, whose source is `text`, read once a text."""
     try:
         tree = ast.parse(text)
     except SyntaxError:
         # Its collection fails its row, saying why.
         return {}
-    found: dict[str, str] = {}
+    found: dict[str, tuple[str, str | None]] = {}
     read: set[int] = set()
     for test, mark in decorated_tests(tree.body):
+        by = [keyword.value for keyword in mark.keywords if keyword.arg == "by"]
+        literal = all(isinstance(each, ast.Constant) and isinstance(each.value, str) and compiled(each.value)
+                      for each in by)
         if (ast.unparse(mark.func) == f"pytest.mark.{SHARED_SETUP}" and len(mark.args) == 1
-                and not mark.keywords and isinstance(mark.args[0], ast.Constant)
-                and isinstance(mark.args[0].value, str) and test not in found):
-            found[test] = mark.args[0].value
+                and len(by) == len(mark.keywords) <= 1 and isinstance(mark.args[0], ast.Constant)
+                and isinstance(mark.args[0].value, str) and test not in found and literal):
+            found[test] = (mark.args[0].value, by[0].value if by else None)
             read.add(id(mark.func))
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr == SHARED_SETUP and id(node) not in read:
             raise SystemExit(f"{name}, line {node.lineno}: {SHARED_SETUP} is read on a test's own "
                              f"decorator alone, once, as @pytest.mark.{SHARED_SETUP}(\"name\") of a literal "
-                             "name, which the plan reads from the source (tools/armada/session.py "
-                             "`shared_setups`)")
+                             "name, with at most by=\"<regular expression>\", a literal, which the plan "
+                             "reads from the source (tools/armada/session.py `shared_setups`)")
     return found
+
+
+def compiled(pattern: str) -> bool:
+    """Whether `pattern` is a regular expression (a `SHARED_SETUP` mark's `by`)."""
+    try:
+        re.compile(pattern)
+    except re.error:
+        return False
+    return True
+
+
+def setup_key(node: str, setup: tuple[str, str | None]) -> tuple[str, ...] | None:
+    """The setup test node `node` shares, marked `setup` (`shared_setups`): its name, and with `by` the
+    first match of `by` in its parameter id (its first group's, where it has one); None where its id has
+    none (a test that shares nothing, as an unmarked one)."""
+    name, by = setup
+    if by is None:
+        return (name,)
+    found = re.search(by, node.partition("[")[2][:-1]) if "[" in node else None
+    return None if found is None else (name, found.group(1 if found.re.groups else 0))
 
 
 def units(nodes: list[str]) -> list[list[int]]:
     """The indexes of `nodes` (test node ids, in node-id order) a cut keeps together: each test alone, but
-    those of one file marked with one `SHARED_SETUP`, together, at the place of the first of them. Each
-    file's marks are read once."""
-    marks: dict[str, dict[str, str]] = {}
-    held: dict[tuple[str, str] | int, list[int]] = {}
+    those of one file sharing one `SHARED_SETUP` (`setup_key`), together, at the place of the first of
+    them. Each file's marks are read once."""
+    marks: dict[str, dict[str, tuple[str, str | None]]] = {}
+    held: dict[tuple[str, ...] | int, list[int]] = {}
     for index, node in enumerate(nodes):
         # The node's file as grading.owning reads it, spelled here: conftest loads this module bare (stdlib
         # imports alone), where grading is no sibling it can import.
@@ -406,8 +436,25 @@ def units(nodes: list[str]) -> list[list[int]]:
         if name not in marks:
             marks[name] = shared_setups(name)
         setup = marks[name].get(test_name(node))
-        held.setdefault(index if setup is None else (name, setup), []).append(index)
+        key = None if setup is None else setup_key(node, setup)
+        held.setdefault(index if key is None else (name, *key), []).append(index)
     return list(held.values())
+
+
+def parted(held: list[list[int]], seconds: list[float], count: int) -> list[list[int]]:
+    """`units` `held` (indexes into `seconds`) for a cut into `count` groups: each unit heavier than a
+    group's share of their whole cut into as few runs of its consecutive tests as bring each within it,
+    in order at its place, so one setup is never the cut's longest group; it pays its setup once a run."""
+    share = sum(seconds) / count if count else 0.0
+    parts: list[list[int]] = []
+    for unit in held:
+        weight = sum(seconds[index] for index in unit)
+        if len(unit) < 2 or share <= 0 or weight <= share:
+            parts.append(unit)
+            continue
+        runs = groups([seconds[index] for index in unit], min(len(unit), math.ceil(weight / share)))
+        parts.extend([unit[index] for index in run] for run in runs if len(run))
+    return parts
 
 
 def unit_seconds(nodes: list[str], seconds: list[float]) -> list[float]:
@@ -419,7 +466,7 @@ def cut(nodes: list[str], seconds: list[float], count: int) -> list[list[str]]:
     """`nodes` (node-id order, each weighing its `seconds`) as `count` groups (`groups`) of `units`, a shared
     setup's tests in one group: how the plan cuts a split file's recorded tests (ci.py's `members`), which
     every task of it keeps whatever else it collects (`kept`)."""
-    held = units(nodes)
+    held = parted(units(nodes), seconds, count)
     runs = groups([sum(seconds[index] for index in unit) for unit in held], count)
     return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
 
@@ -549,8 +596,11 @@ def kept(nodes: list[str], planned: list[list[str]], mean: float) -> list[list[s
         placed = next((group_of[nodes[index]] for index in unit if nodes[index] in group_of), None)
         if placed is None:
             new.append([nodes[index] for index in unit])
-        else:
-            held[placed].extend(nodes[index] for index in unit)
+            continue
+        # Each recorded test in its own planned group, a setup's parts apart (`parted`); its new ones with
+        # its first.
+        for index in unit:
+            held[group_of.get(nodes[index], placed)].append(nodes[index])
     for index, run in enumerate(groups([mean * len(unit) for unit in new], len(planned))):
         held[index].extend(node for unit in new[run.start:run.stop] for node in unit)
     return [sorted(members) for members in held]
