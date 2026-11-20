@@ -64,6 +64,18 @@ class Chain:
     copy_bytes: float = 0.0
     stages: int = 1
 
+    def then(self, other: "Chain") -> "Chain":
+        """This path followed by `other`: their events one after another, waited through the one ring a walk's
+        loops share (the shallower one's where both wait on copies through rings apart, which hides less)."""
+        stages = (min(self.stages, other.stages) if self.copied and other.copied
+                  else self.stages if self.copied else other.stages)
+        return Chain(**{name: getattr(self, name) + getattr(other, name) for name in _COUNTED}, stages=stages)
+
+    @property
+    def copied(self) -> bool:
+        """Whether the path waits on a tile copy."""
+        return bool(self.copies or self.copy_bytes)
+
     def times(self, count: float) -> "Chain":
         """This path walked `count` times: each event's count multiplied, its ring the same."""
         return dataclasses.replace(self, **{name: getattr(self, name) * count for name in _COUNTED})
@@ -72,7 +84,7 @@ class Chain:
         """Whether this path takes at least `other`'s time at every part's latencies: at least as many of each
         event, and its copies through no more stages, unless `other` waits on none."""
         counted = all(getattr(self, name) >= getattr(other, name) for name in _COUNTED)
-        return counted and (self.stages <= other.stages or not (other.copies or other.copy_bytes))
+        return counted and (self.stages <= other.stages or not other.copied)
 
 
 _COUNTED = ("span", "products", "columns", "barriers", "copies", "copy_bytes")
@@ -87,6 +99,15 @@ def _kept(chains: tuple[Chain, ...]) -> tuple[Chain, ...]:
             continue
         kept = [held for held in kept if not chain.outlasts(held)] + [chain]
     return tuple(kept)
+
+
+def followed(first: tuple[Chain, ...], then: tuple[Chain, ...]) -> tuple[Chain, ...]:
+    """The paths of `first`'s work followed by `then`'s, run one after the other: each of the one's paths
+    then each of the other's (`Chain.then`), each another outlasts left out; either's where the other has
+    none."""
+    if not (first and then):
+        return first or then
+    return _kept(tuple(one.then(other) for one in first for other in then))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -205,6 +226,14 @@ def step_latency(target: generation.GpuTarget, *, device: bool) -> float | None:
     return target.step_seconds if device else target.kernel_step_seconds
 
 
+def path(work: Work, target: generation.GpuTarget) -> float:
+    """The seconds of `work`'s longest dependent path in a template's walk: its span at an in-kernel step's
+    latency (`spanned`) or its longest chain at the part's latencies (`chained`), the larger; the one peak
+    every price of a walk reads, the greedy (`walked`) and the algebra's exact extractor's
+    (`dew.algebra.cost.Walk.spanned`) alike."""
+    return max(spanned(work, step_latency(target, device=False))[0], chained(work, target))
+
+
 def chained(work: Work, target: generation.GpuTarget) -> float:
     """The longest of `work`'s paths (`Work.chains`) at `target`'s part's latencies: a path's events waited
     one after another, C, and its copies, L, waited past what its ring hides, max(C, (L + C) / stages); an
@@ -227,10 +256,8 @@ def walked(work: Work, target: generation.GpuTarget) -> float:
     """The seconds a program of a template's tile walk spends on `work` by the work-span model: its units'
     work overlapped, each at its rate on one multiprocessor, the longest unit's time (`units`), or its span
     at an in-kernel step's latency where longer (`spanned`); its device bytes the launch's, which a form of
-    its algebra does not change; or its longest dependent path at the part's latencies where longer
-    (`chained`)."""
-    return max(*units(work, rates(target, device=False))[0],
-               spanned(work, step_latency(target, device=False))[0], chained(work, target))
+    its algebra does not change; or its longest dependent path where longer (`path`)."""
+    return max(*units(work, rates(target, device=False))[0], path(work, target))
 
 
 def seconds(work: Work, target: generation.GpuTarget) -> float:
@@ -240,6 +267,5 @@ def seconds(work: Work, target: generation.GpuTarget) -> float:
     where unmeasured): a server's price of a step (`attention_decode.priced_step`), where `walked` is one
     program's."""
     launch = target.launch_seconds or 0.0
-    worked = max(*units(work, rates(target, device=True))[0],
-                 spanned(work, step_latency(target, device=False))[0], chained(work, target))
+    worked = max(*units(work, rates(target, device=True))[0], path(work, target))
     return worked + work.kernels * launch

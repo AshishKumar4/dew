@@ -324,7 +324,8 @@ class Walk:
         return tuple(kernel_cost.units(done, kernel_cost.rates(self.facts, device=False))[0])
 
     def spanned(self, done: Work) -> float:
-        return kernel_cost.spanned(done, kernel_cost.step_latency(self.facts, device=False))[0]
+        # The walk's longest dependent path, the peak its greedy price reads too (`templates.cost.path`).
+        return kernel_cost.path(done, self.facts)
 
     def __call__(self, done: Work) -> float:
         return kernel_cost.walked(done, self.facts)

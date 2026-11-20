@@ -29,7 +29,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn import derivatives, programs
 from dew.nn.kernels.templates import resources
-from dew.nn.kernels.templates.cost import Stated, Work
+from dew.nn.kernels.templates.cost import Chain, Stated, Work, followed
 
 
 class Unpriced(ValueError):
@@ -70,6 +70,15 @@ class Emitted:
         work outside its walks."""
         stepping = [unit(_mean(role.walks)) for role in self.roles if role.walks]
         return max(stepping, default=0) * steps + unit(self.fixed) * programs
+
+    def paths(self, steps: float) -> tuple[Chain, ...]:
+        """A program's dependent paths: each warpgroup's work outside its walks followed by a step of its walk
+        `steps` times (`cost.followed`), the warpgroups side by side (`Work.__add__`)."""
+        def walked(role: Role) -> Work:
+            step = tuple(chain.times(steps) for chain in _mean(role.walks).chains) if role.walks else ()
+            return Work(chains=followed(role.fixed.chains, step))
+
+        return sum(map(walked, self.roles), Work()).chains
 
 
 @dataclasses.dataclass(frozen=True)
@@ -633,8 +642,10 @@ where it leaves them unknown."""
 
 
 def _mean(walks: Sequence[Work]) -> Work:
-    """A step of `walks`, a role's loops: their steps' mean (`Role.step`)."""
-    return _times(sum(walks, Work()), 1 / len(walks))
+    """A step of `walks`, a role's loops: their steps' mean (`Role.step`), their paths followed one by the
+    next through the ring they share (`cost.followed`), each loop's weight kept, before the mean."""
+    paths = functools.reduce(followed, (walk.chains for walk in walks))
+    return _times(dataclasses.replace(sum(walks, Work()), chains=paths), 1 / len(walks))
 
 
 def _envelope(works) -> Work:
@@ -710,7 +721,8 @@ def launch_work(kernel, stated: Stated) -> Work:
     return Work(flops=issued("flops"), operations=issued("operations"), exponentials=issued("exponentials"),
                 conversions=issued("conversions"), device_bytes=stated.bytes_accessed,
                 shared_bytes=issued("shared_bytes"), tf32_flops=issued("tf32_flops"),
-                span=stated.steps / programs, fp8_flops=issued("fp8_flops"), kernels=1)
+                span=stated.steps / programs, fp8_flops=issued("fp8_flops"), kernels=1,
+                chains=counted.paths(stated.steps / programs))
 
 
 def _estimate(work: Work) -> pl.CostEstimate:
