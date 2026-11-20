@@ -1456,6 +1456,75 @@ def test_a_large_write_through_a_later_walks_gates_is_kept_by_the_merge(side):
                     f"a large write's {side} merged", seeds=16)
 
 
+def scalar_gla(h, q, k, v, g, beta):
+    """GLA's token under a decay a head's: the state decayed by `exp(g)`, then written."""
+    del q
+    return jnp.exp(g) * h + beta * k[:, None] * v[None, :]
+
+
+def steep_last_draw(seed: int):
+    """`scalar_gla`'s operands and a state entering of about 2^90 (within 2^96 of its values of about one,
+    row 2344's range): the last chunk no write and three gates of -39 to -41 at its second to fourth tokens,
+    so its readers after them read the state through a span past fp32's least normal (`e^-120`), about
+    2^-83, normal, and the chunk leaves it so. Its exponents multiples of 2^-10, every span's sum exact in
+    fp32 (row 9667's rounding none of the witness)."""
+    rng = np.random.default_rng([9660, seed, 2])
+    last = TOKENS - CHUNK
+    k = rng.standard_normal((TOKENS, KEY))
+    g = -np.round(rng.uniform(0, 1e-2, TOKENS) * 1024) / 1024
+    g[last + 1:last + 4] = -rng.integers(39, 42, 3)
+    beta = rng.uniform(0.05, 0.95, TOKENS)
+    beta[last:] = 0.0
+    drawn = (rng.standard_normal((TOKENS, KEY)), k / np.linalg.norm(k, axis=-1, keepdims=True),
+             rng.standard_normal((TOKENS, VALUE)), g, beta, 2.0 ** 90 * rng.standard_normal((KEY, VALUE)))
+    return tuple(jnp.asarray(x, jnp.float32) for x in drawn)
+
+
+def late_reads(run):
+    """`run`'s outputs of the last chunk's readers after its gates and its final state, and their tangent
+    and every operand's gradient (`jax.jvp`, `jax.vjp`)."""
+    def late(*primals):
+        outputs, final = run(*primals)
+        return outputs[TOKENS - CHUNK + 4:], final
+
+    def ran(*primals):
+        value, pull = jax.vjp(late, *primals)
+        tangents = tuple(jnp.full_like(x, 1e-2) for x in primals)
+        return {"late": value[0], "final": value[1], "gradients": pull(tuple(map(jnp.ones_like, value))),
+                "tangent": jax.jvp(late, primals, tangents)[1]}
+
+    return ran
+
+
+def test_a_steep_chunks_split_decays_keep_the_state_it_enters_and_leaves():
+    """GLA under a decay a head's (`scalar_gla`), its dual form (an H100's), the state entering its last chunk
+    about 2^90 and that chunk's three gates of -40 (`steep_last_draw`): its readers after the gates (through
+    `entering`) and the state it leaves (through `whole`), their tangent and every gradient through the
+    forms' own derivatives, on par with the token scan's from float64 (check 1), each standalone decay
+    (`e^-120`) taken as two normal factors (`scan._Split`), where whole it underflowed to zero and read the
+    state as none (row 9660)."""
+    declared = scan.Scan(scalar_gla, gated_readout, GATED, walked="time", state=((KEY, VALUE), jnp.float32))
+
+    def tokenwise(q, k, v, g, beta, h0):
+        def one(h, token):
+            h = scalar_gla(h, *token)
+            return h, gated_readout(h, *token)
+
+        final, outputs = jax.lax.scan(one, h0, (q, k, v, g, beta))
+        return outputs, final
+
+    with generation.assumed("sm90"):
+        forms = scan.derive_scan(declared, saturation=SATURATION)
+
+        def walked(q, k, v, g, beta, h0):
+            values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+            outputs, state = walk(forms, values, range(TOKENS // CHUNK), (forms.init({})[0], h0), GATED)
+            return jnp.concatenate(outputs), forms.finish(state, values)
+
+        assert_as_exact(jax.jit(late_reads(walked)), jax.jit(late_reads(tokenwise)), steep_last_draw,
+                        "a steep last chunk's split decays", seeds=16)
+
+
 def corrected_two_sided(h, q, k, v, g, e, beta):
     """A two-sided decay beside the delta rule's correction, which no chunk form takes."""
     del q
