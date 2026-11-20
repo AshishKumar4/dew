@@ -497,11 +497,12 @@ def _merges(call: Call) -> tuple:
 
 def _merged(call: Call) -> Operand:
     """The form the doubling's merges take the inverse and its power in (`_merges`): an fp32 call's; a
-    `ranged` 16-bit call's fp32 in its fast forms' parts (`_fast_parts`), fp32's range at TF32's precision or
-    past it; else one fp16 part."""
+    `ranged` or `bfloat16` 16-bit call's fp32 in its fast forms' parts (`_fast_parts`), fp32's range at
+    TF32's precision or past it (fp16 underflows tiny write gates below 2^-24, zeroing a bf16 chunk inverse
+    under faint cross terms, row 8569); else one fp16 part."""
     if call.held.dtype == jnp.float32:
         return call.held
-    if call.ranged:
+    if call.ranged or call.held.dtype == jnp.bfloat16:
         return Operand(call.rows, _fast_parts(call.family), jnp.dtype(jnp.float32))
     return Operand(call.rows, 1, jnp.dtype(jnp.float16))
 
