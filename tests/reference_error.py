@@ -2082,9 +2082,10 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     third value returned is the truth of the site's `Followed`, which holds Dew's float64 path,
     following the recorded decisions, to the recorded truth at each seed before it follows an arm's. Its
     reference and truth are host functions, called as check 1 calls them, not traced. Where it holds
-    pilots (`<site>.pilot.`, `merge_shards`), seeds from SIZING_FROM on read them, and its reference
-    carries them (`recorded_pilots`'s `.pilots`), so a paired sizing of it takes those draws alone
-    (`seeds_for`).
+    pilots (`<site>.pilot.`: a summary's `merge_shards`, a whole recording's `<site>.pilot.input.<name>`,
+    `.reference.` and `.truth.`, its generator's draws from SIZING_FROM on), seeds from SIZING_FROM on read
+    them, and its reference carries them (`recorded_pilots`'s `.pilots`), so a sizing of it takes those draws
+    alone (`seeds_for`).
 
     With `leaves`, the recording is read for those leaves alone (`_of_leaves`): a site whose leaves are
     judged in groups, each its own test, reads each group so, its Dew arm and truth giving that group's
@@ -2095,63 +2096,9 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     if any(name.startswith(f"{site}.sketch.") for name in stored):
         return _summarized(stored, site, seeds, inputs_of, truth_fn)
 
-    def tree(kind):
-        prefix = f"{site}.{kind}."
-        return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
+    from recordings import whole_recording
 
-    inputs, reference, truth, replayed = tree("input"), tree("reference"), tree("truth"), tree("replayed")
-    narrow = [name for name, value in truth.items()
-              if jnp.issubdtype(value.dtype, jnp.floating) and value.dtype != np.float64]
-    if narrow:
-        raise AssertionError(f"{site}: the recorded truth {narrow} is not float64; record it in float64, as "
-                             f"no later widening recovers what a narrower recording dropped")
-    if inputs_of is None and not inputs:
-        raise AssertionError(f"{site}: no inputs recorded and no `inputs_of` to draw them again")
-    if int(stored.get(f"{site}.redraw", -1)) != REDRAW:
-        raise AssertionError(f"{site}: the recording holds no `{site}.redraw` of {REDRAW}, which "
-                             f"record_case writes and the fetched store's rule reads it by")
-    digests = stored.get(f"{site}.input_digest")
-    if inputs_of is not None and digests is None:
-        raise AssertionError(f"{site}: `inputs_of` draws the inputs again and the recording keeps no "
-                             f"digest to check them by; record the outputs alone (`store_inputs=False`)")
-    recorded = [*reference.values(), *truth.values(),
-                *(inputs.values() if inputs_of is None else [digests])]
-    count = min(len(value) for value in recorded)
-    if count < staged_units(seeds):
-        raise AssertionError(f"{site}: {count} recorded seeds, and check 1 over {seeds} may draw "
-                             f"{staged_units(seeds)}; record (1 + REDRAW) times the declared seeds")
-
-    def draw(seed):
-        if inputs_of is None:
-            drawn = {name: value[seed] for name, value in inputs.items()}
-        else:
-            drawn = drawn_on_the_host(inputs_of, seed)
-            if input_digest(drawn) != digests[seed]:
-                raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones "
-                                     f"(their digest differs); the generator's draw changed since the "
-                                     f"recording")
-        return np.int32(seed), {**drawn, **{name: value[seed] for name, value in replayed.items()}}
-
-    def lookup(values):
-        # A draw's recorded leaves are read from the host at the draw's index, in the dtypes the caller's
-        # context holds them in. A recording is never a program's constants, which exhaust a host's memory
-        # where a weighed recording keeps thousands of draws whole. An arm that wraps this one and is traced
-        # reads at run time (`jax.pure_callback`); JAX keeps a callback as long as its program, so the
-        # gate's own read, its index in hand, goes through none.
-        def read(at):
-            return {name: value[int(at)] for name, value in values.items()}
-
-        def recorded(index, inputs):
-            if not isinstance(index, jax.core.Tracer):
-                return {name: jnp.asarray(value) for name, value in read(index).items()}
-            kept = {name: jax.ShapeDtypeStruct(value.shape[1:], jax.dtypes.canonicalize_dtype(value.dtype))
-                    for name, value in values.items()}
-            return jax.pure_callback(
-                lambda at: {name: np.asarray(value, kept[name].dtype) for name, value in read(at).items()},
-                kept, index, vmap_method="sequential")
-        return as_recorded(recorded)
-
-    return draw, lookup(reference), lookup(truth)
+    return whole_recording(stored, site, seeds, inputs_of)
 
 
 def _recorded_tree(stored, site: str, kind: str) -> dict[str, np.ndarray]:

@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.parity_stages import staged_units
+from dew.parity_stages import SIZING_FROM, staged_units
 
 FACTOR = 2.0
 
@@ -1762,10 +1762,6 @@ def _drawn_from(names: list[str], widths: tuple[int, ...], evidence: list[list[t
                   widths, examples, example_rows, _shares(each(6), count))
 
 
-SIZING_FROM = 1 << 20
-"""The first seed a paired sizing draws (`seeds_for` with `dew_fn`): past every site's verdict seeds
-and below every null run's (tools/gate_null_runs.py, from 2^16 runs of at least 80 seeds on), so the
-count a site declares is fixed by draws its verdict never sees."""
 
 
 MOST_SEEDS = 512

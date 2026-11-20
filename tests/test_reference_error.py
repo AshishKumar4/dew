@@ -694,6 +694,39 @@ def test_a_reference_sized_against_itself_draws_none_of_a_verdicts_seeds():
     assert min(drawn) >= SIZING_FROM
 
 
+def test_a_whole_recording_with_pilots_is_sized_against_itself_on_its_pilots_alone():
+    """A whole recording (its reference's outputs kept, `indexed_recording`) whose generator recorded pilots
+    from SIZING_FROM on (`<site>.pilot.`, tools/block_override_reference.py's): its reference sized against
+    itself (`seeds_for`) draws its pilots alone, none of its verdict seeds, where a whole recording read no
+    pilots and such a sizing, which draws no verdict seed now, was refused (row 9005's head review)."""
+    from reference_error import indexed_recording, seeds_for
+
+    from dew.parity import SIZING_FROM
+    from dew.parity_stages import REDRAW, staged_units
+
+    def recorded(seeds):
+        drawn = [_draw(seed) for seed in seeds]
+        return ({"x": np.stack([x for x, _ in drawn]), "w": np.stack([w for _, w in drawn])},
+                np.stack([np.asarray(x) @ np.asarray(w) for x, w in drawn]),
+                np.stack([x.astype(np.float64) @ w.astype(np.float64) for x, w in drawn]))
+
+    stored = {"site.redraw": np.asarray(REDRAW)}
+    for under, seeds in (("site", range(staged_units(8))),
+                         ("site.pilot", range(SIZING_FROM, SIZING_FROM + 32))):
+        inputs, reference, truth = recorded(seeds)
+        stored.update({f"{under}.input.{name}": value for name, value in inputs.items()})
+        stored.update({f"{under}.reference.y": reference, f"{under}.truth.y": truth})
+    draw, reference, truth = indexed_recording(stored, "site", 8)
+    asked = []
+
+    def counted(seed):
+        asked.append(seed)
+        return draw(seed)
+
+    seeds_for(reference, counted, "a whole recording's pilots", truth_fn=truth, most=8)
+    assert min(asked) >= SIZING_FROM
+
+
 def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
     """`torch_with_gradients` gives, bit for bit, a torch function's output and the gradients torch's
     autograd pulls back from the cotangent passed last, cast to the output's dtype, at float32 and at

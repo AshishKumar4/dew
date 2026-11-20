@@ -79,9 +79,9 @@ def cells(test: str) -> list:
 def test_a_kernel_runs_per_shard(module, choice, kernel, label):
     """One kernel's per-shard cell where this process's devices run it (`sharded.interprets` on the CPU's;
     on a GPU's, a GPU generation's cell this GPU runs, `generation_support.runnable`; on a TPU's, its own
-    generation's), skipped where they do not; a kernel's test (`kernel`), so the native tiers, which select
-    their GPU's and their TPU's kernel tests, run it on its own devices (spec alignment, 9002: marked for a
-    mesh alone it ran on no native device, and on one it took any GPU's cell for this one's)."""
+    generation's), skipped where they do not (spec alignment, 9002: on a GPU it took any GPU generation's
+    cell for this one's). Its native run takes two devices of one generation, which a host is run on by hand:
+    the GPU tier selects `gpu` flows on hosts of one GPU each, so no tier runs these cells natively yet."""
     shard = stated(module, choice, kernel)[label]
     platform = jax.default_backend()
     gpu_cell = shard.target.startswith("sm")

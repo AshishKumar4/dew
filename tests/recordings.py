@@ -1,0 +1,97 @@
+"""A recording of a reference over seeds read whole (`reference_error.indexed_recording`'s path for a
+recording that keeps the reference's outputs, not its evidence alone): its draw, reference and truth, each
+seed's recorded row, a pilot's (from SIZING_FROM on) where the recording holds pilots."""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from arm_forms import as_recorded
+from reference_error import SIZING_FROM, drawn_on_the_host, input_digest
+
+from dew.parity_stages import REDRAW, staged_units
+
+
+def whole_recording(stored, site: str, seeds: int, inputs_of):
+    """`indexed_recording`'s draw, reference and truth of a whole recording `stored` of `site`, which
+    covers check 1 over `seeds` (its account's, `reference_error.indexed_recording`), its pilots
+    (`<site>.pilot.input.<name>`, `.reference.`, `.truth.`, `.replayed.`, and `.input_digest` where
+    `inputs_of` draws its inputs again) read at seeds from SIZING_FROM on and carried by its reference
+    (`as_recorded`'s `pilots`), so a sizing of it takes them alone (`seeds_for`)."""
+    def tree(kind):
+        prefix = f"{site}.{kind}."
+        return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
+
+    inputs, reference, truth, replayed = tree("input"), tree("reference"), tree("truth"), tree("replayed")
+    narrow = [name for name, value in truth.items()
+              if jnp.issubdtype(value.dtype, jnp.floating) and value.dtype != np.float64]
+    if narrow:
+        raise AssertionError(f"{site}: the recorded truth {narrow} is not float64; record it in float64, as "
+                             f"no later widening recovers what a narrower recording dropped")
+    if inputs_of is None and not inputs:
+        raise AssertionError(f"{site}: no inputs recorded and no `inputs_of` to draw them again")
+    if int(stored.get(f"{site}.redraw", -1)) != REDRAW:
+        raise AssertionError(f"{site}: the recording holds no `{site}.redraw` of {REDRAW}, which "
+                             f"record_case writes and the fetched store's rule reads it by")
+    digests = stored.get(f"{site}.input_digest")
+    if inputs_of is not None and digests is None:
+        raise AssertionError(f"{site}: `inputs_of` draws the inputs again and the recording keeps no "
+                             f"digest to check them by; record the outputs alone (`store_inputs=False`)")
+    recorded = [*reference.values(), *truth.values(),
+                *(inputs.values() if inputs_of is None else [digests])]
+    count = min(len(value) for value in recorded)
+    if count < staged_units(seeds):
+        raise AssertionError(f"{site}: {count} recorded seeds, and check 1 over {seeds} may draw "
+                             f"{staged_units(seeds)}; record (1 + REDRAW) times the declared seeds")
+
+    pilot = {kind: tree(f"pilot.{kind}") for kind in ("input", "reference", "truth", "replayed")}
+    pilot_digests = stored.get(f"{site}.pilot.input_digest")
+    pilots = min((len(value) for value in (*pilot["reference"].values(), *pilot["truth"].values(),
+                                           *(pilot["input"].values() if inputs_of is None else
+                                             [] if pilot_digests is None else [pilot_digests]))), default=0)
+
+    def at(seed: int, verdict: dict, piloted: dict):
+        """`seed`'s row: a verdict seed's in `verdict`, a pilot's (from SIZING_FROM on) in `piloted`."""
+        if seed < SIZING_FROM:
+            return verdict, seed
+        if seed >= SIZING_FROM + pilots:
+            raise AssertionError(f"{site}: seed {seed} is past the recording's {pilots} pilots from "
+                                 f"SIZING_FROM")
+        return piloted, seed - SIZING_FROM
+
+    def draw(seed):
+        if inputs_of is None:
+            held, row = at(seed, inputs, pilot["input"])
+            drawn = {name: value[row] for name, value in held.items()}
+        else:
+            drawn = drawn_on_the_host(inputs_of, seed)
+            kept, row = at(seed, {"digest": digests}, {"digest": pilot_digests})
+            if input_digest(drawn) != kept["digest"][row]:
+                raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones "
+                                     f"(their digest differs); the generator's draw changed since the "
+                                     f"recording")
+        held, row = at(seed, replayed, pilot["replayed"])
+        return np.int32(seed), {**drawn, **{name: value[row] for name, value in held.items()}}
+
+    def lookup(values, piloted):
+        # A draw's recorded leaves are read from the host at the draw's index, in the dtypes the caller's
+        # context holds them in. A recording is never a program's constants, which exhaust a host's memory
+        # where a weighed recording keeps thousands of draws whole. An arm that wraps this one and is traced
+        # reads at run time (`jax.pure_callback`); JAX keeps a callback as long as its program, so the
+        # gate's own read, its index in hand, goes through none.
+        def read(index):
+            held, row = at(int(index), values, piloted)
+            return {name: value[row] for name, value in held.items()}
+
+        def recorded(index, inputs):
+            if not isinstance(index, jax.core.Tracer):
+                return {name: jnp.asarray(value) for name, value in read(index).items()}
+            kept = {name: jax.ShapeDtypeStruct(value.shape[1:], jax.dtypes.canonicalize_dtype(value.dtype))
+                    for name, value in values.items()}
+            return jax.pure_callback(
+                lambda index: {name: np.asarray(value, kept[name].dtype)
+                               for name, value in read(index).items()},
+                kept, index, vmap_method="sequential")
+        # Its pilots, where it holds them, a sizing's draws (`seeds_for`, `_paired_most`).
+        return as_recorded(recorded, range(SIZING_FROM, SIZING_FROM + pilots) if pilots else None)
+
+    return draw, lookup(reference, pilot["reference"]), lookup(truth, pilot["truth"])
