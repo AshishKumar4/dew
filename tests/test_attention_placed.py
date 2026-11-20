@@ -279,10 +279,16 @@ def test_the_correction_warpgroup_at_d256_holds_protocol_in_every_interleaving(c
     with pytest.raises(Violation):
         explore(mutated, arrivals)
     if call == "full" and not moves:
-        for lengths in (jnp.asarray([0], jnp.int32), jnp.asarray([64], jnp.int32)):
-            short = template.spans(256, 320, 1, lengths=lengths)
-            short_threads, short_arrivals = programs(_placed_forward(ROWS_TILES, short), query, key,
-                                                     threads=3, rare=False)
+        q1, k1 = jnp.ones((1, 128, 1, 256), jnp.bfloat16), jnp.ones((1, 128, 1, 256), jnp.bfloat16)
+        for steps in (0, 1):
+            short = template.KeySpans(start=jnp.zeros((1, 128), jnp.int32),
+                                      end=jnp.full((1, 128), steps * 64, jnp.int32),
+                                      query_ids=None, key_ids=None, keys=128)
+            short_maps = {5: np.array([[0]], np.int32), 6: np.array([[steps]], np.int32),
+                          7: np.array([[0]], np.int32), 8: np.array([[steps]], np.int32)}
+            short_threads, short_arrivals = programs(_placed_forward(ROWS_TILES, short), q1, k1, threads=3,
+                                                     rare=False,
+                                                     known=lambda idx, _aval, m=short_maps: m.get(idx))
             assert explore(short_threads, short_arrivals) > 0
 
 
