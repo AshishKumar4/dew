@@ -116,6 +116,14 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
         `MosaicGmm`) and a kernel gradient's (`Tgmm`, `MosaicTgmm`) each their own; None here."""
         return None
 
+    def prepared(self, name: str, value):
+        """The launch's `Hooks` as every launch takes them (`tuning.KernelOp.prepared`): its prologue and
+        epilogue each prepared, an explicit caller's and an inferred fusion's alike (`tuning.prepared`)."""
+        if not isinstance(value, Hooks):
+            return super().prepared(name, value)
+        return dataclasses.replace(value, prologue=tuning.prepared(value.prologue),
+                                   epilogue=tuning.prepared(value.epilogue))
+
     def traced(self, name: str, value: Callable | str | None) -> str | None:
         """The launch's `Hooks` as its picks key them (`tuning.KernelOp.traced`): each hook by what it
         computes (`tuning.program`) as a kernel traces it (`Hooks.before`, `Hooks.after`), at a

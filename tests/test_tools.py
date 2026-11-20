@@ -2480,6 +2480,14 @@ def test_a_float64_truth_takes_a_tensors_float32_softmax_in_float64():
 # tools/kernel_routes.py
 
 
+def test_the_route_census_visits_each_tpu_a_template_runs_on():
+    """The census traces each family on every TPU Dew's templates run on, a v5e's capabilities apart from
+    a v6e's (a quarter of its MXU, half its scoped VMEM, no fp16), not on one model of them (spec
+    alignment 2026-11-19 PM, F39)."""
+    tool = load("kernel_routes")
+    assert {"v5e", "v6e"} <= set(tool.audited())
+
+
 def test_the_route_census_reports_a_route_its_host_cannot_lower_and_a_trace_that_failed():
     """A cell whose target route takes a kernel its host cannot lower is reported and explained (the route is
     the target's answer); one whose trace met a defect is reported and left unexplained, its failure named."""
