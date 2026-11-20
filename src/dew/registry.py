@@ -267,13 +267,26 @@ def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) ->
         # path holds: only a module the process can import is imported.
         if package.replace(".", "").isidentifier() and _importable(package):
             importlib.import_module(package)
-    # Only JSON a record holds (`json_value` refuses any other), its every string read once.
-    for named in strings_of(json_value(record, "record")):
+    # Only JSON a record holds (`json_value` refuses any other), its every string read once, but a run's
+    # own processor's record (`custom`), whose strings are its user's data: its classes import where the
+    # registry reaches them (`imported`).
+    for named in strings_of(_without_custom(json_value(record, "record"))):
         module, colon, name = named.partition(":")
         # A string shaped as an import path that names no module (a text field's) is data, not a module.
         if (colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier()
                 and _importable(module)):
             importlib.import_module(module)
+
+
+def _without_custom(record: JSON) -> JSON:
+    """`record` with every `custom` entry (`TaskSettings.custom`) left out, at any depth."""
+    match record:
+        case dict():
+            return {key: _without_custom(value) for key, value in record.items() if key != "custom"}
+        case list():
+            return [_without_custom(value) for value in record]
+        case _:
+            return record
 
 
 def _importable(name: str) -> bool:
@@ -1199,11 +1212,14 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
             # scalar or a dtype's name is read as before (`_rebuilt`).
             return value
         return _rebuilt(declared, configured(value), dtypes=dtypes, name=name)
+    if not (isinstance(value, (Mapping, list, str)) or (dtypes and name == "dtype")):
+        return value
     named = parameters(member)[0]
     declared = parameter_type(named[name][1], name) if name in named else None
-    # A duration a constructor declares is recorded as its text (`_records.recorded_duration`).
-    if not (isinstance(value, (Mapping, list)) or (dtypes and name == "dtype")
-            or (declared is datetime.timedelta and isinstance(value, str))):
+    # A text is kept as given but where its parameter declares a duration, recorded as its text
+    # (`_records.recorded_duration`), optional or not.
+    if (isinstance(value, str) and not (dtypes and name == "dtype")
+            and datetime.timedelta not in (declared, *_union_members(declared))):
         return value
     return _rebuilt(declared, value, dtypes=dtypes, name=name)
 
