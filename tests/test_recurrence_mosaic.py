@@ -2116,27 +2116,14 @@ def test_a_training_step_the_fast_backward_does_not_take_certifies_no_gradient()
 RUNG_LOWERED = """
 import collections, json
 from jax._src import monitoring
-from dew.nn.kernels.templates import resources
 from dew.training.runtime import ready_process
 import test_recurrence_mosaic as gate
-
-class SteppedReverse(type(gate.template.MOSAIC)):
-    def derived(self, ba, target):
-        # Row 6755's SUB-token reverse walk holds unspilled at the B200 floor; start at a spilling producer
-        # cap (88) so certification steps to a clean rung (24) and proves every other kernel hits cache.
-        config = super().derived(ba, target)
-        return gate.template._limited(config, producers=resources.Producers((("recurrence_reverse", 88),)),
-                                      residents=config.residents)
-
-    def rungs(self, ba, config):
-        yield gate.template._limited(config, producers=resources.Producers((("recurrence_reverse", 24),)),
-                                     residents=config.residents)
 
 served = collections.Counter()
 monitoring.register_event_listener(
     lambda event, **_: served.update([event.rsplit("/", 1)[-1]]) if "lowering_cache" in event else None)
 ready_process()
-certified, _ = gate._reverse_walk_certified(SteppedReverse())
+certified, _ = gate._reverse_walk_certified()
 print(json.dumps({"served": dict(served), "kernels": [len(each.kernels) for each in certified],
                   "raised": [each.config.producers.of("recurrence_reverse") for each in certified]}))
 """
@@ -2270,16 +2257,10 @@ def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     from dew.nn.kernels.templates import resources
 
     class PastItsTop(type(template.MOSAIC)):
-        def derived(self, ba, target):
-            config = super().derived(ba, target)
-            return template._limited(config, producers=resources.Producers((('recurrence_reverse', 88),)),
-                                     residents=config.residents)
-
         def rungs(self, ba, config):
             yield template._limited(config, producers=resources.Producers((('recurrence_reverse', 232),)),
                                     residents=config.residents)
-            yield template._limited(config, producers=resources.Producers((('recurrence_reverse', 24),)),
-                                    residents=config.residents)
+            yield from super().rungs(ba, config)
 
     certified, refused = _reverse_walk_certified(PastItsTop())
     taken = [each.config.producers.of('recurrence_reverse') for each in certified]

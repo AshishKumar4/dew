@@ -582,7 +582,8 @@ def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: 
     final_landing, after = final_memory_landing(call, bv)
     # Reversed SUB-token reads contract `algebra.SUB` rows, which wgmma/tcgen05 issue in whole swizzles:
     # size `queries` and the chunk-tall staging tiles to that depth (as `key_backward._key_pairs_staged`).
-    sub_swizzle = None if call.per_key else swizzling.swizzle_for(held.stored, algebra.SUB)
+    reverse_sub = not call.per_key and not call.delta
+    sub_swizzle = swizzling.swizzle_for(held.stored, algebra.SUB) if reverse_sub else None
     sub_tx = None if sub_swizzle is None else swizzling.swizzle_transforms(held.stored, sub_swizzle)
     staged_shapes = tuple(dict.fromkeys(((call.block, bv), (chunk, bv))))
     staged_sets = tuple(
@@ -593,7 +594,7 @@ def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: 
                    else plgpu.SMEM((chunk, bv), held.stored))
     swizzles = ({f"queries{p}": swizzling.swizzle_for(keyed.stored, algebra.SUB)
                  for p in range(keyed.parts)}
-                if not call.per_key else None)
+                if reverse_sub else None)
     return launch_kernel(program, call, out_type=out_type, grid=(value_width // walked_width, sequences,
                                                                  call.heads),
                          # Two deep where the block holds both, else one: fp32's two parts and 256-wide keys
@@ -758,14 +759,18 @@ def _reverse_carried(call: Call, slots, grad: list, out: Parts, columns, issue: 
     gate, low = (family.rows_of(ref.at[h, span]) for ref in prefix)
     ending, ending_low = (jnp.full((chunk,), ref[h, last]) for ref in prefix)
     kept = [algebra.raised(*(jnp.full((call.block,), ref[h, last]) for ref in prefix))[:, None]] * len(grad)
-    def reversed_reads(i: int, read: jax.Array) -> jax.Array:
-        q_tile, r_tile = queries(i), operands.staged(family, read, reads_scratch)
-        step = algebra.SUB if chunk >= algebra.SUB and chunk % algebra.SUB == 0 else chunk
-        blocks = chunk // step
-        return functools.reduce(
-            jnp.add,
-            (issue("reads", q_tile.rows(s, step).T, r_tile.rows(s, step))
-             for s in range((blocks - 1) * step, -1, -step)))
+    if not call.delta:
+        def reversed_reads(i: int, read: jax.Array) -> jax.Array:
+            q_tile, r_tile = queries(i), operands.staged(family, read, reads_scratch)
+            step = algebra.SUB if chunk >= algebra.SUB and chunk % algebra.SUB == 0 else chunk
+            blocks = chunk // step
+            return functools.reduce(
+                jnp.add,
+                (issue("reads", q_tile.rows(s, step).T, r_tile.rows(s, step))
+                 for s in range((blocks - 1) * step, -1, -step)))
+    else:
+        def reversed_reads(i: int, read: jax.Array) -> jax.Array:
+            return issue("reads", queries(i).T, read)
 
     return algebra.reverse_carried(grad, keys, weights, out.value(), local, gate, low, ending,
                                    ending_low, kept, scale, held.dtype, issue, reads=reversed_reads)
