@@ -1313,12 +1313,13 @@ def test_a_narrow_float_widens_as_it_converts(source):
 
 
 def test_an_aligned_sums_shared_float32_factor_takes_its_gradient_summed_wide():
-    """The gradient of `sum(aligned_sum([(a, b)], axis=0))` in a float32 `a` shared against a float64 `b`
-    of `2^140` and `-2^140`, with x64 on: 0, the cotangents summed in float64 and cast once, where each was
-    cast to float32 first, infinite, and their sum NaN (base review 279405f7f F1)."""
+    """The gradient in a float32 `a` shared by a batch of aligned sums `aligned_sum([(a, b)])` (`jax.vmap`
+    over float64 `b` of `2^140` and `-2^140`), with x64 on, summed over the batch: 0, each cotangent in
+    float64 through the batch's sum and cast once, where each was cast to float32 first, infinite, and
+    their sum NaN (base review 279405f7f F1)."""
     with jax.enable_x64(new_val=True):
         b = jnp.asarray([2.0 ** 140, -(2.0 ** 140)], jnp.float64)
-        gradient = jax.grad(lambda a: jnp.sum(aligned_sum([(a, b)], axis=0)))(jnp.float32(1.0))
+        gradient = jax.grad(lambda a: jnp.sum(jax.vmap(lambda b: aligned_sum([(a, b)]))(b)))(jnp.float32(1.0))
     assert gradient.dtype == jnp.float32
     np.testing.assert_array_equal(np.asarray(gradient), 0.0)
 
@@ -1955,16 +1956,21 @@ def power2_rounds_a_subnormal_result_once():
 
     from dew.nn.precision import power2
 
+    # Each exponent given (traced) and fixed (a constant the compiler folds its factors of): a scalar and
+    # two broadcast against the operand (base review 3e560b112, row 9469).
+    fixed = (np.int32(-149), np.full((2,), -149, np.int32))
+
     def scaled(x, one, cotangent, exponents):
-        pulled = [jax.vjp(lambda y, k=k: power2(y, k), one)[1](jnp.broadcast_to(cotangent, k.shape))[0]
-                  for k in (exponents[0], exponents)]
-        return power2(x, exponents[0]), *pulled
+        exponents = (exponents[0], exponents, *fixed)
+        pulled = [jax.vjp(lambda y, k=k: power2(y, k), one)[1](jnp.broadcast_to(cotangent, np.shape(k)))[0]
+                  for k in exponents]
+        return power2(x, exponents[0]), power2(x, fixed[0]), *pulled
 
     tiny = np.float32(0.5 + 2.0 ** -24)
     found = ahead_arm(jax.jit(scaled), "a power of two's scaling and its pullback")(
         tiny, np.float32(1.0), tiny, np.full((2,), -149, np.int32))
     # Each one correctly rounded answer: the least subnormal's bits, twice it summed.
-    for value, bits in zip(found, (1, 1, 2), strict=True):
+    for value, bits in zip(found, (1, 1, 1, 2, 1, 2), strict=True):
         value = np.asarray(value)
         assert value.dtype == np.float32 and value.view(np.uint32) == bits, value.view(np.uint32)
 
