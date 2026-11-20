@@ -300,28 +300,30 @@ def train_and_reload(task, source, reference, key, given, noise):
 
 
 PARTS = ("walk", "update")
-"""What a pipeline's check holds (`check_pipeline`): the suite runs each part in a process of its own, and a
-call that names no `--part` runs both in one."""
+"""What a pipeline's check holds (`check_pipeline`): a call that names no `--part` runs both in one
+process, over one load of each pipeline, as the suite runs them."""
 
 
-def check_pipeline(directory, part: str, streamed: bool = False):
-    """The saved pipeline against the source: its trajectory (`part` 'walk') or its update, reload and
-    export ('update'). With `streamed`, the pipeline streamed onto a mesh a leaf at a time loads the
-    same tree, placed on the mesh, its walk is held to the source as the whole load's is
-    (`streamed_parity`), and it is the pipeline the update, reload and export run on, under the
-    conditions its public `prepare` builds."""
+def check_pipeline(directory, parts: tuple[str, ...] = PARTS, streamed: bool = False):
+    """The saved pipeline against the source: its trajectory ('walk' in `parts`) and its update, reload
+    and export ('update'), the parts sharing each load (no part changes a pipeline it reads). With
+    `streamed`, the pipeline streamed onto a mesh a leaf at a time loads the same tree, placed on the mesh,
+    its walk is held to the source as the whole load's is (`streamed_parity`), and it is the pipeline the
+    update, reload and export run on, under the conditions its public `prepare` builds."""
     directory = Path(directory)
     reference = dict(np.load(directory / "reference.npz"))
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
     key = jax.random.PRNGKey(17)
-    if part == "walk":
-        source = bundle(directory)
-        qualified(directory.name, source, reference, meta, key)
+    loaded = {}
+    if "walk" in parts:
+        loaded[False] = bundle(directory)
+        qualified(directory.name, loaded[False], reference, meta, key)
         if streamed:
-            streamed_parity(directory, source, reference, meta, key)
+            loaded[True] = streamed_parity(directory, loaded[False], reference, meta, key)
         print(json.dumps({"directory": str(directory), "walk": "held"}))
+    if "update" not in parts:
         return
-    source = bundle(directory, streamed=streamed)
+    source = loaded[streamed] if streamed in loaded else bundle(directory, streamed=streamed)
     given, null, process, times = selection(source, meta)
     prepared = public_start(source.text_to_image(), source, reference, meta, key, given, null, process, times)
     given, _ = walked(prepared, given, null)
@@ -405,7 +407,8 @@ def qualified(name, source, reference, meta, key, label=""):
 def streamed_parity(directory, whole, reference, meta, key):
     """The pipeline streamed onto a mesh a leaf at a time: every leaf the whole load holds, bit for
     bit, each placed on the mesh, and its walk held to the source as the whole load's is (`qualified`):
-    another program than the whole load's, which XLA need not round alike."""
+    another program than the whole load's, which XLA need not round alike. The streamed load, for the
+    checks after it."""
     streamed = bundle(directory, streamed=True)
     assert jax.tree.structure(streamed.variables) == jax.tree.structure(whole.variables)
     for path, leaf in jax.tree_util.tree_leaves_with_path(streamed.variables):
@@ -414,6 +417,7 @@ def streamed_parity(directory, whole, reference, meta, key):
                            strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
     qualified(directory.name, streamed, reference, meta, key, label="streamed ")
+    return streamed
 
 
 def pipeline_arms(site, root=None):
@@ -732,5 +736,4 @@ if __name__ == "__main__":
     elif args.case:
         regress(args.directory, args.case)
     else:
-        for part in PARTS if args.part is None else (args.part,):
-            check_pipeline(args.directory, part, args.streamed)
+        check_pipeline(args.directory, PARTS if args.part is None else (args.part,), args.streamed)
