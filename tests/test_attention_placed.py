@@ -8,6 +8,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from generation_support import INTERPRETS
 from reference_error import assert_as_exact
@@ -23,7 +24,7 @@ from test_attention_mosaic import (
 )
 from test_attention_template import CASES, arguments, geometry as core_geometry
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic
 
 pytestmark = pytest.mark.kernel
@@ -59,6 +60,36 @@ def test_the_forward_on_tcgen05s_rows_holds_check_1_over_short_walks_interpreted
     (`placed.issued`), under the interpreter: on par with the reference (check 1)."""
     _check_forward("full", jnp.bfloat16, (1, tokens, 2, 1), natural=False, interpret=True, width=64,
                    value_width=64, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
+
+
+@INTERPRETS
+def test_the_forward_on_tcgen05s_rows_streams_values_its_keys_columns_as_handed_interpreted():
+    """A forward whose values are its keys' leading columns (`in_key`) on a B200's tcgen05 rows, whose
+    issuing role declares the values' stream (`MosaicForward.reads_key_slot`), streams the value array it
+    was handed: bit for bit the same call without `in_key`, under the interpreter (row 6643)."""
+    shape = (1, 128, 1, 64)
+    query, key = (jax.random.normal(stream, shape, jnp.float32).astype(jnp.bfloat16)
+                  for stream in jax.random.split(jax.random.key(0), 2))
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
+        keyed, unkeyed = (attention_mosaic.forward(query, key, key, spans, None, interpret=True,
+                                                   in_key=in_key) for in_key in (True, False))
+    np.testing.assert_array_equal(np.asarray(keyed, np.float32), np.asarray(unkeyed, np.float32))
+
+
+@INTERPRETS
+def test_the_forward_on_tcgen05s_rows_keeps_a_subnormal_output_interpreted():
+    """The forward on a B200's tcgen05 rows, its sums kept in tensor memory and taken by their rows' ratio
+    as stored (`mosaic.Kept.scale`), under the interpreter on XLA's CPU, which flushes a subnormal product:
+    a full bf16 call of 128 keys, every logit 0, one key's values 2^-120 and the rest 0, returns 2^-127
+    (below fp32's and bf16's least normal) at every entry, exactly, as every other forward finish does
+    (`algebra.quotient`, row 6302), where the product by the inverse total returned 0."""
+    query = jnp.zeros((1, 128, 1, 64), jnp.bfloat16)
+    value = jnp.zeros_like(query).at[:, 0].set(2.0 ** -120)
+    spans = template.spans(128, 128, 1)
+    with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
+        out = attention_mosaic.forward(query, query, value, spans, None, interpret=True)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full(out.shape, 2.0 ** -127, np.float32))
 
 
 @INTERPRETS

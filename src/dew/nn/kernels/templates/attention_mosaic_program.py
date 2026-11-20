@@ -545,6 +545,13 @@ def most_consumers(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> int
     return family.consumers if isinstance(tiles, Tiles) else min(family.consumers, BACKWARD_CONSUMERS)
 
 
+def held_walked(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> tuple[int, int]:
+    """The rows a program of `family` at `tiles` holds and the tile it walks a step: its key block and its
+    query tiles where its family holds keys (`Family.holds_keys`, a keys-first placement), else its query
+    block and its key tiles."""
+    return (tiles.block_k, tiles.block_q) if family.holds_keys else (tiles.block_q, tiles.block_k)
+
+
 def column_share(array: jax.Array, count: int) -> outputs.Dim:
     """A program's `count` of `array`'s columns as an output dimension (`outputs.Dim`): its last axis, or that
     axis over the shares it is split into (`BackwardTiles.columns`), each a whole share."""
@@ -561,8 +568,7 @@ def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
     (`Family.walked_rows`), and one to its launch's count of consumers (`most_consumers`), whose turns its
     walks are written for; a family whose products a role issues (`Issuer.places_on_role`) one product's
     rows, a row a consumer thread: a keys-first walk's its key block (`placed.KEYS`)."""
-    keys_first = isinstance(family, placed.Tcgen05KeysFirst)
-    held, walked = (tiles.block_k, tiles.block_q) if keys_first else (tiles.block_q, tiles.block_k)
+    held, walked = held_walked(family, tiles)
     rows = held == family.rows if family.places_on_role else held % family.rows == 0
     return (0 < tiles.consumers <= most_consumers(family, tiles) and tiles.block_q > 0 and tiles.block_k > 0
             and rows and walked % family.walked_rows == 0)
@@ -1684,11 +1690,13 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     return step, vectors
 
 
-def _held_registers(family: mosaic.Family, block_q: int, params: tuple, *, residuals: bool = False) -> int:
+def _held_registers(family: mosaic.Family, block_q: int, params: tuple, *, residuals: bool = False,
+                    natural: bool = False) -> int:
     """The registers a forward walk holds across its steps in the accumulator's row layout: its query tile's
-    score-hook parameters (`held_params`, a QUERY's vector in the dtype its kernel loads it) and, a training
-    walk's (`residuals`), its per-query rows (`TRAINING_ROWS`)."""
-    rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
+    score-hook parameters (`held_params`, a QUERY's vector in the dtype its kernel loads it) and its per-query
+    rows, a training walk's (`residuals`, `TRAINING_ROWS`) or an inference fold walk's (`INFERENCE_ROWS`)."""
+    count = TRAINING_ROWS if residuals else 0 if natural or family.scalars_whole else INFERENCE_ROWS
+    rows = count * family.row_registers(block_q, jnp.float32)
     return rows + sum(family.row_registers(block_q, dtype) for kind, dtype in params if kind is Kind.QUERY)
 
 
@@ -1838,7 +1846,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     if codes:
         phases += _converted(block_k, value_width if width is None else width, value_width)
     walked = (max(resources.live_registers(family, carried, *phases, *products), scored)
-              + _held_registers(family, block_q, params, residuals=residuals)
+              + _held_registers(family, block_q, params, residuals=residuals, natural=natural)
               + (_started_rows(family, block_q) if started else 0))
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
 
@@ -2028,6 +2036,18 @@ TRAINING_ROWS = 5
 denominator and the anchor it carries, and its anchor reduction's shuffled and loaded rows (the corrected IR
 live set, ET-HOOKBREAK at the held term: 3 carried rows and 2 at the peak's shuffle beside its tiles, 174 and
 176 at 64 x 64 and width 64 where the model without them held 164 and 166)."""
+
+
+INFERENCE_ROWS = 5
+"""The per-query rows an inference fold walk holds at its peak (`forward_registers`), its denominator's
+reduction (`attention_algebra.plain_step`'s `weighed`): its denominator and new maximum carried, the factor
+its sums and denominator take, and the reduction's partial and shuffled rows. Priced none, an H100's two
+consumers at 64 x 128, width 128, priced 160 and spilled 48 bytes at their 168 (the base sync's training
+step's output walk, 2ee20e39c); ptxas's least spill-free cap ran 9 to 24 past the model at every width and
+key tile (FS-FOLD-CAUSAL, FS-FOLD-FULL). Its natural form takes none: its exponential's terms price it at or
+past ptxas's need without them (the same census: 160 where 152 held, 224 where 200); nor a family whose
+scalars are a measured whole (`Family.scalars_whole`, mma.sync's), which holds them: an A100's inference walk
+at width 128 held unnarrowed in 247 of its 255 (et-a100-infer3)."""
 
 
 STATISTICS = MappingProxyType({"peak": jnp.float32, "total": jnp.float32, "anchor": jnp.float32,

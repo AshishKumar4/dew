@@ -31,7 +31,7 @@ import test_norm_swiglu as norm_swiglu_tests
 import test_precision_policy as precision_policy
 from gpu_flow import Cell, covering, isolated, run_cells, when
 
-from dew.nn.kernels import grouped_matmul, norm_swiglu
+from dew.nn.kernels import grouped_matmul, grouped_triton, norm_swiglu
 from dew.nn.kernels.generation import triton_runs
 
 pytestmark = pytest.mark.gpu(reason="a GPU's own numerics, its kernels' configs and its driver's facts")
@@ -106,7 +106,7 @@ def grouped_cells(_) -> list[Cell]:
                    kernel, width, features)),
                generation, native={"kernel": kernel.__name__})
           for kernel, width, features, generation in (
-              (grouped_matmul.Gmm, 192, 320, None), (grouped_matmul.Tgmm, 192, 320, None),
+              (grouped_triton.Gmm, 192, 320, None), (grouped_triton.Tgmm, 192, 320, None),
               (grouped_matmul.MosaicGmm, 768, 768, "sm90"), (grouped_matmul.MosaicTgmm, 768, 768, "sm90"))),
         *(Cell(f"a projection on a GPU host's CPU runs without the Triton kernels: {implementation}",
                when(triton_runs(), pallas, functools.partial(

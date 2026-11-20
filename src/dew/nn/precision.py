@@ -33,7 +33,7 @@ import functools
 import math
 import os
 from collections.abc import Callable, Hashable, Sequence
-from typing import Literal, overload
+from typing import Literal, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -475,9 +475,12 @@ def _exp_value(base2: bool, x) -> jax.Array:
     return summed * _power_of_two(half) * _power_of_two(n - half)
 
 
-def _power_of_two(n) -> jax.Array:
-    """`2^n`, fp32, of an integral `n` within fp32's normal exponents, set in its exponent bits."""
-    return jax.lax.bitcast_convert_type((n.astype(jnp.int32) + 127) << 23, jnp.float32)
+def _power_of_two(n, dtype=jnp.float32) -> jax.Array:
+    """`2^n` in `dtype` (fp32 or float64), of an integral `n` within its normal exponents, set in its
+    exponent bits."""
+    limits = jnp.finfo(dtype)
+    signed = jnp.dtype(f"int{limits.bits}")
+    return jax.lax.bitcast_convert_type((n.astype(signed) + (limits.maxexp - 1)) << limits.nmant, dtype)
 
 
 def _exp_jvp(base2: bool, primals, tangents) -> tuple[jax.Array, jax.Array]:
@@ -1315,6 +1318,26 @@ def _two_sum(left, right):
     return total, (left - (total - part)) + (right - part)
 
 
+def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
+    """A float `x` (fp32 or float64) from its bits, each a signed integer of its width: its sign bit, its
+    biased exponent, its fraction, its fraction normalized as a normal one's (a subnormal's leading bit moved
+    up to the implicit bit's place and dropped) and its binary exponent `floor(log2 |x|)`, a subnormal's
+    below the least normal: `(sign, biased, fraction, normalized, exponent)`. Read from its bits, a
+    subnormal is kept where a process's float multiply flushes a subnormal operand (XLA's CPU, row 4023):
+    the one reading `binade_of`, `raised_exactly` and `aligned_sum` take."""
+    limits = jnp.finfo(x.dtype)
+    signed = jnp.dtype(f"int{limits.bits}")
+    bias, width = limits.maxexp - 1, limits.nmant
+    bits = jax.lax.bitcast_convert_type(x, signed)
+    biased = (bits >> width) & (2 * limits.maxexp - 1)
+    fraction = bits & ((1 << width) - 1)
+    sign = bits & np.array(-(1 << (limits.bits - 1)), signed)
+    up = jnp.clip(width - (limits.bits - 1 - jax.lax.clz(fraction)), 0, width)
+    normalized = jnp.where(biased > 0, fraction, (fraction << up) & ((1 << width) - 1))
+    exponent = jnp.where(biased > 0, biased - bias, limits.minexp - up)
+    return sign, biased, fraction, normalized, exponent
+
+
 def uncontracted(*values):
     """`values` each read as the one value it is, never fused into the arithmetic that reads it: an error-free
     transform reads each operand more than once and holds only where every read sees the same rounded value,
@@ -1338,14 +1361,11 @@ def uncontracted(*values):
 
 
 def binade_of(x: jax.Array) -> jax.Array:
-    """`floor(log2(|x|))` of an fp32 `x` from its bits, int32, a subnormal's by its significand's leading
-    bit (its arithmetic on a process that flushes subnormal operands reads none of it), -1024 for zero."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
-    leading = 31 - jax.lax.clz(fraction).astype(jnp.int32)
-    subnormal = jnp.where(fraction > 0, leading - 149, -1024)
-    return jnp.where(biased > 0, biased - 127, subnormal)
+    """`floor(log2(|x|))` of an fp32 `x` from its bits (`float_bits`), int32, a subnormal's by its
+    significand's leading bit (its arithmetic on a process that flushes subnormal operands reads none of
+    it), -1024 for zero."""
+    _, biased, fraction, _, exponent = float_bits(x.astype(jnp.float32))
+    return jnp.where((biased == 0) & (fraction == 0), -1024, exponent).astype(jnp.int32)
 
 
 def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
@@ -1353,18 +1373,11 @@ def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
     subnormal `x` normalized by its significand's leading bit, so a process whose float32 multiply flushes a
     subnormal operand (XLA's CPU, row 4023) still raises it. The result at most fp32's largest; an infinity
     or NaN as it is."""
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    sign = bits & np.uint32(0x80000000)
-    biased = ((bits >> 23) & np.uint32(0xFF)).astype(jnp.int32)
-    fraction = bits & np.uint32(0x7FFFFF)
-    target = binade_of(x) + k
-    # A subnormal's significand, its leading bit at bit 23 of a normal one, the rest its fraction.
-    leading = 31 - jax.lax.clz(fraction).astype(jnp.int32)
-    up = jnp.clip(23 - leading, 0, 23).astype(jnp.uint32)
-    normalized = jnp.where(biased > 0, fraction, (fraction << up) & np.uint32(0x7FFFFF))
-    normal = sign | (jnp.clip(target + 127, 1, 254).astype(jnp.uint32) << 23) | normalized
+    sign, biased, fraction, normalized, exponent = float_bits(x.astype(jnp.float32))
+    target = exponent + k
+    normal = sign | (jnp.clip(target + 127, 1, 254) << 23) | normalized
     # Still below the least normal: the subnormal's significand shifted up by `k`.
-    below = sign | (fraction << jnp.clip(k, 0, 31).astype(jnp.uint32))
+    below = sign | (fraction << jnp.clip(k, 0, 31))
     raised = jnp.where(target >= -126, normal, below)
     kept = (biased == 0xFF) | ((biased == 0) & (fraction == 0))
     return jnp.where(kept, x.astype(jnp.float32), jax.lax.bitcast_convert_type(raised, jnp.float32))
@@ -1687,6 +1700,343 @@ def vanishing(dtype, base2: bool = False) -> float:
     (`dew.algebra.scan`'s decays)."""
     least = math.log(float(jnp.finfo(dtype).smallest_subnormal))
     return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
+
+
+def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...] | None = None) -> jax.Array:
+    """The sum of `terms` in float32 or float64 (their widest, at least float32), each the broadcast product
+    of its factors, summed over `axis` of each product too where given (kept): the exact sum of the exact
+    products, rounded once to nearest, ties to even (`_exact_sum`), so a sum in range is its value though its
+    terms leave float32's range and cancel: entry writes of keys of +-2^60 and values of 2^-20 under a weight
+    of 2^100, each term 2^140 and their sum zero, where summed as formed it was inf - inf, NaN (base review
+    ead11c83a F1), and no order of terms that cancel drops a smaller one, as floats summed did, each sum
+    rounding (base reviews 224fcf53a to af2cca564, row 8757). A product a term at a time (`twice_scaled`)
+    holds each term's range, not a sum's. Its tangent is its terms' own, each factor's direction times its
+    term's other factors, and each factor's gradient the cotangent times its terms' other factors, each summed
+    aligned as its value is (`_aligned_directions`): its bits carry none, so differentiated as formed every
+    factor's was zero, and summed plainly a cancelling entry write's terms of 2^160 were inf - inf (row 8501).
+    A factor several terms share (one array: an entry write's weight) is one factor, its gradient one aligned
+    sum over them. Elementwise and over a 2-D array's axes, so a Pallas TPU kernel forms it in place. At most
+    `2^31 - 1` products a value in float32 (`2^63 - 1` in float64), else a ValueError (row 8757)."""
+    return _aligned_terms(terms, ((axis, None),) * len(terms))
+
+
+def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Array:
+    """`aligned_sum` of `terms`, each product summed over its `spec` entry's axis (kept) and, where it gives
+    `(held, shape)`, broadcast to `held` and reshaped to `shape` (a gradient's term in its factor's)."""
+    dtype = jnp.result_type(jnp.float32, *(factor for term in terms for factor in term))
+    # Each factor once, by identity: a shared factor's gradient sums its terms' together, aligned.
+    factors, places, shape = [], {}, []
+    for term in terms:
+        indices = []
+        for factor in term:
+            if id(factor) not in places:
+                places[id(factor)] = len(factors)
+                factors.append(jnp.asarray(factor, dtype))
+            indices.append(places[id(factor)])
+        shape.append(tuple(indices))
+    from dew.nn.kernels.launches import interpreting
+
+    # A compiled kernel's body bare, as Mosaic lowers no symbolic zeros' rule; an interpreted one declared.
+    return (_aligned_value if interpreting() is False else _aligned)(tuple(shape), tuple(spec), *factors)
+
+
+def _regrouped(shape: tuple[tuple[int, ...], ...], flat: Sequence[jax.Array]) -> list[tuple[jax.Array, ...]]:
+    """`aligned_sum`'s terms from its factors, `shape` each term's factors' places among them."""
+    return [tuple(flat[at] for at in term) for term in shape]
+
+
+def _aligned_value(shape: tuple[tuple[int, ...], ...], spec: tuple, *flat: jax.Array) -> jax.Array:
+    """`_aligned_terms` of its terms' factors in a row (`_regrouped`), summed exactly (`_exact_sum`)."""
+    return _exact_sum(_regrouped(shape, flat), spec, flat[0].dtype)
+
+
+class _Product(NamedTuple):
+    """A term's product, exactly (`_product`): its limbs, its lowest bit's place, its sign and IEEE class."""
+
+    limbs: tuple[jax.Array, ...]
+    place: jax.Array
+    negative: jax.Array
+    nan: jax.Array
+    infinite: jax.Array
+    zero: jax.Array
+
+
+def _product(term: Sequence[jax.Array], ints) -> _Product:
+    """`term`'s product (`_Product`), exactly, from its factors' bits: each significand two digits of half
+    its bits, convolved and carried a factor at a time (`k` factors `k` limbs); NaN, or a signed infinity, as
+    IEEE's, no finite factors' rounded product (`2^-75 2^-75` zero) meeting the infinity (row 8757)."""
+    limits = jnp.finfo(term[0].dtype)
+    half, top = _split_bits(term[0].dtype)[2], 2 * limits.maxexp - 1
+    low = (1 << half) - 1
+    read = [float_bits(factor) for factor in term]
+    special = [biased == top for _, biased, *_ in read]
+    zeros = [(biased == 0) & (fraction == 0) for _, biased, fraction, *_ in read]
+    nan, infinite, zero = (functools.reduce(jnp.logical_or, flags) for flags in (
+        [out & (fraction != 0) for out, (_, _, fraction, *_) in zip(special, read, strict=True)],
+        [out & (fraction == 0) for out, (_, _, fraction, *_) in zip(special, read, strict=True)], zeros))
+    negative = functools.reduce(jnp.logical_xor, [sign != 0 for sign, _, _, _, _ in read])
+    place = functools.reduce(jnp.add, [(exponent - limits.nmant).astype(ints) for *_, exponent in read])
+    digits: list[jax.Array] = []
+    for (_, _, _, normalized, _), out, nothing in zip(read, special, zeros, strict=True):
+        mantissa = jnp.where(out | nothing, 0, normalized | (1 << limits.nmant)).astype(ints)
+        pair = (mantissa & low, mantissa >> half)
+        if not digits:
+            digits = list(pair)
+            continue
+        sums: list = [0] * (len(digits) + 1)
+        for at, digit in enumerate(digits):
+            for by, other in enumerate(pair):
+                sums[at + by] = sums[at + by] + digit * other
+        digits, carry = [], 0
+        for total in sums:
+            total = total + carry
+            digits.append(total & low)
+            carry = total >> half
+        digits.append(jnp.asarray(carry, ints))
+    limbs = tuple(digits[at] | (digits[at + 1] << half) for at in range(0, len(digits), 2))
+    shape = jnp.broadcast_shapes(*(np.shape(limb) for limb in limbs), np.shape(place), np.shape(negative))
+    return _Product(tuple(jnp.broadcast_to(limb, shape) for limb in limbs), jnp.broadcast_to(place, shape),
+                    jnp.broadcast_to(negative, shape), nan | (infinite & zero), infinite, zero)
+
+
+def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
+    """A term's reduction to the sum's value, `op` over its axes (kept) and laid, and its count."""
+    axes = () if axis is None else tuple(sorted({int(a) % len(shape) for a in np.atleast_1d(axis)}))
+
+    def reduced(x: jax.Array, op: Callable = jnp.sum, **options) -> jax.Array:
+        x = op(x, axis=axes, keepdims=True, **options) if axes else x
+        return x if laid is None else jnp.broadcast_to(x, laid[0]).reshape(laid[1])
+
+    return reduced, math.prod(shape[a] for a in axes)
+
+
+def _exact_sum(terms, spec, dtype) -> jax.Array:
+    """The sum `_aligned_terms` states, exact: every product exact (`_product`), summed as whole digits and
+    rounded once to nearest, ties to even (`_nearest`); IEEE's non-finite sums and signed zeros (row 8757)."""
+    limits = jnp.finfo(dtype)
+    ints = jnp.dtype(f"int{limits.bits}")
+    factors = max(map(len, terms))
+    parts, nan, positive, negative, live = [], False, False, False, False
+    for term, (axis, laid) in zip(terms, spec, strict=True):
+        product = _product(term, ints)
+        reduced, extent = _reduction(product.place.shape, axis, laid)
+        parts.append((product, reduced, extent))
+        nan = nan | reduced(product.nan, jnp.any)
+        positive = positive | reduced(product.infinite & ~product.negative, jnp.any)
+        negative = negative | reduced(product.infinite & product.negative, jnp.any)
+        # A sum of negative zeros alone is one, of none positive zero (base review 6c68b90ad F4).
+        live = live | reduced(~(product.zero & product.negative), jnp.any)
+    count = sum(extent for _, _, extent in parts)
+    if not count:
+        live = True
+    # The widest digit whose one term's sum `widest (2^w - 1)` the integers hold, its quotient carried apart
+    # as it adds (`_nearest`, row 8757).
+    widest, most = max(extent for _, _, extent in parts), (1 << (limits.bits - 1)) - 1
+    digit = max([0] + [w for w in range(1, limits.bits - 1) if widest * ((1 << w) - 1) <= most])
+    if digit < 1 or count > most:  # A level's carry lies in [-count, count - 1] (row 8757).
+        raise ValueError(f"an aligned sum of {count} products a value, past its cap of {most}")
+    lowest = factors * (limits.minexp - 2 * limits.nmant)
+    highest = factors * (limits.maxexp + 1) + count.bit_length() + 2
+    levels = -(-(highest - lowest) // digit)
+    exact = _nearest(parts, lowest, digit, levels, limits)
+    exact = jnp.where(live, exact, -jnp.zeros_like(exact))
+    special = jnp.where(positive, jnp.asarray(jnp.inf, dtype), jnp.asarray(-jnp.inf, dtype))
+    special = jnp.where(nan | (positive & negative), jnp.asarray(jnp.nan, dtype), special)
+    return jnp.where(nan | positive | negative, special, exact).astype(dtype)
+
+
+def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
+    """The parts' exact sum as the nearest float, ties to even: each of `levels` digits of `digit` bits from
+    bit `lowest` every limb's bits there summed, carried as the number's and its negation's, the last carry
+    its sign; the magnitude's highest digits and a sticky bit kept, then written as its bits (`_written`)."""
+    ints = jnp.dtype(f"int{limits.bits}")
+    # A limb's bits, two of `_split_bits`' low halves (`_product`).
+    bits, mask, width = limits.bits, (1 << digit) - 1, 2 * _split_bits(limits.dtype)[2]
+    held = 2 + -(-(limits.nmant + 3) // digit)
+
+    def digit_sums(level):
+        low = lowest + level * digit
+        sums = []
+        for product, reduced, _ in parts:
+            taken = 0
+            for at, limb in enumerate(product.limbs):
+                shift = low - (product.place + at * width)
+                right = (limb >> jnp.clip(shift, 0, bits - 1)) & mask
+                kept = limb & ((1 << jnp.clip(digit + shift, 0, bits - 1)) - 1)
+                left = kept << jnp.clip(-shift, 0, bits - 1)
+                taken = taken + jnp.where(shift >= 0, right, jnp.where(digit + shift > 0, left, 0))
+            sums.append(reduced(jnp.where(product.negative, -taken, taken), jnp.sum, dtype=ints))
+        return sums
+
+    def rolled(state, sums, level):
+        # Each term's sum carried as added; the window's last into its sticky part; kept where it leads.
+        carry, window, under, lead, kept, sticky = state
+        value, carry = carry & mask, carry >> digit
+        for total in sums:
+            value, carry = value + (total & mask), carry + (total >> digit)  # No partial past one term's.
+            carry, value = carry + (value >> digit), value & mask
+        under = under | (window[-1] != 0)
+        window = (value, *window[:-1])
+        nonzero = window[0] != 0
+        return (carry, window, under, jnp.where(nonzero, level, lead),
+                tuple(jnp.where(nonzero, new, old) for new, old in zip(window, kept, strict=True)),
+                jnp.where(nonzero, under, sticky))
+
+    def step(level, states):
+        sums = digit_sums(level)
+        return rolled(states[0], sums, level), rolled(states[1], [-total for total in sums], level)
+
+    zeros = functools.reduce(jnp.add, [reduced(jnp.zeros_like(product.place), jnp.sum, dtype=ints)
+                                       for product, reduced, _ in parts])
+    start = (zeros, (zeros,) * held, zeros != 0, zeros - 1, (zeros,) * held, zeros != 0)
+    first, last = _levels(parts, lowest, digit, levels, limits)
+    # A counter of the value's integers: x64 traced a 64-bit index where Mosaic's is 32 (row 8757).
+    _, states = jax.lax.while_loop(lambda carried: carried[0] < last,
+                                   lambda carried: (carried[0] + 1, step(carried[0], carried[1])),
+                                   (jnp.asarray(first, ints), (start, start)))
+    negative = states[0][0] < 0
+    _, _, _, lead, kept, sticky = jax.tree.map(lambda p, n: jnp.where(negative, n, p), *states)
+    return _written(lead, kept, sticky, negative, lowest, digit, limits)
+
+
+def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
+    """The digits `_nearest` walks: a kernel's every one, else the nonzero limbs' and a carry's room."""
+    from dew.nn.kernels.launches import interpreting
+
+    if interpreting() is not None:
+        return 0, levels
+    ints = jnp.dtype(f"int{limits.bits}")
+    width = 2 * _split_bits(limits.dtype)[2]
+    least, most = jnp.iinfo(ints).max, jnp.iinfo(ints).min
+    for product, _, _ in parts:
+        for at, limb in enumerate(product.limbs):
+            place = product.place + at * width
+            least = jnp.minimum(least, jnp.min(jnp.where(limb != 0, place, least), initial=least))
+            most = jnp.maximum(most, jnp.max(jnp.where(limb != 0, place + width, most), initial=most))
+    count = sum(extent for _, _, extent in parts)
+    first = jnp.clip((least - lowest) // digit, 0, levels)
+    last = jnp.clip((most + count.bit_length() + 2 - lowest) // digit + 2, 0, levels)
+    return first, jnp.maximum(first, last)
+
+
+def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> jax.Array:
+    """The magnitude's digits from its highest nonzero one at `lead` (`kept`), `sticky` where any under them
+    is nonzero, as the nearest float's bits, ties to even, signed where `negative`, rounded in integers."""
+    ints = lead.dtype
+    bits = jnp.iinfo(ints).bits
+    length = bits - jax.lax.clz(kept[0])
+    top = lead * digit + length - 1
+    least = limits.minexp - limits.nmant
+    # The rounding place, two bits below the significand's lowest, relative to the lowest digit's bit.
+    place = jnp.maximum(lowest + top - limits.nmant, least) - 2 - lowest
+    whole = jnp.zeros_like(lead)
+    for at, value in enumerate(kept):
+        offset = (lead - at) * digit - place
+        up = value << jnp.clip(offset, 0, bits - 1)
+        down = value >> jnp.clip(-offset, 0, bits - 1)
+        whole = whole + jnp.where(offset >= 0, up, jnp.where(-offset < digit, down, 0))
+        below = value & ((1 << jnp.clip(-offset, 0, digit)) - 1)
+        sticky = sticky | (jnp.where(offset >= 0, 0, jnp.where(-offset < digit, below, value)) != 0)
+    whole = whole | sticky.astype(ints)
+    tail, significand = whole & 3, whole >> 2
+    significand = significand + ((tail > 2) | ((tail == 2) & ((significand & 1) == 1))).astype(ints)
+    # The float's bits: its significand (a carry into the next binade its exponent's unit) at its place.
+    field = lowest + place + 2 - least
+    finite = (jnp.clip(field, 0, 2 * limits.maxexp - 3) << limits.nmant) + significand
+    infinite = (2 * limits.maxexp - 1) << limits.nmant
+    magnitude = jnp.where(lead < 0, 0, jnp.where(field > 2 * limits.maxexp - 3, infinite, finite))
+    signed = jnp.where(negative & (lead >= 0), magnitude | np.array(-(1 << (bits - 1)), ints), magnitude)
+    return jax.lax.bitcast_convert_type(signed, jnp.dtype(limits.dtype))
+
+
+def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents):
+    """`_aligned_terms`' value (`_aligned`'s) and tangent in the factors it reaches."""
+    from jax.custom_derivatives import SymbolicZero
+
+    value = _aligned(shape, spec, *primals)
+    live = tuple(index for index, direction in enumerate(tangents) if not isinstance(direction, SymbolicZero))
+    if not live:
+        return value, jnp.zeros_like(value)
+    return value, _aligned_directions(shape, spec, primals, [tangents[index] for index in live], value, live)
+
+
+def _placed_as(x: jax.Array, like: jax.Array) -> jax.Array:
+    """`x` placed as `like`'s type, whole too, where its mesh has an Explicit axis (row 8757)."""
+    placed = jax.typeof(like).sharding
+    typed = isinstance(placed, jax.sharding.NamedSharding) and placed.mesh.explicit_axes
+    return jax.sharding.reshard(x, placed) if typed else x
+
+
+def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.Array) -> tuple:
+    """`aligned_sum`'s cotangent of one term's factor at `spot` as products and that factor's shape in their
+    space: summed over the axes the shape is one along, then broadcast to it. The term's product reduced
+    over `axis` (its own axes) and broadcast into the value, transposed in reverse: the value's broadcast
+    summed, each of the reduction's elements taking the cotangent, the factor's broadcast summed, as one sum
+    of the cotangent times the term's other factors in a space holding the value's axes and, beside each
+    reduced one, the product's own (row 8501; mixed ranks reduced against another term's axis, base review
+    f5e6e678d F2)."""
+    rank = max(np.ndim(factor) for factor in term)
+    reduced = set() if axis is None else {int(a) % rank for a in np.atleast_1d(axis)}
+    lead = cotangent.ndim - rank
+
+    def laid(x):
+        # A factor in the space: its reduced axes beside the value's, which it is broadcast along.
+        x = jnp.reshape(x, (1,) * (rank - np.ndim(x)) + np.shape(x))
+        return x.reshape((1,) * lead + tuple(d for k, size in enumerate(x.shape)
+                                             for d in ((1, size) if k in reduced else (size,))))
+
+    spread = cotangent.reshape(cotangent.shape[:lead] + tuple(
+        d for k, size in enumerate(cotangent.shape[lead:]) for d in ((size, 1) if k in reduced else (size,))))
+    products = (spread, *(laid(factor) for other, factor in enumerate(term) if other != spot))
+    return products, laid(term[spot]).shape
+
+
+def _aligned_directions(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, tangents, value,
+                        live: tuple[int, ...]):
+    """`aligned_sum`'s tangent in its `live` factors' `tangents`, a linear map (`generation.linear_map`) of
+    each direction in its places, its own tangent one aligned sum of all a tangent reaches (row 8757)."""
+    from dew.nn.kernels import generation
+
+    def applied(factors, directions):
+        # A place's terms side by side, the first factor's direction in every term, then the second's...
+        moving = dict(zip(live, directions, strict=True))
+        placed = [(spot, index) for spot in range(max(map(len, shape)))
+                  for index, term in enumerate(shape) if spot < len(term) and term[spot] in moving]
+        moved = [(*(factors[at] for at in shape[index][:spot]), moving[shape[index][spot]],
+                  *(factors[at] for at in shape[index][spot + 1:])) for spot, index in placed]
+        # In the value's layout inside the sum, which reverse mode then sums inside it too (row 8757).
+        laid = tuple((axis, (value.shape, value.shape) if held is None else held)
+                     for axis, held in (spec[index] for _, index in placed))
+        return _placed_as(_aligned_terms(moved, laid), value)
+
+    def pulled(factors, cotangent):
+        gradients = []
+        for place in live:
+            factor = factors[place]
+            # Each of the factor's places a term of one aligned sum in its shape (`_transposed_term`), the
+            # cotangent inside its products, so an overflowing partial sum or one bit-formed is none.
+            terms, laid = [], []
+            for index, term in enumerate(shape):
+                axis, value = spec[index]
+                given = cotangent if value is None else cotangent.reshape(value[0])
+                for spot, at in enumerate(term):
+                    if at == place:
+                        products, held = _transposed_term([factors[other] for other in term], spot, axis,
+                                                          given)
+                        along = tuple(d for d, size in enumerate(held) if size == 1)
+                        terms.append(products)
+                        laid.append((along if along else None, (held, factor.shape)))
+            gradients.append(_placed_as(_aligned_terms(terms, tuple(laid)).astype(factor.dtype), factor))
+        return gradients
+
+    # Typed as the value it perturbs, so a reverse pass traces no forward mode for its type alone.
+    return generation.linear_map(applied, pulled, list(primals), list(tangents),
+                                 out_aval=jax.typeof(value).to_tangent_aval(), traced_tangent=True)
+
+
+_aligned = contracted("test_an_aligned_sum_holds_every_order")(
+    declared_tangent(Protected(), _aligned_value, _aligned_tangent, nondiff_argnums=(0, 1),
+                     symbolic_zeros=True))
 
 
 def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax.Array:

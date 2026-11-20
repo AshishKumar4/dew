@@ -16,7 +16,7 @@ from low_precision_support import nvfp4
 
 from dew.algebra import bits
 from dew.nn import fake_quant
-from dew.nn.kernels import formats, gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
@@ -90,7 +90,7 @@ def test_the_mainloop_decodes_an_nvfp4_stage_in_place(family):
     def packed(step_tiles):
         return mosaic_gpu.gmm(rows, matrix.words[None], jnp.asarray([136], jnp.int32), tiles=step_tiles,
                               transpose_rhs=True, out_dtype=jnp.float32, multiprocessors=4,
-                              interpret=grouped_matmul.INTERPRETED, dense=True, scales=matrix.scales[None])
+                              interpret=grouped_launch.INTERPRETED, dense=True, scales=matrix.scales[None])
 
     with generation.assumed("sm90" if family == "wgmma" else "sm80"):
         np.testing.assert_array_equal(np.asarray(packed(tiles), np.float64), expected)
@@ -113,7 +113,7 @@ def test_the_mainloop_decodes_an_nvfp4_matrixs_rows_into_its_products_left_opera
         return mosaic_gpu.gmm(matrix.words, rows[None], jnp.asarray([256], jnp.int32),
                               tiles=mosaic_gpu.Tiles(128, 16, 256, 2, 1, warpgroups=2, family=family),
                               transpose_rhs=True, out_dtype=jnp.float32, multiprocessors=4,
-                              interpret=grouped_matmul.INTERPRETED, dense=True, scales=matrix.scales,
+                              interpret=grouped_launch.INTERPRETED, dense=True, scales=matrix.scales,
                               packed_rows=True)
 
     with generation.assumed("sm90"):
@@ -240,26 +240,29 @@ def nvfp4_bank(seed: int, groups: int, depth: int, width: int) -> tuple[formats.
     return bank, np.stack([values for _, values in matrices])
 
 
+@pytest.mark.parametrize("sizes", [(40, 0, 72, 24), (0, 0, 0, 0)], ids=["ragged", "empty"])
 @pytest.mark.parametrize("kernel", ["packed", "xla"])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
-def test_an_nvfp4_banks_grouped_product_is_its_values_product(generation_name, kernel):
+def test_an_nvfp4_banks_grouped_product_is_its_values_product(generation_name, kernel, sizes):
     """`gemm.nvfp4_product` of a bank of four experts' NVFP4 matrices (row 4516: each its own tensor scale)
-    over a ragged group table (one group empty, rows past the groups) through `kernel`: the packed kernel,
-    each tile decoding its group's expert's stages in place (interpreted), or the bank decoded once a call;
+    over a ragged group table (one group empty, rows past the groups), or a call of no rows, through
+    `kernel`: the packed kernel, each tile decoding its group's expert's stages in place (interpreted), or
+    the bank decoded once a call;
     exactly the float64 product of the values, small integer rows making every product and sum exact in
     fp32; the bank takes no gradient. A hang dumps every thread's stack (the packed walk was suspected of
     one on an empty group; NSPROBE-PK1 found it walks)."""
     faulthandler.dump_traceback_later(240, exit=True)
     bank, values = nvfp4_bank(11, 4, 512, 128)
-    sizes = np.asarray([40, 0, 72, 24])
-    rows = jnp.asarray(np.random.default_rng(12).integers(-3, 4, size=(140, 512)), jnp.float32)
+    sizes = np.asarray(sizes)
+    count = 140 if sizes.sum() else 0
+    rows = jnp.asarray(np.random.default_rng(12).integers(-3, 4, size=(count, 512)), jnp.float32)
     with generation.assumed(generation_name), generation.chosen(nvfp4=kernel), generation.routes() as routes:
         got = gemm.nvfp4_product(rows, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32,
                                  interpret_on_cpu=True)
     faulthandler.cancel_dump_traceback_later()
     assert {route.kernel for route in routes if route.choice == "nvfp4"} == {kernel}, routes
     starts = np.cumsum([0, *sizes])
-    truth = np.zeros((140, 128))
+    truth = np.zeros((count, 128))
     for group, (first, last) in enumerate(itertools.pairwise(starts)):
         truth[first:last] = np.asarray(rows[first:last], np.float64) @ values[group]
     np.testing.assert_array_equal(np.asarray(got, np.float64), truth)

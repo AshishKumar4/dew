@@ -48,7 +48,7 @@ import contextvars
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from typing import NamedTuple
 
 import jax
@@ -138,7 +138,7 @@ def block_of(family: mosaic.Family) -> int:
 
 
 
-@dataclasses.dataclass(frozen=True, repr=False)
+@dataclasses.dataclass(frozen=True)
 class Tiles:
     """A forward's tiles, the recurrence template's config, derived from the call's shape and the device's
     and its bundle's facts (`templates.recurrence.template.Mosaic.derived`): the value block the states
@@ -164,17 +164,18 @@ class Tiles:
     their producers' ladders run out (`template.Mosaic._fewer`), every other launch's as many as its plan
     holds."""
 
-    def __repr__(self) -> str:
-        # Its fields as a dataclass names them, its residents only where a rung set them: a config's repr is
-        # its identity in every store (its certification's program, `report._compiled_launch`; the kernels'
-        # names, `report.named`), which a config without them keeps as it was before they were a field.
-        fields = [field for field in dataclasses.fields(self)
-                  if field.name != "residents" or self.residents.held_to]
-        return f"{type(self).__name__}({', '.join(f'{f.name}={getattr(self, f.name)!r}' for f in fields)})"
-
     @property
     def output_block(self) -> int:
         return self.block_v if self.block_o is None else self.block_o
+
+    def at(self, kernels: Collection[str]) -> "Tiles":
+        """What a launch building `kernels` is given of them: all of them but the other launches' producers
+        and residents, its kernels' caps alone at each level (the call's tiles and its forward's), so a
+        producer's raise or a launch's program fewer leaves every other launch given what it was
+        (`template.Mosaic.emitted`, `tuning.lowered_once`)."""
+        return dataclasses.replace(self, producers=self.producers.only(kernels),
+                                   residents=self.residents.only(kernels),
+                                   forward=None if self.forward is None else self.forward.at(kernels))
 
 
 def per_key_refusal(dtype, *, rounded: bool) -> str | None:
@@ -259,14 +260,14 @@ class Operand:
         return jax.ShapeDtypeStruct((self.parts * self.rows, columns), self.stored)
 
     def split(self, x):
-        """`x` `[rows, columns]` in its dtype as its stacked parts."""
+        """`x` `[rows, columns]` in its dtype as its stacked parts (`product.stacked`)."""
         if self.parts == 1:
             return x.astype(self.dtype)
-        return jnp.concatenate(product.formed(x.astype(jnp.float32), self.parts), 0)
+        return product.stacked(x, self.parts)
 
     def joined(self, x):
-        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`split`'s inverse)."""
-        return x.astype(jnp.float32).reshape(self.parts, -1, x.shape[-1]).sum(0)
+        """Its stacked parts `x` as the value `[rows, columns]` they sum to, fp32 (`product.joined`)."""
+        return product.joined(x, self.parts)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -295,6 +296,20 @@ class Call:
     """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
     bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges in bf16 parts
     (`_merging`)."""
+    unit_keys: bool = False
+    """Whether its keys are of unit norm (`recurrence.Hooks.l2norm`'s, or as `Hooks.write_bound` declares,
+    `Hooks.inverse_bound`'s contract): an own pair's decay may fold into its row before the key's product
+    (`recurrence_algebra.key_diagonal_bands`), all it loses below normal in the exact product too, as fla's
+    token-parallel diagonal folds it into the key (row 7299). Other keys keep the row times the key first;
+    the backward's terms keep theirs either way, a gradient's strip unbounded against a key's decayed
+    product."""
+    values_gated: bool = False
+    """Whether a call without the delta rule whose values pass between launches in their 16-bit dtype gates
+    its write on the values, as fla's simple GLA does (its route's, `recurrence_chunk.simple_gla`: each
+    token's value times its decay to the chunk's end, rounded before `k^T v`, `chunk_fwd_kernel_h`), not on
+    the keys' rows, as mamba_ssm's SSD does (`gated_keys`). The two part at fp32's edge: a key of 2^64 and a
+    value of (145/128) 2^64 decayed by exp(-0.1268) write (16385/16384) 2^128 rounded on the key, past
+    fp32's largest, and (255/256) 2^128 on the value (base review 3ee9253c9 F1)."""
     apart: int = 0
     """The tokens of a group whose readout reads the state after its update less the group's writes
     (`recurrence.Hooks.reads` 'apart', a token's ranks `Hooks.ranks`, mamba_ssm's Mamba-3, whose caller
@@ -311,6 +326,12 @@ class Call:
         lowers to (`Tiles.producers`), None at the least."""
         return self.producers.of(f"recurrence{launching.__name__}")
 
+    def at(self, kernels: Collection[str]) -> "Call":
+        """What a launch building `kernels` is given of it: all of it but the other launches' producers and
+        residents (`Tiles.at`)."""
+        return dataclasses.replace(self, producers=self.producers.only(kernels),
+                                   residents=self.residents.only(kernels))
+
     @property
     def gated_keys(self) -> bool:
         """Whether the write gate takes the keys' side: a call without the delta rule whose values pass
@@ -318,8 +339,9 @@ class Call:
         `prepared`), the values themselves then held and the gate scaling the keys' rows, the scores' columns
         and their gradients in fp32 before their products round, as mamba_ssm places its `dt`: gating the
         values, `x dt` rounded put a token's write one rounding past mamba_ssm's (B = 1, x = 129/128,
-        dt = 129/256: 130/256 against 16641/32768)."""
-        return not self.delta and self.held.parts == 1
+        dt = 129/256: 130/256 against 16641/32768). A call that gates its values instead (`values_gated`,
+        fla's simple GLA) does not."""
+        return not self.delta and self.held.parts == 1 and not self.values_gated
 
     @property
     def gates(self) -> Operand:
@@ -646,10 +668,18 @@ STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype", "solves")
 and its constants; its every other argument an array or None."""
 
 
-lowered_once = tuning.lowered_once(STATIC, configured=("call", "tiles"), at="tiles",
-                                   unless=lambda: PLANNED.get() is not None)
+def building(kernels: Callable[[Callable], Collection[str]]) -> Callable[[Callable], Callable]:
+    """`lowered_once` for launches building the `kernels` of their function: each given its call and tiles
+    narrowed to those kernels' producers (`Call.at`, `Tiles.at`)."""
+    return tuning.lowered_once(STATIC, configured=("call", "tiles"), at="tiles",
+                               kernels=lambda launch, given: kernels(launch),
+                               unless=lambda: PLANNED.get() is not None)
+
+
+lowered_once = building(lambda launch: (f"recurrence{launch.__name__}",))
 """A launch lowered once a configuration (`tuning.lowered_once`): a launch's program closes over its call,
-so each call traced its own and a hybrid model's step lowered its layers' identical kernels one by one.
+so each call traced its own and a hybrid model's step lowered its layers' identical kernels one by one. Its
+one kernel is `recurrence<function>`, `launch_kernel`'s name for it (`building` where a launch names its own).
 Planning (`template.planned`) traces every call, each launch recording itself (`launch_kernel`). Its kernels
 are emitted at its `tiles`, a training config's own or its forward's (`Tiles.forward`, a forward alone's),
 which their names read."""
@@ -893,14 +923,11 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     streams = allocations(stages)
     collected = PLANNED.get()
     if collected is not None:
-        def recorded(*arrays):
-            stepped = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
-            collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
-                                    registers, stages, stepped, found.programs if found else 0,
-                                    consumers, family, producer, planning if ringed else None))
-            return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
-
-        return recorded
+        stepped = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
+        record = Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)), registers,
+                        stages, stepped, found.programs if found else 0, consumers, family, producer,
+                        planning if ringed else None)
+        return functools.partial(_recorded, collected, record, out_type)
 
     def entry(*arrays):
         def run(staged, *, streams):
@@ -919,7 +946,9 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                 return
             walked = given({axis: lax.axis_index(axis) for axis in grid_names})
             if walked is not None:
-                family.run(streams["walked"], walked, call.interpret, floor=producer)
+                # A walk's once streams (`mosaic.Walk.once`) its launch's `once` blocks.
+                family.run(streams["walked"], walked, call.interpret, floor=producer,
+                           once=streams.get("once"))
 
         # The products' own memory where the family's issuer keeps each (`Family.scoped`'s `products`): a
         # product's width is one of its tiles' (its streams', its staging's) or the chunk's.
@@ -949,6 +978,14 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                              producer=producer)(*arrays)
 
     return launched
+
+
+def _recorded(collected: list, record: "Launch", out_type, *arrays):
+    """A launch where `template.planned` collects launches (`launch_kernel`'s): its `record` collected, zeros
+    of `out_type` its outputs."""
+    del arrays
+    collected.append(record)
+    return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
 
 def _persisted(family: mosaic.Family, streams, given, live, arrays, grid: tuple, grid_names: tuple,
@@ -1295,7 +1332,7 @@ def _weighted_held(call: Call, block: int) -> Held:
            if call.delta else []),))
 
 
-@lowered_once
+@building(lambda launch: ("recurrence_weighted", "recurrence_decayed_keys"))
 def _weighted(k, v, a, hi, lo, beta, taken, call: Call):
     """`(w [R, HV * Dk], u [R, HV * Dv])` as `call.held` (`algebra.weighted`): the inverse against the decayed
     write-gated keys and against the write-gated values; under a decay a key dimension the keys alone,
@@ -1714,7 +1751,7 @@ def _last_write(call: Call, keys: Operand, k_ref, row, final_token, key_columns,
 
     def key_rows(i):
         views = keys.vectors(k_ref, row + final_token, key_columns + i * call.block, call.block)
-        return functools.reduce(jnp.add, (family.rows_of(view).astype(jnp.float32) for view in views))
+        return product.whole([family.rows_of(view) for view in views])
 
     ends = family.iota(gated.shape, 0) == final_token
     return key_rows, columns(jnp.where(ends, gated, 0.0)), final_token

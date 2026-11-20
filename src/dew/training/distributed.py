@@ -1,12 +1,11 @@
 """The trainer's side of placement: the step's batch arguments (`STEP_BATCH`, `step_reads`), a stream's
 checks and microbatch staging (`check_stream`, `stage_microbatches`), the links a run measures between
-processes, and a run's first state traced and placed (`traced_start`, `placed_start`). Where arrays live
+processes, and a run's first state traced and placed (`traced_draw`, `placed_start`). Where arrays live
 is `dew.distributed.placement`'s."""
 
 from __future__ import annotations
 
 import collections
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -20,14 +19,12 @@ from typing import Any, Concatenate, Protocol
 import jax
 import numpy as np
 from flax import linen as nn
-from jax._src import config as jax_config
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P, Sharding
 
 from dew._cache import holding
 from dew._coordination import from_every_process
 from dew._files import write_atomically
 from dew._records import JSON, number, record
-from dew.algebra.program import replaying
 from dew.batch import EXAMPLE_ROWS, Batch, Variables
 from dew.data.dataset import (
     Checkpointable,
@@ -42,17 +39,10 @@ from dew.data.dataset import (
 from dew.distributed.batches import Signature
 from dew.distributed.placement import Layout, Placement, link_topology, placed_shapes
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
-from dew.nn.kernels.options import (
-    Compiling,
-    OuterProgram,
-    Placements,
-    abstract_signature,
-    compiling,
-    held_context,
-    owned_program,
-)
+from dew.nn.kernels.options import Compiling, OuterProgram, Placements, compiling, owned_program
 from dew.nn.sharding import microbatched
 from dew.objectives.base import Held, Initializer
+from dew.objectives.drawn import Parts, drawing, drawn_rest, reassembled
 from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
 
@@ -439,22 +429,6 @@ def taking_over[Held, Result](program: OuterProgram, taken: Held, kept: Held
     return taken_over
 
 
-def drawing() -> contextlib.AbstractContextManager[None]:
-    """Where a fresh state's program is lowered, wherever it is (`placed_start`, `start_compiled`,
-    `start_compiling`): on a GPU, JAX's threefry draws as rolled loops over their rounds
-    (`jax_threefry_rolled_lowering`, Dew's JAX build's from post100), in place of each draw's twenty rounds
-    unrolled. The draws are the same bits; the program is what an init is, a draw for nearly every leaf, and
-    unrolled it is mostly hash arithmetic whose code generation is its compile: a 142M DiT's start compiled
-    on a GH200 in 23.8 s, 4.9 s rolled, and placed its state in 26.7 s where it now takes 7.6 s (a 4x1024
-    MoE decoder's, 26.5 s and 5.4 s; placed in 41.5 s and 20.2 s; M-MC-13, row 6740).
-    Rolled, a draw's rounds no longer fuse into the leaf it makes, which costs one round's state a leaf,
-    partitioned as the leaf is (a 1 GB draw over eight GPUs held one shard of temporaries, and no
-    collective, where JAX's threefry kernel, unpartitioned, held 6.44 GB). The setting is in JAX's trace
-    context and jit key, so every site of the program enters it alike; a step, whose draws fuse into what
-    reads them, keeps JAX's default."""
-    return jax_config.threefry_rolled_lowering(new_val=True)
-
-
 def _held_leaves(tree) -> list:
     """One of the held tree's two trees as its places' leaves, None where the other holds the leaf."""
     return jax.tree.leaves(tree, is_leaf=lambda leaf: leaf is None)
@@ -474,19 +448,6 @@ def start_program[Held, Result](function: Callable[[Held, jax.Array], Result], s
                                                        for one, other in zip(taken, kept, strict=True)]), key)
 
     return owned_program(joined, out_shardings=shardings, donate_argnums=0)
-
-
-def _rest(initial_state: Callable[[Initializer, jax.Array], TrainState], built: list[int]
-          ) -> Callable[[Initializer, jax.Array], tuple[TrainState, tuple[jax.Array, ...]]]:
-    """A fresh state's moving tree and the frozen leaves its init builds (`built`, by their index among the
-    frozen tree's leaves), the ones it passes through left out: what `placed_start` compiles where its init
-    passes some through."""
-    def rest(tree: Initializer, draw: jax.Array) -> tuple[TrainState, tuple[jax.Array, ...]]:
-        state, own = apart(initial_state(tree, draw))
-        leaves = jax.tree.leaves(own)
-        return state, tuple(leaves[index] for index in built)
-
-    return rest
 
 
 @dataclasses.dataclass(frozen=True)
@@ -517,14 +478,18 @@ class StartBuild:
 
 
 def start_build(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                shardings: Placement[TrainState], through: Mapping[int, int]) -> StartBuild:
+                shardings: Placement[TrainState], through: Mapping[int, int], *, kept: bool) -> StartBuild:
     """The one way a fresh state is built and placed, which a run's start runs (`placed_start`) and a run
     compiled ahead compiles (`start_compiled`): where its init passes no frozen leaf through, one program
     builds the state; where it does, the passed leaves are the held arrays placed where the state keeps them,
-    and the program builds the rest (`_rest`). One build a process keeps for each init (`initial_state`, by
-    the object itself: a refit's start traced once, `traced_start`), placement and held arrays it passes
-    through, held weakly (`Held`, `_cache.holding`), so a trainer's refits compile and lower its program
-    once (PF03): their start's program keeps the executable their call runs (`start_compiling`)."""
+    and the program builds the rest (`_rest`). One build a process keeps for each init it `kept` (a refit's
+    start traced once, `traced_draw`; by the object itself), placement and held arrays it passes through,
+    held weakly (`Held`, `_cache.holding`), so a trainer's refits compile and lower its program once (PF03):
+    their start's program keeps the executable their call runs (`start_compiling`). An init no process
+    keeps is traced afresh each fit, so its build is read once and kept by none, where it took a kept one's
+    place among the `KEPT_STARTS`."""
+    if not kept:
+        return _built(initial_state, initializer, shardings, through)
     inputs = jax.tree.leaves(initializer)
     where = jax.tree.flatten(shardings)
     passed = tuple((index, Held(inputs[given])) for index, given in sorted(through.items()))
@@ -542,7 +507,8 @@ def _built(initial_state: Callable[[Initializer, jax.Array], TrainState], initia
     where, structure = jax.tree.flatten(frozen)
     built = tuple(index for index in range(len(where)) if index not in through)
     # Each passed leaf is placed once, where the state keeps it, whatever path the init moves it to.
-    return StartBuild(_rest(initial_state, list(built)), (moving, tuple(where[index] for index in built)),
+    return StartBuild(drawn_rest(initial_state, HELD_APART, built),
+                      (moving, tuple(where[index] for index in built)),
                       {id(inputs[given]): where[index] for index, given in through.items()}, through,
                       (where, structure), built)
 
@@ -583,72 +549,19 @@ def _start_shapes(start: StartBuild, initializer: Initializer, abstract: TrainSt
 
 
 KEPT_STARTS = 4
-"""The traced starts and their builds a process keeps for a refit to read (`traced_start`, `start_build`),
-the latest of each."""
+"""The start builds a process keeps for a refit to read (`start_build`), the latest of them."""
 
-_TRACED_STARTS: collections.OrderedDict[Hashable, Any] = collections.OrderedDict()
+HELD_APART: Parts[TrainState, TrainState, dict[str, Variables]] = Parts(apart, together)
+"""A fresh state's parts as a draw reads them (`dew.objectives.drawn.Parts`): its moving trees and its frozen
+tree, whose leaves may be held arrays its init passes through."""
+
 _BUILDS: collections.OrderedDict[Hashable, StartBuild] = collections.OrderedDict()
-
-
-def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                 key: jax.Array, kept: Hashable | None = None
-                 ) -> tuple[TrainState, dict[int, int], Callable[[Initializer, jax.Array], TrainState]]:
-    """The shapes of the fresh state `initial_state` builds, which of its frozen leaves are the
-    initializer's arrays as they are, and its build replayed from the program its one trace made: each
-    passed leaf's index among the frozen tree's leaves, to the index of the initializer's leaf it is. An
-    init that returns a held leaf as it is, by reference, passes it through (`Objective.held_variables`);
-    one trace finds all three, and the start's program (`placed_start`, `start_compiled`) traces its
-    replay (`dew.algebra.program.replaying`), which runs no model code: a 4B decoder's init traced twice
-    took 41 and 36 s on a B200 host before its first step. Where `kept` states what the start traces from
-    beside its arguments (`Trainer._step_key`, and the trainer's class, whose `initial_state` an override
-    may make its own), the trace its equal made under the same context (`held_context`) over arguments of the
-    same shapes in this process is read (`_cache.holding`): a trainer's refit traces its start once
-    (PF03)."""
-    def made() -> tuple[TrainState, dict[int, int], Callable[[Initializer, jax.Array], TrainState]]:
-        through: dict[int, int] = {}
-
-        def traced(initializer: Initializer, key: jax.Array) -> TrainState:
-            state = initial_state(initializer, key)
-            inputs = {id(leaf): index for index, leaf in enumerate(jax.tree.leaves(initializer))}
-            frozen = jax.tree.leaves(apart(state)[1])
-            through.update({index: inputs[id(leaf)] for index, leaf in enumerate(frozen)
-                            if id(leaf) in inputs})
-            return state
-
-        trace = owned_program(traced).trace(initializer, key)
-        abstract = trace.out_info
-        return abstract, through, replaying(trace.jaxpr, jax.tree.structure(abstract), (), ())
-
-    if kept is None:
-        return made()
-    # The arguments by their leaves alone: the initializer's tree holds its objective's bound init, which
-    # a key held past its trainer would keep alive.
-    leaves = abstract_signature(jax.tree.leaves((initializer, key)))
-    return holding(_TRACED_STARTS, (kept, held_context(), leaves), made, KEPT_STARTS)
-
-
-def built_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
-                key: jax.Array) -> TrainState:
-    """`initial_state(initializer, key)` for a caller outside any trace, built by one program: its trace
-    (`traced_start`) replayed and compiled whole, where run eagerly each operation of the model's draw
-    compiled alone (tens to hundreds a model, row 8682). The frozen leaves its init passes through as they
-    are (`through`) are the initializer's arrays themselves, as an eager build returns them, not the
-    program's copies of them."""
-    _, through, build = traced_start(initial_state, initializer, key)
-    state = owned_program(build)(initializer, key)
-    if not through:
-        return state
-    moving, frozen = apart(state)
-    leaves, structure = jax.tree.flatten(frozen)
-    given = jax.tree.leaves(initializer)
-    return together(moving, jax.tree.unflatten(structure, [
-        given[through[index]] if index in through else leaf for index, leaf in enumerate(leaves)]))
 
 
 def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, abstract: TrainState,
                  shardings: Placement[TrainState], mesh: Mesh) -> TrainState:
     """A fresh state on `mesh`, built by `initial_state` from the objective's held tree (`placed_held`).
-    The frozen leaves the objective's init passes through as they are (`through`, `traced_start`),
+    The frozen leaves the objective's init passes through as they are (`through`, `traced_draw`),
     which no step donates (`apart`), are the held arrays themselves, placed where the state keeps
     them, the same arrays where they are placed already: the run and the objective then hold one
     frozen tree between them. One program builds the rest, a frozen leaf the init builds among it,
@@ -662,13 +575,10 @@ def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, ab
     where, structure = start.frozen
     placed = jax.tree.leaves(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
                                           is_leaf=lambda leaf: leaf is None))
-    drawn = dict(zip(start.built, made, strict=True))
 
-    def leaf(index: int) -> jax.Array:
-        if index in drawn:
-            return drawn[index]
+    def held_at(index: int) -> jax.Array:
         # A held leaf an init passes through at two places of other shardings is placed at the second too.
         held = placed[start.through[index]]
         return held if held.sharding == where[index] else jax.device_put(held, where[index])
 
-    return together(state, jax.tree.unflatten(structure, [leaf(index) for index in range(len(where))]))
+    return reassembled(HELD_APART, state, made, start.built, structure.unflatten, len(where), held_at)

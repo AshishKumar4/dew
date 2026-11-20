@@ -715,7 +715,8 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
 
 
 
-def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub: int = SUB) -> list:
+def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub: int = SUB,
+                       unit_keys: bool = False) -> list:
     """Each sub-chunk's own pairs of one key block under a decay a key dimension, each its own decay, as a
     band `[C, sub]` a product: its row `i`'s column `e` the pair `(i, i - e)`, `sum_k r_ik k_(i-e)k
     exp2(g_ik - g_(i-e)k)`, zero where token `i - e` precedes `i`'s sub-chunk (fla_kda's token-parallel
@@ -732,7 +733,12 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     clip, a power of two and an exp2), a B200's Kimi Linear training spent 0.96 ms of an emulated 2.86 in this
     form and its transpose, each issue-bound (an emulated B200 at 8aab1729e65). Summed over a chunk's key
     blocks, a launch's bands are placed by its caller (`placed_bands`): placed a key block and an offset at a
-    time, the `[C, C]` selects took an H100's Kimi Linear intra launch from 492 to 1982 us (M-JS-50d)."""
+    time, the `[C, C]` selects took an H100's Kimi Linear intra launch from 492 to 1982 us (M-JS-50d).
+    Where the keys are at most one in size (`unit_keys`, `mainloop.Call.unit_keys`), each row takes its
+    decay first instead, a multiply an element and a term's fused multiply-add (fla's token-parallel
+    diagonal folds it so, into the key): all the decayed row loses is below normal in the exact term too.
+    Unnormalised keys keep the row times the key first, which loses no term in range to the decay (row
+    7299; a decayed row lost 2^-100 against a key of 2^60, base review 6ce025bc7 F1)."""
     index, _ = _grid(rows[0].shape)
     lane = jax.lax.broadcasted_iota(jnp.int32, (index.shape[0], sub), 1)
     token = jax.lax.broadcasted_iota(jnp.int32, lane.shape, 0)
@@ -744,7 +750,18 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
         return (tuple(band + jnp.where(column, jnp.sum(row * keys * pair, axis=1)[:, None], 0.0)
                       for band, row in zip(bands, rows, strict=True)), pair, decays)
 
+    def folded(e, carried):
+        # Each row's decay folded in: a multiply an element and a term's fused multiply-add, where keys at
+        # most one in size (`unit_keys`) make what the decayed row loses below normal in the exact term too.
+        bands, decayed, following = carried
+        keys, decays = shifted(e)
+        decayed, column = tuple(row * following for row in decayed), (lane == e) & (token % sub >= e)
+        return (tuple(band + jnp.where(column, jnp.sum(row * keys, axis=1)[:, None], 0.0)
+                      for band, row in zip(bands, decayed, strict=True)), decayed, decays)
+
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
+    if unit_keys:
+        return list(jax.lax.fori_loop(0, sub, folded, ((zero,) * len(rows), tuple(rows), one))[0])
     return list(jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), one, one))[0])
 
 

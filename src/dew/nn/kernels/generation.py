@@ -273,6 +273,11 @@ class RegisterRaises:
     highest: int
     step: int
 
+    def below(self, registers: int) -> int:
+        """The most a `setmaxnreg` moves a thread to at or below `registers`: a program's entry share, a
+        thread's 255 at two warpgroups, is no step (row 6783)."""
+        return min(registers, self.highest) // self.step * self.step
+
 
 SETMAXNREG = RegisterRaises(24, 256, 8)
 """`setmaxnreg`'s range on every architecture that takes it (PTX ISA, "setmaxnreg")."""
@@ -281,23 +286,18 @@ SETMAXNREG = RegisterRaises(24, 256, 8)
 @dataclasses.dataclass(frozen=True)
 class Multiprocessor:
     """A CUDA multiprocessor's resources, which the templates' register and resource models read
-    (`templates.resources`, `templates.cost`) and a compile ahead's target describes
-    (`target_config`): the most threads and blocks resident at once
-    (`resident_threads`, `resident_blocks`), its 32-bit `registers`, the most a thread holds
-    (`thread_registers`), a block's limits (`block_registers`, `block_threads`, `block_shared`, the static
-    shared memory a block declares without opting in), the threads of a warp (`warp_threads`), the
-    allocator's `register_step` a thread (256 a warp), the shared memory the driver reserves for each
-    resident block (`reserved_shared`), the bytes its shared memory serves a clock
-    (`shared_bytes_per_clock`), the base-2 exponentials its special-function units return a clock
-    (`exponentials_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    (`templates.resources`, `templates.cost`) and a compile ahead's target describes (`target_config`): the
+    most threads and blocks resident at once (`resident_threads`, `resident_blocks`), its 32-bit `registers`,
+    the most a thread holds (`thread_registers`), a block's limits (`block_registers`, `block_threads`,
+    `block_shared`, the static shared memory a block declares without opting in), the threads of a warp
+    (`warp_threads`), the allocator's `register_step` a thread (256 a warp), the shared memory the driver
+    reserves for each resident block (`reserved_shared`), the bytes its shared memory serves a clock
+    (`shared_bytes_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
     (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
-    to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; the exponentials the CUDA C++ Best
-    Practices Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s row, where CUDA 13 moved the throughput table,
-    15.97 measured on an H200, the kernel challenge's MUFU.EX2; 128 bytes a clock measured 126 to 128 on an
-    A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking",
-    Table 3) and setmaxnreg's range,
-    which a target of no architecture (the CPU interpreting a launch) reads too, under which every family's
-    launch interprets."""
+    to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; 128 bytes a clock measured 126 to 128
+    on an A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through
+    Microbenchmarking", Table 3) and setmaxnreg's range, which a target of no architecture (the CPU
+    interpreting a launch) reads too, under which every family's launch interprets."""
 
     resident_threads: int = 1536
     resident_blocks: int = 16
@@ -310,7 +310,6 @@ class Multiprocessor:
     register_step: int = 8
     reserved_shared: int = 1024
     shared_bytes_per_clock: int = 128
-    exponentials_per_clock: int = 16
     register_raises: RegisterRaises | None = SETMAXNREG
 
     def raises(self) -> RegisterRaises:
@@ -331,8 +330,11 @@ class Architecture:
     `wgmma`, one of them), the multiprocessors a cluster's TMA multicast reaches (`cluster`), whether its
     tensor instructions read block-scaled operands (`block_scales`), its dense tensor-core FLOPs per clock per
     multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32'; '8bit': FP8
-    operands, E4M3 or E5M2, where the family's tensor instructions multiply them natively; 'fp32': IEEE fp32
-    on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Blackwell's tensor memory columns (PTX ISA,
+    operands, E4M3 or E5M2, where the family's tensor instructions multiply them natively), the elementwise
+    fp32 operations its vector units do a clock (`vector_per_clock`: a CUDA multiprocessor's fp32 lanes'
+    FLOPs, two a lane for its fused multiply-add, which a dot at Precision.HIGHEST takes there too; a TPU's
+    VPU's) and the exponentials its special-function units return a clock (`exponentials_per_clock`: a CUDA
+    multiprocessor's, a TPU's transcendental unit's), Blackwell's tensor memory columns (PTX ISA,
     tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and the VMEM a kernel may raise its
     limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block into shared memory by TMA, which
     it picks from compute capability 9.0 on (its `emit_pipeline` and `copy_gmem_to_smem`), where below it they
@@ -343,6 +345,8 @@ class Architecture:
     issuers: tuple[str, ...]
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
     multiprocessor: Multiprocessor | None = Multiprocessor()
+    vector_per_clock: float | None = None
+    exponentials_per_clock: float | None = None
     tma: bool = False
     dependent_launch: bool = False
     tmem_columns: int | None = None
@@ -400,31 +404,41 @@ class Architecture:
 # Resident blocks and threads a multiprocessor holds are the CUDA C++ Programming Guide's (§5.1, Table 33):
 # 7.5 16 and 1024, 8.0 32 and 2048, 8.6 16 and 1536, 8.9 24 and 1536, 9.0 and 10.0 32 and 2048, 12.x 24 and
 # 1536; setmaxnreg is sm_90a's, sm_100f's and sm_120f's (PTX ISA, `SETMAXNREG`).
-_AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024, 'fp32': 128},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None))
-_AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, 'fp32': 256},
-                                Multiprocessor(register_raises=None))
-_ADA = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
-                    Multiprocessor(resident_blocks=24, register_raises=None))
+CUDA_EXPONENTIALS = 16
+"""The base-2 exponentials a CUDA multiprocessor's special-function units return a clock, every compute
+capability from 7.5 to 12.x alike (the CUDA C++ Best Practices Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s
+row, where CUDA 13 moved the throughput table; 15.97 measured on an H200, the kernel challenge's MUFU.EX2)."""
+_AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024},
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None),
+                       vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS)
+_AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512},
+                                Multiprocessor(register_raises=None),
+                                vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS)
+_ADA = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048},
+                    Multiprocessor(resident_blocks=24, register_raises=None),
+                    vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS)
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture((), {'16bit': 1024, 'fp32': 128},
-                       Multiprocessor(resident_threads=1024, register_raises=None))
+_TURING = Architecture((), {'16bit': 1024}, Multiprocessor(resident_threads=1024, register_raises=None),
+                       vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS)
 # Hopper issues wgmma (sm_90a) and mma.sync, its TMA multicast to a pair of multiprocessors a cluster (the
 # pair CUTLASS's grouped GEMM and cuBLASLt take on an H100).
-_HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32), tma=True,
+_HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192},
+                       Multiprocessor(resident_threads=2048, resident_blocks=32),
+                       vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS, tma=True,
                        dependent_launch=True, cluster=2)
 # Blackwell's tcgen05 family: tcgen05 (sm_100a) and mma.sync, no wgmma; tensor memory, a pair's 2-CTA
 # products and multicast, block-scaled operands (PTX ISA, tcgen05.mma's kind::mxf8f6f4 and mxf4nvf4).
-_BLACKWELL = Architecture(('tcgen05', 'mma.sync'), {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
-                          Multiprocessor(resident_threads=2048, resident_blocks=32), tmem_columns=512,
+_BLACKWELL = Architecture(('tcgen05', 'mma.sync'), {'16bit': 8192, 'tf32': 4096, '8bit': 16384},
+                          Multiprocessor(resident_threads=2048, resident_blocks=32),
+                          vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS, tmem_columns=512,
                           tma=True, dependent_launch=True, cluster=2, block_scales=True)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
 # Its components are those PTX's forward compatibility gives every NVIDIA GPU after it too: mma.sync and
 # cp.async from sm_80, TMA and grid dependency control from sm_90, no arch-specific instruction (wgmma's
 # sm_90a, tcgen05's sm_100a), which no capability implies.
-_BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
-                                   Multiprocessor(resident_blocks=24), tma=True, dependent_launch=True)
+_BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048},
+                                   Multiprocessor(resident_blocks=24), vector_per_clock=256,
+                                   exponentials_per_clock=CUDA_EXPONENTIALS, tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
 # default, read from a Mosaic kernel's refusal of a scratch it uses whole (a flag such as
 # --xla_tpu_scoped_vmem_limit_kib moves it): v5e 16 MiB ("limit 16.00M"); v6e 32 MiB ("Scoped allocation with
@@ -433,11 +447,26 @@ _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
+# Its VPU's fp32 operations and its transcendental unit's exponentials a clock, measured (Google's pages state
+# neither): a Pallas kernel's chain over one VMEM-resident 512 x 1024 fp32 block, the slope of its wall time
+# over 256 to 4096 iterations, each iteration one step or four, over the clock its MXU's peak gives (the
+# tpu_rates script on Colab TPUs, colab7062's rates2 and rates3, two rounds each, at most 1% from the line).
+# An iteration costs the block's VMEM read and write (v5e 0.65 us, v6e 0.28) beside its steps, so a unit's own
+# rate is the four-step iteration's excess over the one-step's, a third of it a step: the VPU's a
+# multiply-add's, two operations an element (v5e 0.627 us a step, 1.67e12 operations a second; v6e 0.370,
+# 2.83e12, where an add alone takes 0.138), and the exponentials an exp2's (v5e 0.341 us, 1.54e12 a second;
+# v6e 0.293, 1.79e12). That read and write is 4 MiB an iteration, 6.5e12 bytes a second on a v5e and 1.5e13
+# on a v6e, which a TPU states no rate of (no shared memory, `templates.cost.rates`): the unit rates hold none
+# of it, and nothing prices a form's VMEM traffic there. A step (`step_seconds`) holds its body's own, once: a
+# substitution row reads its chunk's 64 x 128 fp32 values and writes a row, 33 KiB, 5 ns at that rate of a
+# v5e's 0.89 us step, the rest the chain's latency.
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20, float16=False, packed_slices=False,
-                             fp32_by_bf16_precise=False),
+                             vmem_bytes=128 * 2 ** 20, vector_per_clock=1.67e12 / (197e12 / 131072),
+                             exponentials_per_clock=1.54e12 / (197e12 / 131072), float16=False,
+                             packed_slices=False, fp32_by_bf16_precise=False),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
-                             vmem_bytes=128 * 2 ** 20)}
+                             vmem_bytes=128 * 2 ** 20, vector_per_clock=2.83e12 / (918e12 / 524288),
+                             exponentials_per_clock=1.79e12 / (918e12 / 524288))}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -550,14 +579,20 @@ class GpuTarget:
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
     step_seconds: float | None = None
-    """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
-    predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
-    GPU (FS-STEP-SECONDS1's receipts); None where none was, so a form's span there is priced by no time."""
+    """The least one step of a form's dependent chain costs on XLA's path (the work-span model's step,
+    `templates.cost.Work.span`), each step reading the last: the slope over its iterations of a loop XLA
+    lowers, measured per device (FS-STEP-SECONDS1's script). A span counts dependent steps, a chunk's
+    forward-substitution row (64 rows of 128 values) two of them on every device, its contraction and its set
+    (`dew.algebra.linear_scan`'s `Chunk.substituted`). What bounds a step is the device's: on a GPU each
+    iteration's launch, a one-element loop's launch and predicate; on a TPU, whose iterations launch nothing
+    (a one-element loop's slope zero within 1e-9 s), its body, half the substitution row's slope, a step of
+    two vector operations: a form whose iteration body is longer is priced approximately there until measured
+    as its own. None where none was measured, so a form's span there is priced by no time."""
     kernel_step_seconds: float | None = None
     """One dependent step's latency within a kernel: a tile's 128-lane reduction broadcast into the next
     step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
-    measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
-    none was."""
+    measured per device as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None
+    where none was."""
     vmem_rate: float | None = None
     """A TPU's VMEM bytes a second, read and written by its vector unit: what XLA's path moves between its
     vector registers and VMEM costs (`templates.cost.Work.kept_bytes`, `templates.cost.rates`), measured as a
@@ -702,12 +737,11 @@ class GpuTarget:
         """Dense tensor-core FLOPs per clock per multiprocessor in arithmetic `mode`, or None where
         the generation states none: the generation's, lowered where the SKU's catalogued dense bf16 peak
         is below what its multiprocessors and clock give at that rate, as a GeForce part's half-rate
-        fp32 accumulation reads; IEEE fp32 on the CUDA cores keeps its rate. A part reporting fewer
-        multiprocessors than its catalogue counts (a MIG slice) keeps the generation's rate: the
-        catalogue never raises it."""
+        fp32 accumulation reads. A part reporting fewer multiprocessors than its catalogue counts (a MIG
+        slice) keeps the generation's rate: the catalogue never raises it."""
         rate = self.tensor_rates.get(mode)
         peak = self.bf16_peak
-        if rate is None or mode == 'fp32' or not (peak and self.multiprocessors and self.clock_hz):
+        if rate is None or not (peak and self.multiprocessors and self.clock_hz):
             return rate
         return rate * min(1.0, peak / (self.tensor_rates['16bit'] * self.multiprocessors * self.clock_hz))
 
@@ -900,9 +934,16 @@ TARGETS = {target.generation: target for target in (
     # (cloud.google.com/tpu/docs/v5e, /tpu/docs/system-architecture-tpu-vm); the clock is 197e12 / 131072,
     # derived from the peak, no stated clock. Its scoped VMEM and MXU rate are its family's (`_TPUS`).
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
-              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30,
+              clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30, host_links={},
+              # A step of a form's chain on XLA's path, 0.89 us: half the substitution row's slope over 64 to
+              # 1024 iterations, a row two steps (FS-STEP-SECONDS1's script on a Colab v5e, colab7062's
+              # steps-v5e1, its two rounds 1.772 and 1.770 us a row, 1.8% from the line); its one-element
+              # loop's slopes +-1e-9 s, zero.
+              step_seconds=1.77e-6 / 2,
+              # In-kernel: a dependent lane reduction's 133.8 ns (its two rounds 133.78 and 133.70).
+              kernel_step_seconds=133.8e-9,
               # 0.65 us an iteration of 4 MiB (`vmem_rate`).
-              vmem_rate=6.5e12, host_links={}),
+              vmem_rate=6.5e12),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}},
               host_links={}),
     # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
@@ -910,9 +951,15 @@ TARGETS = {target.generation: target for target in (
     # link is "PCIe Gen5 x8 per chip" (the same page's system architecture): half a Gen5 x16's 64 GB/s each
     # way.
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}, multiprocessors=1,
-              clock_hz=918e12 / 524288, memory_bandwidth=1638e9,
+              clock_hz=918e12 / 524288, memory_bandwidth=1638e9, host_links={'TPU v6 lite': 32e9},
+              # A step of a form's chain on XLA's path, 1.23 us: half the substitution row's slope, a row two
+              # steps (colab7062's steps-v6e1, its two rounds 2.452 and 2.445 us a row); its one-element
+              # loop's slopes 6e-9 and 2e-10 s.
+              step_seconds=2.45e-6 / 2,
+              # In-kernel: a dependent lane reduction's 141.1 ns (its two rounds 141.12 and 141.07).
+              kernel_step_seconds=141.1e-9,
               # 0.28 us an iteration of 4 MiB (`vmem_rate`).
-              vmem_rate=1.5e13, host_links={'TPU v6 lite': 32e9}),
+              vmem_rate=1.5e13),
 )}
 
 
@@ -1022,19 +1069,24 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the GPU `target` a build states (`built_target`: its
     CUDA generation's, its multiprocessors its own where stated): its compute capability, the shared memory
     a block may opt into, its multiprocessors, clock and bandwidth, its multiprocessor's and a block's
-    limits (`Multiprocessor`) and its fp32 lanes (`Architecture.tensor_rates`); CUDA's grid limits for the
+    limits (`Multiprocessor`) and its fp32 lanes (`Architecture.vector_per_clock`); CUDA's grid limits for the
     rest. The fields past the capability and shared memory only steer XLA's own fusions, never a Triton
     kernel's code. From Hopper on, its capability states the architecture-specific features (sm_90a,
     sm_100a, sm_120a), which Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain
-    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
+    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120'). Its
+    device memory `memory` where a build states it, else the least of the target's parts (`GpuTarget.memory`),
+    never none: XLA's memory-driven passes compiled a recurrence's gradient for a GPU of 0 bytes to values
+    O(1) wrong (a GH200 running a step compiled ahead for compile-only sm90 GPUs of no stated memory, row
+    8768)."""
     generation = target.generation
     version = capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
     clock, bandwidth = target.clock_hz, target.memory_bandwidth
+    memory = target.memory if memory is None else memory
     # Its fp32 lanes, two FLOPs a clock each (a fused multiply-add), as its architecture states them.
-    fp32 = target.tensor_rates.get("fp32")
+    fp32 = target.architecture.vector_per_clock
     if (version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None
-            or fp32 is None):
+            or fp32 is None or memory is None):
         raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
     major, minor = version
     multiprocessor = target.multiprocessor
@@ -1045,12 +1097,12 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
   shared_memory_per_core: {shared + multiprocessor.reserved_shared}
   threads_per_core_limit: {multiprocessor.resident_threads}
   core_count: {multiprocessors}
-  fpus_per_core: {fp32 // 2}
+  fpus_per_core: {int(fp32) // 2}
   block_dim_limit_x: 2147483647
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
   memory_bandwidth: {int(bandwidth)}
-  device_memory_size: {0 if memory is None else memory}
+  device_memory_size: {memory}
   clock_rate_ghz: {clock / 1e9}
   shared_memory_per_block_optin: {shared}
   cuda_compute_capability {{
@@ -1077,8 +1129,9 @@ def compile_only_gpus(generation: str, count: int = 1, memory: int | None = None
     `dew._devices.STATED_GPUS`), as the GPU's own allocator states it, at `share`, the pool's share in the
     run that loads their programs: Dew's own (`DEW_SHARE`, a constant) where none is given, never this
     process's (`pool_share`). Devices of two shares are two (each its record), however alike otherwise.
-    Absent `memory`, the devices state no memory: a step is compiled ahead for them only where it is
-    stated (`compile_ahead`)."""
+    Absent `memory`, the devices state no memory to an admission (a step is compiled ahead for them only where
+    it is stated, `compile_ahead`), and XLA compiles for the least of the generation's parts
+    (`target_config`)."""
     from dew._devices import DEW_SHARE, STATED_GPUS, StatedGpu
 
     if memory is not None:
@@ -1579,7 +1632,7 @@ def unbroadcast(cotangent, shape: tuple[int, ...]):
 
 
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None,
-               zero_cotangents: bool = False):
+               zero_cotangents: bool = False, traced_tangent: bool = False):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
@@ -1587,7 +1640,10 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
     `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
     derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
     avals like it), which `apply` is then traced for only where forward mode runs it. With `zero_cotangents`,
-    a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros."""
+    a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros. With
+    `traced_tangent`, its tangent is one jvp of `apply` in the residuals and moving leaves a tangent reaches,
+    the others held as constants: an `apply` whose own derivative sums both in one (an aligned sum's, whose
+    two parts added overflowed to inf - inf, and a zero direction met an infinite factor, NaN; row 8757)."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
@@ -1597,7 +1653,8 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
         traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
         out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
-    return _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents)(residuals, moving)
+    primitive = _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents, traced_tangent)
+    return primitive(residuals, moving)
 
 
 @functools.cache
@@ -1618,6 +1675,30 @@ def _linear_primitive() -> type:
         """`tangents` with each symbolic zero an array of its tangent type: float0's for an integer leaf."""
         return jax.tree.map(hijax.instantiate_zeros, tangents, is_leaf=zero)
 
+    def nothing(out_aval):
+        """A tangent of `out_aval`'s type no direction reaches: its symbolic zeros."""
+        return jax.tree.map(lambda aval: hijax.Zero(aval.to_tangent_aval()), out_aval)
+
+    def held_jvp(apply, primals, tangents, out_aval):
+        """`apply(*primals)`'s tangent in the leaves `tangents` reaches (neither None nor a symbolic zero,
+        paired by the primals' structure, which raises where theirs differs), the others held as constants:
+        a zero tangent's leaf beside an infinite one was a 0 inf, NaN (row 8757)."""
+        flat, tree = jax.tree.flatten(primals)
+        directions = tree.flatten_up_to(tangents)
+        live = [index for index, direction in enumerate(directions)
+                if direction is not None and not zero(direction)]
+        if not live:
+            return nothing(out_aval)
+
+        def moved(*held):
+            leaves = list(flat)
+            for index, leaf in zip(live, held, strict=True):
+                leaves[index] = leaf
+            return apply(*jax.tree.unflatten(tree, leaves))
+
+        return jax.jvp(moved, tuple(flat[index] for index in live),
+                       tuple(directions[index] for index in live))[1]
+
     def unbatched(cotangent):
         """An unbatched operand's cotangent: its batch's sum."""
         if cotangent.dtype == jax.dtypes.float0:
@@ -1628,12 +1709,14 @@ def _linear_primitive() -> type:
         apply: Callable
         pullback: Callable
         zero_cotangents: bool
-        """`linear_map`'s two functions and whether its pullback takes None for a zero cotangent, `params`
-        that `HiPrim` makes attributes."""
+        traced_tangent: bool
+        """`linear_map`'s two functions, whether its pullback takes None for a zero cotangent and whether its
+        tangent is one jvp of `apply` (`held_jvp`), `params` that `HiPrim` makes attributes."""
 
-        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False):
+        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False, traced_tangent=False):
             self.in_avals, self.out_aval = in_avals, out_aval
-            self.params = {"apply": apply, "pullback": pullback, "zero_cotangents": zero_cotangents}
+            self.params = {"apply": apply, "pullback": pullback, "zero_cotangents": zero_cotangents,
+                           "traced_tangent": traced_tangent}
             super().__init__()
 
         def expand(self, *args):
@@ -1655,16 +1738,20 @@ def _linear_primitive() -> type:
         def jvp(self, primals, tangents):
             residuals, moving = primals
             d_residuals, d_moving = tangents
+            if self.traced_tangent:
+                return self(residuals, moving), held_jvp(self.apply, primals, tangents, self.out_aval)
             terms = []
             if not all_zero(d_moving):
                 terms.append(self(residuals, instantiated(d_moving)))
             if not all_zero(d_residuals):
-                terms.append(jax.jvp(lambda held: self.apply(held, moving), (residuals,),
-                                     (instantiated(d_residuals),))[1])
+                # The residuals' own, the moving leaves held still (base review 0c6ef9c11 F2).
+                held = (d_residuals, jax.tree.map(lambda _: None, moving))
+                terms.append(held_jvp(self.apply, primals, held, self.out_aval))
             if not terms:
-                return self(residuals, moving), jax.tree.map(
-                    lambda aval: hijax.Zero(aval.to_tangent_aval()), self.out_aval)
-            return self(residuals, moving), jax.tree.map(lambda *parts: sum(parts), *terms)
+                return self(residuals, moving), nothing(self.out_aval)
+            # Added only where two parts are: a lone part's sign kept (`0 + -0.0` is positive zero).
+            return self(residuals, moving), jax.tree.map(lambda *parts: functools.reduce(jnp.add, parts),
+                                                         *terms)
 
         lin, linearized = hijax.linearize_from_jvp
         vjp_fwd, vjp_bwd_retval = hijax.vjp_from_jvp
@@ -1686,7 +1773,8 @@ def _linear_primitive() -> type:
                     unbatched(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
                     for leaf, axis in zip(leaves, axes, strict=True)])
 
-            return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents),
+            return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents,
+                               traced_tangent=self.traced_tangent),
                     jax.tree.map(lambda _: 0, self.out_aval))
 
     return Linear

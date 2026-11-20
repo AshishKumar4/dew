@@ -9,7 +9,7 @@ set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a f
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Hashable, Sequence, Set
+from collections.abc import Callable, Hashable, Iterable, Sequence, Set
 from typing import ClassVar, Literal, overload
 
 import jax
@@ -62,7 +62,6 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _forward_allocations,
     _plain_forward,
     _trained_forward,
-    _whole,
     certified_walk,
     forward_products,
     logits_ahead,
@@ -86,6 +85,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     few_rows,
     fewer_rows,
     fuses,
+    held_walked,
     holders,
     hook_reduces,
     launch_scope,
@@ -134,7 +134,8 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                                                 least_held: Callable[..., int] = query_rows
                                                 ) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7), no space ranked: its
-    consumers the family's (`Family.consumers`) where its step `overlapped` (a softmax between its products,
+    consumers the family's first count (`Family.derived_consumers`, at most a launch's `most_consumers`)
+    where its step `overlapped` (a softmax between its products,
     which runs under its partner's products as the consumers take turns, FlashAttention-3's), else one (a
     step issuing its products back to back, which turns only make wait); fewer where the `held` rows a
     consumer accumulates (a forward's queries, a dK/dV launch's keys) fill fewer of the family's units; each
@@ -149,9 +150,10 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     where its family's products read operands from registers, a tile its transposed streams staged at the
     family's own swizzle do not fit fits them staged narrowest (`Tiles.narrow`), a wide stage's bandwidth
     traded for the larger tile; fewer consumers where no tile of the family's count holds the block (a GPU
-    of a smaller one). Where an `overlapped` step's family runs one consumer a program on registers it
-    budgets (no partner whose products a softmax runs under: mma.sync's), its consumer's rows twice the unit
-    too, each warp two of the products' row tiles, FlashAttention 2's 128-row tile on one warpgroup, first,
+    of a smaller one). Where an `overlapped` step's program runs one consumer on registers its family
+    budgets (no partner whose products a softmax runs under: a family of one, or a family whose products read
+    registers falling back to one, `wide`), its consumer's rows twice the unit too, each warp two of the
+    products' row tiles, FlashAttention 2's 128-row tile on one warpgroup, first among one consumer's tiles,
     where its first key tile holds, each key tile's loads and fragments read once for twice the queries (an
     A100 at width 128, 128 x 32 against 64 x 64, ptxas 250 and 189 registers spilling none; width 64, 128 x
     64 against 64 x 128, two programs a multiprocessor against one, et-a100tile2); then the unit, then
@@ -160,14 +162,22 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     (`query_rows`: the issuer's rows for a decode step's few), a backward's a role's rows (`_role_rows`).
     None where no tile fits."""
     unit = least_held(family, dtype, held) if rows is None else rows
-    most = most_consumers(family, tiles(unit, family.rows, 1)) if overlapped else 1
-    wide = rows is None and overlapped and most == 1 and family.budgets_registers
+    most = (min(most_consumers(family, tiles(unit, family.rows, 1)), family.derived_consumers) if overlapped
+            else 1)
+    # Twice the unit a consumer where the program runs one: a family of one consumer, or a family whose
+    # products read registers at its fallback to one (a fed mma.sync's two consumers that hold no tile, its
+    # one then FlashAttention 2's 128 rows, as a family of one derives it).
+    wide = (rows is None and overlapped and family.budgets_registers
+            and (most == 1 or family.operands_in_registers))
 
     def padded(rows: int, consumers: int) -> int:
         return -(-held // (rows * consumers)) * rows * consumers
 
-    def first(rows: int) -> Config | None:
-        for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
+    def counts(rows: int) -> range:
+        return range(max(1, min(most, -(-held // rows))), 0, -1)
+
+    def first(rows: int, tried: Iterable[int]) -> Config | None:
+        for consumers in tried:
             if consumers > 1 and padded(rows, consumers) - padded(rows, consumers - 1) > held // 8:
                 # A count whose tile pads the held rows by more than an eighth of them beyond the next
                 # count's (a 192-row tile of three consumers over a 256-row shard pads it by half, where two
@@ -180,15 +190,18 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                         return config
         return None
 
-    # Twice the unit where the held rows take it, padding them by no more than an eighth beyond the unit's;
-    # then the unit; then, for a call of fewer rows than a role's, fewer of them a tile, its issuer's rows at
-    # least, where no tile of them all holds (a 48-row training walk's scaled op on mma.sync held 278
-    # registers of 255 at 48 x 64, the least key tile so few rows take, `_least_keys`, et-sm86scaled). The
-    # first that holds is the config: legality steps down, nothing is ranked (design §7).
+    # The unit at the counts above one first (FlashAttention 3's consumers); then one consumer's heights:
+    # twice the unit where `wide` and the held rows take it, padding them by no more than an eighth beyond
+    # the unit's, then the unit; then, for a call of fewer rows than a role's, fewer of them a tile at every
+    # count, its issuer's rows at least, where no tile of them all holds (a 48-row training walk's scaled op
+    # on mma.sync held 278 registers of 255 at 48 x 64, the least key tile so few rows take, `_least_keys`,
+    # et-sm86scaled). The first that holds is the config: legality steps down, nothing is ranked (design §7).
     heights = [2 * unit] if wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8 else []
     heights.append(unit)
     fewer = range(unit - family.rows, 0, -family.rows) if rows is None and few_rows(family, held) else ()
-    return next((config for config in map(first, (*heights, *fewer)) if config is not None), None)
+    order = ((unit, [count for count in counts(unit) if count > 1]), *((height, [1]) for height in heights),
+             *((rows, counts(rows)) for rows in fewer))
+    return next((config for config in (first(*each) for each in order) if config is not None), None)
 
 
 def _role_rows(family: mosaic.Family, dtype, held: int) -> int:
@@ -209,10 +222,29 @@ def _least_keys(family: mosaic.Family, rows: int) -> int:
     return WARPGROUP_WARPS * 16 if rows < family.role_rows else 1
 
 
+def _fewer_hooked(score_mod, reads_queries: bool, family: mosaic.Family) -> bool:
+    """Whether a backward of `score_mod` takes fewer rows a consumer than a role's on `family` (`fewer_rows`):
+    a call of no score hook, or one whose family reads its products' fragments from registers
+    (`Family.operands_in_registers`, mma.sync's) under a hook reading no query's place (`reads_queries`,
+    `MosaicBackward.score_reads`' first, its builder's reading of the hook). An sm80 accurate-form backward
+    under a score hook held its keys 32 a tile (q64 x k32: a key bias's dQ kernel 251 registers, a tile
+    bias's, its columns in two, 255, spilling nothing) where every tile of a role's rows spilled (et-k32;
+    rows 7279, 7280); a row-indexed hook's term of its query places (`q_pos[:, :1]`) found no layout at 32
+    rows on sm80, sm86 and sm89 (et-fewer-stack), as the forward's did before it held them in the
+    accumulator's layout (row 5279)."""
+    return score_mod is None or (family.operands_in_registers and not reads_queries)
+
+
 def _sides(rows: int, family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
     """A backward's walked tile of a consumer's `rows` below a role's (`fewer_rows`): whole multiples of them
     and of its swizzled rows, a launch's walked tile the other's consumer rows (`extents`' bounds)."""
     return tuple(side for side in walked_extents(family, dtype, extent) if side % rows == 0)
+
+
+def _query_walk(rows: int | None) -> Callable[..., tuple[int, ...]]:
+    """The query blocks a backward walks for a consumer of `rows` rows, largest first: a role's (None)
+    `extents`, fewer rows' (`fewer_rows`) `_sides`; its derivation's walk and its ladder's (`ladder`)."""
+    return extents if rows is None else functools.partial(_sides, rows)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -289,7 +321,9 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """Why the launch runs no call of `ba` on `target`, or None: its family has no bundle here, the call
         is one it does not take (`refusal`, each reason with its ledger row), it is interpreted in a GPU
         process (`grouped_matmul._Mosaic.eligible`: the interpreter's callbacks are ordered effects, which a
-        GPU process's lowering cannot carry), or no config fits the device (`derived`)."""
+        GPU process's lowering cannot carry), or no config fits the device (`derived`), certification
+        refusing each it derives (`tuning`'s `_certified`: an A100's accurate backward 128 wide under a
+        temperature, every config spilling at 255 registers, which the Pallas-Triton backward takes)."""
         name = generation.family(target.generation)
         query = ba.arguments["query"]
         family = self._bundle(target.generation, query.dtype)
@@ -302,6 +336,20 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         if self.derived(ba, target) is None:
             return Refusal('resources',
                            f"no config of the Mosaic mainloop fits {target.generation}'s block and registers")
+        return None
+
+    def uncertified(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Refusal | None:
+        """Why the launch the route selected runs no call of `ba` on `target` as the GPU assembles its
+        configs (`tuning`'s `_certified`: each that spills or serializes its warpgroup MMAs refused, the next
+        derived in its place), or None: a call the route sends here alone is certified, once it is selected
+        (`attention_route._mainloop`), so a call another mainloop takes compiles none of its kernels. A
+        process compiling for no GPU certifies none, and its derived config holds."""
+        if self.derived(ba, target) is None:
+            return self.declined(ba, target)
+        if not self.holds(ba):
+            # Certification refused every config the derivation offers (`tuning`'s exhausted verdict, None).
+            return Refusal('resources', f"every config of the Mosaic mainloop spills or serializes its "
+                           f"products as {target.generation}'s assembler builds them")
         return None
 
     def legal(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
@@ -463,15 +511,15 @@ class MosaicForward(_Mainloop[Tiles]):
                     return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                           out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
                                           table=table, sources=sources, subtracted=self.subtracted,
-                                          scales=scales, parts=self.parts, scaled=scaled, in_key=self.in_key,
-                                          **form)
+                                          scales=scales, parts=self.parts, scaled=scaled,
+                                          in_key=self.reads_key_slot(bundle_of(config, query.dtype)), **form)
 
         if scaled or self.bounded or hooks.rounds is not None or not algebra.headroom(value.dtype):
             return launched(), None
         # A call some row of which can be scaled (`algebra.may_scale`) launches the scaled op's kernels (its
         # own config, `scaled`), every other call, every ordinary input's, this op's unscaled ones, bit for
         # bit the scaled walk's there.
-        may = algebra.may_scale(_whole(value, self.parts), keys_axis=1,
+        may = algebra.may_scale(product.joined(value, self.parts), keys_axis=1,
                                 initial=None if initial is None else initial.acc,
                                 amplified=1.0 if drop is None else drop.bound)
         arguments = (query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
@@ -628,10 +676,10 @@ class MosaicForward(_Mainloop[Tiles]):
         """`config` as it launches, its natural rewalk's tiles named (`_relaunched`), where that is legal
         (`legal`: a compile's refusal of the launch among its rules, keyed by this config); None where it is
         not or no tile holds the rewalk."""
-        if not self._launch_legal(ba, config, target):
+        if not (self._launch_legal(ba, config, target) and self.proposes(ba, config, target)):
             return None
         launched = self._relaunched(ba, config, target)
-        return launched if launched is not None and self.legal(ba, launched, target) else None
+        return launched if launched is not None and self.takes(ba, launched, target) else None
 
     def streaming(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Tiles:
         """`config` for a call whose walk the device's memory bounds (`streams`), its key tile the least its
@@ -731,7 +779,8 @@ class MosaicForward(_Mainloop[Tiles]):
                       for consumers in range(config.consumers, 0, -1)
                       for block in walked_extents(family, query.dtype, config.block_k)
                       if config.block_k % block == 0)
-        relaunch = next((tiles for tiles in relaunches if self._launch_legal(ba, tiles, target)), None)
+        relaunch = next((tiles for tiles in relaunches
+                         if self._launch_legal(ba, tiles, target) and self.proposes(ba, tiles, target)), None)
         if relaunch is None:
             return None
         return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers,
@@ -751,7 +800,7 @@ class MosaicForward(_Mainloop[Tiles]):
         while (fallback := self._tiles(ba, target, skip=family, refused=refused)) is not None:
             relaunch = fallback.relaunch if fallback.relaunch_k is not None else dataclasses.replace(
                 fallback, natural_form=True)
-            if not self._launch_legal(ba, relaunch, target):
+            if not (self._launch_legal(ba, relaunch, target) and self.proposes(ba, relaunch, target)):
                 return None
             launched = dataclasses.replace(config, relaunch_family=relaunch.family,
                                            relaunch_q=relaunch.block_q, relaunch_k=relaunch.block_k,
@@ -808,7 +857,8 @@ class MosaicForward(_Mainloop[Tiles]):
                                            ba.arguments.get("residuals") is Kept.SPLIT,
                                            min(config.stages, steps), out_dtype=out_dtype, page=page,
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
-                                           parts=self.parts, params=self.score_types, in_key=self.in_key)
+                                           parts=self.parts, params=self.score_types,
+                                           in_key=self.reads_key_slot(family))
         # An inference launch may flag its rows for the fold's rewalk, and a cache's scaled walk reads its
         # keys' value magnitudes from its value slots (`algebra.SCALED_WALK`; another scaled walk the call's,
         # `attention_mosaic_forward._largest`), each a reduction across warps (`reducing`).
@@ -914,29 +964,15 @@ class MosaicForward(_Mainloop[Tiles]):
         if self.parts > 1 and not loads_parts(family):
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
-        if self.in_key and (reason := self._in_key_refusal(ba, family)) is not None:
-            return reason
         if family.places_on_role and (reason := self._placed_refusal(ba, hooks, family)) is not None:
             return reason
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
-    def _in_key_refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
-        """Why a call whose values are its keys' leading columns (`in_key`) runs on no program of `family`,
-        or None: its value tile a view of the key slot's whole swizzled groups of columns, no wider than the
-        key's (a view ending within a group is one no product reads), read where its
-        family streams the keys of 16-bit operands into one slot a step (no fp32 parts, quantized codes or
-        paged gather), its products issued from its own consumers (a family placing them on an issuing role
-        declares the values' stream)."""
-        key, value = ba.arguments["key"], ba.arguments["value"]
-        group = swizzling.swizzle_columns(key.dtype, swizzling.SWIZZLE_BYTES)
-        if value.shape[3] > key.shape[3] or value.shape[3] % group:
-            return Refusal('columns', f"a value of the keys' leading {value.shape[3]} columns is read as "
-                           f"whole groups of {group} of the key's {key.shape[3]}")
-        if self.parts > 1 or ba.arguments["scales"] is not None or ba.arguments["table"] is not None:
-            return Refusal('columns', "a value read from the key's slot is a dense 16-bit call's")
-        if family.places_on_role:
-            return Refusal('columns', f"{family.name} declares the values' stream of its issuing role")
-        return None
+    def reads_key_slot(self, family: mosaic.Family) -> bool:
+        """Whether its launches on `family` read the values from the key's slot (`in_key`, `reads_in_key`'s
+        call): every family's but one placing its products on an issuing role, whose role declares the
+        values' stream (tcgen05's rows), which streams the value array the call was handed."""
+        return self.in_key and not family.places_on_role
 
     def _placed_refusal(self, ba: tokamax.BoundArguments, hooks: Hooks, family: mosaic.Family
                         ) -> Refusal | None:
@@ -1062,7 +1098,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     """
     # The key prologue taken as XLA's program before the launch (`key_prologue_taken`); the query's where the
     # call's consumers cannot take it (`_forward_call`).
-    in_key = reads_in_key(in_key, hooks, residuals)
+    in_key = reads_in_key(in_key, key, value, hooks, residuals, table=table, scales=scales)
     key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     if residuals is Kept.SPLIT:
         # The training walk reads an interval a query (`KeySpans.per_query`); the inference walk by position.
@@ -1076,24 +1112,36 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 
 def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                      hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
-                     residuals: Kept = Kept.NONE, in_key: bool = False) -> Refusal | None:
-    """Why `forward` runs no call of these arrays compiled on this device, or None
-    (`MosaicForward.declined`)."""
+                     residuals: Kept = Kept.NONE, in_key: bool = False,
+                     certified: bool = False) -> Refusal | None:
+    """Why `forward` runs no call of these arrays compiled on this device (`MosaicForward.declined`), and
+    where `certified` (the route's selected mainloop alone) as the GPU assembles its configs
+    (`MosaicForward.uncertified`), or None."""
     spans = spans.per_query() if residuals is Kept.SPLIT else spans
-    in_key = reads_in_key(in_key, hooks, residuals)
+    in_key = reads_in_key(in_key, key, value, hooks, residuals)
     key, hooks = key_prologue_taken(key, Hooks() if hooks is None else hooks)
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              residuals=residuals, in_key=in_key)
-    return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
+    ba, target = op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target()
+    return op.uncertified(ba, target) if certified else op.declined(ba, target)
 
 
-def reads_in_key(in_key: bool, hooks: Hooks | None, residuals: Kept = Kept.NONE) -> bool:
+def reads_in_key(in_key: bool, key: jax.Array, value: jax.Array, hooks: Hooks | None,
+                 residuals: Kept = Kept.NONE, *, table: jax.Array | None = None,
+                 scales: tuple[jax.Array, jax.Array] | None = None) -> bool:
     """Whether a call whose values are its keys' leading columns (`in_key`) reads them from the key's slot:
     not under a key prologue, whose keys the slot holds, the values being the keys as given, nor where it
     keeps split residuals, whose anchored training launches stream the values as given
-    (`_trained_forward`); such a call reads them from the slice it was handed. A plain forward keeping its
-    rows (`Kept.OUTPUT`, a split decode step's slices) reads the key's slot as one keeping none."""
-    return in_key and residuals is not Kept.SPLIT and (hooks is None or hooks.key_mod is None)
+    (`_trained_forward`); nor where the slot holds no value tile its products read: a value wider than the
+    key or ending within a swizzle group of its columns (a view no product reads), operands of 32 bits
+    (their 16-bit parts load in pieces, `MosaicForward.parts`), a quantized cache's codes (`scales`) or a
+    paged cache's gathered pages (`table`). Such a call reads them from the slice it was handed, as one
+    without `in_key`: `in_key` states the operands, never another call. A plain forward keeping its rows
+    (`Kept.OUTPUT`, a split decode step's slices) reads the key's slot as one keeping none."""
+    group = swizzling.swizzle_columns(key.dtype, swizzling.SWIZZLE_BYTES)
+    return (in_key and residuals is not Kept.SPLIT and (hooks is None or hooks.key_mod is None)
+            and value.shape[-1] <= key.shape[-1] and value.shape[-1] % group == 0
+            and jnp.dtype(key.dtype).itemsize == 2 and table is None and scales is None)
 
 
 def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
@@ -1157,7 +1205,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         # output fp32, the call's. Its fold's logits a difference of raw products scaled after it
         # (`MosaicForward.subtracted`): no reach, so no natural rewalk, whose guarded walk of parts held no
         # registers at width 64 (8 bytes spilled on an H100, et-fp32regs7).
-        query, key, value = (jnp.concatenate(product.formed(x, parts), axis=0) for x in (query, key, value))
+        query, key, value = (product.stacked(x, parts) for x in (query, key, value))
         out_dtype = jnp.float32 if out_dtype is None else out_dtype
         subtracted = True
     op = MosaicForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
@@ -1293,16 +1341,15 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         and of their cotangents, a step's walked tile each, beside its kept sums' shares of their columns
         (`BackwardTiles.columns`)."""
         query = ba.arguments["query"]
-        keys_first = isinstance(family, placed.Tcgen05KeysFirst)
         # Its operands 16-bit of one part (bf16: fp16's weights and cotangents two scaled parts, whose
         # products no placed walk issues), a fused walk's dQ products a 64- or 128-row tile of its queries
         # (tcgen05's M).
         if (jnp.dtype(query.dtype) != jnp.dtype(jnp.bfloat16) or self.accurate or self.score_kinds
                 or ba.arguments["drop"] is not None or self.per_span > 1 or config.staged_logits
                 or config.shared_keys or tiles.consumers != family.consumers
-                or (config.fused and (not keys_first or tiles.block_q not in (64, 128)))):
+                or (config.fused and (not family.holds_keys or tiles.block_q not in (64, 128)))):
             return False
-        held, walked = (tiles.block_k, tiles.block_q) if keys_first else (tiles.block_q, tiles.block_k)
+        held, walked = held_walked(family, tiles)
         if held != family.rows:
             return False
         # Its scratch as its launch allocates it (`placed_scratch`, the head widths as staged, `_width`).
@@ -1310,7 +1357,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                               for name in ("query", "value"))
         halves = dq_halves(width * config.columns) if config.fused else ()
         products = placed_scratch(family, walked, query.dtype, halves,
-                                  (width, value_width) if keys_first else (width,))["products"]
+                                  (width, value_width) if family.holds_keys else (width,))["products"]
         return family.product_columns(products) <= (target.tmem_columns or 0)
 
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
@@ -1394,10 +1441,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # summed in their order in XLA.
         if config.fused and deterministic_ops_requested():
             return False
-        if (self.score_mod is not None and family is not None
-                and min(config.block_q, config.block_k) < family.role_rows):
-            # A score hook's tiles at a role's rows (`derived`'s fewer rows a consumer): a hooked call's tiles
-            # of fewer fail to lower.
+        if (family is not None and min(config.block_q, config.block_k) < family.role_rows
+                and not _fewer_hooked(self.score_mod, self.score_reads[0], family)):
+            # A score hook's tiles at a role's rows (`derived`'s fewer rows a consumer) where its family
+            # takes none fewer (`_fewer_hooked`): a hooked call's tiles of fewer fail to lower there.
             return False
         if config.shared_keys:
             # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
@@ -1453,11 +1500,44 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                           family=queries.name, columns=columns)
                for columns in (1, 2, 4) for walked in walked_extents(queries, query.dtype, key.shape[1])
                for step in steps] if queries is not None else []
-        return next((config for config in (*fused, *two) if self.legal(ba, config, target)), None)
+        return next((config for config in (*fused, *two) if self.takes(ba, config, target)), None)
+
+    def ladder(self, ba: tokamax.BoundArguments, config: Hashable) -> tuple[Hashable, ...]:
+        # The query blocks its derivation walks below `config`'s for its consumer's rows (`_query_walk`) on
+        # the layout its derivation walks (`_named`'s, its warps not yet arranged for the consumer's rows as
+        # `bundle_of`'s are, mma.sync's at 32 rows two warps of 16, of which no fewer rows are), `config`'s
+        # other fields kept, within its register cap and residency, largest first.
+        if not self._typed(config):
+            return ()
+        target = generation.gpu_target()
+        query = ba.arguments["query"]
+        layout = self._named(target.generation, query.dtype, query.shape[1]).get(config.family)
+        if layout is None:
+            return ()
+        walk = _query_walk(config.block_k if config.block_k in fewer_rows(layout) else None)
+        regime = self._regime(ba, config, target)
+        smaller = (dataclasses.replace(config, block_q=block)
+                   for block in walk(layout, query.dtype, query.shape[1]) if block < config.block_q)
+        return tuple(rung for rung in smaller
+                     if self.takes(ba, rung, target) and self._regime(ba, rung, target) == regime)
+
+    def _regime(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget
+                ) -> tuple:
+        """The assembler's conditions at `config`: each launch's register cap and whether its program moves
+        registers, as its kernels' models state them (`resources.register_model` at the registers its
+        emission states, `_launch_registers`), and the launch's residency."""
+        dtype = ba.arguments["query"].dtype
+        dq, dkv = self._launch_registers(ba, config)
+        launches = ((config.dkv, dkv),) if config.fused else ((config, dq), (config.dkv, dkv))
+        models = [resources.register_model(bundle_of(tiles, dtype), tiles.consumers, registers)
+                  for tiles, registers in launches]
+        return (*((model.cap(1), model.moves) for model in models), self.resident(ba, config, target))
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
-        launches walk the largest their registers and the block hold, two stages, one consumer, whose step
+        launches walk the largest the block holds, its registers the assembler's to judge (`ranks_alone`: a
+        config that spills is refused where it compiles, and the derivation steps past it), two stages, one
+        consumer, whose step
         issues its products back to back (TRAINC-h100: 6.88 against 3.72 ms causal, 9.68 against 7.56 full,
         at 64 x 64 with two consumers and one). The fast form of a hookless call (or one whose hook takes no
         parameters, a softcap, or under an initial state, sinks) takes one launch where one holds the whole
@@ -1480,7 +1560,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         query, key = ba.arguments["query"], ba.arguments["key"]
 
         def fits(config: BackwardTiles) -> bool:
-            return self.legal(ba, config, target)
+            return self.takes(ba, config, target)
 
         derive = functools.partial(_derived, least_held=_role_rows)
 
@@ -1557,8 +1637,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             lambda config: fits(config) and self.resident(ba, config, target) >= 2]
         for wanted in (*residing, fits):
             for columns in (1, 2, 4):
-                for rows in (None, *(fewer_rows(dq) if self.score_mod is None else ())):
-                    walks = extents if rows is None else functools.partial(_sides, rows)
+                fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, self.score_reads[0], dq) else ()
+                for rows in (None, *fewer):
+                    walks = _query_walk(rows)
                     for staged in (False, True):
                         def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
                                   ) -> BackwardTiles:
@@ -1636,14 +1717,14 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return BackwardRegisters(query.dtype, query.shape[-1], value.shape[-1], self.accurate, params,
                                  self.score_slopes, drop is not None, config.queries_first, self.score_reads)
 
-    def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
-        # Each launch's registers within its own layout's budget (`Family.registers`); every config where
-        # the family budgets none (`Family.budgets_registers`).
-        if not bundle_of(config, ba.arguments["query"].dtype).budgets_registers:
-            return True
-        dq, dkv = self._launch_registers(ba, config)
-        held = dkv <= self.register_budget(config.dkv)
-        return held and (config.fused or dq <= self.register_budget(config))
+    def ranks_alone(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        # A backward takes its ranking's first legal config, the assembler judging its registers and its
+        # products' issue (a kernel that spills or whose warpgroup MMAs ptxas serializes refused,
+        # `report.Binary.refused`, and the next ranked in its place): the one its register model proposed
+        # ran slower on every launch measured (M-FS-15: a GH200's 0.692, an A100's six at 0.62 to 0.94).
+        del ba, target
+        return True
+
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -1683,12 +1764,15 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 def backward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                       hooks: Hooks | None, dout: jax.Array, *,
                       residuals: tuple[jax.Array, jax.Array, jax.Array, Split], scale: float | None = None,
-                      natural: bool = NATURAL, accurate: bool = ACCURATE) -> Refusal | None:
-    """Why `backward` runs no call of these arrays compiled on this device, or None
-    (`MosaicBackward.declined`)."""
+                      natural: bool = NATURAL, accurate: bool = ACCURATE, certified: bool = False
+                      ) -> Refusal | None:
+    """Why `backward` runs no call of these arrays compiled on this device (`MosaicBackward.declined`), and
+    where `certified` (the route's selected mainloop alone) as the GPU assembles its configs
+    (`MosaicBackward.uncertified`), or None."""
     op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,
                               accurate=accurate)
-    return op.declined(op.bind(*args, interpret=False), generation.gpu_target())
+    ba, target = op.bind(*args, interpret=False), generation.gpu_target()
+    return op.uncertified(ba, target) if certified else op.declined(ba, target)
 
 
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,

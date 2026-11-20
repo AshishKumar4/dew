@@ -371,7 +371,7 @@ def test_a_kept_program_is_handed_by_its_own_fingerprint_alone(tmp_path):
     other = {f"{number:064d}": each for number, each in enumerate(programs.kept.values())}
     dataclasses.replace(programs, kept=other).save(path)
     assert kept_worker(tmp_path, "take") == {"answers": answers, "compiled": EVERY_PROGRAM}
-    AheadPrograms(programs.target, {}).save(path)
+    AheadPrograms(programs.target, {}, tuned=True, at_run=()).save(path)
     with pytest.raises(ValueError), kept(path):
         pass
 
@@ -490,3 +490,25 @@ def test_a_keeping_block_within_another_is_heard_by_both_and_the_outer_alone_aft
         owned_program(halved)(jnp.arange(3.))
     assert [name for name, _ in heard] == ["outer", "inner", "outer"], heard
     assert heard[0][1] == heard[1][1] != heard[2][1], heard
+
+
+def test_a_save_of_programs_within_another_keeps_its_program_in_both_and_the_later_one_in_the_outer():
+    """Row 8450 through the saves a run makes (`dew.training.ahead.keeping`): a program compiled within a
+    save nested in another is kept by both, and one compiled past the inner save by the outer alone, each
+    kept by its fingerprint, so each file hands back what was compiled while it was open."""
+    from dew.nn.kernels.options import owned_program
+    from dew.training.ahead import keeping
+
+    def doubled(values):
+        return values * 2
+
+    def halved(values):
+        return values / 2
+
+    with keeping() as outer:
+        with keeping() as inner:
+            owned_program(doubled)(jnp.arange(3.))
+        owned_program(halved)(jnp.arange(3.))
+    assert not inner.refused and not outer.refused, (inner.refused, outer.refused)
+    assert len(inner.kept) == 1 and len(outer.kept) == 2 and set(inner.kept) < set(outer.kept), (
+        inner.kept, outer.kept)

@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from contract_support import REVERSE_ONLY, assert_contract, normal_float32
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
 from ssd_support import ssd_orbit, stepwise_scan
 
@@ -351,6 +352,12 @@ Every memory is entered, so no gradient's row is float64 zero, whose terms the g
 draw."""
 
 
+ADDS = ((0, 0, 1), (0, 0, 2))
+"""Each row's documents' added slots (`Chunk.adds`): the first row's last document adding its row's given
+memory to its parent's final, the second row's the first document's final to its predecessor's (row
+7662)."""
+
+
 def documents_draw(seed: int):
     """Two rows of three documents (`DOCUMENTS`) of a forked call (`FORKED`) over one given memory a row,
     each document's entry write (`recurrence_chunk.Chunk.entry_key`: two terms of a state's keys `[N]` and
@@ -367,29 +374,37 @@ def documents_draw(seed: int):
     return (x, b, c, a, given, *entry), seeded
 
 
-def documents_on_the_kernel(x, b, c, a, given, key, value, weight):
-    """The kernel over a forked call, each document laid from a chunk's edge and taking its table slot's
-    memory up there with its entry write added (`recurrence_chunk._ported_documents`): the output and the
-    row's last memory."""
-    from dew.nn.kernels.chunked_launch import AlignedDocuments, Forked
-    from dew.nn.kernels.recurrence_chunk import _ported_documents
+def documents_on_the_kernel(x, b, c, a, given, key, value, weight, added: bool = False):
+    """The kernel over a forked call, its documents walked in place, each taking its table slot's memory up
+    at its first token, where `added` its `ADDS` slot's too (`Chunk.adds`), with its entry write added
+    (`recurrence_chunk._tpu_documents`), launched per shard of rows and heads as the rated scan launches it
+    (`recurrence_chunk.ssd_specs`), so it runs under any mesh: the output and the row's last memory."""
+    from dew.nn.kernels.chunked_launch import Forked
+    from dew.nn.kernels.recurrence_chunk import _tpu_documents, ssd_specs
+    from dew.nn.sharding import manual_map
 
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
-    forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, (key, value, weight), 2)
+    forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, (key, value, weight), 2,
+                    jnp.asarray(ADDS, jnp.int32) if added else None)
+    length = x.shape[1]
     # The table's memories as a chunk's call holds them, `[N, P]`, the SSD's transposed.
-    aligned, documents = _ported_documents(jnp.swapaxes(given, -1, -2), forked, x.shape[1], 64, jnp.float32,
-                                           (16, 16))
-    assert isinstance(aligned, AlignedDocuments)
-    laid = aligned.laid(x, b, c, a)
+    documents = _tpu_documents(jnp.swapaxes(given, -1, -2), forked, length, 64, jnp.float32, (16, 16))
+    # Whole chunks, a padded step the identity (no input, read or write, a unit decay).
+    padding = -length % 64
+    x, b, c, a = (jnp.pad(t, ((0, 0), (0, padding)) + ((0, 0),) * (t.ndim - 2)) for t in (x, b, c, a))
     start = jnp.zeros((x.shape[0], *given.shape[2:]), jnp.float32)
-    y, final = _chunk_scan(*laid, start, documents, 64, "tpu", 2)
-    return aligned.unlaid(y), final
+
+    def local(x, b, c, a, start, documents):
+        return _chunk_scan(x, b, c, a, start, documents, 64, "tpu", 2)
+
+    y, final = manual_map(local, *ssd_specs(x.shape, documents))(x, b, c, a, start, documents)
+    return y[:, :length], final
 
 
-def documents_one_by_one(x, b, c, a, given, key, value, weight):
+def documents_one_by_one(x, b, c, a, given, key, value, weight, added: bool = False):
     """Each document a sequence of its own, a step at a time (`stepwise_scan`), in the row's order from its
-    table slot's memory (a given one, or the final an earlier document stored) with its entry write
-    added."""
+    table slot's memory (a given one, or the final an earlier document stored), its `ADDS` slot's added
+    where `added`, with its entry write added."""
     rows, lasts = [], []
     ends = np.concatenate([np.asarray(DOCUMENTS), np.full((2, 1), x.shape[1])], axis=1)
     for row in range(x.shape[0]):
@@ -398,6 +413,8 @@ def documents_one_by_one(x, b, c, a, given, key, value, weight):
         for index, (first, end) in enumerate(zip(ends[row, :-1], ends[row, 1:], strict=True)):
             span = slice(int(first), int(end))
             entering = table[loads[index] - 1] if loads[index] else jnp.zeros_like(given[row, 0])
+            if added and ADDS[row][index]:
+                entering = entering + table[ADDS[row][index] - 1]
             entering = entering + weight[row, index][:, None, None] * jnp.einsum(
                 'rhp,rhn->hpn', value[row, index], key[row, index])
             y, final = stepwise_scan(x[row:row + 1, span], b[row:row + 1, span], c[row:row + 1, span],
@@ -410,23 +427,113 @@ def documents_one_by_one(x, b, c, a, given, key, value, weight):
     return jnp.stack(rows), jnp.stack(lasts)
 
 
+def _documents_arm(scan, added: bool = False):
+    """A forked call's arm (`documents_on_the_kernel`, `documents_one_by_one`), where `added` each document
+    adding its `ADDS` slot: its output, the row's last state and every operand's gradient by name."""
+    def run(operands, seeded):
+        output, *gradients = with_gradients(lambda *o: scan(*o, added=added))(*operands, seeded)
+        return dict(zip(("output", "final", "x", "B", "C", "A dt", "given", "entry keys", "entry values",
+                         "entry weights"), (*output, *gradients[:8]), strict=True))
+    return run
+
+
 def test_documents_entering_their_own_states_scan_as_each_alone():
     """The TPU kernel over a forked call (a request's questions over its shared prefix's state, a chain's
-    each over its predecessor's, `Chunk.loads`): each document laid from a chunk's edge, the kernel's carry
-    taking its table slot's state up there with its entry write added (`Chunk.entry_key`) and its resident
+    each over its predecessor's, `Chunk.loads`): its documents walked in place, each taking its table slot's
+    state up at its first token mid-chunk with its entry write added (`Chunk.entry_key`) and its resident
     table keeping the finals its documents store; its output, the row's last state and every operand's
     gradient, the given states' and the entry writes' included, as each
     document scanned alone a step at a time in the row's order, from float64 (check 1)."""
-    def under(scan):
-        def run(operands, seeded):
-            output, *gradients = with_gradients(lambda *o: scan(*o))(*operands, seeded)
-            return dict(zip(("output", "final", "x", "B", "C", "A dt", "given", "entry keys", "entry values",
-                             "entry weights"), (*output, *gradients[:8]), strict=True))
-        return run
+    assert_as_exact(without_ynn(_documents_arm(documents_on_the_kernel)),
+                    jax.jit(_documents_arm(documents_one_by_one)), documents_draw,
+                    "the TPU kernel's forked call", seeds=24)
 
-    mine = without_ynn(under(documents_on_the_kernel))
-    theirs = jax.jit(under(documents_one_by_one))
-    assert_as_exact(mine, theirs, documents_draw, "the TPU kernel's forked call", seeds=24)
+
+def test_documents_adding_a_slot_scan_as_each_alone():
+    """The TPU kernel over a forked call whose documents each add a second table slot to the memory they take
+    up (`Chunk.adds`, `ADDS`: a given memory, and a final stored two documents before): its output, the
+    row's last state and every operand's gradient, the given states' included, as each document scanned
+    alone from the two memories summed, from float64 (check 1)."""
+    assert_as_exact(without_ynn(_documents_arm(documents_on_the_kernel, added=True)),
+                    jax.jit(_documents_arm(documents_one_by_one, added=True)), documents_draw,
+                    "the TPU kernel's forked call adding a slot", seeds=24)
+
+
+@pytest.mark.parametrize(("key", "value", "weight", "final", "cancelled"),
+                         [(80, 80, -100, -100, False), (-80, 100, -100, 0, False), (-40, 100, -40, 56, False),
+                          (-100, 100, 30, 30, True), (60, -20, 100, -100, False)],
+                         ids=["overflowing pair", "underflowing pair", "overflowing adjoint",
+                              "a continuation's adjoint", "cancelling terms"])
+def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, value, weight, final,
+                                                                         cancelled):
+    """A forked call's entry write (`Chunk.entry_key`) and its adjoint in the TPU kernel, at powers of two (a
+    key, a value and a weight of 2^`key`, 2^`value`, 2^`weight` on one term, the final memory's cotangent
+    2^`final`, the outputs' none, unless `cancelled`): every output and gradient float64's exactly wherever
+    float64's is a normal float32 (each a sum of equal powers of two, no rounding; `normal_float32`), and
+    every order of the call finite there (`assert_contract`), through unit writes and readers, no inputs and
+    no decay. Formed in one order, a partial product left fp32's range where the whole
+    is in it: keys and values of 2^80 under a weight of 2^-100 wrote inf where the write is 2^60, keys of
+    2^-80 under the same weight zero where it is 2^-80, and a value of 2^100 against a memory's gradient of
+    2^56 gave the keys' and the weight's gradients inf (base reviews 200f6ca65, 7047162e7). `cancelled`, the
+    first row's last document (steps 100 to 189, continued at the chunk's edge 128) reads a cotangent at
+    step 127 that cancels the final memory's, so its opening memory's gradient is zero and its entry
+    write's is too, while the memory continuing past 128 keeps the final's: its terms formed there and
+    masked after, the weight and value's 2^130 against it, gave its key gradient NaN (base review 13abb0d6b
+    F1). `cancelling terms` gives a second term the first's value and its key negated: each term's write
+    2^140 and their sum zero, and its gradients' 2^-40 terms cancelling too, where a sum of terms formed
+    one at a time was inf - inf, NaN (base review ead11c83a F1)."""
+    (x, b, c, a, given, keys, values, weights), (out, last) = documents_draw(0)
+    keys, values = (jnp.zeros_like(t).at[:, :, 0].set(2.0 ** e) for t, e in ((keys, key), (values, value)))
+    if key == 60:
+        keys, values = keys.at[:, :, 1].set(-(2.0 ** key)), values.at[:, :, 1].set(2.0 ** value)
+    operands = (jnp.zeros_like(x), jnp.ones_like(b), jnp.ones_like(c), jnp.zeros_like(a),
+                jnp.zeros_like(given), keys, values, jnp.full_like(weights, 2.0 ** weight))
+    read = jnp.zeros_like(out)
+    if cancelled:
+        # A unit reader's cotangent of -2^final over every value reads the final memory's back to zero.
+        read = read.at[0, 127].set(-(2.0 ** final))
+    seeded = (read, jnp.full_like(last, 2.0 ** final))
+
+    def run(scan):
+        return lambda operands, seeded: with_gradients(lambda *o: scan(*o))(*operands, seeded)
+
+    mine = jax.tree.leaves(without_ynn(run(documents_on_the_kernel))(operands, seeded))
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
+        exact = jax.tree.leaves(jax.jit(run(documents_one_by_one))(*wide))
+    for ours, theirs in zip(mine, exact, strict=True):
+        theirs = np.asarray(theirs)
+        normal = normal_float32(theirs)
+        np.testing.assert_array_equal(np.asarray(ours, np.float64)[normal], theirs[normal])
+    # Every order the kernel's rule takes finite wherever float64's is a normal float32 (the contract's
+    # seams): its primal and its reverse mode (`contract_support.REVERSE_ONLY`: rows 7874, 7875).
+    # The kernel as a program differentiates and places it (no compiler options, which refuse to nest in the
+    # mesh run's program, `without_ynn`).
+    assert_contract(documents_on_the_kernel, operands, operands, seeded,
+                    "the TPU kernel's forked call at fp32's edge", truth_fn=documents_one_by_one,
+                    without=REVERSE_ONLY)
+
+
+def test_an_entry_writes_gradient_lowers_for_a_tpu():
+    """A forked call's gradient with its documents' entry writes (`documents_on_the_kernel`), traced for an
+    assumed v5p on its mesh: it lowers on any host to Mosaic kernels, where the entry write's aligned sums
+    over its 16 keys summed each halving with an empty tail, a slice Mosaic refuses, a vector of no rows
+    (base review 68c63603f F1)."""
+    from jax.sharding import AbstractDevice, AbstractMesh, AxisType
+
+    from dew.nn.kernels.generation import TARGETS, assumed
+    from dew.nn.kernels.lowered import custom_calls
+
+    operands, seeded = documents_draw(0)
+
+    def gradient(operands, seeded):
+        return with_gradients(lambda *o: documents_on_the_kernel(*o))(*operands, seeded)
+
+    device = AbstractDevice(device_kind=TARGETS["v5p"].device_kind, num_cores=None, platform="tpu")
+    mesh = AbstractMesh((1,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    with assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(gradient).trace(operands, seeded).lower(lowering_platforms=("tpu",))
+    assert any(call.target == "tpu_custom_call" for call in custom_calls(lowered))
 
 
 @pytest.mark.tpu(reason="the recurrence matrix's TPU cells run on the TPU tier's own TPU")

@@ -108,6 +108,18 @@ def test_a_decoded_value_restored_wide_is_its_float32_restoring_widened():
                                   narrow[numbers].astype(np.float64).view(np.uint64))
 
 
+def test_a_decoded_value_restored_narrow_is_of_the_dtype_asked_for():
+    """`bits.restored` in bfloat16 is bfloat16, its every pattern's float32 restoring cast: the dtype a caller
+    asks for is the one returned (row 8661's review)."""
+    patterns = jnp.arange(1 << 16, dtype=jnp.uint32)
+    narrow = jax.jit(lambda pattern: bits.restored(pattern, jnp.bfloat16))(patterns)
+    assert narrow.dtype == jnp.bfloat16
+    cast = np.asarray(jax.jit(bits.restored)(patterns).astype(jnp.bfloat16))
+    numbers = ~np.isnan(cast.astype(np.float32))
+    np.testing.assert_array_equal(np.isnan(np.asarray(narrow, np.float32)), ~numbers)
+    np.testing.assert_array_equal(np.asarray(narrow)[numbers].view(np.uint16), cast[numbers].view(np.uint16))
+
+
 def test_an_nvfp4_tile_decodes_to_its_codes_times_their_block_scales():
     """An NVFP4 tile (`nvfp4_decoded`): every code in every place of a word, under E4M3 block scales from the
     least subnormal to the largest, decodes to the code times its block's scale over `NVFP4_OWED`, exactly,

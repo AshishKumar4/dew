@@ -24,461 +24,58 @@ against 8.4).
 
 import abc
 import dataclasses
-import enum
 import functools
 import importlib
 import importlib.util
 import math
-from collections.abc import Callable, Hashable
-from typing import ClassVar, NamedTuple, Protocol
+from collections.abc import Callable
+from typing import ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from ...algebra import bits
-from . import generation, selection, tuning
+from . import generation, selection
 from .generation import INHERENT
-from .templates import across, base, bundles, mosaic, report, resources, stores, swizzling
+from .grouped_cells import (
+    B200_GRID,
+    EM35D,
+    M_EM_36,
+    M_EM_52,
+    M_EM_65,
+    M_EM_67,
+    MEASURED,
+    NORMED_08B,
+    NORMED_4B_8B,
+    Kind,
+    Made,
+)
+from .grouped_launch import INTERPRETED, _GroupedLaunch
+from .grouped_triton import Gmm, Tgmm, _gradient_sides, _product_sides
+from .templates import across, base, bundles, cost, mosaic, report, resources, stores, swizzling
 from .templates.axes import held as held_axes
-from .templates.gemm import mosaic_gpu, packed, pricing, producers
+from .templates.gemm import derivation, mosaic_gpu, packed, pricing, producers, row_tiles
+from .templates.gemm.chained import chained_refusal, replay_refusal, replay_tile
 from .templates.gemm.hooks import NO_HOOKS, Hooks, hooks_lower
 from .templates.product import SCALE_DEPTH, Product, eight
 
 
-@dataclasses.dataclass(frozen=True)
-class Tile:
-    """One Triton launch's output tile, its depth step, and its warps and pipeline stages."""
-    block_m: int
-    block_n: int
-    block_k: int
-    warps: int
-    stages: int
-
-
-INTERPRETED = plgpu.InterpretGPUParams(out_of_bounds_reads="uninitialized")
-"""How a CPU interprets the template's launches on a GPU family: a read past an operand's rows, which a TMA
-load zeroes, gives the poison every buffer starts with (NaN), as an output a kernel fails to store does, so
-the interpreter shows both. A TPU core's interprets them as a TPU runs them, its DMAs and VMEM
-(`mosaic_tpu.VmemRings.kernel`)."""
-
-
-MOST_STAGES = 8
-"""The deepest pipeline a Triton tile's derivation tries: past it a block of any GPU holds no 16-row step's
-stages at the narrowest output tile."""
-
-EXACT_STEP = 64
-"""The most of the contraction one step of a launch with `exact_sums` takes: the tensor cores truncate
-each add within a step's MMA chain, and exact sums promote only between steps."""
-
-
-def _side_tile_bytes(operands, axes_of, extents: dict) -> int:
-    """The bytes of one tile of each side operand at the block `extents` per launch axis, one group's of an
-    operand by group (`axes.held`)."""
-    return sum(math.prod(extents[axis] for axis in held_axes(axes)) * jnp.dtype(operand.dtype).itemsize
-               for operand, axes in zip(operands, axes_of, strict=True))
-
-
-def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array:
-    """Group sizes summing to `rows` over the groups the third spec (the launch's group sizes) names,
-    drawn unevenly, the first left empty where there are several, as a step routes them; a dense call's
-    one group every row (emptied, its share's sum was zero and its sizes NaN cast to integers, W28-a100-2)."""
-    groups = specs[2].shape[0]
-    shares = np.random.default_rng(seed).dirichlet(np.ones(groups))
-    if groups > 1:
-        shares[0] = 0.0
-    sizes = np.floor(shares / shares.sum() * rows).astype(np.int32)
-    sizes[-1] += rows - sizes.sum()
-    return jnp.asarray(sizes)
-
-
-TRACED_TILE = 16
-"""The square tile a launch's hooks are traced at to key its picks (`_GroupedLaunch.traced`)."""
-
-
-class _GroupedLaunch[Config: Hashable](base.Template[Config]):
-    """A grouped launch: its space is a declared tuple, its group sizes drawn as a step routes them."""
-    # Annotations stay evaluated (no postponed annotations in this module):
-    # tokamax serializes a launch's arguments into the program by their types.
-    HOOKS: ClassVar[tuple[str, ...]] = ('hooks',)
-
-    def bind(self, *args, **kwargs):
-        """tokamax's binding, its hooks stating the dtypes a kernel traces them at where the call left them
-        unstated (a launch called itself): the prologue's at the tokens' and its side operands' dtypes, the
-        epilogue's at the fp32 accumulator's and its side operands', as `templates.gemm` states them, so
-        every bound launch's hooks key alike (`traced`)."""
-        ba = super().bind(*args, **kwargs)
-        hooks = ba.arguments.get('hooks', NO_HOOKS)
-        if not isinstance(hooks, Hooks):  # a stored launch's, already keyed (`traced`)
-            return ba
-
-        def named(*arrays) -> tuple[str, ...]:
-            return tuple(jnp.dtype(array.dtype).name for array in arrays)
-
-        stated = dataclasses.replace(
-            hooks, prologue_dtypes=hooks.prologue_dtypes or (() if hooks.prologue is None else named(
-                ba.arguments['tokens'], *ba.arguments.get('prologue_operands', ()))),
-            epilogue_dtypes=hooks.epilogue_dtypes or (() if hooks.epilogue is None else (
-                'float32', *named(*ba.arguments.get('epilogue_operands', ())))),
-            accumulators=1 if ba.arguments.get('paired') is None else 2)
-        return ba if stated == hooks else type(ba)(ba.op, {**ba.arguments, 'hooks': stated})
-
-    ROWS: ClassVar[tuple[str, ...]]
-    """The operands whose rows the launch's groups split: a product's `tokens`, a kernel gradient's
-    `tokens` and `cotangent`."""
-
-    def padded(self, ba, config: Config) -> float | None:
-        """A dense call's (`dense`) output grid, its rows tiled by `block_m` and its columns by `block_n`
-        (`tuning.KernelOp.padded`), the output's sides its launch's (`output_sides`); None for a grouped
-        call, whose groups' rows a step routes, for a tile of no such blocks (a TPU's), and for a launch
-        that states no sides."""
-        sides = self.output_sides(ba)
-        if not ba.arguments.get('dense') or not isinstance(config, Tile | mosaic_gpu.Tiles) or sides is None:
-            return None
-        rows, width = sides
-        grid = -(-rows // config.block_m) * config.block_m * -(-width // config.block_n) * config.block_n
-        return 1 - rows * width / grid if grid else None
-
-    def output_sides(self, ba) -> tuple[int, int] | None:
-        """The rows and columns of a dense call's output its tiles cover (`padded`): a product's (`Gmm`,
-        `MosaicGmm`) and a kernel gradient's (`Tgmm`, `MosaicTgmm`) each their own; None here."""
-        return None
-
-    def traced(self, name: str, value: Callable | str | None) -> str | None:
-        """The launch's `Hooks` as its picks key them (`tuning.KernelOp.traced`): each hook by what it
-        computes (`tuning.program`) as a kernel traces it (`Hooks.before`, `Hooks.after`), at a
-        `TRACED_TILE` square tile and each side tile as its axes lay it out there, in the dtypes the hooks
-        state, beside their axes, squeezed positions and output dtypes; an already traced key as it is."""
-        if not isinstance(value, Hooks):
-            return value if isinstance(value, str) else None
-
-        def program(hook, axes_of: tuple, dtypes: tuple, tiles: int = 1) -> str | None:
-            if hook is None:
-                return None
-            tile, *sides = dtypes
-            return tuning.program(hook, *(jax.ShapeDtypeStruct((TRACED_TILE, TRACED_TILE), tile),) * tiles,
-                                  *(jax.ShapeDtypeStruct((TRACED_TILE,) * len(axes), dtype)
-                                    for axes, dtype in zip(axes_of, sides, strict=True)))
-
-        return "hooks:" + repr((program(value.before(), value.prologue_axes, value.prologue_dtypes),
-                                program(value.after(), value.epilogue_axes, value.epilogue_dtypes,
-                                        value.accumulators),
-                                value.prologue_axes, value.epilogue_axes, value.out_dtypes,
-                                value.prologue_broadcast, value.epilogue_broadcast, value.accumulators))
-
-    def keyed(self, ba):
-        """`tuning.KernelOp.keyed`, a call's tables (`gather`, `scatter`) bucketed as the tokens' rows are,
-        and each side operand's dimension that follows the rows bucketed with the product's rows (the
-        tokens', `ROWS`, or a gathered call's table's, `_rows_of`), so the launch a key measures loads side
-        tiles over all its rows, and a kernel gradient's table meets its ungathered operand at one count."""
-        keyed = super().keyed(ba)
-        arguments = dict(keyed.arguments)
-        for name in ('gather', 'scatter'):
-            if arguments.get(name) is not None:
-                arguments[name] = jax.tree.map(tuning.bucketed, arguments[name])
-        rows = next(iter(jax.tree.leaves(arguments.get('gather'))), arguments['tokens']).shape[0]
-        hooks = ba.arguments.get('hooks', NO_HOOKS)
-        for name, axes_of in (('prologue_operands', hooks.prologue_axes),
-                              ('epilogue_operands', hooks.epilogue_axes)):
-            if name in arguments:
-                arguments[name] = tuple(
-                    jax.ShapeDtypeStruct(tuple(rows if axis == 'rows' else extent
-                                               for axis, extent in zip(axes, side.shape, strict=True)),
-                                         side.dtype)
-                    for side, axes in zip(arguments[name], axes_of, strict=True))
-        return type(keyed)(keyed.op, arguments)
-
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        """`tuning.KernelOp.operands`, the group sizes (every launch's third argument) drawn as a step
-        routes them over its rows (a table's, the last: a gathered or scattered product's, its zero entries
-        reading and writing row 0, `gmm_call`'s `gather` and `scatter`), an integer side operand drawn as any
-        other operand."""
-        arrays = super().operands(specs, seed)
-        last = specs[-1]
-        gathered = len(specs) > 3 and last.ndim == 1 and jnp.issubdtype(last.dtype, jnp.integer)
-        arrays[2] = _sizes(specs, seed, (last if gathered else specs[0]).shape[0])
-        return arrays
-
-
-class _Triton(_GroupedLaunch[Tile]):
-    """JAX's Pallas Triton kernels (`ragged_dot`), on every CUDA GPU from sm80, and on a CPU where the
-    call interprets them."""
-    name: ClassVar[str] = 'triton'
-    config_cls: ClassVar[type[Tile]] = Tile
-    GENERATES: ClassVar[bool] = True
-
-    def eligible(self, ba, target) -> bool:
-        # Every CUDA GPU the template sends the kernels to (`kernels.gemm`), and
-        # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU (a
-        # paired product the selector hands on apart: `_takes_pair`).
-        return generation.capability(target.generation) is not None and self.derived(ba, target) is not None
-
-    def derived(self, ba, target) -> Tile | None:
-        """The one tile the launch runs on `target`, from facts (the ranked set and its cost model deleted,
-        bible §6): eight warps, CUTLASS's and cuBLAS's Ampere block; the widest output tile from 128 x 256,
-        halved columns first then rows, whose fp32 accumulator (two with exact sums) its threads hold
-        (`legal`); the first contraction step the launch takes (`steps`) at which a block holds three stages,
-        two loading ahead of the one consumed, else two; and the most stages that step's block holds
-        (`staged_bytes`). A dense call takes the first such tile dividing its depth and width where one
-        does: the kernel pads to one that does not. On an A100 a product's tile is 128 x 256 a step of 64
-        at four stages: at that step three stages took 0.790 (forward) and 0.793 (input gradient) of two's
-        time, a geomean over 6 grouped and 4 dense rows, where the ranked set's 128-deep step held two
-        (PINS2-triton); PINS3 times the rule's tiles against the ranked set's."""
-        rows, columns = 128, 256
-        shapes = [(rows, columns)]
-        while rows > 16 or columns > 16:
-            rows, columns = (rows, columns // 2) if columns > rows else (rows // 2, columns)
-            shapes.append((rows, columns))
-        extents = self._dense_extents(ba) if ba.arguments.get('dense') else None
-        found = None
-        for output in shapes:
-            for floor in (3, 2):
-                for step in self.steps(ba):
-                    tile = next((tile for stages in range(MOST_STAGES, floor - 1, -1)
-                                 if self.legal(ba, tile := self.tile(output, step, stages), target)), None)
-                    if tile is None:
-                        continue
-                    if extents is None or (extents[0] % self.contraction(tile) == 0
-                                           and extents[1] % output[1] == 0):
-                        return tile
-                    found = found or tile
-        return found
-
-    def legal(self, ba, config: Tile, target) -> bool:
-        """`Template.legal`, its accumulator (two with exact sums) in its threads' registers, an exactly
-        summed step at most `EXACT_STEP` deep (a step's own MMA chain truncates its adds; exact sums
-        promote between steps: H100's 128-row step left 1.55x IEEE's error, a 64-row one 1.03x,
-        GMMGATE-h100-5), and on Hopper each warpgroup's share of the rows a multiple of wgmma's 64 (a
-        32-row share falls back to Ampere's MMA, and an accumulator of 256 registers a thread spills: 1.2 to
-        8.5 times slower on an H100, GMM-h100-2)."""
-        rows, columns = self.output(config)
-        accumulators = 2 if ba.arguments.get('exact_sums') else 1
-        held = accumulators * rows * columns // (32 * config.warps) < target.multiprocessor.thread_registers
-        short = not ba.arguments.get('exact_sums') or self.contraction(config) <= EXACT_STEP
-        shared = not (target.wgmma and rows // max(config.warps // 4, 1) % 64)
-        return held and short and shared and super().legal(ba, config, target)
-
-    @staticmethod
-    @abc.abstractmethod
-    def steps(ba) -> tuple[int, ...]:
-        """The contraction steps the launch tries, in order."""
-
-    @staticmethod
-    @abc.abstractmethod
-    def tile(output: tuple[int, int], step: int, stages: int) -> Tile:
-        """The tile of an `output` (rows, columns) tile, a contraction `step` deep, at `stages`, eight
-        warps."""
-
-    @staticmethod
-    @abc.abstractmethod
-    def _dense_extents(ba) -> tuple[int, int]:
-        """The depth and width a dense call's tiles divide."""
-
-    @staticmethod
-    @abc.abstractmethod
-    def output(tile: Tile) -> tuple[int, int]:
-        """The rows and columns of a program's output tile, the dot's M and N."""
-
-    @staticmethod
-    @abc.abstractmethod
-    def contraction(tile: Tile) -> int:
-        """The contraction one step of `tile` takes, the dot's K."""
-
-    def staged_bytes(self, ba, config: Tile, target) -> int:
-        # Pallas Triton's pipeline holds `stages - 1` depth steps where its MMA reads its operands from
-        # registers, and `stages` where it reads them from shared memory as it runs (the device's family's
-        # issuer, `mosaic.Issuer.operands_in_registers`: Hopper's wgmma, Blackwell's tcgen05), one step read
-        # while the next loads; an A100 and an H100 refuse exactly those bytes, and a B200 refused 262,160
-        # bytes for a dense fp32 tile counted at `stages - 1` (gate-2738-gemm-b200, row 4449). The
-        # prologue's side tiles load in the same steps.
-        # A GPU outside every template family (a Turing part) issues no MMA reading shared memory: its
-        # operands are registers' too.
-        dtype, issuer = ba.arguments['tokens'].dtype, generation.family(target.generation)
-        held = int(issuer is None or bundles.named(issuer, jnp.bfloat16).operands_in_registers)
-        step = self.loaded(config) * jnp.dtype(dtype).itemsize + _side_tile_bytes(
-            ba.arguments['prologue_operands'], ba.arguments['hooks'].prologue_axes, self.extents(config))
-        # A contraction of one step has no loop whose dead stages the output's layout conversion reuses:
-        # it takes a 16-bit output tile beside them (an L4 refused 114688 bytes for a 64 x 128 tile's
-        # 98304 at a depth of one step, either output dtype, GEN6-gpu-l4; at four steps it asked the
-        # stages' alone, TSMEM-l4).
-        contracted = self._contracted(ba)
-        single = contracted is not None and contracted <= self.contraction(config)
-        rows, columns = self.output(config)
-        # A hooked call converts its hooks' tiles' layouts through shared memory beside the stages: an A100
-        # refused 181504 bytes for a relu producer's tile counted at 147456 (ALIGNED-gpu-a100), within a
-        # step's more.
-        hooked = ba.arguments['hooks'] != NO_HOOKS
-        return step * (config.stages - held + hooked) + (2 * rows * columns if single else 0)
-
-    @staticmethod
-    def _contracted(ba) -> int | None:
-        """The contraction a call's every tile steps over, None where its groups' rows set it."""
-        return None
-
-    @staticmethod
-    @abc.abstractmethod
-    def extents(tile: Tile) -> dict:
-        """The block each launch axis takes at `tile`."""
-
-
-    @staticmethod
-    @abc.abstractmethod
-    def loaded(tile: Tile) -> int:
-        """The elements of both operand tiles one depth step loads."""
-
-
-def _product_sides(ba) -> tuple[int, int]:
-    """A product's output: its tokens by its kernel's width."""
-    kernel = ba.arguments['kernel']
-    return ba.arguments['tokens'].shape[0], kernel.shape[1 if ba.arguments['trans_rhs'] else 2]
-
-
-def _gradient_sides(ba) -> tuple[int, int]:
-    """A kernel gradient's output: its tokens' width (its depth) by its cotangent's, the tokens the
-    contraction."""
-    return ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-
-
-@dataclasses.dataclass(frozen=True)
-class Gmm(_Triton):
-    """Each group's rows of `tokens` `[rows, in]` times its matrix of
-    `kernel` `[groups, in, out]`, or of its transpose with `trans_rhs`."""
-
-    ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
-
-    def output_sides(self, ba) -> tuple[int, int]:
-        return _product_sides(ba)
-
-    @staticmethod
-    def _dense_extents(ba) -> tuple[int, int]:
-        """The depth and width of a dense call's product, which `block_k` and `block_n` tile."""
-        kernel = ba.arguments['kernel']
-        return (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-
-    @staticmethod
-    def _contracted(ba) -> int | None:
-        return Gmm._dense_extents(ba)[0]
-
-    @staticmethod
-    def steps(ba) -> tuple[int, ...]:
-        # The deepest first: a dense depth, read a step at a time, synchronizes its pipeline fewer times a
-        # tile the deeper the step (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78,
-        # GMM-h100-2).
-        del ba
-        return 128, 64, 32, 16
-
-    @staticmethod
-    def tile(output: tuple[int, int], step: int, stages: int) -> Tile:
-        return Tile(output[0], output[1], step, 8, stages)
-
-    @staticmethod
-    def loaded(tile: Tile) -> int:
-        return (tile.block_m + tile.block_n) * tile.block_k
-
-    @staticmethod
-    def output(tile: Tile) -> tuple[int, int]:
-        return tile.block_m, tile.block_n
-
-    @staticmethod
-    def contraction(tile: Tile) -> int:
-        return tile.block_k
-
-    @staticmethod
-    def extents(tile: Tile) -> dict:
-        return {'rows': tile.block_m, 'depth': tile.block_k, 'columns': tile.block_n}
-
-
-    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
-             first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
-             hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
-             dense: bool = False, config: Tile, return_residuals: bool = False):
-        del paired, gather, scatter  # a second matrix and table rows are Mosaic GPU's alone (`tables`)
-        # Imported at first use: the kernels need jax's Pallas Triton backend,
-        # which jax 0.11.2 deprecates, and importing a model must not load it.
-        if dense:
-            # One group of every row: the plain tiled kernel, which finds no group and masks no row.
-            from .templates.gemm import triton_dense
-            options = hooks.kernel_options()
-            outs = triton_dense.gmm(tokens, kernel[0], tile=config, transpose_rhs=trans_rhs,
-                                    out_dtypes=tuple(jnp.dtype(d) for d in (options.pop('out_dtypes')
-                                                                            or (out_dtype,))),
-                                    interpret=interpret, prologue_operands=prologue_operands,
-                                    epilogue_operands=epilogue_operands, exact_sums=exact_sums, **options)
-            return (outs if hooks.out_dtypes else outs[0]), None
-        from . import ragged_dot
-        return ragged_dot.gmm(tokens, kernel, sizes, block_m=config.block_m, block_k=config.block_k,
-                              block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
-                              trans_rhs=trans_rhs, interpret=interpret, compute_dtype=tokens.dtype,
-                              out_dtype=jnp.dtype(out_dtype), first=first,
-                              prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              exact_sums=exact_sums, **hooks.kernel_options()), None
-
-
-@dataclasses.dataclass(frozen=True)
-class Tgmm(_Triton):
-    """Each group's `tokens` rows transposed times its `cotangent` rows: the
-    kernel gradient `[groups, in, out]`."""
-
-    ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
-
-    def output_sides(self, ba) -> tuple[int, int]:
-        return _gradient_sides(ba)
-
-    @staticmethod
-    def _dense_extents(ba) -> tuple[int, int]:
-        """The depth and width of a dense call's gradient, which `block_k` and `block_n` tile."""
-        return ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-
-    @staticmethod
-    def loaded(tile: Tile) -> int:
-        return tile.block_m * (tile.block_k + tile.block_n)
-
-    @staticmethod
-    def steps(ba) -> tuple[int, ...]:
-        # Its steps run over a group's rows, each group's padded to whole steps: a step of 64 rows keeps
-        # that padding to half of 64 a group.
-        del ba
-        return 64, 32, 16
-
-    @staticmethod
-    def tile(output: tuple[int, int], step: int, stages: int) -> Tile:
-        return Tile(step, output[1], output[0], 8, stages)
-
-    @staticmethod
-    def output(tile: Tile) -> tuple[int, int]:
-        return tile.block_k, tile.block_n
-
-    @staticmethod
-    def contraction(tile: Tile) -> int:
-        return tile.block_m
-
-    @staticmethod
-    def extents(tile: Tile) -> dict:
-        return {'rows': tile.block_m, 'depth': tile.block_k}
-
-
-    def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), gather: tuple | None = None, *, out_dtype: str, interpret: bool,
-             hooks: Hooks = NO_HOOKS,
-             exact_sums: bool = False, dense: bool = False, config: Tile, return_residuals: bool = False):
-        del gather  # table rows are Mosaic GPU's alone (`tables`)
-        if dense:
-            # One group of every row: the plain tiled kernel (`Gmm._fwd`).
-            from .templates.gemm import triton_dense
-            return triton_dense.tgmm(tokens, cotangent, tile=config, out_dtype=jnp.dtype(out_dtype),
-                                     interpret=interpret, prologue=hooks.before(),
-                                     prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
-                                     exact_sums=exact_sums)[None], None
-        from . import ragged_dot
-        return ragged_dot.tgmm(tokens, cotangent, sizes, block_m=config.block_m, block_k=config.block_k,
-                               block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
-                               interpret=interpret, compute_dtype=tokens.dtype,
-                               out_dtype=jnp.dtype(out_dtype), prologue=hooks.before(),
-                               prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
-                               exact_sums=exact_sums), None
+def _stored_bytes(ba, rows: int, width: int) -> float:
+    """The bytes a product's epilogue moves an element of its `rows` x `width` output
+    (`pricing.split_walk`'s `stored`): each output's dtype's, and its epilogue operands' bytes over the
+    output's elements (an [rows, columns] operand's an element, a column vector's a row's share)."""
+    hooks = ba.arguments['hooks']
+    written = sum(jnp.dtype(dtype).itemsize for dtype in hooks.out_dtypes or (ba.arguments['out_dtype'],))
+    return written + cost.stored(*ba.arguments.get('epilogue_operands', ())) / max(rows * width, 1)
+
+
+def _matrix_extents(ba) -> tuple[int, int]:
+    """A bound product call's depth and width as its matrix lies (`trans_rhs`'s `[width, depth]`), its width
+    every matrix's side by side with the kernel's (`gmm_call`'s `beside`)."""
+    kernel, transposed = ba.arguments['kernel'], ba.arguments['trans_rhs']
+    depth, width = (kernel.shape[2], kernel.shape[1]) if transposed else kernel.shape[1:]
+    return depth, width + sum(each.shape[1 if transposed else 2] for each in ba.arguments.get('beside') or ())
 
 
 _PaddedArgument = tuple[str, "jax.Array | jax.ShapeDtypeStruct | tuple", "dict | tuple"]
@@ -488,7 +85,7 @@ _PaddedArgument = tuple[str, "jax.Array | jax.ShapeDtypeStruct | tuple", "dict |
 class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     """JAX's Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`) on their instruction family's bundle
     (Hopper's warpgroup MMA, Ampere's mma.sync), one 16-bit dtype, their one tile generated from the
-    family's facts, the device's and the call's extents (`mosaic_gpu.derived`). Each runs one warpgroup a
+    family's facts, the device's and the call's extents (`derivation.derived`). Each runs one warpgroup a
     multiprocessor, or two consumers beside a producer (a cooperative tile), persistent over the output
     tiles in a planar snake, so the rows a band of `grid_block_n` column tiles shares and the matrix block
     the row tiles in flight share come from the L2."""
@@ -566,7 +163,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             atom = (config.block_k, swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES))
             tiles = [((config.block_k, config.block_m // config.warpgroups), dtype)] + [(atom, dtype)] * 3
             rewritten = family.scalar_registers(tiles) - family.scalar_registers()
-            staged = max(0, words - family.held_registers) + rewritten
+            staged = max(0, words - family.scalar_registers()) + rewritten
         prologue = self._prologue_registers(ba, config)
         prologue += rewritten if prologue else 0
         # A dense call's last wave balanced over the programs merges a slice of another program's partial at a
@@ -643,7 +240,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             widest = max(jnp.dtype(dtype).itemsize for dtype in stored)
             staging = -(-share * chunk * widest // (4 * resources.THREADS)) + resources.CONTROL_REGISTERS
         if hooks.epilogue is None:
-            return max(0, staging - family.held_registers)
+            return max(0, staging - family.scalar_registers())
         # Column vectors beside the accumulator, in its column layout (`Family.column_registers`), and a
         # paired product's combination of its two accumulators, which holds a row of its results, one fp32
         # column vector's worth (its SwiGLU spilled 32 bytes at 128 x 192 at 232, PAIRED-9, and fit 224 at
@@ -660,7 +257,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
                    for dtype in (hooks.out_dtypes or ())[:-1])
         stage = max(staging, resources.CONTROL_REGISTERS) + vectors
-        return max(0, stage - family.held_registers) + tiles + held
+        return max(0, stage - family.scalar_registers()) + tiles + held
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`); none on a
@@ -742,7 +339,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         """A group's output rows (`rows`, on average), the depth the steps run over (None: a group's rows,
         padded, the output's rows then whole, not a group's) and the output's width, as
-        `mosaic_gpu.derived` reads them."""
+        `derivation.derived` reads them."""
 
     def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
         # The derivation's tile (`_tile`), its producer raised through the rungs compiles refused.
@@ -768,23 +365,24 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return report.refused(self, ba, producers.settled(self, ba, config))
 
     def _derived(self, ba, target, admits=None) -> mosaic_gpu.Tiles | None:
-        """The derivation's tile of `ba` on `target` (`mosaic_gpu.derived`), each candidate also one `admits`
+        """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole
         tiles (`_aligned`'s `whole_tiles`): the tile a launch runs whether its depth and width are padded or
         run partial (`_partial_axes`)."""
         ba = self._aligned(ba, whole_tiles=True)
         rows, depth, width = self._generated_extents(ba)
         # Each issuer's group in turn (`_groups`), a pair's layouts first where the rows hold its tile
-        # (`mosaic_gpu.paired_first`), each its own derivation, the first that holds a tile taken.
+        # (`derivation.paired_first`), each its own derivation, the first that holds a tile taken.
         for tried in (tried for layouts in self._groups(ba, target)
-                      for tried in mosaic_gpu.paired_first(layouts, rows)):
-            tile = mosaic_gpu.derived(tried, rows=rows, depth=depth, width=width,
+                      for tried in derivation.paired_first(layouts, rows)):
+            tile = derivation.derived(tried, rows=rows, depth=depth, width=width,
                                       dtype=ba.arguments['tokens'].dtype,
                                       multiprocessors=_multiprocessors(target), target=target,
                                       candidate=lambda tile: (self.candidate(ba, tile, target)
                                                               and (admits is None or admits(tile))),
                                       launch_of=lambda tile: self.launch_of(ba, tile),
                                       grouped=depth is not None, depths=self.STEPS,
+                                      dense=bool(ba.arguments.get('dense')),
                                       ragged=self._ragged(ba, tried[0]),
                                       units=self._vector_units(ba, tried[0]))
             if tile is not None:
@@ -794,7 +392,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def _vector_units(self, ba, family: mosaic.Family) -> tuple[int, int, int]:
         """The units a tile's rows, columns and step take from the call's side vectors (`candidate`'s, each
         block along a vector's axis whole `mosaic.Transport.vector_unit`s), which the derivation shapes its
-        tiles in (`mosaic_gpu.derived`'s `units`)."""
+        tiles in (`derivation.derived`'s `units`)."""
         by_axis = self.BLOCKS
         units = {'block_m': 1, 'block_n': 1, 'block_k': 1}
         hooks = ba.arguments['hooks']
@@ -807,7 +405,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return units['block_m'], units['block_n'], units['block_k']
 
     def _ragged(self, ba, family: mosaic.Family) -> bool:
-        """Whether the launch's tiles may leave its output's rows a partial last tile (`mosaic_gpu.derived`'s
+        """Whether the launch's tiles may leave its output's rows a partial last tile (`derivation.derived`'s
         `ragged`): none but a kernel gradient's (`MosaicTgmm`)."""
         del ba, family
         return False
@@ -841,8 +439,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         ring of `config.stages` and registers the planner holds at its programs (`resources.plan`, as the
         derivation sizes them). A cluster's legality is each multiprocessor's: its staged bytes and
         registers are a tile's alone. A tile is judged as the call it runs (`_ran`)."""
+        return self._held(ba, config, target, self.candidate)
+
+    def _held(self, ba, config: mosaic_gpu.Tiles, target, candidate: Callable) -> bool:
+        """`legal`'s judgment with `candidate` its candidate rule: the call as `config` runs it (`_ran`), a
+        candidate whose ring and registers the planner holds."""
         ba, config = self._ran(ba, config)
-        if not self.candidate(ba, config, target):
+        if not candidate(ba, config, target):
             return False
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
         launch = dataclasses.replace(self.launch_of(ba, config), floor=config.stages, most=config.stages)
@@ -998,6 +601,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             return ba
         family = layouts[0]
         extents, whole = self._whole_extents(ba, family)
+        if ba.arguments.get('chained'):
+            # Chained products meet at whole steps (`chained_refusal`): their depths run as bound, neither
+            # padded nor partial, so selection and the launch judge the same operands (c3b97e20f F3: a first
+            # depth of 80 padded to 128 was derived on, and refused as bound).
+            whole = {**whole, 'depth': extents['depth']}
         if whole == extents:
             return ba
         depth_partial, width_partial = (False, False) if whole_tiles else self._partial_axes(ba, family)
@@ -1099,7 +707,7 @@ class MosaicGmm(_Mosaic):
     """`Gmm` through the template's mainloop (`mosaic_gpu.gmm`) on a GPU family's bundle or a TPU core's,
     exact sums too: an FP8 product's running sum promoted into fp32 every step (`product.eight`)."""
 
-    ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+    ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'joined')
     EXACT_SUMS: ClassVar[bool] = True
     FP8: ClassVar[bool] = True
     STEP_SCALED: ClassVar[bool] = False
@@ -1126,20 +734,22 @@ class MosaicGmm(_Mosaic):
             dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
             paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED,
             block_scaled=self.BLOCK_SCALED, gathered=ba.arguments.get('gather') is not None,
-            interpret=bool(ba.arguments['interpret']))
+            interpret=bool(ba.arguments['interpret']), joined=ba.arguments.get('joined') is not None)
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A group's rows on average over the call's groups, which a stack read from its `first` matrix
         # holds fewer of than matrices.
-        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
-        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        tokens = ba.arguments['tokens']
+        depth, width = _matrix_extents(ba)
+        # Chained products' depths joined end to end: one contraction the launch walks (`gmm`'s `chained`).
+        depth += sum(rows.shape[1] for rows, _ in ba.arguments.get('chained') or ())
         return -(-tokens.shape[0] // max(ba.arguments['sizes'].shape[0], 1)), depth, width
 
     def _divides(self, ba, config: mosaic_gpu.Tiles) -> bool:
         # A depth or width the tile does not divide where its last step or column tile runs partial
         # (`_partial_axes`, at the tile `mosaic_gpu.partial_runs`), no deeper or wider than the call.
-        kernel, dtype = ba.arguments['kernel'], ba.arguments['tokens'].dtype
-        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        dtype = ba.arguments['tokens'].dtype
+        depth, width = _matrix_extents(ba)
         family = pricing.family_of(config, dtype)
         columns = pricing.tile_columns(config, family)
         runs = mosaic_gpu.partial_runs(config, dtype, ba.arguments['interpret'],
@@ -1174,9 +784,9 @@ class MosaicGmm(_Mosaic):
                                        gathered=ba.arguments.get('gather') is not None,
                                        scattered=ba.arguments.get('scatter') is not None)
         # The tile no deeper and no wider than the call (`mosaic_gpu.gmm`'s refusal): a last tile partial,
-        # never a first.
-        within = (tile.block_k <= extents['depth'],
-                  pricing.tile_columns(tile, pricing.family_of(tile, dtype)) <= extents['width'])
+        # never a first; a width never padded (matrices side by side', `_padded_extents`) never partial.
+        columns = pricing.tile_columns(tile, pricing.family_of(tile, dtype))
+        within = (tile.block_k <= extents['depth'], columns <= extents.get('width', columns))
         depth_partial, width_partial = (each and run and fits for each, run, fits
                                         in zip(admitted, runs, within, strict=True))
         return depth_partial, width_partial
@@ -1198,7 +808,7 @@ class MosaicGmm(_Mosaic):
                 or self._swapped(ba, generation.gpu_target()) is not None):
             return False, False
         tokens, kernel, hooks = ba.arguments['tokens'], ba.arguments['kernel'], ba.arguments['hooks']
-        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        depth, width = _matrix_extents(ba)
         # The matrix as its stream reads it (`_matrix_transposed`): its rows run along the depth or the width.
         trans_rhs = self._matrix_transposed(ba)
 
@@ -1262,9 +872,9 @@ class MosaicGmm(_Mosaic):
         # A packed, step-scaled or block-scaled matrix's layout is its own: such a call is not padded.
         if self._scaled:
             return {}
-        kernel = ba.arguments['kernel']
-        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        return {'depth': depth, 'width': width}
+        depth, width = _matrix_extents(ba)
+        # Matrices side by side are each whole column tiles (`_takes_beside`): their depth alone padded.
+        return {'depth': depth} if ba.arguments.get('beside') else {'depth': depth, 'width': width}
 
     def _padded_dims(self, ba) -> list[_PaddedArgument]:
         matrix = {1: 'width', 2: 'depth'} if ba.arguments['trans_rhs'] else {1: 'depth', 2: 'width'}
@@ -1277,6 +887,17 @@ class MosaicGmm(_Mosaic):
                             {'columns': 'width'}))]
         if ba.arguments.get('paired') is not None:
             dims.append(('paired', ba.arguments['paired'], matrix))
+        if ba.arguments.get('joined') is not None:
+            dims.append(('joined', ba.arguments['joined'], {1: 'depth'}))
+        if ba.arguments.get('beside'):
+            # Each matrix side by side its depth alone, as the kernel's (`_padded_extents`).
+            depth = {dim: axis for dim, axis in matrix.items() if axis == 'depth'}
+            dims = [(name, value, depth if name == 'kernel' else each) for name, value, each in dims]
+            dims.append(('beside', ba.arguments['beside'], (depth,) * len(ba.arguments['beside'])))
+        if ba.arguments.get('chained'):
+            # Each product's matrix its width padded as the kernel's; their depths whole steps (`legal`).
+            width = {dim: axis for dim, axis in matrix.items() if axis == 'width'}
+            dims.append(('chained', ba.arguments['chained'], (({}, width),) * len(ba.arguments['chained'])))
         return dims
 
     BLOCKS: ClassVar[dict[str, str]] = {'rows': 'block_m', 'depth': 'block_k', 'columns': 'block_n'}
@@ -1302,7 +923,7 @@ class MosaicGmm(_Mosaic):
         splits = 1 if ba.arguments['exact_sums'] else pricing.split_count(
             dataclasses.replace(tile, swapped=False), **self._contraction(ba, tile, target))
         split = dataclasses.replace(tile, splits=splits)
-        tile = split if splits > 1 and self.legal(ba, split, target) else tile
+        tile = split if splits > 1 and self.takes(ba, split, target) else tile
         walked = {each: pricing.walk_seconds(each, self._contraction(ba, each, target))
                   for each in (tile, plain) if each is not None}
         return plain if plain is not None and walked[plain] <= walked[tile] else tile
@@ -1318,8 +939,9 @@ class MosaicGmm(_Mosaic):
             tile, target, rows=rows, groups=ba.arguments['sizes'].shape[0], depth=depth, width=width,
             columns=None if swapped is None else swapped.arguments['kernel'].shape[1],
             # A decode step's partials hold its rows, a TMA descriptor's whole 8s of them.
-            held=-(-rows // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS,
-            operands=self._operand_bytes(ba, tile), multiprocessors=_multiprocessors(target))
+            held=-(-rows // row_tiles.TMA_ROWS) * row_tiles.TMA_ROWS,
+            operands=self._operand_bytes(ba, tile), stored=_stored_bytes(ba, rows, width),
+            multiprocessors=_multiprocessors(target))
 
     def _operand_bytes(self, ba, tile: mosaic_gpu.Tiles) -> tuple[tuple[float, float], tuple]:
         """The bytes an element of the products' left and right operands moves from device memory at `tile`
@@ -1345,7 +967,7 @@ class MosaicGmm(_Mosaic):
             return tile
         splits = pricing.split_count(tile, **self._contraction(ba, tile, target))
         split = dataclasses.replace(tile, splits=splits)
-        return split if splits > 1 and self.legal(ba, split, target) else tile
+        return split if splits > 1 and self.takes(ba, split, target) else tile
 
     def _left_fits(self, ba, config: mosaic_gpu.Tiles) -> bool:
         """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,
@@ -1359,16 +981,18 @@ class MosaicGmm(_Mosaic):
         """The dense product `ba` as its swapped tile runs it: its matrix `[width, depth]` the rows, however
         it lies, and its rows a matrix of them, padded to whole column units of every family the target
         runs, read transposed (`mosaic_gpu.gmm`'s `transpose_lhs` where the matrix lies `[depth, width]`).
-        None where it runs as it is: a call with hooks, a paired or grouped one, one whose rows fill a role
+        None where it runs as it is: a call with hooks, a paired or grouped one, matrices side by side (a
+        swapped call's matrix is its products' one left operand), one whose rows fill a role
         (`Family.role_rows`), or one on a family it does not swap on (`_swaps_on`)."""
         families = self._families(ba, target)
-        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
+        tokens = ba.arguments['tokens']
         if (not families or not all(self._swaps_on(family, tokens.dtype) for family in families)
                 or not ba.arguments.get('dense') or ba.arguments['hooks'] != NO_HOOKS
-                or ba.arguments.get('paired') is not None
+                or ba.arguments.get('paired') is not None or ba.arguments.get('beside')
+                or ba.arguments.get('chained')
                 or tokens.shape[0] >= min(family.role_rows for family in families)):
             return None
-        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        depth, width = _matrix_extents(ba)
         unit = max(family.column_unit(tokens.dtype) for family in families)
         abstract = functools.partial(jax.ShapeDtypeStruct, dtype=tokens.dtype)
         swapped = self.SWAPPED_OPTIONS
@@ -1423,6 +1047,12 @@ class MosaicGmm(_Mosaic):
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         if config.swapped and (self._swapped(ba, target) is None or not self._left_fits(ba, config)):
             return False
+        # Matrices side by side judged at the tile as derived, its split and swap whole (`_ran` runs a
+        # split's runs, and a swapped call, at a tile of neither, which `candidate` then reads).
+        if ba.arguments.get('beside') and not self._takes_beside(ba, config):
+            return False
+        if ba.arguments.get('chained') and not self._takes_chained(ba, config):
+            return False
         # A split is a decode step's (a dense call's, swapped or not, or a grouped one's), each run some
         # steps, of no exact sums: their runs sum exactly (`mosaic_gpu.gmm`), but an A100's exact input
         # gradient split four ways at 64 x 128 x 32 (six stages, two programs) spilled 24 bytes where its
@@ -1434,36 +1064,107 @@ class MosaicGmm(_Mosaic):
             return False
         return super().legal(ba, config, target)
 
+    def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        # Matrices side by side, or chained products, take a tile of their own (`_takes_beside`,
+        # `_takes_chained`), the derivation taking the next.
+        return ((not ba.arguments.get('beside') or self._takes_beside(ba, config))
+                and (not ba.arguments.get('chained') or (self._takes_chained(ba, config)
+                                                         and self._replays(ba, config, target)))
+                and super().candidate(ba, config, target))
+
+    def _replays(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        """Whether a chained launch at `config` has its replay (`chained.guarded_walk`: its flagged tiles
+        walked again at a narrower column tile, an accumulator a product, `chained.replay_tile`) at a tile the
+        launch runs: legal as every tile is (`_Mosaic.legal`: its granularity and the planner's resources), so
+        the two geometries are derived and validated before the chained launch is taken, and a call whose
+        replay no tile holds takes its products apart (c3b97e20f F2)."""
+        dtype, products = ba.arguments['tokens'].dtype, 1 + len(ba.arguments['chained'])
+        if replay_refusal(config, products, pricing.family_of(config, dtype), dtype) is not None:
+            return False
+
+        def replayed(ba, config, target):
+            # The replay's own tile, judged as any tile (its chaining judged at the call's, `_takes_chained`),
+            # its own replay none: it flags nothing.
+            return super(MosaicGmm, self).candidate(ba, config, target)
+
+        return self._held(ba, replay_tile(config, products), target, replayed)
+
+    def _takes_chained(self, ba, config: mosaic_gpu.Tiles) -> bool:
+        """Whether `config` joins the call's products end to end (`gmm_call`'s `chained`), as the launch
+        refuses them (`mosaic_gpu.chained_refusal`): the call's parts, its swap and its scales among them."""
+        arguments, hooks = ba.arguments, ba.arguments['hooks']
+        matrix, transposed = self._streamed_matrix(arguments['kernel'], arguments['trans_rhs'])[:2]
+        chained = tuple((rows, self._streamed_matrix(each, arguments['trans_rhs'])[0])
+                        for rows, each in arguments['chained'])
+        parts = (hooks.prologue, hooks.epilogue, arguments.get('paired'), arguments.get('joined'),
+                 arguments.get('gather'), arguments.get('scatter'), arguments.get('first'),
+                 arguments['exact_sums'], arguments.get('beside') or None, config.swapped or None,
+                 self._scaled or None)
+        family = pricing.family_of(config, arguments['tokens'].dtype)
+        return chained_refusal(arguments['tokens'], matrix, chained, config, family,
+                                          transpose_rhs=transposed, parts=parts) is None
+
+    def _takes_beside(self, ba, config: mosaic_gpu.Tiles) -> bool:
+        """Whether `config` runs the call's matrices side by side (`gmm_call`'s `beside`), as the launch
+        refuses them (`mosaic_gpu.beside_refusal`): the call's parts, its swap and its scales among them."""
+        arguments, hooks = ba.arguments, ba.arguments['hooks']
+        widths = tuple(each.shape[1 if arguments['trans_rhs'] else 2]
+                       for each in (arguments['kernel'], *arguments['beside']))
+        parts = (hooks.prologue, hooks.epilogue, arguments.get('paired'), arguments.get('joined'),
+                 arguments.get('gather'), arguments.get('scatter'), config.swapped or None,
+                 self._scaled or None)
+        family = pricing.family_of(config, arguments['tokens'].dtype)
+        return mosaic_gpu.beside_refusal(config, family, widths, parts=parts) is None
+
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+             scatter: jax.Array | None = None, joined: jax.Array | None = None, beside: tuple = (),
+             chained: tuple = (), *, out_dtype: str,
+             trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         del return_residuals
         return self._forward(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                             gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
-                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config, formats={})
+                             gather, scatter, joined, beside, chained, out_dtype=out_dtype,
+                             trans_rhs=trans_rhs, interpret=interpret, hooks=hooks, exact_sums=exact_sums,
+                             dense=dense, config=config, formats={})
 
     def _forward(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first, gather,
-                 scatter, *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks, exact_sums: bool,
-                 dense: bool, config: mosaic_gpu.Tiles, formats: dict):
+                 scatter, joined=None, beside: tuple = (), chained: tuple = (), *, out_dtype: str,
+                 trans_rhs: bool,
+                 interpret: bool, hooks: Hooks, exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles,
+                 formats: dict):
         """`_fwd`'s one forward, every product launch's: the call as the launch runs it, its depth and width
         padded to whole tiles (`_aligned`), its outputs sliced back; `formats` the format operands a
         subclass's binding takes (`MosaicStepScaledGmm`'s step scales, `MosaicMxGmm`'s block scales), passed
-        to the mainloop as they are beside the register model its launch states (`_stated`)."""
+        to the mainloop as they are beside the register model its launch states (`_stated`); matrices
+        `beside` the kernel (`mosaic_gpu.gmm`'s), whole tiles each (`legal`), their outputs each its own;
+        `chained` products (`mosaic_gpu.gmm`'s), each matrix streamed as the kernel and its width padded as
+        the call's, their depths whole steps each (`legal`)."""
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         call = (bound := self._aligned(self.bind(
             tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first, gather, scatter,
-            out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret, hooks=hooks, exact_sums=exact_sums,
-            dense=dense))).arguments
+            joined, tuple(beside or ()), tuple(chained), out_dtype=out_dtype, trans_rhs=trans_rhs,
+            interpret=interpret, hooks=hooks, exact_sums=exact_sums, dense=dense))).arguments
         tokens, kernel, paired, hooks = call['tokens'], call['kernel'], call.get('paired'), call['hooks']
+        joined = call.get('joined')
         prologue_operands, epilogue_operands = call['prologue_operands'], call.get('epilogue_operands', ())
+        if beside:
+            # Each as the mainloop streams the kernel (`_streamed_matrix`), its depth padded as the call's.
+            formats = {**formats, 'beside': tuple(self._streamed_matrix(matrix, trans_rhs)[0]
+                                                  for matrix in call['beside'])}
+        if chained:
+            # Each product's matrix as the mainloop streams the kernel (`_streamed_matrix`).
+            formats = {**formats, 'chained': tuple((rows, self._streamed_matrix(matrix, trans_rhs)[0])
+                                                   for rows, matrix in call['chained'])}
         out, residuals = self._launched_call(tokens, kernel, sizes, prologue_operands, epilogue_operands,
-                                             paired, first, gather, scatter, out_dtype=out_dtype,
+                                             paired, first, gather, scatter, joined, out_dtype=out_dtype,
                                              trans_rhs=trans_rhs, interpret=interpret, hooks=hooks,
                                              exact_sums=exact_sums, dense=dense, config=config,
                                              formats={**formats, **self._stated(bound, config)})
+        if beside:
+            return out, residuals  # their columns unpadded (`_padded_extents`)
         return jax.tree.map(lambda each: each[:, :width], out), residuals
 
     def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
@@ -1482,8 +1183,8 @@ class MosaicGmm(_Mosaic):
         return bool(ba.arguments['trans_rhs']) or eight(ba.arguments['kernel'].dtype)
 
     def _launched_call(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                       gather, scatter, *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks,
-                       exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles, formats: dict):
+                       gather, scatter, joined=None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+                       hooks: Hooks, exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles, formats: dict):
         """`_fwd`'s launch of the call as it runs it (`_aligned`), `formats` its mainloop's keywords."""
         if config.swapped:
             return self._swapped_launch(kernel[0], tokens, sizes, out_dtype=out_dtype, interpret=interpret,
@@ -1494,7 +1195,7 @@ class MosaicGmm(_Mosaic):
                               out_dtype=out_dtype, multiprocessors=self._launched(config, interpret),
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              dense=dense, paired=paired, exact_sums=exact_sums, gather=gather,
+                              dense=dense, paired=paired, joined=joined, exact_sums=exact_sums, gather=gather,
                               scatter=scatter, **stages, **formats, **hooks.kernel_options()), None
 
 
@@ -1521,14 +1222,17 @@ class MosaicPackedGmm(MosaicGmm):
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+             scatter: jax.Array | None = None, joined: jax.Array | None = None, beside: tuple = (),
+             chained: tuple = (), *, out_dtype: str,
+             trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False, dense: bool = False,
              config: mosaic_gpu.Tiles, return_residuals: bool = False, packed_rows: bool = False):
         # `packed_rows` states the swapped call's orientation (`_swapped`), which its derivation reads: the
         # call itself runs as `config` says (`_launched_call`).
-        del packed_rows
+        del packed_rows, chained
         return super()._fwd(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                            gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
+                            gather, scatter, joined, out_dtype=out_dtype, trans_rhs=trans_rhs,
+                            interpret=interpret,
                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
                             return_residuals=return_residuals)
 
@@ -1584,11 +1288,11 @@ class MosaicPackedGmm(MosaicGmm):
         return family.layout == plgpu.Layout.WGMMA
 
     def _launched_call(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                       gather, scatter, *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks,
-                       exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles, formats: dict):
+                       gather, scatter, joined=None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+                       hooks: Hooks, exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles, formats: dict):
         if not config.swapped:
             return super()._launched_call(tokens, kernel, sizes, prologue_operands, epilogue_operands,
-                                          paired, first, gather, scatter, out_dtype=out_dtype,
+                                          paired, first, gather, scatter, joined, out_dtype=out_dtype,
                                           trans_rhs=trans_rhs, interpret=interpret, hooks=hooks,
                                           exact_sums=exact_sums, dense=dense, config=config, formats=formats)
         # The matrix's words and scales the rows, decoded in registers (`_swaps_on`).
@@ -1645,7 +1349,7 @@ class MosaicTgmm(_Mosaic):
         # fewer of ("dimension 1 must have size smaller or a multiple of its tiling 64, but got 200", a
         # 200-deep kernel gradient on sm90 and sm120, the compile gate at c717a2439b4).
         if self._ragged(ba, family):
-            return math.lcm(mosaic_gpu.TMA_ROWS, swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES))
+            return math.lcm(row_tiles.TMA_ROWS, swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES))
         return family.role_rows
 
     def _padded_extents(self, ba) -> dict[str, int]:
@@ -1721,10 +1425,9 @@ class MosaicTgmm(_Mosaic):
         return pricing.split_count(tile, **self._contraction(ba, tile, target))
 
     def _walk(self, ba, tile: mosaic_gpu.Tiles, target) -> pricing.SplitWalk | None:
-        """The walk `tile` runs the call in (`pricing.split_walk`): a split tile's over the partials' call
-        its slices run (`_partials`)."""
-        call = ba if tile.splits == 1 else self._partials(ba)
-        return pricing.split_walk(tile, **self._contraction(call, tile, target))
+        """The walk `tile` runs the call in (`pricing.split_walk`), split or not: its output stored at the
+        call's own dtype, a split's fp32 partials priced by their passes (`SplitWalk.passes`)."""
+        return pricing.split_walk(tile, **self._contraction(ba, tile, target))
 
     def _contraction(self, ba, tile: mosaic_gpu.Tiles, target) -> dict:
         """The call's contraction as the split prices it at `tile` (`pricing.split_walk`'s facts): the call
@@ -1735,7 +1438,9 @@ class MosaicTgmm(_Mosaic):
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
         itemsizes = (tokens.dtype.itemsize, cotangent.dtype.itemsize)
         return {'groups': ba.arguments['sizes'].shape[0], 'rows': _rows_of(_TGMMS, ba.args), 'depth': depth,
-                'width': width, 'itemsizes': itemsizes, 'multiprocessors': _multiprocessors(target),
+                'width': width, 'itemsizes': itemsizes,
+                'stored': jnp.dtype(ba.arguments['out_dtype']).itemsize,
+                'multiprocessors': _multiprocessors(target),
                 'step_seconds': pricing.step_seconds(tile, target, itemsizes),
                 'bandwidth': target.memory_rate,
                 'launch_seconds': target.launch_seconds}
@@ -1817,15 +1522,17 @@ class _ScaledGmm(MosaicGmm):
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, prologue_operands: tuple = (),
              epilogue_operands: tuple = (), paired: jax.Array | None = None, first: jax.Array | None = None,
-             gather: jax.Array | None = None, scatter: jax.Array | None = None, *, out_dtype: str,
+             gather: jax.Array | None = None, scatter: jax.Array | None = None,
+             joined: jax.Array | None = None, beside: tuple = (), chained: tuple = (), *, out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
-             dense: bool = False, scales: tuple = (), config: mosaic_gpu.Tiles,
+             dense: bool = False, scales: tuple = (),
+             config: mosaic_gpu.Tiles,
              return_residuals: bool = False):
-        del return_residuals
+        del return_residuals, chained
         return self._forward(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                             gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
-                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
-                             formats={self.SCALES: tuple(scales)})
+                             gather, scatter, joined, out_dtype=out_dtype, trans_rhs=trans_rhs,
+                             interpret=interpret, hooks=hooks, exact_sums=exact_sums, dense=dense,
+                             config=config, formats={self.SCALES: tuple(scales)})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1964,7 +1671,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
 
     def eligible(self, ba, target) -> bool:
-        return cutlass_built_for(target.generation) is not None and self.takes(ba)
+        return cutlass_built_for(target.generation) is not None and self.in_contract(ba)
 
     def tile(self, ba) -> mosaic_gpu.Tiles | None:
         """The record of the kernel the build holds for the GPU being selected for (`generation.gpu_target`,
@@ -1973,7 +1680,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         return None if built is None else cutlass_tile(built, ba.arguments['out_dtype'])
 
     @staticmethod
-    def takes(ba) -> bool:
+    def in_contract(ba) -> bool:
         """Whether its kernels take the call wherever dew_cutlass holds them (`eligible` adds the installed
         library's generations): bf16 operands, bf16 or fp32 out, int32 sizes, every extent a multiple of 8
         elements (16-byte aligned rows of every operand and output, as its TMA copies and each group's
@@ -1995,6 +1702,12 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Its build's kernel is the one it runs (`cutlass_tile`), sized to every part of its architecture.
         return self.space(ba)
 
+    def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        """Whether `config` runs the call: its build's one kernel (`space`), which CUTLASS sized to every part
+        of its architecture, its shared memory and registers its own; a pin or a tuned pick names it."""
+        del target
+        return config in self.space(ba)
+
 
 @dataclasses.dataclass(frozen=True)
 class CutlassGmm(_Cutlass):
@@ -2005,13 +1718,15 @@ class CutlassGmm(_Cutlass):
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+             scatter: jax.Array | None = None, joined: jax.Array | None = None, beside: tuple = (),
+             chained: tuple = (), *, out_dtype: str,
+             trans_rhs: bool, interpret: bool,
              hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         # No hooks, side operands, second matrix, stack read from a first matrix or exact sums: the launch is
         # not eligible for them (`_Cutlass.eligible`); a dense call is one group, as any.
         del prologue_operands, epilogue_operands, paired, first, gather, scatter, interpret, hooks, exact_sums
-        del dense, config
+        del dense, config, joined, beside, chained
         importlib.import_module('dew_cutlass').registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
@@ -2076,59 +1791,23 @@ def _multiprocessors(target: generation.GpuTarget) -> int:
     return target.multiprocessors
 
 
-class Made(enum.Enum):
-    """What a grouped call makes (`Kind`): a forward product, its input gradient (the matrix read transposed),
-    or the matrices' kernel gradient, summed by the tensor cores or exactly (`exact_sums`)."""
-
-    FORWARD = 'forward'
-    INPUT_GRADIENT = 'input_gradient'
-    KERNEL_GRADIENT = 'kernel_gradient'
-    EXACT_KERNEL_GRADIENT = 'kernel_gradient exact'
-
-
-class Kind(NamedTuple):
-    """The kind of call a grouped product is (`GroupedCase.kind`), which with the device's instruction family
-    is its cell (`DECLARED`): dense (one matrix, every row) or grouped, what it makes, the operands no
-    receipt of a 16-bit call times: FP8 ones (XLA's dot of them sums narrower than the FP8 contract holds,
-    row 1625), rows gathered through a table or stored through one (no old route reads them); and, for a
-    dense product a receipt timed on its family (`MEASURED`: its matrix, over the rows it timed), that
-    matrix's `[in, out]` extents, a cell of its own, which the receipt's winner for it holds (None for every
-    other product, the kind's cell)."""
-
-    dense: bool
-    made: Made
-    fp8: bool = False
-    gathered: bool = False
-    scattered: bool = False
-    matrix: tuple[int, int] | None = None
-    formed: bool = False
-    """Whether its left operand is formed by a prologue the kernel runs tile by tile (a norm's normalization
-    the algebra's recognition fused into the product, `fused_gemm`), its call one that reads the rows the
-    prologue forms them from: a forward's or a kernel gradient's, a cell of its own where a receipt timed one
-    (`MEASURED`)."""
-
-    def __str__(self) -> str:
-        parts = (('fp8',) * self.fp8 + ('gathered',) * self.gathered + ('scattered',) * self.scattered
-                 + ('formed',) * self.formed)
-        timed = () if self.matrix is None else ('x'.join(map(str, self.matrix)),)
-        return ' '.join(('dense' if self.dense else 'grouped', self.made.value, *parts, *timed))
-
-
 @dataclasses.dataclass(frozen=True)
 class GroupedCase:
     """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run on its
     target (`placed`: a GPU of sm80 on, or a TPU; the template's dispatch runs in the branch its platform
     places), whether they see its operands whole (`whole`,
-    `dew.nn.sharding.seen_whole`), the `product` it declares, its `rows`, its launches bound to it
+    `dew.nn.sharding.seen_whole`), the `product` it declares, its `extents`, its launches bound to it
     (`call`) and the `kind` of call it is (`Kind`, as `gmm_call` and `tgmm_call` state it), which with the
     device's instruction family is its cell (`DECLARED`)."""
 
     placed: bool
     whole: bool
     product: Product
-    rows: int
     call: base.Call
     kind: Kind
+    extents: tuple[int, int, int]
+    """Its product's rows, depth and width (`_extents_of`): a kernel gradient's rows the ones it sums over,
+    a product's those it walks (`_rows_of`)."""
     paired: bool = False
     """Whether it multiplies its rows by a second matrix beside the first (`gmm_call`'s `paired`)."""
 
@@ -2160,11 +1839,13 @@ SUPPORTS = (
     _Need('step_sums', lambda case: not (case.product.promoted and generation.tpu(case.call.target)),
           lambda case: f"{case.call.target.generation}'s MXUs add within a step, which no measurement states "
                        "IEEE", row=INHERENT),
-    _Need('rows', lambda case: case.rows > 0, "the call has no rows", row=INHERENT),
+    _Need('extents', lambda case: 0 not in case.extents, "the call has no rows, depth or width",
+          row=INHERENT),
 )
 """What every launch needs of a grouped product: a process that runs it, whole operands, a product the
 kernels compute exactly on the target (its declaration's refusal, the target's tensor rate for its
-dtype, no step-by-step sums on a TPU, whose launches do not add them apart), and rows to launch."""
+dtype, no step-by-step sums on a TPU, whose launches do not add them apart), and some extent on each axis
+(a product of no rows, depth or width has no tile to launch: XLA's program, its sum of nothing)."""
 
 
 def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]:
@@ -2234,68 +1915,6 @@ TRITON = _launch_kernel(Gmm.name, DENSE_MEASURED)
 CUTLASS = _launch_kernel(CutlassGmm.name, DECLARED_ONLY)
 """CUTLASS's launches, on their declared cells alone (`DECLARED_ONLY`)."""
 XLA = selection.Kernel[GroupedCase]('xla', (), generic=True)
-
-FOUR_B = ((2560, 9216), (9216, 2560), (2560, 1024), (2560, 64))
-"""Qwen3.5-4B's dense projections' matrices `[in, out]`: its MLP's up and down, its attention's key, its
-gated delta net's gates, which M-EM-36-gh200 and em35d timed at 24,576 tokens, each product of each."""
-
-class Timed(NamedTuple):
-    """The dense products a kind's receipts timed (`MEASURED`): of these `matrices` `[in, out]`, over `rows`
-    from `fewest` to `most` tokens. A receipt is evidence for the products it measured alone: a product of
-    another matrix, or of one of these over rows outside them, takes its kind's cell (row 6794: the 4B
-    key's cells, timed at 24,576 tokens, took a fine-tune's key and value products at 2,048, whose 216
-    template launches a step ran 6.57 ms, the step's dense products 1.75 ms slower than cuBLAS's alone)."""
-
-    matrices: frozenset[tuple[int, int]]
-    fewest: int
-    most: int
-
-    def holds(self, matrix: tuple[int, int], rows: int) -> bool:
-        """Whether a product of `matrix` over `rows` tokens is one these receipts timed."""
-        return matrix in self.matrices and self.fewest <= rows <= self.most
-
-
-NORMED_08B = ((1024, 4096 + 512 + 512), (1024, 2 * 3584))
-"""Qwen3.5-0.8B's normed projections M-EM-65 timed (`M_EM_65`): the attention input norm before the joined
-query (doubled by its output gate), key and value, and the MLP's norm before gate and up, `[in, out]`."""
-
-NORMED_4B_8B = ((2560, 8192 + 1024 + 1024), (2560, 2 * 9216), (4096, 4096 + 1024 + 1024), (4096, 2 * 14336))
-"""Qwen3.5-4B's and Llama-3.1-8B's normed projections M-EM-67 timed (`M_EM_67`): each's joined query (the
-4B's doubled by its output gate), key and value, and its gate and up, `[in, out]`."""
-
-M_EM_67 = ("M-EM-67-gh200 (a GH200, main 27bc19ccba3, rounds.py's two arms interleaved 5 rounds, fresh "
-           "caches an arm, 2 x 2048 and 4 x 3072 rows of bf16, a training step's forward and backward): the "
-           "norm in the template's prologue against the fused norm kernel then XLA's dot, 0.562x to 0.624x "
-           "at every projection, ranges apart; an A100 1.041x to 1.100x, so no A100 cell")
-M_EM_65 = ("M-EM-65-a100 and M-EM-65-gh200 (an A100 and a GH200, main 99c7334e2, rounds.py's two arms "
-           "interleaved 5 rounds, CUPTI medians, 4 x 3072 rows of bf16, a training step's forward and "
-           "backward): the norm in the template's prologue against the fused norm kernel then XLA's dot, "
-           "0.955x and 0.619x at the attention norm + q/k/v, 0.971x and 0.533x at the MLP norm + gate/up, "
-           "ranges apart")
-MEASURED: dict[tuple[str | None, Made, bool], tuple[Timed, ...]] = {
-    **{(family, made, False): (Timed(frozenset(FOUR_B), 24576, 49152),) for family in ('wgmma', 'tcgen05')
-       for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT)},
-    **{('mma.sync', made, True): (Timed(frozenset(NORMED_08B), 12288, 12288),)
-       for made in (Made.FORWARD, Made.KERNEL_GRADIENT)},
-    **{('wgmma', made, True): (Timed(frozenset(NORMED_08B), 12288, 12288),
-                               Timed(frozenset(NORMED_4B_8B), 4096, 12288))
-       for made in (Made.FORWARD, Made.KERNEL_GRADIENT)}}
-"""The dense products each instruction family's receipts timed, by what the product makes: one of them is a
-cell of its own (`Kind.matrix`), which its receipt's winner holds, each receipt its own matrices and rows;
-every other product its kind's. The
-receipts timed 24,576 tokens (M-EM-36, M-EM-52, em35d); the 4B step's 49,152 (four rows) held the same
-cells at parity with cuBLASLt (M-EM-54, interleaved in one session: 3,418.7 against 3,416.9 ms)."""
-
-M_EM_36 = ("M-EM-36-gh200 (a GH200, base/kernels df82480cb5c, CUPTI medians of 5 rounds, cuBLASLt autotuned "
-           "at run, 24,576 tokens)")
-M_EM_52 = ("M-EM-52-gh200 (a GH200 under its power cap, base/kernels 3bea6245b56's derivation: the kernel "
-           "gradient on a multicast pair, CUPTI medians of 5 rounds interleaved with cuBLASLt's, autotuned "
-           "in the same process, 24,576 tokens)")
-EM35D = ("em35d (a B200, base/kernels ce6eff7f0be, CUPTI medians of 5 rounds, cuBLASLt autotuned at run, "
-         "24,576 tokens)")
-B200_GRID = ("lab-b200-20261113-grid (a B200, base/kernels 5ac163abbec, medians of 5 rounds' same-round "
-             "ratios, cuBLASLt autotuned at run, 24,576 tokens; its down kernel gradient the template's, "
-             "0.833x)")
 
 DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {
     **{(family, Kind(dense=True, made=made, matrix=matrix, formed=True)): (MOSAIC, M_EM_65)
@@ -2404,7 +2023,8 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     scattered = launches is not _TGMMS and len(arguments) > 8 and arguments[8] is not None
     call = base.call(launches, *arguments, **options)
     matrix = _matrix_of(launches, arguments) if options['dense'] else None
-    rows = _rows_of(launches, arguments)
+    extents = _extents_of(launches, arguments, options)
+    rows = extents[0]
     # A left operand a prologue forms (a norm's, fused by the algebra's recognition) is a cell of its own
     # where a receipt timed it formed; elsewhere it is its matrix's cell as any call's (train 977 F1: the
     # 4B's normed projections keep the template FOUR_B's receipts measured).
@@ -2420,8 +2040,10 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
-    paired = any(bound.arguments.get('paired') is not None for _, bound in call.bound.values())
-    return GroupedCase(placed, whole, product, rows, call, kind, paired=paired)
+    # A pair, matrices side by side or chained products: Mosaic GPU's launch alone takes them (`_takes_pair`).
+    paired = any(bound.arguments.get('paired') is not None or bound.arguments.get('beside')
+                 or bound.arguments.get('chained') for _, bound in call.bound.values())
+    return GroupedCase(placed, whole, product, call, kind, extents, paired=paired)
 
 
 def _matrix_of(launches, arguments) -> tuple[int, int]:
@@ -2431,6 +2053,17 @@ def _matrix_of(launches, arguments) -> tuple[int, int]:
     if launches is _TGMMS:
         return arguments[0].shape[1], arguments[1].shape[1]
     return tuple(arguments[1].shape[1:])
+
+
+def _extents_of(launches, arguments, options) -> tuple[int, int, int]:
+    """A call's product's rows, depth and width (`GroupedCase.extents`): a product's walked rows
+    (`_rows_of`), its tokens' depth and its matrix's width; a kernel gradient's summed rows, its tokens'
+    and its cotangent's columns."""
+    rows = _rows_of(launches, arguments)
+    if launches is _TGMMS:
+        return rows, arguments[0].shape[1], arguments[1].shape[1]
+    kernel = arguments[1]
+    return rows, arguments[0].shape[1], kernel.shape[1 if options['trans_rhs'] else 2]
 
 
 def _rows_of(launches, arguments) -> int:
@@ -2457,8 +2090,9 @@ def launched(launches, arguments, options, *, product: Product, whole: bool):
 
 def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
              paired: jax.Array | None = None, first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS,
-             interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
+             scatter: jax.Array | None = None, joined: jax.Array | None = None, beside: tuple = (),
+             chained: tuple = (), *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool,
+             promoted: bool = False, dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` times its matrix of `kernel`,
     both of one dtype, with the template's hooks (`gemm.gemm`). `promoted`,
     the declared product's (`templates.product.Product`), adds each depth step's partial apart
@@ -2469,8 +2103,14 @@ def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_oper
     banked layer's experts, `gemm.gemm`'s `layer`); `gather`, int32 `[rows]`, the rows of `tokens` the
     product's rows are, in order (a mixture of experts' tokens read where they lie, row 1376); `scatter`,
     int32 `[rows]` a permutation, the output row each product row lands at (its slots written in token
-    order); Mosaic GPU's launch alone takes either."""
-    optional = (paired, first, gather, scatter)
+    order); Mosaic GPU's launch alone takes either; `joined`, rows of `tokens`' shape that `paired` multiplies
+    into the one product (`mosaic_gpu.gmm`'s `joined`: a paired product's input gradient, row 6783);
+    `beside`, matrices of `kernel`'s groups and depth side by side with it, each its own output (Mosaic
+    GPU's launch alone takes them: `mosaic_gpu.gmm`'s `beside`, row 6794); `chained`, further `(rows,
+    matrix)` products summed with it over their contractions joined end to end (Mosaic GPU's launch alone:
+    `mosaic_gpu.gmm`'s `chained`, a multi-matrix input gradient, row 8282)."""
+    optional = (paired, first, gather, scatter, joined, tuple(beside) or None,
+                tuple(map(tuple, chained)) if chained else None)
     last = max((place for place, value in enumerate(optional) if value is not None), default=-1)
     arguments = (tokens, kernel, sizes, tuple(prologue_operands), tuple(epilogue_operands),
                  *optional[:last + 1])

@@ -1445,6 +1445,21 @@ def test_a_value_is_priced_at_the_bytes_its_dtype_holds():
     assert (narrow.device_bytes, narrow.shared_bytes) == (2 * 64 * 64 * 2, 2 * 64 * 64 * 2)
 
 
+@pytest.mark.parametrize("function, exponentials", [
+    (jnp.exp, 64 * 64), (jnp.sqrt, 64 * 64), (jax.lax.erf, 0), (jnp.expm1, 0)],
+    ids=lambda f: getattr(f, "__name__", None))
+def test_a_functions_work_is_the_units_the_kernels_counter_names(function, exponentials):
+    """A region's elementwise function is priced on the units the kernels' counter states it issues on
+    (`emission.SPECIAL_FUNCTIONS`, `cost.work`): an exp and a square root on the special-function units, an
+    erf and an expm1 on the CUDA cores (XLA's polynomial; CUDA's expm1f, FMAs alone), where the algebra's
+    own table charged all four as exponentials (base review 05bd9f77b F2)."""
+    region = terms.region(jax.make_jaxpr(function)(jnp.ones((64, 64), jnp.float32)))
+    graph, bundle, _ = program.graphed(region)
+    _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                             cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
+    assert price.work.exponentials == exponentials, price.work
+
+
 def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
     """A window's derivation is keyed by the matmul precision its pricing reads for a product of no stated
     precision (`jax.default_matmul_precision`: TF32 at the default, the CUDA cores' IEEE fp32 above it): a

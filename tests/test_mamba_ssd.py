@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import interprets
 from port_support import row_names_port
 from reference_error import (
     PRECISION,
@@ -38,7 +39,7 @@ from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd
 pytestmark = pytest.mark.kernel
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
-INTERPRETED = jax.default_backend() != "gpu"
+INTERPRETED = interprets()
 SEEDED = FIXTURES / "ssd_mamba_ssm_seeded.npz"
 
 
@@ -159,7 +160,7 @@ def _port_holds_check_1(case):
         inputs = tuple(jnp.asarray(arrays[name], dtype if name in ("x", "B", "C") else jnp.float32)
                        for name in names)
         seq = arrays.get("seq")
-        return ssd_value_and_grad(lambda *values: mamba_ssd.ssd_scan(*values, seq, None, chunk, INTERPRETED),
+        return ssd_value_and_grad(lambda *values: mamba_ssd.ssd_scan(*values, seq, chunk, INTERPRETED),
                                   inputs, jnp.asarray(arrays["dy"], dtype), jnp.asarray(arrays["dfinal"]))
 
     _, inputs = draw(0)
