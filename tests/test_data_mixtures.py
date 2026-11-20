@@ -2117,6 +2117,35 @@ def test_a_token_mixture_of_published_generations_weighs_the_targets_each_states
     assert drawn["short"] > 0 and drawn["long"] > 0
 
 
+def test_a_streamed_token_mix_of_stated_counts_draws_as_its_indexed_read(tmp_path):
+    """A mix by tokens of two published generations, each stating its rows and valid targets, read as a
+    stream draws its members as its indexed read does, each weighed by the counts its member states
+    (row 9010: the stream kept a deficit of the targets it read, whatever its members stated)."""
+    from dew.data.cache import Cache
+    from dew.data.steps.text import CountTargets
+    from dew.data.text import Tokenize
+
+    texts = {"short": " ".join(["short"] * 3), "long": " ".join(["long"] * 10)}
+
+    def published(name: str, tag: int) -> Pipeline:
+        rows = Memory([{"text": texts[name], "id": tag * 1000 + index} for index in range(16)], identity=name)
+        generation = publish(Pipeline(rows).map(Tokenize()).filter_map(CountTargets()),
+                             Cache(str(tmp_path / name)), read="indexed", loading=READ)
+        return Pipeline(generation.source(), name=name)
+
+    members = [published("short", 1), published("long", 2)]
+
+    def ids(read: str) -> list[int]:
+        mixed = mix(members, weights=[1, 3], by="tokens")
+        reader = compile(mixed.repeat().batch(1), read=read, loading=READ).train(DataPartition())
+        try:
+            return [int(identity) for batch in itertools.islice(reader, 40) for identity in batch["id"]]
+        finally:
+            reader.close()
+
+    assert ids("streamed") == ids("indexed")
+
+
 def _short_and_long() -> Pipeline:
     """Short rows of two tokens and long rows of ten, each corpus read on past its end, mixed by tokens."""
     return mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()], by="tokens")

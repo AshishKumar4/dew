@@ -38,6 +38,7 @@ from dew.batch import DRAWS, EXAMPLES_CONSUMED, Batch, Draws
 from dew.data.analysis import (
     _LOCAL,
     _VIEWS,
+    STATED_SHARES,
     _at,
     _cache_manifest,
     _cache_steps,
@@ -93,6 +94,7 @@ from dew.data.mixing import (
     KeyedMix,
     Streak,
     TokenDeficit,
+    _weights,
     mix_end,
     mixed_indexed,
     rewound,
@@ -1500,7 +1502,8 @@ class _Build:
                        for key, stream in zip(keys, streams, strict=True)]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).
-        if source.tokens is not None:
+        stated = self.lowering.order.get("shares") == STATED_SHARES
+        if source.tokens is not None and not stated:
             return TokenDeficit(
                 streams,
                 source.weights,
@@ -1517,7 +1520,10 @@ class _Build:
                    if source.seed is None and partition.count == 1 else [None])
         known = [length for length in lengths if length is not None]
         end = mix_end(known, source) if len(known) == len(lengths) else None
-        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped, end=end)
+        # A token mix whose members state their counts weighs each by them (`STATED_SHARES`), as its indexed
+        # read does (`mixed_indexed`); a record mix by its weights.
+        weights = _weights(source) if stated else source.weights
+        return KeyedMix(streams, weights, keys, source.seed, stamped=self.stamped, end=end)
 
     def member_records(self, member: Pipeline, index: int) -> int | None:
         """The records the `index`th member of a mix, `member`, reads before it ends (`dew.data.epochs`),
