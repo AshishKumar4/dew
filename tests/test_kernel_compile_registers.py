@@ -131,50 +131,98 @@ def test_a_kernel_ptxas_serializes_carries_ptxas_own_notes_in_its_binary(depth):
 
 
 
+
 def test_a_triton_template_binary_in_compile_mosaic_kernels_reports_shared_registers_and_spills():
     """Row 7263: when a public route compiled through `compile_mosaic_kernels` falls back to a
     Pallas-Triton template launch, `reports` + `inherited` + `mosaic_failures` read its cubin's shared
     bytes, registers and stack frame (zero unread, tmem 0 when `uses_tmem is False`), refuse spills,
-    preserve XLA-uniquified Triton cubin names, and mark TMEM unread when `uses_tmem` is True or None."""
+    preserve XLA-uniquified Triton cubins losslessly apart from independent stems and Mosaic inventories,
+    and mark TMEM unread when `uses_tmem` is True or None."""
     import dataclasses
 
-    assert report.kernel_of("probe__l0123456789__1") == ("probe__1", "0123456789")
-    assert report.launch_name("probe__1", "0123456789") == "probe__1__l0123456789"
+    assert report.kernel_of("probe__l0123456789__1") == ("probe", "0123456789")
     assert report.kernel_of("probe__1__l0123456789") == ("probe__1", "0123456789")
+    assert report.launch_name("probe", "0123456789", "1") == "probe__l0123456789__1"
+    assert report.launch_name("probe__1", "0123456789") == "probe__1__l0123456789"
 
     clean = report.Binary("attention_forward", "0123456789", 64, 0, "triton",
                           shared=16384, sass=(), uses_tmem=False)
-    uniquified_spill = report.Binary(*report.kernel_of("attention_forward__l0123456789__1"), 96, 24, "triton",
-                                     shared=16384, sass=(), uses_tmem=False)
+    uniquified_spill = report.Binary("attention_forward", "0123456789", 96, 24, "triton",
+                                     shared=16384, sass=(), uses_tmem=False, index="1")
+    distinct_stem = report.Binary("attention_forward__1", "0123456789", 48, 0, "triton",
+                                  shared=8192, sass=(), uses_tmem=False)
     tmem_using = report.Binary("tmem_triton", "0123456789", 64, 0, "triton",
                                shared=16384, sass=(), uses_tmem=True)
     undecoded = report.Binary("undecoded_triton", "0123456789", 64, 0, "triton",
                               shared=16384, sass=(), uses_tmem=None)
 
     found = [kc.inherited(dataclasses.asdict(r), {}, "sm80")
-             for r in kc.reports({}, [clean, uniquified_spill, tmem_using, undecoded], {})]
-    by_kernel = {item["kernel"]: item for item in found}
-    assert by_kernel["attention_forward"]["unread"] == ()
-    assert by_kernel["attention_forward"]["shared"] == 16384
-    assert by_kernel["attention_forward"]["tmem"] == 0
-    assert by_kernel["attention_forward"]["registers"] == 64
-    assert by_kernel["attention_forward"]["spilled"] == 0
-    assert "attention_forward__1" in by_kernel
+             for r in kc.reports({}, [clean, uniquified_spill, distinct_stem, tmem_using, undecoded], {})]
+    by_key = {report.launch_name(item["kernel"], item["launch"], item["index"]): item for item in found}
+    assert len(by_key) == 5, by_key
+    clean_item = by_key["attention_forward__l0123456789"]
+    assert clean_item["unread"] == ()
+    assert clean_item["shared"] == 16384
+    assert clean_item["tmem"] == 0
+    assert clean_item["registers"] == 64
+    assert clean_item["spilled"] == 0
 
-    clean_rec = {"name": "decode", "limit": 166912, "tmem_limit": 0,
-                 "kernels": [by_kernel["attention_forward"]]}
+    clean_rec = {"name": "decode", "limit": 166912, "tmem_limit": 0, "kernels": [clean_item]}
     assert kc.mosaic_failures([clean_rec]) == []
 
     spill_rec = {"name": "decode", "limit": 166912, "tmem_limit": 0,
-                 "kernels": [by_kernel["attention_forward"], by_kernel["attention_forward__1"]]}
+                 "kernels": [clean_item, by_key["attention_forward__l0123456789__1"]]}
     failures = kc.mosaic_failures([spill_rec])
     assert len(failures) == 1 and "24 bytes spilled" in failures[0], failures
 
-    for name in ("tmem_triton", "undecoded_triton"):
-        assert "tensor memory columns" in by_kernel[name]["unread"], by_kernel[name]
-        assert by_kernel[name]["tmem"] is None
-        tmem_rec = {"name": "decode", "limit": 166912, "tmem_limit": 512, "kernels": [by_kernel[name]]}
-        assert kc.mosaic_failures([tmem_rec]), name
+    for key in ("tmem_triton__l0123456789", "undecoded_triton__l0123456789"):
+        assert "tensor memory columns" in by_key[key]["unread"], by_key[key]
+        assert by_key[key]["tmem"] is None
+        tmem_rec = {"name": "decode", "limit": 166912, "tmem_limit": 512, "kernels": [by_key[key]]}
+        assert kc.mosaic_failures([tmem_rec]), key
+
+    # Mosaic estimates join only Mosaic binaries: a same-named Triton binary never masks a missing Mosaic
+    # binary and never collides with a same-named Mosaic binary.
+    mosaic_est = {"attention_forward__l0123456789": "Resources(smem_bytes=1024, tmem_cols=0)"}
+    mixed = kc.reports(mosaic_est, [clean], {})
+    assert len(mixed) == 2, mixed
+    assert any(r.kind == "mosaic_gpu" and "binary" in r.unread for r in mixed), mixed
+    assert any(r.kind == "triton" and not r.unread for r in mixed), mixed
+    mosaic_bin = report.Binary("attention_forward", "0123456789", 64, 0, "mosaic_gpu", shared=1024, sass=())
+    both = kc.reports(mosaic_est, [clean, mosaic_bin], {})
+    assert {r.kind for r in both} == {"mosaic_gpu", "triton"}, both
+
+
+@lowers("sm80")
+def test_compile_mosaic_kernels_reports_both_xla_uniquified_triton_cubins():
+    """Row 7263: two Pallas-Triton calls sharing one launch-tagged kernel name with distinct shapes force
+    XLA to emit a uniquified second cubin (`__1`); `compile_mosaic_kernels` reports both distinct cubins
+    with zero unread fields and zero spills."""
+    import jax.numpy as jnp
+    from fla_gdn_support import KernelCase
+    from jax.experimental import pallas as pl
+
+    from dew.nn.kernels import generation
+
+    def add_one(x_ref, o_ref):
+        o_ref[...] = x_ref[...] + 1.0
+
+    def program(a, b):
+        def call(x):
+            return pl.pallas_call(add_one, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+                                  name="probe__l0123456789")(x)
+        return call(a), call(b)
+
+    a = jax.ShapeDtypeStruct((128,), jnp.float32)
+    b = jax.ShapeDtypeStruct((256,), jnp.float32)
+    with generation.assumed("sm80"):
+        found = kc.compile_mosaic_kernels([KernelCase("uniquified", lambda: (program, (a, b)))], "sm80")
+    kernels = [k for k in found[0]["kernels"] if k["kind"] == "triton"]
+    assert len(kernels) == 2, kernels
+    assert {k["index"] for k in kernels} == {None, "1"}, kernels
+    assert all(k["kernel"] == "probe" and k["launch"] == "0123456789" for k in kernels), kernels
+    assert all(not k["unread"] for k in kernels), kernels
+    assert kc.mosaic_failures(found) == []
 
 
 @lowers("sm100")

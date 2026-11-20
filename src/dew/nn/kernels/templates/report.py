@@ -80,8 +80,7 @@ def kernel_of(name: str) -> tuple[str, str | None]:
     kernel = function.group("kernel") if function else name
     if not (launch := LAUNCH_SUFFIX.search(kernel)):
         return kernel, None
-    stem = kernel[:launch.start()]
-    return (f"{stem}__{launch.group(2)}" if launch.group(2) is not None else stem), launch.group(1)
+    return kernel[:launch.start()], launch.group(1)
 KERNEL_PROTO_VERSION = 4
 """The `MosaicGpuKernelProto` version jaxlib serializes (mosaic/gpu/custom_call.cc), which it alone reads."""
 MOSAIC_TARGET = b"mosaic_gpu_v2"
@@ -424,10 +423,11 @@ def launch_metadata() -> bytes:
     return b"" if digest is None else digest.encode()
 
 
-def launch_name(kernel: str, launch: str | None) -> str:
-    """`kernel`'s name carrying the digest `launch` (`LAUNCH_SUFFIX`), as is where None: `kernel_of`'s
-    inverse, the key a kernel's evidence goes by beside its launch."""
-    return kernel if launch is None else f"{kernel}__l{launch}"
+def launch_name(kernel: str, launch: str | None, index: str | None = None) -> str:
+    """`kernel`'s name carrying the digest `launch` (`LAUNCH_SUFFIX`) and optional XLA uniquification
+    `index`, as is where None: the lossless key a kernel's evidence goes by beside its launch."""
+    named = kernel if launch is None else f"{kernel}__l{launch}"
+    return named if index is None else f"{named}__{index}"
 
 
 class KernelsOfOneName(ValueError):
@@ -1963,6 +1963,8 @@ class Binary:
     None where it reconfigures none that way, or no disassembler read it."""
     uses_tmem: bool | None = None
     """Whether its decoded SASS issues any Blackwell tensor-memory instruction (`_uses_tmem`); None undecoded."""
+    index: str | None = None
+    """XLA uniquification suffix (`__1`) where a second cubin shares `(kernel, launch)`; None otherwise."""
 
     @property
     def launched(self) -> str | None:
@@ -2167,9 +2169,12 @@ def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = Fal
     decreased, raised = (None, None) if listing is None else reconfigured(listing)
     sass = (None if listing is None else sass_findings_of(listing)) if decoded else ()
     uses_tmem = None if listing is None else _uses_tmem(listing)
+    matched = LAUNCH_SUFFIX.search(function)
+    index = matched.group(2) if matched is not None else None
     return Binary(*kernel_of(function), stated[REGISTER_COUNT], frame, kind=kind, sass=sass,
                   spilled_in=(None if listing is None else spilled_roles(listing)) if frame else (),
-                  threads=stated.get(MAX_THREADS), decreased=decreased, raised=raised, uses_tmem=uses_tmem)
+                  threads=stated.get(MAX_THREADS), decreased=decreased, raised=raised,
+                  uses_tmem=uses_tmem, index=index)
 
 
 def disassembler() -> Path | None:
