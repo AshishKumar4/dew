@@ -580,7 +580,7 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
         sizes = []
         for leaf in jax.tree.leaves(tree, is_leaf=lambda x: isinstance(x, plgpu.RefUnion)):
             if isinstance(leaf, plgpu.RefUnion):
-                sizes.append(max(allocated(*arrays(member)) for member in getattr(leaf, "refs", leaf)))
+                sizes.append(max(allocated(*arrays(member)) for member in leaf.refs))
             elif not _barrier(leaf) and not _semaphore(leaf):
                 sizes.append(stored_bytes(leaf.shape, leaf.dtype))
         return sizes
