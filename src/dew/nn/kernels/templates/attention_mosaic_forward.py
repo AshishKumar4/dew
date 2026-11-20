@@ -546,7 +546,7 @@ class BlockPlan(NamedTuple):
     output hook runs inside the kernel (`output_hook`). Shared by legality, residency, and emission
     (row 9542)."""
     split: bool
-    out_dtype: Any
+    out_dtype: object
     output_hook: bool
 
 
