@@ -55,6 +55,51 @@ def test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones(name, 
                           width=WIDTH)
 
 
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", sorted(MIXERS))
+def test_a_delta_rule_split_over_the_sequence_and_its_heads_runs_its_rows_as_whole_ones(name):
+    """Under a sequence axis of 2 beside a tensor axis of 2, which splits the mixer's heads (each device its
+    share of the queries', keys' and values' heads and of their conv's taps, `linear.sequence_delta_rule`),
+    the mixer runs packed rows, one document continuing across the cut, as on one device
+    (`assert_split_as_whole`)."""
+    module = MIXERS[name]
+    hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
+    variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
+    assert_split_as_whole(module, variables, "packed", SEEDS["packed"],
+                          f"{name} split over the sequence and its heads", width=WIDTH, shards=2, tensor=2)
+
+
+WIDE_HEADS = {
+    "gated delta net": GatedDeltaNet(emb_features=WIDTH, num_k_heads=4, num_v_heads=8, head_k_dim=32,
+                                     head_v_dim=32, chunk_size=4, dtype=jnp.float32),
+    "kimi delta attention": KimiDeltaAttention(emb_features=WIDTH, num_heads=4, head_dim=32, conv_kernel=4,
+                                               lower_bound=-5.0, chunk_size=4),
+}
+"""Each delta-rule mixer with heads its scan's work dwarfs its projections' on: four key heads 32 wide."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", sorted(WIDE_HEADS))
+def test_a_delta_rule_split_over_the_sequence_divides_its_heads_work_over_a_tensor_axis(name):
+    """Under a sequence axis of 2, a tensor axis of 2 beside it divides the mixer's heads (`linear.
+    sequence_delta_rule`): each device's compiled forward and backward does under three quarters of the work
+    it does with no tensor axis, its scan's and conv's half (row 1437: each device ran every head, 0.99 of
+    it)."""
+    module = WIDE_HEADS[name]
+    hidden = jnp.asarray(np.random.default_rng(0).standard_normal((2, 32, WIDTH)), jnp.float32)
+    variables = module.init(jax.random.key(7), hidden)
+
+    def step(params, hidden):
+        out, pull = jax.vjp(lambda params, hidden: module.apply(params, hidden, MixerCall()), params, hidden)
+        return out, pull(jnp.ones_like(out))
+
+    def work(tensor: int) -> float:
+        with jax.set_mesh(MeshSpec(sequence=2, tensor=tensor).build(jax.devices()[:2 * tensor])):
+            return jax.jit(step).lower(variables, hidden).compile().cost_analysis()["flops"]
+
+    assert work(2) < 0.75 * work(1)
+
+
 DECODE_MIXERS = {
     **MIXERS,
     "mamba": Mamba(emb_features=WIDTH, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4),
