@@ -9,6 +9,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.core import eval_jaxpr
 from jax.extend import core as jcore
 from jax.extend.core import primitives
 
@@ -220,7 +221,7 @@ def products_held(fn):
     @functools.wraps(fn)
     def held(*inputs, **options):
         closed, shapes = jax.make_jaxpr(functools.partial(fn, **options), return_shape=True)(*inputs)
-        return jax.tree.unflatten(jax.tree.structure(shapes), jcore.eval_jaxpr(
+        return jax.tree.unflatten(jax.tree.structure(shapes), eval_jaxpr(
             _products_held(closed.jaxpr), closed.consts, *jax.tree.leaves(inputs)))
     return held
 
