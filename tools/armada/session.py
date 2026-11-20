@@ -396,16 +396,17 @@ def marked_setups(name: str, text: str) -> dict[str, tuple[str, str | None]]:
         if isinstance(node, ast.Attribute) and node.attr == SHARED_SETUP and id(node) not in read:
             raise SystemExit(f"{name}, line {node.lineno}: {SHARED_SETUP} is read on a test's own "
                              f"decorator alone, once, as @pytest.mark.{SHARED_SETUP}(\"name\") of a literal "
-                             "name, with at most by=\"<ASCII regular expression naming no character>\", a "
-                             "literal, which the plan reads from the source (tools/armada/session.py "
-                             "`shared_setups`)")
+                             "name, with at most by=\"<ASCII regular expression>\", a literal spelling no "
+                             "\\N and no inline flag, which the plan reads from the source "
+                             "(tools/armada/session.py `shared_setups`)")
     return found
 
 
 def by_of(mark: ast.Call) -> str | None | Literal[False]:
-    """A `SHARED_SETUP` mark's `by`, a literal regular expression of ASCII naming no character and setting no
-    flag: None where it names none, False where it has another keyword or a `by` that is no such literal (the
-    file then refused, `marked_setups`)."""
+    """A `SHARED_SETUP` mark's `by`, a literal regular expression of ASCII whose spelling holds no `\\N` and no
+    `(?` followed by a flag letter, wherever they stand (a character class's too): None where it names none,
+    False where it has another keyword or a `by` that is no such literal (the file then refused,
+    `marked_setups`)."""
     if not mark.keywords:
         return None
     if len(mark.keywords) > 1 or mark.keywords[0].arg != "by":
