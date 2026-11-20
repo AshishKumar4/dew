@@ -539,3 +539,80 @@ def test_a_program_dews_compile_point_compiles_is_stated_by_its_function_and_arg
     assert stated(called, "a program called") == one
     assert stated(owned_program(_halved), "another function's") != one
     assert stated(owned_program(_doubled, donate_argnums=(0,)), "another argument's") != one
+
+
+_FACTOR = 2.0
+"""A global a module's function reads (the library-function witness's)."""
+
+
+def _by_factor(x):
+    """A module's function of the user's reading a global of its module (the library-function witness's)."""
+    return x * _FACTOR
+
+
+def test_a_librarys_local_function_is_stated_by_its_code_and_closure_not_its_modules_globals(monkeypatch):
+    """A library's local function (`jax.checkpoint`'s, which Dew's SwiGLU holds) is stated by its module, its
+    name, its code, its closure and its defaults, its globals its module's at its installed version
+    (`dew._stated.reads`): Dew's SwiGLU states, alike made twice (rows 10064 on: its arms ran unprepared);
+    two over one function of the user's state alike and over two apart; and a function of the user's own
+    code is still stated with its globals, one changed another identity."""
+    from dew._stated import stated
+    from dew.nn import activations
+
+    assert stated(activations.gated_product("swiglu"), "a SwiGLU") == stated(
+        activations.gated_product("swiglu"), "a SwiGLU made again")
+    assert stated(jax.checkpoint(_doubled), "a checkpoint") == stated(jax.checkpoint(_doubled), "again")
+    assert stated(jax.checkpoint(_doubled), "a checkpoint") != stated(jax.checkpoint(_halved), "another's")
+    before = stated(_by_factor, "a user's function")
+    monkeypatch.setitem(globals(), "_FACTOR", 3.0)
+    assert stated(_by_factor, "its global changed") != before
+
+
+def _identity(x, y):
+    """A function a custom derivative wraps (the custom-derivative witness's)."""
+    return x + y
+
+
+def _doubled_tangent(primals, tangents):
+    return _identity(*primals), 2 * tangents[0] + tangents[1]
+
+
+def _tripled_tangent(primals, tangents):
+    return _identity(*primals), 3 * tangents[0] + tangents[1]
+
+
+def _with_jvp(rule):
+    made = jax.custom_jvp(_identity)
+    made.defjvp(rule)
+    return made
+
+
+def _with_jvps(scale):
+    """A custom JVP of one rule an argument (`defjvps`, a closure over them), the second's scaled."""
+    made = jax.custom_jvp(_identity)
+    made.defjvps(lambda tangent, out, x, y: tangent, lambda tangent, out, x, y: scale * tangent)
+    return made
+
+
+def _forward(x, y):
+    return _identity(x, y), None
+
+
+def _backward(_, cotangent):
+    return cotangent, cotangent
+
+
+def test_a_custom_derivative_is_stated_by_its_function_and_its_rules():
+    """A function with a custom derivative (`jax.custom_jvp`, `jax.custom_vjp`) is stated by its function,
+    its rules and the options a trace reads (`dew._stated.stated`), so an arm holding a test's own rule has a
+    statement (row 10087: it ran unprepared): one made twice of the same functions states alike, two whose
+    rule differs apart, two whose per-argument rules (`defjvps`) differ in one argument's apart, and a custom
+    VJP before its rules are defined states as such, apart from one defined."""
+    from dew._stated import stated
+
+    assert stated(_with_jvp(_doubled_tangent), "a rule") == stated(_with_jvp(_doubled_tangent), "again")
+    assert stated(_with_jvp(_doubled_tangent), "a rule") != stated(_with_jvp(_tripled_tangent), "another")
+    assert stated(_with_jvps(2.0), "per-argument rules") != stated(_with_jvps(3.0), "one argument's apart")
+    undefined, defined = jax.custom_vjp(_identity), jax.custom_vjp(_identity)
+    defined.defvjp(_forward, _backward)
+    assert stated(undefined, "no rules yet") != stated(defined, "its rules")
