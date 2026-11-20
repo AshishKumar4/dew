@@ -644,11 +644,12 @@ def _recorded_at(config: "RunConfig", path: str) -> JSON:
     return node.get(field)
 
 
-def _unset_default(owner: "DataclassInstance", group: str) -> "DataclassInstance | None":
+def _unset_default(owner: "RunConfig | DataclassInstance | type[DataclassInstance]", group: str
+                   ) -> "DataclassInstance | None":
     """The value an optional record field `group` of `owner` takes where it holds none and a path steps into
     it (`trainer.layout.min_shard` of an unset `TrainerConfig.layout`): its one dataclass's defaults; None
     for a field of no such type (row 9635: `--set` refused the path a flag sets)."""
-    annotation = registry.declared_type(type(owner), group)
+    annotation = registry.declared_type(owner if isinstance(owner, type) else type(owner), group)
     kinds = [kind for kind in typing.get_args(annotation)
              if isinstance(kind, type) and dataclasses.is_dataclass(kind)]
     return kinds[0]() if len(kinds) == 1 and type(None) in typing.get_args(annotation) else None
