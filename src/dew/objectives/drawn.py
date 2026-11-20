@@ -104,10 +104,14 @@ def held_signature[Tree](tree: Tree) -> Hashable:
     return _shape_of((jax.tree.structure(tree),)), abstract_signature(jax.tree.leaves(tree))
 
 
-def _shape_of(held: tuple[jax.tree_util.PyTreeDef]) -> Hashable:
-    """A tree's structure, held in a one-element tuple (JAX declares `PyTreeDef` a value, which a type admits
-    only inside another), as a value of plain data alone: each node its kind, its static data as plain data
-    (`_static`) and its children's, a leaf none."""
+_Structure = tuple[jax.tree_util.PyTreeDef]
+"""A tree's structure in a one-element tuple: JAX declares `PyTreeDef` as a value, which a type admits only
+inside another (`dew.nn.kernels.options._Structure`)."""
+
+
+def _shape_of(held: _Structure) -> Hashable:
+    """A tree's structure (`_Structure`) as a value of plain data alone: each node its kind, its static data
+    as plain data (`_static`) and its children's, a leaf none."""
     (structure,) = held
     node = structure.node_data()
     if node is None:
