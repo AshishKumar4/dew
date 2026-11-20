@@ -820,8 +820,9 @@ def owned_built(record: JSON, *, called: bool, what: str) -> Configured:
         importlib.import_module(module)
     member = imported(named[0])
     if not _owned(member, called=called):
-        raise ValueError(f"{what} names {named[0]!r}, which no trusted package holds: a record builds a "
-                         f"class of Dew's or of a package the load trusts (trust=, --trust)")
+        called_so = " whose instances are called" if called else ""
+        raise ValueError(f"{what} names {named[0]!r}, which is no class of Dew's or of a package the load "
+                         f"trusts{called_so} (trust=, --trust)")
     return _built(member, named[1], dtypes=True)
 
 
