@@ -402,14 +402,17 @@ def marked_setups(name: str, text: str) -> dict[str, tuple[str, str | None]]:
 
 
 def by_of(mark: ast.Call) -> str | None | Literal[False]:
-    """A `SHARED_SETUP` mark's `by`, a literal regular expression: None where it names none, False where it
-    has another keyword or a `by` that is no such literal (the file then refused, `marked_setups`)."""
+    """A `SHARED_SETUP` mark's `by`, a literal regular expression of ASCII naming no character: None where it
+    names none, False where it has another keyword or a `by` that is no such literal (the file then refused,
+    `marked_setups`)."""
     if not mark.keywords:
         return None
     if len(mark.keywords) > 1 or mark.keywords[0].arg != "by":
         return False
     value = mark.keywords[0].value
-    if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+    # ASCII, with no character named, so no Python's Unicode tables read it otherwise than the plan's do.
+    if (not isinstance(value, ast.Constant) or not isinstance(value.value, str) or not value.value.isascii()
+            or "\\N" in value.value):
         return False
     try:
         re.compile(value.value)

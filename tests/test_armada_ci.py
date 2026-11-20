@@ -1288,8 +1288,11 @@ def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_
     models = ("m-a-tiny", "m-b-tiny", "m-c-tiny", "plain")
     nodes = [node.format(f"test_forward[{model}]") for model in models] + [
         node.format(f"test_gradient[f32-{model}]") for model in models]
-    # Node-id order parts each model's two tests; 100 s each, a 300 s target cuts the file in three.
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict.fromkeys(nodes, 100.0)))
+    # Node-id order parts each model's two tests; 100 s each, a 300 s target cuts the file in three. The two
+    # plain tests, matching no model, 200 s each: sharing nothing, they run apart.
+    plain = {node.format("test_forward[plain]"), node.format("test_gradient[f32-plain]")}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {each: 200.0 if each in plain else 100.0 for each in nodes}))
     verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
     base = commit(tmp_path, "base")
     rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
@@ -1299,12 +1302,13 @@ def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_
     for model in models[:3]:
         both = {node.format(f"test_forward[{model}]"), node.format(f"test_gradient[f32-{model}]")}
         assert sum(both <= tests for tests in ran.values()) == 1, ran
+    assert not any(plain <= tests for tests in ran.values()), ran
     count = len(ran)
     assert [set(ci.members("tests/test_models.py", f"{group}/{count}")) for group in range(1, count + 1)] == [
         ran[f"3.12:tests/test_models.py#{group}/{count}"] for group in range(1, count + 1)]
     assert sorted((tmp_path / "runs").read_text().splitlines()) == sorted(
         f"{kind} {model}" for kind in "fg" for model in models)
-    for refused in ("by=NAME", "by=r'['", "by='x', other='y'", "other='y'"):
+    for refused in ("by=NAME", "by=r'['", "by='x', other='y'", "other='y'", "by=r'\\N{BULLET}'"):
         (tmp_path / "tests/test_refused.py").write_text(
             f"import pytest\nNAME = 'x'\n@pytest.mark.shared_setup('s', {refused})\n"
             "def test_one():\n    pass\n")
