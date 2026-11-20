@@ -611,10 +611,10 @@ class KernelOp(tokamax.Op):
 
     def prepared(self, name: str, value):
         """The hook field or argument `name`'s `value` as every launch of the op takes it, explicit or
-        inferred: each function in it rewritten once by the algebra pass where it is traced (`prepared`), the
-        rest of it as it is. An op naming `HOOKS` whose hook is a bundle of functions defines it (a GEMM's
-        `Hooks`)."""
-        return value if value is None or isinstance(value, str) else prepared(value)
+        inferred: a function rewritten once by the algebra pass where it is traced (`prepared`); anything
+        else (None, a key, a bundle of functions no call reaches whole) as it is, a bundle's op preparing
+        its functions in its own override (a GEMM's `Hooks`, `grouped_launch`)."""
+        return prepared(value) if callable(value) else value
 
     def __call__(self, *args, **kwargs):
         # One path for every config (row 1866): bound once, the op's own config, a pin or a pick checked
