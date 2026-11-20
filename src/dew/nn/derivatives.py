@@ -175,17 +175,11 @@ def portable_formed[Value](portable: Callable[..., Value], /) -> Callable[..., V
 
     def backward(saved, operands, cotangent, live):
         del saved
-        leaves, tree = jax.tree.flatten(operands)
-        first = len(leaves) - len(jax.tree.leaves(operands[-1]))
-
-        def moved(*values):
-            # `portable` of the live leaves, the others held as they are.
-            whole = list(leaves)
-            for index, value in zip(live, values, strict=True):
-                whole[index] = value
-            return portable(*jax.tree.unflatten(tree, whole))
-
-        pulled = jax.vjp(moved, *(leaves[index] for index in live))[1](cotangent)
+        count = len(jax.tree.leaves(operands))
+        first = count - len(jax.tree.leaves(operands[-1]))
+        # `portable` of the live leaves, the others held as they are.
+        moving, fill = programs.holes(operands, [index in live for index in range(count)])
+        pulled = jax.vjp(lambda *values: portable(*fill(values)), *moving)[1](cotangent)
         inputs, formed = with_gradients_formed(
             tuple(each for index, each in zip(live, pulled, strict=True) if index < first),
             tuple(each for index, each in zip(live, pulled, strict=True) if index >= first))

@@ -1544,6 +1544,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     import jax.numpy as jnp
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
+    from dew.nn import programs
     from dew.nn.derivatives import contracted, declared_tangent
 
     def produced_jvp(primals, tangents):
@@ -1581,7 +1582,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     def bounded_jvp(primals, tangents):
         output, saved = level(*primals)
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
-        directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+        directions = jax.tree.leaves(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)
                 if not isinstance(direction, SymbolicZero)]
         if not live:
@@ -1589,17 +1590,10 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         def tangent(residuals, moving):
             operands, _ = residuals
-            leaves = jax.tree.leaves(operands)
-
-            def moved(*values):
-                # `portable` of the perturbed operands, the others held as constants: a zero direction
-                # would meet an infinite factor (inf * 0, NaN, where a bias's own tangent was 1: row 6740).
-                whole = list(leaves)
-                for index, value in zip(live, values, strict=True):
-                    whole[index] = value
-                return portable(*jax.tree.unflatten(tree, whole))
-
-            return jax.jvp(moved, tuple(leaves[index] for index in live), tuple(moving))[1]
+            # `portable` of the perturbed operands, the others held as constants: a zero direction would
+            # meet an infinite factor (inf * 0, NaN, where a bias's own tangent was 1: row 6740).
+            perturbed, fill = programs.holes(operands, [index in live for index in range(len(directions))])
+            return jax.jvp(lambda *values: portable(*fill(values)), tuple(perturbed), tuple(moving))[1]
 
         def transposed(residuals, cotangent):
             operands, saved = residuals
