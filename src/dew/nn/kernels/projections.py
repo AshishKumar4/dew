@@ -531,9 +531,7 @@ def launches(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
     taken, found = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole, generation.gpu_target(),
                             _cache.KERNEL_CHOICES.value, _cache.KERNEL_PINS.value)
-    for route in found:
-        generation.route(route.choice, kernel=route.kernel, preferred=route.preferred, refusal=route.refusal,
-                         forced=route.forced)
+    generation.reported(found)
     return taken
 
 
