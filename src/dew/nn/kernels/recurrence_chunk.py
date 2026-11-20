@@ -127,6 +127,8 @@ class Chunk(recurrence.Gated):
     `[B, Hv, Dk, Dv]` is the memory entering, zero where None, and `starts` `[B, S]` marks packed
     documents' first tokens, each from a zero memory, `firsts` their rows' documents' first slots as the
     batch built them (`dew.batch.Coordinates.firsts`; the kernels sort them from `starts` where None).
+    Under `Hooks.substeps` (DeltaProduct's) `key`, `value` and `beta` hold a token's `m` updates in turn,
+    `[B, S m, ...]`, and every other operand its `S` tokens.
 
     A forked call (`dew.batch.Forks`, `dew.nn.linear.forked_scan`) gives `loads` and `stores` `[B, D]` int,
     each of a row's documents in the order of their first slots (`firsts`, else `starts`'s,
@@ -175,7 +177,9 @@ def _read_checked(hooks: recurrence.Hooks, operands: Chunk) -> dict:
                          f"{', Dk' * (hooks.decay == 'vector')}], not {given['log_decay'].shape}")
     tokens = given['query'].shape[1]
     stepped = {name: given[name].shape[1] for name in ('key', 'value', 'beta') if name in given}
-    held = {name: given[name].shape[1] for name in ('log_decay',) if name in given}
+    held = {name: given[name].shape[1] for name in ('log_decay', 'z') if name in given}
+    if operands.starts is not None:
+        held['starts'] = operands.starts.shape[1]
     if any(length != tokens * hooks.substeps for length in stepped.values()) or any(
             length != tokens for length in held.values()):
         raise ValueError(f"{tokens} tokens of {hooks.substeps} updates each take keys, values and write "
@@ -219,7 +223,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     g, beta = recurrence.log_gates(hooks, given, work)
     state, starts, firsts = operands.state, operands.starts, operands.firsts
     if hooks.substeps > 1:
-        query, g, starts, firsts = _substeps_laid(hooks.substeps, query, g, starts, firsts)
+        query, g, starts, firsts, max_segments = _substeps_laid(hooks.substeps, query, g, starts, firsts,
+                                                                max_segments)
     g = jnp.zeros(value.shape[:3], work) if g is None else g
     beta = jnp.ones(value.shape[:3], work) if beta is None else beta
     forked = None
@@ -298,23 +303,30 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         out, final = _per_product(GATED_DELTA.bound(product_kernel), run, query, key, value, g, beta, skip,
                                   state, starts, firsts, given.get('turn'),
                                   *(() if forked is None else forked.walked), parameters=(5,))
-    # A token's output its last update's (`Hooks.substeps`), the epilogue in the working precision, and the
-    # output rounded once.
+    # A token's output its last update's (`Hooks.substeps`), the epilogue in work, the output rounded once.
     out = out[:, hooks.substeps - 1::hooks.substeps]
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
 
-def _substeps_laid(substeps: int, query, g, starts, firsts):
+def _substeps_laid(substeps: int, query, g, starts, firsts, max_segments: int | None):
     """A call of `substeps` delta-rule updates a token (`Hooks.substeps`, DeltaProduct's) as the op's tokens,
     its keys', values' and write gates' own in turn: each token's query on its last update (zeros on the
     others, whose outputs the op drops) and its decay on its first (zeros, no decay, on the others), a packed
-    document from its first token's first update; fla's `chunk_gated_delta_product`'s layout."""
+    document from its first token's first update, fla's `chunk_gated_delta_product`'s layout; a row of
+    packed documents at most a document a token where `max_segments` bounds none, its updates holding none
+    of their own."""
+    if starts is not None and max_segments is None:
+        max_segments = starts.shape[1]
     def spread(x, at: int):
-        laid = jnp.zeros((x.shape[0], x.shape[1], substeps, *x.shape[2:]), x.dtype).at[:, :, at].set(x)
+        # Padded beside each token on an axis of its own, so the laid operand keeps the token's placement.
+        before = at % substeps
+        widths = ((0, 0), (0, 0), (before, substeps - 1 - before)) + ((0, 0),) * (x.ndim - 2)
+        laid = jnp.pad(x[:, :, None], widths)
         return laid.reshape(x.shape[0], x.shape[1] * substeps, *x.shape[2:])
 
     return (spread(query, -1), None if g is None else spread(g, 0),
-            None if starts is None else spread(starts, 0), None if firsts is None else firsts * substeps)
+            None if starts is None else spread(starts, 0), None if firsts is None else firsts * substeps,
+            max_segments)
 
 
 @dataclasses.dataclass(frozen=True)

@@ -413,14 +413,94 @@ def test_a_delta_products_chunks_are_as_exact_as_its_tokens(hooks, packed):
                     functools.partial(substepped_draw, hooks), f'{hooks} packed={packed}', seeds=8)
 
 
+def substepped_entered_draw(hooks: recurrence.Hooks, seed: int):
+    """`entered_draw`'s forked operands, entry writes among them, of `LENGTH` tokens of `hooks.substeps`
+    updates each, and cotangents: its keys, values and write gates fresh at every update, its queries and
+    decays a token's."""
+    operands, (out, final) = entered_draw(hooks, seed, entries=True, length=LENGTH * hooks.substeps)
+    every = hooks.substeps
+    return (dataclasses.replace(operands, query=operands.query[:, ::every],
+                                log_decay=operands.log_decay[:, ::every]), (out[:, ::every], final))
+
+
+@pytest.mark.parametrize('by_firsts', [False, True], ids=['starts', 'firsts'])
+def test_a_forked_delta_products_documents_are_as_exact_as_each_alone(by_firsts):
+    """Gated DeltaProduct (`DELTA_PRODUCTS[0]`) over a forked call on the chunked op's portable math, each
+    document entering its table slot's memory with its entry write, the documents given by their starts or
+    their first slots alone (`Chunk.firsts`, a token's, which its updates scale): output, last memory and
+    every gradient against each document alone a token at a time (`document_by_document`) from float64
+    (check 1, row 9030)."""
+    hooks = DELTA_PRODUCTS[0]
+
+    def ours(operands):
+        return chunk_on('xla', hooks, entering_documents(operands, by_firsts=by_firsts), chunk_size=CHUNK)
+
+    assert_as_exact(jax.jit(with_gradients(ours)),
+                    jax.jit(with_gradients(functools.partial(document_by_document, hooks))),
+                    functools.partial(substepped_entered_draw, hooks),
+                    f'{hooks} forked by_firsts={by_firsts}', seeds=8)
+
+
+def delta_product_token(state, query, key, value, log_decay, beta):
+    """A DeltaProduct decode token as its paper writes it, a value head per key head: the memory `[R, H, K,
+    V]` decayed once, `exp(g) S`, then each of its updates `S + beta_j k_j (v_j - S^T k_j)^T` in turn, read
+    after the last, `S^T q`: `(output [R, H, V], memory)` (Siems et al. 2025, eq. 3; fla's
+    `naive_gated_delta_product`)."""
+    state = jnp.exp(log_decay)[..., None, None] * state
+    for update in range(key.shape[1]):
+        k, v, b = key[:, update], value[:, update], beta[:, update]
+        corrected = v - jnp.einsum('rhkv,rhk->rhv', state, k)
+        state = state + b[..., None, None] * k[..., :, None] * corrected[..., None, :]
+    return jnp.einsum('rhkv,rhk->rhv', state, query), state
+
+
+def test_a_delta_product_decode_token_is_as_exact_as_its_recurrence():
+    """A decode token of three updates (`Hooks.substeps`) through the public step (`recurrence.step`):
+    output, memory and every gradient against the token as DeltaProduct's paper writes it
+    (`delta_product_token`: decayed once, read after its last update) from float64 (check 1, row 9030)."""
+    hooks = recurrence.Hooks(decay='scalar', substeps=3)
+
+    def draw(seed):
+        normal = np.random.default_rng([9030, seed]).standard_normal
+        rows, heads, keys, values = 2, 2, KEY_WIDTH, VALUE_WIDTH
+        operands = (hosted(0.3 * normal((rows, heads, keys, values))), hosted(normal((rows, heads, keys))),
+                    hosted(unit(normal((rows, 3, heads, keys)))), hosted(normal((rows, 3, heads, values))),
+                    hosted(-softplus(normal((rows, heads)))), hosted(sigmoid(normal((rows, 3, heads)))))
+        return operands, (hosted(normal((rows, heads, values))), hosted(normal((rows, heads, keys, values))))
+
+    def stepped(state, query, key, value, log_decay, beta):
+        token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
+        out, _, updated = recurrence.step(hooks, token)
+        return out, updated
+
+    assert_as_exact(jax.jit(with_gradients(stepped)), jax.jit(with_gradients(delta_product_token)), draw,
+                    'a DeltaProduct decode token', seeds=8)
+
+
 @pytest.mark.parametrize(('substeps', 'form'), [(2, {'delta': False}), (2, {'reads': 'before'}),
-                                               (2, {'ranks': 2, 'reads': 'apart', 'delta': False}), (0, {})],
-                         ids=['no delta rule', 'read before', 'ranks', 'none'])
+                                               (2, {'ranks': 2, 'reads': 'apart', 'delta': False}),
+                                               (2, {'rated': True}), (0, {})],
+                         ids=['no delta rule', 'read before', 'ranks', 'rated', 'none'])
 def test_a_delta_product_outside_its_form_is_refused(substeps, form):
     """Substeps (`Hooks.substeps`) outside DeltaProduct's form, a token's delta-rule updates read after its
     last: a ValueError, where Mamba-3's ranks keep their own readout apart (row 9030)."""
     with pytest.raises(ValueError):
         recurrence.Hooks(decay='scalar', substeps=substeps, **form)
+
+
+@pytest.mark.parametrize('stream', ['key', 'value', 'beta'])
+def test_a_delta_product_token_of_another_count_of_updates_is_refused(stream):
+    """A decode token of three updates (`Hooks.substeps`) given two of one stream, its keys', values' or
+    write gates': a ValueError, where the step took the updates it was given and left the third out (row
+    9030)."""
+    hooks = recurrence.Hooks(decay='scalar', substeps=3)
+    shapes = {'key': (1, 3, 1, 4), 'value': (1, 3, 1, 2), 'beta': (1, 3, 1)}
+    given = {name: jnp.ones((shape[0], 2 if name == stream else 3, *shape[2:]))
+             for name, shape in shapes.items()}
+    token = recurrence.Step(jnp.zeros((1, 1, 4, 2)), query=jnp.ones((1, 1, 4)),
+                            log_decay=jnp.zeros((1, 1)), **given)
+    with pytest.raises(ValueError):
+        recurrence.step(hooks, token)
 
 
 TURNED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True, turns=KEY_WIDTH // 2 - 2)
@@ -1014,7 +1094,7 @@ def entering_documents(operands, documents=DOCUMENTS, by_firsts: bool = False, a
     if by_firsts:
         return dataclasses.replace(operands, starts=None, firsts=jnp.asarray(documents, jnp.int32),
                                    loads=loads, stores=stores, adds=adds, held=HELD)
-    starts = jnp.zeros(operands.value.shape[:2], bool)
+    starts = jnp.zeros(operands.query.shape[:2], bool)
     for row, begins in enumerate(documents):
         starts = starts.at[row, jnp.asarray(begins)].set(True)
     return dataclasses.replace(operands, starts=starts, loads=loads, stores=stores, adds=adds, held=HELD)
@@ -1041,8 +1121,10 @@ def document_by_document(hooks, operands, run=None, documents=DOCUMENTS, added: 
     run = token_by_token if run is None else run
     named = [name for name in ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z', 'turn')
              if getattr(operands, name) is not None]
-    bounds = [tuple(zip(begins, (*begins[1:], operands.value.shape[1]), strict=True)) for begins in documents]
+    bounds = [tuple(zip(begins, (*begins[1:], operands.query.shape[1]), strict=True)) for begins in documents]
     longest = max(end - begin for row in bounds for begin, end in row)
+    # A token's updates (`Hooks.substeps`) its keys', values' and write gates' in turn.
+    every = {name: hooks.substeps if name in ('key', 'value', 'beta') else 1 for name in named}
     tables = [list(operands.state[row]) + [None] * HELD for row in range(len(documents))]
     pieces = [[] for _ in documents]
     finals = []
@@ -1059,8 +1141,11 @@ def document_by_document(hooks, operands, run=None, documents=DOCUMENTS, added: 
             states.append(state)
         spans = [(row, *bounds[row][document]) for row in range(len(documents))]
         piece = dataclasses.replace(
-            operands, **{name: stacked_documents(getattr(operands, name), spans, longest,
-                                                 _neutral(hooks, name)) for name in named},
+            operands, **{name: stacked_documents(getattr(operands, name),
+                                                 [(row, begin * every[name], end * every[name])
+                                                  for row, begin, end in spans],
+                                                 longest * every[name], _neutral(hooks, name))
+                         for name in named},
             state=jnp.stack(states), starts=None, loads=None, stores=None, held=0, entry_key=None,
             entry_value=None, entry_weight=None)
         out, finals = run(hooks, piece)

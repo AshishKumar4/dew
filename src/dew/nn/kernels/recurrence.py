@@ -188,10 +188,10 @@ class Hooks:
             raise ValueError('a rated decay is one a head without the gates, which rate their own')
         if self.substeps < 1 or (self.substeps > 1 and (
                 not self.delta or self.reads != 'after' or self.ranks > 1 or self.own_weight or self.turns
-                or self.gates is not None or self.skip or self.conv is not None)):
+                or self.gates is not None or self.rated or self.skip or self.conv is not None)):
             raise ValueError(f"a token's delta-rule updates are one or more, more read after the last, its "
-                             f"decay a given log decay's, without ranks, turns, an own write's weight, a "
-                             f"skip or a conv: not {self.substeps} under {self}")
+                             f"decay a given log decay's, unrated, without ranks, turns, an own write's "
+                             f"weight, a skip or a conv: not {self.substeps} under {self}")
         if self.turns < 0 or (self.turns and (self.delta or self.own_weight or self.rated
                                               or self.decay != 'scalar' or self.reads == 'before')):
             raise ValueError(f"a state turns its key pairs under a decay a head's, unrated, without the "
@@ -331,7 +331,9 @@ class Step(Gated):
     Dk]` (vector), or with the gates `gate` `[rows, Hv]`, `log_a` and `bias` `[Hv]`. `beta` `[rows, Hv]` is
     the write gate (a raw beta with the gates), `skip` `[Hv]` the skip's `D`, `z` `[rows, Hv, Dv]` and
     `weight` `[Dv]` the epilogue's, `rate` `[Hv]` a rated decay's, at most zero (`Hooks.rated`), `own`
-    `[Hv, Dk]` the readout's weight of the token's own write (`Hooks.own_weight`). `state` is
+    `[Hv, Dk]` the readout's weight of the token's own write (`Hooks.own_weight`). Under `Hooks.substeps`
+    (DeltaProduct's) `key`, `value` and `beta` hold the token's `m` updates on an axis of their own, `[rows,
+    m, ...]`. `state` is
     `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by `round_to_bf16`), or wider for the reference. `active`
     `[rows]` marks the rows that draw. A pytree of its arrays, so it crosses `jit` and a transformation as a
     token's operands do; the `Hooks` are its static form. Its fields are the decode launch's operands
@@ -569,6 +571,10 @@ def _substeps(hooks: Hooks, given: dict, work):
     """A decode token's `hooks.substeps` delta-rule updates in turn (`Hooks.substeps`, DeltaProduct's) in
     `work`, the state held there between them (`_substep`). `(output, last keys, last values, state)`, the
     output the state after the last read by the query."""
+    counts = {name: given[name].shape[1] for name in ('key', 'value', 'beta') if name in given}
+    if any(count != hooks.substeps for count in counts.values()):
+        raise ValueError(f"a token of {hooks.substeps} updates takes keys, values and write gates of "
+                         f"{hooks.substeps} each, not {counts}")
     found = _substep(hooks, given, work, given['state'].astype(work), 0)
     for substep in range(1, hooks.substeps):
         found = _substep(hooks, given, work, found[3], substep)
