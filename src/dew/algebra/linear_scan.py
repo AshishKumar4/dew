@@ -13,8 +13,11 @@ key's weight passing through it. Where the update's class holds a decayed state 
 `B` whose values `U` may read the decayed state once more (`U + X^T D h`), each part free of the state, it
 is affine (`Affine.decayed`, `Affine.corrected`): `h_t = A_t h_{t-1} + B_t U_t^T` with the transition
 `A_t = (I - s_t B_t C_t^T) D_t`, `D_t = exp(z_t)` (or `exp2`) a scalar's or each key's, `C = -X` and `s = 1`
-where a token corrects the state; and a readout `o_t = Q_t^T h_t + R_t` (`Affine.readout`). Any other update
-or readout reaches no such form and is refused.
+where a token corrects the state. Its correction may read the state the token enters instead, before its
+decay (`Affine.corrected_before`, `A_t = D_t - s_t B_t C_t^T`), or run along a vector of its own beside the
+write (`Affine.erased_before`, `A_t = D_t - s_t A_t' C_t^T`, RWKV7's erase, `A'` the token's "A"). The
+readout is `o_t = Q_t^T h_t + R_t` (`Affine.readout`) or the state applied to a vector along its values
+(`Affine.applied`). Any other update or readout reaches no such form and is refused.
 
 The affine token update enters a second e-graph as its chunk's token loop, `Chunk.loop`, which runs its
 tokens in turn. Each identity holds of every chunk, its side condition a fact of the declaration:
@@ -22,7 +25,11 @@ tokens in turn. Each identity holds of every chunk, its side condition a fact of
 - `wy` (the compact WY form): where tokens correct the state, the loop of corrected transitions is the loop
   of plain ones over the corrected inputs `W`, which solve the unit lower-triangular system
   `(I + diag(s) strictly_lower(gram(C, B))) W = U - diag(s) (C * gamma) h_in`, a correction of token `i`
-  reading each earlier token `j`'s write decayed between them;
+  reading each earlier token `j`'s write decayed between them (a correction reading the state a token enters,
+  through the decays a token back); an erase of its own's loop is the plain loop of its writes less the
+  erases `A^T W`, its erased values `W = diag(s) C^T h` solving
+  `(I + diag(s) strictly_lower(gram(C, A))) W = diag(s) ((C * gamma') h_in + strictly_lower(gram(C, B)) U)`,
+  `gamma'` and the pairs' decays a token back;
 - `dual` (the state-space dual): the loop of plain transitions is its outputs
   `(Q * gamma) h_in + lower(gram(Q, B)) U + R` and its state
   `gamma_last h_in + sum_t (B_t * exp(G_last - G_t)) U_t^T`, its decays the exponentials of its exponents'
@@ -329,7 +336,8 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
         args = (base2, per_key, exponent, left, right)
     if args is None:
         raise Refused("the update is not a decayed state, exp(z) a scalar's or each key's, plus a rank-one "
-                      f"input and corrections of the decayed state along the input's vector{stopped}")
+                      "input and corrections of the decayed state or the state entering along the input's "
+                      f"vector or an erase's own{stopped}")
     readout_args = get_callable_args(read, Affine.readout)
     values_read = readout_args is None
     found = get_callable_args(read, Affine.applied) if values_read else readout_args
@@ -545,7 +553,9 @@ class Chunk(Expr):
     @classmethod
     def decay(cls, part: StringLike, prefix: Chunk) -> Chunk: ...
     """The chunk's decays (`scan._Decays`): "entering" `gamma`, "to_last" `exp(G_last - G_t)`, "whole"
-    `gamma_last`, "between" each pair's, each an exponential of the shared `prefix` (`decayed_by`)."""
+    `gamma_last`, "between" each pair's, each an exponential of the shared `prefix` (`decayed_by`); and
+    "entering_before" and "between_before", "entering"'s and "between"'s a token back, each a shift of the
+    decay it is shifted from (`shifted_back`), its `prefix` that decay."""
 
     @classmethod
     def across_prefix(cls) -> Chunk: ...
@@ -647,6 +657,12 @@ def decayed_by(part: str) -> Chunk:
     return Chunk.decay(part, Chunk.prefix())
 
 
+def shifted_back(part: str) -> Chunk:
+    """The chunk's decay `part` ("entering" or "between") a token back (`scan._back`): a shift of that decay,
+    which a form reading both prices once."""
+    return Chunk.decay(f"{part}_before", decayed_by(part))
+
+
 def across_by(part: str) -> Chunk:
     """The chunk's decay `part` along the state's values (`Chunk.across`) of the shared prefix."""
     return Chunk.across(part, Chunk.across_prefix())
@@ -680,7 +696,7 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: 
         memory = queries.matmul(h).times(entering) if scalar else queries.times(entering).matmul(h)
     found = []
     if corrects and not erased:
-        read, through = ((decayed_by("entering_before"), decayed_by("between_before")) if before
+        read, through = ((shifted_back("entering"), shifted_back("between")) if before
                          else (entering, between))
         system = Chunk.gram(Chunk.token("C"), Chunk.token("B"), 1, through).rows(Chunk.token("s"))
         corrected = Chunk.solve(system, values.minus(
@@ -692,9 +708,6 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: 
     if across and (corrects or values_read):
         raise Refused("a decay along the state's values beside corrections or a readout along them has no "
                       "chunk form here")
-    if erased and (values_read or apart):
-        raise Refused("an erase along a vector of its own beside a readout along the values or apart from "
-                      "its group's writes has no chunk form here")
     scores = Chunk.gram(queries, Chunk.token("B"), apart, between)
     if across:
         local = Chunk.weighed(scores, given, across_by("between"))
@@ -706,9 +719,9 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: 
                  else scores.matmul(given))
         carried, written = Chunk.decayed(h, decayed_by("whole")), given
     if erased:
-        erase, strength, through = Chunk.token("A"), Chunk.token("s"), decayed_by("between_before")
+        erase, strength, through = Chunk.token("A"), Chunk.token("s"), shifted_back("between")
         system = Chunk.gram(Chunk.token("C"), erase, 1, through).rows(strength)
-        erased_values = Chunk.solve(system, Chunk.token("C").times(decayed_by("entering_before")).rows(
+        erased_values = Chunk.solve(system, Chunk.token("C").times(shifted_back("entering")).rows(
             strength).matmul(h).plus(Chunk.gram(Chunk.token("C"), Chunk.token("B"), 1, through).rows(
                 strength).matmul(values)))
         found += [
@@ -815,7 +828,7 @@ def _leaves(extents: Extents) -> list:
               Chunk.token("U"): (c, v), Chunk.token("R"): (c, out), Chunk.token("s"): (c, 1),
               Chunk.entering(): (k, v), Chunk.prefix(): (c, d), decayed_by("entering"): (c, d),
               decayed_by("to_last"): (c, d), decayed_by("whole"): (d, 1), decayed_by("between"): (c, c),
-              **({decayed_by("entering_before"): (c, d), decayed_by("between_before"): (c, c)}
+              **({shifted_back("entering"): (c, d), shifted_back("between"): (c, c)}
                  if extents.before else {}),
               **({Chunk.token("A"): (c, k)} if extents.erased else {}),
               **({Chunk.token("E"): (c, v), Chunk.across_prefix(): (c, v), across_by("entering"): (c, v),
@@ -951,12 +964,13 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
             part = terms.text(args[0])
             elements = {"entering": c * width, "to_last": c * width, "whole": width, "between": c * c * width,
                         "entering_before": c * width, "between_before": c * c * width}
-            exponentials = elements[part] * (1 if part.startswith("between") else 2)
+            # A span's two factors (`scan._Split`), a pair's one.
+            factors = elements[part] * (1 if part.startswith("between") else 2)
             if part.endswith("_before"):
-                # A token back: its shifted copy kept beside the decay it is shifted from (`scan._back`).
-                return Work(operations=exponentials, exponentials=exponentials,
-                            kept_bytes=kept(elements[part]))
-            return Work(operations=exponentials, exponentials=exponentials)
+                # A token back: a shift of the decay it reads (`shifted_back`, priced once beside it), each
+                # factor selected at a document's start and kept (`scan._back`).
+                return Work(operations=factors, kept_bytes=kept(factors))
+            return Work(operations=factors, exponentials=factors)
     if (args := get_callable_args(node, Chunk.gram)) is not None:
         if d == 1:
             return product(c, k, c) + Work(operations=2.0 * c * c)

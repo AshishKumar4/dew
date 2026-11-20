@@ -368,10 +368,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
 
 def _laid(hooks: recurrence.Hooks, tokens: tuple, given: dict, starts, firsts, max_segments: int | None):
     """A call's `tokens` `(query, key, value, g, beta)` laid as the op's tokens: a token's updates in turn
-    (`_substeps_laid`, `Hooks.substeps`), an erase of its own's two tokens (`_erases_laid`), or as given,
-    each a form of its own (`recurrence.Hooks`' validation). `((query, key, value, g, beta, erase, starts,
-    firsts, max_segments), stride)`: the laid tokens a call's token takes, its output its last's, `erase`
-    `_erases_laid`'s."""
+    (`_substeps_laid`, `Hooks.substeps`), an untied erase's two tokens or an additive erase's one beside its
+    erase vectors (`_erases_laid`), or as given, each a form of its own (`recurrence.Hooks`' validation).
+    `((query, key, value, g, beta, erase, starts, firsts, max_segments), stride)`: the laid tokens a call's
+    token takes, its output its last's, `erase` `_erases_laid`'s."""
     query, key, value, g, beta = tokens
     if hooks.substeps > 1:
         query, g, starts, firsts, max_segments = _substeps_laid(hooks.substeps, query, g, starts, firsts,

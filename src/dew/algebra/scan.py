@@ -6,7 +6,9 @@ rules (`linear_scan.parts`): a decay `D_t = exp(z_t)` (or `exp2`) on the state, 
 (a per-key vector); one input `B_t (x) u_t` free of it; and corrections along the input's own vector,
 reading the decayed state, `-s_t B_t (c_t^T D_t h)`. So `h_t = (I - s_t B_t c_t^T) D_t h_{t-1} + B_t u_t^T`:
 the gated delta rule (a scalar decay, `s = beta`, `B = c = k`, `u = beta v`), Kimi's delta attention (a
-per-key decay), or with no correction Mamba-2's state space. The readout must contract the
+per-key decay), or with no correction Mamba-2's state space; its corrections may read the state the token
+enters, before its decay, along the input's vector or an erase's own (RWKV7's, `linear_scan.Affine.
+erased_before`), through the decays a token back (`_Decays.entering_before`). The readout must contract the
 state with a vector `q_t` along `B_t`'s axis, plus a part free of it. Over a chunk, with `G` the decay
 exponents' inclusive prefix (per key), `Gamma[i, j, k] = exp(G_ik - G_jk)` for `j <= i` and
 `gamma = exp(G)`, the inputs each token's correction leaves, `w`, solve the unit lower-triangular system
@@ -288,7 +290,12 @@ def _apart(declaration: Scan, affine, tokens: int) -> int:
     of `tokens` cuts a group (its memory would hold its own group's earlier writes), or a group of more than
     one token is declared beside another readout, which reads none of it (train 1004's review F3), or its
     update decays the state along its values too (`linear_scan.Parts.across`), whose apart state no form
-    decays along them: refused here, which preparing and replaying a chunk both ask."""
+    decays along them; and an erase along a vector of its own (`linear_scan.Parts.erase`) beside a readout
+    along the values or apart from its writes, which no form takes: refused here, which preparing and
+    replaying a chunk both ask."""
+    if affine.erase is not None and (affine.values_read or declaration.reads == "apart"):
+        raise Refused("an erase along a vector of its own beside a readout along the values or apart from "
+                      "its group's writes has no chunk form here")
     if declaration.reads == "apart" and affine.across is not None:
         raise Refused("a readout apart from its group's writes beside a decay along the state's values has "
                       "no chunk form here")
@@ -402,6 +409,9 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
         if declaration.reads == "before":
             read = h if declaration.reset is None else jnp.where(step[declaration.reset], 0.0, h)
             entering = _read(read, q, affine.values_read, affine.reader_scale) + r
+        # A correction reading the state the token enters (`linear_scan.Parts.before`) reads a document's
+        # start's zero (`RESET_DECAY`) and a key whose decay alone vanishes whole, as its forms read them.
+        entered = jnp.where(_reset(z)[:, None], 0.0, h) if affine.before else None
         _, cut = vanished(z, affine.base2)
         h = jnp.where(cut[:, None], 0.0, h)
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
@@ -422,7 +432,7 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             # on the query, as the decode step reads them (`dew.nn.kernels.recurrence.update`): read through
             # the decayed state's own rounding, a packed additive erase's worst gradient row was 2.7 times
             # the decode step's (jsf-assoc3).
-            correction = jnp.sum(c[:, None] * h, axis=0)
+            correction = jnp.sum(c[:, None] * entered, axis=0)
             erased = (erase if affine.erase is not None else b)[:, None] * (strength * correction)[None, :]
             update = b[:, None] * u[None, :] - erased
             along, scale = affine.values_read, affine.reader_scale
@@ -445,7 +455,10 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             output = _read(h, q, affine.values_read, affine.reader_scale) + r
         return (h, apart, index + 1), output if entering is None else entering
 
-    carried = at_least_fp32(h.dtype)
+    # The state carried in the type its tokens' operands and itself widen to (a float32 state's replay over
+    # a float64 erase vector, x64's), as the token loop carries it.
+    carried = at_least_fp32(jnp.result_type(h, *(x for x in along.values()
+                                                 if jnp.issubdtype(x.dtype, jnp.floating))))
     h = h.astype(carried)
     if walked is None:
         (h, _, _), outputs = lax.scan(token, (h, h, 0), along)
@@ -727,16 +740,19 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
             bounded[DECAYS + index] = math.inf if magnitude >= 1024 else 2.0 ** magnitude
     # The solve's inverse less its diagonal: the inverse of a unit lower-triangular matrix whose entries
     # are at most `a` in magnitude is at most `(1 + a)^(C - 1)` (by induction on the substitution); its
-    # entries `s_i C_i . B_j` times a decay at most 1, a contraction over the keys: at most the declared
-    # overlap (`Scan.ranges`' "overlap"), else the corrections' elementwise bounds' product times the keys'
-    # count (two tokens of 16 keys each element at most 1 overlap by 16).
+    # entries `s_i C_i . B_j` (an erase of its own's `s_i C_i . A_j`, `linear_scan.Parts.erase`) times a
+    # decay at most 1, a contraction over the keys: at most the declared overlap (`Scan.ranges`' "overlap",
+    # the writes' keys', which bounds no erase), else the corrections' elementwise bounds' product times the
+    # keys' count (two tokens of 16 keys each element at most 1 overlap by 16).
     places = TOKENS
     tokens_at = {name: DECAYS + place for place, name in enumerate(places)}
-    entry = _magnitude(declaration.ranges.get("overlap"))
-    if entry is None and all(tokens_at[name] in bounded for name in ("B", "s", "C")):
-        B = region.outputs[places.index("B")]
-        keys = math.prod(np.shape(region.literal_outputs[0]) if B is None else region.shape(B))
-        entry = bounded[tokens_at["s"]] * bounded[tokens_at["C"]] * bounded[tokens_at["B"]] * keys
+    along = "B" if affine.erase is None else "A"
+    entry = _magnitude(declaration.ranges.get("overlap")) if along == "B" else None
+    if entry is None and all(tokens_at[name] in bounded for name in (along, "s", "C")):
+        at = places.index(along)
+        vector = region.outputs[at]
+        keys = math.prod(np.shape(region.literal_outputs[at]) if vector is None else region.shape(vector))
+        entry = bounded[tokens_at["s"]] * bounded[tokens_at["C"]] * bounded[tokens_at[along]] * keys
     if entry is not None:
         # No bound where it passes float64's range (16 unit keys over 256 tokens: 17**255).
         power = max(chunk_size - 1, 0) * math.log2(1.0 + entry)
@@ -887,7 +903,12 @@ def _elementwise(node, of: Callable):
     if (args := get_callable_args(node, Chunk.minus)) is not None:
         return of(args[0]) - of(args[1])
     if (args := get_callable_args(node, Chunk.decayed)) is not None:
-        return _scaled(of(args[0]), jax.tree.map(lambda x: x[:, None], of(args[1])))
+        # A state carried across a document's start taken out by select before its decay, as `times` takes
+        # a read's: a memory past the largest before the reset is no 0 times inf.
+        whole = of(args[1])
+        crossed = _crossed(whole.first if isinstance(whole, _Split) else whole)
+        state = jnp.where(crossed[:, None], 0.0, of(args[0]))
+        return _scaled(state, jax.tree.map(lambda x: x[:, None], whole))
     if (args := get_callable_args(node, Chunk.columns)) is not None:
         return _scaled(of(args[0]), jax.tree.map(lambda x: x[None, :], of(args[1])))
     return None
@@ -910,17 +931,24 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
     valued = jnp.ones((count, values.shape[-1]), stepped.dtype) if across is None else across
     # The state carried in the type its first step leaves it in: operands wider than it widen it (a float32
     # state's walk over float64 operands, x64's).
-    h = h.astype(jnp.result_type(h, stepped, B, values, *((s, C) if corrected else ())))
+    h = h.astype(jnp.result_type(h, stepped, B, values, *((s, C, A) if corrected else ())))
+    # The decays a token back, cut where a document starts alone (`_decays_value`): what a correction reading
+    # the state a token enters reads it through.
+    back = jnp.concatenate([_scaled(1.0, jax.tree.map(lambda x: x[:1], decays.entering_before)),
+                            decays.between_before[jnp.arange(1, count), jnp.arange(count - 1)]])
 
     def step(carry, token):
         h, held, index = carry
-        decay, b, strength, c, q, r, value, along, a = token
+        decay, b, strength, c, q, r, value, along, a, started = token
+        # Read before the decay where the token's corrections read the state it enters, as the replay reads
+        # it: a document's start's zero, a key whose decay alone vanishes whole.
+        entered = (_portable(c[None, :], jnp.where(_crossed(started)[:, None], 0.0, h))
+                   if corrected and before else None)
+        # A cut key's state selected out before its decay, so a memory past the largest before a document's
+        # start is no 0 times inf.
+        h = jnp.where(_crossed(decay)[:, None], 0.0, h)
         # Apart from its group's writes: the state its group entered, decayed by every token since it.
         held = decay[:, None] * (jnp.where(index % apart == 0, h, held) if apart else h)
-        # Read before the decay where the token's corrections read the state it enters, a cut key's (a
-        # document's start, a vanished decay) zero, as the replay reads it.
-        entered = (_portable(c[None, :], jnp.where(_crossed(decay)[:, None], 0.0, h)) if corrected and before
-                   else None)
         h = decay[:, None] * h * along[None, :]
         if corrected:
             h = h - strength * a[:, None] * (_portable(c[None, :], h) if entered is None else entered)
@@ -930,7 +958,7 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
                 else _portable(q[None, :], read_from)[0])
         return (h, held, index + 1), read + r
 
-    (h, _, _), outputs = lax.scan(step, (h, h, 0), (stepped, B, s, C, Q, R, values, valued, A))
+    (h, _, _), outputs = lax.scan(step, (h, h, 0), (stepped, B, s, C, Q, R, values, valued, A, back))
     return outputs, h
 
 
@@ -1445,6 +1473,7 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     holding -2**127 twice is -inf; one holding -2**70 loses a later -1 to its rounding, its decay 1 in place
     of `exp(-1)`), and each span through one is zero."""
     live, cut = vanished(exponents, base2)
+    reset = _reset(exponents)
     high, low = compensated(live, restarts=cut)
     segments = jnp.cumsum(cut.astype(jnp.int32), axis=0)
     count = exponents.shape[0]
@@ -1457,13 +1486,23 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN), and its
     # decay negative zero, which no exponential is (`_crossed`).
     between = jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), -0.0)
-    return _Decays(entering=_two_factors(base2, high + low, started),
+    entering = _two_factors(base2, high + low, started)
+    return _Decays(entering=entering,
                    to_last=_two_factors(base2, (high[-1] - high) + (low[-1] - low), ending),
                    whole=_two_factors(base2, high[-1] + low[-1], started[-1]), between=between,
-                   # A token back, cut where the reader's own token cuts (a document's start): its correction
-                   # reads the state it enters, a reset's zero.
-                   entering_before=_two_factors(base2, _back(high + low, first=0.0), started),
-                   between_before=jnp.where(joined, _back(between, first=-0.0), -0.0))
+                   # A token back, `entering`'s and `between`'s shifted a row: through the tokens before the
+                   # reader's, cut where the reader's own token is a document's start (`_reset`) alone, so
+                   # its correction reads the state it enters, a reset's zero, and a key whose decay alone
+                   # vanishes at it whole.
+                   entering_before=_Split(jnp.where(reset, -0.0, _back(entering.first, first=1.0)),
+                                          jnp.where(reset, 1.0, _back(entering.rest, first=1.0))),
+                   between_before=jnp.where(reset[:, None], -0.0, _back(between, first=-0.0)))
+
+
+def _reset(exponents) -> jax.Array:
+    """Where a token's exponent is a document's start's (`RESET_DECAY`, `_at_token`'s) or past it: the one
+    cut of a read of the state a token enters, which a decay that vanishes alone leaves whole."""
+    return exponents <= RESET_DECAY
 
 
 def _back(array, first):
