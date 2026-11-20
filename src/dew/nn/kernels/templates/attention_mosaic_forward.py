@@ -2085,24 +2085,23 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by,
                                 in_key=value_columns is not None)
     grid = (heads, queries // pair * splits, batch)
+    joined = placed_mod.correction_roles(family, consumers, value_width)
     reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
-                       magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None)
+                       magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None,
+                       joined=joined)
     reduces = forward_reduces(family, reduced)
     tmem = family.product_columns(products) if scopes_products(family) else 0
     shared = (resources.shared_bytes(family, launch_scope(family, (scoped, rings, after), reduced,
                                                           reduces=reduces, products=products,
                                                           over_rings=True))
               if family.budgets_registers else None)
-    joined = ((placed_mod.CORRECTION, 1),) if (isinstance(family, placed_mod.Tcgen05Placed)
-                                               and family.corrects(consumers)) else ()
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,
                          approx_math=spec.approximate, name=name, cost=cost, model_flops=model,
                          registers=registers, shared=shared, tmem=tmem, reducing_warpgroups=reduced,
                          reduces=reduces, joined=joined)(query, key, value, *leaves)
-
 
 def _per_role(family: mosaic.Family, consumers: int, consumer: Callable) -> Callable:
     """`consumer(index)` as `family`'s roles run it: each consumer built at its static role where its issuer
@@ -2139,7 +2138,7 @@ def _correction(program: _Program, placed_at: Callable, value_width: int) -> tup
     """The correction warpgroup role where `program.family` places its sums' rescales on one
     (`placed.Tcgen05Placed.correcting`, row 5368); empty otherwise."""
     family, consumers = program.family, program.tiles.consumers
-    if not (isinstance(family, placed_mod.Tcgen05Placed) and family.corrects(consumers)):
+    if not (isinstance(family, placed_mod.Tcgen05Placed) and family.corrects(consumers, value_width)):
         return ()
 
     def body(_index):

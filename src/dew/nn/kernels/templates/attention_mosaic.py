@@ -317,7 +317,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """A consumer thread's share of the registers (`Family.registers`): the family's roles share the
         file (`handoffs.Schedule`)."""
         # A consumer's budget is its family's, whatever the operands' dtype (`mosaic.Family.registers`).
-        return bundle_of(config, jnp.bfloat16).registers(config.consumers)
+        family = bundle_of(config, jnp.bfloat16)
+        return family.registers(config.consumers)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return self.declined(ba, target) is None
@@ -427,12 +428,14 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         whose family budgets no registers (a TPU's, `Family.budgets_registers`), and one at the least, a
         legal config's (row 9105)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
+        value_width = ba.arguments["value"].shape[-1]
+        joined = placed.correction_roles(family, config.consumers, value_width)
         if not family.budgets_registers:
-            return family.programs(config.consumers)
+            return family.programs(config.consumers, joined=joined)
         staged = self.staged_bytes(ba, config, target) if target.shared_limit else None
         tmem = self.tmem_columns(ba, config, target)
         return max(1, resources.register_model(family, config.consumers, self.registers(ba, config),
-                                               shared=staged, target=target, tmem=tmem).most)
+                                               shared=staged, target=target, tmem=tmem, joined=joined).most)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -980,11 +983,13 @@ class MosaicForward(_Mainloop[Tiles]):
                 staged = (self._staged_bytes(ba, config, target, products=base)
                           if target.shared_limit else None)
                 regs = self.registers(ba, config)
+                joined = placed.correction_roles(family, config.consumers, value_width)
                 base_most = resources.register_model(family, config.consumers, regs, shared=staged,
-                                                     target=target, tmem=family.product_columns(base)).most
+                                                     target=target, tmem=family.product_columns(base),
+                                                     joined=joined).most
                 with_most = resources.register_model(family, config.consumers, regs, shared=staged,
-                                                     target=target,
-                                                     tmem=family.product_columns(with_query)).most
+                                                     target=target, tmem=family.product_columns(with_query),
+                                                     joined=joined).most
                 if with_most >= base_most:
                     return with_query
         return base

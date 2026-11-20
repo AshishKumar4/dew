@@ -122,11 +122,11 @@ class Tcgen05Placed(Tcgen05Rings):
                                   handoffs.Role("producer", warp=True, weight=0),
                                   handoffs.Role("issuer", warp=True, weight=0)), floor=producer)
 
-    def corrects(self, consumers: int) -> bool:
-        """Whether a launch of `consumers` softmax warpgroups places its sums' rescales on a dedicated
-        `CORRECTION` warpgroup (at one consumer, e.g. d256 where two softmax warpgroups do not fit in
-        tensor memory; two consumers already hide each other's rescales)."""
-        return consumers == 1
+    def corrects(self, consumers: int, value_width: int) -> bool:
+        """Whether a launch of `consumers` softmax warpgroups and `value_width` value columns places its
+        sums' rescales on a dedicated `CORRECTION` warpgroup (at one consumer and width >= 256, where TMEM
+        already caps residency to 1 CTA/SM and two softmax warpgroups do not fit)."""
+        return consumers == 1 and value_width >= 256
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
                     walk: Callable[..., R], *, between=None, counted=0) -> R:
@@ -164,7 +164,7 @@ class Tcgen05Placed(Tcgen05Rings):
         if query_left:
             ((q_width, q_dtype),) = query_left
             scratch[QUERY] = tuple(self.tensor_memory((rows, q_width), q_dtype) for _ in range(consumers))
-        if self.corrects(consumers):
+        if self.corrects(consumers, kept):
             scratch["factor_ready"] = self.signals(2).scratch()
             scratch["factor_free"] = self.signals(2).scratch()
             scratch[FACTORS] = plgpu.SMEM((2, rows), jnp.float32)
@@ -474,6 +474,13 @@ correction warpgroup's rescale-factor staging; a declared product's by its accum
 CORRECTION = handoffs.Role("correction", 1, weight=0.5)
 """The correction warpgroup role of tcgen05's rows (`Tcgen05Placed.correcting`, row 5368): rescales kept
 sums in tensor memory off the softmax warpgroup's critical path."""
+
+
+def correction_roles(family: mosaic.Family, consumers: int,
+                     value_width: int) -> tuple[tuple[handoffs.Role, int], ...]:
+    """The joined correction warpgroup role for `family` at `consumers` and `value_width`, or empty."""
+    return ((CORRECTION, 1),) if (isinstance(family, Tcgen05Placed)
+                                  and family.corrects(consumers, value_width)) else ()
 
 
 def placed_products(products: Sequence[mosaic.Product]) -> tuple[mosaic.Product, mosaic.Product]:

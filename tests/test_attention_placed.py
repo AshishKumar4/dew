@@ -142,8 +142,10 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
     query = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     key = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
-    threads, arrivals = programs(_placed_forward(tiles, spans), query, key,
-                                 threads=tiles.consumers + 1, rare=False)
+    threads, arrivals = programs(
+        _placed_forward(tiles, spans), query, key,
+        threads=tiles.consumers + 1 + len(placed.correction_roles(placed.ROWS, tiles.consumers, width)),
+        rare=False)
     (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
     q_smem = _consumer_q_smem(threads, tiles.consumers)
     # Map each consumer-exclusive barrier name to its consumer index so each score MMA's `scored` arrival
@@ -250,6 +252,30 @@ def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
     for thread in threads_e:
         assert _tmem_q_copies(thread) == []
     assert explore(threads_e, arrivals_e) > 0
+
+
+@pytest.mark.parametrize("moves", [False, True], ids=["kept", "moved"])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_correction_warpgroup_at_d256_holds_protocol_in_every_interleaving(call, moves):
+    """Row 5368: at d256 on 1-consumer `tcgen05.rows`, the dedicated `CORRECTION` warpgroup rescales kept
+    sums in TMEM off the softmax warpgroup's critical path: every interleaving of consumer, correction, and
+    producer/issuer holds without deadlock or race, both when rescales are skipped (`kept`) and taken
+    (`moved`)."""
+    from ring_protocol import explore, programs
+
+    query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 256, 1, 256), jnp.bfloat16)
+    spans = template.spans(256, 256, 1, **CALLS[call])
+    threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key, threads=3, rare=moves)
+    assert explore(threads, arrivals) > 0
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_correction_warpgroup_at_d256_holds_check_1_interpreted(call):
+    """Row 5368: 1-consumer d256 `tcgen05.rows` with the dedicated `CORRECTION` warpgroup holds check 1
+    against the reference under the interpreter (full and causal)."""
+    _check_forward(call, jnp.bfloat16, (1, 256, 2, 1), natural=False, interpret=True, width=256,
+                   value_width=256, tiles=ROWS_TILES, target=generation.gpu_target("sm100"))
 
 
 def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
