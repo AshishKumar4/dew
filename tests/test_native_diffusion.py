@@ -51,14 +51,22 @@ STREAMED = ("sd", "xl", "safety")
 (tests/test_pipeline_streaming.py) and hold it to the source beside the whole load."""
 
 
-@pytest.mark.parametrize(
-    "task", ["sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"]
-)
-def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, task):
-    """A saved pipeline's walk held to the source's, and its update, reload and export, in one process
-    over one load of each pipeline (tools/check_native_diffusion.py's `check_pipeline`, both parts): each
-    process paid its imports and the loads again."""
-    run_check(saved_pipelines / task, *(["--streamed"] if task in STREAMED else []))
+BUNDLE_CHECKS = [*((task, None) for task in ("sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint",
+                                               "refiner")),
+                 ("safety", "walk"), ("safety", "update")]
+"""Each pipeline's check: both parts in one process over one load of each pipeline (None), 5 to 21% less
+than each part's own process on armada's large class (sd 116 s to 108 s), but the safety pipeline's, whose
+parts together run past a group's 120 s (137 s apart, 131 s together), each part in its own."""
+
+
+@pytest.mark.parametrize(("task", "part"), BUNDLE_CHECKS,
+                         ids=[task if part is None else f"{task}-{part}" for task, part in BUNDLE_CHECKS])
+def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, task, part):
+    """A saved pipeline's walk held to the source's, and its update, reload and export
+    (tools/check_native_diffusion.py's `check_pipeline`): both in one process over one load of each
+    pipeline, or the `part` named (`BUNDLE_CHECKS`)."""
+    run_check(saved_pipelines / task, *(["--part", part] if part else []),
+              *(["--streamed"] if task in STREAMED else []))
 
 
 EVALUATION_SEEDS = 8
