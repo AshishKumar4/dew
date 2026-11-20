@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import functools
 import itertools
+import logging
 import math
 from collections.abc import Callable
 
@@ -2421,3 +2422,38 @@ def test_turned_gradient_p0_regressions_f1_f2_f3():
         t3 = jnp.array([[[[0.0]], [[np.pi / 2.0 - 1e-9]]]], jnp.float64)
         grad3 = _unit_turn_grad(q3, k3, v2, do3, z2, turn=t3)
         assert float(grad3[0, 1, 0, 0]) > 0.0
+
+
+def test_a_forked_training_walk_traces_once_under_every_route_receipt(caplog):
+    """A forked call's training (documents taking their memories up, three layers of it) traced twice, each
+    under a route receipt of its own (`generation.routes`), on the portable math: the second traces no walk
+    (`_walk_once`'s, run unrecorded; no tracing cache miss JAX explains of it), its routes
+    recorded alike by both receipts, where each receipt's identity keyed the walk a trace of its own (row
+    6740: a decision step's walk traced twice, 0.84 s of its lowering against 0.30)."""
+    sig = jax.ShapeDtypeStruct
+    queries, values = sig((4, 2048, 1, 8), jnp.float32), sig((4, 2048, 3, 8), jnp.float32)
+    gates, state = sig((4, 2048, 3), jnp.float32), sig((4, 1, 3, 8, 8), jnp.float32)
+    starts, slots = sig((4, 2048), jnp.bool_), sig((4, 7), jnp.int32)
+
+    def loss(q, k, v, g, beta, state, starts, loads, stores):
+        for _ in range(3):
+            v, _ = recurrence_chunk.chunk_gated_delta_rule(q, k, v, g, beta, state, starts=starts,
+                                                           loads=loads, stores=stores, held=3,
+                                                           write_bound=1.0)
+        return v.sum()
+
+    def traced():
+        with generation.routes() as found:
+            jax.make_jaxpr(jax.value_and_grad(loss, argnums=(0, 1, 2, 3, 4)))(
+                queries, queries, values, gates, gates, state, starts, slots, slots)
+        return collections.Counter(found)
+
+    with generation.chosen(gated_delta_rule='xla'):
+        routed = traced()
+        # JAX's own account of each trace its jits' caches miss (`jax_explain_cache_misses`).
+        with jax.explain_cache_misses(new_val=True), caplog.at_level(logging.WARNING):
+            caplog.clear()
+            rerouted = traced()
+    walks = [record for record in caplog.records
+             if "TRACING CACHE MISS" in record.getMessage() and "recurrence_walk" in record.getMessage()]
+    assert (walks, bool(routed), routed == rerouted) == ([], True, True)
