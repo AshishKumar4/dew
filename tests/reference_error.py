@@ -1961,9 +1961,12 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
     (`CompiledTruths.ran`), tracing, lowering and compiling none; outside a part, `fn` itself. With `host`,
     its call is placed on the host's CPU, its program traced and compiled for it and run there (a GPU host's
     CPU-placed computation, row 8376's). One no statement holds, or one its prepare did not reach, runs
-    unprepared, recorded and named (`unprepared`, as `running` records a site). One call a label: a second in
-    one prepare is refused, as a second site of one label is (`compile_site`). Its inputs are host arrays,
-    NumPy's: a prepare's default device computes nothing, not even their placement (bible §8). With
+    unprepared, recorded and named (`unprepared`, as `running` records a site). One program a label: a second
+    call of it in one prepare at the same program (its role and its inputs' shapes, `named`: two draws of one
+    shape, one forward read by two backwards) gives that program's zeros and launches, compiling nothing
+    again (`CompiledTruths.arm_again`), and one at another program is refused, as a second site of one label
+    is (`compile_site`). Its inputs are host arrays, NumPy's: a prepare's default device computes nothing,
+    not even their placement (bible §8). With
     `launched`, a call returns its outputs and the kernel launches the program it ran took (`tuning.Seen`,
     held): in a prepare its trace's, in its run its record's (`CompiledTruths.ran` notes them), outside a part
     those of its one lowering, traced and run once a call, so a witness judges the launches of the program
@@ -1986,6 +1989,8 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
             store.unprepared(f"{label}: its arm has no statement of what it computes")
             return unprepared(*inputs)
         if store.prepare:
+            if armed(label) in store.arms:
+                return store.arm_again(armed(label), named(role, inputs))
             programs: dict = {}
             held: dict = {}
             # A host-placed arm traced, and retraced where its compile lowers it, on the host's CPU.
@@ -1995,11 +2000,9 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
                     shapes = _arm_program(programs, held, role, fn, inputs, reference=False)
                 store.compile_site(armed(label), programs, held, compiled=_arm_compile(plain=True),
                                    arms=True, host=host)
-            # The launches of the lowering compiled, as its run reports them (`CompiledTruths.ran`).
-            tuning.noted(held[named(role, inputs)]["launches"])
-            # Zeros of the shapes its own trace gave, in the store's tracing: a jit of its own compiler
-            # options traced again inside another, `eval_shape`'s, was refused.
-            return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)
+            name = named(role, inputs)
+            store.arms[armed(label)] = (name, shapes, held[name]["launches"])
+            return store.arm_again(armed(label), name)
         if not store.holds(armed(label)):
             store.unprepared(f"{label}: its prepare did not reach this arm")
             return unprepared(*inputs)

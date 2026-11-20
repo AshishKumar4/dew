@@ -198,3 +198,23 @@ def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran(tmp_path):
                             for launches in (*(found for _, found in made), *stored))
     np.testing.assert_array_equal(np.asarray(made[0][0]), np.asarray(made[1][0]))
 
+
+def test_an_arm_ahead_called_again_at_its_program_in_a_prepare_reuses_it_and_refuses_another(tmp_path):
+    """An arm with no site called twice in one prepare at one program (two draws of one shape): the second
+    call gives the first's zeros and launches, compiling nothing again, and a call of its label at other
+    inputs' shapes is refused; its run executes each call's own inputs (row 9550's witness's cache)."""
+    def doubled(x):
+        return x * 2
+
+    draws = [np.arange(8, dtype=np.float32) + offset for offset in (0, 100)]
+    with compiled_truths(tmp_path, prepare=True, stamp="again") as store:
+        arm = ahead_arm(doubled, "one program, two draws")
+        prepared = [arm(x) for x in draws]
+        with pytest.raises(ValueError):
+            arm(np.arange(4, dtype=np.float32))
+    assert len(store.arms) == 1 and all(not np.any(made) for made in prepared)
+    with compiled_truths(tmp_path, prepare=False, stamp="again"):
+        ran = [ahead_arm(doubled, "one program, two draws")(x) for x in draws]
+    for x, made in zip(draws, ran, strict=True):
+        np.testing.assert_array_equal(np.asarray(made), x * 2)
+
