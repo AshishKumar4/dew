@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from contract_support import EDGES, REVERSE_ONLY, assert_drawn_contract, normal_draw
+from reference_error import FEWEST_SEEDS
 
 from dew.nn import attention, kv_cache
 from dew.nn.kernels.templates import (
@@ -176,20 +177,23 @@ def test_a_padded_merges_derivatives_are_the_laws(edge):
     spec = algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True))
 
     def inputs(seed: int, scale: float) -> tuple:
-        # Padded outputs and maxima at `scale`, totals drawn positive, their directions and a cotangent.
-        padded, maxima, totals = normal_draw([7124, seed], (1, 4, 4, 2, 16), (1, 2, 4, 4), (1, 2, 4, 4),
+        # Two slices' padded outputs (three rows of which two are queries, 12 columns of which 8 are its
+        # width) and maxima at `scale`, totals drawn positive, their directions and a cotangent: the one-head
+        # step whose every order an edge's run held its group to 1,635 s at four slices of two heads.
+        padded, maxima, totals = normal_draw([7124, seed], (1, 2, 3, 1, 12), (1, 1, 2, 3), (1, 1, 2, 3),
                                              scale=scale)
-        direction = normal_draw([7125, seed], (1, 4, 4, 2, 16), (2, 1, 2, 4, 4), scale=scale)
-        (cotangent,) = normal_draw([7126, seed], (1, 2, 2, 16))
+        direction = normal_draw([7125, seed], (1, 2, 3, 1, 12), (2, 1, 1, 2, 3), scale=scale)
+        (cotangent,) = normal_draw([7126, seed], (1, 2, 1, 8))
         return (padded, jnp.stack([maxima, jnp.abs(totals)])), direction, cotangent
 
     def merge(padded, stacked):
-        return merged.merged_padded(spec, padded, stacked, queries=2, width=16).acc
+        return merged.merged_padded(spec, padded, stacked, queries=2, width=8).acc
 
     def law(padded, stacked):
-        return merged._value(padded, stacked, spec=spec, queries=2, width=16)[0]
+        return merged._value(padded, stacked, spec=spec, queries=2, width=8)[0]
 
-    assert_drawn_contract(merge, inputs, EDGES[edge], f"a padded merge {edge}", plain_fn=law)
+    assert_drawn_contract(merge, inputs, EDGES[edge], f"a padded merge {edge}", plain_fn=law,
+                          seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("edge", EDGES)
