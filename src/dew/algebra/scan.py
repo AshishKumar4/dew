@@ -1232,9 +1232,9 @@ def _lowered_rule() -> Callable:
         generation.linear_tangent(forward, backward, _doubled, kind=Protected()))
 
 
-@functools.partial(nested, static_argnames=("axis", "reverse"), inline=True)
-def compensated(values, *, low=None, axis: int = 0, reverse: bool = False,
-                restarts=None) -> tuple[jax.Array, jax.Array]:
+@functools.partial(nested, static_argnames=("axis", "reverse", "wrap", "chunk"), inline=True)
+def compensated(values, *, low=None, axis: int = 0, reverse: bool = False, restarts=None,
+                wrap: Callable | None = None, chunk: int | None = None) -> tuple[jax.Array, jax.Array]:
     """`values`' inclusive prefix sums along `axis` (suffix sums where `reverse`), each a float and its
     rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
     element of it the first of its segment's, in either direction: a suffix sums to its segment's last).
@@ -1244,11 +1244,20 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False,
     rated decay's `rate * beta`, an FMA) had left wrong, 1.5e-5 off a 16-token prefix (row 1966).
     A nested program (`dew.nn.nested`), traced once for its arguments' types within a trace: the associative
     scan otherwise traces its protected additions afresh at every level on every call, each chunk's walked
-    sum among them."""
+    sum among them. `wrap`, where given, maps each sum of two pairs to an equal one modulo its period (an
+    angle less its whole turns, `templates.recurrence.turned`'s frames). `chunk`, where given, walks the
+    prefixes in chunks of that many elements (`_chunk_walked`), every element read once, where an associative
+    scan reads each at every level (Mamba-3's frames took a step 13% past its kernels on a GH200 so, row
+    7402): prefixes alone, a reverse scan's none."""
     low = jnp.zeros_like(values) if low is None else low
+    joined = compensated_add if wrap is None else (lambda left, right: wrap(compensated_add(left, right)))
+    if chunk is not None:
+        if reverse:
+            raise ValueError("compensated's chunk walks prefixes alone: a reverse scan takes chunk=None")
+        return _chunk_walked(values, low, axis, restarts, joined, chunk)
 
     def combine(left, right):
-        summed = compensated_add(left[:2], right[:2])
+        summed = joined(left[:2], right[:2])
         if restarts is None:
             return summed
         # Where the right part restarts, the left's sums are not its segment's.
@@ -1266,6 +1275,52 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False,
                                     jnp.ones_like(restarts[(*before, slice(0, 1))])], axis=axis)
     high, low, _ = lax.associative_scan(combine, (values, low, restarts), reverse=reverse, axis=axis)
     return high, low
+
+
+def _chunk_walked(values, low, axis: int, restarts, joined: Callable,
+                  chunk: int) -> tuple[jax.Array, jax.Array]:
+    """`compensated`'s prefixes walked in chunks of `chunk` elements along `axis`, each pair `joined` to the
+    next: each chunk's own a walk of its elements, each chunk's entering the walk of the chunks' ends, a
+    segment's first (`restarts`) starting its sums from zero within its chunk and the chunks' walk from its
+    chunk's end."""
+    restarts = (jnp.zeros(jnp.shape(values), bool) if restarts is None
+                else jnp.broadcast_to(jnp.asarray(restarts, bool), jnp.shape(values)))
+    values, low, restarts = (jnp.moveaxis(x, axis, 0) for x in (values, low, restarts))
+    length, rest = values.shape[0], values.shape[1:]
+    if length == 0:
+        return jnp.moveaxis(values, 0, axis), jnp.moveaxis(low, 0, axis)
+    pad = (-length) % chunk
+    chunks = (length + pad) // chunk
+
+    def laid(x):
+        x = jnp.pad(x, [(0, pad)] + [(0, 0)] * len(rest))
+        return jnp.moveaxis(jnp.reshape(x, (chunks, chunk, *rest)), 1, 0)
+
+    def within(total, token):
+        value, part, restart = token
+        total = tuple(jnp.where(restart, jnp.zeros((), each.dtype), each) for each in total)
+        total = joined(total, (value, part))
+        return total, total
+
+    zero = jnp.zeros((chunks, *rest), values.dtype)
+    flags = laid(restarts)
+    _, local = lax.scan(within, (zero, zero), (laid(values), laid(low), flags))
+
+    def across(entering, end):
+        sums, broke = end
+        leaving = joined(entering, sums)
+        return tuple(jnp.where(broke, e, part) for e, part in zip(sums, leaving, strict=True)), entering
+
+    ends = tuple(part[-1] for part in local)
+    _, offsets = lax.scan(across, (zero[0], zero[0]), (ends, jnp.any(flags, axis=0)))
+    seen = jnp.cumsum(flags.astype(jnp.int32), axis=0) > 0
+    summed = joined(local, tuple(part[None] for part in offsets))
+    high, low = (jnp.where(seen, part, whole) for part, whole in zip(local, summed, strict=True))
+
+    def unlaid(part):
+        return jnp.moveaxis(jnp.reshape(jnp.moveaxis(part, 0, 1), (chunks * chunk, *rest))[:length], 0, axis)
+
+    return unlaid(high), unlaid(low)
 
 
 class _Split(NamedTuple):
