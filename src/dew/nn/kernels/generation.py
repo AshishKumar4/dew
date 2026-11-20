@@ -1007,7 +1007,8 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
         # compile-only one (an abstract mesh of GPUs a CPU process lowers for) has none of. Else the device
         # the call is placed on (`placed_device`).
         device = jax.local_devices()[0] if assumption() is not None else placed_device()
-        real = device.platform == 'gpu' and assumption() is None
+        # A device of this process's or a compile-only one; an abstract mesh's states its kind alone.
+        real = isinstance(device, jax.Device) and device.platform == 'gpu' and assumption() is None
         if real and gpu_placed():
             _one_kind(_run_devices())
         return _resolved(device, device_generation(), real)
@@ -1935,7 +1936,16 @@ def placed_devices() -> list:
 def placed_device():
     """The device a call's target and generation are read from (`gpu_target`, `device_generation`): the
     first its context places it on (`placed_devices`), so a call on a second local GPU reads that GPU's
-    instruction family and resources."""
+    instruction family and resources; where the context places it on an abstract mesh alone (devices none
+    of this process's, a compile-only lowering's, `jax.sharding.use_abstract_mesh`), that mesh's abstract
+    device, whose kind names its SKU."""
+    import jax
+    from jax._src import mesh as mesh_lib
+
+    concrete = mesh_lib.get_concrete_mesh()
+    abstract = jax.sharding.get_abstract_mesh().abstract_device
+    if abstract is not None and (concrete is None or concrete.empty):
+        return abstract
     return _placed()[0]
 
 
