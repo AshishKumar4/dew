@@ -444,6 +444,13 @@ def test_a_forked_delta_products_documents_are_as_exact_as_each_alone(by_firsts)
                     f'{hooks} forked by_firsts={by_firsts}', seeds=8)
 
 
+def stepped(hooks: recurrence.Hooks, state, query, key, value, log_decay, beta):
+    """A decode token of `hooks` through `recurrence.step`: `(output, state')`."""
+    token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
+    out, _, updated = recurrence.step(hooks, token)
+    return out, updated
+
+
 def delta_product_token(state, query, key, value, log_decay, beta):
     """A DeltaProduct decode token as its paper writes it, a value head per key head: the memory `[R, H, K,
     V]` decayed once, `exp(g) S`, then each of its updates `S + beta_j k_j (v_j - S^T k_j)^T` in turn, read
@@ -471,13 +478,9 @@ def test_a_delta_product_decode_token_is_as_exact_as_its_recurrence():
                     hosted(-softplus(normal((rows, heads)))), hosted(sigmoid(normal((rows, 3, heads)))))
         return *operands, (hosted(normal((rows, heads, values))), hosted(normal((rows, heads, keys, values))))
 
-    def stepped(state, query, key, value, log_decay, beta):
-        token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
-        out, _, updated = recurrence.step(hooks, token)
-        return out, updated
-
-    assert_as_exact(jax.jit(with_gradients(stepped)), jax.jit(with_gradients(delta_product_token)), draw,
-                    'a DeltaProduct decode token', seeds=8)
+    assert_as_exact(jax.jit(with_gradients(functools.partial(stepped, hooks))),
+                    jax.jit(with_gradients(delta_product_token)), draw, 'a DeltaProduct decode token',
+                    seeds=8)
 
 
 @pytest.mark.parametrize(('substeps', 'form'), [(2, {'delta': False}), (2, {'reads': 'before'}),
@@ -616,13 +619,8 @@ def test_an_oja_decode_token_is_as_exact_as_its_formula():
         seeded = (normal((rows, heads, values)), normal((rows, heads, keys, values)))
         return *(hosted(x) for x in operands), tuple(hosted(x) for x in seeded)
 
-    def stepped(state, query, key, value, log_decay, beta):
-        token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
-        out, _, updated = recurrence.step(hooks, token)
-        return out, updated
-
-    assert_as_exact(jax.jit(with_gradients(stepped)), jax.jit(with_gradients(oja_token)), draw,
-                    "an oja decode token", seeds=8)
+    assert_as_exact(jax.jit(with_gradients(functools.partial(stepped, hooks))),
+                    jax.jit(with_gradients(oja_token)), draw, "an oja decode token", seeds=8)
 
 
 def oja_edge(state, key, value, beta):
