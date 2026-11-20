@@ -688,48 +688,44 @@ def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_rol
         interpret=False,
         program=types.SimpleNamespace(family=placed.KEYS, tiles=types.SimpleNamespace(block_q=block_q)))
 
-    def launch(dq_arr):
-        def body(dq_ref):
-            def scope(stage, filled, emptied):
-                ring = dkv._PlacedDq(walk, dq_ref, (None, stage, filled, emptied), (0, 0))
-                half = jnp.zeros((block_q, width), jnp.float32)
-                role = jax.lax.axis_index("wg")
+    def traced(name: str):
+        def launch(dq_arr):
+            def body(dq_ref):
+                def scope(stage, filled, emptied):
+                    ring = dkv._PlacedDq(walk, dq_ref, (None, stage, filled, emptied), (0, 0))
+                    half = jnp.zeros((block_q, width), jnp.float32)
+                    role = jax.lax.axis_index("wg")
 
-                @pl.when(role == 0)
-                def _():
-                    ring.added((half,), 0, types.SimpleNamespace(turn=0, n=0))
-                    ring.added((half,), 2 * block_q, types.SimpleNamespace(turn=0, n=placed.TURNS))
-                    ring.drained(0, 3, role=0)
+                    @pl.when(role == 0)
+                    def _():
+                        ring.added((half,), 0, types.SimpleNamespace(turn=0, n=0))
+                        ring.added((half,), 2 * block_q, types.SimpleNamespace(turn=0, n=placed.TURNS))
+                        ring.drained(0, 3, role=0)
 
-                @pl.when(role == 1)
-                def _():
-                    ring.reduced(0, 3, role=0)
+                    @pl.when(role == 1)
+                    def _():
+                        ring.reduced(0, 3, role=0)
 
-            pl.run_scoped(
-                scope,
-                plgpu.SMEM((placed.TURNS, dkv.REDUCED, block_q, slot_cols), jnp.float32),
-                tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),
-                tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),
-            )
+                pl.run_scoped(
+                    scope,
+                    plgpu.SMEM((placed.TURNS, dkv.REDUCED, block_q, slot_cols), jnp.float32),
+                    tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),
+                    tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),
+                )
 
-        return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(dq_arr.shape, dq_arr.dtype),
-                            grid=(1,), grid_names=("p",), num_threads=2, thread_name="wg")()
+            return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(dq_arr.shape, dq_arr.dtype),
+                                grid=(1,), grid_names=("p",), num_threads=2, thread_name="wg", name=name)()
 
-    threads, arrivals = programs(launch, dq_out, threads=2)
-    assert any(event.kind == "arrive" for event in threads[0]), f"threads={threads!r}"
-    assert any(event.kind == "wait" for event in threads[1]), f"threads={threads!r}"
+        return programs(launch, dq_out, threads=2)
+
+    threads, arrivals = traced("dq_ring_ordinals")
     assert explore(threads, arrivals) > 0
 
     # Dropping `ordinal` in `_PlacedDq._turn` must be caught by `explore`.
     monkeypatch.setattr(dkv._PlacedDq, "_turn", lambda self, ordinal, piece: rings.Turn.of(piece, dkv.REDUCED))
-    bad_threads, bad_arrivals = programs(launch, dq_out, threads=2)
-    assert bad_threads != threads, f"bad_threads == threads: {bad_threads!r}"
-    try:
-        states = explore(bad_threads, bad_arrivals)
-    except Violation:
-        pass
-    else:
-        pytest.fail(f"expected Violation, explored {states} states; bad_threads={bad_threads!r}")
+    bad_threads, bad_arrivals = traced("dq_ring_ordinals_mutated")
+    with pytest.raises(Violation):
+        explore(bad_threads, bad_arrivals)
 
 
 @COMPILES_ON_CPU
