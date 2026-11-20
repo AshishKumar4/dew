@@ -851,11 +851,12 @@ writes, and the state's first key pairs turned each token (`Hooks.turns`), two p
 def test_a_turned_call_on_the_template_is_on_par_with_the_portable_math_interpreted(packed):
     """A state that turns its key pairs (`TURNED`) through the chunked op on the template, its queries and
     keys turned into their documents' frames and its turns' gradient in the crossing form
-    (`templates.recurrence.turned`), against the portable math's (`scan.Scan.turn`, its turns' gradient the
-    replay's): output, final memory and every operand's gradient, the turns' among them, from float64 over
-    one sequence or packed documents each beginning a token's ranks (check 1, row 7419), its queries, keys,
-    values and write gate in bf16 under the run's fast forms, as the template's fast backward trains it
-    (`mainloop_backward.fast_backward_form`)."""
+    (`templates.recurrence.turned`), against the portable math's: output, final memory and every operand's
+    gradient from float64 over one sequence or packed documents each beginning a token's ranks (check 1, row
+    7419), its queries, keys, values and write gate in bf16 under the run's fast forms, as the template's fast
+    backward trains it (`mainloop_backward.fast_backward_form`). Both arms take the turns' gradient from one
+    crossing form (`turned.turn_gradient`), which the recurrence a token at a time holds
+    (test_recurrence_chunk's turned states), not this pair (row 7971)."""
     def on(route, operands, starts=None):
         return chunk_on(route, TURNED, dataclasses.replace(operands, starts=starts))
 

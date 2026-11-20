@@ -806,7 +806,8 @@ class Decide(SavedRunTask, InItsForm):
 
     @overload
     def __call__(self, state: Sequence[tuple[JSON, Mapping[str, Question]]], questions: None = None, *,
-                 contexts: Sequence[JSON | None] | None = None) -> list[dict[str, Answer]]: ...
+                 images: Sequence[Sequence[Image.Image]] = (), contexts: Sequence[JSON | None] | None = None
+                 ) -> list[dict[str, Answer]]: ...
 
     @traced_in_its_form
     def __call__(self, state, questions=None, *, images=(), context=None, contexts=None, request=None):
@@ -817,7 +818,8 @@ class Decide(SavedRunTask, InItsForm):
         server runs and over its programs (`logits`), one path for a call and a server alike. Images
         need a layout with a place for them (`Layout.images`) and the backbone's processor, as a
         joint-head release brings. `context` is a sequence the decision reads beside the state through
-        the backbone's cross-attention (`Example.context`), and `contexts` each request's, in order.
+        the backbone's cross-attention (`Example.context`), and `contexts` each request's, in order, as
+        `images` given with a batch is each request's (none for a request without).
         `request` is the whole request `questions` are asked from, which a summary of it writes
         (`RequestSummary`), where they are a part of it: a tournament's rounds (`tournament`).
         """
@@ -825,11 +827,10 @@ class Decide(SavedRunTask, InItsForm):
             if request is not None:
                 raise ValueError("each of a batch's requests is its own whole request; ask a part of one "
                                  "with questions= and request=")
-            if images or context is not None:
-                raise ValueError("a batch of requests reads no one request's images or context: give each "
-                                 "request's context in contexts=, and ask a request with images alone")
-            answered = self._answered(self.rows(state, contexts=contexts), [asked for _, asked in state])
-            return [_told(answers, usage) for answers, usage in answered]
+            if context is not None:
+                raise ValueError("a batch of requests reads no one request's context: give each request's "
+                                 "in contexts=")
+            return [_told(*answered) for answered in self._requests_answered(state, images, contexts)]
         if contexts is not None:
             raise ValueError("one request reads its context in context=; contexts= is a batch's, each "
                              "request's own")
@@ -837,6 +838,26 @@ class Decide(SavedRunTask, InItsForm):
             return _told(*self._seen(state, questions, images, context, request=request))
         return _told(*self._answered([self._encoded(state, questions, context=context, request=request)],
                                      [questions])[0])
+
+    def _requests_answered(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]],
+                           images: Sequence[Sequence[Image.Image]], contexts: Sequence[JSON | None] | None
+                           ) -> list[tuple[dict[str, Answer], Usage]]:
+        """Each of a batch's requests' answers and usage, in order: those with images (`images`, each
+        request's, none for one without) each through its own multimodal pass (`_seen`), as a request asked
+        alone is, and the rest scored together (`_answered`), each with its context (`contexts`; row 9061:
+        a batch took no request's images)."""
+        shown = list(images) if images else [()] * len(requests)
+        held = [None] * len(requests) if contexts is None else list(contexts)
+        if len(shown) != len(requests) or len(held) != len(requests):
+            raise ValueError(f"{len(shown)} requests' images and {len(held)} contexts for {len(requests)} "
+                             "requests")
+        plain = [index for index, seen in enumerate(shown) if not seen]
+        answered = dict(zip(plain, self._answered(
+            self.rows([requests[index] for index in plain], contexts=[held[index] for index in plain]),
+            [requests[index][1] for index in plain]), strict=True)) if plain else {}
+        answered.update((index, self._seen(*requests[index], seen, held[index]))
+                        for index, seen in enumerate(shown) if seen)
+        return [answered[index] for index in range(len(requests))]
 
     def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
              contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:

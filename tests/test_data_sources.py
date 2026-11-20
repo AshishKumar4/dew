@@ -526,15 +526,19 @@ def test_spark_directory_requires_success_marker(tmp_path):
 @dataclasses.dataclass(frozen=True)
 class ArrowFiles:
     """A native writer of the caller's: an Arrow IPC file for each batch it is handed, each beside a
-    hidden checksum as Hadoop's writers leave one, stopping before its file `stop` where given."""
+    hidden checksum as Hadoop's writers leave one, stopping before its file `stop` where given, raising, or
+    returning before its file `returns`."""
 
     stop: int | None = None
+    returns: int | None = None
     format = "arrow"
 
     def write(self, rows, directory, filesystem):
         for number, batch in enumerate(rows):
             if number == self.stop:
                 raise RuntimeError(f"the writer stopped before file {number}")
+            if number == self.returns:
+                return
             path = f"{directory}/part-{number:06d}.arrow"
             with filesystem.open_output_stream(path) as stream, pa.ipc.new_file(stream, batch.schema) as file:
                 file.write_batch(batch)
@@ -573,6 +577,41 @@ def test_an_export_whose_writer_stops_commits_nothing_and_the_next_commits_only_
     export(Memory(rows[:6]), str(tmp_path), format=ArrowFiles(), rows_per_shard=4)
     stored = Files(str(tmp_path)).records("indexed")
     assert [stored[index] for index in range(len(stored))] == rows[:6]
+
+
+def test_an_export_whose_writer_returns_with_rows_unread_commits_nothing(tmp_path):
+    """A writer that returns normally before reading every row of its stream commits nothing: no manifest
+    and no `_SUCCESS` (row 9014: the export published its first file as the whole)."""
+    rows = [{"id": index} for index in range(10)]
+    with pytest.raises(ValueError):
+        export(Memory(rows), str(tmp_path), format=ArrowFiles(returns=1), rows_per_shard=4)
+    assert not (tmp_path / EXPORT_MANIFEST).exists() and not (tmp_path / "_SUCCESS").exists()
+
+
+def test_an_uncommitted_export_is_read_by_no_discovery(tmp_path):
+    """An export not yet committed is read by no discovery (row 9015): a directory's raw listing refuses the
+    shards an export's writer left without a manifest, and a Spark reader refuses a manifest whose
+    `_SUCCESS` is not yet written."""
+    rows = [{"id": index} for index in range(10)]
+    stopped = tmp_path / "stopped"
+    with pytest.raises(RuntimeError):
+        export(Memory(rows), str(stopped), format=ArrowFiles(stop=2), rows_per_shard=4)
+    with pytest.raises(ValueError):
+        Files(str(stopped), format="arrow").records("indexed")
+    marked = tmp_path / "marked"
+    export(Memory(rows), str(marked), format=ArrowFiles(), rows_per_shard=4)
+    (marked / "_SUCCESS").unlink()
+    with pytest.raises(ValueError):
+        Files(str(marked), format="arrow", spark=True).records("indexed")
+
+
+def test_a_directory_of_committed_exports_reads_their_shards_raw(tmp_path):
+    """A directory holding committed exports beneath it reads their shards as raw files, each export's root
+    holding its manifest (row 9536: any export's shards beneath refused the read as still writing)."""
+    rows = [{"id": index} for index in range(10)]
+    export(Memory(rows), str(tmp_path / "a"), format=ArrowFiles(), rows_per_shard=4)
+    stored = Files(str(tmp_path), format="arrow").records("indexed")
+    assert sorted(stored[index]["id"] for index in range(len(stored))) == list(range(10))
 
 
 @pytest.mark.parametrize("kind", ["jsonl", "text"])

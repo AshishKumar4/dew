@@ -145,32 +145,40 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
                      resume=trainer.data_resume, step=step)
 
 
-def computation_differs(saved: JSON, now: JSON) -> list[str]:
-    """Where the computation a checkpoint trained, its inference record (`Objective.inference_record`, which
-    every step carries), and this run's differ: each path of the objective's class or its model's record where
-    both state it and they disagree, the fields that say how layers execute aside (the configured path's own
-    `RunConfig.EXECUTED`) and a loop's passes (`Loop.PASSED`, which a phase sets), and a field one of them
-    predates. Nothing where either records none (an unrecordable model's, or a step that predates the
-    record): only positive evidence refuses (row 5723)."""
+def computation_differs(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:
+    """Where the computation a checkpoint trained and this run's differ: each path of its objective's class
+    or its model's record in its inference record (`Objective.inference_record`), the fields that say how
+    layers execute aside (the configured path's own `RunConfig.EXECUTED`), and each setting of what its
+    objective's loss computes (`trained` against `training`, `Objective.training_record`; row 9020: an LM's
+    `z_loss` changed and resumed), where both state it and they disagree. A loop's passes (`Loop.PASSED`,
+    which a phase sets) and a field one of them predates are no evidence, nor is a record either holds none
+    of (an unrecordable model's, a step that predates the record): only positive evidence refuses (row
+    5723)."""
     from dew._records import without_fields
     from dew.config import RunConfig
-    from dew.nn.backbones.decoder_stack import Loop
 
-    def differing(before: JSON, after: JSON, path: str) -> list[str]:
-        # A loop's passes are the run's to set, a phase's own (`Loop.PASSED`).
-        passed = Loop.PASSED if path.endswith(".loop") else ()
-        match before, after:
-            # A field one record holds and the other predates is no evidence: only fields both state compare.
-            case dict(), dict():
-                return [found for key in sorted((before.keys() & after.keys()) - set(passed))
-                        for found in differing(before[key], after[key], f"{path}.{key}")]
-            case _:
-                return [] if before == after else [path]
-
+    found = []
     match saved, now:
         case dict(), dict() if "unrecorded" not in {*saved, *now}:
-            return [found for name in ("objective", "model") if name in saved and name in now
-                    for found in differing(without_fields(saved[name], RunConfig.EXECUTED),
-                                           without_fields(now[name], RunConfig.EXECUTED), name)]
+            found = [differs for name in ("objective", "model") if name in saved and name in now
+                     for differs in _differing(without_fields(saved[name], RunConfig.EXECUTED),
+                                               without_fields(now[name], RunConfig.EXECUTED), name)]
+    match trained, training:
+        case dict(), dict():
+            found += _differing(trained, training, "training")
+    return found
+
+
+def _differing(before: JSON, after: JSON, path: str) -> list[str]:
+    """Each path at which `before` and `after` both state a value and disagree (`computation_differs`)."""
+    from dew.nn.backbones.decoder_stack import Loop
+
+    # A loop's passes are the run's to set, a phase's own (`Loop.PASSED`).
+    passed = Loop.PASSED if path.endswith(".loop") else ()
+    match before, after:
+        # A field one record holds and the other predates is no evidence: only fields both state compare.
+        case dict(), dict():
+            return [found for key in sorted((before.keys() & after.keys()) - set(passed))
+                    for found in _differing(before[key], after[key], f"{path}.{key}")]
         case _:
-            return []
+            return [] if before == after else [path]

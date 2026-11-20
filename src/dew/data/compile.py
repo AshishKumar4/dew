@@ -27,7 +27,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew._position import unplaced
-from dew._records import JSON, integer, json_value
+from dew._records import JSON, integer, json_value, record
 from dew.batch import Batch
 from dew.data.analysis import (
     _VIEWS,
@@ -1183,10 +1183,28 @@ def _compiled(
         statistics=statistics,
         batch_tokens=staged.batch_tokens,
         device=device,
+        fields=_fixed_fields(original, train_host),
         widths=_bound_widths(original),
         tail=tail(train, build),
         order_records=ordered,
     )
+
+
+def _fixed_fields(pipeline: Pipeline, host: Sequence[HostStep]) -> Mapping[str, tuple[int | None, ...]]:
+    """Each field's per-row shape the batches the training stream hands its step hold (`Loader.fields`), as
+    the facts state them (`Dataset.facts`): `pipeline`'s record stages, then the batch steps its reader runs
+    on the host (`host`: a pack's layout, the chain's own and the compile's), a step that does not say what
+    it makes leaving no field fixed; never a device step's, which the step runs after the check (row 9533:
+    a batch was held to a device crop it had not run, and without a host step's drop it had). The
+    producer's shape, which every batch is held to (docs/design/training.md, the producer's contract)."""
+    from dew.data.facts import _after, folded
+
+    records = dataclasses.replace(pipeline, stages=tuple(stage for stage in pipeline.stages
+                                                         if not isinstance(stage, MapBatch)))
+    made = functools.reduce(lambda facts, step: _after(MapBatch(step), facts), host, folded(records))
+    stated = made.get("fields", {})
+    return {name: tuple(shape) for name, shape in record(stated, "fields").items()
+            if isinstance(shape, list) and all(axis is None or isinstance(axis, int) for axis in shape)}
 
 
 def _bound_widths(pipeline: Pipeline) -> Mapping[str, object]:
