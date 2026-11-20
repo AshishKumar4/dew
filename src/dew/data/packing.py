@@ -19,7 +19,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import integer, record
+from dew._records import integer, integers, record
 from dew.batch import Batch
 from dew.data.dataset import Records
 from dew.data.generation import Generation
@@ -590,12 +590,47 @@ class _ConcatPacking(pygrain.DatasetIterator[Batch]):
 
     def set_state(self, state: Mapping[str, object]) -> None:
         saved = record(state, "concatenating packer position")
+        if "remainder_slices" in saved:
+            self._grains(saved)
+            return
         self._documents.set_state(record(saved["parent"], "concatenating packer's documents"))
-        offset = integer(saved["offset"], "concatenating packer's offset")
+        self._begin(integer(saved["offset"], "concatenating packer's offset"))
+
+    def _begin(self, offset: int) -> None:
+        """The next window begun `offset` tokens into the next document, or with it whole."""
         self._pending = None
         if offset:
             before = self._documents.get_state()
             self._pending = (before, next(self._documents), offset)
+
+    def _grains(self, saved: Mapping[str, object]) -> None:
+        """A position Grain's concatenating packer saved (`ConcatThenSplitIterDataset`'s, before row 9059):
+        its documents' position before the remainder it held, where the remainder starts in its document,
+        and the windows emitted since, which a restore emits again. Where the pack overlaps its cuts, its
+        documents were those cuts written out (`_OverlappedCuts` then, saving the room its window had left
+        beside their position), and the remainder starts in that document, at a cut: past the pieces before
+        it, the first that room long and each after a window's, each next one starting `overlap` tokens
+        before the last one's end in the document itself."""
+        pack = self._pack
+        parent = record(saved["parent_state"], "Grain packer's documents")
+        room = pack.seq_len
+        if pack.overlap:
+            room = integer(parent["room"], "packed window room")
+            parent = record(parent["documents"], "packed documents")
+        self._documents.set_state(parent)
+        start, _ = integers(record(saved["remainder_slices"], "packed remainder")[pack.fields[0]],
+                            "packed remainder")
+        offset = max(start, 0)
+        if pack.overlap and start > 0:
+            written, offset = start, 0
+            while written > 0:
+                written, offset, room = written - room, max(offset + room - pack.overlap, 0), pack.seq_len
+            if written:
+                raise ValueError(f"a saved remainder {start} tokens into its overlapped document starts at "
+                                 "no cut of it")
+        self._begin(offset)
+        for _ in range(integer(saved["elements_from_buffer_after_checkpoint"], "windows emitted")):
+            next(self)
 
     def close(self) -> None:
         self._documents.close()

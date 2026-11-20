@@ -111,6 +111,11 @@ SAVED_UNDER_16 = Path(__file__).with_name("fixtures") / "positions" / "main-47a7
 """A position main saved at 47a76d52d, under plan 16, before a phases' position's version was read from its
 phase's reader: phases through a step whose table its repr hides (`hidden_field_positions`)."""
 
+SAVED_BY_GRAINS_PACKER = Path(__file__).with_name("fixtures") / "positions" / "main-45131ca01"
+"""Positions main saved at 45131ca01, while Grain's concatenating packer laid a concatenating pack's windows
+(row 9059): its own position, the remainder it held a slice of its document, a window emitted after it, its
+cuts overlapped or not (`saved_positions_support.concatenated`)."""
+
 
 @pytest.mark.parametrize(("saved_at", "module", "name"), [
     (SAVED_BEFORE_THE_MOVE, "saved_positions_support", "conditioned_phases"),
@@ -119,7 +124,10 @@ phase's reader: phases through a step whose table its repr hides (`hidden_field_
     (SAVED_UNDER_15, "hidden_field_positions", "hidden_phases"),
     (SAVED_UNDER_15, "hidden_field_positions", "hidden_global"),
     (SAVED_UNDER_15, "hidden_field_positions", "hidden_global_phases"),
-    (SAVED_UNDER_16, "hidden_field_positions", "hidden_phases")])
+    (SAVED_UNDER_16, "hidden_field_positions", "hidden_phases"),
+    (SAVED_BY_GRAINS_PACKER, "saved_positions_support", "concatenated"),
+    (SAVED_BY_GRAINS_PACKER, "saved_positions_support", "concatenated_overlapped"),
+    (SAVED_BY_GRAINS_PACKER, "saved_positions_support", "concatenated_overlapped_later")])
 def test_a_position_an_earlier_dew_saved_resumes_where_it_stopped(saved_at, module, name):
     """A position an earlier Dew saved resumes onto the rows a read of the same chain stopped where it
     stopped reads next. Saved while a step's encoder was dew.inputs's: a phased read past its first phase,
@@ -131,7 +139,9 @@ def test_a_position_an_earlier_dew_saved_resumes_where_it_stopped(saved_at, modu
     (`Plan.under`, `Plan.order_under`), where the record of a run saved since plan 15 hit PlanChanged on its
     steps (train 1013's review, F3) and a global order's position on its order (train 1016's review, F1;
     phases of them, train 1018's, F2). Saved under plan 16 with no version of its own, phases through such a
-    step, read as its phase's reader's plan records (train 1018's review, F3)."""
+    step, read as its phase's reader's plan records (train 1018's review, F3). Saved while Grain's
+    concatenating packer laid a pack's windows, its position Grain's, cut through a document or not, its
+    cuts overlapped or not: Dew's packer reads it (row 9059)."""
     import importlib
 
     from resumed_support import resumed_as_read
