@@ -3,6 +3,8 @@ record that decides which green run of a row a lookup may reuse: its epoch, whic
 green run recorded before it stands again (`epoch`). What a record holds and when a row is reused are ci.py's
 (`record`, `green_record`, `reused`)."""
 
+from __future__ import annotations
+
 import importlib.util
 import json
 import os
@@ -10,6 +12,10 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from r2 import Store
 
 HERE = Path(__file__).resolve().parent
 
@@ -43,7 +49,7 @@ SEND = r2.KeptSend()
 """How every request to the Worker is sent: on a connection its thread keeps (`r2.KeptSend`)."""
 
 
-def store(token: str) -> r2.Store:
+def store(token: str) -> Store:
     """The Worker that holds the records."""
     return r2.Store(os.environ["DEW_XLA_CACHE_URL"], token, "dew-ci-test-cache", timeout=10, send=SEND)
 

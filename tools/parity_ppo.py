@@ -6,6 +6,10 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "verl"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 REVISION = "d040717b21af2e23e8e789a3e354cff2394ae2de"
 
 

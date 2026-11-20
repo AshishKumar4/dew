@@ -24,6 +24,7 @@ the torch side writes each backend's hidden states as bf16 bits to
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from common import window_rows, write_record
@@ -42,9 +43,13 @@ def torch_side(args) -> None:
     from torch.nn.attention import SDPBackend, sdpa_kernel
     from torch_lm import bf16_residual
     from transformers import AutoModelForCausalLM
+    from transformers.modeling_utils import PreTrainedModel
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32,
-                                                 attn_implementation="sdpa").cuda()
+    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32,
+                                                                  attn_implementation="sdpa")
+    # Moved in place by its own `cuda` (PreTrainedModel's), whose functools.wraps hides its signature.
+    placed: Any = model
+    placed.cuda()
     bf16_residual(model)
     kept = {}
     model.model.norm.register_forward_hook(lambda module, inputs, output: kept.__setitem__("hidden", output))
@@ -81,14 +86,18 @@ def dew_side(args) -> None:
         model = pretrained.model
 
         def states(variables, tokens, model=model):
-            return model.apply(variables, tokens, method=type(model).hidden_states)
+            return model.apply(variables, tokens, method="hidden_states")
 
         values = jax.jit(states)(pretrained.variables, jnp.asarray(rows[:, :-1]))
         hidden[f"dew-{implementation}"] = np.asarray(jnp.asarray(values, jnp.float32))
         if table is None:
             head = model.apply(pretrained.variables, method="output_table")
+            if isinstance(head, tuple):
+                raise TypeError("output_table applied without mutable collections returned its variables too")
             table = jnp.asarray(head.matrix.T if head.vocab_major else head.matrix, jnp.bfloat16)
 
+    if table is None:
+        raise ValueError("no implementation was loaded to read the output table from")
     width = next(iter(hidden.values())).shape[-1]
     # A tied head is the embedding table, [vocab, width]; a Dense kernel is [width, vocab].
     kernel = table.T if table.shape[-1] == width and table.shape[0] != width else table

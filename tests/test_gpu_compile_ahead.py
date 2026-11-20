@@ -415,24 +415,54 @@ def test_a_deviceless_compile_stores_nothing_a_device_run_reads(tmp_path):
     assert ran("run") == {"read": 0}
 
 
-def test_a_fresh_state_placed_on_a_gpu_is_bitwise_its_draws_under_jaxs_default_lowering():
-    """A fresh run's state placed on the GPU (`Trainer.place`, its start program drawn through loops over
-    threefry's rounds, `dew.training.distributed.drawing`) is bit for bit the state its initializer draws
-    jitted under JAX's default lowering, every round unrolled: the looped draw changes the start program's
-    compile alone (row 6740)."""
-    import optax
+FRESH_WEIGHT_SEEDS = 8
+"""Check 1's declared draws of a fresh state's weights on the GPU, placed against drawn under JAX's default
+lowering (`seeds_for`: the two programs share every bit and differ only in how they round from them)."""
 
+
+def test_a_fresh_state_placed_on_a_gpu_draws_the_bits_of_jaxs_default_lowering():
+    """A fresh run's start program on the GPU draws through loops over threefry's rounds
+    (`dew.objectives.drawn.drawing`): the raw bits it draws are bit for bit those of JAX's default lowering,
+    every round unrolled, and the weights it builds from them (`Trainer.place`) are on par (check 1) with
+    the state its initializer draws jitted under the default lowering, truth the initializer's float64
+    replay over the same bits (`float64_replay`): the looped draw changes the start program's compile alone
+    (row 6740), and floats two programs round from those bits are held on par, not bit for bit (row 9045,
+    docs/design/testing.md's layout invariance)."""
+    import jax.numpy as jnp
+    import optax
+    from float64_replay import float64_replay
+    from placement_parity import floats
+    from reference_error import as_given, assert_as_exact
+
+    from dew.objectives.drawn import drawing
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import Trainer
 
+    def bits(key):
+        return jax.random.bits(key, (64, 33), jnp.uint32)
+
+    for seed in range(3):
+        key = jax.random.key(seed)
+        with drawing():
+            rolled = jax.jit(bits)(key)
+        assert np.array_equal(np.asarray(rolled), np.asarray(jax.jit(lambda key: bits(key))(key)))
     model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
                          mlp_features=64, max_seq_len=16)
-    trainer = Trainer(LMObjective(model, 15), optax.adam(1e-3), key=jax.random.key(3))
-    placed = trainer.place()[0]
-    drawn = jax.jit(lambda key: trainer.initial_state(None, key))(trainer.key)
-    for mine, theirs in zip(jax.tree.leaves(placed.variables), jax.tree.leaves(drawn.variables), strict=True):
-        assert np.array_equal(np.asarray(mine), np.asarray(theirs))
+    objective = LMObjective(model, 15)
+
+    def trainer(key) -> Trainer:
+        return Trainer(objective, optax.adam(1e-3), key=key)
+
+    drawer = trainer(jax.random.key(0))
+
+    def initial(key):
+        # The initializer's draws from `key`, as a fresh run's start makes them (`Trainer.initial_state`).
+        return floats(drawer.initial_state(None, key).variables)
+
+    assert_as_exact(as_given(lambda key: floats(trainer(key).place()[0].variables)), jax.jit(initial),
+                    lambda seed: (jax.random.key(seed),), "a fresh state's weights placed and drawn",
+                    seeds=FRESH_WEIGHT_SEEDS, truth_fn=float64_replay(initial))
 
 
 CERTIFIED = """

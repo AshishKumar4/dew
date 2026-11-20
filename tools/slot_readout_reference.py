@@ -98,7 +98,7 @@ def observed(model, head, capture, readout, inputs, labels, *, blocked: bool, dt
     probe = torch.from_numpy(inputs["probe"]).to(dtype)
     result = {}
     for mode in ("slot_lm", "head"):
-        local = tuple(head.named_parameters()) if mode == "head" else ()
+        local: tuple[tuple[str, torch.nn.Parameter], ...] = tuple(head.named_parameters()) if mode == "head" else ()
         scores = (head(answer, pooled) if mode == "head" else
                   output.logits[rows, lengths - 1][:, labels[:selected.shape[1]]])
         scores = scores[selected]
@@ -143,7 +143,9 @@ def main():
                for ids, label in zip(labels, prompt.SLOT_LABELS[:16], strict=True)):
             raise ValueError("every recorded slot must be one round-tripping token in the tiny vocabulary")
         labels = [ids[0] for ids in labels]
-        head = readout.ReadoutHead.from_lm_head(model.get_output_embeddings().weight, labels, 8)
+        if (output := model.get_output_embeddings()) is None:
+            raise ValueError("the model has no output embeddings to read the readout head from")
+        head = readout.ReadoutHead.from_lm_head(output.get_parameter("weight"), labels, 8)
         torch.nn.init.normal_(head.k.weight, std=0.2)
         with oracle_precision():
             truth = AutoModelForImageTextToText.from_config(copy.deepcopy(model.config), dtype=torch.float64,

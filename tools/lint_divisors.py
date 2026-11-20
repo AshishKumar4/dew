@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import ast
 import math
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeGuard
 
 import lint_scopes as scopes
 
@@ -168,7 +169,8 @@ def _called(node: ast.Call, scope: Constants):
     # A bare name is a builtin only where nothing of the module or around it binds it.
     builtin = (isinstance(node.func, ast.Name) and node.func.id not in scope.bound
                and node.func.id not in scope.shadowed)
-    path = scopes.resolved(node.func, scope.table) or (node.func.id if builtin else "")
+    path = scopes.resolved(node.func, scope.table) or (
+        node.func.id if builtin and isinstance(node.func, ast.Name) else "")
     if (dtype := _dtype(path)) is not None and len(arguments) == 1:
         # A scalar of its type, so arithmetic with it rounds as the module's own does.
         return dtype.type(arguments[0])
@@ -243,7 +245,7 @@ def _source_of(dotted: str, root: Path) -> tuple[Path, str] | None:
     return None
 
 
-def _rounded(value) -> bool:
+def _rounded(value) -> TypeGuard[float]:
     """Whether a constant divisor `value` is one no power of two divides exactly by: its reciprocal is no
     float, so XLA's product with it rounds twice."""
     return (value is not None and math.isfinite(float(value)) and value != 0
@@ -256,7 +258,8 @@ def _local_arrays(function: ast.AST, table: Mapping[str, str], arrays: set[str])
     assignment, is none), to a fixed point: what a name holds read as what each of its bindings gives it."""
     assigned = {id(target): node.value for node in scopes.own(function) if isinstance(node, ast.Assign)
                 for target in node.targets if isinstance(target, ast.Name)}
-    parameters = scopes.arguments(function) if not isinstance(function, ast.ClassDef) else ()
+    parameters = scopes.arguments(function) if isinstance(
+        function, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) else ()
     bound = scopes.binders(list(scopes.own(function)), parameters)
     candidates = {name: [assigned[id(node)] for node in nodes] for name, nodes in bound.items()
                   if name not in arrays and all(id(node) in assigned for node in nodes)}
@@ -308,7 +311,7 @@ def _shadowing(tree: ast.Module) -> tuple[dict[int, frozenset[str]], dict[int, f
     return shadowed, comprehended
 
 
-def divisions(path: Path, tree: ast.Module, parent: str) -> Iterator[tuple[int, int, str]]:
+def divisions(path: Path, tree: ast.Module, parent: Sequence[str]) -> Iterator[tuple[int, int, str]]:
     """SLOP024: a JAX array (`_array`, or a name its function binds only to one) divided by a compile-time
     constant no power of two divides exactly by (`_constant`, `_rounded`): a literal, a named constant of
     this module or the library's, a number of math or numpy, or a pure function of constants; by `/`, `/=`,
@@ -326,7 +329,7 @@ def divisions(path: Path, tree: ast.Module, parent: str) -> Iterator[tuple[int, 
         if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             table = tables.get(id(function), {})
             annotated = set() if isinstance(function, ast.Lambda) else {
-                name for name, annotation in scopes.annotations(function)
+                name for name, annotation in scopes.annotated(function)
                 if scopes.resolved(annotation, table) in ARRAY_TYPES}
             held = _local_arrays(function, table, annotated)
             for node in scopes.own(function):

@@ -63,6 +63,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _plain_forward,
     _trained_forward,
     certified_walk,
+    column_slices,
     forward_products,
     logits_ahead,
 )
@@ -427,7 +428,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         legal config's (row 9105)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
         if not family.budgets_registers:
-            return 1
+            return family.programs(config.consumers)
         staged = self.staged_bytes(ba, config, target) if target.shared_limit else None
         tmem = self.tmem_columns(ba, config, target)
         return max(1, resources.register_model(family, config.consumers, self.registers(ba, config),
@@ -558,10 +559,10 @@ class MosaicForward(_Mainloop[Tiles]):
                            initial, drop, table, sources, scales, query_params, residuals=residuals,
                            interpret=interpret)
             full_v = _width(value.shape[-1], family, query.dtype)
-            block_v = value_columns(full_v, config.columns)
-            widths = {block_v} if full_v % block_v == 0 else {block_v, full_v % block_v}
-            products = tuple((w, self._products(ba, dataclasses.replace(config, columns=w), target))
-                             for w in sorted(widths))
+            widths = [width for _, width in column_slices(full_v, config.columns)]
+            by_width = {w: self._products(ba, dataclasses.replace(config, columns=w), target)
+                        for w in dict.fromkeys(widths)}
+            products = tuple(by_width[w] for w in widths)
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret,
                 "counts": not self.scaled, "registered": registered, "tmem_columns": target.tmem_columns}
         scaled = (self.scaled or (self.cached(table, sources, scales) and not self.bounded)) and not decides
@@ -1128,7 +1129,8 @@ def streams(query, target: generation.GpuTarget) -> bool:
     (`cost.rates`: the tensor rate its instruction family, clock and multiprocessors derive, no catalog's
     peak, row 3799): a decode step's few rows a key head, never a prefill's. False where either rate is
     unknown."""
-    tensor, *_, memory = cost.rates(target, device=True)
+    rated = cost.rates(target, device=True)
+    tensor, memory = rated.tensor, rated.device
     if not (tensor and memory):
         return False
     return 2 * query.shape[1] / jnp.dtype(query.dtype).itemsize < tensor / memory
@@ -1772,7 +1774,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                    if not split_queries(layout)), None)
         if dq is None:
             return None
-        residing = [] if dq.products_overlap else [
+        residing = [] if dq.products_overlap or (not dq.budgets_registers and dq.programs(1) < 2) else [
             lambda config: fits(config) and self.resident(ba, config, target) >= 2]
         for wanted in (*residing, fits):
             for columns in (1, 2, 4):

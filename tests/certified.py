@@ -558,10 +558,17 @@ def _reduced_sum(params, operands, result, fmt):
         summed = _wrapping(lambda t: np.sum(t, axis=axes, dtype=np.uint64))
         return _bits(result) == _bits(summed(result, terms))
     flushes = lane().flushes
-    moved = np.moveaxis(_read(terms, flushes), axes, tuple(range(-len(axes), 0)))
-    kept = moved.shape[:moved.ndim - len(axes)]
-    count = int(np.prod(moved.shape[len(kept):], dtype=np.int64))
-    return _terms_hold(result, moved.reshape(*kept, count), fmt, flushes)
+    return _terms_hold(result, _flattened(np.moveaxis(_read(terms, flushes), axes,
+                                                     tuple(range(-len(axes), 0))), len(axes)), fmt, flushes)
+
+
+def _flattened(moved: np.ndarray, reduced: int) -> np.ndarray:
+    """`moved`, its last `reduced` axes (a reduction's, moved last) one axis of their extents' product,
+    counted from their extents rather than inferred, so an array of no elements keeps its own (a sum over
+    axis 1 of a `(0, 3)` operand is `(0, 3)`, where `reshape(0, -1)` refused it: the audit of 2026-11-19pm,
+    8965)."""
+    kept = moved.shape[:moved.ndim - reduced]
+    return moved.reshape(*kept, int(np.prod(moved.shape[len(kept):], dtype=np.int64)))
 
 
 def _cumulative(params, operands, result, fmt):
@@ -813,8 +820,8 @@ def _pair_held(params, operands, results, fmt) -> list[np.ndarray]:
     axes = tuple(params["dimensions"])
     # A reduce's operands are its arrays, then each one's initial value, every output's first term.
     arrays, initial = operands[:len(operands) // 2], operands[len(operands) // 2:]
-    terms = [np.moveaxis(_read(value, flushes), axes, range(-len(axes), 0)) for value in arrays]
-    terms = np.concatenate([value.reshape(*value.shape[:value.ndim - len(axes)], -1) for value in terms], -1)
+    terms = np.concatenate([_flattened(np.moveaxis(_read(value, flushes), axes, range(-len(axes), 0)),
+                                       len(axes)) for value in arrays], -1)
     starts = np.broadcast_to(np.stack([_read(value, flushes) for value in initial]), (*terms.shape[:-1], 2))
     terms = np.concatenate([starts, terms], -1)
     count = terms.shape[-1] // 2
@@ -960,8 +967,8 @@ def _extremum(choose, integral):
         (value,) = operands
         if fmt is None:
             return np.asarray(result) == integral(np.asarray(value), axes)
-        moved = np.moveaxis(_read(value, lane().flushes), axes, tuple(range(-len(axes), 0)))
-        flat = moved.reshape(*moved.shape[:moved.ndim - len(axes)], -1)
+        flat = _flattened(np.moveaxis(_read(value, lane().flushes), axes, tuple(range(-len(axes), 0))),
+                          len(axes))
         if flat.shape[-1] == 0:
             identity = -np.inf if choose is _signed_max else np.inf
             return _same(result, np.full(flat.shape[:-1], identity))

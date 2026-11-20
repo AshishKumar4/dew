@@ -405,7 +405,7 @@ def step() -> None:
                    "draw/noise": replayed[2].transpose(last)})
     for dtype in (torch.float64, torch.float32):
         arrays.update(run(dtype, drawn, pixels, classes, replayed))
-    np.savez(FIXTURE / "step.npz", **arrays)
+    np.savez(FIXTURE / "step.npz", allow_pickle=False, **arrays)
     print(f"{FIXTURE / 'step.npz'}: one step, {int(dropped.sum())} of {BATCH} labels dropped, "
           f"{sum(1 for name in arrays if name.startswith('grad/') and name.endswith('_f64'))} gradients")
 

@@ -47,19 +47,25 @@ from __future__ import annotations
 import copy
 import json
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline
+from reference_releases import commit
 
 from _dew_torch.precision import float64, float64_twin
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "fixtures" / "hf" / "qwen-image-2.1-source"
-DIFFUSERS_COMMIT = "6256aa7666cedd47443adc8f82da9a10e110b09c"
-BASE = dict(patch_size=1, in_channels=8, out_channels=8, num_layers=2, attention_head_dim=12,
+COHORT = "diffusers-qwen-image"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+DIFFUSERS_COMMIT = commit("diffusers-qwen-image", "diffusers")
+BASE: dict[str, Any] = dict(patch_size=1, in_channels=8, out_channels=8, num_layers=2, attention_head_dim=12,
             num_attention_heads=2, context_in_dim=16, mlp_ratio=3, axes_dims_rope=(4, 4, 4),
             eps=1e-6, causal_condition=True)
 SEED = 29
@@ -138,7 +144,7 @@ def walked(model, case: Case, inputs: dict[str, np.ndarray], dtype) -> dict[str,
 
 def build(name: str, case: Case, root: Path):
     """The case's saved transformer, its float32 model as saved."""
-    from diffusers import QwenImage21Transformer2DModel
+    from diffusers.models.transformers.transformer_qwenimage21 import QwenImage21Transformer2DModel
 
     config = {**BASE, **case.config}
     torch.manual_seed(SEED)
@@ -151,13 +157,13 @@ def build(name: str, case: Case, root: Path):
 
 
 # The pipeline half.
-PIPELINE = dict(BASE)
+PIPELINE: dict[str, Any] = dict(BASE)
 PROMPTS = ["a red cat on a mat", "sky"]
 HEIGHT, WIDTH = 64, 96
-VAE = dict(base_dim=4, decoder_base_dim=6, z_dim=8, dim_mult=[1, 2, 2, 2, 2], num_res_blocks=1,
-           attn_scales=[], temperal_downsample=[False, True, True, True], dropout=0.0,
-           is_residual=True, in_channels=4, out_channels=4, patch_size=None,
-           scale_factor_spatial=16, scale_factor_temporal=8)
+VAE: dict[str, Any] = dict(
+    base_dim=4, decoder_base_dim=6, z_dim=8, dim_mult=[1, 2, 2, 2, 2], num_res_blocks=1, attn_scales=[],
+    temperal_downsample=[False, True, True, True], dropout=0.0, is_residual=True, in_channels=4,
+    out_channels=4, patch_size=None, scale_factor_spatial=16, scale_factor_temporal=8)
 
 
 def processor():
@@ -200,12 +206,10 @@ def text_encoder(tok):
 
 
 def build_pipeline(root: Path):
-    from diffusers import (
-        AutoencoderKLQwenImage21,
-        FlowMatchEulerDiscreteScheduler,
-        QwenImage21Pipeline,
-        QwenImage21Transformer2DModel,
-    )
+    from diffusers.models.autoencoders.autoencoder_kl_qwenimage21 import AutoencoderKLQwenImage21
+    from diffusers.models.transformers.transformer_qwenimage21 import QwenImage21Transformer2DModel
+    from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import QwenImage21Pipeline
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
     directory = root / "pipeline"
     proc = processor()
@@ -218,8 +222,10 @@ def build_pipeline(root: Path):
         latents_std=published["latents_std"][:VAE["z_dim"]]).eval()
     transformer = QwenImage21Transformer2DModel(**PIPELINE).eval()
     perturb(torch.Generator().manual_seed(SEED + 8), 0.05, vae, transformer)
+    flow = FlowMatchEulerDiscreteScheduler.from_config(scheduler)
+    assert isinstance(flow, FlowMatchEulerDiscreteScheduler)  # No return_unused_kwargs.
     pipe = QwenImage21Pipeline(
-        scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler), vae=vae,
+        scheduler=flow, vae=vae,
         text_encoder=encoder, processor=proc, transformer=transformer)
     return saved_pipeline(pipe, directory, HEIGHT, WIDTH)
 
@@ -257,7 +263,7 @@ def pipeline_walked(pipe, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.
     return arrays
 
 
-def record_seeds(record: dict, models: dict[str, object], pipe) -> dict[str, np.ndarray]:
+def record_seeds(record: dict, models: Mapping[str, torch.nn.Module], pipe) -> dict[str, np.ndarray]:
     """Check 1's recordings over seeds (`record_case`), over tests/qwen_image_draws.py's draws of the
     fixture's `record`, in float32, the reference, and on the float64 twin (`float64_twin`, the pipeline's
     scheduler tables widened by `float64_scheduler`), the truth: each case's walk (`walked`) summarized,
@@ -301,7 +307,7 @@ def main(destination: str) -> None:
 
     import diffusers
     import transformers
-    from diffusers import QwenImage21Pipeline
+    from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import QwenImage21Pipeline
     from recorded_references import provenance, save
 
     root = recording(destination, "qwen-image")

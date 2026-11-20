@@ -29,10 +29,13 @@ checks its greedy path, so the path is the model's and not a rounding.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import torch
 import transformers
 from numerics_reference import FIXTURES, NEW_TOKENS, decoder, prompts, teacher_forced
+
 
 FAMILIES = ("llama-tiny", "qwen3-tiny")
 STOPS = (2, 4)
@@ -67,6 +70,9 @@ def write(name: str) -> None:
     model = decoder(name, torch.float32)
     exact = decoder(name, torch.float64)
     model.generation_config.eos_token_id = None
+    # generate takes its model as GenerationMixin's host protocol, which every model meets at runtime and
+    # none in its static type.
+    generating: Any = model
     with np.load(directory / "generate.npz") as stored:
         greedy = stored["greedy_tokens"]
         # The fp32 decode's error on the committed greedy path, the rounding
@@ -84,7 +90,7 @@ def write(name: str) -> None:
     margins = []
     for path, extra in (("eos", {}), ("min_new", {"min_new_tokens": MIN_NEW})):
         with torch.no_grad():
-            sequences = model.generate(**common, **extra).numpy()
+            sequences = generating.generate(**common, **extra).numpy()
         tokens = sequences[:, width:]
         assert tokens.shape == (len(ids), NEW_TOKENS), tokens.shape
         f64 = teacher_forced(exact, sequences, mask, width)
@@ -101,7 +107,7 @@ def write(name: str) -> None:
     for row in range(len(ids)):
         real = ids[row, width - int(mask[row].sum()):]
         with torch.no_grad():
-            sequence = model.generate(input_ids=torch.from_numpy(real)[None], max_length=MAX_LENGTH,
+            sequence = generating.generate(input_ids=torch.from_numpy(real)[None], max_length=MAX_LENGTH,
                                       pad_token_id=pad, eos_token_id=None, do_sample=False, num_beams=1,
                                       use_cache=True).numpy()[0]
         drawn = sequence[len(real):]
@@ -114,7 +120,7 @@ def write(name: str) -> None:
           f"fp32 decode error on the greedy path {error:.3e}")
     if min(margins) <= 4 * error:
         raise SystemExit(f"{name}: a margin within four fp32 decode errors")
-    np.savez(directory / "stopping.npz", **arrays)
+    np.savez(directory / "stopping.npz", allow_pickle=False, **arrays)
 
 
 def main() -> None:

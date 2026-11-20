@@ -126,3 +126,13 @@ def record_batches(records, batch: int, validation=None, *, loading=None):
 
     held = None if validation is None else Memory(validation).batch(batch)
     return compile(Memory(records).batch(batch), validation=held, read="memory", loading=loading)
+
+
+@dataclasses.dataclass(frozen=True)
+class Fetched:
+    """A record as a live fetch returns it, which may differ between reads (`Volatile`)."""
+
+    volatile: bool = True
+
+    def __call__(self, row):
+        return row

@@ -34,12 +34,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from parity_rl import ActorConfig, load_verl, stub
+from reference_releases import commit
 from reference_source import git_head, loaded
 
 SOURCES = Path.home() / ".cache/dew/research/src"
 VERL = SOURCES / "verl"
 LIGHTNING = SOURCES / "agent-lightning"
-VERL_REVISION = "12ebe0cb4d300c58449fb6c675379e8700015c51"
+VERL_REVISION = commit("verl-agentic", "verl")
 LIGHTNING_REVISION = "ff9457587fb6ec900e16e93be9ad2d77409afa08"
 OUTPUT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "rl" / "agentic.npz"
 
@@ -138,9 +139,9 @@ def main() -> None:
     band, band_metrics = helper.compute_rollout_correction_weights(
         log_ratio, mask, rollout_is="token", rollout_is_threshold=f"{BAND[0]}_{BAND[1]}")
     out.update(tis_weights=tis.numpy(), band_weights=band.numpy(),
-               tis_ess=np.float32(tis_metrics["rollout_is_eff_sample_size"]),
-               band_ess=np.float32(band_metrics["rollout_is_eff_sample_size"]),
-               band_oob=np.float32(band_metrics["rollout_is_oob_ratio"]))
+               tis_ess=np.asarray(tis_metrics["rollout_is_eff_sample_size"], np.float32),
+               band_ess=np.asarray(band_metrics["rollout_is_eff_sample_size"], np.float32),
+               band_oob=np.asarray(band_metrics["rollout_is_oob_ratio"], np.float32))
     run("ppo_band_token", core.compute_policy_loss_vanilla, "token-mean", band)
     run("ppo_tis_token", core.compute_policy_loss_vanilla, "token-mean", tis)
 
@@ -165,7 +166,8 @@ def main() -> None:
             response_mask=rejected)
 
     offpolicy = helper.compute_offpolicy_metrics(old, behavior, mask)
-    out.update(offpolicy_kl=np.float32(offpolicy["kl"]), offpolicy_k3_kl=np.float32(offpolicy["k3_kl"]))
+    out.update(offpolicy_kl=np.asarray(offpolicy["kl"], np.float32),
+               offpolicy_k3_kl=np.asarray(offpolicy["k3_kl"], np.float32))
 
     scaled = lightning.normalize_advantages_by_rollout(advantages, mask, ROLLOUTS,
                                                         num_trained_rows=len(ROLLOUTS))
@@ -175,7 +177,7 @@ def main() -> None:
     assert current.grad is not None
     out.update(per_rollout_loss=per_rollout.detach().numpy(), per_rollout_grad=current.grad.numpy())
 
-    np.savez(OUTPUT, verl_revision=np.asarray(VERL_REVISION),
+    np.savez(OUTPUT, allow_pickle=False, verl_revision=np.asarray(VERL_REVISION),
              lightning_revision=np.asarray(LIGHTNING_REVISION), torch_version=np.asarray(torch.__version__),
              old=OLD, behavior=BEHAVIOR, current=CURRENT, mask=MASK, advantages=ADVANTAGES,
              rollouts=np.asarray(ROLLOUTS), epsilon_low=np.float32(EPSILON_LOW),

@@ -28,6 +28,7 @@ them, which a hash stops at.
 import json
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -87,13 +88,14 @@ def release_ple_ids(config: dict) -> dict[str, np.ndarray]:
     module hashes, then gathers from a 51B-row table, whose stand-in hands the ids back."""
     text = Qwen4ExpTextConfig(**{key: value for key, value in config['text_config'].items()
                                  if key not in ('model_type', 'architectures')})
-    embedding = modeling_qwen4_exp.nn.Embedding
-    modeling_qwen4_exp.nn.Embedding = _Unallocated
-    try:
+    if text.ple_embed_dim is None:
+        raise ValueError("the release's text config names no per-layer embedding width")
+    # The module's table built as the stand-in (torch.nn, which the modeling module builds it from).
+    with patch.object(torch.nn, "Embedding", _Unallocated):
         ngram = modeling_qwen4_exp.Qwen4ExpTextNGramEmbedding(text, text.ple_embed_dim, layer_idx=1)
-    finally:
-        modeling_qwen4_exp.nn.Embedding = embedding
     eos = text.eos_token_id[0] if isinstance(text.eos_token_id, list) else text.eos_token_id
+    if eos is None:
+        raise ValueError("the release's text config names no end-of-sequence id")
     rows = np.random.RandomState(11).randint(0, text.vocab_size, (3, 16)).astype(np.int64)
     rows[0, 5] = rows[1, 0] = rows[1, 9] = rows[2, 14] = eos
     with torch.no_grad():
@@ -107,7 +109,7 @@ def write_release() -> None:
     directory = FIXTURES / 'qwen3.8-flash-next'
     write_released_config(directory.name, *RELEASE)
     config = json.loads((directory / 'config.json').read_text())
-    np.savez(directory / 'release_ple_ids.npz', **release_ple_ids(config))
+    np.savez(directory / 'release_ple_ids.npz', allow_pickle=False, **release_ple_ids(config))
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
 
 
