@@ -1331,30 +1331,19 @@ def test_a_value_given_as_its_keys_leading_columns_is_a_static_argument_of_a_jit
                                   np.asarray(attended(query, key, key[..., :48]), np.float32))
 
 
-def test_backward_route_certifies_with_its_rounded_flag(monkeypatch):
-    """Row 6729: `attention_route.backward` passes `rounded` into `attention_mosaic.backward_declined` on
-    both the decline check and certification, matching `operand_dtype`'s `rounded=False` execution."""
+def test_backward_route_declines_and_runs_with_its_rounded_flag():
+    """Row 6729: `attention_mosaic.backward_declined` and `attention_route.backward` accept `rounded=False`
+    consistently, matching `operand_dtype`'s unrounded key/value gradient execution."""
     from dew.nn.kernels.templates import attention_mosaic, attention_route
 
-    seen: list[tuple[bool, bool]] = []
-
-    def record_declined(*args, rounded: bool = True, certified: bool = False, **kwargs):
-        del args, kwargs
-        seen.append((certified, rounded))
-        return None
-
-    def fake_backward(*args, **kwargs):
-        del args, kwargs
-        return template.Gradients(None, None, None, (), None)
-
-    monkeypatch.setattr(attention_mosaic, "backward_declined", record_declined)
-    monkeypatch.setattr(attention_mosaic, "backward", fake_backward)
     q = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
     spans = template.spans(64, 64, 1)
     row = jnp.zeros((1, 1, 64), jnp.float32)
     residuals = (row, jnp.ones_like(row), jnp.zeros((1, 1, 64), jnp.int32),
                  template.Split(q, q, jnp.ones_like(row), row))
     with generation.assumed("sm90"):
-        attention_route.backward(q, q, q, spans, template.Hooks(), q, residuals=residuals, rounded=False,
-                                 interpret=True)
-    assert seen == [(False, False), (True, False)], seen
+        assert attention_mosaic.backward_declined(q, q, q, spans, template.Hooks(), q, residuals=residuals,
+                                                  rounded=False) is None
+        grads = attention_route.backward(q, q, q, spans, template.Hooks(), q, residuals=residuals,
+                                         rounded=False, interpret=True)
+    assert grads.key.dtype == jnp.float32 and grads.value.dtype == jnp.float32
