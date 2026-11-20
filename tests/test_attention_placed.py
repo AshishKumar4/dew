@@ -24,6 +24,7 @@ from test_attention_mosaic import (
 )
 from test_attention_template import CASES, arguments, geometry as core_geometry
 
+from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic
 
@@ -252,28 +253,26 @@ def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
 
 
 def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
-    """Placed-forward derivation uses rounded TMEM residency (`resources.register_model`) when deciding
-    whether to place Q in TMEM, proved through the public `attention_mosaic.forward` route and its emitted
-    `RegisterModel` (rows 9105, 9475, 9479):
+    """Placed-forward derivation uses rounded TMEM and SMEM residency (`resources.register_model`) when
+    deciding whether to place Q in TMEM, proved through the public `attention_mosaic.forward` route and its
+    emitted `RegisterModel` (rows 9105, 9475, 9479, 9527, 9530):
     - `q64/v32` (`columns=32`, 48 KiB SMEM): 160 base cols -> 256 rounded, 192 with Q -> 256 rounded; raw
       `512 // 160 = 3` vs rounded `512 // 256 = 2`; keeps Q in TMEM and emits `RegisterModel.most == 2`.
     - `q128/v128` (256 base cols -> 256 rounded = 2 CTAs/SM, 320 with Q -> 512 rounded = 1 CTA/SM): drops
-      residency 2 -> 1, so Q stays in SMEM and emits `RegisterModel.most == 2`."""
+      residency 2 -> 1, so Q stays in SMEM and emits `RegisterModel.most == 2`.
+    - `q128/v64` (`stages=5`, >120 KiB K/V rings): 192 cols with Q -> 256 rounded (2 CTAs/SM by TMEM and
+      registers) while SMEM caps residency at 1; keeps Q in TMEM and emits `RegisterModel.most == 1`."""
     from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
 
     from dew.nn.kernels.templates import report
 
     def has_tmem_copy(jaxpr) -> bool:
-        for eq in jaxpr.eqns:
-            if eq.primitive is gpu_primitives.async_copy_smem_to_tmem_p:
-                return True
-            if any(has_tmem_copy(sub) for sub in jax.extend.core.jaxprs_in_params(eq.params)):
-                return True
-        return False
+        return any(eq.primitive is gpu_primitives.async_copy_smem_to_tmem_p
+                   for eq in programs.equations(jaxpr))
 
     def traced_models(jaxpr) -> list:
         found = []
-        for eq in jaxpr.eqns:
+        for eq in programs.equations(jaxpr):
             name = eq.params.get("name")
             if isinstance(name, str):
                 kernel, launch = report.kernel_of(name)
@@ -281,18 +280,19 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
                         and getattr(record.config, "family", None) == "tcgen05.rows"
                         and kernel in record.kernels):
                     found.append(record.kernels[kernel])
-            for sub in jax.extend.core.jaxprs_in_params(eq.params):
-                found.extend(traced_models(sub))
         return found
 
     target = generation.gpu_target("sm100")
     spans = template.spans(128, 256, 1)
     v32_tiles = dataclasses.replace(ROWS_TILES, columns=32)
+    smem_tiles = dataclasses.replace(ROWS_TILES, stages=5)
     # q64/v32 (48 KiB SMEM, 4 CTAs/SM SMEM cap): 160 base cols -> 256 rounded (2 CTAs) vs raw 512//160=3;
     # 192 with Q -> 256 rounded (2 CTAs) vs raw 512//192=2; distinguishes rounded from raw residency.
     # q128/v128: 256 base cols (2 CTAs) vs 320 with Q -> 512 rounded (1 CTA); rejects Q in TMEM.
+    # q128/v64 (stages=5, >120 KiB rings): TMEM (192->256) and registers allow 2 CTAs, SMEM caps to 1.
     for q_width, v_width, pinned, expect_cols, expect_copy, expect_most in (
-            (64, 32, v32_tiles, 192, True, 2), (128, 128, ROWS_TILES, 256, False, 2)):
+            (64, 32, v32_tiles, 192, True, 2), (128, 128, ROWS_TILES, 256, False, 2),
+            (128, 64, smem_tiles, 192, True, 1)):
         q = jnp.ones((1, 128, 1, q_width), jnp.bfloat16)
         k = jnp.ones((1, 256, 1, q_width), jnp.bfloat16)
         v = jnp.ones((1, 256, 1, v_width), jnp.bfloat16)
@@ -310,17 +310,14 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
 
     def block_copies(jaxpr) -> dict[int, bool]:
         """Map each tcgen05.rows kernel's V-block width (operand 2's last dim) to whether it copies Q."""
-        found: dict[int, bool] = {}
-        for eq in jaxpr.eqns:
-            name = eq.params.get("name")
-            if (isinstance(name, str) and (launch := report.kernel_of(name)[1]) is not None
-                    and (record := report.traced(launch)) is not None
-                    and getattr(record.config, "family", None) == "tcgen05.rows"):
-                found[eq.invars[2].aval.shape[-1]] = any(
-                    has_tmem_copy(sub) for sub in jax.extend.core.jaxprs_in_params(eq.params))
-            for sub in jax.extend.core.jaxprs_in_params(eq.params):
-                found.update(block_copies(sub))
-        return found
+        return {
+            eq.invars[2].aval.shape[-1]: any(
+                has_tmem_copy(sub) for sub in jax.extend.core.jaxprs_in_params(eq.params))
+            for eq in programs.equations(jaxpr)
+            if (isinstance(name := eq.params.get("name"), str)
+                and (launch := report.kernel_of(name)[1]) is not None
+                and (record := report.traced(launch)) is not None
+                and getattr(record.config, "family", None) == "tcgen05.rows")}
 
     # Nonuniform legal column pins:
     # - q64/v192 (padded 256, columns=192 -> blocks 192 and 64): both 192 and 64 tail place Q in TMEM.
