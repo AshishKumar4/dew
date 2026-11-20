@@ -11,6 +11,7 @@ from flax import linen as nn
 from reference_error import assert_as_exact, dew_path
 from test_chunk_adaptation import LENGTH, LEVEL, MODEL, VOCAB, decoder, drawn_variables
 
+from dew.batch import token_coordinates
 from dew.inference.tasks import TextGeneration
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.adaptation import ChunkAdaptation, InContextDecoder, adapted_scores
@@ -50,7 +51,8 @@ def trained(model, adaptation: ChunkAdaptation):
     next token, the last slot's weighing nothing."""
     def run(variables, tokens, mask):
         fields = {"attention_mask": mask}
-        hidden = model.apply(variables, tokens, attention_mask=mask, method="hidden_states")
+        hidden = model.apply(variables, tokens, coordinates=token_coordinates(tokens.shape, valid=mask),
+                             method="hidden_states")
         targets = jnp.concatenate([tokens[:, 1:], tokens[:, :1]], axis=1)
         weights = jnp.ones(tokens.shape, jnp.float32).at[:, -1].set(0)
         return adapted_scores(model, variables, hidden, targets, weights, fields, adaptation, predict=False,
