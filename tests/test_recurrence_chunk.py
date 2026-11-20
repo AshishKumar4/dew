@@ -178,7 +178,7 @@ independently by `seeds_for` on armada (2026-10-21; the readouts apart 2026-11-1
 memory entering and a document starting on a chunk's first token."""
 
 
-PACKED = ((0, 23, 40), (9, 48))
+PACKED_DOCUMENTS = ((0, 23, 40), (9, 48))
 """`draw`'s packed documents: each row's documents' first tokens."""
 
 
@@ -280,7 +280,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     if hooks.output is not None:
         epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
-    starts = jnp.asarray(marked(PACKED, length)) if packed else None
+    starts = jnp.asarray(marked(PACKED_DOCUMENTS, length)) if packed else None
     own = {'own': hosted(0.5 * normal((value_heads, KEY_WIDTH))[..., key_order])} if hooks.own_weight else {}
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated

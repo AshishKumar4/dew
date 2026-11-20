@@ -39,7 +39,7 @@ from ssd_support import mamba_side
 from test_recurrence_chunk import (
     FORMED,
     LENGTH,
-    PACKED,
+    PACKED_DOCUMENTS,
     VALUE_HEADS,
     against_the_portable_math,
     chunk_on,
@@ -171,11 +171,11 @@ def _leaves(results) -> dict:
 
 
 def _starts(case: dict[str, str]):
-    """`case`'s documents' first tokens (`draw`'s, `PACKED`, the same for every seed), None for one sequence:
-    the host's NumPy marks, which place nothing on a device before a site (row 7868)."""
+    """`case`'s documents' first tokens (`draw`'s, `PACKED_DOCUMENTS`, the same for every seed), None for one
+    sequence: the host's NumPy marks, which place nothing on a device before a site (row 7868)."""
     if case["documents"] != "packed":
         return None
-    return marked(PACKED, LENGTH)
+    return marked(PACKED_DOCUMENTS, LENGTH)
 
 
 def _step(case: dict[str, str], kernel: str):
