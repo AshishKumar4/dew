@@ -896,24 +896,25 @@ def _compiled_here(cases, generation: str) -> list[dict]:
             # its schedule lowers to (`producer_failures`).
             record["stated_models"] = {
                 report.launch_name(kernel["kernel"], kernel["launch"]): stated.record() for kernel in kernels
-                if kernel["launched"] is not None
+                if kernel.get("kind") != "triton" and kernel["launched"] is not None
                 and (launch := report.traced(kernel["launched"])) is not None
                 and (stated := launch.kernels.get(kernel["kernel"])) is not None}
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [inherited(kernel, compiled, generation) for kernel in kernels]
             printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
             for kernel in record["kernels"]:
-                name = report.launch_name(kernel["kernel"], kernel["launch"])
-                if kernel["module"] is not None and name in printed:
-                    PTX[kernel["module"]] = printed[name]
-                ptx = printed.get(name, PTX.get(kernel["module"], ""))
-                # Whether this process dumped its PTX: none where its Mosaic module compiled before the
-                # gate's; a Pallas-Triton binary dumps no Mosaic PTX (its cubin carries its evidence).
-                kernel["dumped"] = bool(ptx) or kernel.get("kind") == "triton"
-                # The registers its launch runs a thread at, as its compile states them: its consumers' raise
-                # where it raises, else its threads' share of the multiprocessor's registers at the programs
-                # it is launched to hold (`resources.thread_share`); None where its binary states no threads.
-                programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
+                if kernel.get("kind") == "triton":
+                    kernel["dumped"] = True
+                    programs = 1
+                else:
+                    name = report.launch_name(kernel["kernel"], kernel["launch"])
+                    if kernel["module"] is not None and name in printed:
+                        PTX[kernel["module"]] = printed[name]
+                    ptx = printed.get(name, PTX.get(kernel["module"], ""))
+                    # Whether this process dumped its PTX: none where its Mosaic module compiled before the
+                    # gate's.
+                    kernel["dumped"] = bool(ptx)
+                    programs = int(held.group(1)) if (held := PROGRAMS.search(ptx)) else 1
                 with assumed(gpu_target(generation)):
                     kernel["cap"] = (kernel["raised"] if kernel["raised"] is not None
                                      else None if kernel["threads"] is None
@@ -940,7 +941,8 @@ def mosaic_failures(found: list[dict]) -> list[str]:
             found_kernel = _report(kernel)
             if (why := found_kernel.failure(record["limit"], record["tmem_limit"])) is not None:
                 failed.append(f"{record['name']} {found_kernel.kernel}: {why}")
-            stated = record.get("models", {}).get(found_kernel.kernel)
+            stated = (None if found_kernel.kind == "triton"
+                      else record.get("models", {}).get(found_kernel.kernel))
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
                               f"bytes of shared memory, the kernel asks for {found_kernel.shared}")
@@ -956,6 +958,8 @@ def producer_failures(found: list[dict]) -> list[str]:
     for record in found:
         for kernel in record.get("kernels", ()):
             found_kernel = _report(kernel)
+            if found_kernel.kind == "triton":
+                continue
             stated = record.get("stated_models", {}).get(found_kernel.traced,
                                                           record.get("models", {}).get(found_kernel.kernel))
             if stated is None or not stated["producer"]:

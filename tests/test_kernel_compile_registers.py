@@ -191,6 +191,16 @@ def test_a_triton_template_binary_in_compile_mosaic_kernels_reports_shared_regis
     mosaic_bin = report.Binary("attention_forward", "0123456789", 64, 0, "mosaic_gpu", shared=1024, sass=())
     both = kc.reports(mosaic_est, [clean, mosaic_bin], {})
     assert {r.kind for r in both} == {"mosaic_gpu", "triton"}, both
+    # A Mosaic model with a moving producer applies only to the Mosaic kernel, not its clean Triton sibling.
+    mosaic_item = {**dataclasses.asdict(next(r for r in both if r.kind == "mosaic_gpu")),
+                   "registers": 64, "spilled": 0, "decreased": 40}
+    triton_item = dataclasses.asdict(next(r for r in both if r.kind == "triton"))
+    mixed_rec = {"name": "decode", "limit": 166912, "tmem_limit": 0,
+                 "kernels": [mosaic_item, triton_item],
+                 "models": {"attention_forward": {"shared": 1024, "producer": 40, "moves": True}},
+                 "stated_models": {"attention_forward__l0123456789": {"shared": 1024, "producer": 40,
+                                                                       "moves": True}}}
+    assert kc.mosaic_failures([mixed_rec]) == []
 
 
 @lowers("sm80")
