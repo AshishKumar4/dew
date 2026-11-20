@@ -291,8 +291,8 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
     args = corrected if corrected is not None else get_callable_args(made, Affine.decayed)
     across = None
     if args is None and (two_sided := get_callable_args(made, Affine.decayed_across)) is not None:
-        *head, across, left, right = two_sided
-        args = (*head, left, right)
+        base2, per_key, exponent, across, left, right = two_sided
+        args = (base2, per_key, exponent, left, right)
     if args is None:
         raise Refused("the update is not a decayed state, exp(z) a scalar's or each key's, plus a rank-one "
                       f"input and corrections of the decayed state along the input's vector{stopped}")

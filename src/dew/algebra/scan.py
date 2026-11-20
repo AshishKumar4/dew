@@ -315,8 +315,9 @@ def _stepped(state, prepared: Prepared, issue=None):
                       "(`prepare(chunk, transition=True)`)")
     transfer = (None if state.transfer is None
                 else (issue or _issued)("transfer_compose", prepared.transition, state.transfer))
-    across = (None if prepared.across is None
-              else _held(state.across + prepared.across.astype(state.across.dtype)))
+    across = state.across
+    if across is not None and prepared.across is not None:
+        across = _held(across + prepared.across.astype(across.dtype))
     return Walk(decay, leaving, transfer, across)
 
 
@@ -573,7 +574,7 @@ def _merged(a, b, carried, issue: Callable) -> Walk:
         h = issue("transfer_apply", b.transfer, a.h) + b.h
         transfer = (issue("transfer_decay", accurate_exp(a.decay), b.transfer) if a.transfer is None
                     else issue("transfer_compose", b.transfer, a.transfer))
-    across = None if b.across is None else _held(a.across + b.across)
+    across = None if a.across is None or b.across is None else _held(a.across + b.across)
     if carried is None:
         return Walk(_held(a.decay + b.decay), h, transfer, across)
     return Walk(_held(a.decay + b.decay), h.astype(carried),
