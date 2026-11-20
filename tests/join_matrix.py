@@ -199,8 +199,9 @@ def per_shard(choice: str, kernel: str) -> dict:
 
 
     def truth(*operands):
-        # The layer in float64 through XLA's products, which a float64 product runs on.
-        with generation.chosen(grouped_matmul="xla"):
+        # The layer in float64 through XLA's products, which a float64 product runs on, its projections apart:
+        # joined, a named grouped product other than the template's is refused (`joined.BESIDE_SUPPORTS`).
+        with generation.chosen(grouped_matmul="xla", **{case["join"]: "apart"}):
             return with_gradients(_wide(layer).apply)(*operands)
 
     named = {**UNFUSED, "grouped_matmul": "mosaic"}
