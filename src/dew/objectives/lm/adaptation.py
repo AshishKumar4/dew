@@ -778,9 +778,9 @@ class InContextDecoder(nn.Module):
         """Open the trunk's decode cache for `batch_size` rows and each row's chain beside it, no slot
         waiting (`CausalTransformer.init_cache`)."""
         self.decoder.init_cache(batch_size)
-        self.put_variable("cache", IN_CONTEXT, self._opened(batch_size))
+        self.put_variable("cache", IN_CONTEXT, self._decode_opened(batch_size))
 
-    def _chain(self, rows: int) -> _Chain:
+    def _decode_chain(self, rows: int) -> _Chain:
         """The training scan's chain over `rows` rows (`adapted_scores`'s), its windows straddling a row's
         slots one at a time, at the model's variables but its cache."""
         variables = {name: tree for name, tree in self.variables.items() if name != "cache"}
@@ -790,9 +790,9 @@ class InContextDecoder(nn.Module):
         return _Chain(self.model, variables, names, starts, self.adaptation, straddles=True, predict=False,
                       rows=rows)
 
-    def _opened(self, rows: int) -> dict:
+    def _decode_opened(self, rows: int) -> dict:
         """Each row's chain before its first real token (`adapted_scores`'s first carry), no slot waiting."""
-        chain = self._chain(rows)
+        chain = self._decode_chain(rows)
         count = len(chain.starts)
         zeros = tuple(jax.tree.map(jnp.zeros_like, level) for level in chain.started)
         nothing = _gathered(jnp.zeros((rows, 1), bool), jnp.zeros((rows, 1, _WIDTH), jnp.float32))
@@ -822,8 +822,8 @@ class InContextDecoder(nn.Module):
         valid = None if laid is None else laid.valid
         real = jnp.ones(tokens.shape[:2], bool) if valid is None else jnp.asarray(valid, bool)
         held = (self.get_variable("cache", IN_CONTEXT) if self.has_variable("cache", IN_CONTEXT)
-                else self._opened(rows))
-        chain = self._chain(rows)
+                else self._decode_opened(rows))
+        chain = self._decode_chain(rows)
         windows = self.adaptation.windows(len(chain.starts))
         nothing = jnp.zeros((rows, 1), jnp.float32)
         runs = jnp.ones((rows, 1), jnp.int32)
