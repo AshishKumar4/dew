@@ -199,7 +199,8 @@ def _certified_native(query, key, value, *, causal: bool, site: str):
         return jnp.asarray(tiles.block_k, jnp.int32), result
 
     shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in (query, key, value))
-    label = f"attention witness, {site}, {'causal' if causal else 'full'}, {generation.assumption()}, {shapes}"
+    form = "causal" if causal else "full"
+    label = f"attention witness, {site}, {form}, {generation.assumption()}, {shapes}"
     block_k, found = ahead_arm(jax.jit(program), label)(query, key, value)
     return int(np.asarray(block_k)), found
 
