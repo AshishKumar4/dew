@@ -2109,20 +2109,20 @@ def test_a_token_mixture_of_published_generations_weighs_the_targets_each_states
 
 
 def test_a_streamed_token_mix_of_stated_counts_draws_as_its_indexed_read(tmp_path):
-    """A mix by tokens of two published generations, each stating its rows and valid targets, read as a
-    stream draws its members as its indexed read does, each weighed by the counts its member states
-    (row 9010: the stream kept a deficit of the targets it read, whatever its members stated)."""
+    """A mix by tokens of two published generations, each stating its rows and valid targets, its members
+    read as streams (prefetched), draws them as its indexed read does, each weighed by the counts its member
+    states (row 9010: the streams kept a deficit of the targets they read, whatever their members stated)."""
     members = [published_tokens(tmp_path, "short", 1), published_tokens(tmp_path, "long", 2)]
 
-    def ids(read: str) -> list[int]:
-        mixed = mix(members, weights=[1, 3], by="tokens")
+    def ids(read: str, chains: list[Pipeline]) -> list[int]:
+        mixed = mix(chains, weights=[1, 3], by="tokens")
         reader = compile(mixed.repeat().batch(1), read=read, loading=READ).train(DataPartition())
         try:
             return [int(identity) for batch in itertools.islice(reader, 40) for identity in batch["id"]]
         finally:
             reader.close()
 
-    assert ids("streamed") == ids("indexed")
+    assert ids("streamed", [member.prefetch() for member in members]) == ids("indexed", members)
 
 
 TEXTS = {"short": " ".join(["short"] * 3), "long": " ".join(["long"] * 10)}

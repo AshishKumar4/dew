@@ -985,7 +985,7 @@ def _analyzed(
         None if absorbed is None else absorbed[0],
         epochs,
         tuple(at for at, stage in enumerate(stages) if at >= eager and isinstance(stage, TokenSplit)),
-        _order(source, lowered, stages, streamed=per_share and read == "streamed"),
+        _order(source, lowered, stages, streamed=per_share and read != "memory"),
         parts_unending,
         unending,
         records_unending,
