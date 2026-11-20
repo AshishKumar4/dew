@@ -1638,7 +1638,7 @@ def unbroadcast(cotangent, shape: tuple[int, ...]):
 
 
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None,
-               zero_cotangents: bool = False, traced_tangent: bool = False):
+               zero_cotangents: bool = False, traced_tangent: bool = False, summed_first: bool = False):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
@@ -1651,7 +1651,11 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
     tangent is one jvp of `apply` in the residuals and moving leaves a tangent reaches, the others held as
     constants, and reverse mode past the map's own transpose (`pullback`'s) that tangent's, `apply`'s
     declared ones: split into the map and its residuals' part, an aligned sum's two parts added overflowed to
-    inf - inf, and a zero direction met an infinite factor, NaN (row 8757)."""
+    inf - inf, and a zero direction met an infinite factor, NaN (row 8757). With `summed_first`, for a
+    pullback that narrows (an exact widening's cast back), a batch that reaches the map through its cotangent
+    alone pulls back the batch's cotangent summed in its own type, once: pulled back by element and summed
+    after, each element rounded first, and two that cancel overflowed to NaN (base reviews 279405f7f F1 and
+    7fa8fe6c2 F1: a general pullback keeps map-then-reduce, its partial sums its own)."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
@@ -1661,8 +1665,26 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
         traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
         out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
-    primitive = _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents, traced_tangent)
+    primitive = _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents, traced_tangent,
+                                    summed_first)
     return primitive(residuals, moving)
+
+
+def _unmapped(*axes) -> bool:
+    """Whether a batch rule's operands' batch axes (trees of axes, None where unbatched) map none of them."""
+    import jax
+
+    return all(axis is None for axis in jax.tree.leaves(axes, is_leaf=lambda axis: axis is None))
+
+
+def _summed_batch(cotangent):
+    """A batch's cotangent (a tree, the batch its leaves' first axis) summed over the batch in each leaf's own
+    type (`lax.reduce_sum`), whatever x64 scope a pullback runs in; a `float0` leaf's zeros without it."""
+    import jax
+    import numpy as np
+
+    return jax.tree.map(lambda leaf: np.zeros(leaf.shape[1:], jax.dtypes.float0)
+                        if leaf.dtype == jax.dtypes.float0 else jax.lax.reduce_sum(leaf, (0,)), cotangent)
 
 
 @functools.cache
@@ -1713,13 +1735,15 @@ def _linear_primitive() -> type:
         pullback: Callable
         zero_cotangents: bool
         traced_tangent: bool
-        """`linear_map`'s two functions, whether its pullback takes None for a zero cotangent and whether its
-        tangent is one jvp of `apply` (`held_jvp`), `params` that `HiPrim` makes attributes."""
+        summed_first: bool
+        """`linear_map`'s two functions and its flags (`zero_cotangents`, `traced_tangent`, `summed_first`),
+        `params` that `HiPrim` makes attributes."""
 
-        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False, traced_tangent=False):
+        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False, traced_tangent=False,
+                     summed_first=False):
             self.in_avals, self.out_aval = in_avals, out_aval
             self.params = {"apply": apply, "pullback": pullback, "zero_cotangents": zero_cotangents,
-                           "traced_tangent": traced_tangent}
+                           "traced_tangent": traced_tangent, "summed_first": summed_first}
             super().__init__()
 
         def expand(self, *args):
@@ -1770,6 +1794,8 @@ def _linear_primitive() -> type:
                 return jax.vmap(self.apply, in_axes=(residual_axes, moving_axes), **mapped)(residuals, moving)
 
             def pulled(residuals, cotangent):
+                if self.summed_first and _unmapped(residual_axes, moving_axes):
+                    return self.pullback(residuals, _summed_batch(cotangent))
                 back = jax.vmap(self.pullback, in_axes=(residual_axes, 0), **mapped)(residuals, cotangent)
                 leaves, tree = jax.tree.flatten(back)
                 axes = jax.tree.leaves(moving_axes, is_leaf=lambda axis: axis is None)
@@ -1778,7 +1804,7 @@ def _linear_primitive() -> type:
                     for leaf, axis in zip(leaves, axes, strict=True)])
 
             return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents,
-                               traced_tangent=self.traced_tangent),
+                               traced_tangent=self.traced_tangent, summed_first=self.summed_first),
                     jax.tree.map(lambda _: 0, self.out_aval))
 
     return Linear

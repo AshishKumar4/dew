@@ -55,7 +55,14 @@ from dew.nn.derivatives import (
     with_gradients_formed_at,
     with_tangents_formed,
 )
-from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, raw_fields, two_factor_reach
+from dew.nn.float_bits import (
+    exact_power2,
+    float_bits,
+    lowered_rounded,
+    raw_fields,
+    two_factor_reach,
+    widened_exactly,
+)
 from dew.nn.nested import nested
 from dew.nn.programs import UNROUNDED, equations
 from dew.nn.sharding import explicit_spec
@@ -783,8 +790,9 @@ def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
     @_protected
     def wide(*operands):
         with jax.enable_x64(new_val=True):
-            reduced = reduction(*(operand.astype(jnp.float64) if operand.dtype == jnp.float32 else operand
-                                  for operand in operands))
+            # Widened from its bits, where XLA:CPU's cast flushes a subnormal (`widened_exactly`).
+            reduced = reduction(*(widened_exactly(operand, jnp.float64) if operand.dtype == jnp.float32
+                                  else operand for operand in operands))
             return tuple(term.astype(jnp.float32) if term.dtype == jnp.float64 else term for term in reduced)
 
     return tuple(jax.lax.platform_dependent(*operands, cpu=wide, default=lambda *operands: tuple(
@@ -927,7 +935,7 @@ def _summed_wide(product: Callable, preferred_element_type, *operands, counts: i
         pullback is formed in that scope here, for the operands a reverse pass differentiates alone."""
         with jax.enable_x64(new_val=True):
             wide = _widened(operands, counts)
-            wide_cotangent = cotangent.astype(jnp.float64)
+            wide_cotangent = widened_exactly(cotangent, jnp.float64)
 
             def transposed(index):
                 # The product is linear in each operand alone, so its transpose there forms the
@@ -1703,7 +1711,8 @@ def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Arr
         for factor in term:
             if id(factor) not in places:
                 places[id(factor)] = len(factors)
-                factors.append(jnp.asarray(factor, dtype))
+                # Its tangent the cast's, a subnormal kept where XLA:CPU's cast flushes it (row 8966).
+                factors.append(widened_exactly(factor, dtype))
             indices.append(places[id(factor)])
         shape.append(tuple(indices))
     from dew.nn.kernels.launches import interpreting
