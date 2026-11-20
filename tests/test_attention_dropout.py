@@ -816,12 +816,14 @@ def test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term(training, main
 
 
 def test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_gradients():
-    """`test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term`'s call through the portable backward
-    under a cotangent of ones on every output column, which reads the anchor's term: its gradients on par
+    """`test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term`'s call through the Mosaic backward from
+    its forward's split sums (`attention_mosaic_backward`'s D, which reads the anchor's own weight they
+    keep), interpreted for an H100, under a cotangent of ones on every output column: its gradients on par
     with the reference's (check 1), where its first pass rounded the anchor's own weight to fp16 as the
-    forward's split sums did (the head review of c55dff91f, F5, F7; row 9506)."""
+    forward's split sums did (the head reviews of c55dff91f, F5, F7, and of 12e76ca7e: the portable
+    backward's centred pass reads no split sum; row 9506)."""
     spans, hooks, operands = _anchor_below_least_subnormal()
-    ours, reference = _portable_gradients(spans, hooks)
+    ours, reference = _mosaic_gradients(spans, hooks)
     dout = jnp.ones((1, 1, 1, 8), jnp.float16)
     assert_as_exact(ours, reference, lambda seed: (*operands, dout),
                     "a kept anchor below fp16's least subnormal's gradients", seeds=FEWEST_SEEDS)
