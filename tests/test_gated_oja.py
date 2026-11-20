@@ -88,7 +88,7 @@ def test_a_forked_calls_entry_writes_are_as_exact_as_each_document_alone():
 def test_a_kernel_named_for_the_delta_rule_refuses_no_oja_call(named):
     """A forked call of Oja's rule, and one inside a shard_map that checks varying axes, under a native kernel
     named for the delta rule (`generation.chosen`): each handed to the portable math by its erase along the
-    values before the named kernel's other needs are asked (`recurrence_chunk.TRANSPOSED`), so neither the
+    values before the named kernel's other needs are asked (`recurrence_chunk.TRANSITION`), so neither the
     fork nor the varying operands the kernel refuses stops its trace."""
     operands, _ = forked_draw(0)
     query, key, value, gv, beta, state, _ = draw(0)
