@@ -512,3 +512,30 @@ def test_a_save_of_programs_within_another_keeps_its_program_in_both_and_the_lat
     assert not inner.refused and not outer.refused, (inner.refused, outer.refused)
     assert len(inner.kept) == 1 and len(outer.kept) == 2 and set(inner.kept) < set(outer.kept), (
         inner.kept, outer.kept)
+
+
+def _doubled(x):
+    """A module's function a program compiles (the identity witness's)."""
+    return 2 * x
+
+
+def _halved(x):
+    """Another module's function (the identity witness's)."""
+    return x / 2
+
+
+def test_a_program_dews_compile_point_compiles_is_stated_by_its_function_and_arguments():
+    """A program Dew's compile point compiles (`dew.jit`'s, an `OuterProgram`) is stated by its function and
+    its jit arguments (`dew._stated.stated`), so a check-1 arm of one holds a statement and prepares (rows
+    10096 on: dew.jit arms ran unprepared): two programs of one function under one set of arguments state
+    alike, one called (its executables cached) as one never called, and another function or another
+    argument states another identity."""
+    from dew._stated import stated
+    from dew.nn.kernels.options import owned_program
+
+    called = owned_program(_doubled)
+    called(np.ones(3, np.float32))
+    one = stated(owned_program(_doubled), "a program")
+    assert stated(called, "a program called") == one
+    assert stated(owned_program(_halved), "another function's") != one
+    assert stated(owned_program(_doubled, donate_argnums=(0,)), "another argument's") != one
