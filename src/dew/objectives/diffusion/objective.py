@@ -17,7 +17,7 @@ uses; the preview hook limits itself to the display count.
 from __future__ import annotations
 
 from abc import abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
@@ -60,12 +60,14 @@ from dew.objectives.base import (
     TEACHER,
     Aux,
     EMASpec,
+    Held,
     Objective,
     Omitted,
     Pooled,
     ProgramModule,
     Ratio,
     Step,
+    TracedSetting,
     model_rngs,
 )
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
@@ -257,6 +259,16 @@ def _trains_its_grid(source: PipelineSource, process, grid) -> bool:
             and (grid is OMITTED or grid is source.grid))
 
 
+def _keyed_inputs(inputs: InputSpec) -> TracedSetting:
+    """`inputs` as a trace key states it (`DiffusionObjective.traced_by`): its sample, its mask and each
+    condition's field and unconditional datum by value, its encoder by the object itself (`Held`), which
+    holds the arrays its encoding closes over: two objectives over one encoder key alike, a refit's among
+    them, and two encoders of other weights apart, whatever their fields."""
+    return (inputs.sample, inputs.mask,
+            tuple(sorted((name, condition.field, condition.unconditional, Held(condition.encoder))
+                         for name, condition in inputs.conditions.items())))
+
+
 class DiffusionObjective(Objective[Ratio]):
     """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
 
@@ -377,6 +389,15 @@ class DiffusionObjective(Objective[Ratio]):
             raise MissingFlopsCount(f"{type(model).__name__} has no declared image_flops geometry")
         return model.image_flops(model.image_lengths(self.latent_shape, rows),
                                   self.latent_shape[-1], features), encoded
+
+    def traced_by(self, settings: TracedSetting) -> Hashable | None:
+        """`Objective.traced_by` with its inputs (`_inputs`) keyed as its loss reads them (`_keyed_inputs`):
+        each condition's encoder by the object itself, whose parameters its encoding closes over (row
+        6297: an encoder's arrays stated no value, and no key was kept)."""
+        inputs = settings.get("_inputs") if isinstance(settings, Mapping) else None
+        if isinstance(inputs, InputSpec):
+            settings = {**settings, "_inputs": _keyed_inputs(inputs)}
+        return super().traced_by(settings)
 
     @property
     def inputs(self) -> InputSpec:
