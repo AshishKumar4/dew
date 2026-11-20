@@ -121,10 +121,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 - Check 2's ratio contract reads the law's bound looser than its spec states. [7980]
 
-## Decision
-
-- Decision and config. [9691]
-
 ## Tutorials and docs
 
 - TextGeneration.quantized's default example ((0,),) is one token (src/dew/inference/tasks.py:1273), and a decoder with prediction depths…. [9669]
