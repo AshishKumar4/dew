@@ -1318,7 +1318,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         # The weights' derivative through the narrowing as its identity, in fp32, its value none.
         weighed = product(grouped + jax.lax.stop_gradient(rounded - grouped),
                           jax.lax.stop_gradient(value).astype(grouped.dtype))
-        return narrowed + carried(weighed)
+        return narrowed + derivative_of(weighed)
 
     drop = hooks.drop
     if hooks.rounds is not None:
@@ -1365,11 +1365,11 @@ def mean_held(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
 
 
 def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
-    """The reference's `mean_held`: its value, its derivative the mean's, `out`'s (`carried`)."""
-    return mean_held(jax.lax.stop_gradient(out), sums, dtype) + carried(out)
+    """The reference's `mean_held`: its value, its derivative the mean's, `out`'s (`derivative_of`)."""
+    return mean_held(jax.lax.stop_gradient(out), sums, dtype) + derivative_of(out)
 
 
-def carried(out: jax.Array) -> jax.Array:
+def derivative_of(out: jax.Array) -> jax.Array:
     """Zero with `out`'s derivative, where `out` is finite (an infinite one's difference from itself NaN):
     added to a value formed from `out`'s, it carries `out`'s derivative and leaves the value as it is."""
     value = jax.lax.stop_gradient(out)

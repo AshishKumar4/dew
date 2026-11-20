@@ -1276,6 +1276,7 @@ def test_a_mean_of_an_infinite_value_stays_infinite_through_the_hold():
     assert bool(jnp.all(alone == jnp.inf)) and bool(jnp.all(jnp.isnan(opposite)))
 
 
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
 def test_a_quantized_calls_codes_past_fp16s_largest_are_no_mean(training):
     """One fp16 key at logit 0 and value 1024 under a quantized model's weights (`Hooks.rounds` 127.5, the
     key's code 127) and an output hook taking the output by 1/128: the output is 127 x 1024 / 128, 1016, on
