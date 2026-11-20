@@ -230,3 +230,10 @@ class Schedule:
             index = jnp.where(wg >= first, 0, index + 1)
         lax.switch(index, branches)
         return None
+
+
+def runs_alone(family: str, joined: tuple) -> None:
+    """Refuse `joined` roles (`Family.role_schedule`'s) to `family`, whose program runs its own roles alone:
+    one warpgroup, or a core, moving no registers between roles."""
+    if joined:
+        raise ValueError(f"{family} runs its own roles alone, no {[role.name for role, *_ in joined]}")

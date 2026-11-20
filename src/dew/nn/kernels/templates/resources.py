@@ -460,7 +460,8 @@ def joined_warpgroups(joined: Joined) -> int:
     return sum(count for _, count in joined)
 
 
-def role_registers(weights: tuple[int, ...], programs: int = 1, floor: int | None = None) -> tuple[int, ...]:
+def role_registers(weights: tuple[float, ...], programs: int = 1,
+                   floor: int | None = None) -> tuple[int, ...]:
     """The registers a thread of each of a program's warpgroups is moved to by setmaxnreg: `_role_registers`
     on the multiprocessor the launches derive for (`facts`), the floor a producer lowers to `producer_floor`
     where none is given."""
@@ -468,7 +469,7 @@ def role_registers(weights: tuple[int, ...], programs: int = 1, floor: int | Non
 
 
 @functools.lru_cache(maxsize=1024)
-def _role_registers(weights: tuple[int, ...], programs: int, floor: int,
+def _role_registers(weights: tuple[float, ...], programs: int, floor: int,
                     multiprocessor: generation.Multiprocessor) -> tuple[int, ...]:
     """The registers a thread of each of a program's warpgroups is moved to by setmaxnreg
     (`handoffs.Schedule`'s roles), `programs` programs held by a multiprocessor at once: a warpgroup of weight
@@ -489,7 +490,7 @@ def _role_registers(weights: tuple[int, ...], programs: int, floor: int,
         share = pool // (sum(raised.values()) * THREADS)
         capped = [index for index, weight in raised.items() if share * weight >= ceiling]
         if not capped:
-            held |= {index: share * weight // step * step for index, weight in raised.items()}
+            held |= {index: int(share * weight // step * step) for index, weight in raised.items()}
             break
         for index in capped:
             held[index] = ceiling
