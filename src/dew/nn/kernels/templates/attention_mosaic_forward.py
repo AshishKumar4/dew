@@ -498,6 +498,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                                       and form.natural == spec.natural)
                                   else None),
                         table=paged, sources=sources,
+                        out_dtype=jnp.float32 if split else out_dtype, walks=walks,
                         shared_by=len(blocks),
                         column_width=(values.shape[-1] if into is not None and first is not None
                                       else None), flags=stated and len(blocks) == 1, **in_place)

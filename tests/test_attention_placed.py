@@ -308,15 +308,32 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
         models = traced_models(traced)
         assert models and all(model.most == expect_most for model in models), models
 
-    # Nonuniform legal column pin (v192 padded to 256 with columns=192 -> blocks 192 and 64): traces cleanly
-    # and the narrower 64-wide tail block still places Q in TMEM (192 -> 224 cols, both round to 256).
+    def block_copies(jaxpr) -> dict[int, bool]:
+        """Map each tcgen05.rows kernel's V-block width (operand 2's last dim) to whether it copies Q."""
+        found: dict[int, bool] = {}
+        for eq in jaxpr.eqns:
+            name = eq.params.get("name")
+            if (isinstance(name, str) and (launch := report.kernel_of(name)[1]) is not None
+                    and (record := report.traced(launch)) is not None
+                    and getattr(record.config, "family", None) == "tcgen05.rows"):
+                found[eq.invars[2].aval.shape[-1]] = any(
+                    has_tmem_copy(sub) for sub in jax.extend.core.jaxprs_in_params(eq.params))
+            for sub in jax.extend.core.jaxprs_in_params(eq.params):
+                found.update(block_copies(sub))
+        return found
+
+    # Nonuniform legal column pins:
+    # - q64/v192 (padded 256, columns=192 -> blocks 192 and 64): both 192 and 64 tail place Q in TMEM.
+    # - q64/v320 (padded 320, columns=192 -> blocks 192 and 128): 192 copies Q (1 CTA/SM), 128 tail omits Q
+    #   (96 KiB SMEM -> 2 CTAs/SM, 256 -> 288 TMEM cols would drop residency 2 -> 1).
     q64 = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
     k64 = jnp.ones((1, 256, 1, 64), jnp.bfloat16)
-    v192 = jnp.ones((1, 256, 1, 192), jnp.bfloat16)
-    with generation.assumed("sm100"), _pinned(dataclasses.replace(ROWS_TILES, columns=192)):
-        tail_traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
-            q, k, v, spans, natural=True, interpret=False))(q64, k64, v192).jaxpr
-    assert has_tmem_copy(tail_traced)
+    for v_width, expected_blocks in ((192, {192: True, 64: True}), (320, {192: True, 128: False})):
+        v_arr = jnp.ones((1, 256, 1, v_width), jnp.bfloat16)
+        with generation.assumed("sm100"), _pinned(dataclasses.replace(ROWS_TILES, columns=192)):
+            tail_traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
+                q, k, v, spans, natural=True, interpret=False))(q64, k64, v_arr).jaxpr
+        assert block_copies(tail_traced) == expected_blocks
 
     # Rank-only `proposes` must short-circuit before calling `held` (row 9477).
     bwd = attention_mosaic.MosaicBackward(scale=128 ** -0.5, keys=256, form="full")
