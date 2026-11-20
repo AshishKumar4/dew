@@ -38,7 +38,7 @@ from dew.nn.precision import biased, float32_dot_general
 from .kernels import gemm, generation
 from .kernels.generation import INHERENT, Choice, device_generation
 from .kernels.projections import kernel_path, mapped_shards, recipe_takes, shard_placement
-from .kernels.selection import Kernel, Op, Requirement, forced, select
+from .kernels.selection import Kernel, KernelRefused, Op, Requirement, forced, select
 from .sharding import on_shards, seen_whole
 
 
@@ -372,6 +372,8 @@ class BesideCase:
 
     def __init__(self, projections: Sequence[Dense], x: jax.Array):
         self.projections, self.x = projections, x
+        self.refused: KernelRefused | None = None
+        """Why a kernel the call names refuses their forward side by side (`route`), where one does."""
 
     @functools.cached_property
     def found(self) -> Projections:
@@ -424,7 +426,13 @@ class BesideCase:
         # in a shard_map took no compound launch there).
         whole = placement is not None or all(map(seen_whole, (inputs, *kernels)))
         with _launching(self.plan.named):
-            return gemm.side_by_side(rows, matrices, inputs.dtype, self.plan.precision, whole=whole)
+            try:
+                return gemm.side_by_side(rows, matrices, inputs.dtype, self.plan.precision, whole=whole)
+            except KernelRefused as refused:
+                # A kernel the call names refusing their forward side by side: they run apart, the refusal
+                # the selector's reason (`BESIDE_SUPPORTS`' `launched`).
+                self.refused = refused
+                return None
 
 
 BESIDE_SUPPORTS: tuple[Requirement[BesideCase], ...] = (
@@ -447,8 +455,9 @@ BESIDE_SUPPORTS: tuple[Requirement[BesideCase], ...] = (
                               "'joined', whose product runs the grouped GEMM template's launches"),
                 row=INHERENT),
     Requirement('launched', lambda case: case.route is not None,
-                "no launch takes the projections' product side by side, its forward or its input gradient "
-                "(`gemm.side_by_side`)", row=INHERENT),
+                lambda case: ("no launch takes the projections' product side by side, its forward or its "
+                              "input gradient (`gemm.side_by_side`)"
+                              + ("" if case.refused is None else f": {case.refused}")), row=INHERENT),
 )
 """What one side-by-side launch needs to stand in for the projections' own calls
 (`projection_requirements`), what its columns share, and, last, a launch that takes it (head review of

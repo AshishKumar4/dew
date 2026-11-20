@@ -2074,20 +2074,21 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     return GroupedCase(placed, whole, product, call, kind, extents, paired=compound is not None)
 
 
-def _compound(call) -> tuple[str, object] | None:
+def _compound(call) -> tuple[str, tuple] | None:
     """Where `call` is several products in one launch, its form and its further products, as its launches
     bind them: `beside`, matrices side by side; `chained`, `(rows, matrix)` products over joined depths;
-    `paired`, a pair's second matrix (`gmm_call`'s); else None. Read once a case, for its cell
+    `paired`, a pair's second matrix (`gmm_call`'s), alone; else None. Read once a case, for its cell
     (`_together`) and its launches (`GroupedCase.paired`)."""
     for _, bound in call.bound.values():
-        for form in ('beside', 'chained', 'paired'):
-            others = bound.arguments.get(form)
-            if others is not None and (form == 'paired' or others):
-                return form, others
+        for form in ('beside', 'chained'):
+            if others := bound.arguments.get(form):
+                return form, tuple(others)
+        if (paired := bound.arguments.get('paired')) is not None:
+            return 'paired', (paired,)
     return None
 
 
-def _together(compound: tuple[str, object] | None, matrix: tuple[int, int] | None) -> tuple | None:
+def _together(compound: tuple[str, tuple] | None, matrix: tuple[int, int] | None) -> tuple | None:
     """Where a call is products side by side or chained (`compound`, `_compound`'s), their geometry as a
     receipt keys it (`TOGETHER`): the launch's form (`beside`, matrices side by side; `chained`, products over
     joined depths), the first's `matrix`'s shared extent (`_matrix_of`: `[in, out]`; 0 where it is no dense

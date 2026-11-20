@@ -118,18 +118,17 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
     to `lhs`'s dtype, which its producer wrote (a paired product's epilogue, beside `lhs` and the sides it
     read): the product multiplies it in place of forming each tile, and every derivative is the prologue's
     (`portable`'s, which forms it), so `applied` takes no cotangent, and reverse mode forms the prologue's
-    VJP in the transposed product's epilogue (`_input_cotangents`). An NVFP4 `rhs` (`NvFp4`; a stack of
-    banks at its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen. `named`, a remat name or None an output
-    (an epilogue's output that is its accumulator rounded to its dtype, a gate's projection before its
-    SwiGLU, `fused_gemm` lifting the program's name onto it): each named output is a residual of the
-    call's derivative under its name (`checkpoint_name`), so a policy keeping the name keeps it, and the
-    reverse pass reads the accumulator from it where the epilogue reads its accumulator through that
-    rounding alone, recomputing no product (row 7131). `beside`, matrices of `rhs`'s groups and depth each of
-    its own width: an output each (a tuple), one launch over their columns side by side where one takes them
-    (`mosaic_gpu.gmm`'s), the input gradient chained in one accumulator, each kernel gradient its own; no
-    kernels joined, no output split (row 6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`,
-    the forward's route a caller's selection of the call found (`side_by_side`'s), run and reported as it is
-    (`_gemm`'s)."""
+    VJP in the transposed product's epilogue (`_input_cotangents`). An NVFP4 `rhs` (`NvFp4`; a stack of banks
+    at its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen. `named`, a remat name or None an output (an
+    epilogue's output that is its accumulator rounded to its dtype, a gate's projection before its SwiGLU,
+    `fused_gemm` lifting the program's name onto it): each named output is a residual of the call's derivative
+    under its name (`checkpoint_name`), so a policy keeping the name keeps it, and the reverse pass reads the
+    accumulator from it where the epilogue reads its accumulator through that rounding alone, recomputing no
+    product (row 7131). `beside`, matrices of `rhs`'s groups and depth each of its own width: an output each
+    (a tuple), one launch over their columns side by side where one takes them (`mosaic_gpu.gmm`'s), the input
+    gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
+    6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
+    (`side_by_side`'s), runs as found."""
     if isinstance(rhs, NvFp4):
         return _nvfp4_gemm(lhs, rhs, group_sizes, epilogue=epilogue, epilogue_operands=epilogue_operands,
                            out_dtype=out_dtype, layer=layer, gather=gather, scatter=scatter,
@@ -180,13 +179,7 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
 
     def forward(*operands):
         out = value(*operands)
-        if not any(named):
-            return out, ()
-        # Each named output a residual under its name, the one array the output and the residual are.
-        outs = [checkpoint_name(each, name) if name is not None else each
-                for each, name in zip(out if several else (out,), named, strict=True)]
-        kept = tuple(each for each, name in zip(outs, named, strict=True) if name is not None)
-        return (tuple(outs) if several else outs[0]), kept
+        return _named_residuals(out, named, several) if any(named) else (out, ())
 
     call = _Call(prologue, prologue_axes, epilogue, epilogue_axes, dtypes, several, compute, plain,
                  tuple(at for at, name in enumerate(named) if name is not None))
@@ -201,6 +194,15 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
                                    kind=KernelGlue(), nested=not any(named)))
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
                           scatter, None if applied is None else jax.lax.stop_gradient(applied), beside)
+
+
+def _named_residuals(out, named: tuple, several: bool) -> tuple:
+    """`gemm`'s forward's outputs `out` (several, or one) and what it saves: each output `named` names a
+    residual under its name (`checkpoint_name`), the one array the output and the residual are."""
+    outs = [checkpoint_name(each, name) if name is not None else each
+            for each, name in zip(out if several else (out,), named, strict=True)]
+    kept = tuple(each for each, name in zip(outs, named, strict=True) if name is not None)
+    return (tuple(outs) if several else outs[0]), kept
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1259,7 +1261,8 @@ def side_by_side(rows, matrices: tuple, out_dtype, precision: PrecisionLike, *,
     `beside`, each `[depth, width]`, one output each in `out_dtype`) as `gemm` binds them, else None: their
     forward, or their input gradient whole (`_one_launch`, of cotangents in `out_dtype`), Mosaic GPU's
     launch read unreported: the forward and the input gradient independent choices, but a forward that would
-    not run (a named kernel's or a pin's refusal of it) none. The route, decided unreported
+    not run (a pin's refusal of it) none, a named kernel's refusal raised (`selection.KernelRefused`, as
+    `gemm` would raise it). The route, decided unreported
     (`selection.decided`), is the one the call runs and reports where its caller hands it on (`gemm`'s
     `selected`), the call selected once (base review b68fc2382 F5). The operands abstract
     (`jax.ShapeDtypeStruct`) or arrays, `whole` whether a launch sees them whole (`seen_whole`; a device's
@@ -1273,11 +1276,7 @@ def side_by_side(rows, matrices: tuple, out_dtype, precision: PrecisionLike, *,
                                paired=None, first=None, gather=None, scatter=None, summed_as=(),
                                beside=grouped[1:])
     case = grouped_matmul.grouped_case(*call, product=product, whole=whole)
-    try:
-        forward = selection.decided(grouped_matmul.GROUPED, case)
-    except selection.KernelRefused:
-        # A named kernel refusing the forward side by side: `gemm` would raise it, so they run apart.
-        return None
+    forward = selection.decided(grouped_matmul.GROUPED, case)
     if forward.kernel == grouped_matmul.MosaicGmm.name:
         # Its forward a launch's, which runs where its pin does (head review of 4d6c7a69c F5: a forward the
         # pin refused raised where its input gradient alone was asked).
