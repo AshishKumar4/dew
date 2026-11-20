@@ -1792,7 +1792,7 @@ def test_rwkv6_through_the_chunked_op_is_as_exact_as_fla(site):
 
 
 def _unit_turn_grad(q, k, v, do, state, *, turn=None):
-    """Run `turned.turn_gradient` with unit decay/gate and zero final cotangent for P0 regression witnesses."""
+    """Run `turned.turn_gradient` with unit decay/gate and zero final cotangent for P0 witnesses."""
     from dew.nn.kernels.templates.recurrence import turned
 
     length = q.shape[1]
@@ -1810,18 +1810,20 @@ def test_turned_gradient_p0_regressions_f1_f2_f3():
     from dew.nn.kernels.templates.recurrence import turned
 
     # d80c85a37 F1: carry reset at zero peak preserves tangent -1.0 (not -0.5)
-    q129 = jnp.zeros((1, 129, 1, 2), jnp.float32).at[0, 128, 0, 0].set(1.0)
-    k129 = jnp.zeros((1, 129, 1, 2), jnp.float32)
-    v129 = jnp.zeros((1, 129, 1, 1), jnp.float32)
-    do129 = jnp.zeros((1, 129, 1, 1), jnp.float32).at[0, 128, 0, 0].set(1.0)
-    g129 = jnp.zeros((1, 129, 1), jnp.float32).at[0, 64, 0].set(-1000.0)
+    big = np.float32(2.0 ** 126)
+    z129 = jnp.zeros((1, 129, 1, 2), jnp.float32)
+    k129 = z129.at[0, 0, 0, 0].set(-big)
+    v129 = jnp.zeros((1, 129, 1, 1), jnp.float32).at[0, 0, 0, 0].set(1.0)
+    do129 = jnp.zeros((1, 129, 1, 1), jnp.float32)
+    g129 = jnp.zeros((1, 129, 1), jnp.float32)
     b129 = jnp.ones((1, 129, 1), jnp.float32)
     t129 = jnp.zeros((1, 129, 1, 1), jnp.float32)
-    s129 = jnp.array([[[[np.float32(2.0 ** 126)], [0.0]]]], jnp.float32)
-    ds129 = jnp.array([[[[0.0], [1.0]]]], jnp.float32)
+    s129 = jnp.array([[[[big], [np.float32(0.0)]]]], jnp.float32)
+    ds129 = jnp.array([[[[np.float32(1.0)], [np.float32(0.0)]]]], jnp.float32)
+    df129 = jnp.array([[[[np.float32(0.0)], [np.float32(1.0)]]]], jnp.float32)
     _, jvp129 = jax.jvp(
-        lambda st: turned.turn_gradient(q129, k129, v129, do129, g129, b129, st, jnp.zeros_like(st), t129,
-                                        None, scale=1.0, group=1, pairs=1),
+        lambda st: turned.turn_gradient(z129, k129, v129, do129, g129, b129, st, df129, t129, None,
+                                        scale=1.0, group=1, pairs=1),
         (s129,), (ds129,))
     np.testing.assert_array_equal(np.asarray(jvp129[0, 128, 0, 0]), np.float32(-1.0))
 

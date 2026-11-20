@@ -666,7 +666,7 @@ def _ssd_rule(chunk_size: int, platform: str, held: int):
                 dentry = (jnp.moveaxis(dkey, 1, 3).astype(entry[0].dtype),
                           jnp.swapaxes(jnp.moveaxis(dvalue, 1, 3), 2, 4).astype(entry[1].dtype),
                           jnp.moveaxis(dweight[..., 0, 0], 1, 2).astype(entry[2].dtype))
-            no_tokens = tuple(np.zeros(np.shape(t), jax.dtypes.float0) for t in tokens)
+            no_tokens = tuple(jnp.zeros(t.shape, jax.dtypes.float0) for t in tokens)
             dtaken = (jnp.swapaxes(dforked[0], 1, 2).astype(given.dtype), no_tokens, dentry)
         return dx, db, dc, da, dstate, dtaken
 

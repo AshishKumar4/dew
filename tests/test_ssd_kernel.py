@@ -562,4 +562,5 @@ def test_tpu_ssd_jvp_combines_read_and_decay_without_carry_overflow():
     assert np.isfinite(np.asarray(dy)).all() and np.isfinite(np.asarray(dfinal)).all()
     np.testing.assert_array_equal(np.asarray(dy[0, 0, 0, 0]), np.float32(2.0 ** 30))
     np.testing.assert_array_equal(np.asarray(dy[0, 1:, 0, 0]), np.zeros(63, np.float32))
-    assert abs(float(dfinal[0, 0, 0, 0]) - 2.0 ** 110) <= 2.0 ** 90
+    want = jnp.exp(a[0, 1, 0]) * b[0, 0, 0, 0] * dx[0, 0, 0, 0]
+    np.testing.assert_array_equal(np.asarray(dfinal[0, 0, 0, 0]), np.asarray(want))
