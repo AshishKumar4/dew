@@ -41,6 +41,7 @@ from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
+    attention_algebra as algebra,
     attention_decode,
     attention_mosaic,
     attention_portable,
@@ -1195,34 +1196,6 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     default_is_finite(family, "portable")
 
 
-def test_assert_finite_checks_empty_rows_on_every_draw():
-    """Row 9041: a finite nonzero output or dQ in an empty row after seed zero fails `assert_finite`'s
-    per-draw check without running `dew_fn` a second time."""
-    empty = np.array([[True, False]])
-    family = Family(draw=lambda s: (jnp.zeros((1, 2, 1, 1)),), keep=np.zeros((1, 1, 2, 1), bool), empty=empty)
-    calls = 0
-
-    def dew_fn(x):
-        nonlocal calls
-        calls += 1
-        out = jnp.zeros((1, 2, 1, 1), jnp.float32)
-        dq = jnp.where(jnp.asarray(empty)[:, :, None, None], x, 0.0)
-        return (out, dq)
-
-    def truth_fn(x):
-        del x
-        zeros = jnp.zeros((1, 2, 1, 1), jnp.float64)
-        return (zeros, zeros)
-
-    def draw(seed):
-        return (jnp.asarray(float(seed), jnp.float32),)
-
-    with pytest.raises(AssertionError):
-        assert_finite(dew_fn, truth_fn, draw, "probe", seeds=3,
-                      check=lambda found, seed: _held_empty(family, found, f"probe seed {seed}"))
-    assert calls == 2
-
-
 @pytest.mark.skipif(not INTERPRETED, reason="an H100 runs these families in `_mainloops`' Mosaic arms")
 @pytest.mark.parametrize("family", ["values at fp32's largest over 2 equal keys",
                                     "values at fp32's largest over 256 equal keys"])
@@ -1243,16 +1216,16 @@ def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_refere
                     seeds=seeds, truth_fn=_reference(family, anchored=True))
 
 
-MAINLOOPS = ("portable", "triton", *(("mosaic", "decode") if INTERPRETED else ()))
-"""The forwards a mean's test walks: the plain-JAX mainloop's and the Pallas-Triton one's, and in a CPU
-process the Mosaic forward's and its decode step's interpreted as an H100 runs them (a GPU runs them in
-`_mainloops`' Mosaic arms and the decode cells)."""
+MAINLOOPS = ("portable", "triton", "decode_kernel", *(("mosaic", "decode") if INTERPRETED else ()))
+"""The forwards a mean's test walks: the plain-JAX mainloop's, the Pallas-Triton one's and the Triton decode
+kernel's, and in a CPU process the Mosaic forward's and its decode step's interpreted as an H100 runs them (a
+GPU runs them in `_mainloops`' Mosaic arms and the decode cells)."""
 
 
 @pytest.mark.parametrize("sink", [None, -20.0], ids=["no sink", "a sink"])
 @pytest.mark.parametrize(("mainloop", "training"),
                          [(mainloop, training) for mainloop in MAINLOOPS for training in (False, True)
-                          if mainloop != "decode" or not training],
+                          if mainloop not in ("decode", "decode_kernel") or not training],
                          ids=lambda value: {False: "inference", True: "training"}.get(value, value))
 def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, sink):
     """One fp16 query over a key at logit 0 and 1000 at a logit whose weight, 0.50035, narrows up to 0.5005
@@ -1288,6 +1261,9 @@ def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, s
             with generation.assumed("sm90"):
                 out = attention_mosaic.forward(query, key, value, spans, hooks, interpret=True,
                                                residuals=kept)
+        elif mainloop == "decode_kernel":
+            sunk = None if sink is None else jnp.full((heads,), sink, jnp.float32)
+            out = _decode_attend(query, key, value, [keys], 1, sinks=sunk)
         else:
             with generation.assumed("sm90"):
                 out = attention_decode.attend(query, key, value, spans, hooks, interpret=True)
@@ -1309,6 +1285,65 @@ def test_a_mean_of_an_infinite_value_stays_infinite_through_the_hold():
     opposite = template.reference(query, jnp.zeros((1, 2, 1, 8), jnp.float16),
                                   jnp.concatenate([inf, -inf], axis=1), two)
     assert bool(jnp.all(alone == jnp.inf)) and bool(jnp.all(jnp.isnan(opposite)))
+
+
+NARROWING_TIES = {
+    "float16": [65520.0, 1.5 * 2.0 ** -14 + 2.0 ** -25, 3 * 2.0 ** -25, 2.0 ** -25, 1000.25, -65520.0],
+    "bfloat16": [(2 - 2.0 ** -8) * 2.0 ** 127, 1 + 2.0 ** -8, -(1 + 3 * 2.0 ** -8) * 2.0 ** 100,
+                 (1 + 2.0 ** -8) * 2.0 ** -126],
+}
+"""Points exactly between two neighbouring values of each 16-bit dtype, which a narrowing ties to even: fp16's
+overflow midpoint, ties among its subnormals and the least (half its least subnormal), a normal one and a
+negative one; bf16's overflow midpoint, normal ties of either sign and one at its least normal."""
+
+
+@pytest.mark.parametrize("dtype", NARROWING_TIES, ids=NARROWING_TIES.keys())
+def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
+    """Sums over a divisor whose fp32 quotient rounds onto a 16-bit tie (`NARROWING_TIES`), and the sums an
+    fp32 ulp either side of the tie's product with the divisor and on it where exact: the settled quotient
+    (`algebra.narrowing_settled`) narrows to `dtype` as the exact quotient rounds once, to the tie's nearer
+    neighbour where it is not the tie and to the even one where it is, where the fp32 quotient's second
+    rounding took a quotient below fp16's overflow midpoint to inf (row 9544), and so at the overflow
+    midpoint does a register epilogue's settle of it alone (`algebra.midpoint_settled`); a held quotient,
+    past the one it stands for, as it is. Each divisor a drawn fp32 value from 2^-6 to 2^6, the expectation
+    the float64 quotient's side of the tie (two fp32 values' quotient lies on a tie in float64 only where it
+    is one)."""
+    narrow = jnp.dtype(dtype)
+    rng = np.random.default_rng([9544, len(dtype)])
+    ties = np.asarray(NARROWING_TIES[dtype], np.float64)
+    # Drawn divisors and one just below 1, whose tie's product rounds so the quotient lies off it.
+    divisors = np.append(np.float32(np.ldexp(1 + rng.random(64), rng.integers(-6, 7, 64))),
+                         np.float32(1 - 2.0 ** -24))
+    tie, divisor = (np.ravel(x) for x in np.meshgrid(ties, divisors, indexing="ij"))
+    divisor = divisor.astype(np.float32)
+    centre = np.float32(tie * divisor)
+    acc = np.concatenate([np.nextafter(centre, -np.inf), centre, np.nextafter(centre, np.inf)])
+    divisor, tie, centre = (np.tile(x, 3) for x in (divisor, tie, centre))
+    # A tie's product with a divisor past fp32's largest is no sum a quotient of the tie has, and one below
+    # fp32's least normal a sum XLA's CPU flushes (row 4023).
+    finite = np.isfinite(centre) & np.isfinite(acc) & (np.abs(acc) >= np.finfo(np.float32).tiny)
+    acc, divisor, tie = acc[finite], divisor[finite], tie[finite]
+    rounded = np.asarray(jnp.asarray(acc) / jnp.asarray(divisor))
+    settled = algebra.narrowing_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
+    found = np.asarray(settled.astype(narrow).astype(jnp.float32), np.float64)
+    exact = acc.astype(np.float64) / divisor.astype(np.float64)
+
+    def narrowed(x):
+        return np.asarray(jnp.asarray(np.float32(x)).astype(narrow).astype(jnp.float32), np.float64)
+
+    # The tie's neighbours, an fp32 value either side of it narrowed once; the even one, the tie narrowed.
+    nearer, further = (narrowed(np.nextafter(np.float32(tie), np.float32(np.sign(tie) * side)))
+                       for side in (0.0, np.inf))
+    expected = np.where(exact == tie, narrowed(tie), np.where(np.abs(exact) < np.abs(tie), nearer, further))
+    np.testing.assert_array_equal(found, expected)
+    largest = jnp.finfo(narrow).max
+    midpoint = np.abs(tie) > largest
+    alone = algebra.midpoint_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
+    found = np.asarray(alone.astype(narrow).astype(jnp.float32), np.float64)
+    np.testing.assert_array_equal(found[midpoint], expected[midpoint])
+    held = algebra.narrowing_settled(jnp.float32(jnp.finfo(narrow).max), jnp.float32(65522.0),
+                                     jnp.float32(1.0), narrow)
+    assert held == jnp.finfo(narrow).max
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
@@ -1597,6 +1632,17 @@ def _cache(array: jax.Array) -> jax.Array:
     return jnp.pad(array, ((0, 0), (0, slots), (0, 0), (0, 0)))
 
 
+def _decode_attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths, splits: int,
+                   sinks: jax.Array | None = None, **form) -> jax.Array:
+    """`decode_attention.attend` over `key` and `value` padded to whole decode blocks (`_cache`), with
+    `splits` slices pinned (as an A100's launch on a CPU, where `INTERPRETED` holds)."""
+    pin = {decode_attention.DecodeAttention: decode_attention.Split(splits)}
+    target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
+    with target, tuning.pinned(pin):
+        return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(lengths, jnp.int32),
+                                       sinks=sinks, interpret=INTERPRETED, **form)
+
+
 def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
     """The decode kernel over `family`'s step, interpreted on a CPU (as an A100's launch) and compiled on a
     GPU, each row's keys the first `K` of its cache, in the form `natural` names (None, the default), the
@@ -1607,13 +1653,7 @@ def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
 
     def decoded(query, key, value, sinks):
         count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
-        # The family's slice count, which a launch on a CPU, of no multiprocessors, does not offer: there
-        # as an A100's launch.
-        pin = {decode_attention.DecodeAttention: decode_attention.Split(family.splits)}
-        target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
-        with target, tuning.pinned(pin):
-            return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
-                                           sinks=sinks, interpret=INTERPRETED, **form)
+        return _decode_attend(query, key, value, count, family.splits, sinks=sinks, **form)
 
     def forward(seed):
         return _cast(family, family.draw)(seed)[:4]

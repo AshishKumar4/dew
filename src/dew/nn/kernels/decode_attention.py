@@ -166,8 +166,8 @@ power-of-two width from 16 to 256, a capacity of whole blocks, one of its dtypes
 run's declared products (`PRODUCTS`)."""
 
 
-def _spec(scale: float, power: float, softcap: float | None, natural: bool | None, dtype, sinks: bool
-          ) -> algebra.Forward:
+def _spec(scale: float, power: float, softcap: float | None, natural: bool | None, dtype, sinks: bool,
+          stored) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`; None:
     natural for fp32 operands, whose edge logit's base-2 conversion rounded before exp2 moves its normal
@@ -176,12 +176,14 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool | Non
     `algebra.SCALED_WALK`) and keep their additions' rounding (`algebra.compensates`), folded logits a
     difference of raw products scaled after it is taken (`algebra.Forward.subtracted`: no fold's divergence
     past its reach, row 1955, on a walk the memory bounds). A decode block's rows are a key head's query
-    heads and positions (`grouped_query`), so the hook takes no query positions."""
+    heads and positions (`grouped_query`), so the hook takes no query positions. Its output stored in
+    `stored`, the query's dtype, which its narrowing settles for (`algebra.Forward.narrowed`)."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else Capped(softcap),
                            natural=jnp.dtype(dtype) == jnp.float32 if natural is None else natural,
                            headroom=algebra.headroom(dtype), initial=sinks,
-                           compensated=algebra.compensates(dtype), prescale=power, subtracted=True)
+                           compensated=algebra.compensates(dtype), prescale=power, subtracted=True,
+                           largest=dtype, narrowed=algebra.narrowed_of(stored))
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
@@ -385,7 +387,7 @@ class DecodeAttention(tuning.KernelOp):
             )(spans, query, key, value, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=1).astype(query.dtype)
 
-        spec = _spec(scale, power, softcap, natural, value.dtype, sinks is not None)
+        spec = _spec(scale, power, softcap, natural, value.dtype, sinks is not None, query.dtype)
         return launch(spec, spans), None
 
     def _get_heuristics_config(self, ba) -> Split:
@@ -457,7 +459,7 @@ class PagedDecodeAttention(tuning.KernelOp):
             )(spans, table, query, key_pages, value_pages, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=2).astype(query.dtype)
 
-        spec = _spec(scale, power, softcap, natural, value_pages.dtype, sinks is not None)
+        spec = _spec(scale, power, softcap, natural, value_pages.dtype, sinks is not None, query.dtype)
         return launch(spec, spans), None
 
     def _get_heuristics_config(self, ba) -> Split:

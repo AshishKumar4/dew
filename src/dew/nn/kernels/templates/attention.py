@@ -35,10 +35,11 @@ from typing import ClassVar, NamedTuple, overload
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import DTypeLike
 
 from dew._hashing import fmix32
-from dew.nn.derivatives import Protected, contracted
-from dew.nn.float_bits import binade_of, raised_exactly
+from dew.nn.derivatives import Protected, contracted, surrogate
+from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import bodies
 from dew.nn.precision import (
@@ -47,6 +48,7 @@ from dew.nn.precision import (
     exact_float32,
     float32_einsum,
     lowered_divide,
+    two_product,
     two_sum,
 )
 
@@ -1331,6 +1333,9 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
         if hooks.initial is None or hooks.initial.valueless:
             normalized = held_mean(normalized, acc, value.dtype)
+        if hooks.output_mod is None and jnp.dtype(query.dtype).itemsize == 2:
+            # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
+            normalized = narrowing_settled(normalized, acc, total, query.dtype)
     else:
         # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's z
         # times its normalized weight stays in the values' range where z times the unnormalized one may not
@@ -1353,21 +1358,90 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     return (out, safe, total) if residuals else out
 
 
-def mean_held(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
-    """`out`, the weighted values `sums` over their denominator, held at `dtype`'s largest where it passes it
-    from finite sums: a mean of finite values of `dtype` is within it, so one past it is its weights'
-    rounding (narrowed to fp16 for their product, the weights round up by as much as 2^-11 of each where the
-    denominator sums them unrounded, the mean of 1001 values of 65504 at 65522, inf in fp16, row 9519). An
-    infinite or NaN sum's (an infinite value's) stays as it is. The one hold every mainloop's quotient
-    (`attention_algebra.quotient`) and the reference (`held_mean`) take."""
-    largest = jnp.finfo(dtype).max
-    past = (jnp.abs(sums) < jnp.inf) & (jnp.abs(out) > largest)
-    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
+def saturated(x: jax.Array, finite_operands: jax.Array, dtype=None) -> jax.Array:
+    """`x` saturated at `dtype`'s (default `x.dtype`'s) largest magnitude where `finite_operands` holds and
+    `|x|` passes it (rows 6882, 9519): one rule shared by `base2_maximum`, `raw_maximum`,
+    `attention_algebra.quotient` and `held_mean`. A mean of finite values of `dtype` is within `dtype`'s
+    largest, so one past it is its weights' or sums' rounding (narrowed to fp16 for their product, the
+    weights round up by as much as 2^-11 of each where the denominator sums them unrounded, the mean of 1001
+    values of 65504 at 65522, inf in fp16). An infinite or NaN operand's result stays as it is."""
+    largest = jnp.finfo(x.dtype if dtype is None else dtype).max
+    past = finite_operands & (jnp.abs(x) > largest)
+    return jnp.where(past, jnp.where(x > 0, largest, -largest).astype(x.dtype), x)
+
+
+def _narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """`narrowing_settled`'s value."""
+    if out.dtype != jnp.float32:
+        return out
+    divisor = jax.lax.broadcast_in_dim(divisor, acc.shape, tuple(range(divisor.ndim)))
+    above = _remainder_sign(acc, out, divisor)
+    bits = jax.lax.bitcast_convert_type(out, jnp.int32)
+    # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side, its
+    # side read from its sign bit (a subnormal's comparison with zero reads it as zero where the CPU treats
+    # subnormal operands as zero).
+    toward = jnp.where((above > 0) == (bits > 0), 1, -1).astype(jnp.int32)
+    odd = jax.lax.bitcast_convert_type(bits + toward, jnp.float32)
+    nudged = (_between(bits, dtype) & (above != 0) & jnp.isfinite(out) & jnp.isfinite(acc)
+              & (divisor > 0))
+    return jnp.where(nudged, odd, out)
+
+
+narrowing_settled = contracted("test_the_narrowing_settle_holds_every_order")(
+    surrogate(_narrowing_settled, lambda dtype, primals, tangents, value: tangents[0], nondiff_argnums=(3,)))
+"""`out`, the sums `acc` over `divisor` as the finish formed it (fp32; a recovered subnormal's bits,
+`attention_algebra.quotient`), rounded to odd where it narrows to the 16-bit `dtype`: where it lands exactly
+between two values of `dtype` (`_between`) and is not the exact quotient, one fp32 ulp toward it, so the
+narrowing rounds once as the exact quotient would: the exact output 65519.9995 of one kept key of 65504
+rounded to fp32's 65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544). The side is
+the sign of `acc` less `out` times `divisor`, exact (`_remainder_sign`). A finite fp32 `out` over a positive
+divisor alone; any other, a held one (its dtype's largest, no tie) and a guarded zero as they are, selected,
+no arithmetic on them. Its derivative is `out`'s on every entry, nudged or not (`surrogate`). The bound left
+at fp32's resolution, as the fp32 reference's: `divisor` is the one rounded (a dropping call's total times
+its multiplier's rest, `dropped_total`), and the sums and exponentials before it round as the reference's
+do, so an exact output within their rounding of a boundary may narrow past it."""
+
+
+def _remainder_sign(acc: jax.Array, quotient: jax.Array, divisor: jax.Array) -> jax.Array:
+    """A value of the sign of `acc - quotient * divisor` (fp32, finite), exact: `quotient` and `divisor` each
+    normalized to [1, 2) from its bits (`float_bits.binade_of`, raised or lowered exactly, a subnormal's
+    too), so their product's rounding and its residual (`two_product`'s bit split) are normal, and `acc`
+    taken by the same powers of two, which leaves it near the product where the quotient is near
+    `acc / divisor`: no operand or residual passes fp32's range or flushes, at bf16's midpoint over a
+    divisor near 2^126 as at a quotient near fp32's least normal."""
+    def normalized(x):
+        binade = binade_of(x)
+        return jnp.where(binade < 0, raised_exactly(x, jnp.maximum(-binade, 0)),
+                         lowered_rounded(x, jnp.maximum(binade, 0))), binade
+
+    (quotient, at), (divisor, by) = normalized(quotient), normalized(divisor)
+    high, low = two_product(quotient, divisor, bit_split=True)
+    shift = at + by
+    taken = jnp.where(shift < 0, raised_exactly(acc, jnp.maximum(-shift, 0)),
+                      lowered_rounded(acc, jnp.maximum(shift, 0)))
+    return (taken - high) - low
+
+
+def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """Whether each fp32 value of `bits` (its int32 bits) lies exactly between two neighbouring values of the
+    16-bit `dtype`, the tie its narrowing rounds to even: the significand bits the narrowing drops (16 of
+    bf16's, 13 of fp16's normals, more below its least normal, 2^-14) are a one and zeros."""
+    found = jnp.finfo(dtype)
+    exponent = jnp.right_shift(bits, 23) & 0xFF
+    significand = (bits & 0x7FFFFF) | jnp.where(exponent > 0, 0x800000, 0)
+    dropped = 23 - (found.nmant)
+    if found.minexp > -126:
+        # Below the dtype's least normal its narrowing drops a bit more a binade, down to the significand's
+        # whole 24 (half the least subnormal, 2^-25 in fp16, its last tie).
+        dropped = dropped + jnp.clip(127 + found.minexp - exponent, 0, 24 - dropped)
+    half = jnp.left_shift(1, dropped - 1)
+    return (significand & (2 * half - 1)) == half
 
 
 def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
-    """The reference's `mean_held`: its value, its derivative the mean's, `out`'s (`derivative_of`)."""
-    return mean_held(jax.lax.stop_gradient(out), sums, dtype) + derivative_of(out)
+    """The reference's mean saturation (`saturated`): its value, its derivative the mean's, `out`'s
+    (`derivative_of`)."""
+    return saturated(jax.lax.stop_gradient(out), jnp.abs(sums) < jnp.inf, dtype) + derivative_of(out)
 
 
 def derivative_of(out: jax.Array) -> jax.Array:
