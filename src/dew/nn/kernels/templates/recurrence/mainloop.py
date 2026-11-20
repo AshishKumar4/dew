@@ -1181,10 +1181,12 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
 
 def _solves_apart(call: Call) -> bool:
     """Whether a decay a head's solve leaves its inverse's application to `_weighted`: where the doubling's
-    merges take fp32 range (`_merged`, whether bf16 parts on wgmma/tcgen05 or TF32 on mma.sync). Beside the
-    application's tiles the solve spilled on H100 (fast32-sm90 at 09bfe984c) and exceeded 99 KB SMEM on
-    consumer mma.sync GPUs (sm86/sm89/sm120, row 8569)."""
-    return _merged(call).dtype == jnp.float32
+    merges take multiple fp32 parts (`_merged`, bf16 parts on wgmma) or fp32 TF32 on `mma.sync`
+    (`Family.operands_in_registers`). Beside the application's tiles the solve spilled on H100
+    (fast32-sm90 at 09bfe984c) and exceeded 99 KB SMEM on consumer mma.sync GPUs (sm86/sm89/sm120, row 8569),
+    while 1-part TF32 on `tcgen05` (B200) stays fused and spill-free."""
+    merged = _merged(call)
+    return merged.parts > 1 or (call.family.operands_in_registers and merged.dtype == jnp.float32)
 
 
 def whole_blocks(width: int, block: int) -> list[int]:
