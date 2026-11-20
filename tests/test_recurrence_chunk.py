@@ -482,12 +482,13 @@ def test_an_oja_decode_token_is_as_exact_as_its_formula():
 
 @pytest.mark.parametrize(('state', 'key', 'value', 'beta', 'expected'), [
     ([-2.0 ** 127], [2.0 ** 127], [1.0], 0.25, [-2.0 ** 126]),
-    ([2.0 ** 120, 0.0], [0.0], [2.0 ** -60, 1.0], 2.0 ** -100, [2.0 ** 120, -2.0 ** -40])],
-    ids=['a correction past the largest', 'a gated value past the least'])
+    ([2.0 ** 120, 0.0], [0.0], [2.0 ** -60, 1.0], 2.0 ** -100, [2.0 ** 120, -2.0 ** -40]),
+    ([2.0 ** 127] * 4, [0.0], [0.5] * 4, 0.25, [2.0 ** 127 - 2.0 ** 125] * 4)],
+    ids=['a correction past the largest', 'a gated value past the least', 'an ungated read past the largest'])
 def test_an_oja_decode_tokens_gate_scales_its_formed_correction(state, key, value, beta, expected):
     """A decode token of Oja's rule, one key and a query of one, no decay, its memory and output exact in
-    fp32 (`oja_token`'s every term normal): the gate scales the correction `k - v^T S^T` once formed, which
-    neither its sum past fp32's largest (2^128 ungated) nor `beta v` past its least (2^-160) loses."""
+    fp32: the gated correction `beta k - beta v^T S^T` one exact sum, which neither its ungated parts past
+    fp32's largest (2^128) nor `beta v` past its least (2^-160) loses."""
     hooks = dataclasses.replace(OJA, decay='scalar', scale=1.0)
 
     def held(x, *shape):

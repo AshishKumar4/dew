@@ -32,6 +32,7 @@ from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients
 from dew.nn.kernels import launches
 from dew.nn.precision import (
     accurate_exp,
+    aligned_sum,
     at_least_fp32,
     compensated_add,
     l2norm,
@@ -573,19 +574,21 @@ def _values_erased(hooks: Hooks, given: dict, state, query, key, value, work):
     """A decode token of Oja's rule (`Hooks.erase` 'values'), in `work`: on the transposed state `S^T`, the
     delta rule of keys `v`, values `k` and a decay along its keys, the token's `log_decay` `[rows, Hv, Dv]`
     (a head's `[rows, Hv]` where scalar), read along the transposed state's values, `S'^T q`.
-    `(output, state')`. The write gate scales each of the correction's terms once formed, `D S^T + v (beta k
-    - beta (v^T D S^T))^T`, as the token reads `S D` once: corrected ungated, `k - v^T D S^T` passed fp32's
-    largest at a memory of -2^127 and a key of 2^127 under a gate of 1/4, whose memory and output stay
-    -2^126; gated before its sum, `beta v` lost a value of 2^-60 under a gate of 2^-100 to underflow, its
-    read of a memory of 2^120 a normal -2^-40."""
+    `(output, state')`. The gated correction `beta k - beta (v^T D S^T)`, `S D` read once as the token reads
+    it, is one exact sum of its exact terms (`precision.aligned_sum`), rounded once: corrected ungated, `k -
+    v^T D S^T` passed fp32's largest at a memory of -2^127 and a key of 2^127 under a gate of 1/4, whose
+    memory and output stay -2^126; gated before its sum, `beta v` lost a value of 2^-60 under a gate of
+    2^-100 to underflow, its read of a memory of 2^120 a normal -2^-40; gated after it, four values of 1/2
+    read a memory of 2^127 as 2^128, where the gated read of 1/4 is 2^126."""
     if hooks.decay == 'none':
         decay = jnp.ones(value.shape, work)
     else:
         decay = accurate_exp(given['log_decay'].astype(work))
         decay = jnp.broadcast_to(decay[..., None] if hooks.decay == 'scalar' else decay, value.shape)
-    write = given['beta'].astype(work)[..., None]
     decayed = decay[..., :, None] * jnp.swapaxes(state, -1, -2)
-    corrected = write * key - write * jnp.sum(value[..., :, None] * decayed, axis=-2)
+    gate = given['beta'].astype(work)[..., None, None]
+    terms = [(gate, key[..., None, :]), (-gate, value[..., :, None], decayed)]
+    corrected = aligned_sum(terms, axis=-2)[..., 0, :]
     transposed = decayed + value[..., :, None] * corrected[..., None, :]
     return jnp.sum(transposed * query[..., None, :], axis=-1), jnp.swapaxes(transposed, -1, -2)
 
