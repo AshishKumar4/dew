@@ -1269,11 +1269,22 @@ class Plan:
             earlier = record(saved["environment"], "saved data environment")
             changes = environment_changes(
                 {name: value for name, value in earlier.items() if name != "modules"})
-        if self.volatile:
-            _log.warning("resuming volatile data; fetched outcomes may differ")
+        self._volatility_admitted(resume)
         if edited:
             _log.warning("resuming a mixture whose members changed: %s", ", ".join(edited))
         return changes + tuple(f"code.{name}" for name in rewritten) + (edited or ())
+
+    def _volatility_admitted(self, resume: DataResume) -> None:
+        """Refuse an exact resume of volatile data, warn of a relaxed one: a volatile step's fetched outcomes
+        may differ on a second read, and with them the row read next at the saved offset, which no exact
+        resume can then promise (row 9012)."""
+        if self.volatile and resume != "relaxed":
+            raise PlanChanged(("volatile",), "the data reads a volatile step (volatile=True), whose fetched "
+                              "outcomes may differ from the saved run's, so an exact resume cannot promise "
+                              "the rows that come next: snapshot(url) the data and train from the sealed "
+                              "generation, or resume relaxed (`data_resume='relaxed'`)")
+        if self.volatile:
+            _log.warning("resuming volatile data; fetched outcomes may differ")
 
     def _rules_alike(self, saved: Mapping[str, object]) -> None:
         """Refuse a saved plan that read by a rule (`rules`) whose value is not this Dew's, naming the rule:

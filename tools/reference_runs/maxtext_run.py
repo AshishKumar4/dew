@@ -42,9 +42,13 @@ from common import (
     write_record,
 )
 
+COHORT = "maxtext"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 
 def arguments(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="the HF checkpoint the reference compares against")
     parser.add_argument("--model-name", required=True, help="MaxText's config for the same shape")
     parser.add_argument("--out", required=True)
@@ -117,6 +121,7 @@ def main() -> None:
     timed = [row for row in steps if args.timing_warmup <= row["step"] < args.steps - args.profile_steps]
     seconds = [row["perf/step_time_seconds"] for row in timed]
     hf_config = json.loads(Path(args.model, "config.json").read_text())
+    assert work.tokens_per_step  # A training workload's, which states its tokens.
     flops_token = work.training_flops_per_step / work.tokens_per_step
     device_kind = jax.devices()[0].device_kind
     devices = jax.device_count()

@@ -135,7 +135,7 @@ def main(argv: list[str] | None = None) -> None:
     if torch.__version__.split("+")[0] != "2.14.1":
         raise SystemExit(f"the fixture pins torch 2.14.1, got {torch.__version__}")
     out.mkdir(parents=True, exist_ok=True)
-    np.savez(out / FIXTURE.name, **schedules(), **grouped_run())
+    np.savez(out / FIXTURE.name, allow_pickle=False, **schedules(), **grouped_run())
     print(f"{out / FIXTURE.name}: four schedules and {EPOCHS * PER_EPOCH} grouped Adam updates")
 
 

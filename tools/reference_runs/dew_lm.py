@@ -26,7 +26,7 @@ import json
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -34,7 +34,6 @@ import numpy as np
 import optax
 from common import (
     TracedWindow,
-    WorkloadWork,
     attach_xplane_profile,
     device_memory,
     documents,
@@ -51,6 +50,9 @@ from common import (
     write_record,
 )
 from reference_source import dew_revision
+
+if TYPE_CHECKING:
+    from dew.telemetry.workload import WorkloadWork
 
 
 def arguments() -> argparse.Namespace:
@@ -92,7 +94,7 @@ class Run:
     total: int
     schedule_steps: int
     compile_seconds: float
-    work: WorkloadWork
+    work: "WorkloadWork"
 
 
 def build(args: argparse.Namespace) -> Run:
@@ -272,6 +274,8 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
     devices = jax.device_count()
     timed = throughput(curves.window_seconds, curves.timed_steps, args.batch * run.seq)
     hf_config = json.loads(Path(args.model, "config.json").read_text())
+    if not run.work.tokens_per_step:
+        raise ValueError("the measured work counts no tokens to price a token's flops by")
     flops_token = run.work.training_flops_per_step / run.work.tokens_per_step
     peak_rate = peak_flops(device_kind)
     stats = [device.memory_stats() or {} for device in jax.local_devices()]

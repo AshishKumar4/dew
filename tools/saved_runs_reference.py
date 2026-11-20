@@ -98,7 +98,7 @@ def main() -> None:
     # The runs are written under the suite's environment, its simulated devices among it, which a
     # per-share read resumes on alone.
     configure_lane(os.environ)
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT, help="the checkout the corpus is written into")
     parser.add_argument("--kinds", nargs="+", help="the kinds to record (every kind the corpus saves by "
                         "default): a kind new to the corpus recorded at the commit that adds it")

@@ -65,6 +65,10 @@ import torch
 from reference_source import config_lookups, hub_modules, record_padding
 from safetensors.torch import save_file
 
+COHORT = "kimi-k3"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 REPO = "moonshotai/Kimi-K3"
 REVISION = "f831ab66814297da540d832a5235f8e904f29d06"
 REMOTE = ("configuration_kimi_k3.py", "modeling_kimi_k3.py", "modeling_kimi_linear.py")
@@ -166,11 +170,16 @@ def sgd_step(model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: to
     return logits, loss, updated
 
 
-def greedy(model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+
+def greedy(model: object, input_ids: torch.Tensor, attention_mask: torch.Tensor):
     """Four greedy tokens after each row, and the logits each decode step read."""
-    generated = model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=4,
-                               do_sample=False, eos_token_id=None, pad_token_id=0,
-                               output_logits=True, return_dict_in_generate=True)
+    from transformers.generation.utils import GenerateDecoderOnlyOutput, GenerationMixin
+
+    assert isinstance(model, GenerationMixin)  # A causal language model (transformers 4.56.2).
+    generated = model.generate(
+        input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=4, do_sample=False,
+        eos_token_id=None, pad_token_id=0, output_logits=True, return_dict_in_generate=True)
+    assert isinstance(generated, GenerateDecoderOnlyOutput) and generated.logits is not None  # As asked.
     return generated.sequences.cpu().numpy(), torch.stack(generated.logits, 1).cpu().numpy()
 
 
@@ -367,7 +376,7 @@ def float64_truth(model: torch.nn.Module, directory: Path,
     def grid(values: torch.Tensor) -> np.ndarray:
         return np.where(valid[..., None], values.detach().numpy(), np.nan)
 
-    return {"loss_f64": np.float64(loss.detach()), "updated_logits_f64": grid(updated),
+    return {"loss_f64": np.asarray(loss.item(), np.float64), "updated_logits_f64": grid(updated),
             "step_logits_f64": step_logits}
 
 
@@ -387,7 +396,7 @@ def write_truth(directory: Path, truth: Callable[[Path], dict[str, np.ndarray]])
                   f"and {np.sqrt(np.mean(np.square(recorded - exact))):.3e} (rms) from float64")
         print(f"{directory.name} loss: float64 {arrays['loss_f64']:.9f}, "
               f"the reference {float(stored['loss']):.9f}")
-    np.savez(directory / "numerics.npz", **arrays, precision="ieee")
+    np.savez(directory / "numerics.npz", allow_pickle=False, **arrays, precision="ieee")
 
 
 def orders(drawn: Path) -> None:

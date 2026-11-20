@@ -41,7 +41,10 @@ def warm_cold(held: Entry) -> tuple[float, float | None]:
     """An entry's least warm seconds and least cold ones, None where no cold run has timed it."""
     if not isinstance(held, list):
         return float(held), None
-    return float(held[0]), None if held[1] is None else float(held[1])
+    warm, cold = held[0], held[1]
+    if warm is None:
+        raise ValueError(f"a durations entry with no warm time: {held}")
+    return float(warm), None if cold is None else float(cold)
 
 
 def peak(held: Entry) -> int | None:
@@ -222,7 +225,8 @@ def declared_marks(name: str, text: str) -> dict[str, tuple[str, dict[str, int],
         if kind not in SHARDS:
             return
         counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
-                  if isinstance(keyword.value, ast.Constant)}
+                  if keyword.arg is not None and isinstance(keyword.value, ast.Constant)
+                  and type(keyword.value.value) is int}
         allowed = [{SHARDS[kind], "per_task"}]
         if kind == "check1_shards":
             allowed.append({SHARDS[kind], "per_task", "conditioning", "conditioning_per_task"})

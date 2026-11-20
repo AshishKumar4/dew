@@ -143,7 +143,7 @@ def test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence(length):
                     f"an affine scan over {length} tokens", seeds=FEWEST_SEEDS, truth_fn=exact)
 
 
-@pytest.mark.parametrize('length', [65, 128, 130, 194])
+@pytest.mark.parametrize('length', LONG_AXES)
 def test_an_affine_scans_second_order_past_a_block_is_zero_where_it_is_structurally(length):
     """Mamba's affine scan over decays of one half, writes of 1/8 from 5/8, its states' cotangents one but
     1.75 2^127 at the last two tokens of the last whole block: its writes' cotangent's derivative, a quarter
@@ -164,13 +164,17 @@ def test_an_affine_scans_second_order_past_a_block_is_zero_where_it_is_structura
 
 
 @pytest.mark.parametrize('length', LONG_AXES)
-def test_an_affine_scan_over_a_long_axis_takes_empty_lanes_and_a_narrower_entering_state(length):
-    """Mamba's affine scan over an axis longer than a block: of no lanes, its states empty of its shape, and
-    from a bf16 state entering float32 decays and writes, its states float32, where blocks laid by `-1`
-    divided by an empty lane's zero and a scan's carry kept the entering bf16 (the head review of
-    84cf35dfe)."""
+def test_an_affine_scan_over_a_long_axis_takes_empty_lanes(length):
+    """Mamba's affine scan over an axis longer than a block, of no lanes: its states empty of its shape, where
+    blocks laid by `-1` divided by an empty lane's zero (the head review of 84cf35dfe)."""
     empty = jnp.zeros((length, 0), jnp.float32)
     assert affine_states(empty, empty, jnp.zeros((0,), jnp.float32), axis=0).shape == (length, 0)
+
+
+@pytest.mark.parametrize('length', LONG_AXES)
+def test_an_affine_scan_over_a_long_axis_takes_a_narrower_entering_state(length):
+    """Mamba's affine scan over an axis longer than a block, from a bf16 state entering float32 decays and
+    writes: its states float32, where a scan's carry kept the entering bf16 (the head review of 84cf35dfe)."""
     decay, write = jnp.full((length, 4), 0.5, jnp.float32), jnp.full((length, 4), 0.25, jnp.float32)
     assert affine_states(decay, write, jnp.ones((4,), jnp.bfloat16), axis=0).dtype == jnp.float32
 

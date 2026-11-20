@@ -832,9 +832,10 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
         levels = max(math.ceil(math.log2(max(c, 2))), 1)
         return product(c, c, c, count=2 * levels) + Work(operations=levels * c * c)
     if (args := get_callable_args(node, Chunk.substituted)) is not None:
-        # A row a step: its contraction with the rows before it, then its row set (two launches a row).
+        # A row a step: its contraction with the rows before it, then its row set (two launches a row), its
+        # solved rows carried on chip, read and written each step as a token loop's state is.
         columns = shape_of(args[1])[-1]
-        return Work(operations=2.0 * c * c * columns, span=2.0 * c)
+        return Work(operations=2.0 * c * c * columns, span=2.0 * c, kept_bytes=c * kept(c * columns))
     if (args := get_callable_args(node, Chunk.matmul)) is not None:
         left, right = shape_of(args[0]), shape_of(args[1])
         return product(left[0], left[-1], right[-1])

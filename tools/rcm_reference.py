@@ -84,7 +84,7 @@ def main() -> None:
         config=types.SimpleNamespace(**CONFIG), tensor_kwargs={"dtype": torch.float64},
         scaling=scaling_scope["RectifiedFlow_TrigFlowWrapper"](1.0, 1000.0),
         net=velocity(STRENGTH["student"]), net_teacher=velocity(STRENGTH["teacher"]),
-        net_fake_score=velocity(STRENGTH["fake_score"]), sync=lambda *xs: xs if len(xs) > 1 else xs[0])
+        net_fake_score=velocity(STRENGTH["fake_score"]), sync=lambda *xs: xs[0] if len(xs) == 1 else xs)
 
     def drawn(kind):
         def draw(shape):
@@ -123,7 +123,7 @@ def main() -> None:
         arrays[f"{name}.times"] = torch.stack(times["D"]).numpy()
         arrays[f"{name}.draws"] = torch.stack(tape.drawn).numpy()
     FIXTURE.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE / "losses.npz", **arrays)
+    np.savez(FIXTURE / "losses.npz", allow_pickle=False, **arrays)
     print(f"{FIXTURE}: sCM at two iterations, dCM, DMD and critic losses over {SHAPE[0]} rows")
 
 

@@ -108,7 +108,7 @@ def test_two_instances_of_an_overriding_trainer_each_build_their_own_state():
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=8)
     # One objective and one optimizer, so the two trainers' steps trace alike (`Trainer._step_key`) and
-    # their starts are kept as one would be (`traced_start`).
+    # their starts are kept as one would be (`traced_draw`).
     objective, optimizer = LMObjective(model, seq_len=8), optax.adam(1e-3)
     trainers = [Offset(objective, optimizer, key=jax.random.key(0), offset=offset) for offset in (1, 2)]
     assert [int(trainer.place()[0].step) for trainer in trainers] == [1, 2]
@@ -118,3 +118,57 @@ def test_two_instances_of_an_overriding_trainer_each_build_their_own_state():
     with Compiles(None) as second:
         assert int(trainers[1].initial_state().step) == 2
     assert second.count == 0, second.count
+
+
+def test_a_kept_draw_over_trees_alike_under_other_keys_draws_each_tree_its_own():
+    """Two held trees of leaves alike, shapes and dtypes, under other keys are two kept draws
+    (`dew.objectives.drawn.held_signature`): each call builds its own tree from its own values, where keyed
+    by the leaves alone the second replayed the first's structure over its values (row 8989)."""
+    from dew.objectives.drawn import WHOLE, drawn_once
+
+    def doubled(tree, key):
+        return jax.tree.map(lambda leaf: 2 * leaf, tree)
+
+    first = {"a": jnp.full(3, 1.0), "b": jnp.full(3, 0.0)}
+    second = {"c": jnp.full(3, 5.0), "d": jnp.full(3, 7.0)}
+    key = jax.random.key(0)
+    assert sorted(drawn_once(doubled, first, key, WHOLE, kept="doubled")) == ["a", "b"]
+    drawn = drawn_once(doubled, second, key, WHOLE, kept="doubled")
+    assert sorted(drawn) == ["c", "d"], drawn
+    assert float(drawn["c"][0]) == 10.0 and float(drawn["d"][0]) == 14.0, drawn
+
+
+def test_an_initial_state_from_another_initializer_draws_that_initializer():
+    """A state built from an initializer other than the objective's own, of the same leaves (none), draws
+    that initializer, where the eager draw kept by the class replayed the objective's own, which its key
+    states and the other's function is not part of (row 9092)."""
+    from jax.tree_util import Partial
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=8)
+    objective = LMObjective(model, seq_len=8)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
+
+    def sevens(key):
+        return jax.tree.map(lambda leaf: jnp.full_like(leaf, 7.0), objective.init(key))
+
+    own = jax.tree.leaves(trainer.initial_state().variables["params"])
+    other = jax.tree.leaves(trainer.initial_state(Partial(sevens)).variables["params"])
+    assert not all(bool(jnp.all(leaf == 7.0)) for leaf in own)
+    assert all(bool(jnp.all(leaf == 7.0)) for leaf in other)
+
+
+def test_a_draw_that_passes_every_leaf_through_runs_no_program():
+    """A draw whose every leaf is a held array passed through as it is, and whose rest holds none, returns
+    those arrays without compiling or running a program (row 9069: it compiled one that computed nothing)."""
+    from dew._cache import uncached
+    from dew.objectives.drawn import WHOLE, drawn_once
+
+    def kept(tree, key):
+        return tree
+
+    held = {"a": jnp.full(3, 1.0), "b": jnp.full(2, 4.0)}
+    with uncached(), Compiles(None) as compiles:
+        drawn = drawn_once(kept, held, jax.random.key(0), WHOLE)
+    assert drawn["a"] is held["a"] and drawn["b"] is held["b"]
+    assert compiles.count == 0, compiles.count

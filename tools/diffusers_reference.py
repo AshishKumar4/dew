@@ -408,7 +408,7 @@ def main() -> None:
             "latent_scale": float(np.abs(result["latents"]).max()),
         }
         print(f"{name}: {len(case.grid) - 1} intervals, |latent| <= {float(np.abs(result['latents']).max()):.3g}")
-    np.savez(FIXTURES / "schedulers.npz", **arrays)
+    np.savez(FIXTURES / "schedulers.npz", allow_pickle=False, **arrays)
     (FIXTURES / "schedulers.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in FIXTURES.iterdir())
     print(f"{FIXTURES}: {size / 1e3:.0f} kB, {sorted(p.name for p in FIXTURES.iterdir())}")

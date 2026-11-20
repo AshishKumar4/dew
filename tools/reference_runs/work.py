@@ -16,6 +16,7 @@ import dataclasses
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from flax import linen as nn
@@ -29,11 +30,13 @@ from dew.telemetry.workload import WorkloadWork
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def measure(objective: Objective, batch: Batch) -> WorkloadWork:
+def measure(objective: Objective[Any, Any], batch: Batch) -> WorkloadWork:
     """Use the trainer's objective assembly on the complete host batch.
 
     A model with no token geometry, a U-Net's convolutions, counts no tokens.
     """
+    if objective.inputs is None or (sample := objective.inputs.sample) is None:
+        raise ValueError(f"{type(objective).__name__} names no sample input to shape its batch by")
     model = objective.program_key()[0].module
     try:
         tokens = int(np.sum(objective.real_lengths(batch)))
@@ -44,7 +47,7 @@ def measure(objective: Objective, batch: Batch) -> WorkloadWork:
         tokens_per_step=tokens,
         basis="analytic, real tokens, causal half where applicable, objective training rule",
         model_identity=json.dumps(to_record(model, nn.Module), sort_keys=True),
-        batch_shape=np.shape(batch[objective.inputs.sample.key]))
+        batch_shape=np.shape(batch[sample.key]))
 
 
 def lm(args) -> WorkloadWork:

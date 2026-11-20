@@ -3,6 +3,7 @@ blocks that count the programs jitted functions need (`Compiles`) and the thread
 programs alone (`executable_only`)."""
 
 import contextlib
+import contextvars
 import threading
 import traceback
 from collections.abc import Iterator, Mapping
@@ -11,19 +12,91 @@ from typing import ClassVar
 
 import jax
 
+from dew import _cache
+
+
+class Span:
+    """A compile through Dew's compile point (`dew.nn.kernels.options.OuterProgram`) and the work JAX does
+    for it, wherever its context runs (a thread it is copied to among them): the program it compiles
+    (`called`, `OuterProgram.called`), whether it built its own executable (`built`: compiled or read from
+    JAX's persistent cache, not handed by its fingerprint, `dew.nn.kernels.options.taking`), and that
+    executable once compiled (`executable`), which states the backend it targets (`platform`)."""
+
+    __slots__ = ("built", "called", "executable")
+
+    def __init__(self, called: str) -> None:
+        self.called = called
+        self.built = False
+        self.executable: jax.stages.Compiled | None = None
+
+    @property
+    def platform(self) -> str | None:
+        """The backend its executable targets, read from its arguments' and results' placements where a
+        ledger asks (a compile's own reading them rebuilds its trees, whose nodes may refuse leaves of
+        another kind: a dataclass validating its fields); None before it is compiled."""
+        if self.executable is None:
+            return None
+        placed = [*jax.tree.leaves(self.executable.input_shardings),
+                  *jax.tree.leaves(self.executable.output_shardings)]
+        return next(iter(placed[0].device_set)).platform if placed else "none"
+
+
+class Owner:
+    """A block whose work JAX's events are told by (`owning`): equal to itself alone."""
+
+
+_SPAN: contextvars.ContextVar[Span | None] = _cache.untraced(
+    contextvars.ContextVar("dew_compile_span", default=None))
+_OWNER: contextvars.ContextVar[Owner | None] = _cache.untraced(
+    contextvars.ContextVar("dew_compile_owner", default=None))
+
+
+@contextlib.contextmanager
+def _held_as[Held](variable: contextvars.ContextVar[Held | None], held: Held) -> Iterator[Held]:
+    """`variable` set to `held` within the block, and `held` yielded."""
+    token = variable.set(held)
+    try:
+        yield held
+    finally:
+        variable.reset(token)
+
+
+def spanning(called: str) -> contextlib.AbstractContextManager[Span]:
+    """Within the block, the work JAX does in this context is the compile of the program `called` the
+    `Span` it yields stands for: each program a block hears there carries it (`Program.span`). Dew's
+    compile point opens one for exactly the span of a compile (`OuterProgram._compiled_digested`)."""
+    return _held_as(_SPAN, Span(called))
+
+
+def owning() -> contextlib.AbstractContextManager[Owner]:
+    """Within the block, the work JAX does in this context, and in every context copied from it (a compile
+    begun on a thread of its own, a certification's), is the block's own: each program a block hears there
+    carries the `Owner` it yields (`Program.owner`), which another block's work, a concurrent run's or
+    another thread's own, never does. What a host step's startup and its steps read their own compiles by
+    (`dew.training.compiler.HostStartup`, `HostRun`)."""
+    return _held_as(_OWNER, Owner())
+
 
 @dataclass(frozen=True)
 class Program:
     """One program a block needed: `traced` (its jaxpr) or `compiled` (by the backend, or fetched
     from the persistent compilation cache), its function's name, its seconds, where it was asked
-    for, the innermost frame outside JAX's and this module's, and the thread that made it, which a
-    compile at once runs on its own (`report.compiled_at_once`)."""
+    for, the innermost frame outside JAX's and this module's, the thread that made it, which a
+    compile at once runs on its own (`report.compiled_at_once`), the compile through Dew's compile point it
+    was work of (`spanning`), and the block whose work it was (`owning`), None where none's."""
 
     kind: str
     name: str
     seconds: float
     where: str
     thread: str = ""
+    span: Span | None = None
+    owner: Owner | None = None
+
+    @property
+    def called(self) -> str:
+        """Its function's name as its trace names it, a backend compile's `jit(<name>)` unwrapped."""
+        return self.name[4:-1] if self.name.startswith("jit(") and self.name.endswith(")") else self.name
 
 
 EVENTS: Mapping[str, str] = {"/jax/core/compile/jaxpr_trace_duration": "traced",
@@ -142,4 +215,12 @@ class Compiles:
                           and frame.filename != __file__ and "contextlib" not in frame.filename), None)
             where = "?" if frame is None else f"{frame.filename}:{frame.lineno}"
             self.programs.append(Program(kind, str(metadata.get("fun_name")), duration_secs, where,
-                                         threading.current_thread().name))
+                                         threading.current_thread().name, _SPAN.get(), _OWNER.get()))
+
+
+class Ledger(Compiles):
+    """Every program JAX traces, lowers or compiles while it is open, each kind of its events held: the
+    one ledger of what work took (a plan's, `dew.training.planning.spending`; a host step's startup's,
+    `dew.training.compiler.HostStartup`)."""
+
+    COUNTED = frozenset(EVENTS.values())

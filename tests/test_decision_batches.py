@@ -150,6 +150,25 @@ def test_a_mixed_list_answers_its_images_alone_and_its_text_together(tmp_path):
         assert discrete(response) == discrete(decide.systemone(body))
 
 
+def test_a_batch_of_requests_reads_each_requests_images_as_it_is_asked_alone(tmp_path):
+    """A batch of requests given each request's images (`images`, none for a request without) answers a
+    request with images by its own pass, as the request asked alone with them is answered (row 9061: a
+    batch took no request's images, so a request with images had to be asked alone)."""
+    release = FIXTURES / "joint_checkpoint" / "tiny"
+    backbone = FIXTURES / "hf" / "qwen38-dense-tiny"
+    for source in [*backbone.iterdir(), release / "joint_head_config.json",
+                   release / "joint_head.safetensors"]:
+        (tmp_path / source.name).symlink_to(source.resolve())
+    decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    pictures = [Image.fromarray(array) for array in np.load(backbone / "images.npy")]
+    asked = [(body["state"], {name: Question.from_wire(wire) for name, wire in body["questions"].items()})
+             for body in (CASES["structured"], CASES["quickstart"])]
+    answered = decide(asked, images=[(), pictures])
+    alone = decide(*asked[1], images=pictures)
+    assert answered[1].keys() == alone.keys() and answered[0].keys() == asked[0][1].keys()
+    assert all(np.array_equal(answered[1][name].probabilities, alone[name].probabilities) for name in alone)
+
+
 def test_a_mixed_list_with_a_backbone_that_reads_no_images_refuses_the_images_alone(decide):
     """A text backbone refuses a body's images in a list as it does alone, and answers the rest."""
     answered = decide.systemone([{**CASES["quickstart"], "images": ["aGVsbG8="]}, CASES["structured"]])

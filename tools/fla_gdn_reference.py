@@ -30,6 +30,10 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "fla"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "fla" / "gdn_seeded.npz"
 GRADIENTS = ("q", "k", "v", "g", "beta", "h0")
 """The delta rules' differentiated operands; RWKV6's take its own weight in the write gate's place."""
@@ -243,7 +247,7 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
               "float64",
         cross_check="Dew's token recurrence in float64; assert_computes_the_oracle with its traced "
                     "chain_roundings")
-    np.savez(out, **stored)
+    np.savez(out, allow_pickle=False, **stored)
     print(f"wrote {out}: {out.stat().st_size:,} bytes", flush=True)
 
 
