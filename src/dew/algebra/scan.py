@@ -1283,9 +1283,9 @@ def _chunk_walked(values, low, axis: int, restarts, joined: Callable,
     next: each chunk's own a walk of its elements, each chunk's entering the walk of the chunks' ends, a
     segment's first (`restarts`) starting its sums from zero within its chunk and the chunks' walk from its
     chunk's end."""
-    values, low = jnp.moveaxis(values, axis, 0), jnp.moveaxis(low, axis, 0)
-    restarts = (jnp.zeros(values.shape, bool) if restarts is None
-                else jnp.moveaxis(jnp.broadcast_to(jnp.asarray(restarts, bool), jnp.shape(values)), axis, 0))
+    restarts = (jnp.zeros(jnp.shape(values), bool) if restarts is None
+                else jnp.broadcast_to(jnp.asarray(restarts, bool), jnp.shape(values)))
+    values, low, restarts = (jnp.moveaxis(x, axis, 0) for x in (values, low, restarts))
     length, rest = values.shape[0], values.shape[1:]
     if length == 0:
         return jnp.moveaxis(values, 0, axis), jnp.moveaxis(low, 0, axis)
