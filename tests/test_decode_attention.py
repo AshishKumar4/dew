@@ -854,10 +854,11 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
 
 COMPILED = [(kernel, variant, splits) for kernel, variants in
             (("dense", ("bfloat16", "float32")), ("natural", ("raw", "sinks")), ("paged", (16, 32)))
-            for variant in variants for splits in decode_attention.SPLITS]
-"""The decode compile gate's cases: each kernel's variants at every slice count (`decode_attention.SPLITS`),
-a program shape each, so every case compiles one kernel (row 2123: a kernel's twelve together took 228 to
-263 s of a CPU task)."""
+            for variant in variants for splits in (1, decode_attention.SPLITS[-1])]
+"""The decode compile gate's cases: each kernel's variants at unsplit (`1`) and max split
+(`decode_attention.SPLITS[-1]`, 32) — splits 2..32 compile the same split-KV Triton body (identical shared
+bytes, registers and 0 spills, e.g. sm90 dense bf16: 44032 B / 167 regs / 0 B frame for all splits 2..32
+vs 168 regs at split 1), cutting 108 to 36 cells."""
 
 
 @pytest.mark.parametrize(("kernel", "variant", "splits"), COMPILED)
