@@ -735,12 +735,15 @@ def spread_from(producers, variable) -> tuple[int, ...]:
     """`variable`'s shape before a spread over an axis by doubling concatenations of one value and a slice
     (Mamba's B and C over its channels, `dew.nn.mixers.mamba._spread`): an outer product's operand still,
     each element of the product one multiply."""
-    source = producer(producers, variable)
+    walked, spread = variable, False
+    source = producer(producers, walked)
     while source is not None and (source.primitive.name == "slice" or (
             source.primitive.name == "concatenate" and len(set(map(id, source.invars))) == 1)):
-        variable = source.invars[0]
-        source = producer(producers, variable)
-    return variable.aval.shape
+        spread = spread or source.primitive.name == "concatenate"
+        walked = source.invars[0]
+        source = producer(producers, walked)
+    # A slice alone is no spread: only a walk that passed a concatenate of one value reads its source.
+    return walked.aval.shape if spread else variable.aval.shape
 
 
 def producer(producers, variable):
