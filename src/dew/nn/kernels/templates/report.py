@@ -691,12 +691,11 @@ def certifying_aside() -> Iterator[Aside]:
             _ASIDE.reset(token)
 
 
-def settled_aside(aside: Aside) -> bool:
+def settled_aside(aside: Aside) -> None:
     """Each launch `aside` certified, kept as `certified` keeps one: a launch whose kernels the assembler
     refuses refused (`refuse_launch`) and its misses recorded, stepped where its derivation offers another
-    config now, so the program lowered within the block holds a refused config and is lowered afresh.
-    Whether any was refused."""
-    refused = False
+    config now, so the program lowered within the block holds a refused config (`refused_in`) and is lowered
+    afresh."""
     for key, each in aside.pending.items():
         # A launch a derivation certified (a route's eligibility) and no trace called: no program holds it.
         # One certified in turn meanwhile (a refusal's ladder, `tuning.KernelOp._certified`) is certified.
@@ -718,8 +717,6 @@ def settled_aside(aside: Aside) -> bool:
                           {binary.kernel: binary.spilled_in for binary in spilling})
             missed(each.op, each.arguments, each.config, spilling,
                    stepped=each.op.remaining(each.arguments) is not None)
-            refused = True
-    return refused
 
 
 def _refused_before(op, arguments: tokamax.BoundArguments) -> bool:
@@ -1265,7 +1262,9 @@ def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.Com
     held = refusal_entries()
     kept_programs = []
     for (lowered, options, relower), first in zip(programs, firsts, strict=True):
-        if refusal_entries() != held:
+        # A program launching a config an earlier one's compile refused after its trace took it, each program
+        # by what it launches (row 8603); refusals held before every trace, its derivations read.
+        if refusal_entries() != held and refused_in(lowered):
             lowered, first = relower(), None
         kept_programs.append(compiled(lowered, options, relower=relower, first=first))
     return kept_programs
@@ -1691,13 +1690,17 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     executable = first.executable
     assert executable is not None
     found, compiled_from = _misses_of(_refused_binaries(lowered, executable, read)), lowered
+    # The refusals this compile relowered past: a spill at a config another caller refused after this
+    # program's trace took it (another thread's compile, a certification elsewhere) is relowered past as
+    # any, never read as held, which kept a spilling program (row 8603).
+    past: set[tuple[tuple[str, Hashable], str]] = set()
     while True:
-        # Each step refuses a config no step refused before, of the finitely many its launches derive.
-        held = _registry().refused
+        # Each step refuses a config no step of this compile did, of the finitely many its launches derive.
         refusals = [(refusal, (report.kernel, report.spilled_in)) for refusal, report, _ in found
-                    if refusal is not None and report.kernel not in names(held.get(refusal, ()))]
+                    if refusal is not None and (refusal, report.kernel) not in past]
         if not refusals:
             break
+        past.update((refusal, kernel) for refusal, (kernel, _) in refusals)
         try:
             with _proposing(refusals) as proposal:
                 program, alone = _stepped_alone(relower, options, {identity for (identity, _), _ in refusals})
@@ -1893,16 +1896,29 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
             tuning.store_verdict(verdict_target(device), key, kernels)
 
 
+def _launched(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:
+    """Each launch `program` makes, its identity and config (`called`): every call JAX compiles, a branch's
+    no run takes among them (a forward's scaled op's)."""
+    from dew.nn.kernels.lowered import kernel_calls
+
+    return {(launch.identity, launch.config) for call in kernel_calls(program, unrun=True)
+            if (launch := called(call)) is not None}
+
+
+def refused_in(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:
+    """The launches `program` makes at a config refused in this context (`refusal_entries`): a refusal
+    committed after its trace took the config (another program's compile, another thread's certification),
+    past which it is lowered afresh before it compiles (row 8603)."""
+    refused = {(identity, config) for identity, config, _ in refusal_entries()}
+    return _launched(program) & refused if refused else set()
+
+
 def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], Refused]]
              ) -> list[tuple[tuple[str, Hashable], Refused]]:
     """Each of `refusals` (a launch's identity and config, and its spilling kernel, `Refused`) that `program`,
     relowered under them, launches again: its launch's derivation did not read the refusal. Each is logged,
     so the launch whose rule ignores its refusals is named."""
-    from dew.nn.kernels.lowered import kernel_calls
-
-    # Every call JAX compiles, a branch's no run takes among them (a forward's scaled op's).
-    launched = {(launch.identity, launch.config) for call in kernel_calls(program, unrun=True)
-                if (launch := called(call)) is not None}
+    launched = _launched(program)
     untaken = [(refusal, kernel) for refusal, kernel in refusals if refusal in launched]
     for (_, config), (kernel, _) in untaken:
         _log.warning("kernel %s's refusal at %s did not take: the program relowered under it launches it "
