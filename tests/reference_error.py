@@ -1956,7 +1956,7 @@ def declared_seeds(path) -> dict[str, int]:
             if name.endswith(".seeds")}
 
 
-def ahead_arm(fn: Callable, label: str, *, host: bool = False) -> Callable:
+def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = False) -> Callable:
     """`fn` (a function of arrays: a test's computation with no check-1 site, a bitwise check's kernel run on
     the GPU) as an arm with no site, through the arms' own path: within a GPU tier part's prepare (`COMPILED`,
     a store that prepares) its call is traced and compiled at its inputs' shapes as a site's arms are
@@ -1968,13 +1968,18 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False) -> Callable:
     CPU-placed computation, row 8376's). One no statement holds, or one its prepare did not reach, runs
     unprepared, recorded and named (`unprepared`, as `running` records a site). One call a label: a second in
     one prepare is refused, as a second site of one label is (`compile_site`). Its inputs are host arrays,
-    NumPy's: a prepare's default device computes nothing, not even their placement (bible §8)."""
+    NumPy's: a prepare's default device computes nothing, not even their placement (bible §8). With
+    `launched`, a call returns its outputs and the kernel launches the program it ran took (`tuning.Seen`,
+    held): in a prepare its trace's, in its run its record's (`CompiledTruths.ran` notes them), outside a part
+    those of its one lowering, traced and run once a call, so a witness judges the launches of the program
+    it ran and no trace of its own (row 9550)."""
     def unprepared(*inputs):
-        if not host:
-            return fn(*inputs)
-        cpu = jax.devices("cpu")[0]
-        with jax.default_device(cpu):
-            return fn(*jax.device_put(inputs, cpu))
+        cpu = jax.devices("cpu")[0] if host else None
+        with contextlib.nullcontext() if cpu is None else jax.default_device(cpu):
+            placed = inputs if cpu is None else jax.device_put(inputs, cpu)
+            # With `launched`, the launches of the program run: one lowering, traced where they are seen.
+            run = jax.jit(fn).lower(*placed).compile() if launched else fn
+            return run(*placed)
 
     def called(*inputs):
         store = COMPILED.get()
@@ -2002,7 +2007,17 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False) -> Callable:
             return unprepared(*inputs)
         return store.ran(armed(label), role, inputs)
 
-    return called
+    if not launched:
+        return called
+
+    def with_launches(*inputs):
+        from dew.nn.kernels import tuning
+
+        with tuning.seen() as found:
+            outputs = called(*inputs)
+        return outputs, found.held()
+
+    return with_launches
 
 
 def drawn_on_the_host(inputs_of: Callable, seed: int):

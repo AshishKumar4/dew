@@ -9,11 +9,19 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from contract_support import normal_drawn
-from reference_error import GateFailure, Inconclusive, UnpairedDraw, as_given, assert_as_exact, seeds_for
+from reference_error import (
+    GateFailure,
+    Inconclusive,
+    UnpairedDraw,
+    ahead_arm,
+    as_given,
+    assert_as_exact,
+    seeds_for,
+)
 from test_reference_error import exact_rows, noised_draw, stacked_arm, stacked_examples
 from truths_ahead import compiled_truths
 
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import gemm, generation, tuning
 
 
 def noised(scale: float, noise: str, own: float = 0.0):
@@ -154,3 +162,28 @@ def test_the_arms_arithmetic_is_that_of_where_their_calls_are_placed():
     with jax.default_device(compile_only_gpus("sm90", 1)[0]):
         on_a_gpu = preset()
     assert on_a_cpu == FP32_SUMS and on_a_gpu == jax.config.jax_default_matmul_precision
+
+
+def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran():
+    """`ahead_arm(fn, label, launched=True)` outside a part returns its outputs and the launches the program
+    it ran took, at every call: its one lowering's, each the launch a trace of the function takes, the second
+    call's too, whose program a plain jit would take from its cache and trace no launch for a collector open
+    around it (row 9550: a witness retraced a program of its own to see them)."""
+    sizes = np.asarray([128, 128], np.int32)
+    rng = np.random.default_rng(9550)
+    x = rng.standard_normal((256, 128)).astype(np.float32)
+    dy = rng.standard_normal((256, 64)).astype(np.float32)
+
+    def gradient(x, dy):
+        return gemm.gemm_t(x.astype(jnp.bfloat16), dy.astype(jnp.bfloat16), jnp.asarray(sizes),
+                           out_dtype=jnp.float32, precision="highest", interpret_on_cpu=True)
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="triton"):
+        arm = ahead_arm(gradient, "a kernel gradient and its launches", launched=True)
+        made = [arm(x, dy) for _ in range(2)]
+        with tuning.seen() as traced:
+            jax.jit(gradient).trace(x, dy)
+    expected = [type(op) for op, _ in traced]
+    assert expected and all([type(op) for op, _ in launches] == expected for _, launches in made)
+    np.testing.assert_array_equal(np.asarray(made[0][0]), np.asarray(made[1][0]))
+
