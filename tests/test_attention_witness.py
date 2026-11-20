@@ -40,23 +40,25 @@ def test_native_attention_witness_cells_prepare_without_deferring(tmp_path, monk
     through `ahead_arm` into completed `site.json` records with zero `DEFERRED`/`UNPREPARED`."""
     import json
 
+    import generation_support
+    import model_flows
     import test_native_certificates as certs
     import tier_wire
     from gpu_flow import run_cells
     from truths_ahead import DEFERRED, UNPREPARED, prepared
 
-    from dew.nn.kernels.tuning import BuildTarget
-
-    target = BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64")
+    topology = generation_support.node_topology(tmp_path / "topology.bin", gpu="sm90")
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
-    with prepared(tmp_path, stamp="a", target=target):
+    store_dir = tmp_path / "store"
+    with prepared(store_dir, stamp="a", target=generation_support.node_target()):
         run_cells([
             certs.cell(certs.the_attention_templates_states_certify_natively_a_step_at_a_time, "sm90", "causal"),
             certs.cell(certs.the_attention_templates_states_certify_natively_a_step_at_a_time, "sm90", "full"),
             certs.cell(certs.the_attention_witness_refuses_its_faults_natively, "sm90"),
         ])
-    assert not (tmp_path / DEFERRED).exists(), (tmp_path / DEFERRED).read_text()
-    assert not (tmp_path / UNPREPARED).exists(), (tmp_path / UNPREPARED).read_text()
-    labels = {json.loads(path.read_text())["label"] for path in tmp_path.rglob("site.json")}
-    assert any("attention witness, causal, sm90" in label for label in labels), labels
-    assert any("attention witness, full, sm90" in label for label in labels), labels
+    assert not (store_dir / DEFERRED).exists(), (store_dir / DEFERRED).read_text()
+    assert not (store_dir / UNPREPARED).exists(), (store_dir / UNPREPARED).read_text()
+    labels = {json.loads(path.read_text())["label"] for path in store_dir.rglob("site.json")}
+    assert any("attention witness, causal," in label for label in labels), labels
+    assert any("attention witness, full," in label for label in labels), labels

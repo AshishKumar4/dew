@@ -105,6 +105,7 @@ class CompiledTruths:
     tried: set[str] = dataclasses.field(default_factory=set)
     done: set[str] = dataclasses.field(default_factory=set)
     read: dict[str, tuple[dict, dict]] = dataclasses.field(default_factory=dict)
+    prepared_arms: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
 
     def path(self, label: str) -> Path:
         return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]

@@ -25,7 +25,6 @@ A query row's tiles past its last kept key are walked with nothing kept, which l
 the witness holds a row's states up to the last tile it keeps a key of, and its output from there."""
 
 import functools
-import weakref
 
 import attention_oracle
 import numpy as np
@@ -146,20 +145,11 @@ def witnessed(query, key, value, kept, *, interpret: bool, records=None,
                    np.concatenate([inside.ravel() for _, inside in found])) for name, found in held.items()}
 
 
-def certified(query, key, value, spans, *, interpret: bool):
-    """The certify launch's tiles and records (`attention_mosaic.certified`): interpreted, at a Hopper's
-    tiles, the target an interpreted launch derives its config for (`generation.assumed`); natively, on a
-    device whose mainloop runs the call, its test skipped with the mainloop's own reason where it declines it
-    (`attention_mosaic.forward_declined`: an Ampere's, whose family the mainloop does not yet qualify)."""
-    import pytest
-
+def certified(query, key, value, spans):
+    """The interpreted certify launch's tiles and records (`attention_mosaic.certified`) at a Hopper's tiles,
+    the target an interpreted launch derives its config for (`generation.assumed`)."""
     from dew.nn.kernels import generation
 
-    if not interpret:
-        declined = attention_mosaic.forward_declined(query, key, value, spans)
-        if declined is not None:
-            pytest.skip(f"the Mosaic mainloop declines the witnessed call here: {declined}")
-        return attention_mosaic.certified(query, key, value, spans)
     with generation.assumed("sm90"):
         return attention_mosaic.certified(query, key, value, spans, interpret=True)
 
@@ -174,13 +164,6 @@ def spans_of(kept, batch: int):
 SHAPE = (1, 512, 2, 64)
 """The witnessed call's `[B, S, H, D]`: a Hopper's and an Ampere's launch walk more than one key tile at
 this length, so a fault in the rescale has a second step to break."""
-
-
-_PREPARED: weakref.WeakKeyDictionary[object, dict[str, tuple]] = weakref.WeakKeyDictionary()
-"""Per-store cache of native certify placeholders prepared in the active `CompiledTruths`
-(`_certified_native`), scoped to the store instance so a second cell reading the same causal/full program
-reuses its placeholder without re-compiling the same label in one prepare, and a reopened store starts fresh
-(`ahead_arm`, row 9546)."""
 
 
 def operands(seed: int):
@@ -222,7 +205,7 @@ def _certified_native(query, key, value, *, causal: bool):
     shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in (query, key, value))
     label = f"attention witness, {'causal' if causal else 'full'}, {generation.assumption()}, {shapes}"
     store = COMPILED.get()
-    cached = _PREPARED.setdefault(store, {}) if store is not None and store.prepare else None
+    cached = store.prepared_arms if store is not None and store.prepare else None
     if cached is not None and label in cached:
         block_k, found = cached[label]
     else:
@@ -241,7 +224,7 @@ def launched(query, key, value, mask, *, interpret: bool) -> dict:
         block_k, (out, rows, sums) = _certified_native(query, key, value, causal=causal)
     else:
         spans = spans_of(mask, query.shape[0])
-        tiles, (out, rows, sums) = certified(query, key, value, spans, interpret=True)
+        tiles, (out, rows, sums) = certified(query, key, value, spans)
         block_k = tiles.block_k
     return {"out": np.asarray(out, np.float64), "m": np.asarray(rows[0], np.float64),
             "l": np.asarray(rows[1], np.float64), "acc": np.asarray(sums, np.float64), "tile": block_k}
