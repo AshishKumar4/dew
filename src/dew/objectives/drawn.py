@@ -101,18 +101,20 @@ def held_signature[Tree](tree: Tree) -> Hashable:
     keeps none of what its nodes bind alive. Two trees of leaves alike under other keys (row 8989), or apart
     only by an empty collection (row 9548: `{**variables, "batch_stats": {}}` replayed without it) are two
     keys."""
-    return _shape_of(jax.tree.structure(tree)), abstract_signature(jax.tree.leaves(tree))
+    return _shape_of((jax.tree.structure(tree),)), abstract_signature(jax.tree.leaves(tree))
 
 
-def _shape_of(structure: jax.tree_util.PyTreeDef) -> Hashable:
-    """`structure` as a value of plain data alone: each node its kind, its static data as plain data
+def _shape_of(held: tuple[jax.tree_util.PyTreeDef]) -> Hashable:
+    """A tree's structure, held in a one-element tuple (JAX declares `PyTreeDef` a value, which a type admits
+    only inside another), as a value of plain data alone: each node its kind, its static data as plain data
     (`_static`) and its children's, a leaf none."""
-    data = structure.node_data()
-    if data is None:
+    (structure,) = held
+    node = structure.node_data()
+    if node is None:
         return None
-    kind, static = data
+    kind, static = node
     return (kind.__module__, kind.__qualname__, _static(static),
-            tuple(_shape_of(child) for child in structure.children()))
+            tuple(_shape_of((child,)) for child in structure.children()))
 
 
 def _static(value: Hashable | list[Hashable]) -> Hashable:
