@@ -761,8 +761,10 @@ class Trainer(Generic[Loss, Effects]):
                                stated and (stated, self._start_owner()))
         abstract, checkpoints = draw.abstract, self.checkpoints
         # Each process lists the checkpoints itself, one listing may lag another's: all resume or none.
-        step = (None if checkpoints is None
-                else agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume)))
+        step = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.resumed(
+            resume, unrelated=lambda held: bool(computation_differs(  # Another run's model alone (row 9019).
+                checkpoints.artifact(held), self._artifact(), checkpoints.training(held),
+                self.objective.training_record()))))
         if checkpoints is not None and step is not None:
             abstract = self._staging.state(abstract.with_window(checkpoints.accumulation_template(step)),
                                           self._staging.staged_shapes)

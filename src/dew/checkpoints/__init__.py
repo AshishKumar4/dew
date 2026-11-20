@@ -1358,25 +1358,22 @@ class Checkpoints:
             return local if persistent is None else persistent
         return max(persistent, local)
 
-    @property
-    def occupied(self) -> int | None:
-        """The newest committed step of any kind the directory holds, a run's or a model's alone (a
-        weights-only save, which no resume reads): what a run started afresh would write beside."""
-        return self._newest(None)
-
-    def resumed(self, resume: Resume = "auto") -> int | None:
+    def resumed(self, resume: Resume = "auto", *, unrelated: Callable[[int], bool] | None = None
+                ) -> int | None:
         """The step a run continues under `resume`, the `latest`, or None where it starts afresh:
         "auto" continues one where the directory holds it; "require" refuses a directory with none,
         so a job that must continue never trains from scratch; "never" refuses one that holds any step,
-        which a run started afresh would write beside. A directory holding steps of which none resumes
-        (`occupied`, a weights-only save) is refused a fresh run under "auto" too: the run would write
-        beside them (row 9019: such a directory read as empty)."""
+        a model's alone (a weights-only save, which no resume reads) among them, which a run started
+        afresh would write beside. Under "auto" a directory holding steps none of which resumes is refused
+        where `unrelated` finds the newest another run's (a trainer's: another computation), and started
+        afresh where it is the run's own (a rerun's of its ranked weights-only steps; row 9019)."""
         latest = self.latest
         if resume == "require" and latest is None:
             raise ValueError(f"resume='require' continues a run, and {self.directory} holds no checkpoint "
                              "to continue")
-        held = latest if latest is not None else self.occupied
-        if held is not None and (resume == "never" or latest is None):
+        held = latest if latest is not None else self._newest(None)
+        if held is not None and (resume == "never" or (
+                latest is None and unrelated is not None and unrelated(held))):
             raise ValueError(f"resume={resume!r} starts a run afresh here, and {self.directory} holds a step "
                              f"at {held}{'' if latest is not None else ' that no run resumes'}; give the new "
                              "run a directory of its own")

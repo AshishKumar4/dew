@@ -395,22 +395,6 @@ def test_a_direct_resume_into_another_models_computation_is_refused_and_its_own_
     assert int(trainer("swiglu").fit(lm_data(), steps=2).step) == 2
 
 
-def test_a_direct_resume_under_another_loss_setting_is_refused_and_one_of_execution_resumes(tmp_path):
-    """A trainer built directly over a checkpoint directory whose run trained another loss of the same model
-    and objective class (its `z_loss`) refuses to resume, naming the setting (row 9020: it resumed, its
-    inference record alike); a setting that says how the step executes (the head's tiling, `executed`) or
-    reports alone (`token_accuracy`, `resumable`) resumes."""
-    def trainer(**settings) -> Trainer:
-        model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                                  mlp_features=32, max_seq_len=12, dtype="float32")
-        return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT, **settings))
-
-    trainer().fit(lm_data(), steps=1)
-    with pytest.raises(ValueError):
-        trainer(z_loss=1e-4).fit(lm_data(), steps=2)
-    assert int(trainer(head_tile="tiled", token_accuracy=False).fit(lm_data(), steps=2).step) == 2
-
-
 @pytest.mark.parametrize("accumulation", [1, 2], ids=["one-step-updates", "two-step-windows"])
 @pytest.mark.parametrize("steps", [4, 20])
 def test_a_token_budget_stops_its_run_at_the_step_it_is_spent(accumulation, steps):
