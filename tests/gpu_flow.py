@@ -9,6 +9,7 @@ optional package, too little free device memory), is reported skipped with its r
 and the cells after it still run. A cell function that keeps its test's grid in
 its own `pytest.mark.parametrize` marks gives a cell a parameter set (`cells_of`)."""
 
+import contextvars
 import dataclasses
 import functools
 import inspect
@@ -113,6 +114,11 @@ def _raised(error: BaseException) -> str:
     return type(error).__name__ + (f": {message[0]}" if message else "")
 
 
+RUNNING: contextvars.ContextVar[str | None] = contextvars.ContextVar("running_cell", default=None)
+"""The label of the cell `run_cells` is running: what a computation a cell compiles ahead names itself by
+(`test_native_certificates._native`), so its calls are counted within the cell and a cell its prepare
+deferred, which makes more calls in its run than in its prepare, never moves another cell's count."""
+
 REPORTED: list[dict] = []
 """The counts of each outermost flow run since the last test's report took them (`run_cells`), which
 tests/conftest.py reports as the test's JUnit property `cells`: a flow none of whose cells ran is
@@ -185,6 +191,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 continue
             print(f"cell: {cell.label}", flush=True)
             begun = _begun()
+            running = RUNNING.set(cell.label)
             try:
                 cell.run()
             except pytest.skip.Exception as skip:
@@ -201,6 +208,8 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                     failed.append((cell.label, text, frames))
             else:
                 passed += 1
+            finally:
+                RUNNING.reset(running)
     finally:
         # Counted however the flow ends, so a flow stopped early still reports what it ran.
         _depth -= 1

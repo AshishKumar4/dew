@@ -74,7 +74,6 @@ def cells(test: str) -> list:
             for label, shard in stated(module, choice, kernel).items()]
 
 
-@pytest.mark.kernel
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize(("module", "choice", "kernel", "label"), cells("test_a_kernel_runs_per_shard"))
 def test_a_kernel_runs_per_shard(module, choice, kernel, label):

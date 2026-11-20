@@ -155,32 +155,29 @@ def _whole_axes(specs, mesh: jax.sharding.Mesh) -> list[frozenset[str]]:
             for spec in jax.tree.leaves(specs, is_leaf=lambda leaf: isinstance(leaf, PartitionSpec))]
 
 
-def split_checked(fn, draw, specs, mesh, *, moves=(), reductions=None, donate=()):
+def split_checked(fn, draw, specs, mesh, *, moves=(), reductions=(), donate=()):
     """`fn` jitted as the gate compiles a Dew arm (`without_ynn`), and its split executable on `draw(0)`'s
     arguments placed by `specs` (`split_executable`), its compiled step holding no collective that moves
     entries between devices (`MOVES`) beyond `moves`, no sum across devices (`REDUCTIONS`) but those it
     intends, and no copy or transpose at a kernel call's edge (`boundary_copies`): `assert_runs_per_shard`'s
-    compile-time half. A sum it intends is one of `reductions`, `(op, axes)` over the mesh axes it sums
-    along (`collective_axes`), where given; else the gradient's of an operand whole along those axes (its
-    spec naming none of them: `_whole_axes`), as a call of operands to outputs and gradients sums a weight's
-    over the rows a mesh splits, or of an operand a gather `moves` allows ran along them (the gather's
-    transpose). A sum on an axis no operand is whole or gathered along, which a per-shard program should not
-    take, fails, where every reduction passed whole (spec alignment, 9001); a group of one device sums
-    nothing across devices."""
+    compile-time half. A sum it intends is an operand's gradient's over mesh axes it is whole along (its spec
+    naming none of them: `_whole_axes`), as a call of operands to outputs and gradients sums a weight's over
+    the rows a mesh splits, or one of `reductions`, each `(op, axes)` over the axes it sums along
+    (`collective_axes`): a gathered operand's transpose, which its cell names beside its gather (an fsdp
+    weight's reduce-scatter). A sum on axes no operand is whole along and no cell names, which a per-shard
+    program should not take, fails, where every reduction passed whole (spec alignment, 9001); a group of
+    one device sums nothing across devices."""
     run = without_ynn(fn, donate_argnums=donate)
     compiled = split_executable(run, draw(0), specs, mesh)
     text = compiled.as_text()
     moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]
     assert not moved, f"the step moves operands between devices: {moved}"
     found = collective_axes(compiled, mesh)
-    # An operand's gradient sums over the axes it is whole along, and a gathered operand's over the axes its
-    # gather ran along (the gather's transpose, an fsdp weight's reduce-scatter).
-    along = [*_whole_axes(specs, mesh), *(axes for op, axes in found if op in MOVES and op in moves)]
+    whole = _whole_axes(specs, mesh)
+    declared = {(op, frozenset(axes)) for op, axes in reductions}
 
     def intended(op: str, axes: frozenset[str]) -> bool:
-        if reductions is not None:
-            return (op, axes) in {(each, frozenset(named)) for each, named in reductions}
-        return any(axes <= each for each in along)
+        return (op, axes) in declared or any(axes <= each for each in whole)
 
     summed = sorted((op, sorted(axes)) for op, axes in found
                     if op in REDUCTIONS and axes and not intended(op, axes))
@@ -191,16 +188,16 @@ def split_checked(fn, draw, specs, mesh, *, moves=(), reductions=None, donate=()
 
 
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
-                          reductions=None, donate=(), arm=None, also=None, checked=None):
+                          reductions=(), donate=(), arm=None, also=None, checked=None):
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
     by `specs` (PartitionSpecs) is on par with `fn` on one device over the site's declared `seeds`
     (check 1, `assert_as_exact`), both measured from `truth_fn`, the float64 tree of `fn`'s outputs on
     the arguments widened; its compiled step, every draw's one program, holds no collective that moves
     entries between devices (`MOVES`) beyond the ops `moves` names (a sequence split's intended
     exchange), which XLA, unable to split an opaque call, would otherwise insert to replicate it; no sum
-    across devices but those it intends (`split_checked`'s `reductions`: an operand's gradient over the axes
-    it is whole along, a weight's over the rows); and no copy or transpose at a kernel call's edge
-    (`boundary_copies`). `donate` names the arguments `fn`
+    across devices but those it intends (`split_checked`: an operand's gradient over the axes it is whole
+    along, a weight's over the rows, and the `reductions` a gather's transpose takes); and no copy or
+    transpose at a kernel call's edge (`boundary_copies`). `donate` names the arguments `fn`
     takes in place, as its callers donate them (a kernel that aliases its state into its output): a
     call that keeps them would make XLA copy each before the kernel overwrites it. Every arm is Dew's
     program, compiled here as the gate compiles two Dew arms (`without_ynn`) and run as given: the

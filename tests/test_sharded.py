@@ -52,6 +52,9 @@ def test_a_sum_over_an_axis_no_operand_is_whole_along_fails_the_split(whole):
     rng = np.random.default_rng(0x9001)
     x = jnp.asarray(rng.standard_normal((8, 16)), jnp.float32)
     w = jnp.asarray(rng.standard_normal((16, 4)), jnp.float32)
+    def gathered(x):
+        return jnp.sum(x, axis=0), jax.lax.with_sharding_constraint(x, PartitionSpec())
+
     if whole:
         def gradient(x, w):
             return jax.grad(lambda w: jnp.sum(jnp.dot(x, w)))(w)
@@ -60,3 +63,6 @@ def test_a_sum_over_an_axis_no_operand_is_whole_along_fails_the_split(whole):
     else:
         with pytest.raises(AssertionError):
             split_checked(lambda x: jnp.sum(x, axis=0), lambda seed: (x,), (PartitionSpec("data"),), mesh)
+        # A gather the cell allows excuses no sum it does not name (head review).
+        with pytest.raises(AssertionError):
+            split_checked(gathered, lambda seed: (x,), (PartitionSpec("data"),), mesh, moves=("all-gather",))
