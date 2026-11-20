@@ -1026,10 +1026,13 @@ class FitSearch[LossT, EffectsT]:
                 candidate = relowered.candidate(candidate)
             fit, headroom = self.fitting(executable, candidate)
             key = self.compiled_key(candidate.lowered, options)
-            if relowered is not None and executable is not None and (fit or self.provisional):
+            if (relowered is not None or ahead is not None) and executable is not None and (
+                    fit or self.provisional):
                 # Under the program it compiled: the relowered one past a spill, which a plan after it lowers
-                # directly, the spill's refusal held for the process. One that misses on the devices the
-                # step runs on is no step's, its device code held for nothing.
+                # directly, the spill's refusal held for the process; or the one taken ahead, which a later
+                # measure of the same program takes again rather than compiling afresh (row 7988: measured
+                # ahead, then compiled again). One that misses on the devices the step runs on is no step's,
+                # its device code held for nothing.
                 hold(key, executable)
             elif kept is not None and executable is kept and not fit and not self.provisional:
                 unhold(key)
