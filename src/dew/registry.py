@@ -267,26 +267,13 @@ def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) ->
         # path holds: only a module the process can import is imported.
         if package.replace(".", "").isidentifier() and _importable(package):
             importlib.import_module(package)
-    # Only JSON a record holds (`json_value` refuses any other), its every string read once, but a run's
-    # own processor's record (`custom`), whose strings are its user's data: its classes import where the
-    # registry reaches them (`imported`).
-    for named in strings_of(_without_custom(json_value(record, "record"))):
+    # Only JSON a record holds (`json_value` refuses any other), its every string read once.
+    for named in strings_of(json_value(record, "record")):
         module, colon, name = named.partition(":")
         # A string shaped as an import path that names no module (a text field's) is data, not a module.
         if (colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier()
                 and _importable(module)):
             importlib.import_module(module)
-
-
-def _without_custom(record: JSON) -> JSON:
-    """`record` with every `custom` entry (`TaskSettings.custom`) left out, at any depth."""
-    match record:
-        case dict():
-            return {key: _without_custom(value) for key, value in record.items() if key != "custom"}
-        case list():
-            return [_without_custom(value) for value in record]
-        case _:
-            return record
 
 
 def _importable(name: str) -> bool:
@@ -1215,13 +1202,25 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
     if not (isinstance(value, (Mapping, list, str)) or (dtypes and name == "dtype")):
         return value
     named = parameters(member)[0]
-    declared = parameter_type(named[name][1], name) if name in named else None
     # A text is kept as given but where its parameter declares a duration, recorded as its text
     # (`_records.recorded_duration`), optional or not.
-    if (isinstance(value, str) and not (dtypes and name == "dtype")
-            and datetime.timedelta not in (declared, *_union_members(declared))):
+    if isinstance(value, str) and not (dtypes and name == "dtype") and not _declares_duration(named, name):
         return value
-    return _rebuilt(declared, value, dtypes=dtypes, name=name)
+    return _rebuilt(parameter_type(named[name][1], name) if name in named else None, value, dtypes=dtypes,
+                    name=name)
+
+
+def _declares_duration(named: Mapping[str, tuple], name: str) -> bool:
+    """Whether parameter `name` of `named` (`parameters`) declares a duration, optional or not; False where
+    its annotation names what its module does not import at runtime, whose text is passed as given."""
+    if name not in named:
+        return False
+    try:
+        declared = parameter_type(named[name][1], name)
+    except ValueError:
+        # An annotation no record is read against (`parameter_type`): the text is the argument as written.
+        return False
+    return datetime.timedelta in _union_members(declared)
 
 
 def argument_records(member: type | Callable[..., Configured], fields: Mapping[str, object]
@@ -1449,7 +1448,8 @@ def configured(value: object) -> Configured:
     can carry at all, so a value no member could take is refused where the
     record was read instead of inside the module that would have used it.
     """
-    if value is None or isinstance(value, (bool, int, float, str, bytes, type, Enum, np.dtype)):
+    if value is None or isinstance(value, (bool, int, float, str, bytes, type, Enum, np.dtype,
+                                           datetime.timedelta)):
         return value
     if isinstance(value, (np.ndarray, np.generic, jax.Array)):
         return value

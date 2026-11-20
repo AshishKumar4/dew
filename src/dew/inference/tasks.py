@@ -411,7 +411,7 @@ class SavedRun:
         persist_compilations()
         with Checkpoints(directory) as checkpoints:
             step = checkpoints.pinned(step)
-            import_trusted(checkpoints.artifact(step), trust)
+            import_trusted(scanned_artifact(checkpoints.artifact(step)), trust)
             record = saved_artifact(checkpoints, step)
         if record is None:
             raise ValueError("this checkpoint's objective declares no inference record; declare "
@@ -1075,6 +1075,17 @@ def recorded_processor(processor: Processor | None) -> SourceReference | None:
     from dew.interop.processors import Processor as SourceProcessor
 
     return processor.source if isinstance(processor, SourceProcessor) else None
+
+
+def scanned_artifact(record: JSON | Mapping[str, object]) -> JSON | Mapping[str, object]:
+    """A run's inference record as a load's eager import scan reads it (`dew.registry.import_trusted`):
+    its own processor's record (`TaskSettings.custom`, a top-level field) left out, whose strings are its
+    user's data; its classes import where the registry reaches them."""
+    match record:
+        case Mapping():
+            return {key: value for key, value in record.items() if key != "custom"}
+        case _:
+            return record
 
 
 def recorded_custom(processor: Processor | None) -> JSON:
