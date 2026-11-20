@@ -19,7 +19,6 @@ from typing import NamedTuple
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import resources
 
 
 def estimate(flops: float, *arrays, transcendentals: float = 0) -> pl.CostEstimate:
@@ -33,6 +32,8 @@ def estimate(flops: float, *arrays, transcendentals: float = 0) -> pl.CostEstima
 def stored(*arrays) -> int:
     """The bytes `arrays` take in memory, each once (`resources.stored_bytes`: a packed dtype's two elements a
     byte)."""
+    from dew.nn.kernels.templates import resources
+
     return int(sum(resources.stored_bytes(array.shape, array.dtype) for array in arrays))
 
 
