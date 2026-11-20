@@ -1036,10 +1036,13 @@ RESETTING = {
     "kimi_delta": (kimi_delta, gated_readout, KIMI, (KEY, VALUE), kimi_draw, tuple(GATED), {}),
     "kimi_delta_float16": (kimi_delta, gated_readout, KIMI, (KEY, VALUE), kimi_draw_float16, tuple(GATED),
                            {}),
+    "delta_before": (delta_before, gated_readout, GATED, (KEY, VALUE), gated_draw, tuple(GATED), {}),
+    "delta_before_per_key": (delta_before, gated_readout, KIMI, (KEY, VALUE), kimi_draw, tuple(GATED), {}),
 }
 """Each rule a reset walk is derived for: its update and readout, operands, state, draw, token operands and
 constants. A decay in base 2, and exponents in float16, whose partials' sum of several resets passes its
-largest."""
+largest; corrections reading the state a token enters (`delta_before`), a reset's zero, through the decays
+a token back."""
 
 
 READING = {"after": "", "before": ", reading the state entering each token",
