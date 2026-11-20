@@ -874,7 +874,7 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
     B, s, C, Q, R = (tokens[name] for name in ("B", "s", "C", "Q", "R"))
     count = B.shape[0]
     between = decays.between[jnp.arange(1, count), jnp.arange(count - 1)]
-    stepped = jnp.concatenate([_scaled(jnp.ones_like(between[:1]), decays.entering)[:1], between])
+    stepped = jnp.concatenate([_scaled(1.0, jax.tree.map(lambda x: x[:1], decays.entering)), between])
     # A decay along the values too (`across`, each token's own gates `[C, V]`).
     valued = jnp.ones((count, values.shape[-1]), stepped.dtype) if across is None else across
     # The state carried in the type its first step leaves it in: operands wider than it widen it (a float32

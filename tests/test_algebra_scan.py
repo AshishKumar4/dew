@@ -1398,11 +1398,13 @@ def test_a_two_sided_decays_pairs_across_a_sub_chunk_are_decayed_before_they_are
 
 def isolated_draw(seed: int, side: str, merged: bool = False):
     """Two-sided GLA's operands of one write of about 2^100 (its key's where `side` is "keys", its value's
-    where "values") and three gates of about -40 on that side after it, every other write none and every
+    where "values") and three gates of -39 to -41 on that side after it, every other write none and every
     other decay at most 1e-2 a token: the write decayed to about `e^-51`, normal, as the token scan keeps it,
-    where each gate's span past the write alone is past fp32's least normal (row 9660). The write in chunk 1
-    and its readers in the chunks after it, or where `merged`, the write the first half's last token and its
-    gates the second half's first tokens."""
+    where each gate's span past the write alone is past fp32's least normal (row 9660). The gated side's
+    exponents multiples of 2^-10, so every span's sum is exact in fp32 and the decays' own rounding (an
+    exponent of -120 rounded, `|x|` ulps of its decay) is no part of the witness. The write in chunk 1 and its
+    readers in the chunks after it, or where `merged`, the write the first half's last token and its gates
+    the second half's first tokens."""
     rng = np.random.default_rng([9660, seed])
     write = TOKENS // 2 - 1 if merged else CHUNK + int(rng.integers(0, CHUNK - 4))
     large, unit = 2.0 ** 100 * rng.uniform(1, 2), rng.uniform(1, 2)
@@ -1410,7 +1412,8 @@ def isolated_draw(seed: int, side: str, merged: bool = False):
     k[write, 0], v[write, 0] = (large, unit) if side == "keys" else (unit, large)
     g, e = -rng.uniform(0, 1e-2, (TOKENS, KEY)), -rng.uniform(0, 1e-2, (TOKENS, VALUE))
     gated = g if side == "keys" else e
-    gated[write + 1:write + 4] = -40.0 + rng.uniform(-1, 1, (3, gated.shape[1]))
+    gated[:] = np.round(gated * 1024) / 1024
+    gated[write + 1:write + 4] = -rng.integers(39, 42, (3, gated.shape[1]))
     q = rng.standard_normal((TOKENS, KEY))
     q[:(write // CHUNK + 1) * CHUNK] = 0.0
     drawn = (q, k, v, g, e, np.ones(TOKENS), np.zeros((KEY, VALUE)))
