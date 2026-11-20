@@ -27,7 +27,7 @@ import itertools
 import logging
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, ClassVar, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Protocol, TypedDict, Unpack, overload, runtime_checkable
 
 import grain.experimental as gx
 import grain.python as pygrain
@@ -1246,6 +1246,17 @@ def _member_key(members: Sequence[str], index: int) -> int:
     return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "big")
 
 
+class _Counter(TypedDict, total=False):
+    """What a read's counter of a stage's rows takes beside its rows and corpus (`Accepted`)."""
+
+    tokens: Callable[[Batch], int] | None
+    streak: Streak | None
+    rows: bool
+    examples: bool
+    members: Sequence[tuple[str, str, str]]
+    credits: bool
+
+
 @dataclasses.dataclass(frozen=True)
 class _Build:
     read: Read
@@ -1318,6 +1329,12 @@ class _Build:
                 **({"phases": self.DRAWN} if self.skipped else {}),
                 **({"batched": BatchedGroups.REFUSALS} if batched else {}),
                 **({"expanded_draws": EXPANDED_DRAWS} if drawn else {})}
+
+    def accepted(self, parent: pygrain.IterDataset, name: str, label: str, **counter: Unpack[_Counter]
+                 ) -> Accepted:
+        """`parent`'s accepted rows, counted (`Accepted`), its rejections past this read's `Loading.warn_over`
+        warned of."""
+        return Accepted(parent, name, label, warn_over=self.loading.warn_over, **counter)
 
     def counting(self, pipeline: Pipeline) -> bool:
         """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
@@ -1475,7 +1492,7 @@ class _Build:
                       if isinstance(parent, pygrain.MapDataset)]
             return mixed_indexed(mapped, source)
         streams = [
-            Accepted(_as_iter(parent, build.loading), _name(child), _label(child))
+            build.accepted(_as_iter(parent, build.loading), _name(child), _label(child))
             for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
         ]
         if tagged:
@@ -1602,12 +1619,12 @@ class _Build:
                 # Read by index in its inputs' order, as the uncached run's workers read them (`in_order`).
                 return single, cache + 1, None
             kept = (_as_iter(single, self.loading) if marked
-                    else Accepted(_as_iter(single, self.loading), _name(pipeline), _label(pipeline)))
+                    else self.accepted(_as_iter(single, self.loading), _name(pipeline), _label(pipeline)))
             return kept, cache + 1, None
         # A stage on a thread pool of its own among the cached steps reads that many inputs at once, as the
         # read's threads do (`dew.data.compile._build`).
         flat = gx.FlatMapIterDataset(_as_iter(view, self.loading), _CachedOutputs())
-        return (flat if marked else Accepted(flat, _name(pipeline), _label(pipeline))), cache + 1, None
+        return (flat if marked else self.accepted(flat, _name(pipeline), _label(pipeline))), cache + 1, None
 
     @property
     def stream_loading(self) -> Loading:
@@ -1661,7 +1678,7 @@ class _Build:
         quota = None if examples is None or held is not None else partition.bounded(examples)
         rows = self.streamed(shards, pipeline, partition, places, quota)
         if not marked and dropping:
-            rows = Accepted(rows, _name(pipeline), _label(pipeline))
+            rows = self.accepted(rows, _name(pipeline), _label(pipeline))
         return rows, consumed, None if held is None else (lambda _: held)
 
     def dealt(self, partition: DataPartition, records: Callable[[], int | None]) -> Share:
@@ -1809,7 +1826,7 @@ class _Build:
                 # each before the objective's step makes rows of it, and not again after, nor where a
                 # memory read made rows of them before (`_counts_rows`).
                 examples, counting = True, self.counting(pipeline)
-                rows = rows if counting else Accepted(_as_iter(rows, self.loading), _name(pipeline),
+                rows = rows if counting else self.accepted(_as_iter(rows, self.loading), _name(pipeline),
                                                       _label(pipeline), rows=_counts_rows(pipeline, index))
             if record_stage_of(stage):
                 # The record steps from here run as one operator (`_run`), up to where the workers
@@ -1901,11 +1918,11 @@ class _Build:
         that expands in the reading process counts them, then as their rows, what the steps from the
         expansion at `at` to the hand-off at `carried` dropped counted after them as theirs are."""
         if counted_inputs:
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+            rows = self.accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
                             rows=_counts_rows(pipeline, at))
         rows = gx.FlatMapIterDataset(_as_iter(rows, self.loading), _Unspread())
         if any(_drops(stage) for stage in pipeline.stages[at:carried]):
-            rows = Accepted(rows, _name(pipeline), _label(pipeline), streak=streak,
+            rows = self.accepted(rows, _name(pipeline), _label(pipeline), streak=streak,
                             rows=_counts_rows(pipeline, carried), members=self.counted_members(pipeline))
         return rows
 
@@ -1916,11 +1933,11 @@ class _Build:
         if self.global_order:
             return rows
         if counting:
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+            rows = self.accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
                             rows=examples or _counts_rows(pipeline, len(pipeline.stages)), examples=examples)
         if members := self.counted_members(pipeline):
             # Its members' counts, beside what the mixture counts of its own (behind a step of Grain's).
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline), rows=False,
+            rows = self.accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline), rows=False,
                             members=members, credits=True)
         return rows
 
@@ -2012,7 +2029,7 @@ class _Build:
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))
             # A group it makes no rows of is refused and counted here, its examples carried to the next row.
-            rows = Accepted(rows, _name(pipeline), _label(pipeline), rows=False,
+            rows = self.accepted(rows, _name(pipeline), _label(pipeline), rows=False,
                             members=self.counted_members(pipeline))
         else:
             return self.layout_stage(rows, stage, pipeline, at)
@@ -2047,7 +2064,7 @@ class _Build:
         plan's are (`materialize._targeted`, `packing.plan_windows`): one with nothing to predict
         is counted as zero_targets and left out, so how a run reads does not change its steps. Its
         counter stands before the stage at `at` (`_counts_rows`)."""
-        return Accepted(windows, _name(pipeline), _label(pipeline), tokens=ValidTargets(field),
+        return self.accepted(windows, _name(pipeline), _label(pipeline), tokens=ValidTargets(field),
                         rows=_counts_rows(pipeline, at), members=self.counted_members(pipeline))
 
     def block_shuffle(self, rows: Rows, stage: Shuffle, pipeline: Pipeline, partition: DataPartition) -> Rows:
@@ -2106,7 +2123,7 @@ class _Build:
             # keeps every group: one position, whatever the count of workers it is read in.
             ordered = _StreamOrder(_as_iter(rows, self.loading), size, read, _Grouped,
                                    _Ungrouped(size).flat_map, alone=not pool.count)
-            return Accepted(ordered, _name(pipeline), _label(pipeline), streak=streak,
+            return self.accepted(ordered, _name(pipeline), _label(pipeline), streak=streak,
                             rows=_counts_rows(pipeline, at))
         if self.in_order and isinstance(rows, pygrain.MapDataset):
             handed = _InputOrder(rows, size, read, _Grouped)
@@ -2119,7 +2136,7 @@ class _Build:
                 # groups' inputs in another order: a run of rejections spans two rounds more.
                 streak = dataclasses.replace(streak, slack=streak.slack + 2 * pool.count * size)
         flat = gx.FlatMapIterDataset(_as_iter(handed, self.loading), _Ungrouped(size))
-        return Accepted(flat, _name(pipeline), _label(pipeline), streak=streak,
+        return self.accepted(flat, _name(pipeline), _label(pipeline), streak=streak,
                         rows=_counts_rows(pipeline, at))
 
     def read_in(self, groups: Rows, *, pipeline: Pipeline, partition: DataPartition,
@@ -2141,7 +2158,7 @@ class _Build:
         rows = _through(rows, run, _name(pipeline), _label(pipeline), self.loading, seed=seed,
                         unplaced=unplaced)
         if not marked and any(_drops(stage) for stage in run):
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+            rows = self.accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
                             streak=streak, rows=_counts_rows(pipeline, at + len(run)),
                             members=self.counted_members(pipeline))
         return rows

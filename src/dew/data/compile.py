@@ -105,7 +105,7 @@ from dew.data.lowering import (
     cache_prefix,
 )
 from dew.data.materialize import _materialize, _Memory
-from dew.data.mixing import CorpusCounts, Proportions, _weights, mixed_indexed
+from dew.data.mixing import CorpusCounts, Proportions, _weights, mixed_indexed, warn_rejections
 from dew.data.ordering import place_of
 from dew.data.phase_corpora import _alone_mixed, _corpora, _shared
 from dew.data.pipeline import (
@@ -884,6 +884,8 @@ def _staged(
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
     original = branches[0]
     train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
+    if read == "memory":
+        warn_rejections(counts, loading.warn_over)
     validation = scored[0] if scored else None
     # A memory read that kept none of the scored records scores none.
     if validation_counts and not any(count.accepted for count in validation_counts.values()):
@@ -1943,7 +1945,10 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     loading = (pipeline._loading or _DEFAULT_LOADING).unsized()
     if records is not None:
         pipeline = pipeline._then(Limit(records))
-        loading = dataclasses.replace(loading, workers=0, threads=0, read_buffer=0)
+        # Serial where the chain states no loading; the loading it states reads as written (data.md, stats;
+        # row 9058: a stated one was read serially too, so a pass measured another reader than it asked).
+        if pipeline._loading is None:
+            loading = dataclasses.replace(loading, workers=0, threads=0, read_buffer=0)
     if not pipeline.batched:
         pipeline = pipeline.batch(1, drop_remainder=False)
     counts: dict[str, CorpusCounts] = {}
