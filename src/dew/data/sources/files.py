@@ -523,8 +523,8 @@ class Files(Dataset):
                     or not any(part.startswith(("_", ".")) for part in PurePosixPath(name[len(path) :]).parts)
                 )
                 # An export's root holding its shards (`_EXPORTING`), refused where it commits no manifest.
-                roots = sorted({path.rstrip("/") + name[len(path):][:found.start()] for name in names
-                                if (found := _EXPORTING.search(name[len(path):])) is not None})
+                roots = sorted({path.rstrip("/") + name[len(path):][:cut.start()] for name in names
+                                if (cut := _EXPORTING.search(name[len(path):])) is not None})
                 unread = [root for root in roots if not fs.exists(f"{root.rstrip('/')}/{EXPORT_MANIFEST}")]
                 if unread:
                     raise ValueError(f"source {url!r} holds the shards of an export at {unread[0]!r} that "
