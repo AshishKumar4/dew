@@ -91,8 +91,9 @@ def _readout(channels: int, states: jax.Array, C: jax.Array, **product) -> jax.A
     if placed is not None:
         batch = jax.sharding.PartitionSpec(*tuple(placed.spec)[:3], None)
         spread = jax.sharding.reshard(spread, jax.sharding.NamedSharding(placed.mesh, batch))
-    return jnp.einsum('bcdn,bcdn->bcd', states, spread, precision=recurrence_algebra.STATE_PRECISION,
-                      **product)
+    # At `STATE_PRECISION` but where the sum states its own (a wide CPU sum's, `accumulated`).
+    return jnp.einsum('bcdn,bcdn->bcd', states, spread,
+                      **({"precision": recurrence_algebra.STATE_PRECISION} | product))
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE, *,
