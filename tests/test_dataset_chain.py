@@ -1843,7 +1843,7 @@ def test_a_batched_map_that_keeps_its_rows_groups_the_order_whatever_reads_it(re
         assert data.plan is not None and data.plan.lowering == "global"
         reader = data.train(partition)
         try:
-            batches = [next(reader) for _ in range(data.records // 2 // partition.count)]
+            batches = [next(reader) for _ in range(24 // 2 // partition.count)]
         finally:
             reader.close()
         return [(int(i), int(group)) for batch in batches for i, group in zip(batch["i"], batch["group"],
