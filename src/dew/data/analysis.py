@@ -776,9 +776,8 @@ def groups_held(after: Sequence[Stage], size: int, threads: int) -> int:
     a window shuffle's after it and the read's threads'. A global shuffle after it the analysis refused
     (`_regrouped`)."""
     threaded = 2 * max(1, threads)
-    shuffled = next((stage for stage in after if isinstance(stage, Shuffle) and stage.window is not None),
-                    None)
-    return threaded if shuffled is None else -(-shuffled.window // size) + 1 + threaded
+    windows = [stage.window for stage in after if isinstance(stage, Shuffle) and stage.window is not None]
+    return threaded if not windows else -(-windows[0] // size) + 1 + threaded
 
 
 def _regrouped(pipeline: Pipeline, read: Read, eager: int) -> None:
