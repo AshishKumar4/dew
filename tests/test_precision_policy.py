@@ -1342,6 +1342,38 @@ def test_an_explicit_float64_widens_as_jax_resolves_it():
     assert found.dtype == np.float64 and float(found) == 2.0 ** 140
 
 
+def test_a_wide_cpu_reduction_widens_its_subnormal_operands_exactly(monkeypatch):
+    """`widened_reduction`'s sum, under Dew's wide CPU arithmetic, of float32's two largest subnormals (built
+    from their bits): their sum `2^-125 - 2^-148`, a normal float32, each widened from its bits where
+    XLA:CPU's cast flushed them and the sum was 0 (base review 7eccb9f88 F2)."""
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC, widened_reduction
+
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    largest = jnp.asarray(np.full((2,), 0x7FFFFF, np.uint32).view(np.float32))
+    with jax.default_device(jax.devices("cpu")[0]):
+        (found,) = jax.jit(lambda x: widened_reduction(lambda x: (jnp.sum(x),), x))(largest)
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), np.float32(2.0 ** -125 - 2.0 ** -148))
+
+
+def test_an_exact_widenings_transpose_keeps_its_sources_type_outside_x64():
+    """The transpose of a batch's exact widening (`jax.vmap` of `widened_exactly` of a weak float32 to
+    float64, traced with x64 on), its cotangents `2^140` and `-2^140 + 2^100` pulled back with x64 off:
+    the weak float32 `2^100`, the batch summed in float64 and cast once, where summed as x64's default
+    narrowed them first, `inf - inf`, NaN, and the cast's strong result dropped the source's weakness (base
+    review of 961433795 F3, F6)."""
+    # A weak float32: a Python float's array with x64 off.
+    weak = jnp.asarray(1.0)
+    assert weak.dtype == jnp.float32 and jax.typeof(weak).weak_type
+    with jax.enable_x64(new_val=True):
+        transposed = jax.linear_transpose(
+            lambda x: jax.vmap(lambda _: widened_exactly(x, jnp.float64))(jnp.zeros(2)), weak)
+        cotangent = jnp.asarray([2.0 ** 140, -(2.0 ** 140) + 2.0 ** 100], jnp.float64)
+    (pulled,) = transposed(cotangent)
+    assert pulled.dtype == jnp.float32 and float(pulled) == 2.0 ** 100
+    assert jax.typeof(pulled).weak_type
+
+
 def test_a_host_scalar_widens_at_its_destination():
     """`widened_exactly` of a Python integer past int32 (`2^40`) to float32 with x64 off is float32's
     `2^40`, converted at its destination, where staging it as int32 first raised (base review 279405f7f

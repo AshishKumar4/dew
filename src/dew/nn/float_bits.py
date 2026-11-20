@@ -162,26 +162,39 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
     map that widens its operands transposes, however JAX reaches it (`jax.linear_transpose` among them).
     Any other `x` (a Python or NumPy scalar, an integer, a narrower format's, a conversion that narrows)
     converted as `jnp.asarray` converts it, a host scalar at `dtype` directly."""
-    if not isinstance(x, jax.Array | np.ndarray):
+    if not isinstance(x, jax.Array | np.ndarray) or not _widens(jnp.dtype(x.dtype), jnp.dtype(dtype)):
         return jnp.asarray(x, dtype)
     # The destination as JAX resolves an explicit request (x64, or its explicit dtypes allowed without it).
-    dtype = jax.eval_shape(lambda: jnp.zeros((), dtype)).dtype
-    if (jnp.dtype(x.dtype) not in WIDENED or dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.float64))
-            or jnp.finfo(dtype).bits <= jnp.finfo(x.dtype).bits):
-        return jnp.asarray(x, dtype)
+    resolved = np.dtype(jax.eval_shape(lambda: jnp.zeros((), dtype)).dtype)
+    if not _widens(jnp.dtype(x.dtype), resolved):
+        return jnp.asarray(x, resolved)
     from dew.nn.kernels.generation import linear_map
 
     x = jnp.asarray(x)
-    source = x.dtype
+    source = jax.typeof(x)
 
     def apply(_, moving):
         # Traced where JAX evaluates the map, which may lie outside its caller's x64 scope (`float64_sum`'s).
-        with jax.enable_x64(new_val=True) if dtype == jnp.dtype(jnp.float64) else contextlib.nullcontext():
-            return _widened_bits(moving, dtype)
+        with jax.enable_x64(new_val=True) if resolved == np.dtype(np.float64) else contextlib.nullcontext():
+            return _widened_bits(moving, resolved)
+
+    def pulled(_, cotangent):
+        # The cast's own transpose, which keeps the source's type, its weakness included.
+        (back,) = jax.linear_transpose(lambda moving: moving.astype(resolved),
+                                       jax.ShapeDtypeStruct(source.shape, source.dtype,
+                                                            weak_type=source.weak_type))(cotangent)
+        return back
 
     # Its type strong, as an explicit conversion's: a weak one would yield to a strong float32 it meets.
-    return linear_map(apply, lambda _, cotangent: cotangent.astype(source), (), x,
-                      out_aval=jax.typeof(x).update(dtype=dtype, weak_type=False), summed_first=True)
+    return linear_map(apply, pulled, (), x, out_aval=source.update(dtype=resolved, weak_type=False),
+                      summed_first=True)
+
+
+def _widens(source: np.dtype, target: np.dtype) -> bool:
+    """Whether `widened_exactly` sets `source`'s values in `target`'s bits: a `WIDENED` format into float32
+    or float64 wider than it."""
+    return (source in WIDENED and target in (np.dtype(np.float32), np.dtype(np.float64))
+            and np.finfo(target).bits > jnp.finfo(source).bits)
 
 
 def _widened_bits(x: jax.Array, dtype: jnp.dtype) -> jax.Array:

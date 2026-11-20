@@ -1670,6 +1670,16 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
     return primitive(residuals, moving)
 
 
+def _summed_batch(cotangent):
+    """A batch's cotangent (a tree, the batch its leaves' first axis) summed over the batch in each leaf's own
+    type (`lax.reduce_sum`), whatever x64 scope a pullback runs in; a `float0` leaf's zeros without it."""
+    import jax
+    import numpy as np
+
+    return jax.tree.map(lambda leaf: np.zeros(leaf.shape[1:], jax.dtypes.float0)
+                        if leaf.dtype == jax.dtypes.float0 else jax.lax.reduce_sum(leaf, (0,)), cotangent)
+
+
 @functools.cache
 def _linear_primitive() -> type:
     """`linear_map`'s primitive, defined at its first call: this module imports no JAX of its own."""
@@ -1778,7 +1788,7 @@ def _linear_primitive() -> type:
             def pulled(residuals, cotangent):
                 if self.summed_first and all(axis is None for axis in jax.tree.leaves(
                         (residual_axes, moving_axes), is_leaf=lambda axis: axis is None)):
-                    return self.pullback(residuals, jax.tree.map(unbatched, cotangent))
+                    return self.pullback(residuals, _summed_batch(cotangent))
                 back = jax.vmap(self.pullback, in_axes=(residual_axes, 0), **mapped)(residuals, cotangent)
                 leaves, tree = jax.tree.flatten(back)
                 axes = jax.tree.leaves(moving_axes, is_leaf=lambda axis: axis is None)
