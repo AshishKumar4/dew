@@ -779,63 +779,37 @@
 "tests/test_attention_splash.py::test_splash_agrees_with_the_reference_the_oracle_holds[packed-window]"
 ],
 "tests/test_attention_stability.py": [
-"tests/test_attention_stability.py::test_a_scaled_rows_split_sums_keep_a_subnormal_share_element_wise[float32]",
-"tests/test_attention_stability.py::test_a_share_in_bf16s_subnormal_band_is_on_par_with_every_references_form[a share in bf16's subnormal band, the denominator's rest in a later tile-normalized first]",
-"tests/test_attention_stability.py::test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a decode step's weight at the exponent's edge on a large value, bfloat16-default]",
-"tests/test_attention_stability.py::test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest[values at fp32's largest across a split decode's slices]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a column near fp32's least normal beside an overflowing one-portable]",
+"tests/test_attention_stability.py::test_a_share_in_bf16s_subnormal_band_is_on_par_with_every_references_form[a share in bf16's subnormal band on a value near its largest-normalized first]",
+"tests/test_attention_stability.py::test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[keys an ulp apart, bfloat16-natural]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a decode step's sink and one key-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a far maximum in a later key tile-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a product past fp32's largest before a small scale, bfloat16-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a resumed state of a denominator near fp32's largest beside an overflowing column-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a row of small values beside one that overflows in its tile, bfloat16-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a row that overflows beside one that does not-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a share in bf16's subnormal band, the denominator's rest in a later tile-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a sink and one key-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a small column beside an overflowing one-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share beside 255 equal weights, bfloat16-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share of an overflowing row, bfloat16-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share of an overflowing row, float32-portable]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a product past fp32's largest before a small scale, float32-portable]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a row of small values beside one that overflows in its tile, float32-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a sink and one key-portable]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share beside 255 equal weights, bfloat16-triton]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share of an overflowing row, float32-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a tiny value beside an overflowing column at equal weights-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a weight at the exponent's edge on a large value, bfloat16-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a weight at the exponent's edge on a large value, float32-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[causal queries before every key-portable]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a weight at the exponent's edge on a large value, float32-triton]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[fp16 values near their largest beside a state near fp32's largest-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[keys an ulp apart, float32-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[one key-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[small values beside unseen ones near fp32's largest, float32-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[ties at scale 1/2, cotangents near 2**125-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[ties at scale 1/4-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[values near fp32's largest over 2 equal keys, bfloat16-triton]",
-"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[a cotangent on a small column beside an overflowing one]",
-"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[a row that overflows beside one that does not]",
-"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[a subnormal share of an overflowing row, bfloat16]",
-"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[ties at scale 1/2]",
-"tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[a row of small values beside one that overflows in its tile, float32]",
-"tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[a subnormal share of an overflowing row, float32]",
-"tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[a tiny value beside an overflowing column at equal weights]",
-"tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[values at fp32's largest over 256 equal keys]",
-"tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[values near fp32's largest over 64 equal keys]",
-"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a far maximum in a later key tile]",
-"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a resumed state of a large denominator]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[one key-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[ties at scale 1/2-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[values at fp32's largest over 256 equal keys-triton]",
+"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[a product past fp32's largest before a small scale, float32]",
+"tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[keys an ulp apart, float32]",
+"tests/test_attention_stability.py::test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges[a share in bf16's subnormal band, the denominator's rest in a later tile]",
+"tests/test_attention_stability.py::test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges[ties at scale 1/2, cotangents near 2**125]",
+"tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[a subnormal share beside 255 equal weights, bfloat16]",
+"tests/test_attention_stability.py::test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass[values at fp32's largest over 2 equal keys]",
+"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a resumed state of a denominator near fp32's largest beside an overflowing column]",
 "tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a row of no keys]",
-"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a share in bf16's subnormal band, the denominator's rest in a later tile]",
+"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a sink and one key]",
 "tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a small weight on a large value, float32]",
 "tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a subnormal share beside 255 equal weights, bfloat16]",
-"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a subnormal share of an overflowing row, float32]",
 "tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a tiny value beside an overflowing column at equal weights]",
-"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[a weight at the exponent's edge on a large value, float32]",
-"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[causal queries before every key]",
-"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[keys an ulp apart, float32]",
-"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[ties at scale 1, cotangents near 2**125]",
-"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[ties at scale 1]",
-"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[values near fp32's largest over 64 equal keys]",
-"tests/test_attention_stability.py::test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a decode step's sink and one key]",
+"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[fp16 values near their largest beside a state near fp32's largest]",
+"tests/test_attention_stability.py::test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges[ties at scale 1/2]",
+"tests/test_attention_stability.py::test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_reference_interpreted[values at fp32's largest over 256 equal keys]",
 "tests/test_attention_stability.py::test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a far maximum in a later key tile]",
 "tests/test_attention_stability.py::test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share beside 255 equal weights, bfloat16]",
-"tests/test_attention_stability.py::test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[keys an ulp apart, float32]",
-"tests/test_attention_stability.py::test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[small values beside unseen ones near fp32's largest, bfloat16]"
+"tests/test_attention_stability.py::test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[keys near fp32's largest at equal logits]"
 ],
 "tests/test_attention_template.py": [
 "tests/test_attention_template.py::test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys[causal-documents-window-sinks-float32-spanned-at-the-half]",
@@ -1027,9 +1001,6 @@
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_backward_that_read_other_gradients",
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16"
 ],
-"tests/test_checkpoint_averaging.py": [
-"tests/test_checkpoint_averaging.py::test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read_where_it_keeps_one[data]"
-],
 "tests/test_chunk_adaptation.py": [
 "tests/test_chunk_adaptation.py::test_a_chain_steps_each_level_as_equation_71_at_its_own_window[1-3-documents]",
 "tests/test_chunk_adaptation.py::test_a_damped_chain_steps_each_level_as_the_literal_loop[documents]",
@@ -1071,10 +1042,6 @@
 "tests/test_chunked_cross_entropy.py::test_the_softcap_gradient_survives_saturated_logits",
 "tests/test_chunked_cross_entropy.py::test_the_whole_logits_head_computes_what_the_tiled_one_does[None-float32]"
 ],
-"tests/test_clusters.py": [
-"tests/test_clusters.py::test_a_pool_joins_through_a_scheduler_of_the_users_own",
-"tests/test_clusters.py::test_a_tpu_joins_by_jaxs_detection_on_a_tpu_vm_alone_and_leaves_its_place_to_jax"
-],
 "tests/test_compile_ahead.py": [
 "tests/test_compile_ahead.py::test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once",
 "tests/test_compile_ahead.py::test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_loads_only_there",
@@ -1112,9 +1079,6 @@
 "tests/test_compile_ahead.py::test_an_ahead_plan_that_fits_no_device_reports_every_refused_program",
 "tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it",
 "tests/test_compile_ahead.py::test_compiling_ahead_on_gpus_of_no_stated_memory_is_refused_before_anything_traces[False]"
-],
-"tests/test_config_cli.py": [
-"tests/test_config_cli.py::test_a_run_trainer_fit_trains_directly_says_why_no_record_rebuilds_it[as a run states them]"
 ],
 "tests/test_config_paths.py": [
 "tests/test_config_paths.py::test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran[diffusion]",
@@ -1197,9 +1161,6 @@
 "tests/test_counted_passes.py": [
 "tests/test_counted_passes.py::test_a_run_whose_cadences_read_no_pass_compiles_as_before_and_a_counting_one_steps_its_batches"
 ],
-"tests/test_cpu_only_jax.py": [
-"tests/test_cpu_only_jax.py::test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not[prepare-cpu]"
-],
 "tests/test_cross_attention.py": [
 "tests/test_cross_attention.py::test_a_cached_document_reads_its_own_context_without_it[the layer's attention]",
 "tests/test_cross_attention.py::test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it",
@@ -1220,9 +1181,6 @@
 "tests/test_data_automatic_cache.py::test_a_chain_resumes_across_its_automatic_cache_turned_on_or_off[saved-cached-2-indexed-rejecting]",
 "tests/test_data_automatic_cache.py::test_a_chain_resumes_across_its_automatic_cache_turned_on_or_off[saved-cached-2-streamed-rejecting]",
 "tests/test_data_automatic_cache.py::test_a_chain_resumes_across_its_automatic_cache_turned_on_or_off[saved-uncached-2-indexed-rejecting]"
-],
-"tests/test_data_cache.py": [
-"tests/test_data_cache.py::test_a_holdout_by_a_field_its_cached_step_drops_reads_the_parts_it_reads_uncached"
 ],
 "tests/test_data_elastic.py": [
 "tests/test_data_elastic.py::test_an_elastic_expansion_reads_one_readers_pieces_in_or_out_of_workers[2]",
@@ -1323,9 +1281,6 @@
 "tests/test_decision_objective.py::test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from_the_run",
 "tests/test_decision_objective.py::test_the_joint_heads_bfloat16_cosine_is_an_fp32_cosine_in_every_process_on_a_cpu"
 ],
-"tests/test_decision_option_slots.py": [
-"tests/test_decision_option_slots.py::test_a_rows_real_options_compact_in_order_and_a_row_over_the_cap_is_refused"
-],
 "tests/test_decision_packing.py": [
 "tests/test_decision_packing.py::test_a_decision_run_steps_one_program_over_rows_of_every_length",
 "tests/test_decision_packing.py::test_a_joint_head_given_no_layout_reads_every_question_of_a_request_in_one_row[False]",
@@ -1352,9 +1307,6 @@
 "tests/test_decision_recipe.py::test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh",
 "tests/test_decision_recipe.py::test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to_its_end[joint]",
 "tests/test_decision_recipe.py::test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to_its_end[letters]"
-],
-"tests/test_decision_schema_stream.py": [
-"tests/test_decision_schema_stream.py::test_a_schema_read_in_context_reads_the_context_after_it_in_the_room_it_leaves"
 ],
 "tests/test_decision_serving.py": [
 "tests/test_decision_serving.py::test_a_request_jev_would_refuse_gets_a_422_with_its_reason[{not json]",
@@ -1643,9 +1595,6 @@
 "tests/test_diffusion_run_sources.py::test_diffusion_nft_trains_from_the_run_config_on_a_registered_reward",
 "tests/test_diffusion_run_sources.py::test_flow_grpo_trains_from_the_run_config_on_a_registered_reward"
 ],
-"tests/test_discrete.py": [
-"tests/test_discrete.py::test_masked_diffusion_lm_memorises_the_toy_corpus"
-],
 "tests/test_disk_banks.py": [
 "tests/test_disk_banks.py::test_disk_moe_logits_and_cached_decode_equal_resident[False-None]"
 ],
@@ -1862,9 +1811,6 @@
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_groups_rate[a fresh group]"
 ],
-"tests/test_gated_mlp.py": [
-"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-1.5-sm90]"
-],
 "tests/test_gemm_degenerate.py": [
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[depth no step divides-hooked]",
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[depth no step divides-paired]",
@@ -1896,9 +1842,6 @@
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[width no tile divides-hooked]",
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[width no tile divides-paired]",
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[width no tile divides-plain]"
-],
-"tests/test_gemm_formed.py": [
-"tests/test_gemm_formed.py::test_a_composed_mlps_training_step_compiles_within_its_resources[sm90]"
 ],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_says[sm90-2]"
@@ -1972,9 +1915,6 @@
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[bfloat16-tile-boundaries]",
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-all-empty]",
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-tile-boundaries]"
-],
-"tests/test_grpo.py": [
-"tests/test_grpo.py::test_a_recorded_grpo_run_trains_on_the_rollout_it_records"
 ],
 "tests/test_guidance_distillation.py": [
 "tests/test_guidance_distillation.py::test_a_saved_student_samples_one_branch_at_its_conditioners_guidance[flow]",
@@ -2283,8 +2223,8 @@
 "tests/test_kernel_configs.py::test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block[sm89-sm89/chunk_fwd_h/float32/bv64-stages1-warps2/0.8b]",
 "tests/test_kernel_configs.py::test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block[sm89-sm89/kkt_solve/bfloat16/bk64-stages3-warps1/27b]",
 "tests/test_kernel_configs.py::test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block[sm89-sm89/kkt_solve/float32/bk64-stages3-warps1/0.8b]",
-"tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm120-qwen3.5-4b down]",
-"tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm86-llama up]",
+"tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm80-narrow kernel gradient]",
+"tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm86-qwen3 gate]",
 "tests/test_kernel_configs.py::test_every_gemm_form_derives_a_tile_at_every_shape[sm89-qwen3 gate]",
 "tests/test_kernel_configs.py::test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block[sm80]",
 "tests/test_kernel_configs.py::test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block[sm89]",
@@ -2330,9 +2270,6 @@
 "tests/test_kimi_k3.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference",
 "tests/test_kimi_k3.py::test_situ_matches_the_released_activation"
 ],
-"tests/test_kimi_linear.py": [
-"tests/test_kimi_linear.py::test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference"
-],
 "tests/test_kv_cache.py": [
 "tests/test_kv_cache.py::test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages"
 ],
@@ -2354,14 +2291,8 @@
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[deepseek_widths]",
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[gemma4]"
 ],
-"tests/test_layout_counts.py": [
-"tests/test_layout_counts.py::test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read[first-fit-2-indexed]"
-],
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_tensor2]"
-],
-"tests/test_level_stacking.py": [
-"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[one-layer-scanned]"
 ],
 "tests/test_lfm3.py": [
 "tests/test_lfm3.py::test_plain_and_looped_lfm3_train_through_a_decision_run[looped]"
@@ -2749,9 +2680,6 @@
 "tests/test_mosaic_toolkit.py": [
 "tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm86-int8-unscaled]"
 ],
-"tests/test_mtp.py": [
-"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[mean_stream_trunk]"
-],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_site_is_on_par_with_its_reference[llama4]",
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[gemma3-inputs]",
@@ -2901,9 +2829,6 @@
 "tests/test_optim.py::test_narrow_weights_step_on_float32_moments_as_float32_weights_do[bfloat16-muonclip]",
 "tests/test_optim.py::test_rates_of_one_schedule_lower_to_one_update[groups-gauss_newton]"
 ],
-"tests/test_outside_packages.py": [
-"tests/test_outside_packages.py::test_dew_pipeline_loads_a_packages_run_only_when_trusted"
-],
 "tests/test_parallelism.py": [
 "tests/test_parallelism.py::test_accumulated_ema_matches_a_plain_run_at_equal_update_counts"
 ],
@@ -2990,9 +2915,6 @@
 "tests/test_perturbation.py::test_an_indexer_warmup_trains_its_indexer_alone_without_backpropagation",
 "tests/test_perturbation.py::test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does",
 "tests/test_perturbation.py::test_the_estimate_is_the_gradient_in_expectation[trailing-general]"
-],
-"tests/test_pipeline_core.py": [
-"tests/test_pipeline_core.py::test_a_validation_pass_starts_at_most_one_worker_per_batch"
 ],
 "tests/test_pipeline_golden.py": [
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_hf-workers=2,shares=1]",
@@ -3296,9 +3218,6 @@
 "tests/test_recurrent_sequence_split.py::test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device[kimi delta attention]",
 "tests/test_recurrent_sequence_split.py::test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device[mamba3]"
 ],
-"tests/test_reference_runs.py": [
-"tests/test_reference_runs.py::test_packed_documents_give_every_step_the_work_counted_for_one"
-],
 "tests/test_release_parity.py": [
 "tests/test_release_parity.py::test_each_release_answers_as_its_own_engine[joint joint_images]",
 "tests/test_release_parity.py::test_each_release_answers_as_its_own_engine[slot block head]",
@@ -3385,9 +3304,6 @@
 ],
 "tests/test_rl_expert_balance.py": [
 "tests/test_rl_expert_balance.py::test_a_policy_runs_balance_flag_builds_a_policy_that_balances_its_routers[dpo]"
-],
-"tests/test_rl_methods.py": [
-"tests/test_rl_methods.py::test_each_method_is_its_papers_objective[grpo--]"
 ],
 "tests/test_router_statistics.py": [
 "tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
@@ -3658,9 +3574,6 @@
 "tests/test_selective_template.py": [
 "tests/test_selective_template.py::test_the_backward_holds_its_registers_at_the_residency_it_launches[packed]"
 ],
-"tests/test_sensenova_loop.py": [
-"tests/test_sensenova_loop.py::test_its_logits_are_on_par_with_the_remote_codes"
-],
 "tests/test_served_episodes.py": [
 "tests/test_served_episodes.py::test_a_served_cohort_draws_what_its_policy_draws_whole[greedy-attention]",
 "tests/test_served_episodes.py::test_a_served_cohort_draws_what_its_policy_draws_whole[greedy-hybrid]",
@@ -3856,9 +3769,6 @@
 "tests/test_supervised.py::test_the_autoencoders_evidence_bound_falls_over_independent_runs",
 "tests/test_supervised.py::test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name"
 ],
-"tests/test_text_data.py": [
-"tests/test_text_data.py::test_data_export_leaves_every_file_it_did_not_create[False]"
-],
 "tests/test_text_rollout_contract.py": [
 "tests/test_text_rollout_contract.py::test_every_registered_mixer_draws_padded_rows_as_their_unpadded_full_forwards_score[deepseek_v4]",
 "tests/test_text_rollout_contract.py::test_every_registered_mixer_draws_padded_rows_as_their_unpadded_full_forwards_score[kimi_delta_attention]",
@@ -4016,10 +3926,6 @@
 "tests/test_world_model.py::test_a_labeled_model_trains_its_actions_into_its_predictions",
 "tests/test_world_model.py::test_a_tokenizer_reconstructs_the_moving_squares_it_trained_on",
 "tests/test_world_model.py::test_a_tokenizers_patches_are_each_frames_row_major_pixels_whatever_its_leading_axes"
-],
-"tests/test_wrapped_runs.py": [
-"tests/test_wrapped_runs.py::test_a_quantized_run_trains_on_from_its_own_record",
-"tests/test_wrapped_runs.py::test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantization[modelopt nvfp4]"
 ],
 "tests/test_wrappers.py": [
 "tests/test_wrappers.py::test_a_gemma_wrapper_keeps_image_and_source_block_visibility_together[gemma3-tiny-mm]",
