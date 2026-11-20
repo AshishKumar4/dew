@@ -184,9 +184,13 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
     query = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     key = jnp.ones((1, 256, 1, width), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
+    launch_products = forward_mod.forward_products(placed.ROWS, tiles, width, jnp.bfloat16, ahead=True,
+                                                   query_width=width, tmem_columns=tmem)
+    launch_tmem = placed.ROWS.product_columns(launch_products)
     threads, arrivals = programs(
         _placed_forward(tiles, spans), query, key,
-        threads=tiles.consumers + 1 + len(placed.correction_roles(placed.ROWS, tiles.consumers, width)),
+        threads=tiles.consumers + 1 + len(placed.correction_roles(placed.ROWS, tiles.consumers, launch_tmem,
+                                                                  tmem)),
         rare=False)
     (issuer,) = [thread for thread in threads if any(event.kind == "product" for event in thread)]
     q_smem = _consumer_q_smem(threads, tiles.consumers)
