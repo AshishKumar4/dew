@@ -1765,6 +1765,13 @@ def _linear_primitive() -> type:
                 return jax.vmap(self.apply, in_axes=(residual_axes, moving_axes), **mapped)(residuals, moving)
 
             def pulled(residuals, cotangent):
+                # A map no batch reaches but through its cotangent: the batch's cotangent summed first, in its
+                # own type, and pulled back once, as the pullback is linear in it; pulled back by element and
+                # summed after, a narrowing pullback (an exact widening's cast back) rounded each element
+                # before the sum, and two that cancel overflowed to NaN (base review 279405f7f F1).
+                if all(axis is None for axis in jax.tree.leaves((residual_axes, moving_axes),
+                                                                is_leaf=lambda axis: axis is None)):
+                    return self.pullback(residuals, jax.tree.map(lambda leaf: leaf.sum(0), cotangent))
                 back = jax.vmap(self.pullback, in_axes=(residual_axes, 0), **mapped)(residuals, cotangent)
                 leaves, tree = jax.tree.flatten(back)
                 axes = jax.tree.leaves(moving_axes, is_leaf=lambda axis: axis is None)
