@@ -1004,7 +1004,7 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
     ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "cold"), ({"locks/cpu.txt": "jax==9\n"}, "cold"),
     ({"locks/cuda12.txt": "jax-cuda12-plugin==9\n"}, "on"), ({"locks/site.txt": "jax==9\n"}, "on"),
-    ({".gitignore": "*.pyc\n"}, "on"),
+    ({".gitignore": "*.pyc\n"}, "off"),
     ({"tools/armada/session.py": "# the session\n"}, "cold"),
     ({"tools/armada/executed.py": "# the recorder\n"}, "cold"),
     ({".github/workflows/ci.yml": "on: []\n"}, "on"),

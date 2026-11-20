@@ -837,7 +837,7 @@ workflow change reran every file while no record placed it (the maintainer, 2026
 with the cache off, 0.75% of rows reused), and a change to a kernel package's wrapper ran train 537's whole
 suite on both Pythons."""
 PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md", "MANIFEST.in",
-                ".gitignore", ".gitattributes")
+                ".gitattributes")
 """The checkout's own files at its root that tests read as a page is read, and the changelog, which no test
 reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none, it turned the
 cache off for every train holding such a head, which then ran its whole suite on every round (train 149: 30
@@ -863,9 +863,9 @@ def policy(base: str) -> str:
         if armada_seen(None if before is None else before.decode()) == armada_seen(
                 armada.read_text() if armada.is_file() else None):
             changed.remove(".armada.json")  # where and when tasks run, never what a test sees
-    # A lock the environment is not built from is a GPU lane's alone (`lane_inputs`): it reruns no CPU file.
-    changed = [name for name in changed if not name.startswith("locks/") or name in environment_files()]
     whole = {*SHARED, *environment_files(), ".armada.json", ".python-version"}
+    # A lock the environment is not built from is a GPU lane's alone (`lane_inputs`): it reruns no CPU file.
+    changed = [name for name in changed if not name.startswith("locks/") or name in whole]
     # A SHARED module whose code `base` holds as it is (a docstring's or a comment's edit) keys every row as
     # it did (`code_of`, `shared`), so it leaves the cache on (Main, 2026-11-07: 12 of the queue's last 20
     # train runs ran cold on harness edits).
