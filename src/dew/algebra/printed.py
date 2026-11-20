@@ -39,7 +39,8 @@ sections (the standard library's, the third parties', Dew's) and order (`imports
 
 def imports(text: str) -> list[str]:
     """The imports `text` reads (`IMPORTS`), each where it reads its name, a blank line between sections."""
-    found = [[line for name, line in section.items() if re.search(rf"(?<![\w.]){name}\b", text)]
+    # A name read as a module's (`np.`) or a generic's (`Callable[`), never a keyword argument's.
+    found = [[line for name, line in section.items() if re.search(rf"(?<![\w.]){name}[.\[]", text)]
              for section in IMPORTS]
     return [line for number, lines in enumerate(section for section in found if section)
             for line in ([""] if number else []) + lines]

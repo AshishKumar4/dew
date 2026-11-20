@@ -28,31 +28,14 @@ import jax.numpy as jnp
 from jax import lax
 
 
-def _lse_folded_probabilities_default_sm90_0(x1, x2, x3):
+def _lse_folded_probabilities_0(x1, x2, x3):
     v4 = lax.sub_p.bind(x1, x2)
     v5 = lax.exp_p.bind(v4, accuracy=None)
     v6 = lax.div_p.bind(v5, x3)
     return (v6,)
 
 
-def _lse_folded_probabilities_accurate_sm90_0(x1, x2, x3):
-    v4 = lax.sub_p.bind(x1, x2)
-    v5 = lax.exp_p.bind(v4, accuracy=None)
-    v6 = lax.div_p.bind(v5, x3)
-    return (v6,)
-
-
-def _normalized_values_product_default_sm90_0(x1, x2, x3):
-    v4 = lax.broadcast_in_dim_p.bind(x2, shape=(256, 64), broadcast_dimensions=(0,), sharding=None)
-    v5 = lax.div_p.bind(x3, v4)
-    v6 = lax.dot_general_p.bind(
-        x1, v5, dimension_numbers=(((1,), (0,)), ((), ())),
-        precision=(lax.Precision.HIGHEST, lax.Precision.HIGHEST), preferred_element_type=None,
-        out_sharding=None)
-    return (v6,)
-
-
-def _normalized_values_product_accurate_sm90_0(x1, x2, x3):
+def _normalized_values_product_0(x1, x2, x3):
     v4 = lax.broadcast_in_dim_p.bind(x2, shape=(256, 64), broadcast_dimensions=(0,), sharding=None)
     v5 = lax.div_p.bind(x3, v4)
     v6 = lax.dot_general_p.bind(
@@ -67,9 +50,9 @@ def lse_folded_probabilities(*operands, policy: str = 'default', target: str = '
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
     forms: dict[tuple, Callable[..., tuple]] = {
         ('default', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
-            _lse_folded_probabilities_default_sm90_0,
+            _lse_folded_probabilities_0,
         ('accurate', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
-            _lse_folded_probabilities_accurate_sm90_0,
+            _lse_folded_probabilities_0,
     }
     return forms[(policy, target, case)](*operands)[0]
 
@@ -79,8 +62,8 @@ def normalized_values_product(*operands, policy: str = 'default', target: str = 
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
     forms: dict[tuple, Callable[..., tuple]] = {
         ('default', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
-            _normalized_values_product_default_sm90_0,
+            _normalized_values_product_0,
         ('accurate', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
-            _normalized_values_product_accurate_sm90_0,
+            _normalized_values_product_0,
     }
     return forms[(policy, target, case)](*operands)[0]
