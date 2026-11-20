@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_forms import ROUNDED
 from contract_support import (
     ADDS,
     FORKED,
@@ -38,10 +39,16 @@ from contract_support import (
     assert_contract,
     cancelling_entries,
     cancelling_orbit,
-    exactly_rounded,
     normal_float32,
 )
-from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_computes_the_oracle,
+    widened,
+    with_gradients,
+    without_ynn,
+)
 from ssd_support import ssd_orbit, stepwise_scan
 
 from dew.algebra.scan import RESET_DECAY
@@ -493,7 +500,7 @@ def test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel():
     9463). The rated scan's selector routes the same call to it on a TPU (test_recurrence_chunk's
     `LEVELS_ROUTES`)."""
     truth = jax.jit(_entry_arm(documents_one_by_one))
-    assert_as_exact(_entry_arm(documents_on_the_kernel), exactly_rounded(truth), levels_documents_draw,
+    assert_as_exact(_entry_arm(documents_on_the_kernel), ROUNDED, levels_documents_draw,
                     "the TPU kernel's forked call's entry writes of cancelling levels", seeds=LEVELS_SEEDS,
                     truth_fn=truth)
 
@@ -527,7 +534,7 @@ def test_documents_entry_writes_of_cancelling_levels_take_the_selected_tpu_scan(
     forwarded to the Pallas scan it takes, each leaf held as on the kernel (rows 9463, 9464)."""
     truth = jax.jit(_entry_arm(documents_one_by_one))
     with generation.routes() as found:
-        assert_as_exact(_entry_arm(documents_as_selected), exactly_rounded(truth), levels_documents_draw,
+        assert_as_exact(_entry_arm(documents_as_selected), ROUNDED, levels_documents_draw,
                         "the selected TPU scan's forked call's entry writes of cancelling levels",
                         seeds=LEVELS_SEEDS,
                         truth_fn=truth)
@@ -584,7 +591,7 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
 
     mine = jax.tree.leaves(without_ynn(run(documents_on_the_kernel))(operands, seeded))
     with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
+        wide = widened((operands, seeded))
         exact = jax.tree.leaves(jax.jit(run(documents_one_by_one))(*wide))
     for ours, theirs in zip(mine, exact, strict=True):
         theirs = np.asarray(theirs)

@@ -139,11 +139,6 @@ in one case took 127 to 156 s near float32's largest, each order's program compi
 of its own, the scanned one apart from the staged ones (an interpreted selective scan's 170 s alone)."""
 
 
-def outside(taken: tuple[str, ...]) -> tuple[str, ...]:
-    """The orders (`ORDER_SETS`') outside those a case takes (`taken`), which it leaves to the others."""
-    return tuple(name for orders in ORDER_SETS.values() for name in orders if name not in taken)
-
-
 INTERPRETED_REMAT = ("jvp of grad, remat", "second jvp, remat") if INTERPRETED else ()
 """The orders a kernel Mosaic GPU's interpreter runs takes on no CPU: JAX's checkpoint takes no ordered
 effect, which the interpreter's callbacks carry (`NotImplementedError: Effects not supported in AD of
@@ -196,7 +191,7 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     # one or two ops, 109 of the case's 156 s near float32's largest (cProfile on armada, row 4433).
     assert_drawn_contract(jax.jit(rule), draw, DELTA_RULE_EDGES[edge], f"the chunked delta rule {edge}",
                           truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain),
-                          without=outside(ORDER_SETS[taken]))
+                          taking=ORDER_SETS[taken])
 
 
 @pytest.mark.parametrize("order", ("jvp", "vjp", "jvp of grad", "grad of grad"))
@@ -223,9 +218,8 @@ def test_the_chunked_delta_rules_reader_scale_holds_every_order(order):
             recurrence_chunk.Tiles(16), query, key, value, g[..., 0], beta, None, starts,
             scale=width ** -0.5, delta=True, dtype=query.dtype)[0]
 
-    all_orders = frozenset(("primal", "jvp", "vjp", "jvp of grad", "grad of grad"))
     assert_contract(jax.jit(rule), primals, direction, cotangent,
-                    f"the chunked delta rule's reader scale ({order})", without=all_orders - {order})
+                    f"the chunked delta rule's reader scale ({order})", taking=(order,))
 
 
 def test_the_chunked_delta_rules_reader_scale_precedes_a_small_write():
@@ -246,10 +240,8 @@ def test_the_chunked_delta_rules_reader_scale_precedes_a_small_write():
         wide, along = jax.tree.map(lambda x: x.astype(jnp.float64), (primals, direction))
         truth = np.asarray(jax.jit(lambda *x: jax.jvp(rule, x, along)[1])(*wide))
     assert np.all(normal_float32(truth) & np.isfinite(truth))
-    all_orders = frozenset(("primal", "jvp", "vjp", "jvp of grad", "grad of grad"))
     assert_contract(jax.jit(rule), primals, direction, jnp.ones_like(primals[0]),
-                    "the chunked delta rule's reader scale before a small write",
-                    without=all_orders - {"jvp"})
+                    "the chunked delta rule's reader scale before a small write", taking=("jvp",))
 
 
 def plain_delta_rule(query, key, value, g, beta, state, scale):
@@ -367,7 +359,7 @@ def test_the_delta_rule_ports_hold_their_orders(per_key, edge, taken):
 
     assert_drawn_contract(jax.jit(ported), draw, EDGES[edge],
                           f"the {'kda' if per_key else 'gdn'} port {edge}", truth_fn=jax.jit(recurrent),
-                          plain_fn=jax.jit(recurrent), without=outside(ORDER_SETS[taken]))
+                          plain_fn=jax.jit(recurrent), taking=ORDER_SETS[taken])
 
 
 # The template rule near float32's largest: its reverse derivative is NaN at entries fla's chunked form keeps
@@ -402,7 +394,7 @@ def test_the_template_rule_holds_its_orders(edge, taken):
 
     assert_drawn_contract(jax.jit(rule), draw, EDGES[edge], f"the template rule {edge}",
                           truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent),
-                          without=outside(ORDER_SETS[taken]) + INTERPRETED_REMAT)
+                          taking=ORDER_SETS[taken], without=INTERPRETED_REMAT)
 
 
 EDGES_BEYOND = [edge for edge in EDGES if edge != "normal"]
@@ -478,7 +470,7 @@ def assert_selective_contract(edge: str, taken: tuple[str, ...], seeds: int | No
 
     assert_drawn_contract(jax.jit(scanned), draw, EDGES[edge], f"the selective scan {edge}",
                           truth_fn=jax.jit(plain), plain_fn=jax.jit(plain),
-                          without=outside(taken) + INTERPRETED_REMAT, seeds=seeds)
+                          taking=taken, without=INTERPRETED_REMAT, seeds=seeds)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -592,7 +584,7 @@ def test_the_ssd_port_holds_its_orders(edge, taken):
 
     assert_drawn_contract(jax.jit(ported), draw, EDGES[edge], f"the ssd port {edge}",
                           truth_fn=jax.jit(plain_ssd), plain_fn=jax.jit(plain_ssd),
-                          without=outside(ORDER_SETS[taken]))
+                          taking=ORDER_SETS[taken])
 
 
 # A TPU's scan near float32's largest is out of its contract: at the 2^63 draw 23 of the 731 outputs float64

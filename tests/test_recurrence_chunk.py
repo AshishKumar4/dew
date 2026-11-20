@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 import tiny_models
 from arm_arithmetic import on_float64_device
+from arm_forms import ROUNDED
 from contract_support import (
     ADDS,
     CANCELLING_LEVELS,
@@ -25,7 +26,6 @@ from contract_support import (
     HELD,
     cancelling_entries,
     cancelling_orbit,
-    exactly_rounded,
     normal_float32,
 )
 from delta_rule_support import stacked_documents
@@ -953,14 +953,10 @@ def test_a_turned_forked_calls_turn_curvature_is_as_exact_as_each_document_alone
     def alone(operands):
         return document_by_document(TURNED, operands, own)
 
+    # The gate widens the truth's inputs (`reference_error._truth_and_terms`).
     exact = jax.jit(turn_curvature(lambda operands: document_by_document(TURNED, operands)))
-
-    def truth(*inputs):
-        with jax.enable_x64(new_val=True):
-            return exact(*jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), inputs))
-
     assert_as_exact(jax.jit(turn_curvature(ours)), jax.jit(turn_curvature(alone)), turned_entered_draw,
-                    f"xla {TURNED} a forked call's turn curvature", seeds=32, truth_fn=truth)
+                    f"xla {TURNED} a forked call's turn curvature", seeds=32, truth_fn=exact)
 
 
 def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recurrence():
@@ -1257,7 +1253,7 @@ def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact(hooks):
 
     # The gate widens a truth's inputs; the reference is that truth rounded once.
     truth = jax.jit(leaves(functools.partial(document_by_document, hooks)))
-    assert_as_exact(jax.jit(leaves(ours)), exactly_rounded(truth),
+    assert_as_exact(jax.jit(leaves(ours)), ROUNDED,
                     functools.partial(levels_entered_draw, hooks),
                     f"xla {hooks} a forked call's entry writes of cancelling levels",
                     seeds=cancelling_orbit(KEY_HEADS, VALUE_HEADS, VALUE_WIDTH), truth_fn=truth)

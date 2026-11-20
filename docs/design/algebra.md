@@ -1396,8 +1396,9 @@ Agreed with the GEMM template's owner (2026-11-03):
   template's promotion and epilogue: a form may re-encode the codes, never the scales. NVFP4's E4M3 scale is
   `bits.E4M3_SCALE`, its fields placed at a float32's own (the code's value times 2^-120,
   `E4M3_SCALE_OWED`), its form `E4M3_SCALE_FORM` (the search's: one right and two left shifts and a masked
-  XOR), restored by the one integer rule an NVFP4 code's restore shares (`raised`, the owed 2^120: a
-  subnormal scale as its mantissa's integer times 2^-9, never through a flushing lane), `scales_decoded` the
+  XOR), restored by the one integer rule an NVFP4 code's restore shares (`dew.nn.float_bits.raised_exactly`,
+  the owed 2^120 from its bits: a subnormal scale as its mantissa's integer times 2^-9, never through a
+  flushing lane), `scales_decoded` the
   two together, the format's integer decode
   (`bits.decoded`) on every code.
 - Each decode a template takes is declared and checked in once, in `dew.algebra.bits`, the one source the
