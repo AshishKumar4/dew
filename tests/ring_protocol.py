@@ -251,7 +251,7 @@ class _Interpreter:
         return []
 
 
-def _slot(ref, treedef, leaves) -> tuple:
+def _slot(ref, treedef, leaves) -> "tuple | frozenset[tuple]":
     """A transformed ref's location (`_located`), its transforms flattened (`treedef`, `leaves`)."""
     if ref is None:
         return ()
@@ -260,25 +260,31 @@ def _slot(ref, treedef, leaves) -> tuple:
     return _located(ref, jax.tree_util.tree_unflatten(treedef, list(leaves)))
 
 
-def _located(ref, transforms) -> tuple:
+def _located(ref, transforms) -> "tuple | frozenset[tuple]":
     """A ref's location through `transforms`: the ref and each leading index that is one value, in order (a
     ring's slot; a consumer's staging buffer and its chunk's buffer within it, `stores.staged_chunks`; a
     one-entry slice of an axis, which keeps it, last: a gathered ring's slot mbarrier, `gathered.Ring`), else
     the ref whole. Two locations share memory where one's indices are a prefix of the other's (`_overlaps`):
     a consumer's two chunk buffers, keyed by its own index alone, read as one buffer, so its double-buffered
-    stores raced (base review f86cb5b03's witness at 128 x 256)."""
+    stores raced (base review f86cb5b03's witness at 128 x 256). Through a gather (an indexer's array of
+    indices), the blocks of the ref it reaches (`_reached`)."""
+    transforms = list(transforms or ())
+    if any(_selects_none(transform) for transform in transforms):
+        return frozenset()
+    if any(_gathering(transform) for transform in transforms):
+        return _reached(ref, transforms)
     found = []
 
     def whole(index, extent) -> bool:
         return (hasattr(index, "start") and index.start is not None and int(np.asarray(index.start)) == 0
                 and index.size == extent)
 
-    for transform in transforms or ():
+    for transform in transforms:
         if getattr(transform, "indices", None) is None:
             # A transform that moves axes (a transpose, a reshape): later indices are not the base's
             # coordinates, so the location stops at the prefix known (base review 2e4651b2e F3). A tiling's,
             # a swizzle's or a bitcast's changes the trailing axes alone, the leading ones indexed as before.
-            if hasattr(transform, "permutation") or "reshape" in type(transform).__name__.lower():
+            if _moves_axes(transform):
                 return (ref.name, *found) if found else (ref.name, None)
             continue
         indices, shape = transform.indices, getattr(transform, "shape", None)
@@ -286,14 +292,7 @@ def _located(ref, transforms) -> tuple:
             if index is None:
                 return (ref.name, *found) if found else (ref.name, None)
             if not hasattr(index, "start"):
-                # An array index (advanced indexing, ndim > 0) introduces its own output axis, so later
-                # transforms do not index the base's next axis: keep the single base coordinate if constant
-                # and stop at the known base prefix (row 8978).
-                if (one := _one_value(index)) is None:
-                    return (ref.name, *found) if found else (ref.name, None)
-                found.append(one)
-                if np.asarray(index).ndim > 0:
-                    return (ref.name, *found)
+                found.append(int(np.asarray(index)))
                 continue
             # A slice: the axes from it on whole, the next transform indexes them; else its one entry, if it
             # takes one, the location's last.
@@ -306,14 +305,81 @@ def _located(ref, transforms) -> tuple:
     return (ref.name, *found) if found else (ref.name, None)
 
 
-def _one_value(index) -> int | None:
-    """An indexer's index where it names one entry of its axis (a value, an array of one value broadcast
-    beside a gathered index, or a one-entry slice), else None (a slice of more, or an array of several
-    indices: a gathered tile's rows)."""
+def _selects_none(transform) -> bool:
+    """Whether `transform` is an indexer of a static zero extent, a slice of no entry or a gather of no index:
+    an access through it touches nothing, whatever its other indices are (the base review of 369d0ad7b,
+    F2: `ref.at[[0, 1]].at[row, :0]`, at a row the checker does not evaluate, read the ref whole)."""
+    indices = getattr(transform, "indices", None)
+    if indices is None:
+        return False
+    return (any(hasattr(index, "start") and isinstance(index.size, int) and index.size == 0
+                for index in indices)
+            or any(isinstance(extent, int) and extent == 0 for extent in transform.int_indexer_shape))
+
+
+def _gathering(transform) -> bool:
+    """Whether `transform` is an indexer gathering along some axis (an array of indices, not one value)."""
+    return any(index is not None and not hasattr(index, "start") and np.ndim(index) > 0
+               for index in getattr(transform, "indices", None) or ())
+
+
+def _moves_axes(transform) -> bool:
+    """Whether a transform other than an indexer moves the axes its ref's later indices name (a transpose,
+    a reshape), where a tiling's, a swizzle's or a bitcast's changes the trailing axes alone."""
+    return hasattr(transform, "permutation") or "reshape" in type(transform).__name__.lower()
+
+
+def _reached(ref, transforms: list) -> "tuple | frozenset[tuple]":
+    """A gather's location (`_located`): the ref's elements its indexers reach, each indexer's indices
+    applied as NumPy indexes an array (JAX's `NDIndexer` lays a gather's axes out as NumPy's advanced
+    indexing does) to the places of the shape the first reads, so every view axis composes into the ref's
+    coordinates (`ref.at[[[0, 1], [2, 3]]].at[1, 0]`, a `(4,)` ref's element 2), as the blocks of them it
+    reaches whole (`_blocks`): one block's location, a set of several's, and an empty selection's no block,
+    which touches nothing (row 8978 and the base reviews of 2e043406d, 71686face, 8c1c9efca, 31b5fe85b,
+    8a5405c55 and 839bb19de: a gather crashed, lost an alias, located a cell at its row, flattened a
+    rank-two gather, raised on an empty one or on a pick the checker does not evaluate, or read an empty one
+    whole). A transform moving axes, or an indexer of an index or a slice's start the checker does not
+    evaluate (None to it; of 369d0ad7b, F1: `ref.at[[0, 1]].at[pl.ds(row, 1), 0]` raised), leaves the
+    elements reached before it, every one it could reach among them: the ref whole before the first
+    indexer."""
+    places, shape = None, None
+    for transform in transforms:
+        indices = getattr(transform, "indices", None)
+        if indices is None and places is None and not _moves_axes(transform):
+            continue
+        if indices is None or any(index is None or (hasattr(index, "start") and index.start is None)
+                                  for index in indices):
+            if places is None:
+                return (ref.name, None)
+            break
+        if places is None:
+            shape = tuple(transform.shape)
+            places = np.arange(int(np.prod(shape))).reshape(shape)
+        places = places[tuple(_numpy_index(index) for index in indices)]
+    reached = np.zeros(shape, bool)
+    reached.reshape(-1)[np.asarray(places).reshape(-1)] = True
+    blocks = [(ref.name, *block) if block else (ref.name, None) for block in _blocks(reached, ())]
+    return blocks[0] if len(blocks) == 1 else frozenset(blocks)
+
+
+def _numpy_index(index):
+    """An `NDIndexer`'s index as NumPy indexes by it: a `Slice`'s start, size and stride as a slice, a value
+    as an integer, an array of indices as itself."""
     if hasattr(index, "start"):
-        return int(np.asarray(index.start)) if index.size == 1 and index.start is not None else None
-    values = None if index is None else np.unique(np.asarray(index))
-    return None if values is None or values.size != 1 else int(values[0])
+        start, stride = int(np.asarray(index.start)), int(getattr(index, "stride", 1))
+        return slice(start, start + index.size * stride, stride)
+    return int(np.asarray(index)) if np.ndim(index) == 0 else np.asarray(index)
+
+
+def _blocks(reached: np.ndarray, prefix: tuple) -> Iterator[tuple]:
+    """The leading coordinates of each largest block of the elements `reached` marks (an array of the ref's
+    shape below `prefix`): a block reached whole is one, else its entries' blocks along its leading axis; a
+    block of no elements none."""
+    if reached.size and reached.all():
+        yield prefix
+    elif reached.any():
+        for entry, below in enumerate(reached):
+            yield from _blocks(below, (*prefix, entry))
 
 
 def _governing(value, what: str):
@@ -393,7 +459,10 @@ def _access(kind: str, indexed: int) -> Callable:
     def access(self: _Interpreter, equation, values) -> list:
         ref = values[0]
         if isinstance(ref, Ref):
-            self.emit(kind, _slot(ref, equation.params["tree"], values[indexed:]))
+            at = _slot(ref, equation.params["tree"], values[indexed:])
+            # An empty gather touches nothing: no access.
+            if at != frozenset():
+                self.emit(kind, at)
             if kind == "read" and ref.value is not None:
                 # A known operand's read, through its transforms as JAX's state discharge reads one.
                 transforms = jax.tree_util.tree_unflatten(equation.params["tree"], values[indexed:])
@@ -1011,12 +1080,20 @@ def commits_group(event: Event) -> bool:
     return (event.kind == "store" and bool(event.argument)) or event.kind == "store_group"
 
 
-def _overlaps(one: tuple, other: tuple) -> bool:
+def _overlaps(one: "tuple | frozenset[tuple]", other: "tuple | frozenset[tuple]") -> bool:
     """Whether two locations share memory: one ref, one slot or the ref whole, and one part of the slot or
-    the slot whole (a gathered step's tile, `Event`)."""
+    the slot whole (a gathered step's tile, `Event`); a gather's set of blocks (`_reached`) where any of them
+    does, its empty set nowhere."""
+    if isinstance(one, frozenset) or isinstance(other, frozenset):
+        return any(_overlaps(mine, theirs) for mine in _each(one) for theirs in _each(other))
     return bool(one) and bool(other) and one[0] == other[0] and all(
         mine is None or theirs is None or mine == theirs
         for mine, theirs in itertools.zip_longest(one[1:], other[1:]))
+
+
+def _each(location: "tuple | frozenset[tuple]") -> "tuple | frozenset[tuple]":
+    """A location's blocks: a gather's set of them (`_reached`), any other one location."""
+    return location if isinstance(location, frozenset) else (location,)
 
 
 def configurations(**bounds) -> Iterator[dict]:

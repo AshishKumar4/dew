@@ -538,15 +538,18 @@ def _uniform_doc(ids: jax.Array | None, block: int) -> jax.Array | None:
     return jnp.where(jnp.all(blocks == first, axis=-1), first[..., 0], 0)
 
 
-def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int) -> tuple:
+def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int, *,
+              minimum: Callable = jnp.minimum, div: Callable = jax.lax.div) -> tuple:
     """The key tiles `[lo, hi)` a query block of `block_q` queries from `first_query` walks in a call of no
     spans, by its form (`attention_algebra.Forward.form`): under the causal one the tiles at or before its
-    last query, else every tile of the `keys`. A call of spans walks its `BlockMap`'s (`block_map`)."""
+    last query, else every tile of the `keys`, by `minimum` and `div` (a traced walk's; a price's integers'
+    `min` and `operator.floordiv`, `attention_mosaic_program.walks`). A call of spans walks its
+    `BlockMap`'s (`block_map`)."""
     tiles = -(-keys // block_k)
     if form == "causal":
         # Its queries' first place is no negative number: a truncating division rounds it up, as every
         # kernel language lowers.
-        return 0, jnp.minimum(jax.lax.div(first_query + block_q + block_k - 1, block_k), tiles)
+        return 0, minimum(div(first_query + block_q + block_k - 1, block_k), tiles)
     return 0, tiles
 
 

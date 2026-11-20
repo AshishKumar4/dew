@@ -741,8 +741,9 @@ def _filled(jaxpr: jax_core.Jaxpr, stated: Stated) -> jax_core.Jaxpr:
 def launch_work(kernel, stated: Stated) -> Work:
     """A kernel equation's work from its body's emission, a launch's: each unit's, a step's `stated.steps`
     times and the rest each program's (`Emitted.issued`), the bytes it states its device's, its span the
-    steps one of its programs walks, and one kernel. Its cost estimate's (`_estimate`) and a step's price
-    (`work_of`, `attention_decode.priced_step`) alike."""
+    steps its longest program walks (`Stated.longest`; where it states none, its programs' mean, row 8844),
+    and one kernel. Its cost estimate's (`_estimate`) and a step's price (`work_of`,
+    `attention_decode.priced_step`) alike."""
     if kernel.primitive is mpmd.mpmd_map_p:
         (mesh,) = kernel.params["meshes"]
         counted = emitted(_body(kernel), mesh.num_threads or 1, mesh.thread_name)
@@ -756,7 +757,8 @@ def launch_work(kernel, stated: Stated) -> Work:
     return Work(flops=issued("flops"), operations=issued("operations"), exponentials=issued("exponentials"),
                 conversions=issued("conversions"), device_bytes=stated.bytes_accessed,
                 shared_bytes=issued("shared_bytes"), tf32_flops=issued("tf32_flops"),
-                span=stated.steps / programs, fp8_flops=issued("fp8_flops"), kernels=1)
+                span=stated.steps / programs if stated.longest is None else stated.longest,
+                fp8_flops=issued("fp8_flops"), kernels=1)
 
 
 def _estimate(work: Work) -> pl.CostEstimate:

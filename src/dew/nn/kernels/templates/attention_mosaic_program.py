@@ -7,6 +7,7 @@ and each tile's coordinates (`_Program`, `_Spans`, `_coords`), its hooks' parame
 import dataclasses
 import functools
 import math
+import operator
 from collections.abc import Callable, Iterable
 from types import MappingProxyType
 from typing import Any, NamedTuple
@@ -1179,14 +1180,15 @@ def reached(spec: algebra.Forward, queries: int) -> int | None:
 
 
 class TileWalk(NamedTuple):
-    """A launch's walk of its tiles as the work it issues reads it (`walked_steps`): its padded `extents` (its
+    """A launch's walk of its tiles as the work it issues reads it (`walks`): its padded `extents` (its
     arrays' query rows and keys, whole programs of both), its tiles' `blocks` (a consumer's query block and
     the key block), the tiles a program holds on its walk's axis (`holders`: its consumers' query blocks, or
     the key blocks of a walk over query tiles, `keyed`), and whether each of them walks every tile any of its
     program's holders reads (`common`: `Family.walk_own` on a layout whose consumers feed their rings, a
     shared dQ's or staged logits' dK/dV walk), a tile its own does not see masked whole; and the consumers
     that take each of its steps together, each its share of the tile (`sharing`: the fused backward's over
-    shared keys, `attention_mosaic_coop`, its consumers each a share of the key block's columns)."""
+    shared keys, `attention_mosaic_coop`, its consumers each a share of the key block's columns); and the
+    contiguous slices a tile's walk is split into, a program each (`splits`, `_Program._sliced`)."""
 
     extents: tuple[int, int]
     blocks: tuple[int, int]
@@ -1194,45 +1196,86 @@ class TileWalk(NamedTuple):
     keyed: bool = False
     common: bool = False
     sharing: int = 1
+    splits: int = 1
 
 
-def walked_steps(spec: algebra.Forward, tile_walk: TileWalk) -> int | None:
-    """The steps a launch walking `tile_walk` takes, every consumer's of a head: each tile holding a pair its
-    call's form reaches, whole, the first key aligned to the first query, as its program reads them (a query
-    block's key tiles up to its diagonal, `_Program.walked`, or a key block's query tiles from it,
-    `_Program.readers`): every padded row's (a padded consumer walks its keys as a real one does), a causal
-    diagonal tile's masked part computed with the rest (on an H100, the tensor pipes' counts of a causal call
-    at 2048 queries and 128-row tiles: 6.25% past its reached pairs, row 3948), and a common walk's every
-    tile for each holder, one wholly past the keys too (`algebra.Forward.walked_keys`); None for a spans
-    call. The work a consumer's step emits (`emission.Role.step`) times these is its walks'
-    (`cost.Stated.steps`, `emission.Emitted.issued`); a spans call's every key seen, known at trace time
+def walks(spec: algebra.Forward, tile_walk: TileWalk) -> tuple[int, int] | None:
+    """The steps a launch walking `tile_walk` takes, every consumer's of a head, and the steps the longest of
+    its programs walks, from one traversal of its holders' tiles (`_tile_ranges`). Its steps: each tile
+    holding a pair its call's form reaches, whole, the first key aligned to the first query, as its program
+    reads them (a query block's key tiles up to its diagonal, `_Program.walked`, or a key block's query tiles
+    from it, `_Program.readers`): every padded row's (a padded consumer walks its keys as a real one does), a
+    causal diagonal tile's masked part computed with the rest (on an H100, the tensor pipes' counts of a
+    causal call at 2048 queries and 128-row tiles: 6.25% past its reached pairs, row 3948), and a common
+    walk's every tile its program's holders read in a slice for each holder, one wholly past the keys too
+    (`algebra.Forward.walked_keys`). The work a consumer's step emits (`emission.Role.step`) times these is
+    its walks' (`cost.Stated.steps`, `emission.Emitted.issued`). Its longest program's (`cost.Stated.longest`,
+    its span): each slice of a program's walk (`slice_of`, each of its holders' alike) as its producer
+    streams it, the tiles any of them reads (`_streamed`), as the kernel slices and streams them: ten tiles
+    in three slices walk 4, where their mean is 10/3 (row 8844), and a causal pair's second slices of tiles
+    `[1, 3)` and `[2, 4)` stream 3 (the base review of 71686face, F3), its holders' common walk of them 16
+    steps over a causal 256 by 256 call at 64 by 64 tiles where the envelope sliced after was 12 and 2 (of
+    369d0ad7b, F3). None for a spans call, a spans call's every key seen, known at trace time
     (`algebra.Forward.whole`), a full call's."""
+    ranges = _tile_ranges(spec, tile_walk)
+    if ranges is None:
+        return None
+    holders, splits = tile_walk.holders, tile_walk.splits
+    steps = longest = 0
+    for first in range(0, len(ranges), holders):
+        program = ranges[first:first + holders]
+        for split in range(splits):
+            # Each holder's slice first, then the tiles any of them reads, as the kernel streams them
+            # (`_Program.reach`, `_streamed`): a common walk's every holder walks them all.
+            reaches = [slice_of(lo, hi, split, splits, operator.floordiv) for lo, hi in program]
+            lo, hi = _streamed(reaches, min, max)
+            steps += len(program) * (hi - lo) if tile_walk.common else sum(hi - lo for lo, hi in reaches)
+            longest = max(longest, hi - lo)
+    return steps * tile_walk.sharing, longest
+
+
+def _tile_ranges(spec: algebra.Forward, tile_walk: TileWalk) -> list[tuple[int, int]] | None:
+    """Each holder's walk of `tile_walk` as the tiles `[lo, hi)` it reads, by its program's own rules (a query
+    block's key tiles up to its diagonal, `attention.key_tiles`; a key block's query tiles from it,
+    `first_reader`); None for a spans call (but one whose every query sees every key,
+    `algebra.Forward.whole`)."""
     if spec.form == "spans" and not spec.whole:
         return None
     (queries, keys), (block_q, block_k) = tile_walk.extents, tile_walk.blocks
     query_tiles, causal = queries // block_q, spec.form == "causal"
-    seen = min(-(-spec.keys // block_k), keys // block_k)
     if tile_walk.keyed:
-        # A key block's readers, from its diagonal where causal; a block wholly past the keys has none.
-        firsts = [min(tile * block_k // block_q, query_tiles) if causal else 0 for tile in range(seen)]
-        walks = [query_tiles - first for first in firsts] + [0] * (keys // block_k - seen)
-    else:
-        walks = [min(-(-(tile + 1) * block_q // block_k), seen) if causal else seen
-                 for tile in range(query_tiles)]
-    if tile_walk.common:
-        holders = tile_walk.holders
-        programs = (walks[first:first + holders] for first in range(0, len(walks), holders))
-        walks = [len(program) * max(program) for program in programs]
-    return sum(walks) * tile_walk.sharing
+        # A key block's readers, as its program finds the first (`first_reader`).
+        return [(first_reader(tile * block_k, block_q, query_tiles, spec.keys, causal, minimum=min,
+                              div=operator.floordiv, where=_chosen), query_tiles)
+                for tile in range(keys // block_k)]
+    # A query block's key tiles, as its program walks them (`_Program.walked`).
+    return [(0, min(key_tiles(spec.form, tile * block_q, block_q, block_k, spec.keys, minimum=min,
+                              div=operator.floordiv)[1], keys // block_k))
+            for tile in range(query_tiles)]
+
+
+def first_reader(k_first, block_q: int, q_steps: int, keys: int, causal: bool, *,
+                 minimum: Callable = jnp.minimum, div: Callable = lax.div, where: Callable = jnp.where):
+    """The first query tile that sees the key block from `k_first` in a full or causal call of `keys` keys,
+    by `minimum`, `div` and `where` (a traced walk's, `_Program._first_reader`; a price's integers', `walks`):
+    every one, or those from its diagonal (a causal call of more keys than queries leaves its last keys
+    unseen); a block wholly past the keys none, from the last."""
+    lo = minimum(div(k_first, block_q), q_steps) if causal else 0
+    return where(k_first >= keys, q_steps, lo)
+
+
+def _chosen(condition: bool, chosen, otherwise):
+    """`jnp.where`'s choice of host values (`first_reader`)."""
+    return chosen if condition else otherwise
 
 
 def stated(spec: algebra.Forward, batch: int, heads: int, *arrays, tile_walk: TileWalk) -> Stated | None:
     """A launch's statement of its cost (`cost.Stated`), its work its kernel's emission's
-    (`emission.costed`): the steps its walk takes (`walked_steps`), every head's, and the bytes of each of
-    `arrays` once; None for a spans call, whose steps no launch knows (`reached`): its cost counts as
-    unsized, never as 0. The model's share of its work the launch declares apart (`modelled`)."""
-    steps = walked_steps(spec, tile_walk)
-    return None if steps is None else Stated(steps * batch * heads, stored(*arrays))
+    (`emission.costed`): the steps its walk takes, every head's, and its longest program's (`walks`), and the
+    bytes of each of `arrays` once; None for a spans call, whose steps no launch knows (`reached`): its cost
+    counts as unsized, never as 0. The model's share of its work the launch declares apart (`modelled`)."""
+    walked = walks(spec, tile_walk)
+    return None if walked is None else Stated(walked[0] * batch * heads, stored(*arrays), walked[1])
 
 
 def modelled(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int) -> int | None:
@@ -1499,12 +1542,8 @@ class _Program[T: (Tiles, BackwardTiles)]:
         return self.family.scalar_of(ref.at[row, pl.ds(index, 1)])
 
     def _sliced(self, lo, hi) -> tuple[jax.Array, jax.Array]:
-        """`[lo, hi)` key tiles, this program's slice of them (`split`): the `splits` contiguous slices of a
-        query tile's tiles, as long as the others but for rounding, partition them; its whole range of one."""
-        if self.splits == 1:
-            return lo, hi
-        split, count = self.split(), hi - lo
-        return lo + lax.div(count * split, self.splits), lo + lax.div(count * (split + 1), self.splits)
+        """`[lo, hi)` key tiles, this program's slice of them (`split`, `slice_of`); all of one slice's."""
+        return (lo, hi) if self.splits == 1 else slice_of(lo, hi, self.split(), self.splits)
 
     def readers(self, k_first, q_steps: int, spans: _Spans | None, row):
         """The query tiles reading a key block from `k_first`, `[lo, hi)` of the call's `q_steps`, and
@@ -1551,10 +1590,8 @@ class _Program[T: (Tiles, BackwardTiles)]:
         return None if spans is not None or not self.causal else self._whole_run(k_first, q_steps)
 
     def _first_reader(self, k_first, q_steps: int) -> jax.Array:
-        """The first query tile that sees the key block from `k_first` in a full or causal call: every one,
-        or those from its diagonal (a causal call of more keys than queries leaves its last keys unseen)."""
-        lo = jnp.minimum(lax.div(k_first, self.tiles.block_q), q_steps) if self.causal else jnp.int32(0)
-        return jnp.where(k_first >= self.keys, q_steps, lo)
+        """The first query tile that sees the key block from `k_first` (`first_reader`)."""
+        return first_reader(k_first, self.tiles.block_q, q_steps, self.keys, self.causal)
 
     def _whole_run(self, k_first, q_steps: int) -> tuple[jax.Array, jax.Array]:
         """`whole_run`'s of a full or causal call: from past the block's diagonal (none if the block holds
@@ -1576,10 +1613,19 @@ def _per_span(spec: algebra.Forward, spans: _Spans | None) -> int:
     return spec.queries // spans.start.shape[1]
 
 
-def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
-    """The tiles a program streams: those any of its consumers' `reaches` (`[lo, hi)` each) reads."""
-    return (functools.reduce(jnp.minimum, [lo for lo, _ in reaches]),
-            functools.reduce(jnp.maximum, [hi for _, hi in reaches]))
+def _streamed(reaches: list, minimum: Callable = jnp.minimum, maximum: Callable = jnp.maximum) -> tuple:
+    """The tiles a program streams: those any of its consumers' `reaches` (`[lo, hi)` each) reads, by
+    `minimum` and `maximum` (a traced walk's; a price's integers' `min` and `max`, `walks`)."""
+    return (functools.reduce(minimum, [lo for lo, _ in reaches]),
+            functools.reduce(maximum, [hi for _, hi in reaches]))
+
+
+def slice_of(lo, hi, split, splits: int, div: Callable = lax.div) -> tuple:
+    """The `split`th of the `splits` contiguous slices of tiles `[lo, hi)` (`_Program._sliced`), as long as
+    the others but for rounding, which partition them, by `div` (a traced walk's `lax.div`; a price's
+    integers' `operator.floordiv`, `walks`), alike on a count of tiles, never negative."""
+    count = hi - lo
+    return lo + div(count * split, splits), lo + div(count * (split + 1), splits)
 
 
 def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],

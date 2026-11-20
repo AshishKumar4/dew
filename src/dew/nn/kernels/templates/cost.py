@@ -40,12 +40,15 @@ def stored(*arrays) -> int:
 class Stated:
     """What a launch states of its cost beside its kernel's emission, which counts the rest
     (`emission.costed`): the steps of its walks, every consumer's over the call's batch and heads (`steps`,
-    attention's `walked_steps`, the recurrence's `launch_kernel`'s: a laid call's mean chunks a sequence over
+    attention's `walks`, the recurrence's `launch_kernel`'s: a laid call's mean chunks a sequence over
     its sequences), the trips its data decides, which the count multiplies a step's work by; and the bytes it
-    reads and writes, each of its operands and outputs once (`bytes_accessed`, `estimate`'s)."""
+    reads and writes, each of its operands and outputs once (`bytes_accessed`, `estimate`'s); and the steps
+    the longest of its programs walks, its critical path (`longest`, attention's `walks`), None where
+    it states none: its steps over its programs then (`emission.launch_work`)."""
 
     steps: float
     bytes_accessed: int
+    longest: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
