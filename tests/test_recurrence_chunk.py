@@ -178,6 +178,10 @@ independently by `seeds_for` on armada (2026-10-21; the readouts apart 2026-11-1
 memory entering and a document starting on a chunk's first token."""
 
 
+PACKED = ((0, 23, 40), (9, 48))
+"""`draw`'s packed documents: each row's documents' first tokens."""
+
+
 def marked(documents, length: int) -> np.ndarray:
     """Each row's `documents` (its documents' first tokens) as the `[rows, length]` marks of those tokens."""
     starts = np.zeros((len(documents), length), bool)
@@ -276,7 +280,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     if hooks.output is not None:
         epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
-    starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), length)) if packed else None
+    starts = jnp.asarray(marked(PACKED, length)) if packed else None
     own = {'own': hosted(0.5 * normal((value_heads, KEY_WIDTH))[..., key_order])} if hooks.own_weight else {}
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
@@ -704,27 +708,32 @@ def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
         assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
 
 
-def test_a_forked_calls_token_maps_keep_its_rows_on_an_explicit_axis():
-    """A forked call's token maps (`chunked_launch.Forked.tokens`: each token's load, store and document) of
-    two rows of three documents a row, its rows split over an Explicit mesh axis: the loads, stores and
-    documents each map lays a row's own (a document's first token its load and number, its last its store,
-    every other token -1 or zero), placed as its rows are (row 9690: scattered into whole buffers by a row
-    index, JAX refused indices and updates split on an Explicit axis)."""
-    firsts = np.asarray([[0, 3, 7], [0, 5, 9]], np.int32)
-    loads, stores = np.asarray([[1, 0, 2], [0, 3, 1]], np.int32), np.asarray([[1, 2, 0], [3, 0, 1]], np.int32)
-    expected = (np.full((2, 10), -1), np.zeros((2, 10)), np.zeros((2, 10)))
-    for row in range(2):
-        ends = (*firsts[row, 1:] - 1, 9)
-        expected[0][row, firsts[row]], expected[1][row, ends] = loads[row], stores[row]
-        expected[2][row, firsts[row]] = range(3)
+@pytest.mark.parametrize('documents', [3, 0], ids=['three slots a row', 'none'])
+def test_a_forked_calls_token_maps_keep_its_rows_on_an_explicit_axis(documents):
+    """A forked call's token maps (`chunked_launch.Forked.tokens`: each token's load, store and document)
+    over ten tokens, its rows split over an Explicit mesh axis: a row of three documents and one of two, its
+    third slot unused (its start the call's length, its load and store nonzero, dropped), or a table of no
+    documents, each map a row's own exactly (a document's first token its load and number, its last its
+    store, every other token -1 or zero), int32 and placed as its rows are (row 9690: scattered into whole
+    buffers by a row index, JAX refused indices and updates split on an Explicit axis)."""
+    firsts = np.asarray([[0, 3, 7], [0, 5, 10]], np.int32)[:, :documents]
+    loads = np.asarray([[1, 0, 2], [0, 3, 4]], np.int32)[:, :documents]
+    stores = np.asarray([[1, 2, 3], [3, 1, 5]], np.int32)[:, :documents]
+    expected = (np.full((2, 10), -1, np.int32), np.zeros((2, 10), np.int32), np.zeros((2, 10), np.int32))
+    if documents:
+        for row, (begins, ends) in enumerate((([0, 3, 7], [2, 6, 9]), ([0, 5], [4, 9]))):
+            live = len(begins)
+            expected[0][row, begins], expected[1][row, ends] = loads[row, :live], stores[row, :live]
+            expected[2][row, begins] = range(live)
     mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
     with jax.set_mesh(mesh):
         rows = jax.sharding.NamedSharding(mesh, P('data'))
         placed = (jax.device_put(x, rows) for x in (firsts, loads, stores))
         forked = chunked_launch.Forked(*placed, entry=None, held=3)
         found = jax.jit(lambda forked: forked.tokens(10))(forked)
-    assert [np.asarray(got).tolist() for got in found] == [x.tolist() for x in expected]
-    assert all(jax.typeof(got).sharding.spec[0] == 'data' for got in found)
+    for got, want in zip(found, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), want, strict=True)
+        assert jax.typeof(got).sharding.spec[0] == 'data'
 
 
 @pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['laid', 'a token at a time'])

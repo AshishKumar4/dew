@@ -25,6 +25,7 @@ from dew.batch import document_firsts
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.tables import Column, column, packed, unpacked
 from dew.nn.precision import aligned_sum
+from dew.nn.sharding import rows_like
 
 
 @dataclasses.dataclass(frozen=True)
@@ -453,14 +454,12 @@ class Forked:
         lasts = jnp.concatenate([firsts[:, 1:], jnp.full_like(firsts[:, :1], length)], axis=1)
         lasts = jnp.minimum(lasts, length) - 1
         began = jnp.where(held, firsts, length)
-        # A row at a time, each row's buffer from its own documents' (`firsts`' rows): a row's tokens are
-        # its documents' alone, so the maps are placed as the rows are, where scattered by a row index
-        # into whole buffers, JAX refused indices and updates split on an Explicit axis (row 9690).
-        tokens = jnp.zeros_like(firsts[:, :1]) + jnp.zeros((1, length), jnp.int32)
-
+        # A row at a time, each row's buffer placed as `firsts`' rows: a row's tokens are its documents'
+        # alone, so the maps are placed as the rows are, where scattered by a row index into whole buffers,
+        # JAX refused indices and updates split on an Explicit axis (row 9690).
         def laid(fill: int, at, values):
-            return jax.vmap(lambda row, where, value: row.at[where].set(value, mode="drop"))(
-                tokens + fill, at, values)
+            base = rows_like(jnp.full((firsts.shape[0], length), fill, jnp.int32), firsts)
+            return jax.vmap(lambda row, where, value: row.at[where].set(value, mode="drop"))(base, at, values)
 
         numbers = jnp.zeros_like(firsts) + jnp.arange(firsts.shape[1], dtype=jnp.int32)
         return (laid(-1, began, jnp.asarray(self.loads, jnp.int32)),

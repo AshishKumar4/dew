@@ -38,11 +38,14 @@ from reference_error import FEWEST_SEEDS, assert_as_exact, indexed_recording, re
 from ssd_support import mamba_side
 from test_recurrence_chunk import (
     FORMED,
+    LENGTH,
+    PACKED,
     VALUE_HEADS,
     against_the_portable_math,
     chunk_on,
     draw,
     hosted,
+    marked,
     oracle,
     release,
     token_by_token,
@@ -168,11 +171,11 @@ def _leaves(results) -> dict:
 
 
 def _starts(case: dict[str, str]):
-    """`case`'s documents' first tokens (`draw`'s, the same for every seed), None for one sequence."""
+    """`case`'s documents' first tokens (`draw`'s, `PACKED`, the same for every seed), None for one sequence:
+    the host's NumPy marks, which place nothing on a device before a site (row 7868)."""
     if case["documents"] != "packed":
         return None
-    (operands,) = draw(FORMS[case["form"]], packed=True, seed=0)
-    return operands.starts
+    return marked(PACKED, LENGTH)
 
 
 def _step(case: dict[str, str], kernel: str):
