@@ -35,7 +35,7 @@ import pytest
 from arm_arithmetic import Truth
 from attention_oracle import exact_attention
 from generation_support import here, interprets
-from reference_error import as_given, assert_as_exact, widened, with_gradients
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, widened, with_gradients
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -1206,6 +1206,42 @@ def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_refere
     assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
                     lambda seed: _cast(family, family.draw)(seed)[:4], "mosaic forward at fp32's limit",
                     seeds=seeds, truth_fn=_reference(family, anchored=True))
+
+
+MAINLOOPS = ("portable", *(("mosaic",) if INTERPRETED else ()))
+"""The forwards a mean's test walks: the plain-JAX mainloop's, and in a CPU process the Mosaic forward's
+interpreted as an H100 runs it (a GPU runs it in `_mainloops`' Mosaic arms)."""
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+@pytest.mark.parametrize("mainloop", MAINLOOPS)
+def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training):
+    """One fp16 query over a key at logit 0 and 1000 at a logit whose weight, 0.50035, narrows up to 0.5005
+    for its product, every value fp16's largest: the output, their mean, is 65504, on par with the reference
+    (check 1) on both walks, where the narrowed weights over their unrounded sum put it at 65522, inf in
+    fp16 (row 9519). Each key's logit is two fp16 entries of it, their sum in fp32 log(0.50035) at the
+    call's scale, 1/8."""
+    keys, width = 1001, 64
+    logit = np.float32(8 * np.log(0.50035))
+    high = np.float16(logit)
+    query = jnp.zeros((1, 1, 1, width), jnp.float16).at[..., :2].set(1)
+    key = (jnp.zeros((1, keys, 1, width), jnp.float16).at[0, 1:, 0, 0].set(high)
+           .at[0, 1:, 0, 1].set(np.float16(logit - np.float32(high))))
+    value = jnp.full((1, keys, 1, width), jnp.finfo(jnp.float16).max, jnp.float16)
+    spans = template.spans(1, keys, 1)
+
+    def ours(query, key, value):
+        if mainloop == "portable":
+            out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                                  template.Hooks(), residuals=training)
+        else:
+            kept = template.Kept.SPLIT if training else template.Kept.NONE
+            with generation.assumed("sm90"):
+                out = attention_mosaic.forward(query, key, value, spans, None, interpret=True, residuals=kept)
+        return out[0] if training else out
+
+    assert_as_exact(ours, lambda query, key, value: template.reference(query, key, value, spans),
+                    lambda seed: (query, key, value), "an fp16 mean at fp16's largest", seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])

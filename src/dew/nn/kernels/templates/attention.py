@@ -1314,6 +1314,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     elif drop is None:
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
+        if hooks.initial is None:
+            normalized = held_mean(normalized, acc, value.dtype)
     else:
         # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's z
         # times its normalized weight stays in the values' range where z times the unnormalized one may not
@@ -1333,6 +1335,29 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     out = output_hooked(normalized, hooks.output_mod, hooks.output_params)
     out = jnp.swapaxes(out.astype(query.dtype), 1, 2)
     return (out, safe, total) if residuals else out
+
+
+def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
+    """`out`, the weighted values `sums` over their denominator, held at `dtype`'s largest where it passes it
+    from finite sums: a mean of finite values of `dtype` is within it, so one past it is its weights'
+    rounding, as the kernels hold it (`attention_algebra.quotient`): narrowed to fp16 for their product, the
+    weights round up by as much as 2^-11 of each where the denominator sums them unrounded, the mean of 1001
+    values of 65504 at 65522, inf in fp16 (row 9519). An infinite or NaN sum's (an infinite value's) stays
+    as it is. Its derivative is the mean's, `out`'s (`_held`)."""
+    largest = float(jnp.finfo(dtype).max)
+    return _held(out, jnp.isfinite(sums) & (jnp.abs(out) > largest), largest)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
+def _held(out: jax.Array, past: jax.Array, largest: float) -> jax.Array:
+    """`out` at `largest` of its sign where `past` (`held_mean`), its tangent `out`'s."""
+    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
+
+
+@_held.defjvp
+def _held_tangent(largest: float, primals: tuple, tangents: tuple) -> tuple[jax.Array, jax.Array]:
+    out, past = primals
+    return _held(out, past, largest), tangents[0]
 
 
 def output_hooked(out: jax.Array, output_mod: Callable | None, output_params: tuple[Param, ...]) -> jax.Array:

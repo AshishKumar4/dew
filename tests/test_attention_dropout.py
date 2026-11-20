@@ -8,6 +8,7 @@ in bf16.
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -704,6 +705,17 @@ def test_a_resumed_state_of_a_large_denominator_keeps_a_finite_dropping_backward
     assert bool(np.all(np.isfinite(np.asarray(grads.value))))
 
 
+def _walked(spans, hooks, training: bool, **options) -> Callable:
+    """The portable mainloop's call over `spans` under `hooks` at tiles of 8 (its training walk's where
+    `training`), its output alone, a function of `(query, key, value)` for check 1."""
+    def walked(query, key, value):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks, residuals=training, **options)
+        return out[0] if training else out
+
+    return walked
+
+
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
 @pytest.mark.parametrize(("rate", "logit", "seed"),
                          [(1.0 - 2.0 ** -14, -18.0, None), (127 / 256, -17.34375, None),
@@ -725,11 +737,7 @@ def test_an_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps(rate, logit,
     value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1, 0, 0].set(2.0 ** 15)
     spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
 
-    def walked(query, key, value):
-        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                              hooks, scale=1.0, residuals=training)
-        return out[0] if training else out
-
+    walked = _walked(spans, hooks, training, scale=1.0)
     assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
                                                                          scale=1.0),
                     lambda seed: (query, key, value), "a small kept fp16 weight", seeds=FEWEST_SEEDS)
@@ -755,11 +763,7 @@ def test_an_fp16_kept_weight_near_fp16s_largest_keeps_its_output_finite(weight, 
     value = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, 1].set(jnp.finfo(jnp.float16).max)
     spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
 
-    def walked(query, key, value):
-        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                              hooks, scale=1.0, residuals=training)
-        return out[0] if training else out
-
+    walked = _walked(spans, hooks, training, scale=1.0)
     assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
                                                                          scale=1.0),
                     lambda seed: (query, key, value), "an fp16 kept weight near fp16's largest",
@@ -783,11 +787,7 @@ def test_a_kept_anchor_below_fp16s_least_subnormal_keeps_its_term(training):
     hooks = template.Hooks(initial=template.sinks(jnp.asarray([18.0], jnp.float16), 1, 1, 8),
                            drop=dropout_of(words, 1, 1, rate))
 
-    def walked(query, key, value):
-        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                              hooks, scale=1.0, residuals=training)
-        return out[0] if training else out
-
+    walked = _walked(spans, hooks, training, scale=1.0)
     assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks,
                                                                          scale=1.0),
                     lambda seed: (query, key, value), "a kept anchor below fp16's least subnormal",
@@ -825,11 +825,7 @@ def test_a_kept_fp32_key_near_fp32s_largest_keeps_its_finite_output(training):
     value = jnp.full((1, 1, 1, 8), 2.0 ** 127, jnp.float32)
     spans, hooks = template.spans(1, 1, 1), hooked(words, 1, 1, 0.25)
 
-    def walked(query, key, value):
-        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                              hooks, residuals=training)
-        return out[0] if training else out
-
+    walked = _walked(spans, hooks, training)
     assert_as_exact(walked, lambda query, key, value: template.reference(query, key, value, spans, hooks),
                     lambda seed: (query, key, value), "a kept key near fp32's largest", seeds=FEWEST_SEEDS)
 

@@ -31,6 +31,7 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import DTypeLike
 
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
@@ -105,6 +106,10 @@ class Forward:
     of 1 - 2^-14, the base review of 56a716c95, F1), the rest in the division (`dropped_total`)."""
     units: float = 1.0
     """What a dropping call's sums hold its kept weights by (`sums_units`); 1 where no call drops."""
+    largest: DTypeLike | None = None
+    """The dtype whose largest its output is within, which a quotient past it by its weights' rounding is
+    held at (`quotient`): a call's values', where it drops none and resumes no state, its output a mean of
+    them (`largest_of`); None where its output may pass them."""
 
     @property
     def reach(self) -> float:
@@ -245,6 +250,13 @@ def finite(x: jax.Array) -> jax.Array:
     """Whether each entry of `x` is finite, `|x| < inf` (NaN not), as `jnp.isfinite`: a mainloop's lowering
     may take no `is_finite` (Mosaic GPU's warpgroup lowering, jax 0.11.2)."""
     return jnp.abs(x) < jnp.inf
+
+
+def largest_of(value_dtype: DTypeLike, *, drops: bool, resumes: bool) -> DTypeLike | None:
+    """`Forward.largest` of a call over values of `value_dtype`: the values' dtype where it drops none and
+    resumes no state, so its output is a mean of them; else None (a resumed partial's mean may pass the
+    values' largest, and a sink is a state the walk takes alike)."""
+    return None if drops or resumes else value_dtype
 
 
 def infinite(x: jax.Array) -> jax.Array:
@@ -1263,25 +1275,18 @@ def kept_parts(p: jax.Array, multiplier: jax.Array | None, reach: float, dtype) 
     """Weights `p` as the parts of their product with values of `dtype`, a dropout draw's (`multiplier`) kept
     keys' alone taken by its `reach` before the narrowing, past the dtype's largest binade at their row's
     power of two (at a power below, e^-17.34 at 256/129 and e^-28 at 2^17 rounded to 0, the base reviews of
-    4e2eb287e and a648b3279, F1, F3); fp16's two parts at one scale (`dropped_parts`)."""
+    4e2eb287e and a648b3279, F1, F3). fp16's take two parts at one scale (`split_parts`), 22 bits, whose
+    products issue into one accumulator: a dropping call's output is no mean of its values, so one rounding
+    of a weight, up to 2^-11 of it, carried it past fp16's largest where the exact output is within it (a
+    weight rounded up to 2, 65526.93 where the float64 output is 65513.82, the base review of 70c1aa096, F1;
+    row 9505)."""
     if multiplier is None or jnp.dtype(dtype) != jnp.dtype(jnp.float16):
         return (narrow(kept(p, multiplier, reach), dtype),)
     if drops_in_place(dtype, reach):
-        return dropped_parts(kept(p, multiplier, reach))
+        return split_parts(kept(p, multiplier, reach))
     # Its row's power of two along the product's columns, as the rows' product reads it.
     value, exponent = _scaled(kept(p, multiplier, reach), rows=True)
-    return tuple(product.Scaled(part, exponent[:, None]) for part in dropped_parts(value))
-
-
-def dropped_parts(weights: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """An fp16 dropping call's kept weights (fp32, within fp16's range, `kept_parts`) as two fp16 parts at
-    their scale, the weights rounded and what that rounding lost rounded, 22 bits, whose products issue into
-    one accumulator, a remainder below fp16's least normal kept to its least subnormal, 2^-24. A dropping
-    call's output is no mean of its values: one rounding of a weight, up to 2^-11 of it, carried it past
-    fp16's largest where the exact output is within it (a weight rounded up to 2, 65526.93 where the float64
-    output is 65513.82, the base review of 70c1aa096, F1; row 9505)."""
-    high = weights.astype(jnp.float16)
-    return high, (weights - high.astype(jnp.float32)).astype(jnp.float16)
+    return tuple(product.Scaled(part, exponent[:, None]) for part in split_parts(value))
 
 
 def in_units(spec: "Forward", products: jax.Array) -> jax.Array:
@@ -1757,9 +1762,10 @@ def anchor_split(p: jax.Array, at_anchor: jax.Array, dtype) -> tuple[jax.Array, 
 
 
 def _summed_row(part: jax.Array | product.Scaled) -> jax.Array:
-    """A product's part's rows' sums `[bq]`, fp32, a scaled one's taken back by its row's power of two."""
+    """A product's part's rows' sums `[bq]`, fp32, a scaled one's taken back by its rows' powers of two
+    (`[bq, 1]`, `kept_parts`)."""
     if isinstance(part, product.Scaled):
-        return taken_back(part.value.astype(jnp.float32).sum(axis=-1), part.exponent[:, 0])
+        return taken_back(part.value.astype(jnp.float32).sum(axis=-1), jnp.reshape(part.exponent, (-1,)))
     return part.astype(jnp.float32).sum(axis=-1)
 
 
@@ -1848,11 +1854,11 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     return _derived_merged(spec, stacked, axis)
 
 
-def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, held: bool = False) -> jax.Array:
+def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, held: DTypeLike | None = None
+              ) -> jax.Array:
     """The weighted values `acc` over their denominator, any leading axes: zero for a query that saw nothing
     where it may (`guarded`: a walk's whose row may see none, or one from a state); a subnormal ratio kept
-    where the arithmetic flushes one, and one past the values' largest held there where `held`
-    (`quotient`)."""
+    where the arithmetic flushes one, and one past the dtype `held`'s largest held there (`quotient`)."""
     if not guarded:
         return quotient(lambda sums: sums / expand(denominator, sums), acc, denominator, held=held)
     safe = jnp.where(denominator > 0, denominator, 1.0)
@@ -1861,19 +1867,21 @@ def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, held: bo
 
 
 def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax.Array, *,
-             held: bool = False) -> jax.Array:
+             held: DTypeLike | None = None) -> jax.Array:
     """`ratio(acc)`, the weighted values `acc` `[..., Dv]` over their rows' `total` `[...]` as its caller
     divides them; where the arithmetic flushes a subnormal result (`bodies.subnormals`: XLA's CPU, per
     primitive, row 4023), each element whose quotient may fall below fp32's least normal divided raised to
     its row's total's binade (`dew.nn.float_bits.raised_exactly`, from its bits) and taken back in the one
     rounding of the correctly rounded division (`lowered_divide`): a subnormal one kept (row 6302); every
     other element's bits the plain ratio's. Wider sums (a float64 truth's) keep their subnormals as they
-    are. Where `held` (an fp32 call's walk, `MosaicForward.parts`: dropout-free inference), a quotient of
-    finite sums is a mean of finite values, within their dtype's largest, so one past it is the sums'
-    rounding, held there by selection: a scaled row's sums of values at fp32's largest round up an ulp onto
-    2^127 at a total of 1/2, its quotient 2^128 (row 6842); an infinite value's sum stays infinite, its
-    quotient as it is (a dropping call's may pass the values' largest, as the reference's does; a 16-bit
-    output casts one held at fp32's largest to inf, so no 16-bit walk pays for the hold)."""
+    are. Where `held` (a dtype: a dropout-free call's values' of no initial state, `Forward.largest`; an fp32
+    call's walk's, `MosaicForward.parts`), a quotient of finite sums is a mean of finite values, within
+    that dtype's largest, so one past it is its weights' or its sums' rounding, held there by selection: an
+    fp16 weight rounds up by as much as 2^-11 of it where the denominator sums it unrounded, the mean of
+    1001 values of 65504 at 65522, inf in fp16 (row 9519); a scaled row's sums of values at fp32's largest
+    round up an ulp onto 2^127 at a total of 1/2, its quotient 2^128 (row 6842). An infinite value's sum
+    stays infinite or NaN, its quotient as it is; a dropping call's or a state's may pass the values'
+    largest, as the reference's does."""
     def divided(*, flushing: bool) -> jax.Array:
         plain = ratio(acc)
         if not flushing:
@@ -1885,9 +1893,9 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
         return jnp.where(raised > 0, lowered_divide(lifted, divisor, raised), plain)
 
     out = bodies.subnormals(divided, acc.dtype)
-    if not held:
+    if held is None:
         return out
-    largest = jnp.finfo(out.dtype).max
+    largest = jnp.finfo(held).max
     past = finite(acc) & (jnp.abs(out) > largest)
     return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
 
@@ -1915,7 +1923,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     rows' scale leaves (both its sums are at it). A `normalized` state's sums are its output already (a
     merge of finished states, `finished_merged`): zero where it holds no mass. Where its arithmetic flushes
     a subnormal result (XLA's CPU, `bodies.subnormals`), its ratio is `quotient`'s, held at the values'
-    largest where `held` (an fp32 call's walk, `quotient`)."""
+    largest (`Forward.largest`), or at fp32's where `held` (an fp32 call's walk, `quotient`)."""
     m, denominator = finished_rows(spec, state, initial=initial)
     if normalized:
         out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
@@ -1923,7 +1931,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
         acc, total = dropped_total(spec, state.acc, state.total)
         state = state._replace(acc=acc, total=total)
         out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
-                       held=held)
+                       held=jnp.float32 if held else spec.largest)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
@@ -2004,10 +2012,15 @@ def running_shift(old: jax.Array, new: jax.Array) -> jax.Array:
 
 def parts_at(x: jax.Array, exponent: jax.Array, dtype=jnp.float16) -> tuple[jax.Array, jax.Array]:
     """An fp32 tile `x` as two `dtype` parts at the running scale of `exponent`, its tile's own or larger
-    (`running_parts`): `x` times `2^(14 - exponent)` rounded, then its remainder rounded."""
-    scaled = scalar_power2(x, jnp.where(exponent == -jnp.inf, 0.0, 14.0 - exponent))
-    high = scaled.astype(dtype)
-    return high, (scaled - high.astype(jnp.float32)).astype(dtype)
+    (`running_parts`): `x` times `2^(14 - exponent)` in two parts (`split_parts`)."""
+    return split_parts(scalar_power2(x, jnp.where(exponent == -jnp.inf, 0.0, 14.0 - exponent)), dtype)
+
+
+def split_parts(x: jax.Array, dtype=jnp.float16) -> tuple[jax.Array, jax.Array]:
+    """An fp32 tile `x` within `dtype`'s range as two `dtype` parts at its scale: `x` rounded, then what that
+    rounding lost rounded, a remainder below the dtype's least normal kept to its least subnormal."""
+    high = x.astype(dtype)
+    return high, (x - high.astype(jnp.float32)).astype(dtype)
 
 
 def running_restored(value: jax.Array, exponent: jax.Array) -> jax.Array:

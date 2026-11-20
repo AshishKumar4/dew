@@ -1824,7 +1824,9 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
     # An fp32 call's weights fp32, their remainder fp32 and the part taken (`_parted_products`); a dropping
-    # fp16 call's kept weights' second part beside the first (`algebra.dropped_parts`).
+    # fp16 call's kept weights' second part beside the first (`algebra.kept_parts`: an fp16 causal call at a
+    # rate of 0.1, 64 and 128 wide, compiled spill-free at its derived tiles on sm80, sm90 and sm120,
+    # et-fp16w-a; the draw itself is unpriced, row 9526).
     step = [logits] * (3 if parts > 1 else 1) + [weights] * ((2 if residuals else 1) + weight_parts - 1)
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
@@ -2002,7 +2004,7 @@ class ForwardRegisters:
     and their queries each (`positions`, `per_span`; none unpacked), whose reach its walk reads first
     (`_reach_registers`), whether its walk merges an initial state past its keys (`merged`), and the parts
     its kept weights enter their product as (`weight_parts`: a dropping fp16 call's two,
-    `algebra.dropped_parts`)."""
+    `algebra.kept_parts`)."""
     dtype: Any
     width: int
     value_width: int

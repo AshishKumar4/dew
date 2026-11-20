@@ -1004,7 +1004,7 @@ class MosaicForward(_Mainloop[Tiles]):
                    scales=None, initial=None, drop=None) -> ForwardRegisters:
         """The call's base register facts (`ForwardRegisters`): an `initial` state merges past an inference
         walk's keys (`attention_mosaic_forward._started`), a split training walk starting from it; a `drop`
-        over fp16 values takes its kept weights in two parts (`algebra.dropped_parts`)."""
+        over fp16 values takes its kept weights in two parts (`algebra.kept_parts`)."""
         params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype) for param in score_params),
                            strict=True))
         computed = query.dtype if scales is not None else value.dtype
