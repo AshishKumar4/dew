@@ -738,7 +738,7 @@ def scales_decoded(codes: jax.Array) -> jax.Array:
     bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing lane; the NaN code,
     0x7F, which no block scale holds, reads as 480, as `decoded` reads it)."""
     (pattern,) = E4M3_SCALE_FORM.traced(codes.astype(jnp.uint32))
-    return raised_exactly(jax.lax.bitcast_convert_type(pattern, jnp.float32), 120)
+    return raised_exactly(jax.lax.bitcast_convert_type(pattern, jnp.float32), jnp.int32(120))
 
 
 NVFP4_OWED = 2.0 ** 8
@@ -781,7 +781,8 @@ def restored(pattern: jax.Array, dtype=jnp.float32) -> jax.Array:
     power, row 8660's head review; every code's restoring is a normal float32, which a wider one holds
     exactly). The one definition of the decoded value: the portable decode's (`nvfp4_decoded`), the native
     staged decode's, whatever lanes each extracts, and a truth's."""
-    restoring = raised_exactly(jax.lax.bitcast_convert_type(pattern << jnp.uint32(16), jnp.float32), 126)
+    held = jax.lax.bitcast_convert_type(pattern << jnp.uint32(16), jnp.float32)
+    restoring = raised_exactly(held, jnp.int32(126))
     return restoring.astype(dtype)
 
 
