@@ -639,9 +639,9 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: 
     if values_read and apart:
         raise Refused("a readout along the state's values apart from its group's writes has no chunk form "
                       "here")
-    if across and (corrects or values_read or apart):
-        raise Refused("a decay along the state's values beside corrections, a readout along them or apart "
-                      "from its group's writes has no chunk form here")
+    if across and (corrects or values_read):
+        raise Refused("a decay along the state's values beside corrections or a readout along them has no "
+                      "chunk form here")
     scores = Chunk.gram(queries, Chunk.token("B"), apart, between)
     if across:
         local = Chunk.weighed(scores, given, Chunk.across("between"))

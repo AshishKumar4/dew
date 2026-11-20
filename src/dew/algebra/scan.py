@@ -285,7 +285,12 @@ def _apart(declaration: Scan, affine, tokens: int) -> int:
     """The tokens of the group a readout reads apart from (`Scan.group`, 0 where it reads after its write or
     before its token): refused where its tokens correct the state in a group past one (`Scan.reads`), a chunk
     of `tokens` cuts a group (its memory would hold its own group's earlier writes), or a group of more than
-    one token is declared beside another readout, which reads none of it (train 1004's review F3)."""
+    one token is declared beside another readout, which reads none of it (train 1004's review F3), or its
+    update decays the state along its values too (`linear_scan.Parts.across`), whose apart state no form
+    decays along them: refused here, which preparing and replaying a chunk both ask."""
+    if declaration.reads == "apart" and affine.across is not None:
+        raise Refused("a readout apart from its group's writes beside a decay along the state's values has "
+                      "no chunk form here")
     if declaration.reads != "apart":
         if declaration.group != 1:
             raise Refused(f"a group of {declaration.group} tokens under a readout {declaration.reads!r} its "
@@ -315,10 +320,7 @@ def _stepped(state, prepared: Prepared, issue=None):
                       "(`prepare(chunk, transition=True)`)")
     transfer = (None if state.transfer is None
                 else (issue or _issued)("transfer_compose", prepared.transition, state.transfer))
-    across = state.across
-    if across is not None and prepared.across is not None:
-        across = _held(across + prepared.across.astype(across.dtype))
-    return Walk(decay, leaving, transfer, across)
+    return Walk(decay, leaving, transfer, _summed(state.across, prepared.across))
 
 
 def _at_token(declaration: Scan, names: Sequence[str], affine, token: Mapping) -> tuple:
@@ -571,14 +573,22 @@ def _merged(a, b, carried, issue: Callable) -> Walk:
         h = accurate_exp(b.decay)[:, None] * entered + b.h
         transfer = None if a.transfer is None else accurate_exp(b.decay)[:, None] * a.transfer
     else:
-        h = issue("transfer_apply", b.transfer, a.h) + b.h
+        h = issue("transfer_apply", b.transfer, entered) + b.h
         transfer = (issue("transfer_decay", accurate_exp(a.decay), b.transfer) if a.transfer is None
                     else issue("transfer_compose", b.transfer, a.transfer))
-    across = None if a.across is None or b.across is None else _held(a.across + b.across)
+    across = _summed(a.across, b.across)
     if carried is None:
         return Walk(_held(a.decay + b.decay), h, transfer, across)
     return Walk(_held(a.decay + b.decay), h.astype(carried),
                 None if transfer is None else transfer.astype(carried), across)
+
+
+def _summed(a, b):
+    """Two walks' exponent sums along the state's values (`Walk.across`), None the identity's: a walk that
+    decays none composes with one that does as the zero sum."""
+    if a is None or b is None:
+        return b if a is None else a
+    return _held(a + b.astype(a.dtype))
 
 
 def _transition(prepared: Prepared, h: jax.Array) -> jax.Array:
