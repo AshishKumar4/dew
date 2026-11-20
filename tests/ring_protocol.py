@@ -390,13 +390,15 @@ def _access(kind: str, indexed: int) -> Callable:
     def access(self: _Interpreter, equation, values) -> list:
         ref = values[0]
         if isinstance(ref, Ref):
-            self.emit(kind, _slot(ref, equation.params["tree"], values[indexed:]))
+            tree = equation.params.get("tree")
+            if tree is None:
+                tree = equation.params["transforms_treedef"]
+            self.emit(kind, _slot(ref, tree, values[indexed:]))
             if kind == "read" and ref.value is not None:
                 # A known operand's read, through its transforms as JAX's state discharge reads one.
-                transforms = jax.tree_util.tree_unflatten(equation.params["tree"], values[indexed:])
+                transforms = jax.tree_util.tree_unflatten(tree, values[indexed:])
                 return [np.asarray(discharge.transform_array(jnp.asarray(ref.value), transforms))]
         return [None] * len(equation.outvars)
-
     return access
 
 

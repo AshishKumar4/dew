@@ -267,16 +267,15 @@ def test_the_correction_warpgroup_at_d256_holds_protocol_in_every_interleaving(c
     query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 320, 1, 256), jnp.bfloat16)
     spans = template.spans(256, 320, 1, **CALLS[call])
     threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key, threads=3, rare=moves)
-    assert any(event.kind == "read" and event.at[0] == "factors"
-               for thread in threads for event in thread), "correction factor load must be traced"
+    consumer_writes = {e.at[0] for e in threads[0] if e.kind == "write" and e.at[0].startswith("smem")}
+    factor_reads = [e for e in threads[1] if e.kind == "read" and e.at[0] in consumer_writes]
+    assert factor_reads, "correction factor load must be traced"
     assert explore(threads, arrivals) > 0
     # Negative control: dropping the correction warpgroup's factor_ready waits lets the factor read race
     # with the consumer's factor write.
-    correction_idx = next(i for i, thread in enumerate(threads)
-                          if any(e.kind == "read" and e.at[0] == "factors" for e in thread))
+    factor_ready = next(e.at[0] for e in threads[1] if e.kind == "wait")
     mutated = list(threads)
-    mutated[correction_idx] = [e for e in threads[correction_idx]
-                               if not (e.kind == "wait" and e.at[0] == "factor_ready")]
+    mutated[1] = [e for e in threads[1] if not (e.kind == "wait" and e.at[0] == factor_ready)]
     with pytest.raises(Violation):
         explore(mutated, arrivals)
     if call == "full" and not moves:
