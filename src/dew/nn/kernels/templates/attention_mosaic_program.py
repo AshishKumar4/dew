@@ -1769,8 +1769,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
                       natural: bool = False, params: tuple = (), width: int | None = None,
                       parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
                       per_span: int = 1, merged: bool = False, started: bool = False,
-                      dropped: bool = False, weight_parts: int = 1,
-                      scaled_products: bool = False) -> int:
+                      dropped: bool = False, weight_parts: int = 1, scaled_products: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -1849,9 +1848,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     if scaled:
         step, scaled_terms = _scaled_step(family, step, logits, weights, (block_q, value_width, jnp.float32),
                                           block_k=block_k, parts=parts, dtype=dtype, residuals=residuals)
-    elif scaled_products:
-        step.append((block_q, value_width, jnp.float32))
-    phases = [step]
+    phases = [step + ([(block_q, value_width, jnp.float32)] if scaled_products and not scaled else [])]
     if family.operands_in_registers:
         # Its weights relaid as the values' product's left operand (`MmaIssuer._left`), a copy in each warp
         # along the columns (`Family.lhs_copies`), beside the step's logits, where `_products` holds a
