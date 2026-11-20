@@ -1670,6 +1670,13 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
     return primitive(residuals, moving)
 
 
+def _unmapped(*axes) -> bool:
+    """Whether a batch rule's operands' batch axes (trees of axes, None where unbatched) map none of them."""
+    import jax
+
+    return all(axis is None for axis in jax.tree.leaves(axes, is_leaf=lambda axis: axis is None))
+
+
 def _summed_batch(cotangent):
     """A batch's cotangent (a tree, the batch its leaves' first axis) summed over the batch in each leaf's own
     type (`lax.reduce_sum`), whatever x64 scope a pullback runs in; a `float0` leaf's zeros without it."""
@@ -1728,8 +1735,9 @@ def _linear_primitive() -> type:
         pullback: Callable
         zero_cotangents: bool
         traced_tangent: bool
-        """`linear_map`'s two functions, whether its pullback takes None for a zero cotangent and whether its
-        tangent is one jvp of `apply` (`held_jvp`), `params` that `HiPrim` makes attributes."""
+        summed_first: bool
+        """`linear_map`'s two functions and its flags (`zero_cotangents`, `traced_tangent`, `summed_first`),
+        `params` that `HiPrim` makes attributes."""
 
         def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False, traced_tangent=False,
                      summed_first=False):
@@ -1786,8 +1794,7 @@ def _linear_primitive() -> type:
                 return jax.vmap(self.apply, in_axes=(residual_axes, moving_axes), **mapped)(residuals, moving)
 
             def pulled(residuals, cotangent):
-                if self.summed_first and all(axis is None for axis in jax.tree.leaves(
-                        (residual_axes, moving_axes), is_leaf=lambda axis: axis is None)):
+                if self.summed_first and _unmapped(residual_axes, moving_axes):
                     return self.pullback(residuals, _summed_batch(cotangent))
                 back = jax.vmap(self.pullback, in_axes=(residual_axes, 0), **mapped)(residuals, cotangent)
                 leaves, tree = jax.tree.flatten(back)
