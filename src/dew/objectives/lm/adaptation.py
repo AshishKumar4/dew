@@ -782,7 +782,9 @@ class InContextDecoder(nn.Module):
                                  positions=positions, right_padded=right_padded)
         hidden = self.decoder.hidden_states(tokens, train=train, decode=True, coordinates=laid, **fields)
         rows = tokens.shape[0]
-        real = jnp.ones(tokens.shape[:2], bool) if laid.valid is None else jnp.asarray(laid.valid, bool)
+        # No coordinates: every token real (`token_coordinates`).
+        valid = None if laid is None else laid.valid
+        real = jnp.ones(tokens.shape[:2], bool) if valid is None else jnp.asarray(valid, bool)
         held = (self.get_variable("cache", IN_CONTEXT) if self.has_variable("cache", IN_CONTEXT)
                 else self._opened(rows))
         chain = self._chain(rows)
