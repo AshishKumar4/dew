@@ -1295,8 +1295,10 @@ def test_a_cuda_lock_rekeys_a_gpu_lanes_files_and_no_cpu_tasks(ci, tmp_path):
     so a CUDA or site lock's change reuses every CPU row; a GPU lane's (`lane_inputs`) holds every lock, so
     the same change reruns its files on the new wheels (Main, 2026-11-20: a CUDA wheel bump ran a train's CPU
     suite cold)."""
-    written(tmp_path, {".armada.json": '{"environment": {"base": "debian", "key": ["locks/cpu.txt"]}}\n',
-                       "locks/cpu.txt": "jax==1\n", "locks/cuda12.txt": "jax-cuda12-plugin==1\n"})
+    for name, text in {".armada.json": '{"environment": {"base": "debian", "key": ["locks/cpu.txt"]}}\n',
+                       "locks/cpu.txt": "jax==1\n", "locks/cuda12.txt": "jax-cuda12-plugin==1\n"}.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
     cpu, gpu = ci.shared("3.12"), ci.lane_inputs("3.12")
     (tmp_path / "locks/cuda12.txt").write_text("jax-cuda12-plugin==2\n")
     assert ci.shared("3.12") == cpu and ci.lane_inputs("3.12") != gpu
