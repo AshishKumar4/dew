@@ -232,7 +232,8 @@ def test_a_lanes_prepare_ends_within_its_one_deadline_however_many_files_it_hold
     # its own end: the first two prepare; the third, which needs more than is left, is cut at what is left,
     # where a deadline of its own would have let it end; and the fourth, with none left, is never started.
     out = tmp_path / "verdict.json"
-    assert ci.gpu_prepared("3.12", names, out, processes=1, deadline=ci.session.GRACE + ci.SETTLE + 30.0) == 0
+    # A unit left unprepared exits the prepare 1.
+    assert ci.gpu_prepared("3.12", names, out, processes=1, deadline=ci.session.GRACE + ci.SETTLE + 30.0) == 1
     rows = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
     assert rows == {f"3.12:{name}": code for name, code in zip(names, (0, 0, 1, 1), strict=True)}
     assert sorted(path.name for path in tmp_path.glob("started-*")) == [
