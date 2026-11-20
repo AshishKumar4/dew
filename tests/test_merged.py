@@ -339,22 +339,37 @@ def _one_launch(name: str, *, slices: int, width: int) -> None:
     assert "error" not in record and record["thunks"] == ["merged_padded"], record
 
 
-def test_a_padded_merges_launch_work_counts_both_window_passes_and_span():
-    """`merged.launch_work` prices a native `merged_padded` launch from its Triton body's emitted work across
-    both dependent passes of `means._windows` (placement and summation, row 8845): one kernel, span
-    `2 * chunks` (2 for a 1-chunk 8-slice merge, 8 for a 4-chunk 32-slice merge), and device bytes covering
-    both passes' reads plus outputs written."""
+def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
+    """`merged.launch_work` prices a native `merged_padded` launch on the common one-window path (row 8845):
+    one kernel, span `3 * chunks` (1 joining pass + 2 `_windows` passes), valid unmasked device bytes
+    excluding masked tail slices and tail channels, and row-stat stores charged once per row even when a row
+    splits across multiple channel blocks."""
     target = generation.gpu_target("sm90")
     spec = SPECS["fold"]
-    one_chunk = merged.launch_work(
-        spec, jax.ShapeDtypeStruct((2, 8, 16, 8, 128), jnp.float32),
-        jax.ShapeDtypeStruct((2, 2, 8, 8, 16), jnp.float32), 4, 128, target)
-    four_chunks = merged.launch_work(
-        spec, jax.ShapeDtypeStruct((2, 32, 16, 8, 128), jnp.float32),
-        jax.ShapeDtypeStruct((2, 2, 8, 32, 16), jnp.float32), 4, 128, target)
-    assert one_chunk.kernels == 1.0 and four_chunks.kernels == 1.0
-    assert one_chunk.span == 2.0 and four_chunks.span == 8.0
-    # Each row of 128 fp32 channels + 2 fp32 stats read across both passes (2x) plus written once.
-    min_one_chunk_bytes = 2 * 4 * 8 * (2 * 8 * (128 + 2) + (128 + 2)) * 4
-    assert one_chunk.device_bytes >= min_one_chunk_bytes
-    assert four_chunks.device_bytes > 3 * one_chunk.device_bytes
+
+    def expected_bytes(batch: int, slices: int, queries: int, heads: int, width: int, block: int) -> float:
+        channels = 1 << (width - 1).bit_length()
+        blocks = channels // block
+        rows = batch * queries * heads
+        return float(rows * ((3 * slices + 1) * width * 4 + (blocks * 3 * slices + 1) * 8))
+
+    # 1-chunk (slices=8), 4-chunk (slices=32), irregular tail (slices=9, width=96), and multi-block (1 row).
+    cases = [
+        (2, 8, 16, 8, 4, 128, 1),
+        (2, 32, 16, 8, 4, 128, 4),
+        (2, 9, 16, 8, 4, 96, 2),
+        (1, 8, 8, 1, 1, 128, 1),
+    ]
+    for batch, slices, padded_q, heads, queries, width, chunks in cases:
+        padded = jax.ShapeDtypeStruct((batch, slices, padded_q, heads, width), jnp.float32)
+        stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, padded_q), jnp.float32)
+        block = merged._channel_block(spec, padded, stacked, queries, width, target)
+        work = merged.launch_work(spec, padded, stacked, queries, width, target)
+        assert work.kernels == 1.0
+        assert work.span == float(3 * chunks)
+        assert work.device_bytes == expected_bytes(batch, slices, queries, heads, width, block)
+    # The 1-row 128-wide case splits across multiple channel blocks on an H100 (row 8439), exercising the
+    # single-stat-store-per-row accounting directly.
+    small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
+    small_s = jax.ShapeDtypeStruct((2, 1, 1, 8, 8), jnp.float32)
+    assert merged._channel_block(spec, small_p, small_s, 1, 128, target) < 128

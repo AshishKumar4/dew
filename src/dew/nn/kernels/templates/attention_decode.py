@@ -294,76 +294,6 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     return work, rows, row_spans, whole
 
 
-def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
-                  hooks: Hooks | None, *, scale: float | None, interpret: bool, table: jax.Array | None,
-                  sources: jax.Array | None, scales: tuple[jax.Array, jax.Array] | None,
-                  bounds: jax.Array | None, finished: bool,
-                  in_key: bool) -> tuple[Callable[[], jax.Array | Initial], Mapping[str, Plan]]:
-    """`attend`'s step planned once (`planned`): what runs it and its walks' plans, which a step's price
-    reads beside its launches (`priced_step`)."""
-    hooks = Hooks() if hooks is None else hooks
-    if hooks.key_mod is not None and (table is not None or scales is not None):
-        raise ValueError("a paged or quantized cache holds its keys under their prologue, taken as they were "
-                         "cached: a call over its pages or codes takes no key prologue")
-    in_key = attention_mosaic.reads_in_key(in_key, key, value, hooks, table=table, scales=scales)
-    query, key, hooks = prologues_taken(query, key, hooks)
-    if not packable(hooks):
-        raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "
-                                  "hook or dropout (`packable`)")
-    heads = query.shape[2]
-    work, rows, row_spans, whole = planned(query, key, value, spans, hooks, scale=scale, table=table,
-                                           sources=sources, scales=scales, in_key=in_key)
-    initial = whole.initial
-    if work is None:
-        raise NotImplementedError(f"the template's decode derives no config on {generation.gpu_target()}")
-    launch = functools.partial(attention_mosaic.forward, scale=scale, natural=False, interpret=interpret,
-                               masked=True, table=table, sources=sources, subtracted=True, scales=scales,
-                               in_key=in_key)
-
-    def walked(walk: str) -> jax.Array | Initial:
-        # The step's walk (`WALKS`) at its own plan: scaled or unscaled as it names, else a cache call's own
-        # (`MosaicForward.cached`).
-        chosen, at = WALKS[walk], work[walk]
-        if at.slices == 1 and finished:
-            # A row's walk from the initial state, finished in the query's dtype, no merge past it (its fp32
-            # rows and their merge took 45 of B128's 820 us at 4096 keys, ET-DECODE6-h100).
-            with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
-                out = launch(rows, key, value, row_spans, whole, residuals=Kept.NONE, scaled=chosen.scaled,
-                             bounded=chosen.bounded)
-            return ungrouped_rows(out, heads)
-        stateless = dataclasses.replace(hooks, initial=None)
-        with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
-            walked_out = launch(rows, key, value, row_spans, stateless, residuals=Kept.OUTPUT,
-                                out_dtype=jnp.float32, splits=at.slices, scaled=chosen.scaled,
-                                bounded=chosen.bounded)
-        spec = _spec(rows, row_spans, stateless, scale=scale)
-        queries, width = rows.shape[1], value.shape[-1]
-        if at.slices == 1:
-            # One slice's outputs `[B, Q, KV, Dv]` and rows `[B, KV, Q]`, a slice axis of one.
-            out, maximum, total = walked_out[:3]
-            out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
-            state = algebra.merged_state(spec, out, maximum, total, initial)
-        else:
-            # The slices merged where the launch wrote them (`merged.merged_split`).
-            state = merged.merged_split(spec, walked_out[0], walked_out[1], queries=queries, width=width,
-                                        initial=initial)
-        if finished:
-            merged_rows = algebra.finish(spec, state, initial=True, normalized=True)[0]
-            return ungrouped_rows(merged_rows, heads).astype(query.dtype)
-        return _unpacked_state(algebra.resumable(spec, state), heads)
-
-
-
-    def run() -> jax.Array | Initial:
-        if "plain" in work:
-            return walked("plain")
-        largest = _largest(value, table, sources, scales) if bounds is None else _held(bounds, table, sources)
-        may = algebra.bounded_past(largest, keys_axis=-1, initial=None if initial is None else initial.acc)
-        return jax.lax.cond(may, lambda: walked("scaled"), lambda: walked("bounded"))
-
-    return run, work
-
-
 def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: int, heads: int,
                 kv_heads: int, width: int, dtype, page_size: int | None = None) -> Work | None:
     """A decode step's work as `attend` launches it on `target` (a server's choice between a dense and a paged
@@ -381,14 +311,12 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
     table = None if pages is None else jax.ShapeDtypeStruct((rows, pages), jnp.int32)
 
     def step(q, k, v, t):
-        # The step planned once, as its trace forms it (`planned` packs its rows: operands, never shapes).
-        run, _ = _planned_step(q, k, v, spans, None, scale=None, interpret=False, table=t, sources=None,
-                               scales=None, bounds=None, finished=True, in_key=False)
-        return run()
+        return attend(q, k, v, spans, None, scale=None, interpret=False, table=t, sources=None,
+                      scales=None, bounds=None, finished=True, in_key=False)
 
     with generation.assumed(target):
         traced = jax.make_jaxpr(step)(query, key, key, table)
-    # A step whose walks derive no config refuses as it traces (`_planned_step`).
+    # A step whose walks derive no config refuses as it traces (`attend`).
     kernels = (equation for equation in programs.equations(traced.jaxpr)
                if equation.primitive in programs.NATIVE_KERNELS)
     found = [emission.work_of(kernel) for kernel in kernels]
@@ -455,8 +383,62 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     maximum natural, `algebra.resumable`): another call over other keys that takes it as its initial state
     (`Hooks.initial`) merges the two (kernel-templates.md §A rows 19 and 63: a window's walk merged with a
     sparse part's)."""
-    return _planned_step(query, key, value, spans, hooks, scale=scale, interpret=interpret, table=table,
-                         sources=sources, scales=scales, bounds=bounds, finished=finished, in_key=in_key)[0]()
+    hooks = Hooks() if hooks is None else hooks
+    if hooks.key_mod is not None and (table is not None or scales is not None):
+        raise ValueError("a paged or quantized cache holds its keys under their prologue, taken as they were "
+                         "cached: a call over its pages or codes takes no key prologue")
+    in_key = attention_mosaic.reads_in_key(in_key, key, value, hooks, table=table, scales=scales)
+    query, key, hooks = prologues_taken(query, key, hooks)
+    if not packable(hooks):
+        raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "
+                                  "hook or dropout (`packable`)")
+    heads = query.shape[2]
+    work, rows, row_spans, whole = planned(query, key, value, spans, hooks, scale=scale, table=table,
+                                           sources=sources, scales=scales, in_key=in_key)
+    initial = whole.initial
+    if work is None:
+        raise NotImplementedError(f"the template's decode derives no config on {generation.gpu_target()}")
+    launch = functools.partial(attention_mosaic.forward, scale=scale, natural=False, interpret=interpret,
+                               masked=True, table=table, sources=sources, subtracted=True, scales=scales,
+                               in_key=in_key)
+
+    def walked(walk: str) -> jax.Array | Initial:
+        # The step's walk (`WALKS`) at its own plan: scaled or unscaled as it names, else a cache call's own
+        # (`MosaicForward.cached`).
+        chosen, at = WALKS[walk], work[walk]
+        if at.slices == 1 and finished:
+            # A row's walk from the initial state, finished in the query's dtype, no merge past it (its fp32
+            # rows and their merge took 45 of B128's 820 us at 4096 keys, ET-DECODE6-h100).
+            with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
+                out = launch(rows, key, value, row_spans, whole, residuals=Kept.NONE, scaled=chosen.scaled,
+                             bounded=chosen.bounded)
+            return ungrouped_rows(out, heads)
+        stateless = dataclasses.replace(hooks, initial=None)
+        with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
+            walked_out = launch(rows, key, value, row_spans, stateless, residuals=Kept.OUTPUT,
+                                out_dtype=jnp.float32, splits=at.slices, scaled=chosen.scaled,
+                                bounded=chosen.bounded)
+        spec = _spec(rows, row_spans, stateless, scale=scale)
+        queries, width = rows.shape[1], value.shape[-1]
+        if at.slices == 1:
+            # One slice's outputs `[B, Q, KV, Dv]` and rows `[B, KV, Q]`, a slice axis of one.
+            out, maximum, total = walked_out[:3]
+            out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
+            state = algebra.merged_state(spec, out, maximum, total, initial)
+        else:
+            # The slices merged where the launch wrote them (`merged.merged_split`).
+            state = merged.merged_split(spec, walked_out[0], walked_out[1], queries=queries, width=width,
+                                        initial=initial)
+        if finished:
+            merged_rows = algebra.finish(spec, state, initial=True, normalized=True)[0]
+            return ungrouped_rows(merged_rows, heads).astype(query.dtype)
+        return _unpacked_state(algebra.resumable(spec, state), heads)
+
+    if "plain" in work:
+        return walked("plain")
+    largest = _largest(value, table, sources, scales) if bounds is None else _held(bounds, table, sources)
+    may = algebra.bounded_past(largest, keys_axis=-1, initial=None if initial is None else initial.acc)
+    return jax.lax.cond(may, lambda: walked("scaled"), lambda: walked("bounded"))
 
 
 def _unpacked_state(state: algebra.Partial, heads: int) -> Initial:

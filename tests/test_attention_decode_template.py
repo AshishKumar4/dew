@@ -1047,9 +1047,9 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     key = jax.ShapeDtypeStruct((1, 8192, 2, 128), jnp.bfloat16)
     spans = template.spans(1, 8192, 1, causal=False)
     with generation.assumed(target):
-        traced = jax.make_jaxpr(lambda q, k, v: attention_decode._planned_step(
+        traced = jax.make_jaxpr(lambda q, k, v: attention_decode.attend(
             q, k, v, spans, None, scale=None, interpret=False, table=None, sources=None,
-            scales=None, bounds=None, finished=True, in_key=False)[0]())(query, key, key)
+            scales=None, bounds=None, finished=True, in_key=False))(query, key, key)
     (merge_eq,) = [eq for eq in programs.equations(traced.jaxpr) if eq.primitive is merged.merged_padded_p]
     merge_work = merged.launch_work(
         merge_eq.params["spec"],
@@ -1059,6 +1059,6 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     walk_launches = [w for eq in programs.equations(traced.jaxpr)
                      if eq.primitive in programs.NATIVE_KERNELS
                      and (w := emission.work_of(eq)) is not None]
-    assert merge_work.span >= 2.0 and merge_work.device_bytes > 0
+    assert merge_work.span >= 3.0 and merge_work.device_bytes > 0
     assert priced.span == sum(w.span for w in walk_launches) + merge_work.span
     assert priced.device_bytes == sum(w.device_bytes for w in walk_launches) + merge_work.device_bytes
