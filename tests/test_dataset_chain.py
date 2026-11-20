@@ -1766,6 +1766,13 @@ def test_a_token_holdouts_spans_are_resolved_by_one_scan_of_its_order():
     assert held and all(mapped[start] == 1 for start in held), (mapped, read)
 
 
+def drop_lasts_of_threes(row: dict) -> dict:
+    """Drop the last row of every three, so no share of the rows read rejects more than a third."""
+    from dew.data import Rejected
+
+    return Rejected("third") if row["i"] % 3 == 2 else row
+
+
 @pytest.mark.parametrize("read", ["memory", "streamed"])
 def test_a_reads_rejection_warning_is_its_loadings_warn_over(read, caplog):
     """A read warns of a corpus that rejects more of its records than its loading's `warn_over` (1% by
@@ -1774,7 +1781,7 @@ def test_a_reads_rejection_warning_is_its_loadings_warn_over(read, caplog):
     def warned(warn_over: float) -> bool:
         caplog.clear()
         loading = dataclasses.replace(READ, warn_over=warn_over)
-        chain = Memory(rows("a", 30)).named("sample").filter_map(drop_thirds).repeat().batch(2)
+        chain = Memory(rows("a", 30)).named("sample").filter_map(drop_lasts_of_threes).repeat().batch(2)
         stream = compile(chain, read=read, loading=loading).train(DataPartition())
         try:
             for _ in range(8):
