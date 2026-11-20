@@ -417,3 +417,20 @@ def test_a_saved_fp32_gradient_under_the_highest_precision_runs_the_numbers_its_
     with generation.assumed("sm90"), jax.default_matmul_precision("highest"):
         lowered = lowered_for(lambda arrays: ruled(saved, arrays), (abstract,), "sm90")
     assert any(call.name.startswith("recurrence_values_back") for call in kernel_calls(lowered, unrun=True))
+
+
+def test_mosaic_held_prices_backward_launches_when_reverse_is_true():
+    """`Mosaic.held(ba, config, reverse=True)` checks every launch `launches(..., backward=True)` compiles
+    against its own consumer register budget, while `reverse=False` checks `_forwards` alone (row 6740)."""
+    hooks = case_hooks("one sequence")
+    (sample,) = draw(jnp.bfloat16, 0, **geometry("one sequence"))
+    ba = template_call(sample, hooks)
+    target = generation.gpu_target("sm100")
+    family = bundles.of("sm100", jnp.bfloat16)
+    with generation.assumed(target):
+        tiles = template.MOSAIC.derived(ba, target)
+        assert tiles is not None
+        assert template.MOSAIC.held(ba, tiles, reverse=False) == template.MOSAIC._launches_hold(
+            template.MOSAIC._forwards(ba, tiles, target), family)
+        assert template.MOSAIC.held(ba, tiles, reverse=True) == template.MOSAIC._launches_hold(
+            template.MOSAIC.launches(ba, tiles, target, backward=True), family)
