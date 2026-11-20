@@ -30,6 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from contract_support import (
+    FORKED,
     REVERSE_ONLY,
     assert_contract,
     cancelling_entries,
@@ -351,14 +352,6 @@ DOCUMENTS = ((0, 70, 100), (0, 40, 150))
 """Each row's documents' first steps, over rows of 190 steps: a document that ends inside a chunk, one
 shorter than a chunk, and one longer than two."""
 
-FORKED = (((1, 2, 2), (1, 0, 0)), ((1, 2, 3), (1, 2, 0)))
-"""Each row's documents' table slots and stored slots (`recurrence_chunk.Chunk.loads`, `Chunk.stores`), one
-given memory a row then two stored: the first row's start continued by its first document, whose final both
-later ones enter; the second row a chain from its start, each document entering its predecessor's final.
-Every memory is entered, so no gradient's row is float64 zero, whose terms the gate would trace each
-draw."""
-
-
 ADDS = ((0, 0, 1), (0, 0, 2))
 """Each row's documents' added slots (`Chunk.adds`): the first row's last document adding its row's given
 memory to its parent's final, the second row's the first document's final to its predecessor's (row
@@ -462,8 +455,8 @@ def levels_documents_draw(seed: int):
     state's first key read by a unit reader, so its output, last state and entry writes' gradients are each
     a sum float32 holds exactly or rounds once, as float64's is."""
     (x, b, c, a, given, key, value, _), (out, last) = documents_draw(seed)
-    rows, documents, _, heads, width = value.shape
-    entries = cancelling_entries(seed, rows, documents, heads, key.shape[-1], heads, width)
+    *_, heads, width = value.shape
+    entries = cancelling_entries(seed, heads, key.shape[-1], heads, width)
     reader = jnp.zeros_like(c).at[..., 0].set(1.0)
     operands = (jnp.zeros_like(x), jnp.zeros_like(b), reader, jnp.zeros_like(a), jnp.zeros_like(given),
                 *(jnp.asarray(part) for part in (entries.key, entries.value, entries.weight)))
