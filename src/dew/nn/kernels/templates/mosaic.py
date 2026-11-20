@@ -214,27 +214,20 @@ runs): the role's own share of what the program holds a role each (`Issuer.produ
 
 
 def per_role(index: int | jax.Array, roles: int, run: Callable[[int, int | jax.Array], None]) -> None:
-    """`run(role, index)` for the role `index` names among `roles`, each role's built at its own static
-    index (`ROLE` while it is built): Mosaic GPU slices a swizzled tile only at static columns (a role's
-    share of a block's, shared keys at width 256: offsets from the traced index spilled 20 bytes, a static
-    role's none). A static `index` (a schedule's branch of its own, `handoffs.Schedule.run`'s `static`)
-    builds its own role alone."""
-    if isinstance(index, int):
-        token = ROLE.set(index)
+    """`run(role, index)` for the role `index` names among `roles` (a static one alone), each built at its
+    static index (`ROLE`): Mosaic GPU slices swizzled tiles at static columns (traced, 20 bytes spilled)."""
+    def built(role):
+        token = ROLE.set(role)
         try:
-            run(index, index)
+            run(role, index)
         finally:
             ROLE.reset(token)
+
+    if isinstance(index, int):
+        built(index)
         return
     for role in range(roles):
-        def built(role=role):
-            token = ROLE.set(role)
-            try:
-                run(role, index)
-            finally:
-                ROLE.reset(token)
-
-        pl.when(index == role)(built)
+        pl.when(index == role)(functools.partial(built, role))
 
 
 def rotated(turned: Callable, lo, hi, first, stages: int) -> tuple:
@@ -1632,12 +1625,10 @@ class Transport[Allocated, Opened](abc.ABC):
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
                   exclusive: bool = False, static_consumers: bool = False, issuer: Callable | None = None,
                   joined: tuple = ()):
-        """The family's roles run (`role_schedule`, its producer lowered to `floor`): `consumer(index)`,
-        `producer()`, `issuer()` where it issues on a role (`Issuer.places_on_role`) and each `joined`
-        role's body at its index, `(role, count, body)` (a correction warpgroup's, a launch's reducing warps':
-        `(handoffs.REDUCER, consumers, reduce)`), each a branch of one switch where `exclusive`;
-        `static_consumers` gives each compute warpgroup its own branch with a static index. The consumers'
-        value."""
+        """The family's roles run (`role_schedule`, its producer at `floor`): `consumer(index)`, `producer()`,
+        `issuer()` where it issues on a role (`Issuer.places_on_role`), each `joined` role's body at its index
+        (`(role, count, body)`: a correction warpgroup's, a launch's reducing warps'), a switch's branches
+        where `exclusive`, a consumer's at a static index where `static_consumers`; the consumers' value."""
         schedule = self.role_schedule(consumers, floor, tuple((role, count) for role, count, _ in joined))
         # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
         units = {"producer": producer, "issuer": issuer}
