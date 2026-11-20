@@ -142,20 +142,20 @@ class Work:
     operands and results in (`dew.algebra.cost.work`'s: a leaf's read once, a reduction's and a product's
     result written once and read once): a TPU's VMEM, at its rate (`GpuTarget.vmem_rate`); a GPU's on-chip
     copies, which no rate prices (`rates`)."""
+    integer_operations: float = 0.0
+    """32-bit integer operations a CUDA multiprocessor's ALU issues (add, shift, logic, comparison), beside
+    its fp32 lanes at its own rate (`Architecture.integer_per_clock`)."""
     chains: tuple[Chain, ...] = ()
 
     def __add__(self, other: "Work") -> "Work":
         # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
         # which the term that chains them states (`dew.algebra.linear_scan`).
-        return Work(self.flops + other.flops, self.operations + other.operations,
-                    self.exponentials + other.exponentials, self.conversions + other.conversions,
-                    self.device_bytes + other.device_bytes, self.shared_bytes + other.shared_bytes,
-                    self.tf32_flops + other.tf32_flops, max(self.span, other.span),
-                    self.fp8_flops + other.fp8_flops, self.kernels + other.kernels,
-                    self.kept_bytes + other.kept_bytes,
-                    # Each path no other outlasts, the side with none's kept as the other's.
-                    _kept(self.chains + other.chains) if self.chains and other.chains
-                    else self.chains or other.chains)
+        summed = {field.name: getattr(self, field.name) + getattr(other, field.name)
+                  for field in dataclasses.fields(Work) if field.name not in ("span", "chains")}
+        # Each path no other outlasts, the side with none's kept as the other's.
+        chains = (_kept(self.chains + other.chains) if self.chains and other.chains
+                  else self.chains or other.chains)
+        return Work(**summed, span=max(self.span, other.span), chains=chains)
 
 
 @functools.cache
@@ -163,15 +163,15 @@ def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, 
     """`target`'s rate of each unit `units` prices, per second: the tensor cores' 16-bit, TF32 and FP8 modes
     (FP8's the 16-bit one's where the generation states none, its codes unpacked into 16-bit products), the
     vector units (the CUDA cores, a TPU's VPU), the special-function units, shared memory, the on-chip memory
-    XLA's fusion keeps its kernels' operands and results in (`Work.kept_bytes`) and device memory. Each is a
-    multiprocessor's at the clock the target holds under a step's tensor-core load
-    (`GpuTarget.loaded_clock_hz`: a B200's measured 1.549 GHz, not its 1.965 GHz boost), or with `device`
-    the whole device's (its multiprocessors at that clock, the tensor cores at its datasheet's dense peak
-    where it states no clock), where a tile walk's device bytes and XLA's fusion's staged bytes cost nothing
-    (infinite). What XLA's fusion keeps on chip is a TPU's VMEM traffic, with `device` at its VMEM rate
-    (`GpuTarget.vmem_rate`), and nothing a GPU's or a tile walk's (infinite). None for a unit the target
-    states no rate of (a TPU's vector and transcendental units, an unmeasured TPU's VMEM, a datasheet's
-    missing clock)."""
+    XLA's fusion keeps its kernels' operands and results in (`Work.kept_bytes`), the integer units (a CUDA
+    multiprocessor's ALU, `Architecture.integer_per_clock`) and device memory. Each is a multiprocessor's at
+    the clock the target holds under a step's tensor-core load (`GpuTarget.loaded_clock_hz`: a B200's
+    measured 1.549 GHz, not its 1.965 GHz boost), or with `device` the whole device's (its multiprocessors at
+    that clock, the tensor cores at its datasheet's dense peak where it states no clock), where a tile walk's
+    device bytes and XLA's fusion's staged bytes cost nothing (infinite). What XLA's fusion keeps on chip is a
+    TPU's VMEM traffic, with `device` at its VMEM rate (`GpuTarget.vmem_rate`), and nothing a GPU's or a tile
+    walk's (infinite). None for a unit the target states no rate of (a TPU's vector and transcendental units,
+    an unmeasured TPU's VMEM, a datasheet's missing clock, an integer rate unread)."""
     clock = target.loaded_clock_hz
     if not device:
         each = clock
@@ -191,20 +191,21 @@ def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, 
     return (tensor, rate(target.tensor_rate("tf32")), eight, rate(architecture.vector_per_clock),
             rate(architecture.exponentials_per_clock),
             math.inf if device else rate(None if held is None else held.shared_bytes_per_clock), kept,
-            target.memory_rate if device else math.inf)
+            rate(architecture.integer_per_clock), target.memory_rate if device else math.inf)
 
 
 def units(work: Work, at: tuple[float | None, ...]) -> tuple[list[float], tuple[float, ...]]:
     """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit, TF32 and
     FP8 modes in turn), the CUDA cores (operations and conversions), the special-function units, on-chip
     memory (shared memory's bytes, then what XLA's fusion keeps there, one memory's two levels, so a TPU's
-    one VMEM is one unit) and device memory; and, level by level, the work at a rate the target states none
+    one VMEM is one unit), device memory and the integer units; and, level by level, the work at a rate the
+    target states none
     of, which no time prices (0 where one does)."""
-    tensor, tf32, eight, cuda, special, shared, kept, device = at
+    tensor, tf32, eight, cuda, special, shared, kept, integer, device = at
     grouped = (((work.flops, tensor), (work.tf32_flops, tf32), (work.fp8_flops, eight)),
                ((work.operations + work.conversions, cuda),),
                ((work.exponentials, special),), ((work.shared_bytes, shared), (work.kept_bytes, kept)),
-               ((work.device_bytes, device),))
+               ((work.device_bytes, device),), ((work.integer_operations, integer),))
     priced = [sum(amount / per_second for amount, per_second in unit if amount and per_second is not None)
               for unit in grouped]
     unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped for amount, per_second in unit)

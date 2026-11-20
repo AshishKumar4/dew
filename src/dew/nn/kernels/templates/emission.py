@@ -472,7 +472,7 @@ class _Counting:
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
         if primitive in _OPERATIONS:
-            self.add(Work(operations=sum(_elements(v.aval) for v in equation.outvars)))
+            self.add(_operated(equation))
         elif primitive in _REDUCTIONS:
             self.add(Work(operations=_elements(equation.invars[0].aval)))
         elif primitive in SPECIAL_FUNCTIONS:
@@ -684,6 +684,17 @@ _REGIONS = {pallas.run_scoped_p: _Counting.scoped, lax.while_p: _Counting.loop, 
             mpmd.mpmd_map_p: _Counting.warps}
 """The regions a kernel's body counts within it, each by its method: its outputs' concrete values, or none
 where it leaves them unknown."""
+
+
+def _operated(equation) -> Work:
+    """An elementwise operation's work, one an output element: on the integer units where its operands are
+    integers or predicates (logic, shifts, integer arithmetic and comparisons: the ALU's LOP3, SHF, IADD3,
+    ISETP and PLOP3, `Work.integer_operations`), else on the fp32 lanes. Its last operand's type is its
+    operands' (a select's arms', its predicate first)."""
+    count = sum(_elements(variable.aval) for variable in equation.outvars)
+    dtype = jnp.dtype(equation.invars[-1].aval.dtype)
+    integral = jnp.issubdtype(dtype, jnp.integer) or dtype == jnp.bool_
+    return Work(integer_operations=count) if integral else Work(operations=count)
 
 
 def _then(first: Work, then: Work) -> Work:

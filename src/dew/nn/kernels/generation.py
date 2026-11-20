@@ -335,7 +335,9 @@ class Architecture:
     fp32 operations its vector units do a clock (`vector_per_clock`: a CUDA multiprocessor's fp32 lanes'
     FLOPs, two a lane for its fused multiply-add, which a dot at Precision.HIGHEST takes there too; a TPU's
     VPU's) and the exponentials its special-function units return a clock (`exponentials_per_clock`: a CUDA
-    multiprocessor's, a TPU's transcendental unit's), Blackwell's tensor memory columns (PTX ISA,
+    multiprocessor's, a TPU's transcendental unit's), the 32-bit integer operations its ALU returns a clock
+    (`integer_per_clock`: add, shift, logic and comparison, CUDA C++ Programming Guide 12.6 §5.4.1 Table 4,
+    64 on sm80 to sm90; None where unread), Blackwell's tensor memory columns (PTX ISA,
     tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and the VMEM a kernel may raise its
     limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block into shared memory by TMA, which
     it picks from compute capability 9.0 on (its `emit_pipeline` and `copy_gmem_to_smem`), where below it they
@@ -348,6 +350,7 @@ class Architecture:
     multiprocessor: Multiprocessor | None = Multiprocessor()
     vector_per_clock: float | None = None
     exponentials_per_clock: float | None = None
+    integer_per_clock: float | None = None
     tma: bool = False
     dependent_launch: bool = False
     tmem_columns: int | None = None
@@ -411,13 +414,14 @@ capability from 7.5 to 12.x alike (the CUDA C++ Best Practices Guide 13's §12.1
 row, where CUDA 13 moved the throughput table; 15.97 measured on an H200, the kernel challenge's MUFU.EX2)."""
 _AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024},
                        Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None),
-                       vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS)
+                       vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS, integer_per_clock=64)
 _AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512},
                                 Multiprocessor(register_raises=None),
-                                vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS)
+                                vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,
+                                integer_per_clock=64)
 _ADA = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048},
                     Multiprocessor(resident_blocks=24, register_raises=None),
-                    vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS)
+                    vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS, integer_per_clock=64)
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
 _TURING = Architecture((), {'16bit': 1024}, Multiprocessor(resident_threads=1024, register_raises=None),
                        vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS)
@@ -425,7 +429,8 @@ _TURING = Architecture((), {'16bit': 1024}, Multiprocessor(resident_threads=1024
 # pair CUTLASS's grouped GEMM and cuBLASLt take on an H100).
 _HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192},
                        Multiprocessor(resident_threads=2048, resident_blocks=32),
-                       vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS, tma=True,
+                       vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,
+                       integer_per_clock=64, tma=True,
                        dependent_launch=True, cluster=2)
 # Blackwell's tcgen05 family: tcgen05 (sm_100a) and mma.sync, no wgmma; tensor memory, a pair's 2-CTA
 # products and multicast, block-scaled operands (PTX ISA, tcgen05.mma's kind::mxf8f6f4 and mxf4nvf4).
