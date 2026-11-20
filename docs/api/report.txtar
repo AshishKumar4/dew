@@ -621,7 +621,7 @@ dew.config.trainer.TrainerConfig
   precision: Annotated[Numerics, _numerics_argument()] = dew.nn.precision.Numerics()
   mesh: MeshSpec = dew.distributed.placement.MeshSpec()
   microbatches: int | None = None
-  layout: Layout = dew.distributed.placement.Layout()
+  layout: Annotated[Layout, tyro.conf.subcommand('layout')] | None = None
   profile: ProfileWindow | None = None
   run_profile: RunProfile | None = dew.training.profiling.RunProfile()
   compilation_cache_dir: str | None = None
