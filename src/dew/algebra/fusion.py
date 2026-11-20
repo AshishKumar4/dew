@@ -132,8 +132,12 @@ def _taken(index: Index, found: Region, decided: Callable[[Region], RegionDecisi
             if decision.taken:
                 return region
             fewer += _fewer(index, region, decision)
-        level = [region for region in fewer if (region.places, region.prologue) not in seen]
-        seen.update((region.places, region.prologue) for region in level)
+        # One region each, a product alone reached without its prologue and without its epilogue alike.
+        level = []
+        for region in fewer:
+            if (region.places, region.prologue) not in seen:
+                seen.add((region.places, region.prologue))
+                level.append(region)
     return None
 
 
