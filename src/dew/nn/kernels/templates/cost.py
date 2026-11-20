@@ -41,10 +41,13 @@ class Stated:
     (`emission.costed`): the steps of its walks, every consumer's over the call's batch and heads (`steps`,
     attention's `walked_steps`, the recurrence's `launch_kernel`'s: a laid call's mean chunks a sequence over
     its sequences), the trips its data decides, which the count multiplies a step's work by; and the bytes it
-    reads and writes, each of its operands and outputs once (`bytes_accessed`, `estimate`'s)."""
+    reads and writes, each of its operands and outputs once (`bytes_accessed`, `estimate`'s); and the most
+    steps one of its programs walks (`longest`, its critical path) where its programs walk unequal shares (a
+    causal walk's tiles), None where each walks their mean."""
 
     steps: float
     bytes_accessed: int
+    longest: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
