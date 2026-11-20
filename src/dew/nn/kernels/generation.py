@@ -1771,7 +1771,7 @@ def _linear_primitive() -> type:
                 # before the sum, and two that cancel overflowed to NaN (base review 279405f7f F1).
                 if all(axis is None for axis in jax.tree.leaves((residual_axes, moving_axes),
                                                                 is_leaf=lambda axis: axis is None)):
-                    return self.pullback(residuals, jax.tree.map(lambda leaf: leaf.sum(0), cotangent))
+                    return self.pullback(residuals, jax.tree.map(unbatched, cotangent))
                 back = jax.vmap(self.pullback, in_axes=(residual_axes, 0), **mapped)(residuals, cotangent)
                 leaves, tree = jax.tree.flatten(back)
                 axes = jax.tree.leaves(moving_axes, is_leaf=lambda axis: axis is None)
