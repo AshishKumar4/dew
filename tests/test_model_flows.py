@@ -201,15 +201,17 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     """A GPU part's prepare as its node's CPU runs it (`DEW_TIER_PREPARE=1`): a flow prepared in a process
     of its own (`model_flows.prepared_apart`) over the node's serialized topology (here a compile-only
     A100's, serialized as a host serializes its own), its Dew and reference programs compiled for that GPU
-    and its truths' programs compiled into the tier's store, and what it took reported."""
+    and its truths' programs compiled into the tier's store, and what it took reported. The dense fp32
+    decoder's flow, the cheapest of two kinds to prepare (armada: 77 s against the selective scan's 152,
+    whose prepare held this test at 117 s on CI past the 120 s group target, row 9709)."""
 
 
     topology = node_topology(store / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.TRUTHS, str(store / "tier"))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
-    monkeypatch.setenv(tier_wire.UNIT, "a selective scan's unit")
-    flow = model_flows.flow_named("selective scan")
+    monkeypatch.setenv(tier_wire.UNIT, "a dense decoder's unit")
+    flow = model_flows.flow_named("dense fp32")
     took = model_flows.prepared_apart(flow)
     store = model_flows.store_of(flow)
     assert took is not None and took["written_bytes"] > 0 and took["seconds"] > 0
@@ -220,7 +222,7 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     [needs] = (store.parent / "needs").iterdir()
     filed = json.loads(needs.read_text())
     stated = json.loads((store / model_flows.NEED).read_text())["programs"]
-    assert (filed["unit"], filed["programs"]) == ("a selective scan's unit", stated)
+    assert (filed["unit"], filed["programs"]) == ("a dense decoder's unit", stated)
 
 
 def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monkeypatch):
