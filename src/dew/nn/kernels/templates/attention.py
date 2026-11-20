@@ -1301,10 +1301,19 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
     total = total0 * carried + jnp.sum(p, axis=-1)
 
-    def valued(weights: jax.Array) -> jax.Array:
-        # The weights narrowed to the values' dtype times the values, a query group's over its key head.
-        grouped = weights.astype(value.dtype).reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
-        return float32_einsum("bhgqk,bkhd->bhgqd", grouped, value, precision=REFERENCE_PRECISION,
+    def valued(weights: jax.Array, *, cotangent_wide: bool = False) -> jax.Array:
+        # The weights narrowed to the values' dtype times the values, a query group's over its key head. With
+        # `cotangent_wide` the narrowing straight through in fp32, the values widened, so each product is the
+        # narrowed weight's, exact, and the weights' cotangent dO·Vᵀ fp32: an fp16 dropping call's reached
+        # 8 x 2^15 before the small weight that takes it finite, inf in fp16 (row 9506's gradients).
+        grouped = weights.reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
+        if cotangent_wide:
+            rounded = grouped.astype(value.dtype).astype(grouped.dtype)
+            grouped = grouped + jax.lax.stop_gradient(rounded - grouped)
+            operand = value.astype(grouped.dtype)
+        else:
+            grouped, operand = grouped.astype(value.dtype), value
+        return float32_einsum("bhgqk,bkhd->bhgqd", grouped, operand, precision=REFERENCE_PRECISION,
                               preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
 
     drop = hooks.drop
@@ -1331,7 +1340,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 
         drawn = jax.vmap(jax.vmap(multiplier, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch),
                                                                                     jnp.arange(heads))
-        normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn)
+        normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn,
+                                                                   cotangent_wide=value.dtype == jnp.float16)
 
     out = output_hooked(normalized, hooks.output_mod, hooks.output_params)
     out = jnp.swapaxes(out.astype(query.dtype), 1, 2)
