@@ -274,6 +274,15 @@ def test_the_run_length_is_steps_or_epochs():
         TrainerConfig().total_steps(sized)
 
 
+def test_a_setting_of_an_unset_layout_sets_it_from_its_defaults():
+    """A run whose trainer states no layout (`TrainerConfig.layout` unset) takes a setting of one of its
+    fields (`--set trainer.layout.min_shard=8`, `RunConfig.assigned`) over `Layout()`'s defaults, as the
+    `--trainer.layout.*` flags do (row 9635: refused, naming no field of the run record)."""
+    config = RunConfig(data=images_of("tfds://oxford_flowers102", 32))
+    assert config.trainer.layout is None
+    assert config.assigned(["trainer.layout.min_shard=8"]).trainer.layout == Layout(min_shard=8)
+
+
 def test_the_cli_parses_the_mesh_the_layout_and_a_setting_of_the_chain():
     config = RunConfig.cli([
         "--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
