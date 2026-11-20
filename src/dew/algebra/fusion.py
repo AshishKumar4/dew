@@ -511,17 +511,48 @@ def _xla_whatever_its_prologue(launch) -> bool:
     return launch is not None and launch.kernel == "xla" and launch.forced == "xla"
 
 
-class _Trace(NamedTuple):
-    """A region's written program (`_traced`): its one equation, the inputs it reads them by, the routes and
-    launches (each its op and keyed arguments, and the config it took, `tuning.Seen.held`) its trace
-    reported, which each program it is written into reports, and the facts its trace read
-    (`generation.recording`), which each program it is written into reads again (`generation.replay`)."""
+class Recorded(NamedTuple):
+    """What a trace of Dew's reported as it ran (`recorded`): the routes it took, the launches it made (each
+    its op and keyed arguments, and the config it took, `tuning.Seen.held`) and the facts it read
+    (`generation.recording`). A program written from that trace again, never traced again, reports them
+    again (`replay`), so a recording around the program that writes it holds them as one around the trace
+    did (row 6708), and is reused only while each fact answers alike (`still`)."""
 
-    equation: jcore.JaxprEqn
-    invars: tuple[jcore.Var, ...]
     routes: tuple
     launches: tuning.Seen
     reads: dict
+
+    def still(self) -> bool:
+        """Whether each fact the trace read answers alike now (`generation.still`)."""
+        return generation.still(self.reads)
+
+    def replay(self) -> None:
+        """The trace's routes and launches reported, and its facts read, where its program is written."""
+        from dew.nn.kernels.tuning import noted
+
+        generation.reported(self.routes)
+        noted(self.launches)
+        generation.replay(self.reads)
+
+
+def recorded[Made](make: Callable[[], Made]) -> tuple[Made, Recorded]:
+    """`make()`, a trace of Dew's, and what it reported (`Recorded`): the one record-and-replay of a held
+    trace, a region's (`_traced`) and a nested body's (`dew.algebra.program._closed`)."""
+    # Imported where used: tuning imports the algebra's terms, which this module's package imports.
+    from dew.nn.kernels.tuning import seen as launched
+
+    with (generation.routes(alone=True) as routes, launched() as seen, generation.recording() as reads):
+        made = make()
+    return made, Recorded(tuple(routes), seen.held(), reads)
+
+
+class _Trace(NamedTuple):
+    """A region's written program (`_traced`): its one equation, the inputs it reads them by, and what its
+    trace reported (`Recorded`)."""
+
+    equation: jcore.JaxprEqn
+    invars: tuple[jcore.Var, ...]
+    record: Recorded
 
 
 _traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
@@ -534,20 +565,14 @@ def _traced(region: Written) -> _Trace:
     launches reported where it is written, as its trace reported them (`generation.reported`,
     `tuning.noted`), and the facts it read read again there (`generation.replay`), so a recording around the
     program that writes it holds them as one around its trace did (row 6708)."""
-    from dew.nn.kernels import tuning
-
     def traced_once() -> _Trace:
-        with (generation.routes(alone=True) as routes, tuning.seen() as seen,
-              generation.recording() as reads):
-            traced = jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs))
+        traced, record = recorded(lambda: jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs)))
         (equation,) = traced.jaxpr.eqns
-        return _Trace(equation, tuple(traced.jaxpr.invars), tuple(routes), seen.held(), reads)
+        return _Trace(equation, tuple(traced.jaxpr.invars), record)
 
     held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD,
-                          still=lambda trace: generation.still(trace.reads))
-    generation.reported(held.routes)
-    tuning.noted(held.launches)
-    generation.replay(held.reads)
+                          still=lambda trace: trace.record.still())
+    held.record.replay()
     return held
 
 
