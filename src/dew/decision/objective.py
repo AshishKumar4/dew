@@ -756,13 +756,22 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         logits = passes[-1]
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         metrics: dict[str, jax.Array | Ratio] = {"accuracy": self.accuracy(correct, batch, scored)}
-        if self.exit_entropy is None or len(passes) == 1:
+        if self.exit_entropy is None:
             charge = self._weighed(charges)
         else:
-            # Each question's hazards where its head reads its answer (`Head.answered`), in the row's tokens.
-            at = self.model.head.answered(inputs)[..., None]
-            hazards = [jnp.take_along_axis(gate, at, axis=1) for gate in gates]
-            charge, expected, entropy = exit_objective(charges, hazards, self.exit_entropy, charges[-1].dtype)
+            if len(passes) == 1:
+                # One pass exits surely: its label loss is the expectation, its exit distribution's entropy
+                # none, reported as every count's step reports them, so a sampled count's steps hold one
+                # tree (row 9691: a step of 1 pass held no exit_ce or exit_entropy).
+                charge = expected = self._weighed(charges)
+                entropy = jnp.zeros_like(expected)
+            else:
+                # Each question's hazards where its head reads its answer (`Head.answered`), in the row's
+                # tokens.
+                at = self.model.head.answered(inputs)[..., None]
+                hazards = [jnp.take_along_axis(gate, at, axis=1) for gate in gates]
+                charge, expected, entropy = exit_objective(charges, hazards, self.exit_entropy,
+                                                           charges[-1].dtype)
             counted = self.row_mean(scored, batch).total
             metrics["exit_ce"] = Ratio(self.row_mean(expected * scored, batch).total, counted)
             metrics["exit_entropy"] = Ratio(self.row_mean(entropy * scored, batch).total, counted)
