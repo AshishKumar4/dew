@@ -529,3 +529,14 @@ def test_a_warpgroup_waits_on_a_copy_its_barrier_lands_or_on_another_warpgroups_
         (cost.Chain(copies=1, copy_bytes=512),),)
     assert _waits(handed, plgpu.Barrier()) == ((cost.Chain(barriers=1),),)
 
+
+def test_an_integer_operation_counts_on_the_integer_units_not_the_fp32_lanes():
+    """A row's integer XOR, shift, add and comparison each count one integer operation an element
+    (`Work.integer_operations`: the ALU's LOP3, SHF, IADD3 and ISETP, issued every 2 cycles a sub-partition,
+    half the fp32 lanes' rate) and none of the fp32 lanes (row 5386)."""
+    row = jax.ShapeDtypeStruct((1, 128), jnp.int32)
+    operations = (lambda x: x ^ 7, lambda x: x >> 3, lambda x: x + 1, lambda x: (x < 5).astype(jnp.int32))
+    for operation in operations:
+        role = _emitted(operation, row).roles[0]
+        assert (role.fixed.integer_operations, role.fixed.operations) == (128, 0), role.fixed
+

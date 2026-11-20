@@ -1220,6 +1220,20 @@ def test_the_exact_extractor_reads_a_walks_longest_path_as_the_greedy_price_does
     assert schedule.spanned(waits) > schedule.spanned(reductions)
 
 
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_integer_operations_take_the_integer_units_rate(generation_name):
+    """An integer operation runs on a multiprocessor's ALU at 64 results a clock on sm80 and sm90 (CUDA C++
+    Programming Guide 12.6, §5.4.1 Table 4: 32-bit integer add, shift, logic, compare), beside the fp32 lanes,
+    not on them: a walk of integer work alone costs its count over that rate, and fp32 work beside it no more
+    (row 5386)."""
+    target = generation.gpu_target(generation_name)
+    integers = kernel_cost.Work(integer_operations=64.0 * 10_000)
+    alone = kernel_cost.walked(integers, target)
+    assert_computes_the_oracle(np.float64(alone), np.float64(10_000 / target.loaded_clock_hz),
+                               "integer work's seconds", roundings=4)
+    assert kernel_cost.walked(integers + kernel_cost.Work(operations=128.0), target) == alone
+
+
 def test_a_protected_span_is_kept_as_traced_however_often_the_pass_runs():
     """A protected span (`dew.nn.derivatives.Protected`: an error-free transform's) is a boundary no region
     crosses and whose inside no rule touches (docs/design/algebra.md §1.2): two sums the pass rewrites
