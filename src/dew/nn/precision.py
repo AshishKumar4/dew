@@ -1394,7 +1394,10 @@ def rounding_alone():
     rounded value the one every later step reads, its operands read without a barrier where the platform the
     program lowers for fences the mark too (`uncontracted`). Elsewhere nothing is marked, and the transforms
     hold their operands behind a barrier, as a Pallas kernel's body a GPU traces does (Triton's lowering takes
-    no platform choice)."""
+    no platform choice). A kernel Dew launches keeps the barrier in its body however it is traced
+    (`dew.nn.kernels.launches.interpreting`); a raw `pallas_call` outside them, traced for a CPU and lowered
+    for CUDA, meets the platform choice, which Triton's lowering refuses by name: no public JAX predicate
+    states a Pallas trace yet (row 10138)."""
     from dew.nn.kernels.generation import backend
 
     name = no_contract()
