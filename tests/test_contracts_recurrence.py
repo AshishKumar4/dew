@@ -713,7 +713,7 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge, taken):
 
     scanned = jax.jit(tokenwise)
     assert_drawn_contract(jax.jit(derived), draw, EDGES[edge], f"the derived delta rule {edge}",
-                          truth_fn=scanned, plain_fn=scanned, without=outside(ORDER_SETS[taken]))
+                          truth_fn=scanned, plain_fn=scanned, taking=ORDER_SETS[taken])
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_derived_delta_rules_chunk_adjoint_holds_its_orders(edge):
@@ -821,4 +821,4 @@ def test_a_turned_template_call_holds_every_order(edge, taken):
 
     plainly = jax.jit(_turned_plainly)
     assert_drawn_contract(jax.jit(rule), draw, EDGES[edge], f"a turned template call {edge}",
-                          truth_fn=plainly, plain_fn=plainly, without=outside(ORDER_SETS[taken]))
+                          truth_fn=plainly, plain_fn=plainly, taking=ORDER_SETS[taken])
