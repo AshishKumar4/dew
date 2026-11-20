@@ -102,22 +102,10 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     for found in _regions(index):
         if held & set(found.places):
             continue
-        identity = _identity(jaxpr, found)
-        weighed = _decided(identity, lambda found=found: _takes(fused_gemm, jaxpr, found))
-        if weighed.taken:
-            identities[found] = identity
-        elif weighed.launchable:
-            # A region a stage keeps from fusing (a prologue or an epilogue the template refuses, or one that
-            # does not pay) is weighed with fewer (`_fewer`), its product the template's where it can be and
-            # the stage left as the program wrote it, XLA's beside the launch: unless its launch is XLA's for
-            # a reason no stage enters (`_xla_whatever_its_prologue`, the call's naming it), on which each
-            # region with fewer fails too, an analysis wasted (row 8996: a refused epilogue left the
-            # product a plain dot).
-            for fewer in _fewer(index, found, epilogue=weighed.launched):
-                identity = _identity(jaxpr, fewer)
-                if _decided(identity, lambda fewer=fewer: _takes(fused_gemm, jaxpr, fewer)).taken:
-                    identities[fewer] = identity
-                    break
+        taken = _taken(index, found, lambda region: _decided(
+            _identity(jaxpr, region), lambda: _takes(fused_gemm, jaxpr, region)))
+        if taken is not None:
+            identities[taken] = _identity(jaxpr, taken)
     products = list(identities)
     # A norm a product's prologue replays is the product's (`_prologue`), as an epilogue's norm is.
     held |= {place for region in products for place in region.replayed}
@@ -130,27 +118,45 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     return _spliced(jaxpr, written)
 
 
-def _fewer(index: Index, region: Region, *, epilogue: bool) -> list[Region]:
-    """`region` with fewer stages, the most first, each where the region has the stages it drops: without its
-    prologue (its product and its epilogue, reading the product's rows as given), and where `epilogue` (its
-    launch the template's or undecided, `RegionDecision.launched`) without its epilogue (its prologue and its
-    product, before the first of its consumers, which read the product's value as the program wrote them)
-    and its product alone."""
+def _taken(index: Index, found: Region, decided: Callable[[Region], RegionDecision]) -> Region | None:
+    """`found`, or where a stage keeps it from fusing (a prologue or an epilogue the template refuses, or one
+    that does not pay), the region with the most stages of fewer the template takes (`_fewer`, each
+    `decided` once for its structure), its product the template's where it can be and the stages it drops
+    left as the program wrote them, XLA's beside the launch; None where none is taken (row 8996: a refused
+    epilogue left the product a plain dot)."""
+    level, seen = [found], set()
+    while level:
+        fewer = []
+        for region in level:
+            decision = decided(region)
+            if decision.taken:
+                return region
+            fewer += _fewer(index, region, decision)
+        level = [region for region in fewer if (region.places, region.prologue) not in seen]
+        seen.update((region.places, region.prologue) for region in level)
+    return None
+
+
+def _fewer(index: Index, region: Region, decision: RegionDecision) -> list[Region]:
+    """`region` with one stage fewer, as its `decision` allows each: without its prologue (its product and
+    its epilogue, reading the product's rows as given) where its launch is XLA's for no reason a prologue
+    enters (`RegionDecision.launchable`); without its epilogue (its prologue and its product, before the
+    first of its consumers, which read the product's value as the program wrote them) where its launch is
+    the template's or undecided (`RegionDecision.launched`: an epilogue keys no launch's cell). Each where the
+    region has the stage it drops."""
     jaxpr = index.jaxpr
-
-    def of(places: tuple[int, ...], outputs: tuple, at: int, prologue: tuple[int, ...] = ()) -> Region:
-        return Region(places, region_inputs(jaxpr, places), outputs, at, prologue)
-
     (product,) = (place for place in region.places if _form(jaxpr.eqns[place]) is not None)
-    staged = tuple(place for place in region.places if place in region.prologue)
-    fewer = [of(tuple(place for place in region.places if place not in region.prologue), region.outputs,
-                region.at)] if region.prologue else []
-    if epilogue and len(region.places) > len(staged) + 1:
+    fewer = []
+    if region.prologue and decision.launchable:
+        places = tuple(place for place in region.places if place not in region.prologue)
+        fewer.append(Region(places, region_inputs(jaxpr, places), region.outputs, region.at))
+    if decision.launched and any(place > product for place in region.places):
         made = tuple(jaxpr.eqns[product].outvars)
+        # The prologue's equations it replaces read again: one a consumer it leaves reads stays.
+        computed = {*region.prologue, product}
+        places = tuple(sorted({*_alone(index, region.prologue, computed), product}))
         first = min(place for var in made for place in index.readers[var])
-        if region.prologue:
-            fewer.append(of((*staged, product), made, first, region.prologue))
-        fewer.append(of((product,), made, first))
+        fewer.append(Region(places, region_inputs(jaxpr, sorted(computed)), made, first, region.prologue))
     return fewer
 
 
@@ -337,7 +343,7 @@ def _regions(index: Index) -> list[Region]:
     up to the first equation outside them that reads one of their values, with the layout equations of its
     captured operands that no other equation reads (`CAPTURED`). A prologue's equation nothing outside the
     region reads is replaced with it (`Region.places`); one something else reads stays in the program too."""
-    jaxpr, readers, escaping, producer = index.jaxpr, index.readers, index.escaping, index.producer
+    jaxpr, escaping = index.jaxpr, index.escaping
     found: list[Region] = []
     claimed: set[int] = set()
     for start, equation in enumerate(jaxpr.eqns):
@@ -372,23 +378,29 @@ def _regions(index: Index) -> list[Region]:
         made.update(var for place in prologue for var in jaxpr.eqns[place].outvars)
         inputs = tuple(dict.fromkeys(var for place in sorted(computed) for var in jaxpr.eqns[place].invars
                                      if isinstance(var, jcore.Var) and var not in made))
-        # A prologue's equation goes with the region where only the region reads it and nothing kept reads
-        # it; one something else reads stays, and every one of the prologue it reads with it.
-        kept = [place for place in prologue if any(not readers[var] <= computed or var in escaping
-                                                   for var in jaxpr.eqns[place].outvars)]
-        held = set(kept)
-        while kept:
-            for var in jaxpr.eqns[kept.pop()].invars:
-                source = producer.get(var) if isinstance(var, jcore.Var) else None
-                if source in prologue and source not in held:
-                    held.add(source)
-                    kept.append(source)
-        alone = [place for place in prologue if place not in held]
+        alone = _alone(index, prologue, computed)
         if outputs:
             replaced = tuple(sorted({*places, *alone}))
             found.append(Region(replaced, inputs, outputs, min(at, places[-1] + 1), prologue))
             claimed.update(replaced)
     return found
+
+
+def _alone(index: Index, prologue: Sequence[int], computed: set[int]) -> tuple[int, ...]:
+    """The equations of `prologue` a region computing `computed` replaces (`Region.places`): a prologue's
+    equation goes with the region where only the region reads it and nothing kept reads it; one something
+    else reads stays, and every one of the prologue it reads with it."""
+    jaxpr, readers, escaping, producer = index.jaxpr, index.readers, index.escaping, index.producer
+    kept = [place for place in prologue if any(not readers[var] <= computed or var in escaping
+                                               for var in jaxpr.eqns[place].outvars)]
+    held = set(kept)
+    while kept:
+        for var in jaxpr.eqns[kept.pop()].invars:
+            source = producer.get(var) if isinstance(var, jcore.Var) else None
+            if source in prologue and source not in held:
+                held.add(source)
+                kept.append(source)
+    return tuple(place for place in prologue if place not in held)
 
 
 def _replayed(jaxpr: jcore.Jaxpr, region: Region, fused_gemm):
