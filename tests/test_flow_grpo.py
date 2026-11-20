@@ -1586,11 +1586,11 @@ def test_a_flows_scaling_is_exact_where_its_result_is_normal():
 
     for dtype, big, small in ((np.float32, 150, 100), (np.float64, 1500, 1000)):
         with jax.enable_x64(new_val=dtype == np.float64):
-            within = (np.asarray([[1.5, -1.75, 1.0 + 2.0 ** -20], [2.0 ** -small, -(2.0 ** small), 3.0]],
-                                 dtype),
-                      np.asarray([[-60], [0]], np.int32) + np.asarray([[0, 60, -30]], np.int32))
+            # Values `(2, 1)` against powers `(2, 3)`, broadcast inside the scaling, every result normal.
+            within = (np.asarray([[1.0 + 2.0 ** -20], [-1.75]], dtype),
+                      np.asarray([[-60, 0, 60], [-30, 30, 1]], np.int32))
             past = (np.asarray([[2.0 ** -small], [-(2.0 ** small)]], dtype),
-                    np.asarray([[big], [-big]], np.int32))
+                    np.asarray([[big, big - 1, big - 2], [-big, -big + 1, -big + 2]], np.int32))
             for value, power in (within, past):
                 found = np.asarray(jax.jit(_scaled)(value, power))
                 expected = np.ldexp(value, power)
