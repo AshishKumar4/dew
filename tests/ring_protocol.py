@@ -67,7 +67,7 @@ from jax._src.state import discharge
 from jax.extend import core as jcore
 
 from dew.nn import derivatives
-from dew.nn.kernels.templates import across, gathered, swizzling
+from dew.nn.kernels.templates import across, gathered
 from dew.nn.programs import called
 
 THREAD_AXIS = "wg"
@@ -513,7 +513,7 @@ def _gathers(self: _Interpreter, body: gathered.Gathers, values, located) -> Non
         # that step's fill there: no such fill ordered before it is a read of nothing or of another step's
         # (`"filled"`, the step `_started` counted).
         step = self.entry_steps[(entries[0], warp)] - 1
-        reads = list(dict.fromkeys(_lowered_reads(body, values, parity, tiles)))
+        reads = list(dict.fromkeys(_lowered_reads(body, values, parity)))
         _entry_events(self, reads, entries[0], warp, step)
     for tile in body.tiles(tiles):
         self.emit("copy", (*slot, tile), barrier)
@@ -533,25 +533,38 @@ def _lowered(body, avals, scalars: dict[int, int]) -> list[tuple[str, int | None
     return _lowering([aval for at, aval in enumerate(avals) if at not in scalars], scalars, lowered)
 
 
-def _lowered_reads(body: gathered.Gathers, avals, parity: int, tiles: int) -> list[tuple[str, int | None]]:
-    """A load warp's reads of its step's entries (`gathered.Gathers`' `_entries`, where it reads them ahead:
-    `gathered.Held.entry`) as their lowered loads state them: each a `"read"` of the parity its address
-    takes (`_walked`), `parity` the step's operand (base review 0991196fb F2: the read was stated from the
-    operand, so a load from the other parity passed). The gathers themselves (their TMA copies, which take a
-    launch's context) are `_gathers`' fields."""
-    entries, rows = avals[5], avals[1]
+def _lowered_reads(body: gathered.Gathers, avals, parity: int) -> list[tuple[str, int | None]]:
+    """A load warp's reads of its step's entries (where it reads them ahead: `gathered.Held.entry`) as the
+    production body's lowered loads state them (`gathered.Gathers.__call__`, lowered whole over its operands'
+    memrefs, `parity` the step's operand): each a `"read"` of the parity its address takes (`_walked`; base
+    review 0991196fb F2: the read was stated from the operand; head review of 0099a4701 F2: read from a Held
+    the checker built, a body handing on another parity passed). Its TMA copies, which `_gathers` counts from
+    the body's tiles, are issued nowhere."""
+    source, rows, slot, barrier, _, entries, _ = avals
+    # One stage's slot and barrier, as a kernel hands the body its ring's step: the walk's avals hold every
+    # stage's (`_gathers`' `(slot, stage)`).
+    slot = jax.core.ShapedArray(slot.shape[1:], slot.dtype)
+    barrier = jax.core.ShapedArray((1,), barrier.dtype)
+
+    # The production body, its every tile's TMA gather issued nowhere (`gathered.Gathers._gathered`): what it
+    # reads of its entries and how it hands its operands on are its own.
+    unissued = type("Reading", (type(body),), {"_gathered": lambda self, *_: None})
+    reading = unissued(**{field.name: getattr(body, field.name) for field in dataclasses.fields(body)
+                          if field.init})
 
     def lowered(memories, constants):
-        held = gathered.Held.read((memories[0], _Splat(constants["parity"])))
-        positions = gathered._positions(body.share, len(body.tiles(tiles)), swizzling.TILE_ROWS)
-        body._entries(memories[1], positions, held)
+        entries_, source_, rows_, slot_, barrier_ = memories
+        reading(None, source_, rows_, slot_, barrier_, _Splat(constants["column"]), entries_,
+                _Splat(constants["parity"]))
 
-    return _lowering([entries, rows], {"parity": parity}, lowered)
+    return _lowering([entries, source, rows, slot, barrier], {"column": 0, "parity": parity}, lowered,
+                     shared=(0, 3, 4))
 
 
-def _lowering(memories, constants: dict, lowered: Callable) -> list[tuple[str, int | None]]:
-    """`lowered(memories, constants)`'s ops, built in a function of `memories`' memrefs (the first in shared
-    memory, the entries) with `constants` as i32 constants, walked (`_walked`)."""
+def _lowering(memories, constants: dict, lowered: Callable, *, shared: tuple[int, ...] = (0,)
+              ) -> list[tuple[str, int | None]]:
+    """`lowered(memories, constants)`'s ops, built in a function of `memories`' memrefs (those at `shared` in
+    shared memory, the first the entries) with `constants` as i32 constants, walked (`_walked`)."""
     from jax._src.interpreters import mlir as jax_mlir
     from jax.experimental.mosaic.gpu import dialect as mgpu_dialect
     from jax.extend.mlir import ir
@@ -560,10 +573,13 @@ def _lowering(memories, constants: dict, lowered: Callable) -> list[tuple[str, i
     with jax_mlir.make_ir_context() as context, ir.Location.unknown():
         mgpu_dialect.register_dialect(context)
         module = ir.Module.create()
-        shared = ir.Attribute.parse("#gpu.address_space<workgroup>")
         i32 = ir.IntegerType.get_signless(32)
+        # An H100's module, as Mosaic GPU's lowering states the generation its helpers read (`get_arch`).
+        module.operation.attributes["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, 9)
+        module.operation.attributes["mosaic_gpu.arch_minor"] = ir.IntegerAttr.get(i32, 0)
+        workgroup = ir.Attribute.parse("#gpu.address_space<workgroup>")
         types = [ir.MemRefType.get(list(aval.shape), _element(aval.dtype),
-                                   memory_space=None if at else shared)
+                                   memory_space=workgroup if at in shared else None)
                  for at, aval in enumerate(memories)]
         with ir.InsertionPoint(module.body):
             function = func.FuncOp("body", (types, []))

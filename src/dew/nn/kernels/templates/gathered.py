@@ -335,10 +335,8 @@ class Gathers:
             mgpu_nvvm.mbarrier_arrive_expect_tx(tracked.get_ptr(), mgpu_utils.c(total, i32),
                                                 predicate=mgpu_utils.single_thread_predicate(
                                                     mgpu_utils.ThreadSubset.WARP))
-        layout = mgpu_fragments.TMA_INDICES_4_LAYOUT
-        vector = mgpu_ir.VectorType.get((4,), i32)
         # The step's column as the warp holds it uniformly, as its rows' entries are (`_entries`).
-        start = across.lane_value(splat_value(column), 0)
+        start = mgpu_arith.index_cast(index, across.lane_value(splat_value(column), 0))
         issuer = mgpu_utils.single_thread_predicate(mgpu_utils.ThreadSubset.WARP)
         tiles = list(self.tiles(shape[0]))
         held = Held.read(ahead) if self.ahead else None
@@ -346,16 +344,25 @@ class Gathers:
         positions = _positions(self.share, len(tiles), tile_rows)
         entries = self._entries(rows, positions, held)
         for at, tile in enumerate(tiles):
-            # The tile's entries, four a register, every thread the same (`layout`).
-            mine = entries[at * tile_rows:(at + 1) * tile_rows]
-            registers = [mgpu_vector.from_elements(vector, mine[4 * part:4 * (part + 1)])
-                         for part in range(tile_rows // 4)]
-            indices = mgpu_fragments.FragmentedArray(
-                _registers=_registered(registers, layout, tile_rows), _layout=layout, _is_signed=False)
-            ctx.async_copy(src_ref=source, dst_ref=mgpu_utils.memref_slice(slot, mgpu_utils.ds(tile, 1)),
-                           gmem_slice=(indices, mgpu_utils.ds(mgpu_arith.index_cast(index, start), width)),
-                           gmem_transform=mgpu_launch.TileTransform((tile_rows, tile_columns)),
-                           swizzle=self.swizzle, barrier=tracked, arrive=False, predicate=issuer)
+            self._gathered(ctx, source, mgpu_utils.memref_slice(slot, mgpu_utils.ds(tile, 1)),
+                           entries[at * tile_rows:(at + 1) * tile_rows], (start, width),
+                           (tile_rows, tile_columns), tracked, issuer)
+
+    def _gathered(self, ctx, source, slot, entries: list, columns: tuple, tile: tuple, barrier,
+                  issuer) -> None:
+        """One tile's TMA gather into `slot`: its `entries` (the rows of `source`), four a register, every
+        thread the same, at `columns` (a first column and a width), tiled as `tile`, arriving on `barrier`."""
+        i32 = mgpu_ir.IntegerType.get_signless(32)
+        layout = mgpu_fragments.TMA_INDICES_4_LAYOUT
+        vector = mgpu_ir.VectorType.get((4,), i32)
+        registers = [mgpu_vector.from_elements(vector, entries[4 * part:4 * (part + 1)])
+                     for part in range(tile[0] // 4)]
+        indices = mgpu_fragments.FragmentedArray(
+            _registers=_registered(registers, layout, tile[0]), _layout=layout, _is_signed=False)
+        start, width = columns
+        ctx.async_copy(src_ref=source, dst_ref=slot, gmem_slice=(indices, mgpu_utils.ds(start, width)),
+                       gmem_transform=mgpu_launch.TileTransform(tile), swizzle=self.swizzle, barrier=barrier,
+                       arrive=False, predicate=issuer)
 
     def _entries(self, rows, positions: list, held: "Held | None") -> list:
         """The table entries of the warp's tiles (`rows`, a step's table in global memory: tile t's
