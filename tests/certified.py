@@ -25,10 +25,13 @@ from op_certificates import (
     nearest,
     rounded,
     stepped as oc_stepped,
+    tf32_operand,
     two_sum,
 )
 
+from dew.algebra import means, scaled
 from dew.nn.precision import correctly_rounded_divide_p
+from dew.nn.programs import dot_arithmetic
 
 STORAGE = {"float32": np.uint32, "bfloat16": np.uint16}
 """Each format's storage bits, which a move of data is compared by."""
@@ -495,6 +498,359 @@ def _correctly_divided(params, operands, result, fmt):
     return _same(np.asarray(result, np.float64), rounded_on_lane(hi, lo, fmt, flushes=False))
 
 
+def _exactly(values) -> np.ndarray:
+    """A float array's values as exact rationals (an object array of `Fraction`s), a non-finite one None."""
+    values = np.asarray(values, np.float64)
+    made = np.empty(values.shape, object)
+    for place, value in np.ndenumerate(values):
+        made[place] = fractions.Fraction(value) if math.isfinite(value) else None
+    return made
+
+
+def _plain_fold(anchors: np.ndarray, joined: np.ndarray, scale: float) -> np.ndarray:
+    """Plain units' base-2 exponent of each factor (`means.Units(compensated=False)`) as the law's
+    specification folds it, each step rounded in float32 apart from the law's code: the anchors' difference
+    (at half each where it passes the format, doubled after: exact powers of two), times the scale times
+    `log2(e)` rounded to float32, the product rounded (the merge P0's base review 12, F3: the fold, 0.24% off
+    the exact exponential at a scale of 1/8 and anchors -262144 and 1/64, held to the compensated bound).
+    Its value is exact; the factor is its exponential, within the exponential's own roundings."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        spilled = np.isinf(anchors - joined)
+        half, twice = (np.where(spilled, np.float32(power), np.float32(1)) for power in (0.5, 2))
+        # Float32 arithmetic, each operation rounded once: the halves exact, then the difference, the product.
+        coefficient = np.float32(scale * math.log2(math.e))
+        return (anchors * half - joined * half) * coefficient * twice
+
+
+EXPONENT_ROUNDING = 4
+"""The relative rounding, in units of the format's roundoff, of the base-2 exponent a ratio's factor compares
+with its cutoffs (`_factors_hold`, `means._factors_value`'s high part): plain units round the anchors'
+difference, the scale times `log2(e)` and their product once each, `3u + O(u^2)`; compensated units the
+exponent's high part once and leave the difference's error in its low part, `2u + O(u^2)`; four bounds
+both."""
+
+
+def _factors_hold(form, laid, fmt, formed=None) -> bool:
+    """Whether each exponential factor a ratio reads (`means.Ratio`'s `("e", i, j)`, its numerator's, its
+    denominator's and its products' sums') is, as the ratio forms it (`means._factors_value`, the factor it
+    receives), the exponential `exp(s (a_i - a_j))` of its anchors as read within its own stated roundings,
+    checked apart from the code that forms it: the exact exponent `s (a_i - a_j)` (`s` the units' scale in
+    the format) and its exponential enclosed by mpmath at 80 bits (`interval_precision`), the received factor
+    within `2 u reach + 0.85 u + 4 ln2 u^2 |v| + u^2` of it relatively (`reach` the lane's exp's, `v` the
+    exponent in base 2: the exponential's one rounding, its argument's two, the base-2 exponent's residual),
+    finite and nonzero wherever `v` is within its cutoffs (`means.FLOOR`, `means.CEILING`), zero past the
+    floor, NaN past the ceiling, either within `EXPONENT_ROUNDING u |v|` of a cutoff, where the exponent the
+    law compares (`means._factors_value`'s high part) may round across it; a binade either side passed a
+    zero factor in range (the merge P0's base review 11, F4). The ratio is then certified on the
+    factors it received (`_ratio_factor`); one that fails here fails the call, which a factor's own fault
+    would otherwise pass on both sides (the merge P0's base review 10, F6). `formed` forms the factors it
+    checks, the law's (`means._factors_value`) unless given."""
+    formed = means._factors_value if formed is None else formed
+    terms = [*form.numerator, *form.denominator,
+             *(term for _, sums in form.products for each in sums for term in each.terms)]
+    pairs = {factor[1:] for _, factors in terms for factor in factors if factor[0] == "e"}
+    if not pairs:
+        return True
+    units = form.units
+    u = fractions.Fraction(fmt.unit_roundoff)
+    reach = 2 * u * fractions.Fraction(lane().reach[jax.lax.exp_p, fmt.name])
+    scale = fractions.Fraction(float(np.float32(units.scale)))
+    ln2 = fractions.Fraction(math.log(2))
+    for i, j in pairs:
+        anchors, joined = np.broadcast_arrays(np.float32(laid[i]), np.float32(laid[j]))
+        significand, exponent = (np.asarray(x) for x in formed(anchors, joined, units=units))
+        # Plain units' exponent is their fold's as specified, each step rounded in the format (`_plain_fold`),
+        # the exponential of its exact value the factor's truth; compensated units' the exact exponent.
+        folded = None if units.compensated else _plain_fold(anchors, joined, units.scale)
+        for place in np.ndindex(anchors.shape):
+            got = float(significand[place])
+            if folded is None:
+                x = scale * (fractions.Fraction(float(anchors[place]))
+                             - fractions.Fraction(float(joined[place])))
+                v = x / ln2
+                slack, residual = EXPONENT_ROUNDING * u * abs(v), 4 * ln2 * u * u * abs(v)
+            else:
+                fold = float(folded[place])
+                if not math.isfinite(fold):
+                    # A fold past the format, its rounded steps' overflow: past the floor (-inf) the factor
+                    # is zero, past the ceiling (+inf) NaN (the merge P0's head review, F5: a Fraction of
+                    # an infinity raised).
+                    if (got != 0) if fold == -math.inf else not math.isnan(got):
+                        return False
+                    continue
+                v = fractions.Fraction(fold)
+                x, slack, residual = None, 0, 0
+            if v < means.FLOOR - slack:
+                if got != 0:
+                    return False
+                continue
+            if v > means.CEILING + slack:
+                if not math.isnan(got):
+                    return False
+                continue
+            near = abs(v - means.FLOOR) <= slack or abs(v - means.CEILING) <= slack
+            if near and (got == 0 or math.isnan(got)):
+                continue
+            if not math.isfinite(got):
+                return False
+            with interval_precision(80) as iv:
+                exponent_of = (iv.mpf(x.numerator) / iv.mpf(x.denominator) if x is not None
+                               else iv.mpf(v.numerator) / iv.mpf(v.denominator) * iv.log(2))
+                low, high = interval_ends(iv.exp(exponent_of), 80)
+            bound = reach + fractions.Fraction(85, 100) * u + residual + u * u
+            factor = fractions.Fraction(got) * fractions.Fraction(2) ** int(exponent[place])
+            if not low * (1 - bound) <= factor <= high * (1 + bound):
+                return False
+    return True
+
+
+def _ratio_factor(factor, laid, units) -> np.ndarray:
+    """A ratio's factor (`means.Ratio`) exactly, as the ratio forms it: an operand as it is (a subnormal's
+    value kept, read from its bits: `scaled`'s account), the units' scale in the format, an exponential its
+    factor as formed
+    (`means._factors_value`, a stated input: its one rounding is the exponential's), None where it is NaN."""
+    if factor[0] == "v":
+        return _exactly(laid[factor[1]])
+    if factor[0] == "s":
+        return _exactly(np.float32(units.scale))
+    significand, exponent = means._factors_value(np.float32(laid[factor[1]]), np.float32(laid[factor[2]]),
+                                                 units=units)
+    made = _exactly(significand)
+    for place, power in np.ndenumerate(np.asarray(exponent)):
+        if made[place] is not None:
+            made[place] = made[place] * fractions.Fraction(2) ** int(power)
+    return made
+
+
+def _ratio_sums(terms, laid, form, shape, axis, over=()):
+    """A ratio's sum of `terms` (`means.Ratio`) exactly and its terms' magnitudes' sum, over `axis` where
+    given, and whether a term of it is NaN (a factor past its reach), each of the result's shape. A term
+    with an exactly zero factor is zero whatever its others (`means._product`: a state of no mass, its
+    factor past its reach included); over `over` each term is summed across its own extent there, one of
+    none counted once (`Ratio.over`)."""
+    ones = tuple(1 if place in over else size for place, size in enumerate(shape))
+    total = np.full(ones, fractions.Fraction(0), object)
+    magnitude = np.full(ones, fractions.Fraction(0), object)
+    undefined = np.zeros(ones, bool)
+    missing = np.vectorize(lambda v: v is None, otypes=[bool])
+    nothing = np.vectorize(lambda v: v is not None and v == 0, otypes=[bool])
+    for coefficient, factors in terms:
+        values = [np.broadcast_to(_ratio_factor(factor, laid, form.units), shape) for factor in factors]
+        product = np.full(shape, fractions.Fraction(coefficient), object)
+        refused, zero = np.zeros(shape, bool), np.zeros(shape, bool)
+        for value in values:
+            refused, zero = refused | missing(value), zero | nothing(value)
+            product = product * np.where(missing(value), fractions.Fraction(1), value)
+        refused &= ~zero
+        product = np.where(refused | zero, fractions.Fraction(0), product)
+        size = np.vectorize(abs, otypes=[object])(product)
+        extent = np.broadcast_shapes((1,) * len(shape), *(laid[index].shape for factor in factors
+                                                          for index in factor[1:]))
+        for place in over:
+            if extent[place] > 1:
+                product, size = (np.sum(x, axis=place, keepdims=True) for x in (product, size))
+                refused = np.any(refused, axis=place, keepdims=True)
+            else:
+                product, size, refused = (np.take(x, [0], axis=place) for x in (product, size, refused))
+        total, magnitude, undefined = total + product, magnitude + size, undefined | refused
+    if axis is not None:
+        total, magnitude = (np.sum(x, axis=axis, keepdims=True) for x in (total, magnitude))
+        undefined = np.any(undefined, axis=axis, keepdims=True)
+    return total, magnitude, undefined
+
+
+def _ratio_holds(params, operands, result, fmt):
+    """`means.ratio_p`'s contract (its compensated sum's bound, `means`'s account): each element of the
+    ratio `R = N / D` of its operands as read and its factors as formed (`_ratio_factor`), exact, within
+    `u |R| + u gamma_(n(f+3)+4) (sum |N's terms| + |R| sum |D's terms|) / |D|` (`n` its summands, `f` a term's
+    most factors: each term a double float within `(f+3) u^2` of itself, their sum compensated, the quotient's
+    residual carried, landed once), and the format's least normal where it flushes a sum or its landing
+    beneath it; zero where `D` is (a row of no mass), NaN where a term is, the format's infinity where `R`
+    passes it; a zero +0 alone, as a ratio lands one. Its quotients summed across further axes before it
+    lands (`Ratio.across`, `R = sum_c N_c / D_c`, a quotient over a zero denominator none), each within its
+    own bound but the landing's, their sum compensated: `u |R|` beside the quotients' bounds summed, `gamma`'s
+    count raised by theirs. Its denominator raised to its `power` (`Ratio.power`, `N / D^p`): the bound's
+    `|R| sum |D's terms| / |D|` term `p` times as large, `sum |N's terms|` over `|D|^p`, `gamma`'s count
+    raised by the power's products."""
+    form = params["form"]
+    laid = [np.asarray(_read(value, flushes=False), np.float64) for value in operands]
+    rank = max(value.ndim for value in laid)
+    laid = [value.reshape(value.shape + (1,) * (rank - value.ndim)) for value in laid]
+    shape = np.broadcast_shapes(*(value.shape for value in laid))
+    if not _factors_hold(form, laid, fmt):
+        return np.zeros(np.shape(result), bool)
+    if form.products:
+        return _products_hold(form, laid, shape, result, fmt)
+    numerator, numerator_size, undefined = _ratio_sums(form.numerator, laid, form, shape,
+                                                       form.axis if form.reduced else None, form.over)
+    refused = np.zeros((), bool)
+    if form.denominator:
+        denominator, denominator_size, refused = _ratio_sums(form.denominator, laid, form, shape, form.axis)
+        # The denominator, of no extent along the numerator's further sums, one along them.
+        for place in form.over:
+            denominator, denominator_size, refused = (np.take(x, [0], axis=place)
+                                                      for x in (denominator, denominator_size, refused))
+        undefined = undefined | refused
+    else:
+        denominator = np.full(numerator.shape, fractions.Fraction(1), object)
+        denominator_size = np.full(numerator.shape, fractions.Fraction(0), object)
+    if form.reduced:
+        numerator, numerator_size, undefined = (np.squeeze(x, form.axis)
+                                                for x in (numerator, numerator_size, undefined))
+        denominator, denominator_size, refused = (np.squeeze(np.broadcast_to(x, np.broadcast_shapes(
+            np.shape(x), (1,) * len(shape))), form.axis) for x in (denominator, denominator_size, refused))
+    else:
+        denominator, denominator_size, undefined = (np.broadcast_to(x, numerator.shape)
+                                                    for x in (denominator, denominator_size, undefined))
+    # Each quotient exactly and the sizes its bound reads, `(sum |N's terms| + |R| sum |D's terms|) / |D|`;
+    # one over a zero denominator none.
+    denominator, denominator_size = (np.broadcast_to(x, numerator.shape)
+                                     for x in (denominator, denominator_size))
+    quotients = np.full(numerator.shape, fractions.Fraction(0), object)
+    sizes = np.full(numerator.shape, fractions.Fraction(0), object)
+    power = form.power
+    for place in np.ndindex(numerator.shape):
+        if not undefined[place] and denominator[place] != 0:
+            quotients[place] = numerator[place] / denominator[place] ** power
+            sizes[place] = (numerator_size[place] / abs(denominator[place]) ** power
+                            + power * abs(quotients[place]) * denominator_size[place]
+                            / abs(denominator[place]))
+    none = _defined_zero(denominator, refused, numerator.shape)
+    undefined = undefined & ~none
+    across = tuple(place - (form.reduced and place > form.axis) for place in form.across)
+    if across:
+        quotients, sizes = (np.sum(x, axis=across, keepdims=True) for x in (quotients, sizes))
+        undefined = np.any(undefined, axis=across, keepdims=True)
+        none = np.all(none, axis=across, keepdims=True)
+    spread = int(np.prod([shape[place] for place in form.over]))
+    summands = (len(form.numerator) * spread + len(form.denominator)) * shape[form.axis]
+    factors = max(len(factors) for _, factors in form.numerator + form.denominator)
+    unit = fractions.Fraction(fmt.unit_roundoff)
+    count = int(np.prod([shape[place] for place in form.across]))
+    second = fractions.Fraction(gamma(summands * (factors + 3) + 4 + count * bool(across) + 2 * (power - 1),
+                                      fmt)) * unit
+    least = fractions.Fraction(2) ** fmt.emin
+    slack = np.vectorize(lambda exact, size: unit * abs(exact) + least + second * size, otypes=[object])(
+        quotients, sizes)
+    return _landed_hold(result, quotients, slack, undefined, none, fmt)
+
+
+def _products_hold(form, laid, shape, result, fmt):
+    """`_ratio_holds` of a numerator of products of sums (`means.Ratio.products`), `R = sum_t c_t prod_j
+    S_tj / D^q`: each sum exactly (`_ratio_sums`) and within `E_j = u gamma_(n(f+3)+4) sum |its terms|` of
+    its compensated value (the classic numerator's bound, sum by sum), each product of them within
+    `|c| (prod_j (|S_j| + E_j) - prod_j |S_j|)` of its exact one beside its double floats' products'
+    `2 u^2` each, the products joined within `u^2` of their magnitudes, the denominator's power within
+    `(|D| + E_D)^q - |D|^q` of `|D|^q`; the quotient within `u |R| + 4 u^2 |R| + (E_P + |R| E_Dq) / (|D|^q -
+    E_Dq)` and the format's least normal, its quotients summed across as the classic one's
+    (`Ratio.across`)."""
+    unit = fractions.Fraction(fmt.unit_roundoff)
+    square = unit * unit
+    numerator = None
+    error = None
+    undefined = np.zeros((), bool)
+    summed: dict = {}
+    for coefficient, sums in form.products:
+        product = np.full((), fractions.Fraction(coefficient), object)
+        reach = np.full((), abs(fractions.Fraction(coefficient)), object)
+        for each in sums:
+            if each not in summed:
+                value, size, held = _ratio_sums(each.terms, laid, form, shape,
+                                                form.axis if each.reduced else None, each.over)
+                spread = int(np.prod([shape[place] for place in each.over]))
+                count = len(each.terms) * spread * (shape[form.axis] if each.reduced else 1)
+                factors = max(len(factors) for _, factors in each.terms)
+                bound = fractions.Fraction(gamma(count * (factors + 3) + 4, fmt)) * unit
+                summed[each] = (value, size * bound, held)
+            value, bound, held = summed[each]
+            undefined = undefined | held
+            product = product * value
+            reach = reach * (np.vectorize(abs, otypes=[object])(value) + bound)
+        made = np.vectorize(abs, otypes=[object])(product)
+        own = reach - made + 2 * len(sums) * square * reach
+        numerator = product if numerator is None else numerator + product
+        error = own if error is None else error + own + square * (reach + made)
+    if form.denominator:
+        denominator, size, held = _ratio_sums(form.denominator, laid, form, shape, form.axis)
+        for place in form.over:
+            denominator, size, held = (np.take(x, [0], axis=place) for x in (denominator, size, held))
+        factors = max(len(factors) for _, factors in form.denominator)
+        bound = fractions.Fraction(gamma(len(form.denominator) * shape[form.axis] * (factors + 3) + 4, fmt))
+        denominator_error = size * bound * unit
+        undefined, refused = undefined | held, held
+    else:
+        denominator = np.full((1,) * len(shape), fractions.Fraction(1), object)
+        denominator_error = np.full((1,) * len(shape), fractions.Fraction(0), object)
+        refused = np.zeros((1,) * len(shape), bool)
+    if form.reduced:
+        numerator, error, undefined, denominator, denominator_error, refused = (
+            np.squeeze(np.broadcast_to(x, np.broadcast_shapes(np.shape(x), (1,) * len(shape))), form.axis)
+            for x in (numerator, error, undefined, denominator, denominator_error, refused))
+    whole = np.broadcast_shapes(np.shape(numerator), np.shape(denominator), np.shape(undefined))
+    numerator, error, undefined, denominator, denominator_error = (
+        np.broadcast_to(x, whole) for x in (numerator, error, undefined, denominator, denominator_error))
+    power = form.power
+    quotients = np.full(whole, fractions.Fraction(0), object)
+    slack = np.full(whole, fractions.Fraction(0), object)
+    least = fractions.Fraction(2) ** fmt.emin
+    for place in np.ndindex(whole):
+        if undefined[place] or denominator[place] == 0:
+            continue
+        magnitude = abs(denominator[place]) ** power
+        raised = ((abs(denominator[place]) + denominator_error[place]) ** power * (1 + power * 2 * square)
+                  - magnitude)
+        quotients[place] = numerator[place] / denominator[place] ** power
+        slack[place] = (unit * abs(quotients[place]) + 4 * square * abs(quotients[place]) + least
+                        + (error[place] + abs(quotients[place]) * raised) / (magnitude - raised))
+    none = _defined_zero(denominator, refused, whole)
+    undefined = undefined & ~none
+    across = tuple(place - (form.reduced and place > form.axis) for place in form.across)
+    if across:
+        quotients, slack = (np.sum(x, axis=across, keepdims=True) for x in (quotients, slack))
+        undefined = np.any(undefined, axis=across, keepdims=True)
+        none = np.all(none, axis=across, keepdims=True)
+    return _landed_hold(result, quotients, slack, undefined, none, fmt)
+
+
+def _defined_zero(denominator, refused, shape) -> np.ndarray:
+    """Where a ratio's denominator is zero and none of its terms refused (`refused`): its quotient there is
+    +0 whatever its numerator, a refused factor's too (`means._quotient`: a row of no mass), so it is no
+    undefined quotient (`_landed_hold`; `exp(2^22) / 0` is +0, the merge P0's base review 13, F3)."""
+    zero = np.vectorize(lambda value: value == 0, otypes=[bool])(denominator)
+    return np.broadcast_to(zero & ~np.asarray(refused, bool), shape)
+
+
+def _landed_hold(result, quotients, slack, undefined, none, fmt) -> np.ndarray:
+    """Each element of a ratio's landed `result` held to its exact quotient, summed across where it is
+    (`quotients`), within `slack`: NaN where a quotient is undefined (a term refused over a denominator that
+    is not a defined zero, `_defined_zero`), zero where every quotient's denominator is a defined zero
+    (`none`), the format's infinity where the quotient passes the format; a zero +0 alone, as a ratio lands
+    one. The one classification of both numerator forms (`_ratio_holds`, `_products_hold`)."""
+    largest = fractions.Fraction(fmt.largest)
+    result = np.asarray(result, np.float64)
+    quotients, slack, undefined, none = (np.broadcast_to(x, result.shape)
+                                         for x in (quotients, slack, undefined, none))
+    holds = np.zeros(result.shape, bool)
+    for place, got in np.ndenumerate(result):
+        if undefined[place]:
+            holds[place] = math.isnan(got)
+            continue
+        if got == 0 and math.copysign(1.0, got) < 0:
+            # A ratio lands a zero as +0 (`means.Ratio`), whatever sign its exact value has.
+            continue
+        if none[place]:
+            holds[place] = got == 0
+            continue
+        exact, room = quotients[place], slack[place]
+        if abs(exact) - room > largest:
+            holds[place] = math.isinf(got) and (got > 0) == (exact > 0)
+        elif math.isfinite(got):
+            holds[place] = abs(fractions.Fraction(got) - exact) <= room
+        else:
+            holds[place] = math.isinf(got) and abs(exact) + room > largest and (got > 0) == (exact > 0)
+    return holds
+
+
 BROADCAST = "broadcast"
 """A division's form whose divisor is broadcast along a size-1 axis within the one equation (lax's implicit
 broadcast), its reach measured apart (`lane`, under `(jax.lax.div_p, BROADCAST)`): XLA on the CPU computes
@@ -573,8 +929,9 @@ def _flattened(moved: np.ndarray, reduced: int) -> np.ndarray:
 
 def _cumulative(params, operands, result, fmt):
     """A cumulative sum along `axis`, forward or reversed: each prefix's (or suffix's) sum of its terms
-    within its bound in any order (`_terms_hold`, every prefix taken as one of the axis's length, which
-    bounds each shorter one); for integers, each wrapped to the result's width."""
+    within its own bound in any order (`_terms_hold`, each prefix's count of terms its own: the axis's length
+    gave a one-term prefix γ_n's slack, so a 128-term bfloat16 scan's first prefix took 0 for 1, and past
+    γ's reach any value: spec alignment, 9000); for integers, each wrapped to the result's width."""
     (terms,) = operands
     axis, reverse = params["axis"], params["reverse"]
     if fmt is None:
@@ -588,7 +945,8 @@ def _cumulative(params, operands, result, fmt):
         np.arange(count)[None, :] <= np.arange(count)[:, None]
     # [..., k, j]: the j-th term where the k-th prefix (or suffix) takes it, zero elsewhere.
     prefixes = np.where(taken, moved[..., None, :], 0.0)
-    held = _terms_hold(np.moveaxis(np.asarray(result), axis, -1), prefixes, fmt, flushes)
+    counts = np.broadcast_to(taken.sum(-1), prefixes.shape[:-1])
+    held = _terms_hold(np.moveaxis(np.asarray(result), axis, -1), prefixes, fmt, flushes, counts=counts)
     return np.moveaxis(held, -1, axis)
 
 
@@ -618,7 +976,15 @@ def _dot(params, operands, result, fmt):
         summed = _wrapping(lambda lhs, rhs: paired(lhs, rhs).sum(-1))
         return _bits(result) == _bits(summed(result, left, right).reshape(result.shape))
     flushes = lane().flushes
-    products = paired(_read(left, flushes), _read(right, flushes))
+    lhs, rhs = _read(left, flushes), _read(right, flushes)
+    # The operands as the arithmetic the product requests reads them (`programs.dot_arithmetic`): a TF32
+    # product's as a tensor core rounds them to TF32 (`op_certificates.tf32_operand`), so an explicitly TF32
+    # dot of fp32 `1 + 2^-15` and `1` is held to 1, not to the fp32 product it drops bits of (spec alignment,
+    # 9004).
+    arithmetic = dot_arithmetic(params.get("precision"), left.dtype, right.dtype)
+    if arithmetic is not None and arithmetic.tf32 and arithmetic.operations == 1:
+        lhs, rhs = tf32_operand(lhs), tf32_operand(rhs)
+    products = paired(lhs, rhs)
     native = np.asarray(result, np.float64).reshape(products.shape[:-1])
     return _terms_hold(native, products, fmt, flushes).reshape(result.shape)
 
@@ -906,6 +1272,15 @@ def _reduced(eqn, operands, results) -> list[np.ndarray]:
     if contract is None or not np.issubdtype(np.asarray(operands[0]).dtype, np.floating):
         raise TypeError("a reduction of none of Dew's combines")
     return contract(eqn.params, operands, results, _format(np.asarray(results[0]).dtype))
+
+
+def _split_part(x: np.ndarray, index: int) -> np.ndarray:
+    """`scaled.split_p`'s result `index` of `x` exactly (`scaled._split_value`'s account): its significand in
+    [1, 2), its sign kept (0), or its exponent (1); a subnormal's normalized, its exponent beneath the least
+    normal's (NumPy's `frexp` reads it as it is), a zero's +0 and 0, a non-finite value its own
+    significand."""
+    fraction, exponent = np.frexp(np.where(x == 0, np.zeros_like(x), x))
+    return 2 * fraction if index == 0 else np.where(fraction == 0, 0, exponent - 1).astype(np.int32)
 
 
 def _moved(oracle):
@@ -1438,6 +1813,9 @@ CONTRACTS = {
     jax.lax.square_p: _rounding(jax.lax.square_p, _wrapping(lambda a: a * a)),
     jax.lax.div_p: _rounding(jax.lax.div_p, _truncated),
     correctly_rounded_divide_p: _correctly_divided,
+    means.ratio_p: _ratio_holds,
+    # A float's significand and exponent (`scaled.split_p`), a value's alone: each result exact, bit for bit.
+    scaled.split_p: _moved(lambda params, x, index: _split_part(x, int(index))),
     # A remainder (C's, the dividend's sign) is exact in IEEE arithmetic and in integers, and a sign is a
     # sign operation, each kept zero's sign: bit for bit.
     jax.lax.rem_p: _moved(lambda params, a, b: _remainder(a, b)),
@@ -1539,14 +1917,16 @@ def _piece(params, value, index):
 RESULT_OPERANDS = {
     jax.lax.optimization_barrier_p: lambda params, operands, index: [operands[index]],
     jax.lax.split_p: lambda params, operands, index: [_piece(params, operands[0], index)],
+    scaled.split_p: lambda params, operands, index: [operands[0], index],
     jax.lax.unstack_p: lambda params, operands, index: [np.take(operands[0], index, axis=params["axis"])],
     jax.lax.sort_p: lambda params, operands, index: [_sorted(params, operands)[index]],
     jax.lax.top_k_p: lambda params, operands, index: [_top(params, operands[0])[index]],
 }
 """The primitives of several results whose each result is a move of its operands of its own position,
 `parts(params, operands, index)`, which its contract reads alone (`_held`): an optimization barrier's i-th
-operand, a split's i-th piece, an unstack's i-th slice, a sort's i-th operand reordered (`_sorted`), a
-top_k's values or their indices (`_top`)."""
+operand, a split's i-th piece, a float's significand or exponent (`scaled.split_p`'s: its operand and
+which), an unstack's i-th slice, a sort's i-th operand reordered (`_sorted`), a top_k's values or their
+indices (`_top`)."""
 
 
 def certified(fn, *arguments) -> tuple:

@@ -524,13 +524,14 @@ def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, spli
     """The inference walk's outputs from its launches' (`_inference_walk`'s `finished`), unpadded to the
     call's `queries` and value `width`: the output, and with `rows` its finished maxima and denominators, an
     anchor key of none and the output as the split sums. A split launch's are its slices along the query
-    axis (`_launch`'s `splits`): `[B, S, Q, H, Dv]`, its rows `[B, H, S, Q]`, each slice's maxima and
-    denominators its own, which XLA merges (`attention_decode`)."""
+    axis (`_launch`'s `splits`) as its launch wrote them, padded: `[B, S, Qp, H, Dvp]`, and its maxima and
+    denominators stacked, `[2, B, H, S, Qp]`, each slice's its own, which its caller merges where they lie
+    (`merged.merged_split`)."""
     out, *rows_of = walked
     if splits > 1:
-        out = out.reshape(out.shape[0], splits, -1, *out.shape[2:])[:, :, :queries, :, :width]
-        maximum, total = (array.reshape(*array.shape[:2], splits, -1)[..., :queries] for array in rows_of[0])
-        return out, maximum, total
+        stacked = rows_of[0]
+        return (out.reshape(out.shape[0], splits, -1, *out.shape[2:]),
+                stacked.reshape(*stacked.shape[:3], splits, -1))
     out = out[:, :queries, :, :width]
     if not rows:
         return out

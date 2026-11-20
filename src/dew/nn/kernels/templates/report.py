@@ -2016,6 +2016,15 @@ def custom_kernels(executable: jax.stages.Compiled) -> list[tuple[str, bytes, in
             if (kernel := custom_kernel(proto)) is not None]
 
 
+def launched_thunks(executable: jax.stages.Compiled) -> list[str]:
+    """Every thunk `executable` launches, in order, by its kernel's name (`_thunk_protos`): XLA's own (a
+    fusion of one operation's `wrapped_<operation>`) beside the custom kernels, a run's every launch."""
+    runtime = executable.runtime_executable()
+    if runtime is None:
+        raise ValueError("a compiled program with no runtime executable launches no kernel to read")
+    return [name for name, _ in _thunk_protos(runtime.serialize())]
+
+
 def launched_kernels(executable: jax.stages.Compiled) -> list[tuple[str, int]]:
     """Every custom kernel `executable` launches (`custom_kernels`), by its name, with the shared bytes its
     launch asks for."""

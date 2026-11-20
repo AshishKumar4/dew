@@ -7,7 +7,7 @@ import pytest
 from arm_arithmetic import summed_as_run
 from jax.sharding import AxisType, PartitionSpec
 from reference_error import without_ynn
-from sharded import placed_on, split_executable
+from sharded import placed_on, split_checked, split_executable
 
 from dew.nn import precision
 
@@ -39,3 +39,30 @@ def test_the_split_executable_runs_each_shard_as_the_gate_runs_its_arms():
     wide = np.concatenate([np.asarray(run(rows, w)) for rows in (x[:4], x[4:])])
     assert not np.array_equal(narrow, wide)
     np.testing.assert_array_equal(split, narrow)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("whole", [False, True], ids=["every operand split", "a weight whole"])
+def test_a_sum_over_an_axis_no_operand_is_whole_along_fails_the_split(whole):
+    """A step summing across the data axis: a column sum of rows split along it, every operand split, which a
+    per-shard program should not take, is refused (spec alignment, 9001: every reduction passed whole); a
+    weight's gradient, the weight whole along it, summed over the rows, is the sum the step intends, and the
+    split passes."""
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Auto,), devices=jax.devices()[:2])
+    rng = np.random.default_rng(0x9001)
+    x = jnp.asarray(rng.standard_normal((8, 16)), jnp.float32)
+    w = jnp.asarray(rng.standard_normal((16, 4)), jnp.float32)
+    def gathered(x):
+        return jnp.sum(x, axis=0), jax.lax.with_sharding_constraint(x, PartitionSpec())
+
+    if whole:
+        def gradient(x, w):
+            return jax.grad(lambda w: jnp.sum(jnp.dot(x, w)))(w)
+
+        split_checked(gradient, lambda seed: (x, w), (PartitionSpec("data"), PartitionSpec()), mesh)
+    else:
+        with pytest.raises(AssertionError):
+            split_checked(lambda x: jnp.sum(x, axis=0), lambda seed: (x,), (PartitionSpec("data"),), mesh)
+        # A gather the cell allows excuses no sum it does not name (head review).
+        with pytest.raises(AssertionError):
+            split_checked(gathered, lambda seed: (x,), (PartitionSpec("data"),), mesh, moves=("all-gather",))

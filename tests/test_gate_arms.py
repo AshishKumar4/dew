@@ -8,12 +8,22 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_forms import without_ynn
 from contract_support import normal_drawn
-from reference_error import GateFailure, Inconclusive, UnpairedDraw, as_given, assert_as_exact, seeds_for
+from reference_error import (
+    GateFailure,
+    Inconclusive,
+    UnpairedDraw,
+    ahead_arm,
+    as_given,
+    assert_as_exact,
+    seeds_for,
+)
 from test_reference_error import exact_rows, noised_draw, stacked_arm, stacked_examples
-from truths_ahead import compiled_truths
+from test_reference_error_written import _cancelling, _combined
+from truths_ahead import UNPREPARED, compiled_truths
 
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import gemm, generation, tuning
 
 
 def noised(scale: float, noise: str, own: float = 0.0):
@@ -113,6 +123,20 @@ def test_a_prepared_sites_arms_report_the_routes_their_unprepared_run_reports(tm
     assert unprepared and reported(prepare=False) == unprepared, unprepared
 
 
+def test_a_prepared_sites_reference_as_written_is_prepared_and_fails_dews_arm_in_its_run(tmp_path):
+    """The combination XLA's fusions rewrite (`test_reference_error_written._combined`, row 6909), one
+    function as both arms, its site prepared into a store (`truths_ahead.compiled_truths`, a GPU tier part's)
+    and run from it: its reference compiled as written (`arm_forms._written_twin`) is prepared beside its arms
+    compiled alike (`arm_store.armed`), and the run, calling that program, fails Dew's arm against it as a
+    site run unprepared does, nothing of the site run unprepared."""
+    label = "a prepared combination XLA's fusions rewrite"
+    with compiled_truths(tmp_path, prepare=True, stamp="here"):
+        assert_as_exact(_combined, _combined, _cancelling, label, seeds=8)
+    with compiled_truths(tmp_path, prepare=False, stamp="here"), pytest.raises(GateFailure):
+        assert_as_exact(_combined, _combined, _cancelling, label, seeds=8)
+    assert not (tmp_path / UNPREPARED).exists()
+
+
 def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed():
     """`arm_forms.without_ynn` takes XLA:CPU's options (WITHOUT_YNN) where the context places its calls on a
     CPU, and none where it places them on a GPU, whatever the process's default backend: a GPU tier part's
@@ -154,3 +178,62 @@ def test_the_arms_arithmetic_is_that_of_where_their_calls_are_placed():
     with jax.default_device(compile_only_gpus("sm90", 1)[0]):
         on_a_gpu = preset()
     assert on_a_cpu == FP32_SUMS and on_a_gpu == jax.config.jax_default_matmul_precision
+
+
+def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran(tmp_path):
+    """`ahead_arm(fn, label, launched=True)` outside a part returns its outputs and the launches the program
+    it ran took, at every call: its one lowering's, each the launch a trace of the function takes, the second
+    call's too, whose program a plain jit would take from its cache and trace no launch for a collector open
+    around it (row 9550: a witness retraced a program of its own to see them); a jit of its own compiler
+    options (`without_ynn`'s) lowered as itself, never nested in another; and prepared into a store and run
+    from it, a plain function's and a whole jit's, its prepare's lowering's launches once, its run's alike (a
+    relowering past a spill, a GPU's, keeps its own: `_arm_program`'s `again`, `_Whole.lower`)."""
+    sizes = np.asarray([128, 128], np.int32)
+    rng = np.random.default_rng(9550)
+    x = rng.standard_normal((256, 128)).astype(np.float32)
+    dy = rng.standard_normal((256, 64)).astype(np.float32)
+
+    def gradient(x, dy):
+        return gemm.gemm_t(x.astype(jnp.bfloat16), dy.astype(jnp.bfloat16), jnp.asarray(sizes),
+                           out_dtype=jnp.float32, precision="highest", interpret_on_cpu=True)
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="triton"):
+        made = [ahead_arm(arm, f"a kernel gradient and its launches, {at}", launched=True)(x, dy)
+                for at, arm in enumerate((gradient, gradient, without_ynn(gradient)))]
+        with tuning.seen() as traced:
+            jax.jit(gradient).trace(x, dy)
+        # Prepared and run from its store: the launches its prepare's lowering took, its run's alike.
+        stored = []
+        for prepare in (True, False):
+            with compiled_truths(tmp_path, prepare=prepare, stamp="launched"):
+                stored.extend(ahead_arm(arm, f"a stored kernel gradient, {at}", launched=True)(x, dy)[1]
+                              for at, arm in enumerate((gradient, without_ynn(gradient))))
+    expected = [type(op) for op, _ in traced]
+    assert expected and all([type(op) for op, _ in launches] == expected
+                            for launches in (*(found for _, found in made), *stored))
+    np.testing.assert_array_equal(np.asarray(made[0][0]), np.asarray(made[1][0]))
+
+
+def test_an_arm_ahead_called_again_at_its_program_in_a_prepare_reuses_it_and_refuses_another(tmp_path):
+    """An arm with no site called twice in one prepare at one program (two draws of one shape): the second
+    call gives the first's zeros and launches, compiling nothing again, and a call of its label at other
+    inputs' shapes, or placed on the host, is refused; its run executes each call's own inputs (row 9550's
+    witness's cache)."""
+    def doubled(x):
+        return x * 2
+
+    draws = [np.arange(8, dtype=np.float32) + offset for offset in (0, 100)]
+    with compiled_truths(tmp_path, prepare=True, stamp="again") as store:
+        arm = ahead_arm(doubled, "one program, two draws")
+        prepared = [arm(x) for x in draws]
+        with pytest.raises(ValueError):
+            arm(np.arange(4, dtype=np.float32))
+        # The same function and label placed on the host: another program (head review).
+        with pytest.raises(ValueError):
+            ahead_arm(doubled, "one program, two draws", host=True)(draws[0])
+    assert len(store.arms) == 1 and all(not np.any(made) for made in prepared)
+    with compiled_truths(tmp_path, prepare=False, stamp="again"):
+        ran = [ahead_arm(doubled, "one program, two draws")(x) for x in draws]
+    for x, made in zip(draws, ran, strict=True):
+        np.testing.assert_array_equal(np.asarray(made), x * 2)
+

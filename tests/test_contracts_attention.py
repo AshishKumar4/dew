@@ -10,7 +10,12 @@ import pytest
 from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
 
 from dew.nn import attention, kv_cache
-from dew.nn.kernels.templates import attention as template, attention_quantized
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    attention_quantized,
+    merged,
+)
 from dew.nn.sharding import manual_map
 
 
@@ -172,6 +177,28 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_a_padded_merges_derivatives_are_the_laws(edge):
+    """`merged.merged_padded` (a split decode step's slices merged where its launch wrote them; its value one
+    launch on a GPU, its tangent the law's path's, a custom JVP): every order runs, finite wherever float64
+    is a normal float32 and the law's path (`merged._value`, differentiated by JAX) is, at padded outputs and
+    maxima near float32's ends, two slices' totals drawn positive."""
+    spec = algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True))
+    padded, maxima, totals = normal_draw(7124, (1, 4, 4, 2, 16), (1, 2, 4, 4), (1, 2, 4, 4),
+                                         scale=EDGES[edge])
+    direction = normal_draw(7125, (1, 4, 4, 2, 16), (2, 1, 2, 4, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(7126, (1, 2, 2, 16))
+    stacked = jnp.stack([maxima, jnp.abs(totals)])
+
+    def merge(padded, stacked):
+        return merged.merged_padded(spec, padded, stacked, queries=2, width=16).acc
+
+    def law(padded, stacked):
+        return merged._value(padded, stacked, spec=spec, queries=2, width=16)[0]
+
+    assert_contract(merge, (padded, stacked), direction, cotangent, f"a padded merge {edge}", plain_fn=law)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_a_sink_softmax_holds_every_order(edge):
     """The sink softmax (`attention_sinks.sink_softmax`: its reverse mode returning the logits' cotangent
     only with the sinks' gradient formed): every order, forward and reverse, under a nested jit and a scan,
@@ -190,33 +217,4 @@ def test_a_sink_softmax_holds_every_order(edge):
 
     assert_contract(sink_softmax, primals, direction, cotangent, f"a sink softmax {edge}",
                     plain_fn=lambda logits, sinks: _weights(logits, sinks, None),
-                    draw=draw if edge == "normal" else None)
-
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_the_finished_merges_mean_holds_every_order(edge):
-    """The finished merge's mean of its states' outputs by their masses (`attention_algebra._mean`, a
-    declared tangent: the mean's own derivative, its coefficients formed at a scale that passes fp32 only
-    where they do, row 6827): every order, forward and reverse, finite wherever float64 is a normal float32
-    and the plain mean, sum(w o) / sum(w), is, its outputs at `edge` over masses of every size."""
-    from dew.nn.kernels.templates.attention_algebra import _mean
-
-    def drawn(seeds: tuple, scale: float) -> tuple:
-        # Masses of every size from a quarter up, outputs and their directions at `scale`, from `seeds`.
-        weights, outputs = normal_draw(seeds[0], (3, 4), (3, 4, 8))
-        direction = normal_draw(seeds[1], (3, 4), (3, 4, 8))
-        return ((jnp.abs(weights) + 0.25, outputs * scale), (direction[0], direction[1] * scale),
-                normal_draw(seeds[2], (4, 8))[0])
-
-    primals, direction, cotangent = drawn((6827, 6828, 6829), EDGES[edge])
-
-    def plain(weights, outputs):
-        return jnp.sum(weights[..., None] * outputs, axis=0) / jnp.sum(weights, axis=0)[..., None]
-
-    def draw(seed):
-        """A seed's masses, outputs, directions and cotangent at unit scale (the mesh order's check 1)."""
-        return drawn(([6827, seed], [6828, seed], [6829, seed]), 1.0)
-
-    assert_contract(lambda weights, outputs: _mean(weights, outputs, 0), primals, direction, cotangent,
-                    f"the finished merge's mean {edge}", plain_fn=plain,
                     draw=draw if edge == "normal" else None)

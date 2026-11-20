@@ -1203,13 +1203,15 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `value` `[R, K, Hk, D]`: a serving step's work list over its cache's rows, no row copied. `subtracted`
     an inference walk's fold of raw products (`MosaicForward.subtracted`). With `splits`, each query tile's
     keys are cut into that many slices, every output the slices' own along the query axis
-    (`MosaicForward.splits`), which XLA merges (`attention_decode`). With `scales` (an inference walk's),
-    `key` and `value` are quantized codes, int8 or an FP8, and `scales` the keys' and the values'
-    `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads the keys and values they
-    dequantize to, each converted to the query's dtype in its program (`_Codes`). `scaled` launches the
-    scaled op whatever the call's values (`MosaicForward.scaled`: a mainloop whose own kernel holds no scale
-    gives it a call some row of which can be scaled); `bounded` the unscaled
-    one, a cache's call too, where its caller bounded its values (`MosaicForward.bounded`). `in_key` states
+    (`MosaicForward.splits`): with `Kept.OUTPUT`, two arrays in place of the five, the slices' padded
+    outputs and their stacked maxima and denominators (`attention_mosaic_forward._walked_outputs`), which its
+    caller merges where they lie (`merged.merged_split`). With `scales`
+    (an inference walk's), `key` and `value` are quantized codes, int8 or an FP8, and `scales` the keys' and
+    the values' `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads the keys and
+    values they dequantize to, each converted to the query's dtype in its program (`_Codes`). `scaled`
+    launches the scaled op whatever the call's values (`MosaicForward.scaled`: a mainloop whose own kernel
+    holds no scale gives it a call some row of which can be scaled); `bounded` the unscaled one, a cache's
+    call too, where its caller bounded its values (`MosaicForward.bounded`). `in_key` states
     `value` its keys' leading columns (`MosaicForward.in_key`): its programs read them from the key's slot,
     and the value array, a view of the key's, is no operand of the launch.
     """

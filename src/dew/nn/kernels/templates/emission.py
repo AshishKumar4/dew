@@ -20,14 +20,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax._src import ad_util, core as jax_core, pjit
+from jax._src import ad_util, core as jax_core, hijax, pjit
 from jax._src.pallas import mpmd, pallas_call, primitives as pallas
 from jax._src.pallas.mosaic import primitives as tpu
 from jax._src.pallas.mosaic_gpu import core as gpu_core, primitives as gpu
 from jax._src.state import primitives as state, types as state_types
 from jax.experimental import pallas as pl
 
-from dew.nn import derivatives, programs
+from dew.nn import derivatives, precision, programs
 from dew.nn.kernels.templates import resources
 from dew.nn.kernels.templates.cost import Stated, Work
 
@@ -93,16 +93,23 @@ class Role:
         return unit(_mean(self.walks)) if self.walks else None
 
 
-def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None) -> Emitted:
+def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: Sequence[int] = ()
+            ) -> Emitted:
     """`body`, a kernel's jaxpr (its `mpmd_map`'s or its `pallas_call`'s), as each of a program's
     `warpgroups` warpgroups along `axis` runs it (`Emitted`; a program of one, no axis, a TPU's or an
-    mma.sync family's)."""
+    mma.sync family's). Its operands at the indices `device` are refs in device memory, each read and write
+    of them its bytes' device traffic (a Triton launch's blocks, which its loads and stores move: the decode
+    merge's, `merged._channel_block`)."""
     roles = []
     for index in range(warpgroups):
         counted = _Counting(axis, index)
-        counted.run(body, [None] * len(body.invars))
+        counted.run(body, [_DEVICE if at in device else None for at in range(len(body.invars))])
         roles.append(Role(counted.fixed, tuple(counted.walks)))
     return Emitted(tuple(roles))
+
+
+_DEVICE = object()
+"""A ref in device memory, as `emitted`'s walk holds it (`_Counting.equation` prices its reads and writes)."""
 
 
 _OPERATIONS = frozenset({
@@ -110,13 +117,15 @@ _OPERATIONS = frozenset({
     lax.gt_p, lax.le_p, lax.lt_p, lax.max_p, lax.min_p, lax.mul_p, lax.ne_p, lax.neg_p, lax.not_p, lax.or_p,
     lax.rem_p, lax.select_n_p, lax.shift_left_p, lax.shift_right_logical_p, lax.shift_right_arithmetic_p,
     lax.sign_p, lax.sub_p, lax.xor_p, lax.integer_pow_p, lax.square_p, lax.round_p,
-    lax.one_minus_square_p, ad_util.add_jaxvals_p, lax.clz_p, lax.is_finite_p, lax.erf_p, lax.expm1_p})
+    lax.one_minus_square_p, ad_util.add_jaxvals_p, lax.clz_p, lax.is_finite_p, lax.erf_p, lax.expm1_p,
+    lax.nextafter_p, precision.correctly_rounded_divide_p})
 """Elementwise operations of the CUDA cores, one an output element (a cotangent's sum, `add_any`, among
 them; a leading-zero count, `clz`, an integer instruction the finish's exponent reads a subnormal's by,
 `dew.nn.float_bits.binade_of`). A finiteness test is a magnitude's comparison (XLA's elemental emitter: fabs
 and an fcmp), an erf XLA's own rational polynomial (xla/codegen/intrinsic/erf.cc: FMAs and a divide), and an
 expm1 CUDA's expm1f, whose fp32 SASS issues FMAs alone, no MUFU (sm80, probe FS-LIBM2: ten FFMAs and three
-FADDs, where an expf issues a MUFU.EX2)."""
+FADDs, where an expf issues a MUFU.EX2); a float's neighbour (`nextafter`) an integer step of its bits; a
+correctly rounded fp32 division (`precision.correctly_rounded_divide`) PTX's `div.rn.f32`, a division's."""
 
 _REDUCTIONS = frozenset({lax.reduce_max_p, lax.reduce_min_p, lax.reduce_sum_p, lax.reduce_prod_p,
                          lax.reduce_and_p, lax.reduce_or_p, lax.reduce_xor_p})
@@ -150,13 +159,13 @@ _FREE = frozenset({
     gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p, state.get_p,
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
     lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
-    lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p})
+    lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p, ad_util.stop_gradient_p})
 """What moves no data between memories and computes nothing a unit's rate prices: synchronization, layouts,
 indices, a value's elements rearranged among a role's registers (a gather's, a slice's, a concatenation's;
 every layout move the Pallas fuser tiles: a dynamic slice and its update, whose index arithmetic is scalar,
 which nothing counts, a split, a stack, a tile and an unstack, so a fused prologue's stage holds no
-operation the counter cannot price, `fused_gemm._split`), and its reads and writes between its registers
-and its scoped refs, which its products' operands and its copies count."""
+operation the counter cannot price, `fused_gemm._split`), its reads and writes between its registers and
+its scoped refs, which its products' operands and its copies count, and a stopped gradient, its operand."""
 
 _PRODUCTS = frozenset({gpu.wgmma_ref_p, gpu.tcgen05_mma_p})
 """Tensor-core products whose operands' shapes their transforms state (`_product`)."""
@@ -223,7 +232,7 @@ def _bytes(aval) -> int:
     return _elements(aval) * jnp.dtype(aval.dtype).itemsize
 
 
-def _times(work: Work, count: float) -> Work:
+def repeated(work: Work, count: float) -> Work:
     """`work` repeated `count` times in a chain: its every unit's, and its span."""
     return Work(**{field.name: getattr(work, field.name) * count for field in dataclasses.fields(Work)
                    if field.name != "kernels"}, kernels=work.kernels)
@@ -393,10 +402,28 @@ class _Counting:
                 return np.asarray(atom.val)[()] if np.ndim(atom.val) == 0 else atom.val
             return held.get(atom)
 
+        # The variables a later equation or the jaxpr's outputs read: a swap's old value is live where read.
+        live = {atom for atoms in (*(equation.invars for equation in jaxpr.eqns), jaxpr.outvars)
+                for atom in atoms if isinstance(atom, jax_core.Var)}
         for equation in jaxpr.eqns:
-            outputs = self.equation(equation, [read(atom) for atom in equation.invars])
+            values = [read(atom) for atom in equation.invars]
+            outputs = self.moved(equation, values, live) or self.equation(equation, values)
             held.update(zip(equation.outvars, outputs, strict=True))
         return [read(atom) for atom in jaxpr.outvars]
+
+    def moved(self, equation, values: list, live: set) -> list | None:
+        """A read or write of a ref in device memory (`emitted`'s `device`) counted as the bytes it moves,
+        its outputs unknown; None for any other equation. A read and a swap read the old value where it is
+        `live` (a later equation or the jaxpr's outputs read it: a swap a load and a store, as Triton lowers
+        it), a swap a store alone where it is dropped."""
+        primitive = equation.primitive
+        if primitive not in (state.get_p, state.swap_p) or not values or values[0] is not _DEVICE:
+            return None
+        old = equation.outvars[0]
+        read = _bytes(old.aval) if old in live else 0
+        written = _bytes(equation.invars[1].aval) if primitive is state.swap_p else 0
+        self.add(Work(device_bytes=read + written))
+        return [None] * len(equation.outvars)
 
     def equation(self, equation, values: list) -> list:
         primitive, params = equation.primitive, equation.params
@@ -462,8 +489,8 @@ class _Counting:
             return region(self, equation, values) or unknown
         elif primitive is derivatives.marked_call_p and isinstance(params["kind"], _MARKS):
             return self.marked(params, values)
-        elif (inner := programs.called(equation)) is not None:
-            return self.run(inner, values)
+        elif (expanded := _expanded(equation)) is not None:
+            return self.run(expanded[0], values, expanded[1])
         elif primitive not in _FREE:
             raise Unpriced(f"no rule prices {primitive} in a kernel's body")
         return unknown
@@ -523,7 +550,7 @@ class _Counting:
             # The first and last trips each take their own work in place of a steady one's.
             for at in _PLACES[1:]:
                 taken = _mean([trip(at, parity).loops[-1].work for parity in (0, 1)])
-                self.fixed = self.fixed + taken + _times(found.work, -1)
+                self.fixed = self.fixed + taken + repeated(found.work, -1)
 
     def warps(self, equation, values: list) -> None:
         """A warpgroup's warps each running its role (`plgpu.warp_map`'s `mpmd_map`: tcgen05's load and
@@ -568,7 +595,7 @@ class _Counting:
             self.loops[-1].work = self.loops[-1].work + found.work
             self.loops[-1].marks += found.marks
         elif walks and found.marks:
-            self.walks.append(_times(found.work, 1 / found.marks))
+            self.walks.append(repeated(found.work, 1 / found.marks))
         else:
             self.fixed = self.fixed + found.work
 
@@ -631,9 +658,31 @@ _REGIONS = {pallas.run_scoped_p: _Counting.scoped, lax.while_p: _Counting.loop, 
 where it leaves them unknown."""
 
 
+def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
+    """The program an equation runs as it lowers, where it is one of JAX's primitives' own, and its
+    constants: a call's (`programs.called`); a high-level operation's expansion (`HiPrim`'s `to_lojax`: a
+    declared tangent's, a contraction whose transpose it states); the construct's own operation's value (the
+    algebra's law, `scaled.primitive`, as a kernel's lowering runs it: the decode merge's, `merged`). None
+    for any other."""
+    # The law's module read here: `dew.algebra` reads this module's counts as it is imported (`cost`).
+    from dew.algebra import scaled
+
+    primitive, params = equation.primitive, equation.params
+    if (inner := programs.called(equation)) is not None:
+        return inner, ()
+    if primitive is hijax.call_hi_primitive_p:
+        expansion = functools.partial(primitive.to_lojax, **params)
+    elif (made := scaled.MADE.get(primitive)) is not None:
+        expansion = functools.partial(made[0], **params)
+    else:
+        return None
+    traced = jax.make_jaxpr(expansion)(*(v.aval for v in equation.invars))
+    return traced.jaxpr, traced.consts
+
+
 def _mean(walks: Sequence[Work]) -> Work:
     """A step of `walks`, a role's loops: their steps' mean (`Role.step`)."""
-    return _times(sum(walks, Work()), 1 / len(walks))
+    return repeated(sum(walks, Work()), 1 / len(walks))
 
 
 def _envelope(works) -> Work:

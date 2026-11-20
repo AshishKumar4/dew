@@ -10,12 +10,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from kernel_compile import lowered_for
 
-from dew.nn import derivatives, programs
-from dew.nn.kernels.templates import emission
+from dew.nn import programs
+from dew.nn.kernels.templates import emission, mosaic
 from dew.nn.kernels.templates.cost import Stated, Work
-
-_STEP = derivatives.marked(derivatives.WalkStep(), lambda index: index)
-"""A walk step's mark, as `mosaic.stepped` makes it."""
 
 _ROW = jax.ShapeDtypeStruct((128,), jnp.float32)
 
@@ -35,7 +32,7 @@ _TRIPS = jax.ShapeDtypeStruct((), jnp.int32)
 def _walked(work):
     """A walk its data decides the trips of, each step marked and doing `work` to the row."""
     def step(index, row):
-        _STEP(index)
+        mosaic.step_index(index)
         return work(row)
 
     return lambda row, trips: lax.fori_loop(0, trips, step, row)
@@ -84,7 +81,7 @@ def test_a_walk_of_stated_trips_counts_each_trip_where_it_stands():
     no step a launch's statement multiplies."""
     def walk(row):
         def step(row, index):
-            _STEP(index)
+            mosaic.step_index(index)
             return row + 1, None
 
         return lax.scan(step, row, jnp.arange(4))[0]
@@ -93,8 +90,61 @@ def test_a_walk_of_stated_trips_counts_each_trip_where_it_stands():
     assert [(role.fixed.operations, role.step(_operations)) for role in counted.roles] == [(512, None)] * 2
 
 
+@pytest.mark.parametrize("device", [True, False], ids=["device", "scoped"])
+def test_a_kernels_reads_and_writes_of_a_device_ref_count_their_bytes_as_device_traffic(device):
+    """A kernel body's read of a `[4, 8]` fp32 ref and write of an `[8]` fp32 row (`state.get` and `swap`)
+    count their 160 bytes as device traffic where its launch states the ref in device memory (`emitted`'s
+    `device`: a Triton launch's blocks, the decode merge's), each a step of a walk of its own counted per
+    step, and nothing where it states none (a scoped ref's, which its copies price): a block a narrower
+    program rereads is traffic a launch's price takes (the merge P0's base review of 05f8cec4d, F8)."""
+    def body(source, target, trips):
+        def step(index, carry):
+            mosaic.step_index(index)
+            target[...] = jnp.sum(source[...], axis=0)
+            return carry
+
+        lax.fori_loop(0, trips[...], step, 0)
+
+    shapes = (jax.ShapeDtypeStruct((4, 8), jnp.float32), jax.ShapeDtypeStruct((8,), jnp.float32),
+              jax.ShapeDtypeStruct((), jnp.int32))
+    (state,) = (equation for equation in jax.make_jaxpr(lambda *arrays: _with_refs(body, *arrays))(
+        *shapes).jaxpr.eqns if equation.primitive.name == "run_state")
+    (role,) = emission.emitted(state.params["jaxpr"], 1, None, device=(0, 1) if device else ()).roles
+    assert role.step(lambda work: work.device_bytes) == (4 * 8 * 4 + 8 * 4 if device else 0)
+
+
+@pytest.mark.parametrize("live", [True, False], ids=["live", "dropped"])
+def test_a_swap_of_a_device_ref_reads_its_old_value_where_it_is_live(live):
+    """A swap of eight fp32 elements of a device ref counts 64 bytes where its old value feeds an output
+    (a load and a store, as Triton lowers it) and 32 where the old value is dropped (a store alone): the
+    merge P0's base review of aa990591f, F6."""
+    shapes = (jax.ShapeDtypeStruct((8,), jnp.float32),) * 2
+    traced = jax.make_jaxpr(lambda *arrays: _with_refs(_swap_body(live), *arrays))(*shapes)
+    (state,) = (equation for equation in traced.jaxpr.eqns if equation.primitive.name == "run_state")
+    (role,) = emission.emitted(state.params["jaxpr"], 1, None, device=(0,)).roles
+    assert role.fixed.device_bytes == (64 if live else 32)
+
+
+def _swap_body(live: bool):
+    """A body swapping eight ones into its first ref, its old value written to its second where `live`."""
+    from jax._src.state import primitives as state_primitives
+
+    def body(target, out):
+        old = state_primitives.ref_swap(target, (), jnp.ones(8, jnp.float32))
+        if live:
+            out[...] = old
+    return body
+
+
+def _with_refs(body, *arrays):
+    """`body` run over refs of `arrays` (`jax.experimental.pallas`' `run_state`), its jaxpr's operands
+    refs as a kernel's are."""
+    from jax._src.state.discharge import run_state
+    return run_state(lambda refs: body(*refs))(arrays)
+
+
 def _one(row, index):
-    _STEP(index)
+    mosaic.step_index(index)
     return jnp.exp(row)
 
 
@@ -127,7 +177,7 @@ def test_a_scoped_bodys_results_resolve_the_roles_after_it():
 
 
 def _converted(row, index):
-    _STEP(index)
+    mosaic.step_index(index)
     return row.astype(jnp.bfloat16).astype(jnp.float32)
 
 
@@ -378,7 +428,7 @@ def test_a_walks_guards_on_its_steps_place_count_at_their_trips():
     none apart: each guard read at the trips it decides, not taken every step."""
     def walk(row, lo, hi):
         def step(index, row):
-            _STEP(index)
+            mosaic.step_index(index)
             row = lax.cond(index == lo, jnp.exp, lambda row: row, row)
             return lax.cond(index + 1 < hi, jnp.exp, lambda row: row, row)
 
@@ -394,7 +444,7 @@ def test_a_walks_guards_on_its_steps_parity_count_one_branch_a_step():
     walk reading ahead issues into) counts one a row a step, not both guards' each step."""
     def walk(row, lo, hi):
         def step(index, row):
-            _STEP(index)
+            mosaic.step_index(index)
             row = lax.cond(index % 2 == 0, jnp.exp, lambda row: row, row)
             return lax.cond(index % 2 == 1, jnp.exp, lambda row: row, row)
 

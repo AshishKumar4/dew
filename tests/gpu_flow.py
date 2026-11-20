@@ -9,6 +9,7 @@ optional package, too little free device memory), is reported skipped with its r
 and the cells after it still run. A cell function that keeps its test's grid in
 its own `pytest.mark.parametrize` marks gives a cell a parameter set (`cells_of`)."""
 
+import contextvars
 import dataclasses
 import functools
 import inspect
@@ -18,7 +19,6 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 
 import lane_environment
 import pytest
-from generation_support import lowers_as, runnable
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,6 +104,20 @@ def _reported(error: BaseException) -> tuple[str, list[tuple[str, int]]]:
     return text, [(frame.filename, frame.lineno or 0) for frame in frames]
 
 
+def _raised(error: BaseException) -> str:
+    """What `error` is in one line: its type and its message's first line, as `traceback` reports them, none
+    of the notes a library appends after it (JAX's line that it removed its internal frames, which a record
+    of a deferred cell held alone where it took the report's last line: 45 GEMM certificate cells on a
+    GH200 tier)."""
+    message = str(error).splitlines()
+    return type(error).__name__ + (f": {message[0]}" if message else "")
+
+
+RUNNING: contextvars.ContextVar[str | None] = contextvars.ContextVar("running_cell", default=None)
+"""The label of the cell `run_cells` is running: what a computation a cell compiles ahead names itself by
+(`test_native_certificates._native`), so its calls are counted within the cell and a cell its prepare
+deferred, which makes more calls in its run than in its prepare, never moves another cell's count."""
+
 REPORTED: list[dict] = []
 """The counts of each outermost flow run since the last test's report took them (`run_cells`), which
 tests/conftest.py reports as the test's JUnit property `cells`: a flow none of whose cells ran is
@@ -121,7 +135,7 @@ def _device() -> str:
     return jax.devices()[0].device_kind
 
 
-def _begun() -> frozenset[str] | None:
+def _tried() -> frozenset[str] | None:
     """The sites the store of a GPU tier part's prepare has tried to prepare
     (`truths_ahead.CompiledTruths.preparing`), read before a cell runs (`_deferred`); none outside one."""
     import tier_wire
@@ -131,29 +145,30 @@ def _begun() -> frozenset[str] | None:
     return frozenset(store.tried) if tier_wire.preparing() and store is not None and store.prepare else None
 
 
-def _deferred(label: str, text: str, frames: list[tuple[str, int]], begun: frozenset[str] | None) -> bool:
+def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
+              tried_before: frozenset[str] | None) -> bool:
     """Whether a cell that raised is deferred to its run (`run_cells`): in a GPU tier part's prepare
-    (`begun`, its store's sites tried before the cell, `_begun`), where nothing computes. A cell that tried
-    no site before it raised, or one its check's prepare did not finish whole (a trace or a compile that
-    raised, an arm's after its site's truths were written: `truths_ahead.CompiledTruths.preparing`),
-    computed past or failed within the programs its prepare holds, and is recorded deferred
-    (`truths_ahead.DEFERRED`, where it raised and why), its run computing and judging it with the flow's
-    other cells served by the store and naming the test unprepared (tests/conftest.py); one whose every site
-    it began its prepare finished, and then raised, checked what its prepare gives in their place (an
-    `ahead_arm`'s zeros: a later failure in its prepare judges nothing) and passes its prepare unrecorded,
-    its run judging it (row 8555: every such cell was named unprepared, falsely)."""
+    (`tried_before`, its store's sites tried before the cell, `_tried`), where nothing computes. A cell that
+    tried no site before it raised, or one its check's prepare did not finish whole (a trace or a compile that
+    raised, an arm's after its site's truths were written: `truths_ahead.CompiledTruths.preparing`), computed
+    past or failed within the programs its prepare holds, and is recorded deferred (`truths_ahead.DEFERRED`,
+    where it raised and why), its run computing and judging it with the flow's other cells served by the store
+    and naming the test unprepared (tests/conftest.py); one whose every site it began its prepare finished,
+    and then raised, checked what its prepare gives in their place (an `ahead_arm`'s zeros: a later failure in
+    its prepare judges nothing) and passes its prepare unrecorded, its run judging it (row 8555: every such
+    cell was named unprepared, falsely)."""
     import os
 
     import truths_ahead
 
-    if begun is None:
+    if tried_before is None:
         return False
     store = truths_ahead.COMPILED.get()
-    new = store.tried - begun
+    new = store.tried - tried_before
     if not new or not new <= store.done:
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
-        truths_ahead.unprepared(store.directory, test, frames[::-1],
-                                f"{label}: {text.splitlines()[-1][:400]}", truths_ahead.DEFERRED)
+        truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {_raised(error)[:400]}",
+                                truths_ahead.DEFERRED)
         print(f"cell deferred to its run: {label}", flush=True)
     return True
 
@@ -163,6 +178,11 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     after the last, but in a GPU tier part's prepare, where a cell that computes is deferred to its run
     (`_deferred`); the cells this device cannot run, or that skip themselves, reported skipped, their
     labels returned; an outermost flow's counts reported (`REPORTED`)."""
+    # Read when the flow runs: generation_support reads, in a prepare, model_flows' node target, whose
+    # module imports this one, so importing it here made a flow module imported first refuse to import in
+    # every GPU tier part's prepare (a circular import: its sites went unprepared).
+    from generation_support import lowers_as, runnable
+
     global _depth
     _depth += 1
     failed: list[tuple[str, str, list[tuple[str, int]]]] = []
@@ -174,7 +194,8 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 skipped.append(cell.label)
                 continue
             print(f"cell: {cell.label}", flush=True)
-            begun = _begun()
+            tried_before = _tried()
+            running = RUNNING.set(cell.label)
             try:
                 cell.run()
             except pytest.skip.Exception as skip:
@@ -185,12 +206,14 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
                 # `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end
                 # the flow: kept with its label, and raised with every other cell's after the last.
                 text, frames = _reported(error)
-                if _deferred(cell.label, text, frames, begun):
+                if _deferred(cell.label, error, frames, tried_before):
                     deferred += 1
                 else:
                     failed.append((cell.label, text, frames))
             else:
                 passed += 1
+            finally:
+                RUNNING.reset(running)
     finally:
         # Counted however the flow ends, so a flow stopped early still reports what it ran.
         _depth -= 1
