@@ -260,7 +260,7 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
       `512 // 160 = 3` vs rounded `512 // 256 = 2`; keeps Q in TMEM and emits `RegisterModel.most == 2`.
     - `q128/v128` (256 base cols -> 256 rounded = 2 CTAs/SM, 320 with Q -> 512 rounded = 1 CTA/SM): drops
       residency 2 -> 1, so Q stays in SMEM and emits `RegisterModel.most == 2`.
-    - `q128/v64` (`stages=5`, >120 KiB K/V rings): 192 cols with Q -> 256 rounded (2 CTAs/SM by TMEM and
+    - `q128/v64` (`stages=5`, >120 KiB K/V rings): 192 base cols -> 256 with Q (2 CTAs/SM by TMEM and
       registers) while SMEM caps residency at 1; keeps Q in TMEM and emits `RegisterModel.most == 1`."""
     from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
 
@@ -292,7 +292,7 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
     # q128/v64 (stages=5, >120 KiB rings): TMEM (192->256) and registers allow 2 CTAs, SMEM caps to 1.
     for q_width, v_width, pinned, expect_cols, expect_copy, expect_most in (
             (64, 32, v32_tiles, 192, True, 2), (128, 128, ROWS_TILES, 256, False, 2),
-            (128, 64, smem_tiles, 192, True, 1)):
+            (128, 64, smem_tiles, 256, True, 1)):
         q = jnp.ones((1, 128, 1, q_width), jnp.bfloat16)
         k = jnp.ones((1, 256, 1, q_width), jnp.bfloat16)
         v = jnp.ones((1, 256, 1, v_width), jnp.bfloat16)

@@ -559,8 +559,10 @@ class MosaicForward(_Mainloop[Tiles]):
                            initial, drop, table, sources, scales, query_params, residuals=residuals,
                            interpret=interpret)
             full_v = _width(value.shape[-1], family, query.dtype)
-            products = tuple(self._products(ba, dataclasses.replace(config, columns=width), target)
-                             for _, width in column_slices(full_v, config.columns))
+            widths = [width for _, width in column_slices(full_v, config.columns)]
+            by_width = {w: self._products(ba, dataclasses.replace(config, columns=w), target)
+                        for w in dict.fromkeys(widths)}
+            products = tuple(by_width[w] for w in widths)
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret,
                 "counts": not self.scaled, "registered": registered, "tmem_columns": target.tmem_columns}
         scaled = (self.scaled or (self.cached(table, sources, scales) and not self.bounded)) and not decides
@@ -1771,7 +1773,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                    if not split_queries(layout)), None)
         if dq is None:
             return None
-        residing = [] if dq.products_overlap or dq.programs(1) < 2 else [
+        residing = [] if dq.products_overlap or (not dq.budgets_registers and dq.programs(1) < 2) else [
             lambda config: fits(config) and self.resident(ba, config, target) >= 2]
         for wanted in (*residing, fits):
             for columns in (1, 2, 4):
