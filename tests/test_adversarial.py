@@ -104,7 +104,8 @@ def ladd_step(dtype, inputs):
     def tree(prefix):
         return jax.tree.map(lambda value: jnp.asarray(value, dtype), reference.nested(inputs, prefix))
 
-    pixels = inputs["pixels"]
+    # Pixels at the step's precision, as a float64 run's are (`unit_range`).
+    pixels = jnp.asarray(inputs["pixels"], dtype)
     layers = {name: {"kernel": tree("teacher")[name]} for name in ("layer_a", "layer_b")}
     task = AdversarialDistillationObjective(
         Tokens(settings["width"]), Flow()(), InputSpec(Field("image", pixels.shape[1:])),
