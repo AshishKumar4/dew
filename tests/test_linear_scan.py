@@ -636,7 +636,8 @@ def _in_turn(first, second):
     return _Rows([*first, *second], inner=first.inner)
 
 
-@pytest.mark.parametrize(("corrects", "per_key", "values_read", "across", "before"), CHUNK_FORMS, ids=FORM_IDS)
+@pytest.mark.parametrize(("corrects", "per_key", "values_read", "across", "before"), CHUNK_FORMS,
+                         ids=FORM_IDS)
 def test_every_chunk_identitys_right_side_composes_over_two_blocks_of_any_sizes(corrects, per_key,
                                                                                  values_read, across, before):
     """Each chunk identity's right side as declared (`linear_scan._identities`: the dual form, and where
