@@ -1415,7 +1415,8 @@ def told(out: Path, code: int) -> int:
             shown = (lines if len(lines) <= 2 * TOLD_LINES
                      else [*lines[:TOLD_LINES], "...", *lines[-TOLD_LINES:]])
             print("\n".join([f"RED {found['name']}", *(f"  | {line}" for line in shown)]), flush=True)
-    red = int(json.loads((REPO / ".armada.json").read_text()).get("task", {}).get("redExit", 0))
+    config = REPO / ".armada.json"
+    red = int(json.loads(config.read_text()).get("task", {}).get("redExit", 0)) if config.is_file() else 0
     return code or (red if any(found["exitCode"] for found in rows) else 0)
 
 
