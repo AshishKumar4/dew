@@ -2122,7 +2122,7 @@ def weights_parts(weights: jax.Array, dtype, rows: bool = False, *, split: bool 
     """Weights `[bq, bk]` (fp32) narrowed for their product with an operand of `dtype` (`summed_products`):
     fp16's at a power-of-two scale that keeps them in its range (`_fp16_scaled`, a row's with `rows`),
     which its product takes back; with `split`, two fp16 parts at that one scale (`split_parts`)."""
-    if dtype == jnp.float16:
+    if jnp.dtype(dtype) == jnp.float16:
         if split:
             scaled, exponent = _scaled(weights, rows)
             return tuple(product.Scaled(part, exponent) for part in split_parts(scaled))
@@ -2137,7 +2137,6 @@ def narrowed(x: jax.Array, dtype) -> jax.Array:
     if isinstance(part, product.Scaled):
         return taken_back(part.value.astype(jnp.float32), part.exponent)
     return part.astype(jnp.float32)
-
 
 
 def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
