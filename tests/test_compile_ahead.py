@@ -95,13 +95,15 @@ def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, 
                    tracker=tracker)
 
 
+@functools.cache
 def need_ahead(generation: str, *, split: int, remat: str, tiled: bool = False) -> int:
     """The bytes the fine-tuned step (`fine_tune`) compiled ahead for a compile-only GPU of `generation`
     needs at `split` microbatches and `remat`, its head tiled where asked: the headroom its compile left of
     a room past all (`gpus`' 64 GiB, which states exactly that allocator limit, `memory_limited_to`), taken
     from that room. A cell states its room from such needs, so the plan it claims of a room holds whatever
     the step's GEMM route or workspace makes them; XLA schedules a tighter room's compile for less, so a cell
-    states the least room its claim allows and reads its premise from the build's own probes too."""
+    states the least room its claim allows and reads its premise from the build's own probes too. Measured
+    once a process: the cells that read one need share it (`shared_setup("sm90_full_tiled_needs")`)."""
     from dew.training.ahead import compile_ahead
 
     room = 2**36
@@ -934,6 +936,7 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     assert trainer.plan == ahead.plan and recompute_record(trainer.objective) == plan["remat"]
 
 
+@pytest.mark.shared_setup("sm90_full_tiled_needs")
 @pytest.mark.parametrize("several", [False, True], ids=["one microbatch", "several"])
 def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_fit(tmp_path, monkeypatch,
                                                                                     several):
@@ -980,6 +983,7 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
                                                                              plan["head_fused"])
 
 
+@pytest.mark.shared_setup("sm90_full_tiled_needs")
 def test_a_fused_tiled_heads_plan_compiled_ahead_with_its_frontier_restores_the_admitted_plan(tmp_path,
                                                                                               monkeypatch):
     """A fused tiled head's plan compiled ahead with its frontier (`FitSearch.above`, which moves the
