@@ -352,32 +352,6 @@ def _seek_lines(file: BinaryIO, offset: int) -> None:
             raise ValueError("file reader position exceeds its decompressed stream")
 
 
-class _SchemaFacts(Mapping[str, object]):
-    """A raw Parquet or Arrow store's facts (`Files._metadata`), read off its files' schema the first time
-    one of them is asked for: a fact its schema can never hold (`HELD`), asked by name, is absent without
-    opening a file."""
-
-    HELD = frozenset({"class_names", "rows", "count_rules"})
-    """The facts a raw store's schema states (`Files._metadata`), and no other."""
-
-    def __init__(self, files: Files):
-        self._files = files
-
-    def __getitem__(self, key: str) -> object:
-        if key not in self.HELD:
-            raise KeyError(key)
-        return self._files._metadata[key]
-
-    def __contains__(self, key: object) -> bool:
-        return key in self.HELD and key in self._files._metadata
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._files._metadata)
-
-    def __len__(self) -> int:
-        return len(self._files._metadata)
-
-
 _EXPORTING = re.compile(r"(^|/)shards/[0-9a-f]{32}/")
 """Where an export's writer puts its files before its manifest commits them (`dew.data.sinks.export`'s
 `shards/<writer>`), which a directory's raw discovery refuses (row 9015)."""
@@ -1142,11 +1116,6 @@ class Files(Dataset):
         return {"row_index": hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest()}
 
     def metadata(self) -> Mapping[str, object]:
-        """Its facts (`_metadata`): a raw Parquet or Arrow store's read off its schema only once a fact its
-        schema holds is asked for (`_SchemaFacts`), so a plan that asks it none (a streamed mix pinning its
-        members) opens none of its files (row 9009)."""
-        if self.committed is None and self.kind in ("parquet", "arrow"):
-            return _SchemaFacts(self)
         return self._metadata
 
     def stated(self) -> Mapping[str, object]:
