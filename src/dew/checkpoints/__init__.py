@@ -1357,22 +1357,19 @@ class Checkpoints:
             return local if persistent is None else persistent
         return max(persistent, local)
 
-    def resumed(self, resume: Resume = "auto", *, unrelated: Callable[[int], bool] | None = None
-                ) -> int | None:
+    def resumed(self, resume: Resume = "auto") -> int | None:
         """The step a run continues under `resume`, the `latest`, or None where it starts afresh:
         "auto" continues one where the directory holds it; "require" refuses a directory with none,
         so a job that must continue never trains from scratch; "never" refuses one that holds any step,
         a model's alone (a weights-only save, which no resume reads) among them, which a run started
-        afresh would write beside. Under "auto" a directory holding steps none of which resumes is refused
-        where `unrelated` finds the newest another run's (a trainer's: another computation), and started
-        afresh where it is the run's own (a rerun's of its ranked weights-only steps; row 9019)."""
+        afresh would write beside. A trainer refuses, under "auto" too, a directory whose steps none of
+        which resumes are another run's (`dew.training.Trainer`'s one check of it, row 9019)."""
         latest = self.latest
         if resume == "require" and latest is None:
             raise ValueError(f"resume='require' continues a run, and {self.directory} holds no checkpoint "
                              "to continue")
         held = latest if latest is not None else self._newest(None)
-        if held is not None and (resume == "never" or (
-                latest is None and unrelated is not None and unrelated(held))):
+        if held is not None and resume == "never":
             raise ValueError(f"resume={resume!r} starts a run afresh here, and {self.directory} holds a step "
                              f"at {held}{'' if latest is not None else ' that no run resumes'}; give the new "
                              "run a directory of its own")

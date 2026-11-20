@@ -190,7 +190,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process, sig
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched_state
-from dew.training.startup import Startup, computation_differs, run_data
+from dew.training.startup import Startup, computation_differs, resumed_step, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
@@ -767,10 +767,7 @@ class Trainer(Generic[Loss, Effects]):
                                stated and (stated, self._start_owner()))
         abstract, checkpoints = draw.abstract, self.checkpoints
         # Each process lists the checkpoints itself, one listing may lag another's: all resume or none.
-        step = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.resumed(
-            resume, unrelated=lambda held: bool(computation_differs(  # Another run's model alone (row 9019).
-                checkpoints.artifact(held), self._artifact(), checkpoints.training(held),
-                self.objective.training_record()))))
+        step = resumed_step(self, resume)
         if checkpoints is not None and step is not None:
             abstract = self._staging.state(abstract.with_window(checkpoints.accumulation_template(step)),
                                           self._staging.staged_shapes)
@@ -1530,7 +1527,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")
         if initial is not None and checkpoints is not None and resume == "never":
-            agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume))
+            resumed_step(self, resume)
         if initial is not None:
             # A supplied state's trees are held as dicts too (`initial_state`), its optimizer's and
             # accumulation's mirrors of the parameters with them, each pipelined run stacked by stage. Its
@@ -1600,9 +1597,7 @@ class Trainer(Generic[Loss, Effects]):
     def _resumed_position(self, resume: Resume) -> bytes | None:
         """The data position a resume of this run reads from (`Checkpoints.position`), none for a fresh run,
         one that saved none, or one resumed relaxed whose saved position no reader here reads."""
-        checkpoints = self.checkpoints
-        step = None if checkpoints is None else agreed_same("newest checkpoint",
-                                                            lambda: checkpoints.resumed(resume))
+        checkpoints, step = self.checkpoints, resumed_step(self, resume)
         if checkpoints is None or step is None:
             return None
         try:

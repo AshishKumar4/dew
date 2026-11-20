@@ -1197,7 +1197,7 @@ def test_stats_bounds_preprocessing_and_counts_only_the_inspected_records(read):
         processed.append(row["i"])
         return {**row, "twice": 2 * row["i"]}
 
-    chain = Memory(rows("a", 40)).named("sample").read(read).loading(READ)
+    chain = Memory(rows("a", 40)).named("sample").read(read)
     counts = chain.map(prepare, identity="stats-prepare@1").filter_map(drop_thirds).stats(10)
     assert counts["data/rows/sample"] == 10
     assert counts["data/rows/sample"] + counts["data/rejected/sample/third"] == 15
@@ -1213,7 +1213,7 @@ def test_stats_stops_at_a_finite_sources_end(records):
         processed.append(row["i"])
         return row
 
-    chain = Memory(rows("a", 7)).named("sample").loading(READ)
+    chain = Memory(rows("a", 7)).named("sample")
     counts = chain.map(prepare, identity="stats-finite@1").filter_map(drop_thirds).stats(records)
     expected = 0 if records == 0 else 7
     assert processed == list(range(expected))
@@ -1229,7 +1229,7 @@ def test_stats_counts_one_to_one_chains_lazily(read):
         processed.append(row["i"])
         return {**row, "twice": 2 * row["i"]}
 
-    chain = Memory(rows("a", 7)).named("sample").read(read).loading(READ)
+    chain = Memory(rows("a", 7)).named("sample").read(read)
     counts = chain.map(prepare, identity="stats-one-to-one@1").stats(3)
     assert counts["data/rows/sample"] == 3
     assert processed == [0, 1, 2]
@@ -1764,3 +1764,61 @@ def test_a_token_holdouts_spans_are_resolved_by_one_scan_of_its_order():
     read = {int(row["text"][0][0]) // 100 * 100 for row in rows}
     held = [start for start in range(0, 800, 100) if start not in read]
     assert held and all(mapped[start] == 1 for start in held), (mapped, read)
+
+
+def drop_lasts_of_threes(row: dict) -> dict:
+    """Drop the last row of every three, so no share of the rows read rejects more than a third."""
+    from dew.data import Rejected
+
+    return Rejected("third") if row["i"] % 3 == 2 else row
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_reads_rejection_warning_is_its_loadings_warn_over(read, caplog):
+    """A read warns of a corpus that rejects more of its records than its loading's `warn_over` (1% by
+    default), a memory read's preparation as a streamed read's counter does, and not of one a higher
+    `warn_over` allows (row 9057: the share was fixed at 1%, and a memory read warned of none)."""
+    def warned(warn_over: float) -> bool:
+        caplog.clear()
+        loading = dataclasses.replace(READ, warn_over=warn_over)
+        chain = Memory(rows("a", 30)).named("sample").filter_map(drop_lasts_of_threes).repeat().batch(2)
+        stream = compile(chain, read=read, loading=loading).train(DataPartition())
+        try:
+            for _ in range(8):
+                next(stream)
+        finally:
+            stream.close()
+        return any(record.name == "dew.data.mixing" and record.levelname == "WARNING"
+                   for record in caplog.records)
+
+    assert warned(0.01) and not warned(0.5)
+
+
+@dataclass(frozen=True)
+class Pids:
+    """A step that notes, in `path`, the process each record is mapped in."""
+
+    path: str
+
+    def __call__(self, row):
+        import os
+
+        with open(self.path, "a") as noted:
+            noted.write(f"{os.getpid()}\n")
+        return row
+
+
+def test_stats_reads_with_the_loading_its_chain_states(tmp_path):
+    """`stats` over a chain that states its loading reads as it states (worker processes here), and over one
+    that states none reads serially, in this process (row 9058: a stated loading was read serially too)."""
+    import os
+
+    def mapped_in(chain) -> set[int]:
+        noted = tmp_path / f"pids-{len(list(tmp_path.iterdir()))}"
+        counts = chain.map(Pids(str(noted)), identity="pids@1").stats(4)
+        assert counts["data/rows/sample"] == 4
+        return {int(line) for line in noted.read_text().split()}
+
+    plain = Memory(rows("a", 16)).named("sample").read("indexed")
+    assert mapped_in(plain) == {os.getpid()}
+    assert os.getpid() not in mapped_in(plain.loading(Loading(workers=2)))

@@ -135,7 +135,7 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
     saved no position; a relaxed resume (`Trainer.data_resume`) refuses no position whose data can start
     again, the one decision fit makes too (`_fit.data_resumed`)."""
     checkpoints = trainer.checkpoints
-    step = None if checkpoints is None else checkpoints.resumed(resume)
+    step = resumed_step(trainer, resume)
     if checkpoints is None or step is None:
         return
     # The shares fit reads by, its layout placing the rows, the saved one's among them.
@@ -143,6 +143,30 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
         data_resumed(loader, trainer._stream_partition(),
                      functools.partial(checkpoints.position, step, DataPartition.of(trainer.device_mesh)),
                      resume=trainer.data_resume, step=step)
+
+
+def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "Resume") -> int | None:
+    """The step `trainer`'s run continues under `resume` (`Checkpoints.resumed`), as every process agrees it,
+    or None where it starts afresh: refused, under "auto" too, where its directory holds steps none of which
+    resumes and the newest trained another computation (`computation_differs`): another run's model alone,
+    beside which a fresh run would write (row 9019). The one check of it, every site's (row 9632)."""
+    from dew._coordination import agreed_same
+
+    checkpoints = trainer.checkpoints
+    if checkpoints is None:
+        return None
+
+    def continued() -> int | None:
+        step, held = checkpoints.resumed(resume), max(checkpoints.committed(), default=None)
+        if step is None and held is not None and resume == "auto" and computation_differs(
+                checkpoints.artifact(held), trainer._artifact(), checkpoints.training(held),
+                trainer.objective.training_record()):
+            raise ValueError(f"resume='auto' starts a run afresh here, and {checkpoints.directory} holds "
+                             f"another run's model at step {held}, which no run resumes; give the new run a "
+                             "directory of its own")
+        return step
+
+    return agreed_same("newest checkpoint", continued)
 
 
 def computation_differs(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:

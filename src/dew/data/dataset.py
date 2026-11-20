@@ -465,6 +465,11 @@ class Loading:
     host: Host | None = None
     """The host automatic workers are sized for (`resolved`): this process's (`Host.current`) where None,
     or another's, its CPUs, memory and a worker's start as it states them."""
+    warn_over: float = 0.01
+    """The share of a corpus's attempted records it may reject before the read warns, once (data.md, the
+    counts): a streamed read's counter (`dew.data.mixing.Accepted`) and a memory read's preparation
+    (`dew.data.mixing.warn_rejections`) alike. A filter that drops more than one record in a hundred is
+    worth a look; a read that expects to drop more states its own."""
 
     def resolved(self, records: pygrain.IterDataset, *, reads: int, batches: int | None = None) -> Loading:
         """These settings with automatic workers and read buffer sized for `host` (this process's
