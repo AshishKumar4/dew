@@ -1722,3 +1722,45 @@ def test_a_concat_states_its_datasets_facts_with_their_counts_added():
     facts = concat(counted).facts()
     assert (facts["rows"], facts["language"]) == (10, "en")
     assert "rows" not in concat([counted[0], Memory(rows("c", 2)).map(Scaled(2))]).facts()
+
+
+def test_a_nested_records_numbers_stack_beside_its_opaque_messages():
+    """A nested record whose mapping holds an opaque message list beside numbers and strings batches field by
+    field: the messages a list of each record's, the numbers and strings stacked with a batch axis (row
+    9054: the opaque list kept the whole mapping a list of records)."""
+    from dew.data.dataset import record_batch
+
+    rows = [{"meta": {"id": np.int32(index), "lang": "en", "messages": [{"role": "user", "content": "hi"}]},
+             "x": np.float32(index)} for index in range(3)]
+    batch = record_batch(rows)
+    assert batch["meta"]["id"].tolist() == [0, 1, 2] and batch["meta"]["lang"].tolist() == ["en"] * 3
+    assert batch["meta"]["messages"] == [row["meta"]["messages"] for row in rows]
+
+
+def test_a_token_holdouts_spans_are_resolved_by_one_scan_of_its_order():
+    """A token holdout's spans are resolved once, by one scan of the order before it, which the plan's
+    fingerprint and the reader's split share: a document the trained branch takes none of is mapped once,
+    by that scan (row 9011: the plan and each reader scanned it, three maps of it)."""
+    mapped: collections.Counter[int] = collections.Counter()
+
+    @dataclass(frozen=True)
+    class Counted:
+        def __call__(self, row):
+            mapped[int(row["text"][0])] += 1
+            return row
+
+    documents = [{"text": np.arange(100 * index, 100 * index + size, dtype=np.int32)}
+                 for index, size in enumerate((5, 3, 8, 2, 6, 4, 7, 1))]
+    counted = Pipeline(Memory(documents)).map(Counted(), identity="counted@1")
+    train, _ = counted.shuffle(0).holdout(tokens=0.25)
+    loader = compile(train.batch(1), read="indexed", loading=Loading(workers=0))
+    stream = loader.train(DataPartition())
+    try:
+        rows = [next(stream) for _ in range(loader.records)]
+        stream.get_state()
+        assert loader.plan is not None and loader.plan.record()
+    finally:
+        stream.close()
+    read = {int(row["text"][0][0]) // 100 * 100 for row in rows}
+    held = [start for start in range(0, 800, 100) if start not in read]
+    assert held and all(mapped[start] == 1 for start in held), (mapped, read)

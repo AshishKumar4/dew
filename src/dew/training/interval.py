@@ -711,8 +711,9 @@ class LogWriter:
             try:
                 value = read()
             except BaseException as error:
+                # Raised once, through its verdict, which every path settles first (`raise_failure`).
                 verdict.set_exception(error)
-                written.set_exception(error)
+                written.set_result(None)
                 continue
             verdict.set_result(None)
             self._reports.put((value, report, written))
