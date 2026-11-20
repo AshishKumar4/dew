@@ -630,12 +630,16 @@ def launched(program, operands: tuple, role: str):
     return found
 
 
-def digested(arrays) -> str:
-    """A digest of `arrays`' bytes (a pytree's leaves), which names the values a program closes over."""
-    import jax
+def _starts_tag(starts) -> str | None:
+    """Fingerprint of a `starts` array (shape, dtype, and bytes via `dew._hashing.array_fingerprint`), or None
+    (row 9551)."""
+    if starts is None:
+        return None
+    from dew._hashing import array_fingerprint
 
-    joined = b"".join(np.ascontiguousarray(x).tobytes() for x in jax.tree.leaves(arrays))
-    return hashlib.sha1(joined).hexdigest()[:16]
+    hasher = hashlib.sha1()
+    array_fingerprint(hasher, np.asarray(starts))
+    return hasher.hexdigest()[:16]
 
 
 def _through(operands: tuple, starts, last: int) -> tuple:
@@ -774,7 +778,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         # The options the call's programs close over, which name their launches (`launched`).
         form = (f"delta {delta}, rounded {rounded}, walked {walked}, segments {max_segments}, starts "
-                f"{None if starts is None else digested(starts)}")
+                f"{_starts_tag(starts)}")
         o, final, tiles, trained = _route_forward(route, operands, walked, form)
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's
         # (`Tiles.forward`, the template's primal), which a call its fast backward takes narrows apart.
