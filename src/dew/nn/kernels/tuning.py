@@ -154,6 +154,41 @@ class Unreadable(ValueError):
     its config's, or JSON this module did not write. `_read` keeps such an entry as it is."""
 
 
+@dataclasses.dataclass(frozen=True)
+class Prepared:
+    """A template hook as every launch takes it (`KernelOp.prepared`; docs/design/algebra.md §2's template
+    hooks): its `source`, a function of a tile and its side tiles, and what runs, `run`, its program
+    rewritten by the algebra pass where it is traced, or a form its consumer derived from a program the
+    pass already rewrote (`prepared_as`). Equal, hashed, keyed (`program`, `_held_key`) and stored
+    (`encoded`) as its source, so an op holding it compares, keys and stores as it did."""
+
+    source: Callable
+    run: Callable = dataclasses.field(compare=False, repr=False)
+
+    def __call__(self, *args, **kwargs):
+        return self.run(*args, **kwargs)
+
+
+def prepared(hook):
+    """`hook` as every template launch takes it, explicit or inferred (`KernelOp.prepared`): rewritten once
+    by the algebra pass where it is traced (`dew.algebra.rewritten`), so a launch given a hook directly runs
+    the form an inferred one does; a prepared hook as it is; None as None. A derivative a caller declares
+    for a hook (a GEMM prologue's `prologue_jvp`) stays the caller's, never prepared: the rewritten form
+    computes the hook's own function (`rewritten`'s contract), which that derivative differentiates."""
+    if hook is None or isinstance(hook, Prepared):
+        return hook
+    from dew import algebra
+
+    return Prepared(hook, algebra.rewritten(hook))
+
+
+def prepared_as(hook: Callable) -> Prepared:
+    """`hook`, a form its consumer derived from a program the algebra pass already rewrote (`fused_gemm`'s
+    tiled stages and their declared derivatives), taken as prepared: a second pass would cost its saturation
+    again and could read through the derivative the form declares."""
+    return hook if isinstance(hook, Prepared) else Prepared(hook, hook)
+
+
 def encoded(value: object) -> JSON:
     """`value`, an op's field, a launch's argument or a config, as JSON `decoded` rebuilds equal: a
     scalar, None or string as itself, a list element by element, and every other kind its `_KINDS` entry
@@ -165,6 +200,9 @@ def encoded(value: object) -> JSON:
         return value
     if isinstance(value, list):
         return [encoded(element) for element in value]
+    if isinstance(value, Prepared):
+        # Stored as its source, which the op rebuilt around it prepares again (`KernelOp.prepared`).
+        return encoded(value.source)
     for kind in _KINDS:
         if kind.holds(value):
             return {kind.tag: kind.written(value), **kind.beside(value)}
@@ -503,6 +541,9 @@ def _held_key(value, leaves: list, path: frozenset = frozenset()) -> Hashable:
     parts in turn (a launch's hooks bundle, rebuilt each bind around one retained callable); any other
     value as it hashes (a static's own contract, as `jax.jit` reads it). `TypeError` for a value no hash
     holds, a graph that reaches a part of itself (`path`) among them."""
+    if isinstance(value, Prepared):
+        # Keyed as its source, which a launch's layers share however often their ops prepare it.
+        return _held_key(value.source, leaves, path)
     if id(value) in path:
         raise TypeError("a hook's parts reach the hook again")
     inner = path | {id(value)}
@@ -554,6 +595,27 @@ class KernelOp(tokamax.Op):
     Every other op's derivative is its caller's custom VJP, of launches of their own."""
     revision: int = 1
 
+    def __post_init__(self):
+        # Each hook field as every launch takes it (`prepared`): an op built or replaced around a hook holds
+        # it prepared, so its selection, legality, pricing and key read the form its launch runs.
+        for field in dataclasses.fields(self):
+            if field.name in self.HOOKS:
+                object.__setattr__(self, field.name, self.prepared(field.name, getattr(self, field.name)))
+
+    def bind(self, *args, **kwargs) -> tokamax.BoundArguments:
+        # Each hook argument as every launch takes it (`prepared`), as the fields are at construction.
+        bound = super().bind(*args, **kwargs)
+        hooks = {name: self.prepared(name, value) for name, value in bound.arguments.items()
+                 if name in self.HOOKS}
+        return tokamax.BoundArguments(self, {**bound.arguments, **hooks}) if hooks else bound
+
+    def prepared(self, name: str, value):
+        """The hook field or argument `name`'s `value` as every launch of the op takes it, explicit or
+        inferred: a function rewritten once by the algebra pass where it is traced (`prepared`); anything
+        else (None, a key, a bundle of functions no call reaches whole) as it is, a bundle's op preparing
+        its functions in its own override (a GEMM's `Hooks`, `grouped_launch`)."""
+        return prepared(value) if callable(value) else value
+
     def __call__(self, *args, **kwargs):
         # One path for every config (row 1866): bound once, the op's own config, a pin or a pick checked
         # against the call itself (`pinnable`: a template's legality), the heuristic otherwise. The launch's
@@ -576,7 +638,27 @@ class KernelOp(tokamax.Op):
         # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them; its
         # kernels carry it in their names, so a compile's reports name it (`report.launching`).
         with report.launching(self, ba, config):
-            return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
+            awaiting = report.awaiting()
+            if awaiting is None:
+                return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
+            return self._captured(ba, config, awaiting)
+
+    def _captured(self, ba: tokamax.BoundArguments, config: Hashable, awaiting: tuple):
+        """The launch's call where its certification awaits it (`report.awaiting`): traced once into its
+        program's jaxpr at its operands' own abstract values (a shard's in a shard_map), which certification
+        replays and compiles aside (`report.capture`), and that jaxpr evaluated here, its equations bound into
+        the program as the call's own trace binds them (a custom derivative's rule kept as its equation)."""
+        from jax.extend import core as jax_core
+
+        arrays, fill = programs.holes((ba.args, ba.kwargs), lambda leaf: isinstance(leaf, jax.Array))
+
+        def launched(*values):
+            args, kwargs = fill(values)
+            return self._fwd(*args, config=config, **kwargs)[0]
+
+        closed, shapes = jax.make_jaxpr(launched, return_shape=True)(*arrays)
+        report.capture(awaiting, closed)
+        return jax.tree.unflatten(jax.tree.structure(shapes), jax_core.jaxpr_as_fun(closed)(*arrays))
 
     def exhausted(self, ba: tokamax.BoundArguments) -> report.Exhausted:
         """The refusal of a call of `ba` no config holds (`taken` None): none fits, or certification refused
@@ -1000,10 +1082,12 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     the same under whatever mesh its call traces in, so the launch keys, and names its kernels, alike in its
     program and in certification's own placement, whose kernels ptxas assembled differently under another
     name (row 8532)."""
+    # A prepared hook by its source, which its rewritten form computes the same values of (`Prepared`).
+    traced = function.source if isinstance(function, Prepared) else function
     # A fresh function, which JAX's tracing cache keys by its identity: it keys a callable by equality, so an
     # equal hook of another call would take this one's program.
     with programs.meshless():
-        closed = jax.make_jaxpr(lambda *values: function(*values))(*arguments)
+        closed = jax.make_jaxpr(lambda *values: traced(*values))(*arguments)
     digest = hashlib.sha256()
 
     def update(*parts) -> None:

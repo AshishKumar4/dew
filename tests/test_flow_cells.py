@@ -6,6 +6,7 @@ import inspect
 
 import gpu_flow
 import pytest
+from generation_support import node_topology
 from gpu_flow import Cell, CellsFailed, cells_of, run_cells
 
 
@@ -188,12 +189,9 @@ def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_pa
     import generation_support
     import model_flows
     import tier_wire
-    from jax.experimental import topologies
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = tmp_path / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(tmp_path / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
     ran: list[str] = []
@@ -294,3 +292,22 @@ def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unreco
     with compiled_truths(tmp_path / "second", prepare=True, stamp="a"):
         run_cells([Cell("prepares one check and fails the next", two_checks)])
     assert (tmp_path / "second" / DEFERRED).is_file()
+
+
+def test_a_flow_module_importing_gpu_flow_first_imports_in_a_parts_prepare():
+    """In a GPU tier part's prepare (`tier_wire.PREPARE`) a module importing gpu_flow first imports: gpu_flow
+    read the generation helpers at its import, which in a prepare read model_flows' node target, whose
+    module imports gpu_flow, a circular import that refused such a module in every prepare and left its
+    sites unprepared (the native certificates on a GH200 tier)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import tier_wire
+
+    done = subprocess.run([sys.executable, "-c", "import gpu_flow"], cwd=Path(__file__).parent,
+                          env={**os.environ, tier_wire.PREPARE: "1"}, capture_output=True, text=True,
+                          check=False)
+    assert done.returncode == 0, done.stderr[-2000:]
+

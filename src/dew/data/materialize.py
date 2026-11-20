@@ -488,24 +488,18 @@ def _memory_mixture(
     children = tuple(_measured_targets(_materialize(child, counts, training=training),
                                        mixture)
                      for child in mixture.pipelines)
-    kept = tuple(
-        (child, weight)
-        for child, weight in zip(children, mixture.weights, strict=True)
-        if isinstance(child.source, Combined) or len(child.source.records("memory"))
-    )
-    omitted = [_name(child) for child in children if all(child is not accepted for accepted, _ in kept)]
-    if omitted:
-        _log.warning("left out of the mixture: %s (zero accepted rows)", ", ".join(omitted))
-    if not kept:
-        if not training:
-            return dataclasses.replace(children[0], stages=(*children[0].stages, *pipeline.stages))
-        raise ValueError(
-            f"no accepted row of {', '.join(_name(child) for child in children)}; raise the row budgets"
-        )
-    children, weights = zip(*kept, strict=True)
-    return dataclasses.replace(
-        pipeline, source=dataclasses.replace(mixture, pipelines=tuple(children), weights=tuple(weights))
-    )
+    # A mix ends at its first exhausted member, as an online read of it does (docs/design/data.md, combine):
+    # a member that accepted no row ends it before its first row, every member kept with its weight
+    # (row 9008: the member and its weight were dropped, and the read went on past that end).
+    empty = [child for child in children
+             if not isinstance(child.source, Combined) and not len(child.source.records("memory"))]
+    if empty and training:
+        raise ValueError(f"no accepted row of {', '.join(_name(child) for child in empty)}: a mix ends at "
+                         "its first exhausted member, so it reads none; raise the row budgets, or mix "
+                         "without the member")
+    if empty:
+        return dataclasses.replace(empty[0], stages=(*empty[0].stages, *pipeline.stages))
+    return dataclasses.replace(pipeline, source=dataclasses.replace(mixture, pipelines=children))
 
 
 def _memory_order(

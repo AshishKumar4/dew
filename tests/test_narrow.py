@@ -534,11 +534,12 @@ def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes_where_th
 
 def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monkeypatch):
     """Row 1661's run (1765): devices that hold the state a run keeps between steps, its parameters,
-    optimizer state and the window's accumulator, but not that state and its narrow bf16 copies. The
-    check `fit` makes before it places anything holds that state alone, which `validate` reports the
-    same with the copies on as off: the copies are the plan's first rung, dropped where the step does
-    not fit with them. On devices of that capacity, whose free bytes lie between the step's footprints
-    with and without its copies, fit trains, its plan without them."""
+    optimizer state and the window's accumulator, and that `validate` reports the same with the copies on
+    as off: the copies are the plan's first rung, dropped where the step does not fit with them. Where the
+    step's measured need without its copies is below its need with them (a CPU's), devices whose free
+    bytes lie between the two train it without them, at its own rung; where dropping them frees nothing
+    (a GPU's step, whose temporaries hold its fusions' casts either way: GH200 68.352 MB against 68.344 MB,
+    row 6310), devices short of the need with them keep the copies and climb the ladder (row 8562)."""
     from model_support import allocating
     from token_support import repeated_token_batch
 
@@ -591,18 +592,21 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     # the state's bytes, which a GPU step's temporaries dwarf (M-MC-22: a 349,744 B state, a 68 MB step).
     # The plan made before the state is placed (`Trainer._planned_unplaced`), which reads those bytes as
     # holding the state too, holds none, and the step is planned once the state is placed.
-    free = (with_copies + without) // 2
-    assert without < free < with_copies and state < free, (without, free, with_copies, state)
+    frees = without < with_copies
+    free = (with_copies + without) // 2 if frees else with_copies - 1
+    assert state < free < with_copies, (without, free, with_copies, state)
     gc.collect()
     allocating(monkeypatch, limit, limit, limit - free)
     stream = streamed()
     with chosen(narrow_copies='on'):
         run.fit(stream, steps=2)
-    # It trains without its copies, at its own rung: dropping them freed what it was short, and nothing is
-    # recomputed for it.
     probes = run.plan["probes"]
-    assert run.plan["narrow"] is False and probes[-1]["fits"] is True
-    assert run.plan["remat"] == probes[0]["remat"] and not probes[0]["fits"]
+    rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
+    own = {key: probes[0][key] for key in rung} == {key: run.plan[key] for key in rung}
+    assert probes[-1]["fits"] is True and not probes[0]["fits"]
+    # Where dropping them freed what it was short, it trains without them at its own rung, nothing
+    # recomputed for it; where it frees nothing, they come back and the ladder climbs past its own rung.
+    assert (run.plan["narrow"], own) == ((False, True) if frees else (True, False)), run.plan
     # A pool grown to the state's size, half of it one free block, whose limit holds the state and the step
     # with its copies in all, the step in what the pool can still take: a fresh GH200 4B run's (M-MC-3m).
     # The step is planned before the state is placed on the pool's bytes in all, not on its largest block,

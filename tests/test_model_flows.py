@@ -22,8 +22,10 @@ import numpy as np
 import pytest
 import tier_wire
 from arm_forms import WITHOUT_YNN, without_ynn
+from generation_support import node_topology
 from process_support import relayed
 from reference_error import ahead_arm, assert_as_exact, over_windows, run_to_run, windows
+from tool_support import load
 from truths_ahead import AT_RUN, UNPREPARED, MissingTruth, compiled_truths
 
 from dew.nn.kernels import generation
@@ -200,12 +202,9 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     of its own (`model_flows.prepared_apart`) over the node's serialized topology (here a compile-only
     A100's, serialized as a host serializes its own), its Dew and reference programs compiled for that GPU
     and its truths' programs compiled into the tier's store, and what it took reported."""
-    from jax.experimental import topologies
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = store / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(store / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.TRUTHS, str(store / "tier"))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
@@ -231,12 +230,9 @@ def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monk
     refusal's reason (`model_flows.ON_DEVICE`) and holds none of them, its truths compiled all the same;
     its run names each in the run's summary as its prepare declared (`truths_ahead.AT_RUN`), as an at-run
     site's truths are (row 8636)."""
-    from jax.experimental import topologies
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = store / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(store / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.TRUTHS, str(store / "tier"))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
@@ -420,13 +416,10 @@ def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):
     truths', every truth's with the arms' state held beside it, so the lane sizes the unit's worker by
     them; before it filed none, and the lane admitted the unit on no needs at all."""
     import tier_wire
-    from jax.experimental import topologies
     from truths_ahead import compiled_memory, prepared
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = tmp_path / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(tmp_path / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.UNIT, "a unit")
     monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path))
@@ -450,13 +443,10 @@ def test_a_convolution_sites_truths_and_arms_compile_on_its_gpu_in_its_run(tmp_p
     unprepared; before, the prepare compiled both for the GPU and its run refused their load, and then its
     truths for the host's CPU, dense float64 on the node's CPU in the run (row 8576)."""
     import tier_wire
-    from jax.experimental import topologies
     from truths_ahead import AT_RUN, prepared
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = tmp_path / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(tmp_path / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.UNIT, "a unit")
     monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path))
@@ -757,6 +747,24 @@ def test_a_gpu_tier_parts_prepare_runs_under_its_runs_flags(held):
     assert (opened.returncode, opened.stdout.split()[-1:]) == (0, ["1"]), opened.stderr[-2000:]
 
 
+def test_a_parts_prepare_collects_the_recurrence_tiers_files(tmp_path):
+    """A GPU part's prepare as its lane starts it (`lane_environment.configured`: `DEW_TIER_PREPARE=1` on the
+    node's CPU, the node an A100 by its serialized topology) collects the recurrence tier's files in a
+    process of its own, their imports reading the node's generation as gpu_flow's does (row 9540)."""
+
+
+    topology = node_topology(tmp_path / "topology.bin")
+    prepare = lane_environment.configured({"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu",
+                                            tier_wire.PREPARE: "1", model_flows.TOPOLOGY: str(topology),
+                                            tier_wire.TRUTHS: str(tmp_path / "tier")})
+    # As CI's pytest runs (`pytest_environment`): none of this process's selection or plugins inherited.
+    environment = load("session", "tools/armada").pytest_environment(prepare)
+    collected = relayed([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
+                         "tests/test_gpu_recurrence.py", "tests/test_native_certificates.py"],
+                        environment, timeout=600)
+    assert collected.returncode == 0, collected.output[-3000:]
+
+
 def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
     """A GPU part's prepare on its node's CPU (`DEW_TIER_PREPARE=1`, the node an A100 by its serialized
     topology) runs every cell of a flow pinned to the node's generation, Mosaic's among them, as its run
@@ -764,12 +772,10 @@ def test_a_parts_prepare_runs_every_cell_its_nodes_gpu_runs(store, monkeypatch):
     for a GPU the prepare's process holds none of (row 7868: the recurrence matrix's five cells skipped
     there, then compiled on the held GPU)."""
     import gpu_flow
-    from jax.experimental import topologies
 
     from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = store / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(store / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
     ran: list[int] = []

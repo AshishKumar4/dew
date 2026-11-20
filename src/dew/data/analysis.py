@@ -763,8 +763,11 @@ def _volatile(stage: Stage) -> bool:
 
 def _drops(stage: Stage) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
-    the rows before it, one for one."""
-    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native, Batched)) or rejects(stage)
+    the rows before it, one for one: a batched step that keeps its rows' count (`Batched.same_rows`) is
+    none, its groups formed in the order's own records (row 9007)."""
+    if isinstance(stage, Batched):
+        return not stage.same_rows
+    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native)) or rejects(stage)
 
 
 def rejects(stage: Stage) -> bool:
@@ -985,7 +988,7 @@ def _analyzed(
         None if absorbed is None else absorbed[0],
         epochs,
         tuple(at for at, stage in enumerate(stages) if at >= eager and isinstance(stage, TokenSplit)),
-        _order(source, lowered, stages),
+        _order(source, lowered, stages, streamed=per_share and read != "memory"),
         parts_unending,
         unending,
         records_unending,
@@ -1000,8 +1003,15 @@ def _analyzed(
     return lowering
 
 
-def _order(source: Source | Combined, lowered: Sequence[_Lowering], stages: Sequence[Stage]
-           ) -> Mapping[str, object]:
+STATED_SHARES = "tokens, by stated counts"
+"""How a streamed token mixture whose every member states its rows and valid targets (`_states_its_targets`)
+shares its windows (`_Lowering.order`'s `shares`): by weights those counts make (`token_weights`), as an
+indexed read's do, where one whose counts are not stated keeps a deficit of each member's targets
+(`dew.data.mixing.TokenDeficit`; row 9010: a streamed read kept the deficit whatever its members stated)."""
+
+
+def _order(source: Source | Combined, lowered: Sequence[_Lowering], stages: Sequence[Stage], *,
+           streamed: bool = False) -> Mapping[str, object]:
     """The canonical order a resume must find unchanged (`_Lowering.order`): what `source` reads, a store by
     its description, phases, a mixture or a concatenation by its members' orders (`lowered`) and the names
     they go by (`_members`), then the stages that order its rows, a memory read's own among them
@@ -1019,7 +1029,8 @@ def _order(source: Source | Combined, lowered: Sequence[_Lowering], stages: Sequ
             "corpora": [child.order for child in lowered],
             "members": _members(source.pipelines),
             "weights": list(source.weights),
-            "shares": "tokens" if source.tokens is not None else "accepted rows",
+            "shares": ("accepted rows" if source.tokens is None else STATED_SHARES if streamed and all(
+                _states_its_targets(child) for child in source.pipelines) else "tokens"),
             # The seed of the mix's corpus order where it has one, which another plan's is not.
             **({} if source.seed is None else {"selection_seed": source.seed}),
         }

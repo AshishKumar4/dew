@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from dew.diffusion.schedules import NoiseScheduler, expand
+from dew.diffusion.schedules.common import ByValue
 from dew.nn.precision import divided
 
 
@@ -34,8 +35,9 @@ def from_clean(x_t, prediction, rates) -> tuple[jax.Array, jax.Array]:
     return prediction, divided(x_t - prediction * signal_rate, noise_rate)
 
 
-class PredictionTransform:
-    """Defines what the model predicts and how x_0 and epsilon are recovered from its output.
+class PredictionTransform(ByValue):
+    """Defines what the model predicts and how x_0 and epsilon are recovered from its output, equal to another
+    of its settings (`ByValue`).
 
     The base class provides the x_0 target and the identity output
     transform. A subclass must implement `backward_diffusion`, because the

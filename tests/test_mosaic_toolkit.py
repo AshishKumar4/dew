@@ -461,7 +461,7 @@ def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
         stated = resources.register_model(WGMMA, 2, 168)
         with report.launching(op, bound, Tiles(16, 16, 2, 1, family="wgmma")):
             name = report.named("attention", model=stated)
-        kernel, launch = report.kernel_of(name)
+        kernel, launch, _ = report.kernel_of(name)
         assert kernel == "attention" and report.traced(launch).kernels == {"attention": stated}
         assert report.named("attention", model=stated) == "attention"
 
@@ -1546,7 +1546,11 @@ def _codes(dtype):
 def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype, scaled):
     """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
     `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host;
-    FP8 codes refused where the device converts none (an A100)."""
+    FP8 codes refused where the device converts none (an A100). A host neither a CPU nor a GPU of the
+    generation (a TPU, another GPU) runs none of it (row 9003)."""
+    if jax.default_backend() != "cpu" and generation.device_generation() != generation_name:
+        pytest.skip(f"converts interpreted on a CPU or natively on a {generation_name} GPU, not on this "
+                    f"{generation.device_generation()}")
     codes, scale = _codes(dtype)
     expected = np.asarray(codes, np.float32) * (np.asarray(scale)[:, None] if scaled else 1)
     with generation.assumed(generation_name):
@@ -1572,7 +1576,7 @@ def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_n
                                      scaled=scaled)
         found = compile_mosaic_kernels([KernelCase("converted", lambda: (compiled, shapes))], generation_name)
         assert not mosaic_failures(found), mosaic_failures(found)
-    elif generation.device_generation() == generation_name:
+    else:
         converted = _converted(codes, scale, generation_name=generation_name, interpret=False, scaled=scaled)
         np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
 

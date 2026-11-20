@@ -7,14 +7,19 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import enum
+import functools
+import json
 from collections.abc import Callable, Hashable, Sequence
 
 import jax
 from jax._src import config as jax_config
 
 from dew._cache import holding
+from dew._records import JSON
+from dew._stated import tree_shape
 from dew.algebra.program import replaying
-from dew.nn.kernels.options import abstract_signature, held_context, owned_program
+from dew.nn.kernels.options import OuterProgram, abstract_signature, held_context, owned_program
 
 
 def drawing() -> contextlib.AbstractContextManager[None]:
@@ -74,17 +79,28 @@ WHOLE: Parts = Parts(_whole, _joined)
 """A draw whose whole tree may hold arrays passed through: an objective's init."""
 
 
+type Made[Rest] = tuple[Rest, tuple[jax.Array, ...]]
+"""What a draw's program returns (`drawn_rest`): its build's rest and the leaves it made."""
+
+
 @dataclasses.dataclass(frozen=True)
-class TracedDraw[Built]:
+class TracedDraw[Tree, Built, Rest]:
     """A draw's one trace (`traced_draw`): the shapes of what it builds (`abstract`), which leaves of its
     picked part are its held tree's arrays as they are (`through`, each one's index among the picked part's
-    leaves to the held leaf's), and its build replayed from that trace (`replay`), which runs no model code;
-    the programs an eager draw made of it, by the leaves they build (`programs`)."""
+    leaves to the held leaf's) and which it builds (`built`, the others), its build replayed from that trace
+    (`replay`), which runs no model code, and that build less the arrays it passes through (`rest`,
+    `drawn_rest`), the eager draw's one program (`program`), made the first time one runs it."""
 
     abstract: Built
     through: dict[int, int]
-    replay: Callable
-    programs: dict = dataclasses.field(default_factory=dict, compare=False, repr=False)
+    built: tuple[int, ...]
+    replay: Callable[[Tree, jax.Array], Built]
+    rest: Callable[[Tree, jax.Array], Made[Rest]]
+
+    @functools.cached_property
+    def program(self) -> OuterProgram:
+        """The program an eager draw runs (`drawn_once`): `rest`'s, one for the trace."""
+        return owned_program(self.rest)
 
 
 KEPT_DRAWS = 8
@@ -94,39 +110,54 @@ _TRACED: collections.OrderedDict[Hashable, TracedDraw] = collections.OrderedDict
 
 
 def held_signature[Tree](tree: Tree) -> Hashable:
-    """What a kept trace over `tree` is keyed by: each leaf's path in it, as a string, and the leaves'
-    abstract signatures (`abstract_signature`). The paths and not the tree's structure, which holds what
-    its nodes bind (an initializer's objective, its bound init), so a trace held past its trainer keeps none
-    of it alive; the paths all the same, so two trees of leaves alike under other keys are two keys (row
-    8989: flattened first, they shared one trace, the second replaying the first's structure)."""
-    flat = jax.tree_util.tree_flatten_with_path(tree)[0]
-    return (tuple(jax.tree_util.keystr(path) for path, _ in flat),
-            abstract_signature([leaf for _, leaf in flat]))
+    """What a kept trace over `tree` is keyed by: its structure node by node (`dew._stated.tree_shape`), an
+    empty collection and a None among its nodes, each node's data as plain data (`_plainly`), and its leaves'
+    abstract signatures (`abstract_signature`). Two trees of leaves alike under other keys (row 8989), or
+    apart only by an empty collection (row 9548: `{**variables, "batch_stats": {}}` replayed without it),
+    are two keys; a node's data that is no plain value (`Partial`'s bound function) by its kind alone, so
+    a trace held past its trainer keeps none of what its nodes bind alive."""
+    shape = tree_shape(jax.tree.structure(tree), "a kept draw's held tree", _plainly)
+    return json.dumps(shape, sort_keys=True), abstract_signature(jax.tree.leaves(tree))
+
+
+def _plainly(value: Hashable | list[Hashable], *, at: str) -> JSON:
+    """A node's kind or data as a kept draw's key states it (`held_signature`): a class by its path, an enum
+    member by its class's path and its name, a number, a string, a truth value or None as itself, a sequence
+    (a mapping's keys) item by item; anything else by its kind's path alone."""
+    del at
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
+    if isinstance(value, enum.Enum):
+        return [_plainly(type(value), at=""), value.name]
+    if isinstance(value, list | tuple):
+        return [_plainly(part, at="") for part in value]
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    return _plainly(type(value), at="")
 
 
 def traced_draw[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array], Built], held: Tree,
                                            key: jax.Array, parts: Parts[Built, Rest, Picked],
-                                           kept: Hashable | None = None) -> TracedDraw[Built]:
+                                           kept: Hashable | None = None) -> TracedDraw[Tree, Built, Rest]:
     """`function(held, key)` traced once (`TracedDraw`): the one trace a fresh state's start reads
     (`dew.training.distributed.start_build`, `placed_start`) and an eager draw runs (`drawn_once`). A 4B
     decoder's init traced twice took 41 and 36 s on a B200 host before its first step. Where `kept` states
     what it traces from beside its arguments, the trace its equal made under the same context
     (`held_context`) over arguments of the same paths and shapes in this process is read
     (`dew._cache.holding`, `held_signature`): a trainer's refit traces its start once (PF03)."""
-    def made() -> TracedDraw[Built]:
+    def made() -> TracedDraw[Tree, Built, Rest]:
         traced, through = passed_through(function, lambda built: parts.split(built)[1])
         trace = owned_program(traced).trace(held, key)
         abstract = trace.out_info
-        return TracedDraw(abstract, through, replaying(trace.jaxpr, jax.tree.structure(abstract), (), ()))
+        leaves = jax.tree.structure(parts.split(abstract)[1]).num_leaves
+        built = tuple(index for index in range(leaves) if index not in through)
+        replay = replaying(trace.jaxpr, jax.tree.structure(abstract), (), ())
+        return TracedDraw(abstract, through, built, replay, drawn_rest(replay, parts, built))
 
     if kept is None:
         return made()
     signature = (kept, held_context(), held_signature((held, key)))
     return holding(_TRACED, signature, made, KEPT_DRAWS)
-
-
-type Made[Rest] = tuple[Rest, tuple[jax.Array, ...]]
-"""What a draw's program returns (`drawn_rest`): its build's rest and the leaves it made."""
 
 
 def drawn_rest[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array], Built],
@@ -162,15 +193,17 @@ def drawn_once[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array], 
     where run eagerly each operation of a model's draw compiled alone (tens to hundreds a model, row 8682):
     its trace (`traced_draw`, kept by `kept`) replayed, the held arrays it passes through those arrays
     themselves, no output of the program (`drawn_rest`, `reassembled`), its program kept with its trace so a
-    second call compiles nothing (row 8731). The eager draw of an objective's init (`Objective.init`, its
-    whole tree `WHOLE`) and a trainer's fresh state (`Trainer.initial_state`)."""
+    second call compiles nothing (row 8731). A draw whose every leaf is a held array passed through, and
+    whose rest holds none, runs no program: it builds nothing (row 9069). The eager draw of an objective's
+    init (`Objective.init`, its whole tree `WHOLE`) and a trainer's fresh state (`Trainer.initial_state`)."""
     draw = traced_draw(function, held, key, parts, kept)
-    structure = jax.tree.structure(parts.split(draw.abstract)[1])
-    built = tuple(index for index in range(structure.num_leaves) if index not in draw.through)
-    if built not in draw.programs:
-        draw.programs[built] = owned_program(drawn_rest(draw.replay, parts, built))
-    with drawing():
-        other, made = draw.programs[built](held, key)
+    rest, picked = parts.split(draw.abstract)
+    structure, nothing = jax.tree.structure(picked), not jax.tree.leaves(rest)
+    if draw.built or not nothing:
+        with drawing():
+            other, made = draw.program(held, key)
+    else:
+        other, made = jax.tree.structure(rest).unflatten([]), ()
     given = jax.tree.leaves(held)
-    return reassembled(parts, other, made, built, structure.unflatten, structure.num_leaves,
+    return reassembled(parts, other, made, draw.built, structure.unflatten, structure.num_leaves,
                        lambda index: given[draw.through[index]])

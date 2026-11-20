@@ -127,6 +127,7 @@ from dew.training._fit import (
     FitPlan,
     FitRun,
     HandedSplits,
+    Resumed,
     Start,
     _rollout_admitted,
     _rollout_resumed,
@@ -190,7 +191,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process, sig
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched_state
-from dew.training.startup import Startup, computation_differs, run_data
+from dew.training.startup import Startup, computation_differs, resumed_step, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
@@ -749,7 +750,7 @@ class Trainer(Generic[Loss, Effects]):
         self._compiler.ahead = self._ahead_handed.runnable(list(self.device_mesh.devices.flat))
         self._ahead_handed = None
 
-    def _started(self, resume: Resume = "auto") -> Start:
+    def _started(self, resume: Resume = "auto", known: Resumed | None = None) -> Start:
         """What placing the state reads before it places anything: the objective's held tree and
         the key, resolved once, so that the shapes and the values are the same inputs through the
         same overridable method and the objective is asked for what it holds exactly once; the
@@ -767,13 +768,13 @@ class Trainer(Generic[Loss, Effects]):
                                stated and (stated, self._start_owner()))
         abstract, checkpoints = draw.abstract, self.checkpoints
         # Each process lists the checkpoints itself, one listing may lag another's: all resume or none.
-        step = (None if checkpoints is None
-                else agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume)))
+        # The step a fit's start read already (`known`, `_resumed`), else as `resume` asks.
+        step = known.step if known is not None else resumed_step(self, resume)
         if checkpoints is not None and step is not None:
             abstract = self._staging.state(abstract.with_window(checkpoints.accumulation_template(step)),
                                           self._staging.staged_shapes)
         shardings, validation = self._validated(abstract)
-        return Start(initializer, key, abstract, draw.through, step, shardings, draw.replay,
+        return Start(initializer, key, abstract, draw.through, draw.built, step, shardings, draw.replay,
                      validation.device_bytes, kept=stated is not None)
 
     def _placed(self, start: Start, *, positioned: bool
@@ -831,11 +832,12 @@ class Trainer(Generic[Loss, Effects]):
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         self._compiler.resume_rung(checkpoints.rung(resume))
         # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
-        differs = computation_differs(checkpoints.artifact(resume), self._artifact())
+        differs = computation_differs(checkpoints.artifact(resume), self._artifact(),
+                                      checkpoints.training(resume), self.objective.training_record())
         if differs:
             raise ValueError(f"the checkpoint at step {resume} in {checkpoints.directory} trained another "
-                             f"computation ({', '.join(differs)}); resume it with the objective and model "
-                             "it recorded, or train in another directory")
+                             f"computation ({', '.join(differs)}); resume it with the objective, its "
+                             "settings and model it recorded, or train in another directory")
         # The code and machine that wrote the step's data position, which decide none of its rows: warned of.
         wrote = checkpoints.environment(resume)
         if wrote is not None:
@@ -1130,8 +1132,9 @@ class Trainer(Generic[Loss, Effects]):
 
     @property
     def plan(self) -> JSON:
-        """The plan of the last compiled step: its split, the rows of its microbatch and every compile its
-        search made (`Probe`)."""
+        """The plan of the last compiled step: a device step's split, the rows of its microbatch and every
+        compile its search made (`Probe`); a host step's, which plans no rung, its startup alone
+        (`{"startup": HostStartup.record()}`, AutoPGLE's outcome among it)."""
         return None if self._compiled is None else self._compiled.plan
 
     @property
@@ -1517,14 +1520,17 @@ class Trainer(Generic[Loss, Effects]):
         first and, for a fresh state, its start. A supplied `initial` state is placed as it
         is given, once its shapes are checked as a fresh one's are: no continuation, which
         `resume="require"` refuses, and under "never" into a directory that holds no run either. An
-        objective that names its input field alone declares it first (`_declare_input`)."""
+        objective that names its input field alone declares it first (`_declare_input`), a resume's from the
+        first batch its saved position admits (`_resumed_position`)."""
         checkpoints = self.checkpoints
-        self._declare_input(lambda: self._primed_first(run, dataset))
+        resumed = None if initial is not None else self._resumed(run, resume)
+        self._declare_input(lambda: self._primed_first(run, dataset,
+                                                       None if resumed is None else resumed.position))
         if resume == "require" and (checkpoints is None or initial is not None):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")
         if initial is not None and checkpoints is not None and resume == "never":
-            agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume))
+            resumed_step(self, resume)
         if initial is not None:
             # A supplied state's trees are held as dicts too (`initial_state`), its optimizer's and
             # accumulation's mirrors of the parameters with them, each pipelined run stacked by stage. Its
@@ -1550,16 +1556,12 @@ class Trainer(Generic[Loss, Effects]):
                 with attempting(begun):
                     return self._placed(start, positioned=False)[:2]
             return 0, None, placed, start.abstract, start
-        # Its saved position, which the stream the run opens restores, or starts again where its plan
-        # changed (`_prefetched`); a position saved for other shares is none of this run's to read.
-        try:
-            position = checkpoints.position(start.resume, DataPartition.of(self.device_mesh))
-        except PlanChanged as changed:
-            if self.data_resume == "exact":
-                raise
-            position = None
-            self._restarting(run, tuple(changed.differs))
-        return (start.resume, position, lambda begun=None: self._placed(start, positioned=False)[:2],
+        # Its saved position, read once (`_resumed`), which the stream the run opens restores, or starts
+        # again where its plan changed (`_prefetched`).
+        resumed = self._resumed(run, resume)
+        if resumed.differs:
+            self._restarting(run, resumed.differs)
+        return (start.resume, resumed.position, lambda begun=None: self._placed(start, positioned=False)[:2],
                 start.abstract, None)
 
     def _stream_partition(self) -> DataPartition:
@@ -1567,15 +1569,20 @@ class Trainer(Generic[Loss, Effects]):
         beginning where updates do (`window`, `Ramp.stages`)."""
         return DataPartition.of(self.device_mesh, window=self.accumulation)
 
-    def _primed_first(self, run: FitRun, dataset: Loader) -> Batch:
+    def _primed_first(self, run: FitRun, dataset: Loader, saved: bytes | None = None) -> Batch:
         """The first batch of this process's share of `dataset`'s training stream, its stream kept open with
         its position after it (`FitRun.primed`), which a fresh start's prefetcher hands on as its first
         batch (`_opened`), so the run reads it once (training.md, the batch contract; row 6663); a share
-        that reads none of its own reads its pool's (`first_batch`)."""
+        that reads none of its own reads its pool's (`first_batch`). A resume's from its `saved` position,
+        its plan checked before any batch is read (`restored_or_restarted`; row 9013: the stream was read
+        from its start, the replacement plan unchecked)."""
         partition = self._stream_partition()
         stream = dataset.train(partition)
         run.stages = stages_of(stream)
         try:
+            if saved is not None and isinstance(stream, Checkpointable):
+                self._restarting(run, restored_or_restarted(stream, saved, resume=self.data_resume,
+                                                            step=run.current))
             batch = next(iter(stream), None)
             position = stream.get_state() if isinstance(stream, Checkpointable) else None
         except BaseException:
@@ -1584,8 +1591,26 @@ class Trainer(Generic[Loss, Effects]):
         if batch is None:
             _closed(stream)
             return first_batch(dataset, partition)
-        run.primed = (partition, stream, batch, position)
+        run.primed = (partition, stream, batch, position, saved)
         return batch
+
+    def _resumed(self, run: FitRun, resume: Resume) -> Resumed:
+        """What this fit resumes (`Resumed`), read once for its start and kept on `run`: the step every
+        process agrees (`resumed_step`) and, where it continues one, this share's saved data position
+        (`Checkpoints.position`), none where its plan changed and the run resumes relaxed (what changed its
+        `differs`); a position saved for other shares is none of this run's to read."""
+        if run.resumed is None:
+            checkpoints, step = self.checkpoints, resumed_step(self, resume)
+            position, differs = None, ()
+            if checkpoints is not None and step is not None:
+                try:
+                    position = checkpoints.position(step, DataPartition.of(self.device_mesh))
+                except PlanChanged as changed:
+                    if self.data_resume == "exact":
+                        raise
+                    differs = tuple(changed.differs)
+            run.resumed = Resumed(step, position, differs)
+        return run.resumed
 
     def _declare_input(self, first: Callable[[], Batch]) -> None:
         """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
@@ -1649,7 +1674,8 @@ class Trainer(Generic[Loss, Effects]):
                          resumed=current if resumed and position is None and run.restarted is None else None)
             self._shape = staged(self._shape, stages_of(run.source))
             run.partition = partition
-            run.train = self._prefetched(plan, run, opened, position, ahead)
+            # A stream handed on (`ahead`) stands where it was restored already: restored once.
+            run.train = self._prefetched(plan, run, opened, None if ahead is not None else position, ahead)
             run.source = None  # Lifetime transferred to the prefetch worker.
             if self.rollout is None:
                 # Read on the host before the state is placed, and agreed: a process whose read failed
@@ -1762,9 +1788,11 @@ class Trainer(Generic[Loss, Effects]):
         the run reads its stream from its beginning: that stream, handed on; else a stream opened now, the
         primed one closed."""
         primed, run.primed = run.primed, None
-        # Handed on only where the stream reads from its beginning: a resume, or a relaxed one starting a
-        # stage again (`FitRun.restarted`, which `_prefetched` moves a staged stream to), reads elsewhere.
-        if primed is not None and primed[0] == partition and position is None and run.restarted is None:
+        # Handed on where it was read from the position the run reads from, its beginning or a resume's,
+        # restored there once (row 9663); a relaxed resume starting a stage again (`FitRun.restarted`, which
+        # `_prefetched` moves a staged stream to) reads elsewhere.
+        if (primed is not None and primed[0] == partition and primed[4] == position
+                and run.restarted is None):
             return primed[1], (primed[2], primed[3])
         if primed is not None:
             _closed(primed[1])
@@ -1801,17 +1829,21 @@ class Trainer(Generic[Loss, Effects]):
         counted = run.marked if self.rollout is None else functools.partial(
             consumption_counted, clocked=self._shape.examples is not None, counting=self._counting,
             marks_rows=False)
-        inputs = self.objective.inputs
+        objective, inputs = self.objective, self.objective.inputs
         # What the stream states it hands each step, a rollout's batches aside, which make their own rows.
         produced = None if self.rollout is not None else Produced.of(plan.dataset, run.partition)
+        # A rollout's batches are its prompts, which the objective reads once the rollout makes their rows.
+        whole = not plan.dataset.device and self.rollout is None
 
         def prepare(batch: Batch) -> Batch:
-            # Every batch as its loader states it, before it is placed (`Produced`), and its token ids within
-            # its model's table (`InputSpec.bounded`): an id past the table reads no row, and its gather
-            # fills NaN.
+            # Every batch as its loader states it, before it is placed (`Produced`), and as its objective
+            # admits it (`Objective.check`), where no device step reshapes it, else its token ids within its
+            # model's table (`InputSpec.bounded`): an id past the table reads no row; its gather fills NaN.
             if produced is not None:
                 produced.checked(batch)
-            if inputs is not None:
+            if whole:
+                objective.check(batch)
+            elif inputs is not None:
                 inputs.bounded(batch)
             return counted(batch)
         if run.pooled:
@@ -2335,7 +2367,7 @@ class Trainer(Generic[Loss, Effects]):
         return {"state": self._staging.saved(state), "saved": position, "share": share, "control": control,
                 # The rung beside the layout's host fields, which a resume lays out alike (`resumed_layout`).
                 "rung": {**self._compiler.checkpoint_rung(), "host": list(self.layout.host)},
-                "artifact": self._artifact(),
+                "artifact": self._artifact(), "training": self.objective.training_record(),
                 "boxed": self._boxed_axes(),
                 "rollout": None if weights_only else _rollout_saved(self.rollout)}
 

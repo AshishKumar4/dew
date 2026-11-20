@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_forms import ROUNDED
 from contract_support import (
     ADDS,
     FORKED,
@@ -37,10 +38,17 @@ from contract_support import (
     REVERSE_ONLY,
     assert_contract,
     cancelling_entries,
-    exactly_rounded,
+    cancelling_orbit,
     normal_float32,
 )
-from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_computes_the_oracle,
+    widened,
+    with_gradients,
+    without_ynn,
+)
 from ssd_support import ssd_orbit, stepwise_scan
 
 from dew.algebra.scan import RESET_DECAY
@@ -355,20 +363,25 @@ DOCUMENTS = ((0, 70, 100), (0, 40, 150))
 """Each row's documents' first steps, over rows of 190 steps: a document that ends inside a chunk, one
 shorter than a chunk, and one longer than two."""
 
+DOCUMENT_HEADS, DOCUMENT_WIDTH = 2, 16
+"""`documents_draw`'s heads and their width: each head's values and state keys."""
+
+
 def documents_draw(seed: int):
     """Two rows of three documents (`DOCUMENTS`) of a forked call (`FORKED`) over one given memory a row,
     each document's entry write (`recurrence_chunk.Chunk.entry_key`: two terms of a state's keys `[N]` and
     a head's values `[P]`, a weight a head), and cotangents of the output and the row's last memory."""
     rows, documents = len(FORKED), len(FORKED[0][0])
-    x, dt, A, B, C, _, _ = mixer_operands((rows, 190, 2, 16, 16, 1), seed)
+    heads, width = DOCUMENT_HEADS, DOCUMENT_WIDTH
+    x, dt, A, B, C, _, _ = mixer_operands((rows, 190, heads, width, width, 1), seed)
     x, b, c, a = (jnp.asarray(t, jnp.float32) for t in ssd_operands(x, dt / 64, A, B, C, 1))
     keys = jax.random.split(jax.random.key(seed + 11), 6)
-    given = 0.3 * jax.random.normal(keys[0], (rows, GIVEN, 2, 16, 16), jnp.float32)
-    entry = (0.3 * jax.random.normal(keys[3], (rows, documents, 2, 2, 16), jnp.float32),
-             0.3 * jax.random.normal(keys[4], (rows, documents, 2, 2, 16), jnp.float32),
-             jax.random.uniform(keys[5], (rows, documents, 2), jnp.float32))
+    given = 0.3 * jax.random.normal(keys[0], (rows, GIVEN, heads, width, width), jnp.float32)
+    entry = (0.3 * jax.random.normal(keys[3], (rows, documents, 2, heads, width), jnp.float32),
+             0.3 * jax.random.normal(keys[4], (rows, documents, 2, heads, width), jnp.float32),
+             jax.random.uniform(keys[5], (rows, documents, heads), jnp.float32))
     seeded = (jax.random.normal(keys[1], x.shape, jnp.float32),
-              jax.random.normal(keys[2], (rows, 2, 16, 16), jnp.float32))
+              jax.random.normal(keys[2], (rows, heads, width, width), jnp.float32))
     return (x, b, c, a, given, *entry), seeded
 
 
@@ -447,6 +460,11 @@ def test_documents_entering_their_own_states_scan_as_each_alone():
                     "the TPU kernel's forked call", seeds=24)
 
 
+LEVELS_SEEDS = cancelling_orbit(DOCUMENT_HEADS, DOCUMENT_HEADS, DOCUMENT_WIDTH)
+"""`levels_documents_draw`'s seeds: its state's every value coordinate written once (`documents_draw`'s
+heads, each a key head of its own)."""
+
+
 def levels_documents_draw(seed: int):
     """`documents_draw`'s forked call whose documents' entry writes are `CANCELLING_LEVELS`' on the state's
     first key (`contract_support.cancelling_entries`, its cotangents too): no input, no decay, and each step's
@@ -482,8 +500,8 @@ def test_documents_entry_writes_of_cancelling_levels_are_exact_on_the_kernel():
     9463). The rated scan's selector routes the same call to it on a TPU (test_recurrence_chunk's
     `LEVELS_ROUTES`)."""
     truth = jax.jit(_entry_arm(documents_one_by_one))
-    assert_as_exact(_entry_arm(documents_on_the_kernel), exactly_rounded(truth), levels_documents_draw,
-                    "the TPU kernel's forked call's entry writes of cancelling levels", seeds=8,
+    assert_as_exact(_entry_arm(documents_on_the_kernel), ROUNDED, levels_documents_draw,
+                    "the TPU kernel's forked call's entry writes of cancelling levels", seeds=LEVELS_SEEDS,
                     truth_fn=truth)
 
 
@@ -516,8 +534,9 @@ def test_documents_entry_writes_of_cancelling_levels_take_the_selected_tpu_scan(
     forwarded to the Pallas scan it takes, each leaf held as on the kernel (rows 9463, 9464)."""
     truth = jax.jit(_entry_arm(documents_one_by_one))
     with generation.routes() as found:
-        assert_as_exact(_entry_arm(documents_as_selected), exactly_rounded(truth), levels_documents_draw,
-                        "the selected TPU scan's forked call's entry writes of cancelling levels", seeds=8,
+        assert_as_exact(_entry_arm(documents_as_selected), ROUNDED, levels_documents_draw,
+                        "the selected TPU scan's forked call's entry writes of cancelling levels",
+                        seeds=LEVELS_SEEDS,
                         truth_fn=truth)
     assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
 
@@ -572,7 +591,7 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
 
     mine = jax.tree.leaves(without_ynn(run(documents_on_the_kernel))(operands, seeded))
     with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda t: jnp.asarray(t, jnp.float64), (operands, seeded))
+        wide = widened((operands, seeded))
         exact = jax.tree.leaves(jax.jit(run(documents_one_by_one))(*wide))
     for ours, theirs in zip(mine, exact, strict=True):
         theirs = np.asarray(theirs)
@@ -620,3 +639,23 @@ def test_the_recurrence_matrix_holds_on_this_tpu():
     from gpu_flow import cells_of, run_cells
 
     run_cells(cells_of(recurrence_matrix.a_recurrences_training_step_on_a_tpu_is_on_par))
+
+
+def test_tpu_ssd_jvp_combines_read_and_decay_without_carry_overflow():
+    """Base review e488dc198 F2: `_chunk_scan` JVP reuses `_chunk_forward` so `B0 = 2^100`, `C0 = 2^-100`,
+    `dx0 = 2^30`, `a1 = -20 ln 2` yields finite read tangent `2^30` and final-state tangent `2^110` without
+    materializing a `2^130` fp32 carry."""
+    from dew.nn.kernels.ssd import _chunk_scan
+
+    x = jnp.zeros((1, 64, 1, 16), jnp.float32)
+    dx = x.at[0, 0, 0, 0].set(np.float32(2.0 ** 30))
+    b = jnp.zeros((1, 64, 1, 16), jnp.float32).at[0, 0, 0, 0].set(np.float32(2.0 ** 100))
+    c = jnp.zeros((1, 64, 1, 16), jnp.float32).at[0, 0, 0, 0].set(np.float32(2.0 ** -100))
+    a = jnp.zeros((1, 64, 1), jnp.float32).at[0, 1, 0].set(np.float32(-20.0 * np.log(2.0)))
+    st = jnp.zeros((1, 1, 16, 16), jnp.float32)
+    _, (dy, dfinal) = jax.jvp(lambda x_: _chunk_scan(x_, b, c, a, st, None, 64, "tpu", 0), (x,), (dx,))
+    assert np.isfinite(np.asarray(dy)).all() and np.isfinite(np.asarray(dfinal)).all()
+    np.testing.assert_array_equal(np.asarray(dy[0, 0, 0, 0]), np.float32(2.0 ** 30))
+    np.testing.assert_array_equal(np.asarray(dy[0, 1:, 0, 0]), np.zeros(63, np.float32))
+    want = jnp.exp(a[0, 1, 0]) * b[0, 0, 0, 0] * dx[0, 0, 0, 0]
+    np.testing.assert_array_equal(np.asarray(dfinal[0, 0, 0, 0]), np.asarray(want))

@@ -24,7 +24,6 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .latest: property -> int | None
   .local_path: property -> str
   .materialized(self, template: Mapping[str, Variables], placement: Mapping[str, Variables], *, step: int, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',))) -> Variables
-  .occupied: property -> int | None
   .path(self, step: int) -> str
   .pinned(self, step: int | str | None = None) -> int
   .position(self, step: int, share: DataPartition) -> bytes | None
@@ -38,10 +37,11 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .resumed(self, resume: Resume = 'auto') -> int | None
   .rollout_state(self, step: int, template: Mapping[str, object]) -> dict | None
   .rung(self, step: int) -> JSON
-  .save(self, step: int, state: TrainState | Mapping[str, object], saved: bytes | None = None, metrics: Mapping[str, float] | None = None, *, share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None, weights_only: bool = False, primary: str | None = None, rung: JSON = None, artifact: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None, tokenizer: Tokenizer | None = None) -> None
-  .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None) -> None
+  .save(self, step: int, state: TrainState | Mapping[str, object], saved: bytes | None = None, metrics: Mapping[str, float] | None = None, *, share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None, weights_only: bool = False, primary: str | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None, tokenizer: Tokenizer | None = None) -> None
+  .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None) -> None
   .source(self, step: int) -> str
   .stored(self, step: int | str | None = None) -> Variables
+  .training(self, step: int) -> JSON
   .variables(self, *, step: int | str | None = None, ema: bool | None = None, mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',)), unread: tuple[tuple[str, ...], ...] = (), on_host: bool = False) -> Variables
   .wait(self) -> None
   .window_size(self, step: int) -> int
@@ -144,6 +144,7 @@ class Objective()  [dew.objectives.base]
   .bind_model(self, source: Model | Source[Model], *, variables: Variables | None | Omitted = <Omitted.OMITTED: 'omitted'>, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Model
   .bind_widths(self, widths: Mapping[str, object]) -> None
   .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
+  .check(self, batch: Batch) -> None
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
   .data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData
   .defines_validation_loss: property -> bool
@@ -178,6 +179,7 @@ class Objective()  [dew.objectives.base]
   .recorded_model(self) -> nn.Module
   .reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]
   .restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None
+  .resumed_freely(cls) -> frozenset[str]  [classmethod]
   .row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *, rows: int | tuple[int, ...] = 0, weights: jax.Array | None = None) -> Ratio  [staticmethod]
   .row_moments(values: jax.Array, batch: Batch, axis: int | tuple[int, ...], *, rows: int | tuple[int, ...] = 0) -> tuple[jax.Array, jax.Array]  [staticmethod]
   .row_tokens(self, batch: Batch) -> int | None
@@ -196,6 +198,7 @@ class Objective()  [dew.objectives.base]
   .trace_key(self) -> Hashable | None
   .traced_by(self, settings: TracedSetting) -> Hashable | None
   .training_flops(self, model, batch: Batch) -> float
+  .training_record(self) -> dict[str, JSON]
   .unfuse_head(self) -> str | None
   .validation_loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]
   .validation_loss_refusal: property -> str | None
@@ -246,6 +249,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .bind_model(self, source: Model | Source[Model], *, variables: Variables | None | Omitted = <Omitted.OMITTED: 'omitted'>, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Model
   .bind_widths(self, widths: Mapping[str, object]) -> None
   .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
+  .check(self, batch: Batch) -> None
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
   .data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData
   .defines_validation_loss: property -> bool
@@ -280,6 +284,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .recorded_model(self) -> nn.Module
   .reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]
   .restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None
+  .resumed_freely(cls) -> frozenset[str]  [classmethod]
   .row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *, rows: int | tuple[int, ...] = 0, weights: jax.Array | None = None) -> Ratio  [staticmethod]
   .row_moments(values: jax.Array, batch: Batch, axis: int | tuple[int, ...], *, rows: int | tuple[int, ...] = 0) -> tuple[jax.Array, jax.Array]  [staticmethod]
   .row_tokens(self, batch: Batch) -> int | None
@@ -298,6 +303,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .trace_key(self) -> Hashable | None
   .traced_by(self, settings: TracedSetting) -> Hashable | None
   .training_flops(self, model, batch: Batch) -> float
+  .training_record(self) -> dict[str, JSON]
   .unfuse_head(self) -> str | None
   .validation_loss(self, variables: Variables, batch: Batch, step: Step) -> Loss | tuple[Loss, Aux[Effects]]
   .validation_loss_refusal: property -> str | None
@@ -615,7 +621,7 @@ dew.config.trainer.TrainerConfig
   precision: Annotated[Numerics, _numerics_argument()] = dew.nn.precision.Numerics()
   mesh: MeshSpec = dew.distributed.placement.MeshSpec()
   microbatches: int | None = None
-  layout: Layout = dew.distributed.placement.Layout()
+  layout: Annotated[Layout, tyro.conf.subcommand('layout')] | None = None
   profile: ProfileWindow | None = None
   run_profile: RunProfile | None = dew.training.profiling.RunProfile()
   compilation_cache_dir: str | None = None

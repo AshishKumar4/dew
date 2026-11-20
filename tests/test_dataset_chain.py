@@ -1197,7 +1197,7 @@ def test_stats_bounds_preprocessing_and_counts_only_the_inspected_records(read):
         processed.append(row["i"])
         return {**row, "twice": 2 * row["i"]}
 
-    chain = Memory(rows("a", 40)).named("sample").read(read).loading(READ)
+    chain = Memory(rows("a", 40)).named("sample").read(read)
     counts = chain.map(prepare, identity="stats-prepare@1").filter_map(drop_thirds).stats(10)
     assert counts["data/rows/sample"] == 10
     assert counts["data/rows/sample"] + counts["data/rejected/sample/third"] == 15
@@ -1213,7 +1213,7 @@ def test_stats_stops_at_a_finite_sources_end(records):
         processed.append(row["i"])
         return row
 
-    chain = Memory(rows("a", 7)).named("sample").loading(READ)
+    chain = Memory(rows("a", 7)).named("sample")
     counts = chain.map(prepare, identity="stats-finite@1").filter_map(drop_thirds).stats(records)
     expected = 0 if records == 0 else 7
     assert processed == list(range(expected))
@@ -1229,7 +1229,7 @@ def test_stats_counts_one_to_one_chains_lazily(read):
         processed.append(row["i"])
         return {**row, "twice": 2 * row["i"]}
 
-    chain = Memory(rows("a", 7)).named("sample").read(read).loading(READ)
+    chain = Memory(rows("a", 7)).named("sample").read(read)
     counts = chain.map(prepare, identity="stats-one-to-one@1").stats(3)
     assert counts["data/rows/sample"] == 3
     assert processed == [0, 1, 2]
@@ -1722,3 +1722,139 @@ def test_a_concat_states_its_datasets_facts_with_their_counts_added():
     facts = concat(counted).facts()
     assert (facts["rows"], facts["language"]) == (10, "en")
     assert "rows" not in concat([counted[0], Memory(rows("c", 2)).map(Scaled(2))]).facts()
+
+
+def test_a_nested_records_numbers_stack_beside_its_opaque_messages():
+    """A nested record whose mapping holds an opaque message list beside numbers and strings batches field by
+    field: the messages a list of each record's, the numbers and strings stacked with a batch axis (row
+    9054: the opaque list kept the whole mapping a list of records)."""
+    from dew.data.dataset import record_batch
+
+    rows = [{"meta": {"id": np.int32(index), "lang": "en", "messages": [{"role": "user", "content": "hi"}]},
+             "x": np.float32(index)} for index in range(3)]
+    batch = record_batch(rows)
+    assert batch["meta"]["id"].tolist() == [0, 1, 2] and batch["meta"]["lang"].tolist() == ["en"] * 3
+    assert batch["meta"]["messages"] == [row["meta"]["messages"] for row in rows]
+
+
+def test_a_token_holdouts_spans_are_resolved_by_one_scan_of_its_order():
+    """A token holdout's spans are resolved once, by one scan of the order before it, which the plan's
+    fingerprint and the reader's split share: a document the trained branch takes none of is mapped once,
+    by that scan (row 9011: the plan and each reader scanned it, three maps of it)."""
+    mapped: collections.Counter[int] = collections.Counter()
+
+    @dataclass(frozen=True)
+    class Counted:
+        def __call__(self, row):
+            mapped[int(row["text"][0])] += 1
+            return row
+
+    documents = [{"text": np.arange(100 * index, 100 * index + size, dtype=np.int32)}
+                 for index, size in enumerate((5, 3, 8, 2, 6, 4, 7, 1))]
+    counted = Pipeline(Memory(documents)).map(Counted(), identity="counted@1")
+    train, _ = counted.shuffle(0).holdout(tokens=0.25)
+    loader = compile(train.batch(1), read="indexed", loading=Loading(workers=0))
+    stream = loader.train(DataPartition())
+    try:
+        rows = [next(stream) for _ in range(loader.records)]
+        stream.get_state()
+        assert loader.plan is not None and loader.plan.record()
+    finally:
+        stream.close()
+    read = {int(row["text"][0][0]) // 100 * 100 for row in rows}
+    held = [start for start in range(0, 800, 100) if start not in read]
+    assert held and all(mapped[start] == 1 for start in held), (mapped, read)
+
+
+def drop_lasts_of_threes(row: dict) -> dict:
+    """Drop the last row of every three, so no share of the rows read rejects more than a third."""
+    from dew.data import Rejected
+
+    return Rejected("third") if row["i"] % 3 == 2 else row
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_reads_rejection_warning_is_its_loadings_warn_over(read, caplog):
+    """A read warns of a corpus that rejects more of its records than its loading's `warn_over` (1% by
+    default), a memory read's preparation as a streamed read's counter does, and not of one a higher
+    `warn_over` allows (row 9057: the share was fixed at 1%, and a memory read warned of none)."""
+    def warned(warn_over: float) -> bool:
+        caplog.clear()
+        loading = dataclasses.replace(READ, warn_over=warn_over)
+        chain = Memory(rows("a", 30)).named("sample").filter_map(drop_lasts_of_threes).repeat().batch(2)
+        stream = compile(chain, read=read, loading=loading).train(DataPartition())
+        try:
+            for _ in range(8):
+                next(stream)
+        finally:
+            stream.close()
+        return any(record.name == "dew.data.mixing" and record.levelname == "WARNING"
+                   for record in caplog.records)
+
+    assert warned(0.01) and not warned(0.5)
+
+
+@dataclass(frozen=True)
+class Pids:
+    """A step that notes, in `path`, the process each record is mapped in."""
+
+    path: str
+
+    def __call__(self, row):
+        import os
+
+        with open(self.path, "a") as noted:
+            noted.write(f"{os.getpid()}\n")
+        return row
+
+
+def test_stats_reads_with_the_loading_its_chain_states(tmp_path):
+    """`stats` over a chain that states its loading reads as it states (worker processes here), and over one
+    that states none reads serially, in this process (row 9058: a stated loading was read serially too)."""
+    import os
+
+    def mapped_in(chain) -> set[int]:
+        noted = tmp_path / f"pids-{len(list(tmp_path.iterdir()))}"
+        counts = chain.map(Pids(str(noted)), identity="pids@1").stats(4)
+        assert counts["data/rows/sample"] == 4
+        return {int(line) for line in noted.read_text().split()}
+
+    plain = Memory(rows("a", 16)).named("sample").read("indexed")
+    assert mapped_in(plain) == {os.getpid()}
+    assert os.getpid() not in mapped_in(plain.loading(Loading(workers=2)))
+
+
+def group_firsts(columns: dict[str, list]) -> dict[str, list]:
+    """A batched step that keeps its rows, each row given its group's first `i`: what it makes of a row
+    depends on the group it is read in."""
+    return {"group": [columns["i"][0]] * len(columns["i"])}
+
+
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_a_batched_map_that_keeps_its_rows_groups_the_order_whatever_reads_it(read):
+    """A batched map that keeps its rows groups the order's own consecutive records, so its rows are the
+    same read by one share or by two, each share's rows a part of the one read's, and the read stays a
+    global order (row 9007: grouped after the share cut, each share grouped its own records, and the read
+    was cut per share)."""
+    chain = Memory(rows("a", 24)).map(group_firsts, batched=True, batch_size=4).batch(2)
+
+    def read_by(partition: DataPartition) -> list[tuple[int, int]]:
+        data = compile(chain, read=read, loading=READ)
+        assert data.plan is not None and data.plan.lowering == "global"
+        reader = data.train(partition)
+        try:
+            # An epoch's twelve steps, each share's part of each step's two rows.
+            batches = [next(reader) for _ in range(24 // 2)]
+        finally:
+            reader.close()
+        ids = [int(i) for batch in batches for i in np.asarray(batch["i"]).ravel()]
+        groups = [int(group) for batch in batches for group in np.asarray(batch["group"]).ravel()]
+        assert len(ids) == len(groups) == 24 // partition.count, (len(ids), np.shape(batches[0]["i"]))
+        return list(zip(ids, groups, strict=True))
+
+    whole = read_by(DataPartition())
+    grouped = whole == [(index, index // 4 * 4) for index in range(24)]
+    assert grouped, (len(whole), [pair for pair in whole if pair[1] != pair[0] // 4 * 4][:4])
+    shares = sorted(read_by(DataPartition(0, 2)) + read_by(DataPartition(1, 2)))
+    alike = shares == whole
+    assert alike, (len(shares), [pair for pair in shares if pair not in whole][:4])

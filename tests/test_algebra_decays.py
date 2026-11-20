@@ -6,6 +6,7 @@ rounding of the whole accumulated magnitude."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from reference_error import assert_as_exact
 
 from dew.algebra import scan
@@ -167,21 +168,167 @@ def test_the_decay_takes_the_same_tangent_forward_as_backward():
                     seeds=PAIRING_SEEDS)
 
 
-def test_a_per_key_spreads_factored_pair_keeps_a_result_its_whole_decay_loses():
-    """`scan.spread` under a decay a key dimension: a reader at a sub-chunk's first token
-    (`recurrence_algebra.SUB`) and a write of keys 2^120 two tokens earlier, in the sub-chunk before, under
-    base-2 log decays of -80 a token and dimension there: its read through the factors to and from the
-    sub-chunk's reference, about 2^-80 each, exactly the write decayed by one and then the other, near 2^-40,
-    where the pair's whole decay, 2^-160, is zero in float32 and a select on it read zero (head review of
-    4bc3f5016 F1)."""
+def factored_draw(seed: int):
+    """A per-key spread's operands of two sub-chunks (`recurrence_algebra.SUB`) and its exponents: a reader
+    at the second's first token and a write two tokens earlier, in the first, of keys 2^100 to 2^126, under
+    integer base-2 log decays of -75 to -89 a key at the two tokens between them, summing to -150 or below,
+    so the pair's whole decay underflows float32 where its factors to and from the reference do not; its
+    decays exact powers of two of the exponents' differences (`np.ldexp`, no `scan.between`), a future
+    pair's negative zero, which a live span's underflow is not (`scan._crossed`)."""
     from dew.nn.kernels.recurrence_algebra import SUB
 
+    rng = np.random.default_rng([9549, seed])
     chunk, width = 2 * SUB, 2
     readers, values = np.zeros((chunk, 1), np.float32), np.zeros((chunk, 1), np.float32)
-    keys, exponents = np.zeros((chunk, width), np.float32), np.zeros((chunk, width), np.float32)
-    readers[SUB], values[SUB - 2], keys[SUB - 2] = 1.0, 1.0, 2.0 ** 120
-    exponents[SUB - 1:SUB + 1] = -80.0
-    between = scan.between(exponents, base2=True)
+    keys, exponents = np.zeros((chunk, width), np.float32), np.zeros((chunk, width), np.int32)
+    readers[SUB], values[SUB - 2] = 1.0, 1.0
+    keys[SUB - 2] = np.ldexp(np.float32(1.0), rng.integers(100, 127, width))
+    exponents[SUB - 1:SUB + 1] = -rng.integers(75, 90, (2, width))
+    total = np.cumsum(exponents, axis=0)
+    lower = np.tri(chunk, dtype=bool)[..., None]
+    decays = np.ldexp(np.float32(1.0), total[:, None] - total[None, :])
+    between = np.where(lower, decays, -0.0).astype(np.float32)
+    return readers, values, keys, between, exponents.astype(np.float32)
+
+
+def token_spread(readers, values, keys, between, exponents):
+    """The spread a token at a time, its state a key's: each token decays it by its own exponent's power of
+    two (`jnp.ldexp`, exact) and writes its key times its value, and its reader reads it; the decays `between`
+    unread, an oracle of their own."""
+    del between
+
+    def step(state, token):
+        reader, value, key, exponent = token
+        state = jnp.ldexp(state, exponent.astype(jnp.int32)) + key * value
+        return state, reader * state
+
+    return jax.lax.scan(step, jnp.zeros(keys.shape[1:], keys.dtype), (readers, values, keys, exponents))[1]
+
+
+def test_a_per_key_spreads_factored_pair_keeps_a_result_its_whole_decay_loses():
+    """`scan.spread` under a decay a key dimension, a pair across sub-chunks whose whole decay underflows
+    float32 where its factors to and from the reference do not (`factored_draw`): its read through the
+    factors held by check 1 against the spread a token at a time (`token_spread`), from float64, where a
+    select on the whole decay read zero (head review of 4bc3f5016 F1; row 9549)."""
+    def spread(readers, values, keys, between, exponents):
+        del exponents
+        return scan.spread(readers, values, keys, between)
+
+    assert_as_exact(jax.jit(spread), jax.jit(token_spread), factored_draw, "a per-key spread's factored pair",
+                    seeds=8)
+
+
+def lone_pair(reader: float, value: float, decays, *, width: int = 2, later: int = 2, after: bool = False):
+    """A per-key spread's operands of `later + 1` tokens whose one pair is the last's reader and the first's
+    write, its score `reader value`, every other score zero: unit keys, the pair's decay `decays` a key, its
+    factors across a sub-chunk's reference consistent with it (`recurrence_algebra.SUB`: `decays` up to the
+    reference and one after, or where `after` one up to it and `decays` after), every other pair's zero,
+    exact as given (no `scan.between`): `(readers, values, keys, between)`."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    readers, values = np.zeros((later + 1, 1), np.float32), np.zeros((later + 1, 1), np.float32)
+    readers[later], values[0] = reader, value
+    between = np.zeros((later + 1, later + 1, width), np.float32)
+    between[later, 0] = decays
+    if later >= SUB:
+        reference = later // SUB * SUB - 1
+        between[reference, 0], between[later, reference] = (1.0, decays) if after else (decays, 1.0)
+    return readers, values, np.ones((later + 1, width), np.float32), between
+
+
+@pytest.mark.parametrize("later", [2, 18], ids=["own sub-chunk", "an earlier sub-chunk"])
+@pytest.mark.parametrize("read", ["overflowed", "a NaN"])
+def test_a_per_key_spreads_read_through_an_underflowed_decay_is_zero(read, later):
+    """`scan.spread` under a decay a key dimension, one pair of its last token's reader and its first's
+    write, within a sub-chunk or across one, its decay zero at every key: a read of 2^70 times 2^70, which
+    overflows, zero at every key, the rule of row 9547 (base review of ce6ad9298 F1), and a NaN read NaN."""
+    reader = np.nan if read == "a NaN" else 2.0 ** 70
+    found = np.asarray(scan.spread(*lone_pair(reader, 2.0 ** 70, 0.0, later=later)))
+    if read == "overflowed":
+        np.testing.assert_array_equal(found, np.zeros_like(found))
+    else:
+        assert np.all(np.isnan(found[later])), found
+
+
+@pytest.mark.parametrize(("across", "after"), [(False, False), (True, False), (True, True)],
+                         ids=["own sub-chunk", "an earlier sub-chunk, zero up to its reference",
+                              "an earlier sub-chunk, zero after its reference"])
+def test_a_per_key_spreads_overflowed_read_is_zero_at_each_key_its_decay_underflows(across, after):
+    """`scan.spread` under a decay a key dimension, one pair of its last token's reader and its first's write
+    whose decay is zero at its first key alone, within a sub-chunk or across one, the zero its factor's up to
+    the reference or after it: a read of 2^70 times 2^70, which overflows, zero at that key and infinite at
+    the other, the recurrence's own (row 9631: across a sub-chunk, NaN at the zero key)."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    later = SUB + 2 if across else 2
+    found = np.asarray(scan.spread(*lone_pair(2.0 ** 70, 2.0 ** 70, (0.0, 1.0), later=later, after=after)))
+    expected = np.zeros_like(found)
+    expected[later, 1] = np.inf
+    np.testing.assert_array_equal(found, expected)
+
+
+def test_a_per_key_spreads_pairs_across_a_sub_chunk_are_decayed_before_they_are_summed():
+    """`scan.spread` under a decay a key dimension, two writes of unit keys before a sub-chunk's reference
+    (`recurrence_algebra.SUB`) read by a reader after it, each read 2^127, the keys' decay 1/4 past the
+    reference: the reader's output 2^126 at each key exactly, the recurrence's (its every term normal), each
+    pair's read decayed before the pairs are summed, where summed first they passed float32's largest (row
+    9029's head review)."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    reader, reference = SUB + 1, SUB - 1
+    readers, values = np.zeros((reader + 1, 1), np.float32), np.zeros((reader + 1, 1), np.float32)
+    readers[reader], values[:2] = 2.0 ** 64, 2.0 ** 63
+    between = np.zeros((reader + 1, reader + 1, 2), np.float32)
+    between[reader, :2], between[reference, :2], between[reader, reference] = 0.25, 1.0, 0.25
+    found = np.asarray(scan.spread(readers, values, np.ones((reader + 1, 2), np.float32), between))
+    expected = np.zeros_like(found)
+    expected[reader] = 2.0 ** 126
+    np.testing.assert_array_equal(found, expected)
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["one spread", "a batch of two"])
+def test_a_per_key_spreads_overflowed_read_through_a_vanished_decay_has_zero_gradients(batched):
+    """`scan.spread` under a decay a key dimension, one pair across a sub-chunk whose read of 2^70 times 2^70
+    overflows and whose decay is zero at every key: its keys' and decays' gradients zero, as its output is,
+    one spread or a batch of two (`jax.vmap`), where no infinity meets a zero factor (row 9631)."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    readers, values, keys, between = (jnp.asarray(x) for x in lone_pair(2.0 ** 70, 2.0 ** 70, 0.0,
+                                                                          later=SUB + 2))
+
+    def total(keys, between):
+        return jnp.sum(scan.spread(readers, values, keys, between))
+
+    pulled = jax.grad(total, argnums=(0, 1))
+    if batched:
+        pulled = jax.vmap(pulled)
+        keys, between = (jnp.stack([x, x]) for x in (keys, between))
+    for gradient in pulled(keys, between):
+        np.testing.assert_array_equal(np.asarray(gradient), np.zeros(gradient.shape, np.float32))
+
+
+def test_a_per_key_spreads_finite_read_through_a_small_decay_is_its_product():
+    """`scan.spread` under a decay a key dimension, one pair of a sub-chunk: a read 2^-80 through a decay
+    2^-80 of a key 2^80, exactly 2^-80, the key scaling the read before its decay (head review of
+    04b2ec480 F1: the decay taken first rounded 2^-160 to zero)."""
+    readers, values, keys, between = lone_pair(2.0 ** -80, 1.0, 2.0 ** -80, later=1)
+    keys[0] = 2.0 ** 80
     found = np.asarray(scan.spread(readers, values, keys, between))
-    factors = np.asarray(between[SUB - 1, SUB - 2]), np.asarray(between[SUB, SUB - 1])
-    np.testing.assert_array_equal(found[SUB], keys[SUB - 2] * factors[0] * factors[1])
+    np.testing.assert_array_equal(found[1], np.full(2, 2.0 ** -80, np.float32))
+
+
+def test_a_per_key_spreads_masked_key_carries_no_derivative():
+    """`scan.spread` under a decay a key dimension, a sub-chunk's own pair whose read of 2^70 times 2^70
+    overflows through decays of zero at its first key and one at its second: the first key's output zero,
+    its tangent along the decays zero and its decay's gradient zero under a cotangent on that key alone,
+    where the rejected product's transpose formed infinity times zero (head review of 04b2ec480 F3)."""
+    readers, values, keys, between = lone_pair(2.0 ** 70, 2.0 ** 70, (0.0, 1.0))
+
+    def first_key(between):
+        return scan.spread(readers, values, keys, between)[:, 0]
+
+    out, tangent = jax.jvp(first_key, (between,), (np.ones_like(between),))
+    (gradient,) = jax.vjp(first_key, between)[1](np.ones(3, np.float32))
+    np.testing.assert_array_equal(np.asarray(out), np.zeros(3, np.float32))
+    np.testing.assert_array_equal(np.asarray(tangent)[2], np.float32(0.0))
+    np.testing.assert_array_equal(np.asarray(gradient)[..., 0], np.zeros(gradient.shape[:2], np.float32))

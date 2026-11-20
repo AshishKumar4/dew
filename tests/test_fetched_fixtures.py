@@ -561,3 +561,56 @@ def test_move_pins_the_hubs_rehostable_files_to_githubs_store_and_leaves_the_res
     assert after[moving] == {**before[moving], "repo": store.GITHUB, "revision": None, "origin": "github",
                              "path": f"{before[moving]['sha256']}.npz"}
     assert after[LARGE] == before[LARGE] and after[origin] == before[origin]
+
+
+class _Served:
+    """A response `urlopen` gives: its bytes, read once."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self.data
+
+
+def test_a_download_a_transient_failure_cuts_is_asked_again_and_any_other_failure_stands(store, monkeypatch,
+                                                                                          capsys):
+    """A download a reset connection, a short read or a 503 cuts is asked again, each retry said on stderr
+    with a wait that doubles, and its bytes are the next answer's (base/kernels CI 44663115158, 44670885709);
+    a 404 stands at once, and a failure every attempt meets stands at the last."""
+    import http.client
+    import urllib.error
+    import urllib.request
+
+    waits: list[float] = []
+    monkeypatch.setattr("time.sleep", waits.append)
+    answers: list = [urllib.error.URLError(ConnectionResetError(104, "reset")),
+                     http.client.IncompleteRead(b"x"), urllib.error.HTTPError("u", 503, "busy", None, None),
+                     _Served(b"file")]
+    asked: list[str] = []
+
+    def urlopen(url, timeout):
+        asked.append(url)
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    assert store.downloaded("https://example/f") == b"file"
+    assert len(asked) == 4 and waits == [store.BACKOFF, 2 * store.BACKOFF, 4 * store.BACKOFF]
+    assert len(capsys.readouterr().err.strip().splitlines()) == 3
+    answers[:] = [urllib.error.HTTPError("u", 404, "gone", None, None)]
+    with pytest.raises(urllib.error.HTTPError):
+        store.downloaded("https://example/f")
+    assert len(waits) == 3
+    answers[:] = [urllib.error.URLError(ConnectionResetError(104, "reset"))] * store.ATTEMPTS
+    with pytest.raises(urllib.error.URLError):
+        store.downloaded("https://example/f")
+    assert len(waits) == 3 + store.ATTEMPTS - 1

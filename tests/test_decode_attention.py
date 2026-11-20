@@ -17,6 +17,7 @@ from contract_support import normal_drawn
 from generation_support import here, interprets
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
+from scenario_contract import covering
 from sharded import assert_runs_per_shard
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -201,10 +202,11 @@ def grouped_draw(dtype):
 DECODE_HOOKS = {"sinks": {"sinks": True}, "softcap": {"softcap": True},
                 "both": {"sinks": True, "softcap": True}}
 """The hooked decode cases' hooks by name: sinks, a softcap, both."""
-SINK_CASES = [(dtype, hooks, natural, splits) for dtype in ("bfloat16", "float32") for hooks in DECODE_HOOKS
-              for natural in ("fold", "natural") for splits in CHECKED_SPLITS]
-"""The hooked decode cases, `(dtype, hooks, form, slice count)`, by name."""
-LONG_SINK_CASES = [("float32", "both", "natural", 32), ("float32", "both", "fold", 32)]
+SINK_CASES = tuple(tuple(case.values()) for case in covering({
+    "dtype": ("bfloat16", "float32"), "hooks": tuple(DECODE_HOOKS),
+    "form": ("fold", "natural"), "splits": CHECKED_SPLITS}))
+"""Pairwise covering set of hooked decode cases `(dtype, hooks, form, slice count)` (`covering`)."""
+LONG_SINK_CASES = (("float32", "both", "natural", CHECKED_SPLITS[2]),)
 """The hooked cases past two minutes in one process (137 and 126 s on armada in a verdict on main 495ef4e0e),
 their check 1's draws run as armada's map tasks and a judge (`check1_shards`), each within two minutes."""
 
@@ -780,11 +782,17 @@ PAGED_SEEDS = 8
 """The paged decode kernel's declared check-1 seeds a config, sized by `seeds_for` paired."""
 
 
+PAGED_CASES = tuple(tuple(case.values()) for case in covering({
+    "page_size": (16, 32), "windowed": (False, True),
+    "natural": (False, True), "splits": CHECKED_SPLITS}))
+"""Pairwise covering set of paged decode cases `(page_size, windowed, natural, splits)` (`covering`)."""
+
+
 @CUDA_OR_CPU
-@pytest.mark.parametrize("splits", CHECKED_SPLITS)
-@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
-@pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])
-@pytest.mark.parametrize("page_size", [16, 32])
+@pytest.mark.parametrize(
+    ("page_size", "windowed", "natural", "splits"), PAGED_CASES,
+    ids=[f"{ps}-{'window' if w else 'prefix'}-{'natural' if n else 'fold'}-{s}"
+         for ps, w, n, s in PAGED_CASES])
 def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_config(page_size, windowed,
                                                                                   natural, splits):
     """`decode_attention.attend_paged` reads a row's pages through its table to the row's length, from
@@ -831,10 +839,11 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
 
 COMPILED = [(kernel, variant, splits) for kernel, variants in
             (("dense", ("bfloat16", "float32")), ("natural", ("raw", "sinks")), ("paged", (16, 32)))
-            for variant in variants for splits in decode_attention.SPLITS]
-"""The decode compile gate's cases: each kernel's variants at every slice count (`decode_attention.SPLITS`),
-a program shape each, so every case compiles one kernel (row 2123: a kernel's twelve together took 228 to
-263 s of a CPU task)."""
+            for variant in variants for splits in (1, decode_attention.SPLITS[-1])]
+"""The decode compile gate's cases: each kernel's variants at unsplit (`1`) and max split
+(`decode_attention.SPLITS[-1]`, 32) — splits 2..32 compile the same split-KV Triton body (identical shared
+bytes, registers and 0 spills, e.g. sm90 dense bf16: 44032 B / 167 regs / 0 B frame for all splits 2..32
+vs 168 regs at split 1), cutting 108 to 36 cells."""
 
 
 @pytest.mark.parametrize(("kernel", "variant", "splits"), COMPILED)

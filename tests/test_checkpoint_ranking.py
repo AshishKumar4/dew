@@ -460,9 +460,9 @@ def test_older_kept_steps_hold_their_model_alone_and_the_latest_resumes(tmp_path
 
 def test_a_directory_holding_only_a_model_alone_is_no_fresh_runs(tmp_path):
     """A directory whose committed steps hold their model alone (`Keep(weights_only=True)`), none of them a
-    step a resume reads, is occupied: a fresh run there, asked (`resume="never"`) or chosen (`"auto"`), is
-    refused, as one beside a run's steps is, never started beside them (row 9019: read as empty, a fresh
-    run wrote its steps among them); one that must continue (`"require"`) finds none to continue."""
+    step a resume reads, is occupied: a fresh run asked there (`resume="never"`) is refused, as one beside a
+    run's steps is (row 9019: read as empty); one that must continue (`"require"`) finds none to continue;
+    "auto" starts afresh, a trainer refusing it where the model is another run's (`resumed_step`)."""
     state = trainer(tmp_path / 'run').initial_state()
     held = tmp_path / 'held'
     written = Checkpoints(str(held))
@@ -470,8 +470,8 @@ def test_a_directory_holding_only_a_model_alone_is_no_fresh_runs(tmp_path):
     written.wait()
     assert _items(held, 2) == ['model']
     alone = Checkpoints(str(held))
-    assert alone.latest is None and alone.occupied == 2
-    for resume in ("auto", "never", "require"):
+    assert alone.latest is None and alone.resumed("auto") is None
+    for resume in ("never", "require"):
         with pytest.raises(ValueError):
             alone.resumed(resume)
 
@@ -1175,3 +1175,55 @@ def test_no_split_metric_or_summary_name_takes_the_summaries_namespace():
                            metrics=[Value(name, Shown(better='lower'))], split=split)
     with pytest.raises(ValueError):
         Summary('summary/board', {'val/value': 1.0}, better='lower')
+
+
+def test_a_resume_under_another_loss_setting_is_refused_as_a_fresh_run_beside_its_model_is(tmp_path):
+    """A trainer built directly over a directory whose run trained another loss of the same model and
+    objective class (its `z_loss`) refuses to resume, naming the setting (row 9020: it resumed, its
+    inference record alike), as a fresh run over a directory holding that run's model alone (a weights-only
+    step) is refused (row 9019); a setting that says how the step executes (the head's tiling, `executed`)
+    or reports alone (`token_accuracy`, `resumable`) resumes, and the run whose model alone a directory
+    holds starts afresh there."""
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    rows = (np.arange(16 * 7, dtype=np.int32) % 13).reshape(-1, 7)
+
+    def lm_data():
+        return Pipeline(Memory({"text": rows})).repeat().batch(8)
+
+    def lm(directory, **settings) -> Trainer:
+        model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                                  mlp_features=32, max_seq_len=12, dtype="float32")
+        return Trainer(LMObjective(model, seq_len=6, **settings), optax.sgd(0.1), key=jax.random.key(0),
+                       checkpoints=Checkpoints(str(directory)))
+
+    lm(tmp_path / "run").fit(lm_data(), steps=1)
+    with pytest.raises(ValueError):
+        lm(tmp_path / "run", z_loss=1e-4).fit(lm_data(), steps=2)
+    executed = lm(tmp_path / "run", head_tile="tiled", token_accuracy=False)
+    assert int(executed.fit(lm_data(), steps=2).step) == 2
+    other = lm(tmp_path / "model", z_loss=1e-4)
+    other.checkpoints.save(5, other.initial_state(), None, weights_only=True, artifact=other._artifact(),
+                           training=other.objective.training_record())
+    other.checkpoints.wait()
+    with pytest.raises(ValueError):
+        lm(tmp_path / "model").fit(lm_data(), steps=1)
+    assert int(lm(tmp_path / "model", z_loss=1e-4).fit(lm_data(), steps=1).step) == 1
+
+
+def test_a_rows_length_and_the_context_it_derives_are_no_computation_a_resume_holds():
+    """Two LM objectives over one model at other row lengths, whose contexts differ with them (a rotary
+    model of four places: its context the longer of the two), train one computation: a curriculum's longer
+    rows resume (row 9535: the derived context was recorded and refused)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training.startup import computation_differs
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=4)
+    short, long = LMObjective(model, seq_len=4), LMObjective(model, seq_len=8)
+    assert short.context != long.context
+    assert computation_differs(None, None, short.training_record(), long.training_record()) == []

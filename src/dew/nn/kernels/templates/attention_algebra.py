@@ -31,8 +31,9 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import DTypeLike
 
-from dew.algebra import derive, rewritten
+from dew.algebra import derive
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, raised_exactly
@@ -44,11 +45,13 @@ from dew.nn.kernels.templates.attention import (
     REFERENCE_PRECISION,
     Capped,
     Draw,
+    Hooks,
     Initial,
     coded,
     dropped_reach,
     drops_in_place,
     kept,
+    mean_held,
     within,
 )
 from dew.nn.precision import float32_einsum, lowered_divide, power2, scalar_power2, two_product, two_sum
@@ -105,6 +108,10 @@ class Forward:
     of 1 - 2^-14, the base review of 56a716c95, F1), the rest in the division (`dropped_total`)."""
     units: float = 1.0
     """What a dropping call's sums hold its kept weights by (`sums_units`); 1 where no call drops."""
+    largest: DTypeLike | None = None
+    """The dtype whose largest its output is within, which a quotient past it by its weights' rounding is
+    held at (`quotient`): a call's values', where it drops none and resumes no state, its output a mean of
+    them (`largest_of`); None where its output may pass them."""
 
     @property
     def reach(self) -> float:
@@ -245,6 +252,16 @@ def finite(x: jax.Array) -> jax.Array:
     """Whether each entry of `x` is finite, `|x| < inf` (NaN not), as `jnp.isfinite`: a mainloop's lowering
     may take no `is_finite` (Mosaic GPU's warpgroup lowering, jax 0.11.2)."""
     return jnp.abs(x) < jnp.inf
+
+
+def largest_of(value_dtype: DTypeLike, hooks: Hooks) -> DTypeLike | None:
+    """`Forward.largest` of a call over values of `value_dtype` under `hooks`: the values' dtype where its
+    output is a mean of them, of zeros beside them where it starts from a valueless state (a sink's,
+    `Initial.valueless`; the base review of 545370f65, F2); else None: a dropping call's (its multiplier's),
+    a resumed partial's (whose mean may pass the values' largest), and a quantized call's, whose codes'
+    product is no mean (`Hooks.rounds`: 127 x 1024 held at 65504, of 545370f65, F1)."""
+    stated = hooks.initial is None or hooks.initial.valueless
+    return value_dtype if hooks.drop is None and hooks.rounds is None and stated else None
 
 
 def infinite(x: jax.Array) -> jax.Array:
@@ -925,15 +942,22 @@ def settled(state: Partial) -> Partial:
     return Partial(joined(state.acc, low.acc), state.m, joined(state.total, low.total), state.scale)
 
 
+def saturated(x: jax.Array, finite_operands: jax.Array) -> jax.Array:
+    """`x` saturated at its float dtype's largest magnitude where `finite_operands` holds and `x` overflowed
+    it (row 6882): one owner shared by `base2_maximum` and `raw_maximum`; a quotient's hold is its values'
+    dtype's (`quotient`, `attention.mean_held`), past fp32's largest the same."""
+    largest = jnp.finfo(x.dtype).max
+    return jnp.where(infinite(x) & finite_operands,
+                     jnp.where(x > 0, largest, -largest).astype(x.dtype), x)
+
+
 def base2_maximum(m: jax.Array) -> jax.Array:
     """A natural initial maximum (a sink's logit, a partial's) in base 2, `m * log2(e)`, saturated at fp32's
     largest where that product passes it. Exact as far as any key reads it: a folded logit is at most fp32's
     largest less an ulp (`Forward.base2`), so a maximum past fp32's largest in base 2 exceeds every key's
     by over an ulp there, 2^104, as its saturation does, and every key's weight is zero under either, the
     state's own one; one past its negative is below every key's alike."""
-    folded = m * LOG2E
-    largest = float(jnp.finfo(jnp.float32).max)
-    return jnp.where(infinite(folded) & finite(m), jnp.sign(m) * largest, folded)
+    return saturated(m * LOG2E, finite(m))
 
 
 def raw_maximum(m: jax.Array, scale: float) -> jax.Array:
@@ -941,9 +965,7 @@ def raw_maximum(m: jax.Array, scale: float) -> jax.Array:
     saturated at fp32's largest where that quotient passes it, as `base2_maximum` saturates: a raw product is
     finite, so a maximum past fp32's largest exceeds every key's and weighs them all zero, as its saturation
     does."""
-    raw = m / np.float32(scale)
-    largest = float(jnp.finfo(jnp.float32).max)
-    return jnp.where(infinite(raw) & finite(m), jnp.sign(m) * largest, raw)
+    return saturated(m / np.float32(scale), finite(m))
 
 
 def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Partial:
@@ -1263,12 +1285,18 @@ def kept_parts(p: jax.Array, multiplier: jax.Array | None, reach: float, dtype) 
     """Weights `p` as the parts of their product with values of `dtype`, a dropout draw's (`multiplier`) kept
     keys' alone taken by its `reach` before the narrowing, past the dtype's largest binade at their row's
     power of two (at a power below, e^-17.34 at 256/129 and e^-28 at 2^17 rounded to 0, the base reviews of
-    4e2eb287e and a648b3279, F1, F3)."""
-    if multiplier is None or drops_in_place(dtype, reach):
+    4e2eb287e and a648b3279, F1, F3). fp16's take two parts at one scale (`split_parts`), 22 bits, whose
+    products issue into one accumulator: a dropping call's output is no mean of its values, so one rounding
+    of a weight, up to 2^-11 of it, carried it past fp16's largest where the exact output is within it (a
+    weight rounded up to 2, 65526.93 where the float64 output is 65513.82, the base review of 70c1aa096, F1;
+    row 9505)."""
+    if multiplier is None or jnp.dtype(dtype) != jnp.dtype(jnp.float16):
         return (narrow(kept(p, multiplier, reach), dtype),)
+    if drops_in_place(dtype, reach):
+        return split_parts(kept(p, multiplier, reach))
     # Its row's power of two along the product's columns, as the rows' product reads it.
-    value, exponent = _fp16_scaled(kept(p, multiplier, reach), rows=True)
-    return (product.Scaled(value, exponent[:, None]),)
+    value, exponent = _scaled(kept(p, multiplier, reach), rows=True)
+    return tuple(product.Scaled(part, exponent[:, None]) for part in split_parts(value))
 
 
 def in_units(spec: "Forward", products: jax.Array) -> jax.Array:
@@ -1534,16 +1562,18 @@ def _split_tile(keys: Keys, p: jax.Array, dtype, anchor: Argmax, multiplier: jax
         # where its weights' sum times fp32's largest passes 2^127, so that weight is at least 2^-(1 + log2
         # n) of n keys, and the scale at most 2^-(2 + log2 n)): a small weight is another key's.
         small = jnp.where(at_anchor, 0.0, small)
-    others, own_tile = anchor_split(narrow(p, dtype), at_anchor)
+    others, own_tile = anchor_split(p, at_anchor, dtype)
     lowered = () if small is None else small_parts(small, dtype)
 
     def rest() -> jax.Array:
-        # The other keys' narrowed weights' sum (a dropping call's at its reach, as `kept_parts`' products',
-        # so a kept key's cancels), a scaled tile's small ones' taken back beside it, after the products.
-        dropping = multiplier is not None and small is None and drops_in_place(dtype, reach)
-        narrowed = narrow(jnp.where(at_anchor, 0.0, p) * np.float32(reach), dtype) if dropping else others
-        summed = narrowed.astype(jnp.float32).sum(axis=-1) * np.float32(1 / reach if dropping else 1)
-        return summed if small is None else summed + taken_back(small.sum(axis=-1), float(-SMALL_SHIFT))
+        # The other keys' narrowed weights' sum, after the products: a dropping call's as its products take
+        # them (`kept_parts`, every key's as a kept one's, so a kept key's cancels) over its reach, a scaled
+        # tile's small ones' taken back beside it.
+        if multiplier is None or small is not None:
+            summed = others.astype(jnp.float32).sum(axis=-1)
+            return summed if small is None else summed + taken_back(small.sum(axis=-1), float(-SMALL_SHIFT))
+        taken = kept_parts(jnp.where(at_anchor, 0.0, p), jnp.ones_like(p), reach, dtype)
+        return functools.reduce(jnp.add, map(_summed_row, taken)) * np.float32(1 / reach)
     if multiplier is None or keys.coords.drop is None:
         return (others, *lowered), rest, own_tile, anchor
     apart = jnp.where(at_anchor, 0.0, p)
@@ -1731,12 +1761,22 @@ def argmax(state: Argmax, logits: jax.Array, k_pos: jax.Array) -> Argmax:
                   jnp.where(tile_peak > state.peak, first.astype(jnp.int32), state.key))
 
 
-def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """A tile's narrowed weights split at the anchor key (`at_anchor`): the others, the left operand of
-    the product that adds to `B = sum_{j != c} e_j v_j`, and the anchor's own weight `[bq]`, fp32."""
-    zero = jnp.zeros_like(narrowed)
-    return (jnp.where(at_anchor, zero, narrowed),
-            jnp.where(at_anchor, narrowed, zero).astype(jnp.float32).sum(axis=-1))
+def anchor_split(p: jax.Array, at_anchor: jax.Array, dtype) -> tuple[jax.Array, jax.Array]:
+    """A tile's weights `p` (fp32) split at the anchor key (`at_anchor`): the others narrowed to `dtype`, the
+    left operand of the product that adds to `B = sum_{j != c} e_j v_j`, and the anchor's own weight `[bq]`
+    as it is, fp32, which enters no product, only the output's join (`joined`) and D (`split_delta`), so no
+    narrowing loses it: rounded to fp16, an anchor's e^-18 beside a sink was 0 before a dropping call's
+    multiplier of 2^14 took it, and with it an output of 8.18 (the base review of 70c1aa096, F2; row
+    9506)."""
+    return (narrow(jnp.where(at_anchor, 0.0, p), dtype), jnp.where(at_anchor, p, 0.0).sum(axis=-1))
+
+
+def _summed_row(part: jax.Array | product.Scaled) -> jax.Array:
+    """A product's part's rows' sums `[bq]`, fp32, a scaled one's taken back by its rows' powers of two
+    (`[bq, 1]`, `kept_parts`)."""
+    if isinstance(part, product.Scaled):
+        return taken_back(part.value.astype(jnp.float32).sum(axis=-1), jnp.reshape(part.exponent, (-1,)))
+    return part.astype(jnp.float32).sum(axis=-1)
 
 
 def split_term(own: jax.Array, moved: jax.Array, old_value: jax.Array,
@@ -1824,11 +1864,11 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     return _derived_merged(spec, stacked, axis)
 
 
-def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, held: bool = False) -> jax.Array:
+def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, held: DTypeLike | None = None
+              ) -> jax.Array:
     """The weighted values `acc` over their denominator, any leading axes: zero for a query that saw nothing
     where it may (`guarded`: a walk's whose row may see none, or one from a state); a subnormal ratio kept
-    where the arithmetic flushes one, and one past the values' largest held there where `held`
-    (`quotient`)."""
+    where the arithmetic flushes one, and one past the dtype `held`'s largest held there (`quotient`)."""
     if not guarded:
         return quotient(lambda sums: sums / expand(denominator, sums), acc, denominator, held=held)
     safe = jnp.where(denominator > 0, denominator, 1.0)
@@ -1837,19 +1877,21 @@ def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool, held: bo
 
 
 def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax.Array, *,
-             held: bool = False) -> jax.Array:
+             held: DTypeLike | None = None) -> jax.Array:
     """`ratio(acc)`, the weighted values `acc` `[..., Dv]` over their rows' `total` `[...]` as its caller
     divides them; where the arithmetic flushes a subnormal result (`bodies.subnormals`: XLA's CPU, per
     primitive, row 4023), each element whose quotient may fall below fp32's least normal divided raised to
     its row's total's binade (`dew.nn.float_bits.raised_exactly`, from its bits) and taken back in the one
     rounding of the correctly rounded division (`lowered_divide`): a subnormal one kept (row 6302); every
     other element's bits the plain ratio's. Wider sums (a float64 truth's) keep their subnormals as they
-    are. Where `held` (an fp32 call's walk, `MosaicForward.parts`: dropout-free inference), a quotient of
-    finite sums is a mean of finite values, within their dtype's largest, so one past it is the sums'
-    rounding, held there by selection: a scaled row's sums of values at fp32's largest round up an ulp onto
-    2^127 at a total of 1/2, its quotient 2^128 (row 6842); an infinite value's sum stays infinite, its
-    quotient as it is (a dropping call's may pass the values' largest, as the reference's does; a 16-bit
-    output casts one held at fp32's largest to inf, so no 16-bit walk pays for the hold)."""
+    are. Where `held` (a dtype: a dropout-free call's values' of no initial state, `Forward.largest`; an fp32
+    call's walk's, `MosaicForward.parts`), a quotient of finite sums is a mean of finite values, within
+    that dtype's largest, so one past it is its weights' or its sums' rounding, held there by selection: an
+    fp16 weight rounds up by as much as 2^-11 of it where the denominator sums it unrounded, the mean of
+    1001 values of 65504 at 65522, inf in fp16 (row 9519); a scaled row's sums of values at fp32's largest
+    round up an ulp onto 2^127 at a total of 1/2, its quotient 2^128 (row 6842). An infinite value's sum
+    stays infinite or NaN, its quotient as it is; a dropping call's or a state's may pass the values'
+    largest, as the reference's does."""
     def divided(*, flushing: bool) -> jax.Array:
         plain = ratio(acc)
         if not flushing:
@@ -1861,11 +1903,7 @@ def quotient(ratio: Callable[[jax.Array], jax.Array], acc: jax.Array, total: jax
         return jnp.where(raised > 0, lowered_divide(lifted, divisor, raised), plain)
 
     out = bodies.subnormals(divided, acc.dtype)
-    if not held:
-        return out
-    largest = jnp.finfo(out.dtype).max
-    past = finite(acc) & (jnp.abs(out) > largest)
-    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
+    return out if held is None else mean_held(out, acc, held)
 
 
 def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:
@@ -1891,7 +1929,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     rows' scale leaves (both its sums are at it). A `normalized` state's sums are its output already (a
     merge of finished states, `finished_merged`): zero where it holds no mass. Where its arithmetic flushes
     a subnormal result (XLA's CPU, `bodies.subnormals`), its ratio is `quotient`'s, held at the values'
-    largest where `held` (an fp32 call's walk, `quotient`)."""
+    largest (`Forward.largest`), or at fp32's where `held` (an fp32 call's walk, `quotient`)."""
     m, denominator = finished_rows(spec, state, initial=initial)
     if normalized:
         out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
@@ -1899,7 +1937,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
         acc, total = dropped_total(spec, state.acc, state.total)
         state = state._replace(acc=acc, total=total)
         out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
-                       held=held)
+                       held=jnp.float32 if held else spec.largest)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
@@ -1923,10 +1961,12 @@ def inverse(total: jax.Array) -> jax.Array:
 
 def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:
     """`score_mod` on a tile, rewritten by the algebra pass before the tile places it (docs/design/algebra.md
-    §2, `dew.algebra.rewritten`; the hook as written where the pass is off), each window's derivation held
-    across a launch's tiles (`program._derived`); a custom-derivative call in it lowers as its primal
-    function (Dew's JAX build, constraints.txt)."""
-    return rewritten(score_mod)(logits, q_pos, k_pos, *params)
+    §2, `tuning.prepared`: once, a launch's own prepared hook as it is; the hook as written where the pass is
+    off), each window's derivation held across a launch's tiles (`program._derived`); a custom-derivative
+    call in it lowers as its primal function (Dew's JAX build, constraints.txt)."""
+    from dew.nn.kernels import tuning
+
+    return tuning.prepared(score_mod)(logits, q_pos, k_pos, *params)
 
 
 def _scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:
@@ -1980,10 +2020,15 @@ def running_shift(old: jax.Array, new: jax.Array) -> jax.Array:
 
 def parts_at(x: jax.Array, exponent: jax.Array, dtype=jnp.float16) -> tuple[jax.Array, jax.Array]:
     """An fp32 tile `x` as two `dtype` parts at the running scale of `exponent`, its tile's own or larger
-    (`running_parts`): `x` times `2^(14 - exponent)` rounded, then its remainder rounded."""
-    scaled = scalar_power2(x, jnp.where(exponent == -jnp.inf, 0.0, 14.0 - exponent))
-    high = scaled.astype(dtype)
-    return high, (scaled - high.astype(jnp.float32)).astype(dtype)
+    (`running_parts`): `x` times `2^(14 - exponent)` in two parts (`split_parts`)."""
+    return split_parts(scalar_power2(x, jnp.where(exponent == -jnp.inf, 0.0, 14.0 - exponent)), dtype)
+
+
+def split_parts(x: jax.Array, dtype=jnp.float16) -> tuple[jax.Array, jax.Array]:
+    """An fp32 tile `x` within `dtype`'s range as two `dtype` parts at its scale: `x` rounded, then what that
+    rounding lost rounded, a remainder below the dtype's least normal kept to its least subnormal."""
+    high = x.astype(dtype)
+    return high, (x - high.astype(jnp.float32)).astype(dtype)
 
 
 def running_restored(value: jax.Array, exponent: jax.Array) -> jax.Array:

@@ -35,7 +35,7 @@ import pytest
 from arm_arithmetic import Truth
 from attention_oracle import exact_attention
 from generation_support import here, interprets
-from reference_error import as_given, assert_as_exact, widened, with_gradients
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, widened, with_gradients
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -1086,26 +1086,30 @@ def _held_empty(family: Family, found, label: str) -> None:
         np.testing.assert_array_equal(np.asarray(array, np.float32)[rows], 0.0, err_msg=f"{label} {leaf}")
 
 
-def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
+def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int, check=None) -> None:
     """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever the
-    float64 truth (`truth_fn` on the inputs widened) rounded to the leaf's dtype is. A reference computing
-    in the call's own dtype is no measure of it: fp16's written-out attention at `logits near 1e4` gives a
-    key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1). The truth runs
-    on the host's CPU device, as the lane runs float64 references (tests/lane_environment.py): a family's
-    draws are small, and XLA:GPU compiled each truth in 7.3 s where XLA:CPU takes 0.2 (MAINGPU-0243234e8's
-    part 2 on an H100: 25 truths, 182 s)."""
+    float64 truth (`truth_fn` on the inputs widened) rounded to the leaf's dtype is, and where `check` is
+    given, `check(result, seed)` holds on the already-computed output of every draw (row 9041). A reference
+    computing in the call's own dtype is no measure of it: fp16's written-out attention at `logits near 1e4`
+    gives a key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1). The
+    truth runs on the host's CPU device, as the lane runs float64 references (tests/lane_environment.py): a
+    family's draws are small, and XLA:GPU compiled each truth in 7.3 s where XLA:CPU takes 0.2
+    (MAINGPU-0243234e8's part 2 on an H100: 25 truths, 182 s)."""
     truth_of = Truth(truth_fn, jax.local_devices(backend="cpu")[0])
     for seed in range(seeds):
         inputs = draw(seed)
         with jax.enable_x64(new_val=True):
             truth = jax.tree.leaves(truth_of(*widened(jax.device_get(inputs))))
-        found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
+        result = dew_fn(*inputs)
+        found = jax.tree_util.tree_leaves_with_path(result)
         for (path, mine), wide in zip(found, truth, strict=True):
             mine = np.asarray(mine)
             rounded = np.asarray(wide, np.float64).astype(mine.dtype)
             lost = np.isfinite(rounded.astype(np.float32)) & ~np.isfinite(mine.astype(np.float32))
             assert not lost.any(), (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {int(lost.sum())} "
                                     "values not finite where the truth's rounded to their dtype are")
+        if check is not None:
+            check(result, seed)
 
 
 GPU_ONLY = {
@@ -1158,8 +1162,8 @@ def default_is_finite(family_name: str, mainloop_name: str) -> None:
     truth = with_gradients(_reference(family, anchored=True))
     label = f"{mainloop_name} default {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
-    assert_finite(differentiated, truth, draw, label, seeds=seeds)
-    _held_empty(family, differentiated(*draw(0)), label)
+    assert_finite(differentiated, truth, draw, label, seeds=seeds,
+                  check=lambda found, seed: _held_empty(family, found, f"{label} seed {seed}"))
 
 
 @pytest.mark.parametrize("family", [name for name in TEMPLATE_FAMILIES if _drawn_first(name)[3] is None])
@@ -1176,8 +1180,11 @@ def test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_ed
         return template.reference(query, key, value, _spans(family_spec, query, key), _dropping(query))
 
     for name, mainloop in _mainloops(family_spec, {}, dropping=True).items():
-        assert_finite(jax.jit(with_gradients(mainloop)), with_gradients(truth), draw,
-                      f"{name} dropping {family_spec.dtype}", seeds=seeds)
+        drop_label = f"{name} dropping {family_spec.dtype}"
+        assert_finite(jax.jit(with_gradients(mainloop)), with_gradients(truth), draw, drop_label,
+                      seeds=seeds,
+                      check=lambda found, seed, lbl=drop_label: _held_empty(
+                          family_spec, found, f"{lbl} seed {seed}"))
 
 
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
@@ -1186,6 +1193,34 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     (`algebra.SCALED_WALK`) and under the fold's guard (`algebra.walked`), finite in the default form over
     every family (`default_is_finite`)."""
     default_is_finite(family, "portable")
+
+
+def test_assert_finite_checks_empty_rows_on_every_draw():
+    """Row 9041: a finite nonzero output or dQ in an empty row after seed zero fails `assert_finite`'s
+    per-draw check without running `dew_fn` a second time."""
+    empty = np.array([[True, False]])
+    family = Family(draw=lambda s: (jnp.zeros((1, 2, 1, 1)),), keep=np.zeros((1, 1, 2, 1), bool), empty=empty)
+    calls = 0
+
+    def dew_fn(x):
+        nonlocal calls
+        calls += 1
+        out = jnp.zeros((1, 2, 1, 1), jnp.float32)
+        dq = jnp.where(jnp.asarray(empty)[:, :, None, None], x, 0.0)
+        return (out, dq)
+
+    def truth_fn(x):
+        del x
+        zeros = jnp.zeros((1, 2, 1, 1), jnp.float64)
+        return (zeros, zeros)
+
+    def draw(seed):
+        return (jnp.asarray(float(seed), jnp.float32),)
+
+    with pytest.raises(AssertionError):
+        assert_finite(dew_fn, truth_fn, draw, "probe", seeds=3,
+                      check=lambda found, seed: _held_empty(family, found, f"probe seed {seed}"))
+    assert calls == 2
 
 
 @pytest.mark.skipif(not INTERPRETED, reason="an H100 runs these families in `_mainloops`' Mosaic arms")
@@ -1206,6 +1241,95 @@ def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_refere
     assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
                     lambda seed: _cast(family, family.draw)(seed)[:4], "mosaic forward at fp32's limit",
                     seeds=seeds, truth_fn=_reference(family, anchored=True))
+
+
+MAINLOOPS = ("portable", "triton", *(("mosaic", "decode") if INTERPRETED else ()))
+"""The forwards a mean's test walks: the plain-JAX mainloop's and the Pallas-Triton one's, and in a CPU
+process the Mosaic forward's and its decode step's interpreted as an H100 runs them (a GPU runs them in
+`_mainloops`' Mosaic arms and the decode cells)."""
+
+
+@pytest.mark.parametrize("sink", [None, -20.0], ids=["no sink", "a sink"])
+@pytest.mark.parametrize(("mainloop", "training"),
+                         [(mainloop, training) for mainloop in MAINLOOPS for training in (False, True)
+                          if mainloop != "decode" or not training],
+                         ids=lambda value: {False: "inference", True: "training"}.get(value, value))
+def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, sink):
+    """One fp16 query over a key at logit 0 and 1000 at a logit whose weight, 0.50035, narrows up to 0.5005
+    for its product, every value fp16's largest, beside a `sink` or none: the output, their mean (and the
+    sink's zero), is 65504, on par with the reference (check 1) on both walks, where the narrowed weights
+    over their unrounded sum put it at 65522, inf in fp16 (row 9519; beside a sink of -20, the base review of
+    545370f65, F2; through Triton and the decode step, of c55dff91f, F1: each dropped a sink's hold). The
+    decode step's call is 17 such rows over 8 key heads, 136 programs past an H100's 132, so its work list
+    takes one slice a row and its walk finishes each row from the packed state itself (of 12e76ca7e, F3).
+    Each key's logit is two fp16 entries of it, their sum in fp32 log(0.50035) at the call's scale, 1/8."""
+    keys, width = 1001, 64
+    rows, heads = (17, 8) if mainloop == "decode" else (1, 1)
+    logit = np.float32(8 * np.log(0.50035))
+    high = np.float16(logit)
+    query = jnp.zeros((rows, 1, heads, width), jnp.float16).at[..., :2].set(1)
+    key = (jnp.zeros((rows, keys, heads, width), jnp.float16).at[:, 1:, :, 0].set(high)
+           .at[:, 1:, :, 1].set(np.float16(logit - np.float32(high))))
+    value = jnp.full((rows, keys, heads, width), jnp.finfo(jnp.float16).max, jnp.float16)
+    spans = template.spans(1, keys, rows)
+    hooks = template.Hooks(initial=None if sink is None
+                           else template.sinks(jnp.full((heads,), sink, jnp.float32), rows, 1, width))
+
+    def ours(query, key, value):
+        kept = template.Kept.SPLIT if training else template.Kept.NONE
+        if mainloop == "portable":
+            out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                                  hooks, residuals=training)
+        elif mainloop == "triton":
+            with tuning.pinned(PINS):
+                out = attention_triton.forward(query, key, value, spans, hooks, residuals=kept,
+                                               interpret=INTERPRETED)
+        elif mainloop == "mosaic":
+            with generation.assumed("sm90"):
+                out = attention_mosaic.forward(query, key, value, spans, hooks, interpret=True,
+                                               residuals=kept)
+        else:
+            with generation.assumed("sm90"):
+                out = attention_decode.attend(query, key, value, spans, hooks, interpret=True)
+        return out[0] if training else out
+
+    assert_as_exact(ours, lambda query, key, value: template.reference(query, key, value, spans, hooks),
+                    lambda seed: (query, key, value), "an fp16 mean at fp16's largest", seeds=FEWEST_SEEDS)
+
+
+def test_a_mean_of_an_infinite_value_stays_infinite_through_the_hold():
+    """One fp16 query over one key at logit 0 whose value is inf, and over two keys whose values are inf and
+    -inf: the reference's mean held at fp16's largest from finite sums (`attention.held_mean`) leaves the
+    infinite mean inf and the opposite infinities' NaN, as their mean is, where the held value less the
+    unheld one took inf to NaN (the head review of 12e76ca7e, F2)."""
+    query = jnp.zeros((1, 1, 1, 8), jnp.float16)
+    one, two = template.spans(1, 1, 1), template.spans(1, 2, 1)
+    inf = jnp.full((1, 1, 1, 8), jnp.inf, jnp.float16)
+    alone = template.reference(query, jnp.zeros((1, 1, 1, 8), jnp.float16), inf, one)
+    opposite = template.reference(query, jnp.zeros((1, 2, 1, 8), jnp.float16),
+                                  jnp.concatenate([inf, -inf], axis=1), two)
+    assert bool(jnp.all(alone == jnp.inf)) and bool(jnp.all(jnp.isnan(opposite)))
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
+def test_a_quantized_calls_codes_past_fp16s_largest_are_no_mean(training):
+    """One fp16 key at logit 0 and value 1024 under a quantized model's weights (`Hooks.rounds` 127.5, the
+    key's code 127) and an output hook taking the output by 1/128: the output is 127 x 1024 / 128, 1016, on
+    par with the reference (check 1), the codes' product no mean of the values, so none held at fp16's
+    largest (the base review of 545370f65, F1: held, 511.75)."""
+    query = jnp.zeros((1, 1, 1, 64), jnp.float16)
+    key = jnp.zeros((1, 1, 1, 64), jnp.float16)
+    value = jnp.full((1, 1, 1, 64), 1024, jnp.float16)
+    spans = template.spans(1, 1, 1)
+    hooks = template.Hooks(output_mod=lambda out: out / 128, rounds=127.5)
+
+    def ours(query, key, value):
+        out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                              hooks, residuals=training)
+        return out[0] if training else out
+
+    assert_as_exact(ours, lambda query, key, value: template.reference(query, key, value, spans, hooks),
+                    lambda seed: (query, key, value), "a quantized call's codes", seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])

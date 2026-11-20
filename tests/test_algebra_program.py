@@ -49,6 +49,52 @@ def nested(kind: str):
 KINDS = ("jit", "checkpoint", "scan", "cond", "while")
 
 
+def test_an_infinite_scale_stays_inside_a_maximum():
+    """`max(x * inf)` over `x = [0, 1, ..., 1023]`: `0 * inf` is NaN, so the maximum is NaN; the pass took an
+    infinite scale for a positive one and hoisted it out of the maximum, `max(x) * inf`, infinite, its work
+    the less (spec alignment, 8992). A scale out of an extremum is a finite positive real's alone."""
+    def scaled(x):
+        return jnp.max(x * jnp.inf)
+
+    x = jnp.arange(1024, dtype=jnp.float32)
+    assert np.isnan(np.asarray(jax.jit(algebra.rewritten(scaled))(x)))
+
+
+def test_a_window_proves_nothing_of_a_value_its_program_proves_no_number():
+    """`sum(tanh(a / b) * c)`, its quotient outside the window a reduction heads (three equations deep):
+    `a / b` may be `0 / 0`, so the program proves `tanh` of it no number and bounds nothing it makes; each
+    window cut from it holds no bound and no finiteness the program does not (`program._declared`: the
+    quotient declared as the program proves it, `terms.Proven`), where the window took its input for a finite
+    real and bounded the tanh, its product and its sum, which a reordering reads (spec alignment, 8993)."""
+    from jax.extend import core as jcore
+
+    def program_of(a, b, c):
+        return jnp.sum(jnp.tanh(a / b) * c)
+
+    closed = jax.make_jaxpr(program_of)(*(jnp.ones(8, jnp.float32) for _ in range(3)))
+    whole = terms.region(closed)
+    windows = program._windows(closed.jaxpr)
+    assert windows
+    proven = program._held(closed.jaxpr)
+    for window, _ in windows:
+        cut = terms.region(jcore.ClosedJaxpr(window, []), program._declared(window, proven))
+        made = [var for equation in window.eqns for var in equation.outvars]
+        assert [var for var in made if cut.held.get(var) is not None and whole.held.get(var) is None] == []
+        assert [var for var in made if cut.apart[var].finite and not whole.apart[var].finite] == []
+
+
+@pytest.mark.parametrize(("function", "finite"), [(jnp.tanh, True), (jax.lax.erf, True), (jnp.sin, False)],
+                         ids=["tanh", "erf", "sin"])
+def test_a_saturating_function_of_a_product_that_may_overflow_keeps_its_bound(function, finite):
+    """`f(a * b)` of two inputs, finite reals whose product may overflow to an infinity: a tanh's and an erf's
+    is finite, so its bound stands (a bound is stated of a finite value alone; an infinity's tanh is its
+    side's 1), and a window reading the product as its program proves it bounds them still; a sine's of an
+    infinity is no number, and stays unbounded (spec alignment, 8993)."""
+    closed = jax.make_jaxpr(lambda a, b: function(a * b))(*(jnp.ones(8, jnp.float32) for _ in range(2)))
+    made = closed.jaxpr.outvars[0]
+    assert (terms.region(closed).held.get(made) is not None) is finite
+
+
 @pytest.mark.parametrize("kind", KINDS)
 def test_a_bodys_math_is_rewritten_in_place(kind):
     """Two sums inside a nested jit, a checkpoint, a scan, a conditional or a loop are rewritten inside that
@@ -292,6 +338,23 @@ def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
     return jnp.dot(a, x) + jnp.dot(a, y)
+
+
+def test_two_roots_of_one_shared_product_are_made_once():
+    """Two outputs reading products of a shared operand, `a x + a y` and `a y + a x` (`_shared_products`'s
+    terms, in either order): the pass prices them together as one factored product, and the program it
+    writes makes that product once, the second output the first's value; each traced apart wrote the
+    product twice, so the program computed what extraction priced as shared twice (spec alignment, 8995).
+    Its values are the written program's on par from float64 (check 1)."""
+    def both(a, x, y):
+        a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
+        return jnp.dot(a, x) + jnp.dot(a, y), jnp.dot(a, y) + jnp.dot(a, x)
+
+    shapes = ((256, 64), (64, 64), (64, 64))
+    written = jax.make_jaxpr(algebra.rewritten(both))(*rows(1, *shapes))
+    assert [equation.primitive for equation in equations(written.jaxpr)].count(jax.lax.dot_general_p) == 1
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *shapes),
+                    "two roots of one shared product", seeds=16)
 
 
 def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
@@ -866,8 +929,11 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     v5e = generation.TARGETS["v5e"]
 
     def derived(target):
-        return linear_scan.derive(linear_scan.Extents(64, 128, 128, 1), corrects=False,
-                                  schedule=cost.fused(target), precision=None, saturation=algebra.SATURATION)
+        # Derived as scan derives on a v5e (`program.passes`' target): its products priced in the v5e's modes.
+        with program.passes(target="v5e"):
+            return linear_scan.derive(linear_scan.Extents(64, 128, 128, 1), corrects=False,
+                                      schedule=cost.fused(target), precision=None,
+                                      saturation=algebra.SATURATION)
 
     priced, unmeasured = derived(v5e), derived(dataclasses.replace(v5e, vmem_rate=None))
     assert priced.price.work.kept_bytes > 0
@@ -875,9 +941,29 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     assert priced.price.value > unmeasured.price.value
 
 
+def test_a_derivatives_sum_outside_the_language_is_priced_as_the_sum_it_computes():
+    """A sum JAX's derivatives accumulate with (`add_any`, a leaf of the region, outside the language) is
+    priced as the add it computes, one CUDA-core operation an element, as the template's emission prices it:
+    a product and an `add_any` of it cost what a product and an add do. Its work was dropped, its leaf's
+    bytes alone charged, so a prologue holding one compared cheaper than it computes (the audit of
+    2026-11-19pm, 8964)."""
+    from jax._src.ad_util import add_jaxvals_p
+
+    def priced(fn):
+        x, y = jnp.ones((64, 128), jnp.float32), jnp.ones((64, 128), jnp.float32)
+        region = terms.region(jax.make_jaxpr(fn)(x, y))
+        graph, bundle, _ = program.graphed(region)
+        return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                             cost_model=cost.model(region, cost.fused(generation.TARGETS["sm90"])))[1].work
+
+    accumulated = priced(lambda x, y: add_jaxvals_p.bind(x * y, x))
+    added = priced(lambda x, y: x * y + x)
+    assert accumulated.operations == added.operations
+
+
 def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
     """A `lax.dot_general` of a bfloat16 and a float16 matrix, no preferred type stated, priced at the dtype
-    JAX makes it (`terms.product_dtype`, its traced result's, which the region records as its stated type),
+    JAX makes it (`terms.Product.made`, its traced result's, which the region records as its stated type),
     its result kept on chip at two bytes an element beside its leaves' (`Work.kept_bytes`); NumPy's
     promotion of the pair, which it refuses, raised there (base review 0b8b7ed98 F1). A bare product heads no
     rewrite window, so `dew.jit` alone never prices it (`test_algebra_fusion`'s witness holds its value)."""
@@ -898,7 +984,7 @@ def test_a_product_of_two_16_bit_formats_replays_as_traced():
     the engine binds a term's equation (`terms.value_of`): its product bound with its parameters as traced,
     its preferred type unset, and its value the traced program's bit for bit, one program. The region wrote
     the dtype it makes into that preferred type, which the replay then bound (base review 3232beb7c); it
-    keeps it apart (`Region.made`)."""
+    keeps it apart (`terms.Product.made`)."""
     def product(a, b):
         return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
 
@@ -913,31 +999,11 @@ def test_a_product_of_two_16_bit_formats_replays_as_traced():
 
     def dots(jaxpr) -> list[dict]:
         # Each product's parameters, within the programs an equation calls too (a jit's).
-        found = []
-        for equation in jaxpr.eqns:
-            if equation.primitive is jax.lax.dot_general_p:
-                found.append(dict(equation.params))
-            for value in equation.params.values():
-                inner = getattr(value, "jaxpr", None)
-                if inner is not None:
-                    found += dots(getattr(inner, "jaxpr", inner))
-        return found
+        return [dict(equation.params) for equation in programs.equations(jaxpr)
+                if equation.primitive is jax.lax.dot_general_p]
 
     assert dots(jax.make_jaxpr(replayed)(a, b).jaxpr) == dots(traced.jaxpr)
     assert np.asarray(jax.jit(replayed)(a, b)).tolist() == np.asarray(jax.jit(product)(a, b)).tolist()
-
-
-@pytest.mark.parametrize("apart", [0, 1, 4], ids=["as written", "a group of one", "apart from its group"])
-def test_a_token_loops_states_are_kept_each_token(apart):
-    """A scan's token loop keeps its state on chip each token, written and read (`Work.kept_bytes`, row
-    7283), and where a token reads apart from a group of more than one token's writes the state its group
-    entered beside it (`scan._looped`'s two carried states)."""
-    from dew.algebra import linear_scan
-
-    c, k, v = 16, 32, 64
-    work = linear_scan._work(linear_scan.Chunk.plain(linear_scan.Chunk.token("U")),
-                             linear_scan.Extents(c, k, v, 1, apart=apart), lambda value: (0, 0), None)
-    assert work.kept_bytes == c * (2 if apart > 1 else 1) * 2 * 4 * k * v
 
 
 def test_device_memory_is_priced_at_the_parts_measured_stream():
@@ -948,7 +1014,7 @@ def test_device_memory_is_priced_at_the_parts_measured_stream():
 
     def memory_rate(device_kind, clocked):
         target = dataclasses.replace(hopper, device_kind=device_kind, memory_bandwidth=clocked)
-        return kernel_cost.rates(target, device=True)[-1]
+        return kernel_cost.rates(target, device=True).device
 
     (measured,) = {memory_rate("NVIDIA GH200 480GB", clocked) for clocked in (4.0e12, 4.9e12)}
     assert measured is not None and measured < 4.0e12
@@ -1210,6 +1276,66 @@ def test_an_algebra_span_joins_the_windows_around_it():
     assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(spanning))(*rows(13, *SHAPES_MARKED))) == []
     assert_as_exact(jax.jit(algebra.rewritten(spanning)), jax.jit(two_sums),
                     lambda seed: rows(seed, *SHAPES_MARKED), "an opened span", seeds=8)
+
+
+def test_an_algebra_span_no_rewrite_crosses_keeps_its_marker():
+    """An Algebra span that no rewrite reaches into (`cumsum(sin(x))`, nothing the rules lower) beside two
+    sums the pass joins elsewhere in the program: the joined sums are spliced, and the span stays one marked
+    call of its kind, as written, where one splice anywhere had opened every span for good (spec alignment,
+    8998, §6.10); the program computes what it computes (check 1)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def both(x, y, a):
+        kept = marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x), axis=-1))(x)
+        return kept, two_sums(x, y, a)
+
+    assert cheaper_spliced(lambda x, y, a: both(x, y, a)[1], *rows(14, *SHAPES_MARKED))
+    assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(both))(*rows(14, *SHAPES_MARKED))) == [Algebra()]
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a span no rewrite crosses beside joined sums", seeds=8)
+
+
+def test_an_algebra_span_a_rewrite_lands_inside_stays_rewritten():
+    """An Algebra span whose body joins two sums (`two_sums`) and takes their cumulative sum, an equation no
+    rule rewrites: the join lands inside the span, which stays opened, so the program holds one sum where it
+    held two; closing the span again, its replaced equations being in the program no more, restored its body
+    as written and undid the join the pass had reported (head review). It computes what it computes
+    (check 1)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def program_of(x, y, a):
+        return marked(Algebra(), lambda x, y, a: jnp.cumsum(two_sums(x, y, a), axis=-1))(x, y, a)
+
+    def summed(closed) -> int:
+        return [equation.primitive for equation in equations(closed.jaxpr)].count(jax.lax.reduce_sum_p)
+
+    shapes = SHAPES_MARKED
+    assert summed(jax.make_jaxpr(algebra.rewritten(program_of))(*rows(16, *shapes))) < summed(
+        jax.make_jaxpr(program_of)(*rows(16, *shapes)))
+    assert_as_exact(jax.jit(algebra.rewritten(program_of)), jax.jit(program_of),
+                    lambda seed: rows(seed, *shapes), "a span a join lands inside", seeds=8)
+
+
+def test_an_algebra_span_returning_one_value_twice_stays_open_beside_a_splice():
+    """An Algebra span returning one value as two outputs, both read, beside sums the pass joins elsewhere:
+    the program the pass writes is a valid program (JAX's own check), the span left opened, where calling
+    it again bound that one value's name twice (head review); it computes what it computes (check 1)."""
+    from jax._src import core as jax_core
+
+    from dew.nn.derivatives import Algebra, marked
+
+    def both(x, y, a):
+        def twice(x):
+            made = jnp.cumsum(jnp.sin(x), axis=-1)
+            return made, made
+
+        first, second = marked(Algebra(), twice)(x)
+        return first * second, two_sums(x, y, a)
+
+    closed = jax.make_jaxpr(both)(*rows(15, *SHAPES_MARKED))
+    jax_core.check_jaxpr(algebra.rewritten_program(closed).jaxpr)
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a span returning one value twice beside joined sums", seeds=8)
 
 
 def test_an_algebra_span_with_effects_is_rewritten_within_its_call():

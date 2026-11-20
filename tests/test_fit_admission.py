@@ -1,6 +1,7 @@
 """What a run admits, at one boundary (row 1872, audit TH-07): a configured model is built from its
 effective record, and a trainer makes its key only after the process is ready."""
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -8,6 +9,7 @@ import sys
 from pathlib import Path
 
 import flax.linen as nn
+import jax
 import numpy as np
 import optax
 import pytest
@@ -17,8 +19,9 @@ from objective_cases import IMAGES
 from dew.batch import VALID_ROWS
 from dew.config import TrainerConfig
 from dew.config.jepa import JepaRunConfig
-from dew.data import TFDS, Loading, presets
+from dew.data import TFDS, Loading, Memory, presets
 from dew.data.dataset import DataPartition, Loader, rows_of
+from dew.data.pipeline import DeviceStep, Pipeline
 from dew.inputs import Field, InputSpec
 from dew.objectives.jepa.objective import JepaObjective
 from dew.objectives.supervised import Supervised
@@ -183,3 +186,80 @@ def test_a_trainer_validated_before_it_fits_trains_from_its_seed():
     trainer.validate(steps=2)
     state = trainer.fit(regression_rows(8, 0), steps=2, log_every=1)
     assert int(state.step) == 2
+
+
+@dataclasses.dataclass(frozen=True)
+class Narrowing:
+    """A step that states each row's `aux` holds three values (`Declares`) and, from the row `after` on,
+    hands two: a step that broke the shape its chain fixes."""
+
+    after: int
+
+    def declared(self, facts):
+        from dew.data.facts import shaped
+
+        return shaped(facts, "aux", [3])
+
+    def __call__(self, row):
+        return {**row, "aux": row["aux"][:2]} if int(row["i"]) >= self.after else row
+
+
+def test_a_batch_breaking_a_field_shape_its_chain_fixes_is_refused_before_it_is_placed():
+    """A chain that fixes each row's `aux` at three values (`Loader.fields`) and hands its second step rows of
+    two is refused at that batch, on its host before it is placed (row 9017: only its rows were held to the
+    loader, and the step compiled again for the new shape); one that hands what it states trains on."""
+    rows = 2 * jax.device_count()
+    columns = {"x": np.ones((4 * rows, 8), np.float32), "y": np.zeros((4 * rows, 4), np.float32),
+               "aux": np.ones((4 * rows, 3), np.float32), "i": np.arange(4 * rows, dtype=np.int32)}
+
+    def fit(after: int):
+        chain = Pipeline(Memory(columns)).map(Narrowing(after), identity="narrowing@1").repeat().batch(rows)
+        objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
+        return Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(chain, steps=3, log_every=100)
+
+    with pytest.raises(ValueError):
+        fit(after=rows)
+    assert int(fit(after=8 * rows).step) == 3
+
+
+class Cropped(DeviceStep):
+    """A device step that keeps each row's first four `x` values, and says so (`Declares`)."""
+
+    def declared(self, facts):
+        from dew.data.facts import shaped
+
+        return shaped(facts, "x", [4])
+
+    def __call__(self, batch):
+        return {**batch, "x": batch["x"][:, :4]}
+
+
+def test_a_device_steps_shape_is_no_shape_its_host_batch_is_held_to():
+    """A chain whose device step crops each row's `x` from eight values to four hands its host batch at
+    eight, which the step crops after the host's check: the host batch is held to the shapes of what it
+    holds, no device step's (row 9533: refused at the shape the device step would make)."""
+    rows = 2 * jax.device_count()
+    columns = {"x": np.ones((4 * rows, 8), np.float32), "y": np.zeros((4 * rows, 4), np.float32)}
+    chain = Pipeline(Memory(columns)).repeat().batch(rows).map(Cropped())
+    objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
+    assert int(Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(chain, steps=2,
+                                                                             log_every=100).step) == 2
+
+
+def test_a_stream_with_no_batch_ends_its_run_where_it_starts_its_final_checkpoint_written(tmp_path):
+    """A finite stream that holds no batch, on every process, ends its run at step 0 as its length would,
+    its state the one it started from and its final checkpoint written, where its objective declares the
+    input it reads (row 9068: refused at step 0); one that reads its input's shape off its first batch is
+    refused, as there is none to read it off."""
+    from dew.checkpoints import Checkpoints
+
+    rows = 2 * jax.device_count()
+    empty = Loader(lambda partition: iter(()), None, batch=rows, records=None)
+    declared = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2,
+                          inputs=InputSpec(Field("x", (8,))))
+    trainer = Trainer(declared, optax.sgd(0.1), key=jax.random.key(0), checkpoints=Checkpoints(str(tmp_path)))
+    assert int(trainer.fit(empty, steps=5, log_every=100).step) == 0
+    assert trainer.checkpoints.latest == 0
+    named = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
+    with pytest.raises(ValueError):
+        Trainer(named, optax.sgd(0.1), key=jax.random.key(0)).fit(empty, steps=5, log_every=100)

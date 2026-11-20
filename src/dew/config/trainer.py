@@ -265,7 +265,10 @@ class TrainerConfig:
     microbatches: int | None = None
     """Microbatches a pipelined step feeds through the mesh's stages, a
     multiple of `mesh.stage`; unset feeds one a stage."""
-    layout: Layout = dataclasses.field(default_factory=Layout)
+    layout: Annotated[Layout, tyro.conf.subcommand("layout")] | None = None
+    """The layout the run's trainer is given (`Trainer`'s `layout`): unset, the layout chooser decides
+    (`dew.training.streaming.laid_start`); stated, as `--trainer.layout.min-shard 8`, its own, the device
+    layout kept."""
     profile: ProfileWindow | None = None
     """One profiler window: the steps to trace, the warmup before them and the output directory, in place
     of the run's own (`run_profile`). Unset traces the run's own window alone.
@@ -386,12 +389,6 @@ class TrainerConfig:
     from the GPU's facts (row 4837).
     """
 
-    def stated_layout(self) -> Layout | None:
-        """The layout the run's trainer is given (`Trainer`'s `layout`): its own where the config states one,
-        None where it leaves the default, which a config cannot tell from `Layout()` written out, so a
-        config's run lays out as the layout chooser decides (`dew.training.streaming.laid_start`)."""
-        return None if self.layout == Layout() else self.layout
-
     def accumulating(self, dataset: Loader) -> Self:
         """This config with the accumulation its token budget sets over `dataset`'s token batches, every
         phase's alike (`Loader.token_batches`): `update_tokens` a whole number of them. Raises ValueError for
@@ -504,9 +501,10 @@ class TrainerConfig:
         variables) or keeps its frozen tree whole (`frozen_whole`), which its start places itself."""
         if self.resumes():
             return {"weights": False}
-        if not frozen or "variables" in self.layout.host or self.layout.frozen_whole:
+        layout = Layout() if self.layout is None else self.layout
+        if not frozen or "variables" in layout.host or layout.frozen_whole:
             return {"on_host": True}
-        return {"mesh": self.mesh, "layout": self.layout}
+        return {"mesh": self.mesh, "layout": layout}
 
     def resolved(self, dataset: Loader) -> tuple[Self, Loader, int | None]:
         """This config and `dataset` as a run trains on them, and the run's steps: the accumulation

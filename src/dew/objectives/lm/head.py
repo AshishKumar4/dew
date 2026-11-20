@@ -42,6 +42,8 @@ class HeadedObjective(Objective[Loss, Effects]):
     head_chunks: int
     head_tile: tuple[int, int] | None
 
+    executed: ClassVar[tuple[str, ...]] = ("head_chunks", "head_tile", "head_fused")
+
     untraced: ClassVar[Mapping[str, str]] = {
         "_head_matrices": "what its head's last trace found of each model's output table (`fused_head`), "
                           "whose fusing the key holds as its programs run it (`program_key`'s `head_fused`)"}

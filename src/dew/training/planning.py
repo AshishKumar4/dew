@@ -52,7 +52,7 @@ from dew.nn.kernels.options import (
 from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective, Pooled
 from dew.state import TrainState, apart, together
-from dew.telemetry.compiles import EVENTS, Compiles
+from dew.telemetry.compiles import Ledger
 from dew.telemetry.instrumentation import compiled_memory
 from dew.telemetry.profile import Profiler, active_profile
 from dew.training.ahead import handed
@@ -748,18 +748,12 @@ class Lower(Protocol):
     def __call__(self, split: int, narrow: bool, ns_group: int | None) -> Candidate: ...
 
 
-class _Spent(Compiles):
-    """Every program JAX traces, lowers or compiles while it is open, each kind of its events held."""
-
-    COUNTED = frozenset(EVENTS.values())
-
-
 @contextlib.contextmanager
 def spending(candidate: Candidate | None = None) -> Iterator[dict[str, float]]:
     """The seconds JAX records of the work within the block, by kind (`EVENTS`: traced, lowered, compiled),
     added to `candidate`'s (`Candidate.spent`), in the dict it yields once the block ends."""
     held = dict({} if candidate is None else candidate.spent)
-    with _Spent(None) as compiles:
+    with Ledger(None) as compiles:
         yield held
     for made in compiles.programs:
         held[made.kind] = held.get(made.kind, 0.0) + made.seconds

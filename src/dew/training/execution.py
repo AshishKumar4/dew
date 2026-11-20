@@ -38,6 +38,7 @@ from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from dew.batch import FROZEN, PROBES, at_path, merge, placed_at, select, thaw
 from dew.distributed.batches import batch_shardings
 from dew.distributed.host import transfer
+from dew.distributed.placement import placed_shapes
 from dew.inference.banks import (
     assembled,
     bank_sharding,
@@ -55,7 +56,6 @@ from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.backbones.layer_names import layer_index
 from dew.nn.inspection import unscaled, unscaling
 from dew.nn.kernels.options import Option, owned_program, program
-from dew.nn.sharding import rows_spec
 from dew.training.memory import compiled_if_it_fits, device_tokens, step_compiler_options
 from dew.training.transaction import Realization, discovered_probes, placed_as_rows, refuse_unread_probes
 
@@ -242,10 +242,10 @@ def _forward(loss, primal, frozen, store, batch, execution, scale=None, *, layou
 
 
 def _probed_cotangent(back, cotangent, *, sites, paths, layout):
-    """`_trainable_cotangent` of a watching step's pullback, and its probes' cotangents beside it, one
-    backward for both (`_forward`)."""
-    return (_trainable_cotangent(back, cotangent, sites=sites, paths=paths, layout=layout),
-            back(cotangent)[1])
+    """`_trainable_cotangent` of a watching step's pullback, and its probes' cotangents beside it: the
+    pullback run once for both (`_forward`), as the device path runs it."""
+    pulled = back(cotangent)
+    return _selected(pulled[0], sites=sites, paths=paths, layout=layout), pulled[1]
 
 
 def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
@@ -253,13 +253,18 @@ def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
 
     `back` crosses this boundary as its own pytree, so the residuals are
     arguments rather than captured constants. It returns one cotangent per
-    moving store leaf; `layout` (the store's treedef and which of its leaves
-    are held) puts them back in the store's shape, a held leaf's place
-    empty, so a mixed bank's frozen rows are the dead values the compiler
-    drops and its moving rows are selected under their logical paths.
+    moving store leaf (`_selected`).
     """
+    return _selected(back(cotangent)[0], sites=sites, paths=paths, layout=layout)
+
+
+def _selected(moving, *, sites, paths, layout):
+    """The pullback's cotangents of the moving store leaves (`moving`), in the store's shape: `layout` (the
+    store's treedef and which of its leaves are held) puts them back, a held leaf's place empty, so a mixed
+    bank's frozen rows are the dead values the compiler drops and its moving rows are selected under their
+    logical paths."""
     treedef, held = layout
-    cotangents = iter(back(cotangent)[0])
+    cotangents = iter(moving)
     placed = treedef.unflatten([None if known else next(cotangents) for known in held])
     gradient = logical({"params": placed}, sites)["params"]
     trainable = frozenset(paths)
@@ -275,22 +280,6 @@ def spec_on(mesh: Mesh):
     return placement
 
 
-def placed_as(tree, placement):
-    """`tree`'s leaves as their shapes where `placement` puts them, each keeping its dtype and weak type
-    (`placed_shapes`, which drops the weak type: a lowering's of a state not yet placed): what a host
-    step's pass over shapes reads, its programs keyed as the step's calls over arrays key them
-    (`OuterProgram.abstract_of`)."""
-    return jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(
-        np.shape(leaf), leaf.dtype, sharding=sharding, weak_type=_weak(leaf)), tree, placement)
-
-
-def _weak(leaf) -> bool:
-    """Whether `leaf`, an array, a shape or a host value, is weakly typed: a host value never is."""
-    if isinstance(leaf, jax.Array):
-        return jax.typeof(leaf).weak_type
-    return leaf.weak_type if isinstance(leaf, jax.ShapeDtypeStruct) else False
-
-
 def _stack(*rows):
     """A bank of `rows`, stacked on the CPU (`HostExecution._stack_rows`)."""
     return jnp.stack(rows)
@@ -298,10 +287,12 @@ def _stack(*rows):
 
 class _Abstract:
     """A realization's moves of shapes (`HostExecution.inputs`' `moved`): each leaf the shape it would
-    take, placed where the move would place it (`placed_as`), and a bank of rows its stack's shape."""
+    take, placed where the move would place it (`placed_shapes`, its weak type kept, so the step's programs
+    over shapes are keyed as its calls over arrays are, `OuterProgram.abstract_of`), and a bank of rows
+    its stack's shape."""
 
     def placed(self, tree, placement):
-        return placed_as(tree, placement)
+        return placed_shapes(tree, placement, weak=True)
 
     def _stack_rows(self, rows, sharding):
         return jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype, sharding=sharding)
@@ -310,8 +301,7 @@ class _Abstract:
         return self.placed(tree, jax.tree.map(spec_on(mesh), tree))
 
     def rows(self, index, batch):
-        placed = rows_spec(next(leaf for leaf in jax.tree.leaves(batch) if np.ndim(leaf)), 1)
-        return index if placed is None else self.placed(index, placed)
+        return placed_as_rows(index, batch)
 
 
 class _Collected(_Abstract):
@@ -519,10 +509,15 @@ class HostExecution:
                        jax.tree_util.tree_leaves_with_path(variables["params"]))
         loss = functools.partial(_after, self.device, self.objective._loss)
 
+        # A watching step's pullback hands its probes' cotangents beside the moving leaves', as a sampled
+        # step's realization does (`_realized`'s `probed`): one program holding both, its outputs counted.
+        pulled = (_probed_cotangent if step.watched is not None and step.watched.cotangents
+                  else _trainable_cotangent)
+
         def whole(primal, frozen, rest, batch, step):
             stats, back, aux = _forward(loss, primal, frozen, rest, batch, step, layout=layout)
-            return stats, aux, _trainable_cotangent(back, jax.tree.map(jnp.ones_like, stats), sites=self.own,
-                                                    paths=moving, layout=layout)
+            return stats, aux, pulled(back, jax.tree.map(jnp.ones_like, stats), sites=self.own, paths=moving,
+                                      layout=layout)
 
         with on_mesh(self.accelerator):
             compiled = owned_program(whole, step=self.step_options(variables, batch))

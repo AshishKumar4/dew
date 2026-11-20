@@ -24,7 +24,7 @@ from jax.extend.core import primitives
 from dew.algebra import terms
 from dew.algebra.forms import aval
 from dew.nn.derivatives import marked_call_p, stated_operation
-from dew.nn.programs import called, entrywise, host_evaluated, live, on_host
+from dew.nn.programs import SCALAR_FOLDED, called, entrywise, host_evaluated, live, on_host
 
 
 def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -139,7 +139,8 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
             # mesh, which binds as traced. An equation over a traced value stays traced; the constants its
             # normal form builds beside it (a broadcast divisor) are computed.
             traced = any(isinstance(value, jax_core.Tracer) for value in operands)
-            folded = None if traced or equation.primitive not in FOLDED else _folded(equation, operands)
+            folded = None if traced or not _admitted(equation.primitive, operands) else _folded(
+                equation, operands)
             if folded is not None:
                 outputs = folded
             else:
@@ -187,9 +188,19 @@ FOLDED = frozenset({jax.lax.iota_p, jax.lax.broadcast_in_dim_p, jax.lax.reshape_
     jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p, jax.lax.min_p, jax.lax.neg_p, jax.lax.abs_p,
     jax.lax.reduce_sum_p, jax.lax.reduce_max_p, jax.lax.reduce_min_p, jax.lax.integer_pow_p,
     jax.lax.square_p, jax.lax.sqrt_p, jax.lax.rsqrt_p})
-"""The equations `_evaluated` computes where their operands are constants: those a mask, a divisor or a table
-is built from. Any other binds as traced, a collective or a program placed on a mesh among them, whose
-eager run needs devices a trace has not."""
+"""The equations `_evaluated` computes where their operands are constant arrays: those a mask, a divisor or a
+table is built from (a scalar's the shared fold's, `_admitted`). Any other binds as traced, a collective or
+a program placed on a mesh among them, whose eager run needs devices a trace has not."""
+
+
+def _admitted(primitive: jcore.Primitive, operands: list) -> bool:
+    """Whether `_evaluated` computes `primitive` over constant `operands` where they are made: over scalars,
+    each arithmetic the shared fold computes (`dew.nn.programs.SCALAR_FOLDED`: a shift, a remainder and an XOR
+    among them, so `1 << 2` is the literal `4` it computes, where a list of its own kept it an equation: base
+    review bb25f261d's F2); over arrays, those a mask, a divisor or a table is built from (`FOLDED`)."""
+    if primitive in SCALAR_FOLDED and not any(map(np.ndim, operands)):
+        return True
+    return primitive in FOLDED
 
 
 def _folded(equation: jcore.JaxprEqn, operands: list) -> list | None:

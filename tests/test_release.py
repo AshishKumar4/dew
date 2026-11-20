@@ -81,3 +81,17 @@ def test_a_release_declares_one_temperature_over_every_type_in_its_files_or_its_
     again = Decide.from_pretrained(tmp_path / "saved", attention_impl="xla")
     assert (again(request["state"], asked)["intent"].probabilities.tolist()
             == one(request["state"], asked)["intent"].probabilities.tolist())
+
+
+def test_a_release_of_fp8_codes_that_states_no_dtype_computes_in_its_scales_dtype():
+    """A released model that states no dtype, run under no numerics, its parameters fp8 codes beside bf16
+    scales: its release computes in bf16, the scales' (`interop.release.computed_in`, by
+    `protocols.computes_in`), where it promoted the codes with them (row 7946)."""
+    import jax.numpy as jnp
+    from flax import linen as nn
+
+    from dew.interop.release import computed_in
+
+    variables = {"params": {"proj": {"kernel": jnp.zeros((8, 8), jnp.float8_e4m3fn),
+                                     "scale": jnp.ones((8,), jnp.bfloat16)}}}
+    assert computed_in(None, nn.Dense(8), variables) == "bfloat16"

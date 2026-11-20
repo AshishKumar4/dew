@@ -5,6 +5,7 @@ facts, folded through its stages in the order they run, each step that knows wha
 from __future__ import annotations
 
 from collections.abc import Collection, Iterable, Mapping, Sequence
+from typing import TypeGuard
 
 from dew._records import JSON, integer, record
 from dew.data.pipeline import (
@@ -23,6 +24,7 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
+    Step,
     TokenBudget,
     TokenGeometry,
     TokenSplit,
@@ -108,7 +110,7 @@ def row_lengths(pipeline: Pipeline) -> frozenset[int | None]:
 def _after(stage: Stage, facts: Mapping[str, object]) -> Mapping[str, object]:
     if isinstance(stage, _KEEPS):
         return facts
-    if isinstance(stage, Declares):
+    if _declares(stage):
         return stage.declared(facts)
     declaring = _declaring(stage)
     if declaring is not None:
@@ -122,7 +124,13 @@ def _declaring(stage: Stage) -> Declares | None:
     declares them."""
     ran = runs(stage)
     step = stage if ran is None else ran.step
-    return step if isinstance(step, Declares) else None
+    return step if _declares(step) else None
+
+
+def _declares(step: Stage | Step) -> TypeGuard[Declares]:
+    """Whether `step` says what it makes (`Declares`): its `declared` a method, not a field of that name
+    (`dew.data.images.EncodeCaptions.declared`, its identity), which the protocol's check alone admits."""
+    return isinstance(step, Declares) and callable(step.declared)
 
 
 class PerMember(dict):

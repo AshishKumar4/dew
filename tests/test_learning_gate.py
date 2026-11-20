@@ -110,3 +110,21 @@ def test_a_site_that_cannot_be_judged_is_refused():
     with pytest.raises(ValueError):
         assert_learns(lambda numbers: {"claim": np.where(numbers == 2, np.nan, 1.0)}, "nan",
                       units=FEWEST_UNITS)
+
+
+@pytest.mark.parametrize("later", ["adds a failing claim", "omits a claim"])
+def test_a_judge_refuses_shards_that_claim_different_things(monkeypatch, later):
+    """A sharded site's judge pooling map tasks whose claims differ: a later shard adding a failing claim (its
+    contrasts all against it) had its values dropped and the judge passed, and one omitting a claim the
+    first holds failed on the missing key; each is refused for what it is, the shards' claims unequal (spec
+    alignment, 9047)."""
+    import learning_gate
+
+    half = FEWEST_UNITS
+    rising = np.linspace(0.5, 1.5, half)
+    first = {"holds": rising} if later == "adds a failing claim" else {"holds": rising, "also": rising}
+    second = {"holds": rising, "fails": -rising} if later == "adds a failing claim" else {"holds": rising}
+    monkeypatch.setattr(learning_gate, "sharded", lambda *_, **__: [first, second])
+    with pytest.raises(ValueError):
+        assert_learns(lambda numbers: {}, "shards", units=2 * half)
+

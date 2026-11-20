@@ -11,6 +11,7 @@ import json
 import math
 import os
 import posixpath
+import re
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -351,6 +352,11 @@ def _seek_lines(file: BinaryIO, offset: int) -> None:
             raise ValueError("file reader position exceeds its decompressed stream")
 
 
+_EXPORTING = re.compile(r"(^|/)shards/[0-9a-f]{32}/")
+"""Where an export's writer puts its files before its manifest commits them (`dew.data.sinks.export`'s
+`shards/<writer>`), which a directory's raw discovery refuses (row 9015)."""
+
+
 @dataclass(frozen=True)
 class Files(Dataset):
     """Files at URLs, with producer indexes or explicit provisioning for text.
@@ -461,6 +467,12 @@ class Files(Dataset):
             raise ValueError(f"committed export manifest is corrupt: {store.url}") from error
         if not isinstance(manifest, dict) or manifest.get("schema") != 1:
             raise ValueError(f"committed export manifest has an unknown schema: {store.url}")
+        # The manifest is written before its success marker (`commit_export`): a Spark reader takes it
+        # only once the marker is there (row 9015).
+        marker, at = self._root.child("_SUCCESS").resolve()
+        if self.spark and not marker.exists(at):
+            raise ValueError(f"Spark source {self.url!r} is uncommitted: its manifest is there, _SUCCESS is "
+                             "missing")
         return manifest
 
     @cached_property
@@ -510,6 +522,14 @@ class Files(Dataset):
                     if self.kind not in ("parquet", "arrow")
                     or not any(part.startswith(("_", ".")) for part in PurePosixPath(name[len(path) :]).parts)
                 )
+                # An export's root holding its shards (`_EXPORTING`), refused where it commits no manifest.
+                roots = sorted({path.rstrip("/") + name[len(path):][:cut.start()] for name in names
+                                if (cut := _EXPORTING.search(name[len(path):])) is not None})
+                unread = [root for root in roots if not fs.exists(f"{root.rstrip('/')}/{EXPORT_MANIFEST}")]
+                if unread:
+                    raise ValueError(f"source {url!r} holds the shards of an export at {unread[0]!r} that "
+                                     "commits none: it is still writing or its writer stopped; read it once "
+                                     "it commits")
                 if self.kind != "files":
                     names = [name for name in names if name.lower().endswith(_SUFFIXES[self.kind])]
             else:

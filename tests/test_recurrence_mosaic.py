@@ -1982,7 +1982,7 @@ def test_a_packed_training_step_certifies_the_launch_it_runs_once():
     """A delta rule's training step over packed rows that carry their documents' first slots (a packed
     layer's, `dew.batch.Coordinates.firsts`), lowered for a compile-only H100 through the call's route:
     each config its training launch certifies is certified once, its selector's call bound as the launch
-    binds on each shard (`recurrence_chunk.template_call`). Bound without the firsts, the selector certified
+    binds on each shard (`recurrence_chunk.template_bind`). Bound without the firsts, the selector certified
     a launch the step never ran beside the one it did (train 942's F2)."""
     from dew.nn.kernels.generation import compile_only_gpus
 

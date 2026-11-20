@@ -495,17 +495,18 @@ class MosaicForward(_Mainloop[Tiles]):
         arguments = ba.arguments
         return self.decided(arguments["query"], arguments["value"], arguments["score_params"],
                             arguments.get("residuals"), config, arguments.get("table"),
-                            arguments.get("sources"), arguments.get("scales"), arguments.get("initial"))
+                            arguments.get("sources"), arguments.get("scales"), arguments.get("initial"),
+                            arguments.get("drop"))
 
     def _decided_model(self, query, value, score_params, residuals: Kept | None, config: Tiles,
-                       table=None, sources=None, scales=None, initial=None, *, peaks: bool = False,
+                       table=None, sources=None, scales=None, initial=None, drop=None, *, peaks: bool = False,
                        columns: int | None = None, decides: bool | None = None, priced: bool = True
                        ) -> tuple[bool, ForwardRegisters, int | None]:
         """Resolve whether `config` decides its scaled walk, its `ForwardRegisters`, and (when `priced`) its
         register count in one pass (row 8843): builds the register facts once and reuses the scaled price so
         planning, residency and emission agree without double-pricing prologues."""
         family = bundle_of(config, query.dtype)
-        base = self.registered(query, value, score_params, residuals, table, sources, scales, initial)
+        base = self.registered(query, value, score_params, residuals, table, sources, scales, initial, drop)
         if decides is not None:
             model = dataclasses.replace(base, scaled=True) if decides else base
             count = model.at(family, config, peaks=peaks, columns=columns) if priced else None
@@ -523,7 +524,7 @@ class MosaicForward(_Mainloop[Tiles]):
         return False, base, count
 
     def decided(self, query, value, score_params, residuals: Kept | None, config: Tiles, table=None,
-                sources=None, scales=None, initial=None) -> bool:
+                sources=None, scales=None, initial=None, drop=None) -> bool:
         """Whether its launch at `config` walks unscaled and decides a scaled second walk of a program whose
         rows pass fp32's largest (`after_walk.Decided`, `algebra.may_scale`, row 5274): every inference
         launch whose values can pass fp32's largest (`algebra.headroom`), on a register family whose
@@ -532,7 +533,7 @@ class MosaicForward(_Mainloop[Tiles]):
         the scaled walk's (sm80's and sm120's at width 128 would split their columns). Every other such
         launch takes the one fallback, `_fwd`'s bound pass and guard (`algebra.may_scale`, the scaled op)."""
         return self._decided_model(query, value, score_params, residuals, config, table, sources, scales,
-                                   initial, priced=False)[0]
+                                   initial, drop, priced=False)[0]
 
     def _hooks(self, score_params, output_params, initial, drop, query_params=()) -> Hooks:
         return Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
@@ -550,7 +551,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # A rare call's scaled op states no work to Dew's FLOP count, as the fold's rewalk does not: the
         # common op's is the step's (`_launch_flops`).
         decides, registered, _ = self._decided_model(query, value, score_params, residuals, config, table,
-                                                     sources, scales, initial, priced=False)
+                                                     sources, scales, initial, drop, priced=False)
         family = bundle_of(config, query.dtype)
         target = self.launch_target()
         products = None
@@ -624,10 +625,7 @@ class MosaicForward(_Mainloop[Tiles]):
             return False
         if config.natural_form or self._unrewalked(ba):
             return True
-        arguments = ba.arguments
-        decides = self.decided(arguments["query"], arguments["value"], arguments["score_params"],
-                               arguments.get("residuals"), config, arguments.get("table"),
-                               arguments.get("sources"), arguments.get("scales"), arguments.get("initial"))
+        decides = self.deciding(ba, config)
         relaunch = config.relaunch
         if config.relaunch_family is not None:
             return self._launch_legal(ba, relaunch, target, decides=decides)
@@ -846,10 +844,7 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, query.dtype)
         if not family.rewalks:
             return self._rewalked_apart(ba, config, family, target)
-        arguments = ba.arguments
-        decides = self.decided(arguments["query"], arguments["value"], arguments["score_params"],
-                               arguments.get("residuals"), config, arguments.get("table"),
-                               arguments.get("sources"), arguments.get("scales"), arguments.get("initial"))
+        decides = self.deciding(ba, config)
         # Its value columns whole first, then in blocks (`_column_blocks_of`): a launch a block (row 2526: at
         # width 256 no tile held the anchored rewalk's whole sums).
         relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True,
@@ -1044,13 +1039,14 @@ class MosaicForward(_Mainloop[Tiles]):
         return self._decided_model(arguments["query"], arguments["value"], arguments["score_params"],
                                    arguments.get("residuals"), config, arguments.get("table"),
                                    arguments.get("sources"), arguments.get("scales"),
-                                   arguments.get("initial"), peaks=peaks, columns=columns,
-                                   decides=decides)[2]
+                                   arguments.get("initial"), arguments.get("drop"), peaks=peaks,
+                                   columns=columns, decides=decides)[2]
 
     def registered(self, query, value, score_params, residuals, table=None, sources=None,
-                   scales=None, initial=None) -> ForwardRegisters:
+                   scales=None, initial=None, drop=None) -> ForwardRegisters:
         """The call's base register facts (`ForwardRegisters`): an `initial` state merges past an inference
-        walk's keys (`attention_mosaic_forward._started`), a split training walk starting from it."""
+        walk's keys (`attention_mosaic_forward._started`), a split training walk starting from it; a `drop`
+        over fp16 values takes its kept weights in two parts (`algebra.kept_parts`)."""
         params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype) for param in score_params),
                            strict=True))
         computed = query.dtype if scales is not None else value.dtype
@@ -1061,6 +1057,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                 if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span,
                                 merged=initial is not None and residuals is not Kept.SPLIT,
                                 started=initial is not None and residuals is Kept.SPLIT,
+                                weight_parts=2 if drop is not None and value.dtype == jnp.float16 else 1,
                                 prologue=(None if self.query_mod is None
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)))
 
@@ -1129,7 +1126,8 @@ def streams(query, target: generation.GpuTarget) -> bool:
     (`cost.rates`: the tensor rate its instruction family, clock and multiprocessors derive, no catalog's
     peak, row 3799): a decode step's few rows a key head, never a prefill's. False where either rate is
     unknown."""
-    tensor, *_, memory = cost.rates(target, device=True)
+    rated = cost.rates(target, device=True)
+    tensor, memory = rated.tensor, rated.device
     if not (tensor and memory):
         return False
     return 2 * query.shape[1] / jnp.dtype(query.dtype).itemsize < tensor / memory
@@ -1282,7 +1280,8 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         raise ValueError(f"the Mosaic forward's certify form stores each key tile's state from registers; "
                          f"the call derives {family.name}, whose sums its issuer keeps in tensor memory")
     arguments = ba.arguments
-    registered = op.registered(arguments["query"], arguments["value"], arguments["score_params"], Kept.NONE)
+    registered = op.registered(arguments["query"], arguments["value"], arguments["score_params"], Kept.NONE,
+                               drop=arguments.get("drop"))
     if hooks.query_mod is not None and op.query_mod is None:
         # A query prologue the launch does not take where it loads the query (`_forward_call`), taken here.
         query = prologued(query, hooks.query_mod, hooks.query_params)

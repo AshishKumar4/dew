@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import lowers
 
 from dew import algebra
 from dew.nn.kernels import generation
@@ -97,12 +98,16 @@ def assert_equal(got, expected):
         np.testing.assert_array_equal(np.asarray(value, np.float32), np.asarray(reference, np.float32))
 
 
-ARMS = [("sm90", {"grouped_matmul": "mosaic"}), ("sm80", {"grouped_matmul": "mosaic"}), ("sm90", {}),
-        ("sm80", {})]
+ARMS = [pytest.param(name, named, marks=lowers(name), id=label)
+        for name, named, label in (("sm90", {"grouped_matmul": "mosaic"}, "sm90-named"),
+                                   ("sm80", {"grouped_matmul": "mosaic"}, "sm80-named"),
+                                   ("sm90", {}, "sm90"), ("sm80", {}, "sm80"))]
 """Each GPU and the kernels a call names: an H100's template named for its projections (an A/B's arm, where
 the pass fuses their consumers into its epilogue), an A100's (whose template takes no side operand, so the
 pass keeps the program as traced), and an H100's and an A100's selectors, which give a dense projection
-XLA's dot."""
+XLA's dot. Each runs where this process lowers its generation's Mosaic kernels as it does (`lowers`): a
+CPU interprets every one; a GPU runs its own (an A100 refuses an H100's tile, past its shared memory, and an
+H100 an A100's copies)."""
 
 
 def test_a_program_writing_a_ref_inside_a_nested_body_computes_as_written():
@@ -125,7 +130,7 @@ def test_a_program_writing_a_ref_inside_a_nested_body_computes_as_written():
 
 
 @pytest.mark.parametrize("layer", LAYERS, ids=lambda layer: layer.__name__)
-@pytest.mark.parametrize(("generation_name", "named"), ARMS, ids=["sm90-named", "sm80-named", "sm90", "sm80"])
+@pytest.mark.parametrize(("generation_name", "named"), ARMS)
 def test_a_layer_under_the_pass_computes_what_it_does_as_written(layer, generation_name, named):
     """Each layer under the pass computes what it does as written, bitwise, in each arm (`ARMS`): an
     epilogue reads its product as the dot rounds it, a product read after its consumers is still its own,
@@ -189,6 +194,7 @@ def normed_twice(x, w):
 
 
 @pytest.mark.parametrize("layer", [normed, normed_twice], ids=lambda layer: layer.__name__)
+@lowers("sm90")
 def test_a_norms_normalization_runs_in_its_projections_prologue(layer):
     """An RMSNorm's rows projected, under the pass on an H100 whose template a call names: each product's
     prologue is the normalization (the row statistic outside it), which the template runs on each loaded
@@ -270,6 +276,7 @@ def named_gate(x, w, up):
     return gate * jax.lax.logistic(gate) * up
 
 
+@lowers("sm90")
 def test_a_named_products_consumers_are_its_epilogue_its_name_the_launchs_residual():
     """A product named for remat, its SwiGLU after the name, under the pass on an H100 whose template a call
     names: the SwiGLU is the product's epilogue (its 'gemm_epilogue' route the fused kernel's), where the
@@ -308,6 +315,7 @@ def gated_mlp_product(x, w, up):
     return activations.gated_product("swiglu")(checkpoint_name(x @ w, "gate_proj"), up)
 
 
+@lowers("sm90")
 def test_a_models_gated_product_is_its_gate_projections_epilogue():
     """A model's SwiGLU (`gated_product`, its region marked `Activation`, its body SwiGLU's Pallas kernel on
     an H100) after its named gate projection, under the pass on an H100 whose template a call names: the
@@ -549,6 +557,7 @@ def test_a_product_of_two_16_bit_formats_through_dew_jit_naming_mosaic_holds_che
     assert all(made == own for made, own in dtypes)
 
 
+@lowers("sm90")
 def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew_jit():
     """`dew.jit` over a plain JAX loss on an H100 whose template a call names: its gradient's products run
     the template whether `jax.grad` is taken of the compiled program (inside a plain jit, the pass reads the
@@ -848,6 +857,7 @@ def test_a_programs_own_choice_by_the_platform_stays_as_written():
         assert not _attention_routes(lambda: dew.jit(attend(doubled=True)).trace(*shapes))
 
 
+@pytest.mark.mesh(devices=2)
 def test_a_plain_programs_masked_attention_compiles_under_a_sequence_axis():
     """A plain program's causal attention, its masked logits filled, compiled through `dew.jit` on a mesh
     that splits the sequence, where Dew's call takes no fill (its exchanges weigh a masked key nothing):
@@ -1193,9 +1203,14 @@ in which result is normed or in a constant it closes over, each weighed for its 
 @pytest.mark.parametrize("name", list(WRITTEN_AS_PROGRAMS))
 def test_the_compile_point_writes_a_program_by_its_own_values(name):
     """Each program (`WRITTEN_AS_PROGRAMS`), written after the others in either order, writes the norms it
-    holds and computes what it does as written, bit for bit: a region is the call's only where the call
-    computes the region's own arithmetic."""
+    holds and computes what it does as written, on par from float64 (check 1: the norm's call, a GPU's kernel
+    summing in its own order, and the program as written are two programs XLA promises no common bits): a
+    region is the call's only where the call computes the region's own arithmetic, a statistic over twice the
+    width or of permuted elements written as the norm off by its whole factor."""
     from contract_support import normal_draw
+    from reference_error import as_given, assert_as_exact
+
+    from dew.parity import FEWEST_SEEDS
 
     shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
     names = list(WRITTEN_AS_PROGRAMS)
@@ -1204,22 +1219,27 @@ def test_the_compile_point_writes_a_program_by_its_own_values(name):
     program, norms = WRITTEN_AS_PROGRAMS[name]
     written, found = _norms_written(program, *shapes)
     assert found == norms
-    x, w = normal_draw(4783, (256, 256), (256,), dtype=jnp.bfloat16)
-    for ours, theirs in zip(written(x, w), jax.tree.leaves(program(x, w)), strict=True):
-        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    assert_as_exact(as_given(lambda x, w: tuple(written(x, w))),
+                    lambda x, w: tuple(jax.tree.leaves(program(x, w))),
+                    lambda seed: normal_draw(seed, (256, 256), (256,), dtype=jnp.bfloat16),
+                    f"the compile point's writing of {name}", seeds=FEWEST_SEEDS)
 
 
 def test_a_stream_read_before_its_norm_computes_as_written():
     """A residual stream another value reads before its norm, compiled through the rewrite, computes as
-    written bit for bit: the stream's sum stays where its first reader needs it."""
+    written, on par from float64 (check 1, two programs: the norm's call and the stream's sum as written):
+    the stream's sum stays where its first reader needs it."""
     from contract_support import normal_draw
+    from reference_error import as_given, assert_as_exact
+
+    from dew.parity import FEWEST_SEEDS
 
     rows = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
     shapes = (rows, rows, jax.ShapeDtypeStruct((256,), jnp.bfloat16))
     written, _ = _norms_written(_stream_read_early, *shapes)
-    x, branch, w = normal_draw(4784, (256, 256), (256, 256), (256,), dtype=jnp.bfloat16)
-    for ours, theirs in zip(written(x, branch, w), _stream_read_early(x, branch, w), strict=True):
-        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    assert_as_exact(as_given(lambda x, branch, w: tuple(written(x, branch, w))), _stream_read_early,
+                    lambda seed: normal_draw(seed, (256, 256), (256, 256), (256,), dtype=jnp.bfloat16),
+                    "a stream read before its norm, written", seeds=FEWEST_SEEDS)
 
 
 def test_a_norm_of_a_stopped_row_passes_no_gradient_to_it():

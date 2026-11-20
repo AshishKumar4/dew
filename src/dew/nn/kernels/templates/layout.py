@@ -85,6 +85,26 @@ def _along(key: str) -> Callable:
 
 
 _cumulated = _along("axis")
+PLACEMENTS = (jax_core.primitives.reshard_p, jax.lax.sharding_constraint_p)
+"""The operations that place a value on a mesh and leave it as it is (each output its operand): a tile is
+placed already, so each is the identity where one is transposed (`_placed`) or walked (`dew.algebra.forms`):
+a GPU's trace of a plain program's attention holds a reshard in its score hook's nested call (rows 9570 and
+9571)."""
+
+
+def placed(eqn) -> bool:
+    """Whether `eqn` is a placement a hook may hold where a tile also runs it as written, one entry at a time
+    in a tile's legality (`_axis_free`, the Mosaic backward's `_entrywise`): a reshard, which JAX's Mosaic
+    rules lower; a sharding constraint has none, so a hook holding one stays refused there."""
+    return eqn.primitive is jax_core.primitives.reshard_p
+
+
+@_rule(*PLACEMENTS)
+def _placed(eqn, operand, **params):
+    # The identity, binding nothing, so no kernel's lowering meets a sharding inside a tile.
+    return operand
+
+
 RULES[jax.lax.concatenate_p] = _along("dimension")
 
 
@@ -245,7 +265,7 @@ def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
             if not eqn.primitive.inlined_call or not all(
                     _axis_free(inner, shape) for inner in nested):
                 return False
-        elif not entrywise(eqn):
+        elif not (entrywise(eqn) or placed(eqn)):
             return False
     return True
 

@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from dew.nn.precision import at_least_fp32
 
@@ -31,7 +32,34 @@ def times(t) -> jax.Array:
     t = jnp.asarray(t)
     return t.astype(at_least_fp32(t.dtype))
 
-class NoiseScheduler(ABC):
+class ByValue:
+    """Equal, and hashed, by its settings: its type and each attribute it holds as a value (`settings_of`),
+    so an objective holding one keys its trace by what it computes (`Objective.trace_key`; row 6297), where
+    an object compared by its identity keyed nothing and a refit traced its step again. A schedule's and a
+    prediction transform's attributes are its constructor's settings and the tables they derive."""
+
+    def settings(self) -> tuple:
+        return type(self), tuple(sorted((name, settings_of(value)) for name, value in vars(self).items()))
+
+    def __eq__(self, other) -> bool:
+        return type(other) is type(self) and other.settings() == self.settings()
+
+    def __hash__(self) -> int:
+        return hash(self.settings())
+
+
+def settings_of(value):
+    """`value` as a hashable value of what it holds: an array (NumPy's or JAX's) by its shape, dtype and
+    bytes, a sequence by its parts, another value as itself."""
+    if isinstance(value, np.ndarray | jax.Array):
+        held = np.asarray(value)
+        return held.shape, str(held.dtype), held.tobytes()
+    if isinstance(value, list | tuple):
+        return type(value), tuple(map(settings_of, value))
+    return value
+
+
+class NoiseScheduler(ByValue, ABC):
     """Defines a forward process x_t = alpha(t) x_0 + sigma(t) eps on the time domain [0, T].
 
     t = T is the fully noised end.

@@ -54,7 +54,7 @@ from dew import _cache, algebra
 from dew.algebra import cost as algebra_cost, program as algebra_program
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import gemm, generation, tuning
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost, emission
@@ -233,7 +233,7 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     fusion of the consumers reading it (`algebra.cost.fused`), each XLA program as the algebra prices it
     (`algebra.program.priced`). None where the target states no tensor rate."""
     rates = cost.rates(target, device=True)
-    if rates[0] is None:
+    if rates.tensor is None:
         return None, None
     product = algebra_cost.product_work(region.rows, region.depth, region.width, dtype=region.operands,
                                         precision=region.precision)
@@ -326,8 +326,11 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
             float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs)), formed))
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
-    epilogue = _declared(functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc), written,
-                         treedef, out_treedef, acc)
+    # Its stage and declared derivative, from the consumer's program the algebra pass rewrote
+    # (`_rewritten_consumer`), the launch takes as they are (`tuning.prepared_as`).
+    epilogue = tuning.prepared_as(_declared(
+        functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc), written, treedef,
+        out_treedef, acc))
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
     # Each value the program names (`checkpoint_name`) an output of the launch's, a residual of its
@@ -395,8 +398,10 @@ def _prologue(fusion) -> tuple[jax.Array, dict, Formed | None]:
     if stage is None:
         return fusion(), {}, None
     base, function, sides, axes, jvp, formed = stage
-    return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True)),
-                  'prologue_jvp': jvp}, formed
+    # Its stage, from the producer's program the algebra pass rewrote (`_split`), the launch takes as it is
+    # (`tuning.prepared_as`).
+    return base, {'prologue': tuning.prepared_as(function),
+                  'prologue_operands': tuple(zip(sides, axes, strict=True)), 'prologue_jvp': jvp}, formed
 
 
 def _rewritten_consumer(consumer, values, acc) -> tuple[Callable, Callable]:

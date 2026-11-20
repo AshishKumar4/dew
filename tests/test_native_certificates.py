@@ -19,7 +19,9 @@ each online-softmax state its certify launch stores after a key tile and its out
 step's enclosure on the state before it (`attention_witness`), its faults a dropped rescale, a maximum from
 the wrong tile, sums rounded to bf16 and a mask off by one key."""
 
+import collections
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -28,7 +30,7 @@ import numpy as np
 import pytest
 import recurrence_witness as rw
 from attention_witness import assert_faults_refused, assert_witnessed
-from gpu_flow import Cell, run_cells
+from gpu_flow import RUNNING, Cell, run_cells
 from interval_certificates import Lane, exp2_reach
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -54,10 +56,9 @@ from native_certificates import (
     rows_products,
     separated,
     spans,
-    tf32_operand,
     truncating_step_ends,
 )
-from op_certificates import BFLOAT16, FLOAT16, FLOAT32, TFLOAT32, Format, truncated
+from op_certificates import BFLOAT16, FLOAT16, FLOAT32, TFLOAT32, Format, tf32_operand, truncated
 from reference_error import ahead_arm
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, grouped_triton, tuning
@@ -145,13 +146,35 @@ def products_apart(declared, given, out) -> np.ndarray:
     return separated(*(native_dot_ends(products, out, flushes=False) for products in (declared, given)))
 
 
+_CALLS: collections.Counter[tuple[str, str | None, str]] = collections.Counter()
+"""Each test's and cell's native calls so far by kind (`_native`'s labels)."""
+
+
+def _native(fn, kind: str, *operands) -> np.ndarray:
+    """`fn` (jitted) on `operands` (host arrays) as a GPU tier part runs a computation with no check-1 site
+    (`reference_error.ahead_arm`): compiled in the part's prepare at their shapes, that program in its run,
+    `fn` itself outside a part; as float64. Its label the running test's and cell's (`gpu_flow.RUNNING`),
+    the call's kind and its place among the cell's calls of that kind, one a call, the same in a prepare and
+    its run as far as the prepare reaches: a cell makes its native calls before it asserts anything of one,
+    so a prepare, whose calls give zeros its certificates refuse, reaches them all, and a call it does not
+    reach runs unprepared, recorded, never under another call's label, a cell's count its own (a raw jit was
+    compiled in no prepare: 45 sites unprepared on a GH200 tier, row 8497's class)."""
+    test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+    cell = RUNNING.get()
+    _CALLS[test, cell, kind] += 1
+    label = f"{test}{'' if cell is None else f', {cell}'}: a native {kind}, call {_CALLS[test, cell, kind]}"
+    return np.asarray(ahead_arm(fn, label)(*operands), np.float64)
+
+
 def forward_of(x, w, sizes, out_dtype=jnp.bfloat16, *, dtype=jnp.bfloat16, precision=None) -> np.ndarray:
     """The template's native forward of the rows and matrices in `dtype`, its output in `out_dtype`, its
     product declared at `precision`, traced at JAX's own default precision as a model runs it (`as_run`)."""
+    def forward(rows):
+        return gemm.gemm(rows, jnp.asarray(w, dtype), jnp.asarray(sizes, jnp.int32), out_dtype=out_dtype,
+                         precision=precision)
+
     with as_run():
-        return np.asarray(jax.jit(lambda rows: gemm.gemm(
-            rows, jnp.asarray(w, dtype), jnp.asarray(sizes, jnp.int32), out_dtype=out_dtype,
-            precision=precision))(jnp.asarray(x, dtype)), np.float64)
+        return _native(jax.jit(forward), "forward", np.asarray(x, dtype))
 
 
 def as_run():
@@ -170,8 +193,7 @@ def input_gradient_of(x, w, dy, sizes, *, dtype=jnp.bfloat16) -> np.ndarray:
         return pull(cotangent)[0]
 
     with as_run():
-        pulled = jax.jit(pulled)(jnp.asarray(x, dtype), jnp.asarray(dy, dtype))
-    return np.asarray(pulled, np.float64)
+        return _native(jax.jit(pulled), "input gradient", np.asarray(x, dtype), np.asarray(dy, dtype))
 
 
 def kernel_gradient(sizes, out_dtype=jnp.bfloat16, *, dtype=jnp.bfloat16, precision=None):
@@ -192,26 +214,31 @@ def kernel_gradient_of(x, dy, sizes, out_dtype=jnp.bfloat16, *, dtype=jnp.bfloat
     """The template's native kernel gradient (`kernel_gradient`) of `x` and `dy`, traced as a model runs it
     (`as_run`)."""
     with as_run():
-        native = jax.jit(kernel_gradient(sizes, out_dtype, dtype=dtype, precision=precision))(
-            jnp.asarray(x, dtype), jnp.asarray(dy, dtype))
-    return np.asarray(native, np.float64)
+        return _native(jax.jit(kernel_gradient(sizes, out_dtype, dtype=dtype, precision=precision)),
+                       "kernel gradient", np.asarray(x, dtype), np.asarray(dy, dtype))
 
 
-def assert_products_certify(x, w, dy, read, fmt: Format, outputs: tuple, label) -> None:
-    """Every element of the native forward and kernel gradient of `x`, `w` and `dy`, in each of `outputs`
-    (a dtype and its format, the first the operands' own), and of the input gradient, in the operands' own,
-    is a value the exact products of the operands' values as the tensor cores read them (`read`, values of
-    `fmt`) admit (`native_dot_holds`)."""
+def natives_of(x, w, dy, outputs: tuple) -> tuple:
+    """The native forward and kernel gradient of `x`, `w` and `dy` in each of `outputs` (a dtype and its
+    format, the first the operands' own), each with its format, and the input gradient in the operands' own:
+    a cell's native calls, made before any is asserted of (`_native`)."""
     dtype = outputs[0][0]
+    return ([(forward_of(x, w, SIZES, out_dtype, dtype=dtype),
+              kernel_gradient_of(x, dy, SIZES, out_dtype, dtype=dtype), out) for out_dtype, out in outputs],
+            input_gradient_of(x, w, dy, SIZES, dtype=dtype), outputs[0][1])
+
+
+def assert_products_certify(x, w, dy, read, fmt: Format, made: tuple, label) -> None:
+    """Every element of `made` (`natives_of`'s: the native forward and kernel gradient of `x`, `w` and `dy`
+    in each of its outputs, and the input gradient) is a value the exact products of the operands' values as
+    the tensor cores read them (`read`, values of `fmt`) admit (`native_dot_holds`)."""
+    natives, pulled, own = made
     rx, rw, rdy = (read(value) for value in (x, w, dy))
     forward, gradient = forward_products(rx, rw, SIZES, fmt), kernel_gradient_products(rx, rdy, SIZES, fmt)
-    for out_dtype, out in outputs:
-        assert np.all(native_dot_holds(forward_of(x, w, SIZES, out_dtype, dtype=dtype), forward, out,
-                                       flushes=False)), (label, out.name)
-        assert np.all(kernel_gradient_holds(kernel_gradient_of(x, dy, SIZES, out_dtype, dtype=dtype),
-                                            gradient, out)), (label, out.name)
-    assert np.all(native_dot_holds(input_gradient_of(x, w, dy, SIZES, dtype=dtype),
-                                   input_gradient_products(rdy, rw, SIZES, fmt), outputs[0][1],
+    for native_forward, native_gradient, out in natives:
+        assert np.all(native_dot_holds(native_forward, forward, out, flushes=False)), (label, out.name)
+        assert np.all(kernel_gradient_holds(native_gradient, gradient, out)), (label, out.name)
+    assert np.all(native_dot_holds(pulled, input_gradient_products(rdy, rw, SIZES, fmt), own,
                                    flushes=False)), label
 
 
@@ -304,14 +331,19 @@ def apart_from(states, steps, products_of, fault_ends) -> list[list[np.ndarray]]
         fault_ends(before, group, j, step)))
 
 
-def forward_witnessed(x, w, steps) -> list:
-    """The step witness (`witnessed`) of the native fp32 forward of `x` and `w` with exact sums, against the
-    exact products of each depth step's columns (`steps`: one group's, of the whole depth)."""
+def forward_states(x, w, steps) -> list[np.ndarray]:
+    """The native fp32 forward of `x` and `w` with exact sums after each depth step of `steps` (`states_of`,
+    one group's, of the whole depth)."""
     def run(rows):
         return forward_of(rows, w, SIZES, jnp.float32, precision="highest")[None]
 
-    return witnessed(states_of(run, x, steps), steps,
-                     lambda _, step: forward_products(x[step], w[:, step[1]], SIZES))
+    return states_of(run, x, steps)
+
+
+def forward_witnessed(states, x, w, steps) -> list:
+    """The step witness (`witnessed`) of the native forward's `states` (`forward_states`) of `x` and `w`,
+    against the exact products of each depth step's columns."""
+    return witnessed(states, steps, lambda _, step: forward_products(x[step], w[:, step[1]], SIZES))
 
 
 def flat(lists, first: int = 0) -> np.ndarray:
@@ -330,9 +362,10 @@ def the_grouped_gemm_templates_products_certify_natively(kernel, generation_name
     its exact products admit (`native_dot_holds`), the forward's and the kernel gradient's in bf16 and in
     fp32: the null of row 2084's links 1 and 2."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
-        for seed in range(SEEDS):
-            assert_products_certify(*draw(seed, signed), lambda value: value, BFLOAT16,
-                                    ((jnp.bfloat16, BFLOAT16), (jnp.float32, FLOAT32)), seed)
+        made = [natives_of(*draw(seed, signed), ((jnp.bfloat16, BFLOAT16), (jnp.float32, FLOAT32)))
+                for seed in range(SEEDS)]
+        for seed, natives in enumerate(made):
+            assert_products_certify(*draw(seed, signed), lambda value: value, BFLOAT16, natives, seed)
 
 
 def fp32_operands_certify_natively_as_products_of_their_tf32_values(kernel, generation_name, signed):
@@ -340,9 +373,10 @@ def fp32_operands_certify_natively_as_products_of_their_tf32_values(kernel, gene
     element of the native forward, input gradient and kernel gradient of fp32 operands is a value the exact
     products of their TF32 values admit (`tf32_operand`, `native_dot_holds`)."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
-        for seed in range(SEEDS):
-            assert_products_certify(*draw(seed, signed, np.float32), tf32_operand, TFLOAT32,
-                                    ((jnp.float32, FLOAT32),), seed)
+        made = [natives_of(*draw(seed, signed, np.float32), ((jnp.float32, FLOAT32),))
+                for seed in range(SEEDS)]
+        for seed, natives in enumerate(made):
+            assert_products_certify(*draw(seed, signed, np.float32), tf32_operand, TFLOAT32, natives, seed)
 
 
 def a_depth_step_of_exact_zeros_leaves_the_native_accumulator_bit_identical(kernel, generation_name):
@@ -353,11 +387,13 @@ def a_depth_step_of_exact_zeros_leaves_the_native_accumulator_bit_identical(kern
         steps = gradient_steps(kernel)
         x, _, dy = draw(0, signed=True)
         start, end = spans(SIZES)[3]
+        pairs = []
         for step in steps[3][1:]:
             ending = (*SIZES[:3], step.start - start, SIZES[4] + end - step.start, SIZES[5])
             zeroed = scaled(x, [[slice(step.start, end)]], 0, 0.0)
-            native, ended = (kernel_gradient_of(rows, dy, sizes, jnp.float32, precision="highest")[3]
-                             for rows, sizes in ((zeroed, SIZES), (x, ending)))
+            pairs.append((step, *(kernel_gradient_of(rows, dy, sizes, jnp.float32, precision="highest")[3]
+                                  for rows, sizes in ((zeroed, SIZES), (x, ending)))))
+        for step, native, ended in pairs:
             assert np.array_equal(np.float32(native).view(np.uint32), np.float32(ended).view(np.uint32)), step
 
 
@@ -368,11 +404,11 @@ def the_kernel_gradients_exact_sums_certify_natively_a_step_at_a_time(kernel, ge
     falling past each group's first step (`FALL`), where the witness decides each add's rounding."""
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         steps = gradient_steps(kernel)
-        for seed in range(SEEDS):
-            x, _, dy = draw(seed, signed)
-            for rows in (x, scaled(x, steps, 1, FALL)):
-                held = witnessed(kernel_gradient_states(rows, dy, steps), steps, stepped_products(rows, dy))
-                assert everywhere(held), seed
+        made = [(seed, rows, dy, kernel_gradient_states(rows, dy, steps))
+                for seed in range(SEEDS) for x, _, dy in [draw(seed, signed)]
+                for rows in (x, scaled(x, steps, 1, FALL))]
+        for seed, rows, dy, states in made:
+            assert everywhere(witnessed(states, steps, stepped_products(rows, dy))), seed
 
 
 def the_forwards_exact_sums_certify_natively_a_depth_step_at_a_time(kernel, generation_name, signed):
@@ -386,10 +422,11 @@ def the_forwards_exact_sums_certify_natively_a_depth_step_at_a_time(kernel, gene
         width, _ = depth_step(grouped_triton.Gmm, forward, jax.ShapeDtypeStruct((ROWS, DEPTH), jnp.bfloat16),
                               jax.ShapeDtypeStruct((len(SIZES), DEPTH, WIDTH), jnp.bfloat16))
         steps = [[np.s_[:, at:at + width] for at in range(0, DEPTH, width)]]
-        for seed in range(SEEDS):
-            x, w, _ = draw(seed, signed)
-            for rows in (x, scaled(x, steps, 1, FALL)):
-                assert everywhere(forward_witnessed(rows, w, steps)), seed
+        made = [(seed, rows, w, forward_states(rows, w, steps))
+                for seed in range(SEEDS) for x, w, _ in [draw(seed, signed)]
+                for rows in (x, scaled(x, steps, 1, FALL))]
+        for seed, rows, w, states in made:
+            assert everywhere(forward_witnessed(states, rows, w, steps)), seed
 
 
 def the_kernel_gradients_certificate_refuses_a_lost_block_and_a_misrouted_row(kernel, generation_name):
@@ -401,9 +438,11 @@ def the_kernel_gradients_certificate_refuses_a_lost_block_and_a_misrouted_row(ke
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
         x, _, dy = draw(0, signed=True)
         products = kernel_gradient_products(x, dy, SIZES)
-        for ran, sizes, faulty, share in ((scaled(x, [[LOST]], 0, 0.0), SIZES, [3], LOST_SHARE),
-                                          (x, SHIFTED, [1, 2], MOVED_SHARE)):
-            held = kernel_gradient_holds(kernel_gradient_of(ran, dy, sizes, jnp.float32), products, FLOAT32)
+        cases = [(ran, sizes, faulty, share, kernel_gradient_of(ran, dy, sizes, jnp.float32))
+                 for ran, sizes, faulty, share in ((scaled(x, [[LOST]], 0, 0.0), SIZES, [3], LOST_SHARE),
+                                                   (x, SHIFTED, [1, 2], MOVED_SHARE))]
+        for ran, sizes, faulty, share, native in cases:
+            held = kernel_gradient_holds(native, products, FLOAT32)
             apart = separated(kernel_gradient_ends(products),
                               kernel_gradient_ends(kernel_gradient_products(ran, dy, sizes)))
             assert_refused(held[faulty], apart[faulty], share)
@@ -427,16 +466,22 @@ def the_step_witness_refuses_a_truncating_add_a_lost_block_and_a_misrouted_row(k
         assert gradient_steps(kernel, precision=None) == steps
         x, _, dy = draw(0, signed=False)
         falling = scaled(x, steps, 1, FALL)
+        signed_x, _, signed_dy = draw(0, signed=True)
+        lost = scaled(signed_x, [[LOST]], 0, 0.0)
+        # The cell's native calls, each made before any is asserted of (`_native`).
+        truncating = kernel_gradient_states(falling, dy, steps, precision=None)
+        losing_states = kernel_gradient_states(lost, signed_dy, steps)
+        shifted = kernel_gradient_states(signed_x, signed_dy, steps, sizes=SHIFTED)
         products_of = stepped_products(falling, dy)
-        states = kernel_gradient_states(falling, dy, steps, precision=None)
+        states = truncating
         held = witnessed(states, steps, products_of)
         apart = apart_from(states, steps, products_of, lambda before, group, _, step: truncating_step_ends(
             before, products_of(group, step), flushes=False))
         assert not np.any(flat(held) & flat(apart))
         assert_refused(flat(held, 1), flat(apart, 1), TRUNCATED_SHARE)
-        x, _, dy = draw(0, signed=True)
-        products_of, lost = stepped_products(x, dy), scaled(x, [[LOST]], 0, 0.0)
-        states = kernel_gradient_states(lost, dy, steps)
+        x, dy = signed_x, signed_dy
+        products_of = stepped_products(x, dy)
+        states = losing_states
         held = witnessed(states, steps, products_of)
         apart = apart_from(states, steps, products_of, lambda before, group, _, step: promoted_step_ends(
             before, before, stepped_products(lost, dy)(group, step), flushes=False))
@@ -444,7 +489,7 @@ def the_step_witness_refuses_a_truncating_add_a_lost_block_and_a_misrouted_row(k
                     if step.start <= LOST.start and LOST.stop <= step.stop]
         assert_refused(held[3][losing], apart[3][losing], LOST_SHARE)
         assert everywhere(held, but={(3, losing)})
-        states = kernel_gradient_states(x, dy, steps, sizes=SHIFTED)
+        states = shifted
         held = witnessed(states, steps, products_of)
         kept = [kernel_gradient_products(scaled(x, steps, j, 0.0), dy, SHIFTED)
                 for j in range(1, len(states))]
@@ -478,8 +523,9 @@ def the_tf32_certificate_refuses_bf16_products_and_a_truncated_read(
         tf32, wide = read(x, w), forward_products(bf16(x), bf16(w), SIZES)
         cases = (((bf16(x), bf16(w)), tf32), ((x, w), wide),
                  ((truncated(x, TFLOAT32), truncated(w, TFLOAT32)), tf32))
-        for (operands, declared), share in zip(cases, TF32_SHARES[signed], strict=True):
-            held = native_dot_holds(forward(*operands), declared, FLOAT32, flushes=False)
+        natives = [forward(*operands) for operands, _ in cases]
+        for (operands, declared), native, share in zip(cases, natives, TF32_SHARES[signed], strict=True):
+            held = native_dot_holds(native, declared, FLOAT32, flushes=False)
             assert_refused(held, products_apart(declared, read(*operands), FLOAT32), share)
 
 
@@ -497,18 +543,19 @@ def the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narrow_par
         rows = groups(SIZES) == 3
         lost = x.copy()
         lost[np.ix_(rows, np.arange(32, 48))] = 0
-        held = native_dot_holds(forward_of(lost, w, SIZES), products, BFLOAT16, flushes=False)
+        halves = tuple(np.concatenate([x[:, :64] * keep, x[:, 64:] * (1 - keep)], axis=1)
+                       for keep in (1.0, 0.0))
+        native_lost, native_moved = forward_of(lost, w, SIZES), forward_of(x, w, SHIFTED)
+        first, rest = (forward_of(half, w, SIZES, jnp.float32) for half in halves)
+        held = native_dot_holds(native_lost, products, BFLOAT16, flushes=False)
         assert_refused(held[rows], products_apart(products, forward_products(lost, w, SIZES), BFLOAT16)[rows],
                        LOST_SHARE)
         assert np.all(held[~rows])
-        held = native_dot_holds(forward_of(x, w, SHIFTED), products, BFLOAT16, flushes=False)
+        held = native_dot_holds(native_moved, products, BFLOAT16, flushes=False)
         moved = groups(SIZES) != groups(SHIFTED)
         apart = products_apart(products, forward_products(x, w, SHIFTED), BFLOAT16)
         assert moved.sum() == 1 and np.all(held[~moved])
         assert_refused(held[moved], apart[moved], MOVED_SHARE)
-        halves = tuple(np.concatenate([x[:, :64] * keep, x[:, 64:] * (1 - keep)], axis=1)
-                       for keep in (1.0, 0.0))
-        first, rest = (forward_of(half, w, SIZES, jnp.float32) for half in halves)
         narrow = np.asarray(np.float32(bf16(first)) + np.float32(rest), np.float64)
         held = native_dot_holds(narrow, products, FLOAT32, flushes=False)
         narrowed = narrow_partial_ends(*(forward_products(half, w, SIZES) for half in halves), flushes=False)
@@ -537,8 +584,7 @@ def subnormal_operands_certify_natively_at_their_formats_least_normal(dtype, ker
     subnormal = rng.random(x.shape) < 0.25
     x = np.where(subnormal, np.asarray((rng.uniform(-1, 1, x.shape) * least).astype(values), np.float64), x)
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=kernel):
-        assert np.all(native_dot_holds(forward_of(x, w, SIZES, jnp.float32, dtype=dtype),
-                                       forward_products(x, w, SIZES, fmt), FLOAT32, flushes=False))
+        whole = forward_of(x, w, SIZES, jnp.float32, dtype=dtype)
         if dtype == jnp.float16:
             left, right, _ = SUBNORMAL_CASE
             case = np.zeros((ROWS, DEPTH))
@@ -546,6 +592,8 @@ def subnormal_operands_certify_natively_at_their_formats_least_normal(dtype, ker
             matrices = np.zeros((len(SIZES), DEPTH, WIDTH))
             matrices[:, :5, 0] = right
             native = forward_of(case, matrices, SIZES, jnp.float32, dtype=dtype)
+        assert np.all(native_dot_holds(whole, forward_products(x, w, SIZES, fmt), FLOAT32, flushes=False))
+        if dtype == jnp.float16:
             products = forward_products(case, matrices, SIZES, fmt)
             assert np.all(native_dot_holds(native, products, FLOAT32, flushes=False))
 
@@ -678,7 +726,7 @@ def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_
     output, lies inside its step's enclosure on the state before it, under a causal or a full `mask`
     (`attention_witness.assert_witnessed`), at this GPU's `ex2` (PTX's reach)."""
     with generation.assumed(generation_name):
-        assert_witnessed(0, mask == "causal", interpret=False)
+        assert_witnessed(0, mask == "causal", interpret=False, lane=mosaic_lane())
 
 
 def the_attention_witness_refuses_its_faults_natively(generation_name):
@@ -686,7 +734,7 @@ def the_attention_witness_refuses_its_faults_natively(generation_name):
     (`attention_witness.assert_faults_refused`): a dropped rescale, a maximum from the wrong tile, sums
     rounded to bf16 and a mask off by one key."""
     with generation.assumed(generation_name):
-        assert_faults_refused(interpret=False)
+        assert_faults_refused(interpret=False, lane=mosaic_lane())
 
 
 GENERATIONS = ("sm80", "sm90")

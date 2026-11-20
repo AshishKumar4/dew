@@ -33,7 +33,8 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     decision run's option text as its rows wrote it (`earlier_option_text`), and the fewest options its
     rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`); a world model's
     tokenizer's and its dynamics model's positions as they learned them (`earlier_tokenizer_positions`,
-    `earlier_dynamics_positions`); its data plan version
+    `earlier_dynamics_positions`); a trainer layout recorded at `Layout()`'s defaults as unset
+    (`earlier_trainer_layout`); its data plan version
     as the one it read by (`earlier_data_plan`); a chain's store under the fields its class renamed since,
     by today's names (`dew.data.records.earlier_chains`); an encoder or conditioner by the import path it
     has now (`dew._records.moved_paths`, row 5996); a decision layout of a class it was before by the
@@ -42,12 +43,29 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
     moved = _records.moved_record(record)
-    earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(moved))))
+    earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(
+        earlier_trainer_layout(moved)))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
     # A decision layout recorded by one of the classes it was before (decision-inputs.md §1, row 6140).
     earlier = {name: _records.earlier_layout(_records.json_value(value, name))
                for name, value in earlier.items()}
     return records.earlier_chains(earlier_data_plan(earlier), _chains())
+
+
+def earlier_trainer_layout(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose trainer layout is `Layout()`'s, which every run recorded before its
+    trainer's layout could be unset (`TrainerConfig.layout`) recorded for its default: unset, the layout its
+    resume takes its checkpoint's (`dew.training.streaming.laid_start`), as the run it continues chose it
+    (row 9534: read as a stated device layout, a streamed run's checkpoint resumed on its devices). Carried
+    to 1.0 (ledger 1552)."""
+    from dew.distributed.placement import Layout
+
+    fields = record.get("fields")
+    trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
+    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or not isinstance(
+            trainer.get("layout"), Mapping) or from_record(Layout, trainer["layout"]) != Layout():
+        return record
+    return {**record, "fields": {**fields, "trainer": {**trainer, "layout": None}}}
 
 
 def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:

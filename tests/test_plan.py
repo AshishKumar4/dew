@@ -30,7 +30,7 @@ from jax.extend.backend import get_backend
 from map_judge import marked_seeds, sharded
 from port_support import row_names_port
 from process_support import assert_exits_cleanly
-from reference_error import as_given, assert_as_exact, seeds_for
+from reference_error import as_given, assert_as_exact
 from sharded import collectives
 from token_support import write_token_corpus
 
@@ -1019,6 +1019,12 @@ def regression_rows(seed: int) -> tuple[np.ndarray]:
     return (np.random.default_rng(seed).normal(size=(32, FEATURES)).astype(np.float32),)
 
 
+GUIDED_SEEDS = 8
+"""Check 1's declared draws of a step guided by its profile against the unguided step, sized on a GH200
+(`seeds_for`, measurement M-MC-29): a GPU tier's prepare compiles a declared site's truths, and refuses a
+sizing at its run (rows 7988, 8293)."""
+
+
 def a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly():
     """On an NVIDIA GPU the profile of the admitted step's runs holds its instructions' times, its
     program compiles again guided by it, and the run steps the guided executable alone: the one the plan
@@ -1035,8 +1041,7 @@ def a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly
     guided = as_given(functools.partial(regression_steps, pgle=True))
     unguided = as_given(functools.partial(regression_steps, pgle=False))
     label, truth = "a step guided by its profile", regression_truth()
-    assert_as_exact(guided, unguided, regression_rows, label, truth_fn=truth,
-                    seeds=seeds_for(unguided, regression_rows, label, dew_fn=guided, truth_fn=truth))
+    assert_as_exact(guided, unguided, regression_rows, label, truth_fn=truth, seeds=GUIDED_SEEDS)
 
 
 def test_a_pinned_split_is_read_as_given_and_its_state_holds_it():

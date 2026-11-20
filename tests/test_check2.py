@@ -145,6 +145,17 @@ def test_a_correctly_rounded_division_is_held_at_its_exact_quotient():
                         lambda seed: (dividend,), "a correctly rounded division's gradient", seeds=1)
 
 
+def test_a_compensated_sum_and_a_maximum_of_no_rows_are_certified():
+    """A compensated sum (`precision.compensated_sum`) and a maximum over axis 1 of a `(0, 3)` operand, rows
+    of nothing: check 2 certifies each, holding its empty result; its reshape of the reduced axes inferred
+    their extent from an array of no elements and raised (the audit of 2026-11-19pm, 8965)."""
+    from dew.nn.precision import compensated_sum
+
+    empty = jnp.zeros((0, 3), jnp.float32)
+    for fn in (lambda x: compensated_sum(x, (1,)), lambda x: jnp.max(x, axis=1)):
+        assert ct.certified(fn, empty)[1] == []
+
+
 def test_a_sum_holds_in_any_order_and_a_lost_term_breaks_it():
     """A float32 sum taken left to right, pairwise or the lane's own way holds the sum's bound; a sum
     missing one term of a cancelling row breaks it."""
@@ -179,6 +190,34 @@ def test_a_cumulative_sum_holds_each_prefixs_bound_and_a_lost_term_breaks_it(rev
     native = np.asarray(jax.lax.cumsum(ints, axis=1, reverse=reverse))
     assert np.all(ct.CONTRACTS[jax.lax.cumsum_p](params, [ints], native, None))
     assert not np.all(ct.CONTRACTS[jax.lax.cumsum_p](params, [ints], native + np.int32(1), None))
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reversed"])
+def test_a_long_cumulative_sums_one_term_prefix_holds_that_term_alone(reverse):
+    """A bfloat16 cumulative sum of 256 ones: its one-term prefix (or suffix) is exactly 1, so a faulty 0
+    there is refused, its bound its own one term's; held to the whole axis's count (γ_256 at bfloat16's
+    roundoff, past 1), any value passed (spec alignment, 9000)."""
+    terms = np.ones((1, 256), ml_dtypes.bfloat16)
+    params = {"axis": 1, "reverse": reverse}
+    native = np.asarray(jax.lax.cumsum(jnp.asarray(terms), axis=1, reverse=reverse))
+    assert np.all(ct.CONTRACTS[jax.lax.cumsum_p](params, [terms], native, oc.BFLOAT16))
+    first = -1 if reverse else 0
+    faulty = native.copy()
+    faulty[0, first] = 0
+    assert not ct.CONTRACTS[jax.lax.cumsum_p](params, [terms], faulty, oc.BFLOAT16)[0, first]
+
+
+def test_an_explicit_tf32_dot_is_held_to_its_operands_tf32_values():
+    """A one-term dot of fp32 `1 + 2^-15` and `1` at the TF32 algorithm (`DotAlgorithmPreset.TF32_TF32_F32`):
+    a tensor core reads `1 + 2^-15` as TF32's `1`, so the product is 1, which check 2 holds, and one
+    keeping the bit TF32 drops, `1 + 2^-15`, it refuses; the contract held the dot to its fp32 operands,
+    refusing the right value and passing the wrong one (spec alignment, 9004)."""
+    a, b = np.float32([[1 + 2.0 ** -15]]), np.float32([[1.0]])
+    params = {"dimension_numbers": (((1,), (0,)), ((), ())),
+              "precision": jax.lax.DotAlgorithmPreset.TF32_TF32_F32}
+    held = ct.CONTRACTS[jax.lax.dot_general_p]
+    assert held(params, [a, b], np.float32([[1.0]]), oc.FLOAT32).all()
+    assert not held(params, [a, b], np.float32([[1 + 2.0 ** -15]]), oc.FLOAT32).any()
 
 
 def test_a_dot_holds_its_bound_and_an_element_twice_past_it_breaks_it():
@@ -1033,7 +1072,7 @@ def test_a_tf32_operand_rounds_to_nearest_a_tie_away_from_zero():
              (past, np.inf), (past - 2.0 ** 104, largest)]
     values, expected = (np.asarray([[sign * case[side] for case in cases] for sign in (1.0, -1.0)])
                         for side in (0, 1))
-    read = nc.tf32_operand(np.float32(values))
+    read = oc.tf32_operand(np.float32(values))
     assert np.array_equal(read, expected) and np.array_equal(np.signbit(read), np.signbit(expected))
 
 
@@ -1080,7 +1119,7 @@ def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf
         left, right = (np.asarray((rng.normal(size=shape) if signed else rng.uniform(0.5, 2.0, size=shape))
                                   .astype(np.float32), np.float64) for shape in ((32, 128), (8, 128)))
         tf32, wide, truncated = (nc.terms(_outer, read(left), read(right), fmt=fmt) for read, fmt in (
-            (nc.tf32_operand, oc.TFLOAT32), (bf16, oc.BFLOAT16),
+            (oc.tf32_operand, oc.TFLOAT32), (bf16, oc.BFLOAT16),
             (lambda value: oc.truncated(value, oc.TFLOAT32), oc.TFLOAT32)))
         native = _truncating_sums(tf32.exact, rng)
         assert np.all(nc.native_dot_holds(native, tf32, oc.FLOAT32, flushes=False)), signed
