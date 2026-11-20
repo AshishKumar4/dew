@@ -15,7 +15,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
-from dew.nn.kernels.templates import mosaic, operands, product, resources, swizzling
+from dew.nn.kernels.templates import mosaic, product, resources
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
 from dew.nn.kernels.templates.recurrence.chunk_forward import ForkedTable, prepared
@@ -580,21 +580,6 @@ def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: 
     steps = call.chunks / sequences
     held = dataclasses.replace(call.held, rows=call.rows)
     final_landing, after = final_memory_landing(call, bv)
-    # Reversed SUB-token reads contract `algebra.SUB` rows, which wgmma/tcgen05 issue in whole swizzles:
-    # size `queries` and the chunk-tall staging tiles to that depth (as `key_backward._key_pairs_staged`).
-    reverse_sub = not call.per_key and not call.delta
-    sub_swizzle = swizzling.swizzle_for(held.stored, algebra.SUB) if reverse_sub else None
-    sub_tx = None if sub_swizzle is None else swizzling.swizzle_transforms(held.stored, sub_swizzle)
-    staged_shapes = tuple(dict.fromkeys(((call.block, bv), (chunk, bv))))
-    staged_sets = tuple(
-        tuple(plgpu.SMEM(shape, held.stored, transforms=sub_tx) if sub_tx is not None and shape[0] == chunk
-              else plgpu.SMEM(shape, held.stored) for _ in range(held.parts))
-        for shape in staged_shapes)
-    second_tile = (plgpu.SMEM((chunk, bv), held.stored, transforms=sub_tx) if sub_tx is not None
-                   else plgpu.SMEM((chunk, bv), held.stored))
-    swizzles = ({f"queries{p}": swizzling.swizzle_for(keyed.stored, algebra.SUB)
-                 for p in range(keyed.parts)}
-                if reverse_sub else None)
     return launch_kernel(program, call, out_type=out_type, grid=(value_width // walked_width, sequences,
                                                                  call.heads),
                          # Two deep where the block holds both, else one: fp32's two parts and 256-wide keys
@@ -604,8 +589,9 @@ def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: 
                          held=table_held(_reverse_held(call, bv, gates=gates, skips=skips), call, table, bv),
                          consumers=tiles.walkers,
                          live=sequence_live(8),
-                         staging=(*staged_sets, (second_tile,)),
-                         once=finals, swizzles=swizzles,
+                         staging=(*staging_tiles(held, *dict.fromkeys(((call.block, bv), (chunk, bv)))),
+                                  (plgpu.SMEM((chunk, bv), held.stored),)),
+                         once=finals,
                          landing={**memory_landing(call, bv), "corrected": values.landing(chunk, bv),
                                   **final_landing, **table_landing(call, table is not None, bv)},
                          after=after)
@@ -637,7 +623,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
     chunk, width, value_width, family = call.chunk, call.width, call.value_width, call.family
     grads = _reverse_values(call, gates=gates)
     bv, slices, walkers = tiles.block_v, width // call.block, tiles.walkers
-    walked_width, memories, given = bv * walkers, call.memories, call.given
+    walked_width = bv * walkers
+    memories, given = call.memories, call.given
     batch, chunks = dht.shape[0] // (call.heads * width), call.chunks
     final = Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
     assert gates or not skips, "the walk adds a skip where it gates the values"
@@ -683,12 +670,11 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
             # the next stages; an fp32 call's two parts are the memory products' own (a third took the
             # product's parts apart, each its own accumulator: 277 values live at the walk's peak against a
             # 16-bit call's 133, 100 bytes spilled on an H100, back-need at 5cec06bd8).
-            reads_scratch = chunked if len(chunked) > 1 else (*chunked, second)
-            issue = Issuer(call, {"values_dv": sliced, "weights_dv": chunked, "reads": reads_scratch})
-            return functools.partial(_reverse_step, lands, issue, reads_scratch, walked + role * bv,
-                                     pl.ds(role * bv, bv))
+            issue = Issuer(call, {"values_dv": sliced, "weights_dv": chunked,
+                                   "reads": chunked if len(chunked) > 1 else (*chunked, second)})
+            return functools.partial(_reverse_step, lands, issue, walked + role * bv, pl.ds(role * bv, bv))
 
-        def _reverse_step(lands, issue, reads_scratch, column, columns, f, slots, grad, accumulators):
+        def _reverse_step(lands, issue, column, columns, f, slots, grad, accumulators):
             n = chunks - 1 - f
             span = pl.ds(n * chunk, chunk)
             for i, part in enumerate(grad):
@@ -701,8 +687,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                         algebra.key_memory_decay(entered.value(), part))
 
             out = stream_tile(slots, "out", given, columns=columns)
-            grad, dv = _reverse_carried(call, slots, grad, out, columns, issue, reads_scratch,
-                                        (hi_ref, lo_ref), h, n, scale=scale)
+            grad, dv = _reverse_carried(call, slots, grad, out, columns, issue, (hi_ref, lo_ref), h, n,
+                                        scale=scale)
             if gates:
                 dv = _gated_values_stored(call, slots, columns, out, dv, (beta_ref, skip_ref, gated_ref), h,
                                           span, column // bv)
@@ -734,8 +720,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
     return launched[:-1] if returns == 2 else launched
 
 
-def _reverse_carried(call: Call, slots, grad: list, out: Parts, columns, issue: Issuer, reads_scratch,
-                     prefix: tuple, h, n, *, scale: float) -> tuple:
+def _reverse_carried(call: Call, slots, grad: list, out: Parts, columns, issue: Issuer, prefix: tuple, h,
+                     n, *, scale: float) -> tuple:
     """`_reverse`'s step's algebra on chunk `n` of head `h`: the memory's gradient carried through the chunk
     and the corrected values' (`algebra.reverse_carried`; under a decay a key dimension
     `algebra.key_reverse_carried`, each key slice's rows decayed across the chunk by `exp2(g_last)` a
@@ -759,21 +745,8 @@ def _reverse_carried(call: Call, slots, grad: list, out: Parts, columns, issue: 
     gate, low = (family.rows_of(ref.at[h, span]) for ref in prefix)
     ending, ending_low = (jnp.full((chunk,), ref[h, last]) for ref in prefix)
     kept = [algebra.raised(*(jnp.full((call.block,), ref[h, last]) for ref in prefix))[:, None]] * len(grad)
-    if not call.delta:
-        def reversed_reads(i: int, read: jax.Array) -> jax.Array:
-            q_tile, r_tile = queries(i), operands.staged(family, read, reads_scratch)
-            step = algebra.SUB if chunk >= algebra.SUB and chunk % algebra.SUB == 0 else chunk
-            blocks = chunk // step
-            return functools.reduce(
-                jnp.add,
-                (issue("reads", q_tile.rows(s, step).T, r_tile.rows(s, step))
-                 for s in range((blocks - 1) * step, -1, -step)))
-    else:
-        def reversed_reads(i: int, read: jax.Array) -> jax.Array:
-            return issue("reads", queries(i).T, read)
-
-    return algebra.reverse_carried(grad, keys, weights, out.value(), local, gate, low, ending,
-                                   ending_low, kept, scale, held.dtype, issue, reads=reversed_reads)
+    return algebra.reverse_carried(grad, keys, weights, queries, out.value(), local, gate, low, ending,
+                                   ending_low, kept, scale, held.dtype, issue)
 
 
 def _values_gated_back(call: Call, slots, columns, out: Parts, dv, betas, skip) -> tuple:
