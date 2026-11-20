@@ -1248,12 +1248,12 @@ def compensated(values, *, low=None, axis: int = 0, reverse: bool = False, resta
     angle less its whole turns, `templates.recurrence.turned`'s frames). `chunk`, where given, walks the
     prefixes in chunks of that many elements (`_chunk_walked`), every element read once, where an associative
     scan reads each at every level (Mamba-3's frames took a step 13% past its kernels on a GH200 so, row
-    7402)."""
+    7402): prefixes alone, a reverse scan's none."""
     low = jnp.zeros_like(values) if low is None else low
     joined = compensated_add if wrap is None else (lambda left, right: wrap(compensated_add(left, right)))
     if chunk is not None:
         if reverse:
-            raise NotImplementedError("a chunked walk sums prefixes alone")
+            raise ValueError("compensated's chunk walks prefixes alone: a reverse scan takes chunk=None")
         return _chunk_walked(values, low, axis, restarts, joined, chunk)
 
     def combine(left, right):
