@@ -956,7 +956,8 @@ def _rows_local(walk, like):
     they gather by are split over the rows, a gather JAX refuses to place (row 9690). Every operand is placed
     as the rows are first, the rest of it whole (a no-decay call's gates the prologue forms whole, a head
     split over another axis gathered), and the map checks its varying axes, the walk's carries typed as its
-    operands vary (`varying_like`)."""
+    operands vary (`varying_like`): a call run eagerly within an unchecked map over another axis JAX refuses,
+    the two maps' check modes apart."""
     placed = rows_spec(like, 1)
     if placed is None or placed.spec[0] is None:
         return walk
