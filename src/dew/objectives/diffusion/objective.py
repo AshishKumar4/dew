@@ -16,6 +16,9 @@ uses; the preview hook limits itself to the display count.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import weakref
 from abc import abstractmethod
 from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import replace
@@ -37,6 +40,7 @@ from dew.diffusion.schedules.source import SourceGrid
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inference.images import ImageSettings, TextToImage
 from dew.inputs import InputSpec, encode_conditions, unit_range
+from dew.inputs.condition import ConditionEncoder
 from dew.lora import unadapted
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
@@ -60,7 +64,6 @@ from dew.objectives.base import (
     TEACHER,
     Aux,
     EMASpec,
-    Held,
     Objective,
     Omitted,
     Pooled,
@@ -261,12 +264,34 @@ def _trains_its_grid(source: PipelineSource, process, grid) -> bool:
 
 def _keyed_inputs(inputs: InputSpec) -> TracedSetting:
     """`inputs` as a trace key states it (`DiffusionObjective.traced_by`): its sample, its mask and each
-    condition's field and unconditional datum by value, its encoder by the object itself (`Held`), which
-    holds the arrays its encoding closes over: two objectives over one encoder key alike, a refit's among
-    them, and two encoders of other weights apart, whatever their fields."""
+    condition's field and unconditional datum by value, its encoder by its value too (`_encoder_value`),
+    whose parameters its encoding closes over: two objectives over encoders of one record and one set of
+    weights key alike, built anew or not, and two of other weights apart."""
     return (inputs.sample, inputs.mask,
-            tuple(sorted((name, condition.field, condition.unconditional, Held(condition.encoder))
+            tuple(sorted((name, condition.field, condition.unconditional, _encoder_value(condition.encoder))
                          for name, condition in inputs.conditions.items())))
+
+
+_ENCODER_VALUES: dict[int, tuple[str, str, str]] = {}
+"""Each live encoder's value (`_encoder_value`), by its identity, dropped as the encoder goes."""
+
+
+def _encoder_value(encoder: ConditionEncoder) -> tuple[str, str, str]:
+    """`encoder` as a trace key states it: its class, the record a run keeps of it (`recorded_fields`) and a
+    digest of its parameters, each leaf's path, dtype, shape and bytes, which its encoding closes over as
+    constants. Taken once an encoder object, read off the host once."""
+    held = _ENCODER_VALUES.get(id(encoder))
+    if held is None:
+        digest = hashlib.sha256()
+        for path, leaf in jax.tree_util.tree_flatten_with_path(encoder.params)[0]:
+            array = np.asarray(leaf)
+            digest.update(f"{jax.tree_util.keystr(path)}:{array.dtype}:{array.shape}".encode())
+            digest.update(array.tobytes())
+        held = (f"{type(encoder).__module__}.{type(encoder).__qualname__}",
+                json.dumps(encoder.recorded_fields(), sort_keys=True, default=repr), digest.hexdigest())
+        _ENCODER_VALUES[id(encoder)] = held
+        weakref.finalize(encoder, _ENCODER_VALUES.pop, id(encoder), None)
+    return held
 
 
 class DiffusionObjective(Objective[Ratio]):
@@ -524,9 +549,12 @@ class DiffusionObjective(Objective[Ratio]):
         self.steps = steps
         self.grid = grid
         self.grid_process = grid_process
+        # A constant decay states its average (`EMASpec.stated`), so the trace keys by it (row 6297); a
+        # schedule, a function, states none.
         self.ema = (None if ema_decay is None else EMASpec(
             decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
-            select=under("params")))
+            select=under("params"),
+            stated=None if callable(ema_decay) else ("constant", ema_decay, "params")))
         self._grid = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
 
     @property
@@ -1024,6 +1052,11 @@ class FlowDistillationObjective(DiffusionObjective):
 
     network: ClassVar[str]
     """The network the loss trains beside the student under `params`."""
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "teacher_variables": "the teacher's tree, which the held tree the key states by its shapes holds "
+                             "under its own name (`held_variables`'s `TEACHER`), its arrays passed as "
+                             "arguments"}
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
                  teacher: nn.Module | None = None, teacher_variables: Variables | None = None,
