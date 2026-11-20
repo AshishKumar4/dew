@@ -851,11 +851,7 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     target = generation.TARGETS[generation_name]
     arrays = {"query": shape, "value": shape, "query_ids": None,
               "residuals": template.Kept.SPLIT if step else template.Kept.NONE}
-    # A config either launch refuses (its registers, its block) compiles nothing to compare.
-    launches = [(attention_triton.TritonForward(score_kinds=score_kinds), config)]
-    if step:
-        launches.append((attention_triton.TritonBackward(score_kinds=score_kinds), backward))
-    if not all(op.takes(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches):
+    if not _staged_takes(generation_name, dtype, width, hooks, config, step=step):
         return {}
     pins = {attention_triton.TritonForward: config, attention_triton.TritonBackward: backward}
     record: dict = {}
@@ -881,26 +877,49 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     return staged
 
 
+def _staged_takes(generation_name: str, dtype, width: int, hooks: tuple, config: attention_triton.Tiles,
+                  *, step: bool) -> bool:
+    """Whether `config` is legal for `_staged_launches`' forward (and backward when `step`) on
+    `generation_name`, reusing `op.takes`."""
+    import tokamax
+
+    _, kinds, _ = score_hooks(hooks, 512, 512, width)
+    shape = jax.ShapeDtypeStruct((1, 512, 4, width), dtype)
+    backward = attention_triton.BackwardTiles(config.block_q, config.block_k, config.warps, config.stages,
+                                              config.warps, config.stages)
+    score_kinds = tuple(kinds)
+    target = generation.TARGETS[generation_name]
+    arrays = {"query": shape, "value": shape, "query_ids": None,
+              "residuals": template.Kept.SPLIT if step else template.Kept.NONE}
+    launches = [(attention_triton.TritonForward(score_kinds=score_kinds), config)]
+    if step:
+        launches.append((attention_triton.TritonBackward(score_kinds=score_kinds), backward))
+    return all(op.takes(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches)
+
+
+@pytest.mark.parametrize("config", STAGED_TILES, ids=lambda t: f"{t.block_q}x{t.block_k}")
 @pytest.mark.parametrize("step", [False, True], ids=["forward", "step"])
 @pytest.mark.parametrize(("generation_name", "dtype", "width", "hooks"), STAGED_CALLS.values(),
                          ids=STAGED_CALLS)
-def test_a_triton_launchs_shared_memory_is_what_triton_allocates(generation_name, dtype, width, hooks, step):
+def test_a_triton_launchs_shared_memory_is_what_triton_allocates(generation_name, dtype, width, hooks, step,
+                                                                 config):
     """Each Triton launch of a call, compiled by XLA's CUDA backend for a compile-only GPU on this CPU at
     tiles either side of each staging rule's turns: the shared memory its model counts (`Staging`:
     `TritonForward.staging`, `_dq_staging`, `_dkv_staging`) is the bytes Triton launched it with, where
     Triton's rules determine them, and at or above them where it counts a tile whole that Triton's
     allocator overlaps by liveness. An undercount once derived an A100's fp32 training forward Triton
     refused (180224 bytes asked of 166912, where 131072 were counted)."""
-    compiled = 0
-    for config in STAGED_TILES:
-        staged = _staged_launches(generation_name, dtype, width, hooks, config, step=step)
-        compiled += bool(staged)
-        for kernel, (launched, staging) in staged.items():
-            if staging.whole:
-                assert staging.bytes >= launched, (kernel, config, staging, launched)
-            else:
-                assert staging.bytes == launched, (kernel, config, staging, launched)
-    assert compiled
+    required = next((tile for tile in STAGED_TILES
+                     if _staged_takes(generation_name, dtype, width, hooks, tile, step=step)), None)
+    assert required is not None
+    staged = _staged_launches(generation_name, dtype, width, hooks, config, step=step)
+    if config == required:
+        assert staged
+    for kernel, (launched, staging) in staged.items():
+        if staging.whole:
+            assert staging.bytes >= launched, (kernel, config, staging, launched)
+        else:
+            assert staging.bytes == launched, (kernel, config, staging, launched)
 
 
 def _trained(spans: template.KeySpans):
@@ -911,9 +930,10 @@ def _trained(spans: template.KeySpans):
     return backward
 
 
+@pytest.mark.parametrize("phase", ["forward", "backward"])
 @pytest.mark.parametrize("width", [64, 128, 256])
 @pytest.mark.parametrize("generation_name", ["sm120", "sm86"])
-def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, width):
+def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, width, phase):
     """The forward and a training step's backward (its forward kept) at the tiles they derive on a GPU of a
     99 KB block (an RTX PRO 6000's, an A10's), causal, bf16, compiled by XLA's CUDA backend for a
     compile-only device of it on this CPU (tests/kernel_compile.py): every Triton launch within the block
@@ -928,10 +948,10 @@ def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, widt
     def forward(query, key, value):
         return attention_triton.forward(query, key, value, spans, None, natural=True)
 
-    found = compile_kernels([KernelCase("forward", lambda: (forward, (shape,) * 3)),
-                             KernelCase("backward", lambda: (_trained(spans), (shape,) * 4))],
-                            generation_name)
-    assert len(found) == 2
+    case = (KernelCase("forward", lambda: (forward, (shape,) * 3)) if phase == "forward"
+            else KernelCase("backward", lambda: (_trained(spans), (shape,) * 4)))
+    found = compile_kernels([case], generation_name)
+    assert len(found) == 1
     assert not failures(found), "\n".join(failures(found))
 
 

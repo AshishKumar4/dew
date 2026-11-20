@@ -29,7 +29,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn import derivatives, precision, programs
 from dew.nn.kernels.templates import resources
-from dew.nn.kernels.templates.cost import Stated, Work
+from dew.nn.kernels.templates.cost import Chain, Stated, Work, followed
 
 
 class Unpriced(ValueError):
@@ -70,6 +70,15 @@ class Emitted:
         work outside its walks."""
         stepping = [unit(_mean(role.walks)) for role in self.roles if role.walks]
         return max(stepping, default=0) * steps + unit(self.fixed) * programs
+
+    def paths(self, steps: float) -> tuple[Chain, ...]:
+        """A program's dependent paths: each warpgroup's work outside its walks followed by a step of its walk
+        `steps` times (`cost.followed`), the warpgroups side by side (`Work.__add__`)."""
+        def walked(role: Role) -> Work:
+            step = tuple(chain.times(steps) for chain in _mean(role.walks).chains) if role.walks else ()
+            return Work(chains=followed(role.fixed.chains, step))
+
+        return sum(map(walked, self.roles), Work()).chains
 
 
 @dataclasses.dataclass(frozen=True)
@@ -233,9 +242,10 @@ def _bytes(aval) -> int:
 
 
 def repeated(work: Work, count: float) -> Work:
-    """`work` repeated `count` times in a chain: its every unit's, and its span."""
+    """`work` repeated `count` times in a chain: its every unit's, its span and each of its paths'."""
     return Work(**{field.name: getattr(work, field.name) * count for field in dataclasses.fields(Work)
-                   if field.name != "kernels"}, kernels=work.kernels)
+                   if field.name not in ("kernels", "chains")}, kernels=work.kernels,
+                chains=tuple(chain.times(count) for chain in work.chains))
 
 
 def _tensor(dtype, flops: float) -> Work:
@@ -257,12 +267,12 @@ def _unreffed(aval) -> jax_core.ShapedArray:
 
 
 def _transformed(aval, tree, leaves: Sequence) -> jax_core.ShapedArray:
-    """A ref's aval through its transforms (`tree` of `leaves`)."""
+    """A ref's aval through its transforms (`tree` of `leaves`), applied in order by JAX's own walk of a
+    transform sequence (`state_types.transform_type`, Mosaic GPU's)."""
     shaped = _unreffed(aval)
-    if tree is not None:
-        for transform in jax.tree.unflatten(tree, leaves):
-            shaped = _unreffed(transform.transform_type(shaped))
-    return shaped
+    if tree is None:
+        return shaped
+    return _unreffed(state_types.transform_type(jax.tree.unflatten(tree, leaves), shaped))
 
 
 def _logical(aval, tree, leaves: Sequence) -> tuple[int, ...]:
@@ -271,9 +281,21 @@ def _logical(aval, tree, leaves: Sequence) -> tuple[int, ...]:
 
 
 def _product(equation) -> Work:
-    """A tensor-core product's work, `2 m n k` in its operands' mode: its accumulator `[m, n]` and its left
-    operand `[m, k]` as their transforms read them (the trailing `*_transforms_tree` leaves of its
-    operands)."""
+    """A tensor-core product's work, `2 m n k` in its operands' mode (`_shape`)."""
+    m, n, k = _shape(equation)
+    return _tensor(equation.invars[1].aval.dtype, 2 * m * n * k)
+
+
+def _columns(equation) -> float:
+    """A product's columns as a waited one's latency counts them (`cost.Chain.columns`): its `n` columns, each
+    a step of 128 bytes of its depth (a 16-bit operand 64 deep)."""
+    _, n, k = _shape(equation)
+    return n * k * jnp.dtype(equation.invars[1].aval.dtype).itemsize / 128
+
+
+def _shape(equation) -> tuple[int, int, int]:
+    """A tensor-core product's `m, n, k`: its accumulator `[m, n]` and its left operand `[m, k]` as their
+    transforms read them (the trailing `*_transforms_tree` leaves of its operands)."""
     avals = [variable.aval for variable in equation.invars]
     names = sorted(name for name in equation.params if name.endswith("_transforms_tree"))
     trees = {name: equation.params[name] for name in names}
@@ -288,7 +310,7 @@ def _product(equation) -> Work:
         split[name], at = leaves[at:at + count], at + count
     m, n = _logical(avals[0], trees.get("acc_transforms_tree"), split.get("acc_transforms_tree", ()))[-2:]
     k = _logical(avals[1], trees.get("a_transforms_tree"), split.get("a_transforms_tree", ()))[-1]
-    return _tensor(avals[1].dtype, 2 * m * n * k)
+    return m, n, k
 
 
 def _copied(equation) -> int:
@@ -380,12 +402,44 @@ class _Counting:
         self.fixed = Work()
         self.walks: list[Work] = []
         self.loops = [_Loop() for _ in range(loops)]
+        # The products it issued and has not waited on (each one's columns, `_columns`), and what lands on
+        # each barrier it will wait on: products committed to it, copies arriving on it (`waited`).
+        self.issued: list[float] = []
+        self.landing: dict[jax_core.Var, Chain] = {}
 
     def add(self, work: Work) -> None:
+        # The warpgroup's work in its order: its paths followed one by the next (`_then`).
         if self.loops:
-            self.loops[-1].work = self.loops[-1].work + work
+            self.loops[-1].work = _then(self.loops[-1].work, work)
         else:
-            self.fixed = self.fixed + work
+            self.fixed = _then(self.fixed, work)
+
+    def waited(self, equation) -> None:
+        """A wait the warpgroup's path runs through: products drained (`wgmma_wait`, the oldest past the `n`
+        it lets fly), a barrier's phase (its committed products, its copies, else another warpgroup's
+        arrival, a round trip); what lands on a barrier recorded as it is committed or copied to it. A
+        product waited a trip after it issued (a pipelined walk's) waits no path here: its trip's work hid
+        it."""
+        primitive = equation.primitive
+        if primitive in _PRODUCTS:
+            self.issued.append(_columns(equation))
+        elif primitive is gpu.wgmma_wait_p:
+            drained = self.issued[:max(0, len(self.issued) - equation.params["n"])]
+            self.issued = self.issued[len(drained):]
+            if drained:
+                self.add(Work(chains=(Chain(products=len(drained), columns=sum(drained)),)))
+        elif primitive is gpu.tcgen05_commit_arrive_p:
+            barrier = equation.invars[0]
+            committed = Chain(products=len(self.issued), columns=sum(self.issued))
+            self.landing[barrier] = self.landing.get(barrier, Chain()).then(committed)
+            self.issued = []
+        elif primitive is gpu.copy_gmem_to_smem_p and equation.params.get("has_barrier"):
+            barrier = equation.invars[2]
+            copied = Chain(copies=1, copy_bytes=_copied(equation))
+            self.landing[barrier] = self.landing.get(barrier, Chain()).then(copied)
+        elif primitive is gpu.barrier_wait_p:
+            landed = self.landing.pop(equation.invars[0], None)
+            self.add(Work(chains=(landed if landed is not None else Chain(barriers=1),)))
 
     def run(self, jaxpr: jax_core.Jaxpr, values: list, constants: Sequence = ()) -> list:
         """Count `jaxpr` given its inputs' concrete `values` (None where unknown), and its constants'
@@ -428,6 +482,7 @@ class _Counting:
     def equation(self, equation, values: list) -> list:
         primitive, params = equation.primitive, equation.params
         unknown = [None] * len(equation.outvars)
+        self.waited(equation)
         if primitive is lax.axis_index_p:
             return [self.place(params["axis_name"])]
         if (primitive in programs.SCALAR_FOLDED and values
@@ -444,7 +499,7 @@ class _Counting:
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
         if primitive in _OPERATIONS:
-            self.add(Work(operations=sum(_elements(v.aval) for v in equation.outvars)))
+            self.add(_operated(equation))
         elif primitive in _REDUCTIONS:
             self.add(Work(operations=_elements(equation.invars[0].aval)))
         elif primitive in SPECIAL_FUNCTIONS:
@@ -680,16 +735,37 @@ def _expanded(equation) -> tuple[jax_core.Jaxpr, Sequence] | None:
     return traced.jaxpr, traced.consts
 
 
+def _operated(equation) -> Work:
+    """An elementwise operation's work, one an output element: on the integer units where its operands are
+    integers or predicates (logic, shifts, integer arithmetic and comparisons: the ALU's LOP3, SHF, IADD3,
+    ISETP and PLOP3, `Work.integer_operations`), else on the fp32 lanes. Its last operand's type is its
+    operands' (a select's arms', its predicate first)."""
+    count = sum(_elements(variable.aval) for variable in equation.outvars)
+    dtype = jnp.dtype(equation.invars[-1].aval.dtype)
+    integral = jnp.issubdtype(dtype, jnp.integer) or dtype == jnp.bool_
+    return Work(integer_operations=count) if integral else Work(operations=count)
+
+
+def _then(first: Work, then: Work) -> Work:
+    """`first`'s work followed by `then`'s on one warpgroup: their units' sum, their paths followed
+    (`cost.followed`)."""
+    return dataclasses.replace(first + then, chains=followed(first.chains, then.chains))
+
+
 def _mean(walks: Sequence[Work]) -> Work:
-    """A step of `walks`, a role's loops: their steps' mean (`Role.step`)."""
-    return repeated(sum(walks, Work()), 1 / len(walks))
+    """A step of `walks`, a role's loops: their steps' mean (`Role.step`), their paths followed one by the
+    next through the ring they share (`cost.followed`), each loop's weight kept, before the mean."""
+    paths = functools.reduce(followed, (walk.chains for walk in walks))
+    return repeated(dataclasses.replace(sum(walks, Work()), chains=paths), 1 / len(walks))
 
 
 def _envelope(works) -> Work:
-    """The most of each unit any of `works` holds."""
+    """The most of each unit any of `works` holds, and every path none of the others outlasts (as works side
+    by side keep them)."""
     works = list(works)
     return Work(**{field.name: max(getattr(work, field.name) for work in works)
-                   for field in dataclasses.fields(Work)})
+                   for field in dataclasses.fields(Work) if field.name != "chains"},
+                chains=sum(works, Work()).chains)
 
 
 def _scalar(value) -> bool:
@@ -741,8 +817,8 @@ def _filled(jaxpr: jax_core.Jaxpr, stated: Stated) -> jax_core.Jaxpr:
 def launch_work(kernel, stated: Stated) -> Work:
     """A kernel equation's work from its body's emission, a launch's: each unit's, a step's `stated.steps`
     times and the rest each program's (`Emitted.issued`), the bytes it states its device's, its span the
-    steps one of its programs walks, and one kernel. Its cost estimate's (`_estimate`) and a step's price
-    (`work_of`, `attention_decode.priced_step`) alike."""
+    steps its longest program walks (`Stated.longest`, else their mean), and one kernel. Its cost
+    estimate's (`_estimate`) and a step's price (`work_of`, `attention_decode.priced_step`) alike."""
     if kernel.primitive is mpmd.mpmd_map_p:
         (mesh,) = kernel.params["meshes"]
         counted = emitted(_body(kernel), mesh.num_threads or 1, mesh.thread_name)
@@ -753,10 +829,13 @@ def launch_work(kernel, stated: Stated) -> Work:
     def issued(field: str) -> float:
         return counted.issued(lambda work: getattr(work, field), stated.steps, programs)
 
+    # The steps on its critical path: its longest program's walk where it states one, else their mean.
+    walked = stated.steps / programs if stated.longest is None else stated.longest
+
     return Work(flops=issued("flops"), operations=issued("operations"), exponentials=issued("exponentials"),
                 conversions=issued("conversions"), device_bytes=stated.bytes_accessed,
                 shared_bytes=issued("shared_bytes"), tf32_flops=issued("tf32_flops"),
-                span=stated.steps / programs, fp8_flops=issued("fp8_flops"), kernels=1)
+                span=walked, fp8_flops=issued("fp8_flops"), kernels=1, chains=counted.paths(walked))
 
 
 def _estimate(work: Work) -> pl.CostEstimate:
