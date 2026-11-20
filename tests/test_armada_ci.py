@@ -1290,7 +1290,8 @@ def test_a_parameters_shared_setup_keeps_its_tests_together_across_functions_and
     node = "tests/test_models.py::{}"
     forward = [node.format(f"test_forward[m-{key}-tiny]") for key in "abc"]
     # Stacked parameters' ids as pytest joins them, the decorator nearest the function's first.
-    gradient = [node.format(f"test_gradient[{dtype}-m-{key}-tiny]") for key in "abc" for dtype in ("bf16", "f32")]
+    gradient = [node.format(f"test_gradient[{dtype}-m-{key}-tiny]")
+                for key in "abc" for dtype in ("bf16", "f32")]
     plain = node.format("test_plain")
     nodes = sorted([*forward, *gradient, plain])
     weights = dict.fromkeys(nodes, 10.0)
@@ -1298,12 +1299,12 @@ def test_a_parameters_shared_setup_keeps_its_tests_together_across_functions_and
     groups = session.cut(nodes, [weights[each] for each in nodes], 3)
     for key in "abc":
         assert sum(by_key[key] <= set(group) for group in groups) == 1, groups
-    # Model a's tests weigh twice the rest together: in two consecutive parts, each within a group's share.
+    # Model a's three tests weigh four times the rest together: they run apart, so no group is heavier than
+    # its heaviest test, where kept whole they were three times it.
     heavy = {**weights, **{each: 100.0 for each in by_key["a"]}}
     groups = session.cut(nodes, [heavy[each] for each in nodes], 4)
-    share = sum(heavy.values()) / 4
-    holding = [group for group in groups if set(group) & by_key["a"]]
-    assert len(holding) == 2 and all(sum(heavy[each] for each in group) <= share for group in holding), groups
+    assert sum(bool(set(group) & by_key["a"]) for group in groups) == 3, groups
+    assert max(sum(heavy[each] for each in group) for group in groups) == 100.0, groups
     # A new parameter of model a joins its first recorded test's group; each recorded test keeps its own.
     new = node.format("test_forward[m-a-tiny-new]")
     collected = sorted([*nodes, new])

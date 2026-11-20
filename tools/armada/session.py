@@ -443,8 +443,9 @@ def units(nodes: list[str]) -> list[list[int]]:
 
 def parted(held: list[list[int]], seconds: list[float], count: int) -> list[list[int]]:
     """`units` `held` (indexes into `seconds`) for a cut into `count` groups: each unit heavier than a
-    group's share of their whole cut into as few runs of its consecutive tests as bring each within it,
-    in order at its place, so one setup is never the cut's longest group; it pays its setup once a run."""
+    group's share of their whole cut into as many runs of its consecutive tests as that share goes into its
+    weight, at most one a test, in order at its place, so one setup does not make the cut's longest group;
+    it pays its setup once a run."""
     share = sum(seconds) / count if count else 0.0
     parts: list[list[int]] = []
     for unit in held:
