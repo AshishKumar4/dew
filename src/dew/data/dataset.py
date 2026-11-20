@@ -1300,11 +1300,17 @@ def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
         if all(_stacked(value) for value in values):
             batched[name] = _column(values, shared=shared and _shareable(values))
         elif all(isinstance(value, Mapping) and value and value.keys() == values[0].keys()
-                 for value in values):
-            batched[name] = record_batch(values, shared=shared)
+                 for value in values) and _stacks_any(fields := record_batch(values, shared=shared)):
+            batched[name] = fields
         else:
             batched[name] = values
     return batched
+
+
+def _stacks_any(batched: Batch) -> bool:
+    """Whether a nested record's batch (`record_batch`) stacked any of its fields: one whose every field is
+    opaque (a tool's names, its schema) stays its records' list, as a record of opaque fields alone is."""
+    return any(not isinstance(column, list) for column in batched.values())
 
 
 def _column(values: Sequence[object], *, shared: bool):
