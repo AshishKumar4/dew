@@ -62,17 +62,21 @@ def collectives(text: str | jax.stages.Compiled) -> list[tuple[str, list[tuple[i
             if (kind := collective(instruction.op)) and not instruction.op.endswith("-start")]
 
 
-def collective_axes(text: str | jax.stages.Compiled, mesh: jax.sharding.Mesh
+def collective_axes(text: str | jax.stages.Compiled, mesh: jax.sharding.Mesh, *, values: bool = False
                     ) -> set[tuple[str, frozenset[str]]]:
     """`(op, axes)` of every collective in compiled HLO `text` (or a compiled executable's module, read
     without printing it: XLA prints attributes its parser refuses, an all-reduce-start's
-    `output_to_operand_aliasing`) over `mesh`: the axes along which
+    `output_to_operand_aliasing`) over `mesh`, of those of values alone where `values` (each result array a
+    float's or a complex's, `VALUES`): the axes along which
     the devices of one of its groups (`HloInstruction.groups`) differ, each group's positions read
     in the program's device assignment, `mesh`'s devices in order. An async pair once, by its
     `-start`, which holds the groups."""
     found = set()
     for instruction in hlo_instructions(text).values():
         if (kind := collective(instruction.op)) is None or instruction.op.endswith("-done"):
+            continue
+        arrays = instruction.arrays or (instruction.element,)
+        if values and not all(array.startswith(VALUES) for array in arrays):
             continue
         groups = instruction.groups or (tuple(range(mesh.size)),)
         coordinates = [np.unravel_index(list(group), mesh.devices.shape) for group in groups]
@@ -95,9 +99,14 @@ MOVES = ("all-gather", "all-to-all", "collective-permute")
 needs none of: a reduction (all-reduce, reduce-scatter) is a gradient's sum, not a move."""
 
 REDUCTIONS = ("all-reduce", "reduce-scatter")
-"""The collectives that sum across devices: each a step takes is one its cell intends, over mesh axes it
-names (`split_checked`'s `reductions`), so one on an axis it does not intend fails however the outputs read
-(spec alignment, 9001)."""
+"""The collectives that sum across devices: each a step takes of values (`VALUES`) is one its cell intends,
+over mesh axes it names (`split_checked`'s `reductions`), so one on an axis it does not intend fails however
+the outputs read (spec alignment, 9001)."""
+
+VALUES = ("f", "bf", "c")
+"""The element types (HLO's names) of values a step may sum across devices: a float's or a complex's. An
+integer or a flag the shards agree on is no sum of values: the Pallas interpreter's `pmax` of its callbacks'
+int32 status around an interpreted kernel (three test_linear_attention.py decode cells, train 1089)."""
 
 
 def tpu_mesh(**axes: int) -> jax.sharding.Mesh:
@@ -172,7 +181,7 @@ def split_checked(fn, draw, specs, mesh, *, moves=(), reductions=(), donate=()):
     text = compiled.as_text()
     moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]
     assert not moved, f"the step moves operands between devices: {moved}"
-    found = collective_axes(compiled, mesh)
+    found = collective_axes(compiled, mesh, values=True)
     whole = _whole_axes(specs, mesh)
     declared = {(op, frozenset(axes)) for op, axes in reductions}
 
