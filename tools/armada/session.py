@@ -396,8 +396,9 @@ def marked_setups(name: str, text: str) -> dict[str, tuple[str, str | None]]:
         if isinstance(node, ast.Attribute) and node.attr == SHARED_SETUP and id(node) not in read:
             raise SystemExit(f"{name}, line {node.lineno}: {SHARED_SETUP} is read on a test's own "
                              f"decorator alone, once, as @pytest.mark.{SHARED_SETUP}(\"name\") of a literal "
-                             "name, with at most by=\"<regular expression>\", a literal, which the plan "
-                             "reads from the source (tools/armada/session.py `shared_setups`)")
+                             "name, with at most by=\"<ASCII regular expression naming no character>\", a "
+                             "literal, which the plan reads from the source (tools/armada/session.py "
+                             "`shared_setups`)")
     return found
 
 
