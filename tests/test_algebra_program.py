@@ -302,6 +302,39 @@ def test_a_factored_product_is_admitted_only_under_the_reach(name):
     assert held == {1.0: True, largest: False}
 
 
+REUSED = {
+    "a reciprocal": (lambda a, w: (a / jnp.maximum(jnp.abs(w), 1e-3), 1 / jnp.maximum(jnp.abs(w), 1e-3)),
+                     lambda a, w: (a / jnp.abs(w), 1 / jnp.abs(w))),
+    "a reciprocal root": (
+        lambda a, w: (a / jnp.sqrt(jnp.square(w) + 1e-3), jax.lax.rsqrt(jnp.square(w) + 1e-3)),
+        lambda a, w: (a / jnp.sqrt(jnp.square(w)), jax.lax.rsqrt(jnp.square(w)))),
+}
+"""Each reuse's program, its quotient beside the reciprocal it reads: its divisor held away from zero by an
+epsilon (a normalization's `max(|w|, eps)`, a norm's `w^2 + eps`), and the same with no epsilon."""
+
+
+@pytest.mark.parametrize("name", list(REUSED))
+@pytest.mark.parametrize(("floored", "bounded", "admitted"), [(True, True, True), (False, True, False),
+                                                              (True, False, False)],
+                         ids=["held", "no floor", "no bound"])
+def test_a_quotient_reads_the_reciprocal_its_program_holds_only_where_its_divisor_is_held(name, floored,
+                                                                                       bounded, admitted):
+    """A quotient by a value whose reciprocal (or reciprocal root) the program holds is that reciprocal's
+    product (the reuse set) only where the reciprocal is a normal finite float and the product finite
+    (§6.3): its divisor held away from zero by an epsilon and bounded by its operand's declared range, the
+    dividend bounded too. With no epsilon, a subnormal divisor's reciprocal overflows where the quotient is
+    finite; with no bound, a large divisor's flushes to zero; neither is shared."""
+    from egglog import eq, i64
+
+    program_of = REUSED[name][0 if floored else 1]
+    closed = jax.make_jaxpr(program_of)(*rows(1, (64, 32), (64, 32)))
+    region = terms.region(closed, {0: 4.0, 1: 4.0} if bounded else {0: 4.0})
+    graph, _, (quotient, reciprocal) = program.graphed(region)
+    program.saturate(graph, region, (algebra.rules.RULES["reuse"],), algebra.SATURATION)
+    product = terms.Term.leaf(i64(0)).binary("mul", reciprocal, i64(region.stock["mul"]))
+    assert graph.check_bool(eq(quotient).to(product)) == admitted
+
+
 @pytest.mark.parametrize("fn", [
     lambda x, y, s: jnp.max(jnp.tanh(x) * 0.5, axis=1),
     lambda x, y, s: jnp.min(0.5 * jnp.tanh(x), axis=1),
@@ -631,7 +664,8 @@ def test_a_pass_without_a_rule_set_leaves_its_rewrites_untaken():
     """A pass that leaves sets out (`algebra.program.passes`' `without`, a rule set's receipt's arm) admits
     them nowhere and takes none of their rewrites: the sums the `linear` set joins (as the test above
     records) are rewritten without it by `joined`, the other set that joins them, and by no `linear` match,
-    and without both by none at all, their program computing what the program with no pass computes. A
+    and without every set that changes a program (both, and `reuse`) by none at all, their program
+    computing what the program with no pass computes. A
     derivation's own set an arm may name (`carry`'s) is taken; a dev-time set, a derivation's defining set
     and a name no set registers are refused, as an arm without them would measure nothing."""
     from dew.algebra.program import passes
@@ -644,7 +678,7 @@ def test_a_pass_without_a_rule_set_leaves_its_rewrites_untaken():
         options.program(joined).compiled(x, y, a)
         [made] = report.rewrites()
     assert "linear" not in made.admitted and "linear" not in made.fired and made.fired.get("joined", 0) > 0
-    with report.refusals(), passes(without=("linear", "joined")):
+    with report.refusals(), passes(without=("linear", "joined", "reuse")):
         computed = options.program(joined).compiled(x, y, a)(x, y, a)
         assert not report.rewrites()
     with passes(on=False):
