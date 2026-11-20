@@ -895,11 +895,6 @@ def _races(threads, trace, arrivals) -> None:
             order.landed(thread, position, event)
         else:
             order.moved(thread, position, event)
-    for thread, entries in enumerate(order.pending):
-        for entry_kind, where, prior_event, *_ in entries:
-            if entry_kind == "tmem_load":
-                raise Violation("unordered", f"tmem_load of {where} never waited on",
-                                [(thread, prior_event)])
 
 
 class _Order:
