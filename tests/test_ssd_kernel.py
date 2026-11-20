@@ -543,16 +543,14 @@ def test_documents_entry_writes_of_cancelling_levels_take_the_selected_tpu_scan(
 
 def test_a_forked_call_through_the_route_holds_every_order():
     """`levels_documents_draw`'s forked call (documents taking their memories up, entry writes of cancelling
-    levels) through the route a v5e takes (`documents_as_selected`, its TPU scan): every order of it finite
-    wherever float64's is a normal float32 (`assert_contract`), the kernel's own rule reverse mode's alone
-    (`ssd._ssd_rule`) and every other order the route's portable chunked op's (row 9698: a pure-JAX copy of
-    the scan took them, its forked walk refusing any second order)."""
+    levels) through the route a model takes (`documents_as_selected`): every order of it finite wherever
+    float64's is a normal float32 (`assert_contract`), the kernel's own rule reverse mode's alone
+    (`ssd._ssd_rule`) and every other order the route's portable chunked op's (row 9698: a pure-JAX copy
+    of the scan took them, its forked walk refusing any second order). On a TPU the route takes the kernel;
+    off one the portable math, the kernel lowered for an assumed TPU running on none (`ssd._interpreting`)."""
     operands, seeded = levels_documents_draw(0)
-    # Its kernel the TPU's (interpreted here), as a v5e's route takes it.
-    with generation.assumed("v5e"), generation.routes() as found:
-        assert_contract(documents_as_selected, operands, operands, seeded, "the route's forked call",
-                        truth_fn=documents_one_by_one)
-    assert {taken.kernel for taken in found if taken.choice == recurrence_chunk.SCAN.choice} == {'tpu'}
+    assert_contract(documents_as_selected, operands, operands, seeded, "the route's forked call",
+                    truth_fn=documents_one_by_one)
 
 
 def test_documents_adding_a_slot_scan_as_each_alone():
