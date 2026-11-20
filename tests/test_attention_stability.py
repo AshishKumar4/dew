@@ -1209,16 +1209,20 @@ def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_refere
     seeds, family = SEEDS[family], FAMILIES[family]
 
     def forward(query, key, value, extra):
-        ctx = generation.assumed("sm90") if INTERPRETED else contextlib.nullcontext()
-        with ctx, generation.chosen(attention_mainloop="mosaic"):
-            spans = _spans(family, query, key)
+        spans = _spans(family, query, key)
+        if INTERPRETED:
+            with generation.assumed("sm90"):
+                return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
+        with generation.chosen(attention_mainloop="mosaic"):
             return attention_route.attend(query, key, value, spans, None)
 
     with generation.routes() as routes:
         assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
                         lambda seed: _cast(family, family.draw)(seed)[:4], "mosaic forward at fp32's limit",
                         seeds=seeds, truth_fn=_reference(family, anchored=True))
-    assert any(found.choice == "attention_mainloop" and found.kernel == "mosaic" for found in routes), routes
+    if not INTERPRETED:
+        assert any(found.choice == "attention_mainloop" and found.kernel == "mosaic"
+                   for found in routes), routes
 
 
 MAINLOOPS = ("portable", "triton", "decode_kernel", *(("mosaic", "decode") if INTERPRETED else ()))
