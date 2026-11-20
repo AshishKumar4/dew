@@ -25,6 +25,7 @@ from dew.nn.float_bits import (
     lowered_rounded,
     raised_exactly,
     raw_fields,
+    widened_exactly,
 )
 from dew.nn.kernels import generation
 from dew.nn.local_attention import local_attention
@@ -40,6 +41,7 @@ from dew.nn.precision import (
     compensated_add,
     compensated_difference,
     exact_products,
+    float64_sum,
     fp32_result_dot_general,
     two_product,
     two_sum,
@@ -1228,6 +1230,116 @@ def test_an_aligned_sum_of_fp32_terms_under_x64_keeps_fp32():
         found = aligned_sum([(jnp.ones((3,), jnp.float32),)], axis=0)
     assert found.dtype == jnp.float32
     np.testing.assert_array_equal(np.asarray(found), [3.0])
+
+
+def test_an_aligned_sum_of_mixed_factors_reads_a_subnormal_from_its_bits():
+    """`aligned_sum` of an fp32 subnormal times an fp64 factor, with x64 on: `2^-149 2^149` is fp64's 1 and
+    `-(0x007fffff) 2^-149 2^149` its `-(2^23 - 1)`, each factor widened from its bits, where cast to fp64
+    first XLA:CPU flushed the subnormal and the sum was 0 (row 8966)."""
+    with jax.enable_x64(new_val=True):
+        subnormal = jnp.asarray(np.asarray([1, 0x807FFFFF], np.uint32).view(np.float32))
+        found = aligned_sum([(subnormal, jnp.full((2,), 2.0 ** 149, jnp.float64))])
+    assert found.dtype == jnp.float64
+    np.testing.assert_array_equal(np.asarray(found), [1.0, -(2.0 ** 23 - 1)])
+
+
+def test_an_aligned_sum_of_mixed_factors_differentiates_each_factor():
+    """`aligned_sum([(a, b)])` of an fp32 `a` and an fp64 `b`, with x64 on: its tangent and gradient in `a`
+    at `a = 0` and at the subnormal `2^-149` are `b`, 2, each factor's own type's, where its exact widening
+    read `a`'s bits outside the declared rule and its tangent was 0 (base review ed11c8e4e F1)."""
+    with jax.enable_x64(new_val=True):
+        a = jnp.asarray([0.0, 2.0 ** -149], jnp.float32)
+        b = jnp.full((2,), 2.0, jnp.float64)
+        _, tangent = jax.jvp(lambda a: aligned_sum([(a, b)]), (a,), (jnp.ones_like(a),))
+        gradient = jax.grad(lambda a: jnp.sum(aligned_sum([(a, b)])))(a)
+    assert tangent.dtype == jnp.float64 and gradient.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(tangent), [2.0, 2.0])
+    np.testing.assert_array_equal(np.asarray(gradient), [2.0, 2.0])
+
+
+def test_an_aligned_sums_tangent_keeps_its_float64_sum_where_no_direction_moves_its_float64_term():
+    """The tangent of `aligned_sum([(a, 2^70), (1,)])` of fp32 `a` and `2^70` and a float64 `1`, with x64
+    on, at `a = 0` in the direction `2^70`: float64's `2^140`, the sum's type, where the float64 term no
+    direction moves was dropped from the tangent's terms and they were summed in fp32, infinite (base review
+    a8a1fdea7 F1)."""
+    with jax.enable_x64(new_val=True):
+        big = jnp.float32(2.0 ** 70)
+        value, tangent = jax.jvp(lambda a: aligned_sum([(a, big), (jnp.float64(1.0),)]),
+                                 (jnp.float32(0.0),), (big,))
+    assert value.dtype == tangent.dtype == jnp.float64
+    assert float(tangent) == 2.0 ** 140 and float(value) == 1.0
+
+
+def test_an_aligned_sum_of_a_weak_float64_factor_keeps_float32():
+    """`aligned_sum` of one weakly typed float64 factor (`jnp.asarray(1.0)` with x64 on) is float32's 1, the
+    factor narrowed as promotion narrows it, where its exact widening read float64's bits as float32's and
+    shifted by a negative count (base review ed11c8e4e F2)."""
+    with jax.enable_x64(new_val=True):
+        found = aligned_sum([(jnp.asarray(1.0),)])
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), 1.0)
+
+
+def test_a_float64_sum_widens_its_subnormal_operands_exactly():
+    """`float64_sum`, Dew's wide CPU arithmetic's sum, of fp32 operands below the least normal: `2^-149 2^127`
+    and `(2^-126 - 2^-149) 2^127` taken in float64 and rounded once to fp32, `2^-22` and `2 - 2^-22`, where
+    widened by a cast XLA:CPU flushed them and each product was 0 (row 8966)."""
+    lhs = jnp.asarray(np.asarray([[1], [0x7FFFFF]], np.uint32).view(np.float32))
+    found = float64_sum(jnp.matmul, lhs, jnp.asarray([[2.0 ** 127]], jnp.float32), dtype=jnp.float32)
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), np.float32([[2.0 ** -22], [2.0 - 2.0 ** -22]]))
+
+
+@pytest.mark.parametrize(("source", "target"), [
+    (np.float32, np.float64), (jnp.bfloat16, np.float32), (np.float16, np.float32), (np.float16, np.float64),
+    (jnp.float8_e4m3fn, np.float32), (jnp.float8_e4m3fnuz, np.float32), (np.float32, np.float32)],
+    ids=["fp32-float64", "bf16-fp32", "fp16-fp32", "fp16-float64", "e4m3-fp32", "e4m3fnuz-fp32", "fp32-fp32"])
+def test_a_float_widens_exactly_from_its_bits(source, target):
+    """`widened_exactly` of a format's edge values of both signs (its subnormals of every leading bit's place
+    among them) into a format at least as wide, compiled: NumPy's exact conversion bit for bit, a negative
+    zero's sign kept, where XLA:CPU's cast flushes a subnormal (row 8966); an 8-bit float's as its
+    conversion gives it, E4M3FNUZ's 0x80 a NaN, not -0 (base review ed11c8e4e F4)."""
+    with jax.enable_x64(new_val=target == np.float64):
+        values = edge_values(source)
+        found = np.asarray(jax.jit(lambda x: widened_exactly(x, target))(jnp.asarray(values)))
+    assert found.dtype == target
+    expected = values.astype(target)
+    word = f"uint{np.finfo(target).bits}"
+    np.testing.assert_array_equal(np.isnan(found), np.isnan(expected))
+    held = ~np.isnan(expected)
+    np.testing.assert_array_equal(found[held].view(word), expected[held].view(word))
+
+
+@pytest.mark.parametrize("source", [jnp.float4_e2m1fn, jnp.float8_e4m3fnuz, jnp.float8_e5m2fnuz])
+def test_a_narrow_float_widens_as_it_converts(source):
+    """`widened_exactly` of every code of a narrow float into float32, compiled: its conversion, exact, where
+    its bits were read as an IEEE format's: a sub-byte float's (FP4) asked for an unsigned integer of its
+    width (base review ed11c8e4e F3), and E4M3FNUZ's and E5M2FNUZ's 0x80 widened to -0, not their NaN (F4).
+    FP6's conversion XLA:CPU compiles none of (an invalid i6 bitcast), so its codes are no cell here."""
+    values = np.arange(1 << jnp.finfo(source).bits, dtype=np.uint8).view(source)
+    found = np.asarray(jax.jit(lambda x: widened_exactly(x, np.float32))(jnp.asarray(values)))
+    expected = values.astype(np.float32)
+    np.testing.assert_array_equal(np.isnan(found), np.isnan(expected))
+    np.testing.assert_array_equal(found[~np.isnan(expected)], expected[~np.isnan(expected)])
+
+
+def test_an_aligned_sums_shared_float32_factor_takes_its_gradient_summed_wide():
+    """The gradient of `sum(aligned_sum([(a, b)], axis=0))` in a float32 `a` shared against a float64 `b`
+    of `2^140` and `-2^140`, with x64 on: 0, the cotangents summed in float64 and cast once, where each was
+    cast to float32 first, infinite, and their sum NaN (base review 279405f7f F1)."""
+    with jax.enable_x64(new_val=True):
+        b = jnp.asarray([2.0 ** 140, -(2.0 ** 140)], jnp.float64)
+        gradient = jax.grad(lambda a: jnp.sum(aligned_sum([(a, b)], axis=0)))(jnp.float32(1.0))
+    assert gradient.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(gradient), 0.0)
+
+
+def test_a_host_scalar_widens_at_its_destination():
+    """`widened_exactly` of a Python integer past int32 (`2^40`) to float32 with x64 off is float32's
+    `2^40`, converted at its destination, where staging it as int32 first raised (base review 279405f7f
+    F2)."""
+    found = widened_exactly(2 ** 40, jnp.float32)
+    assert found.dtype == jnp.float32 and float(found) == 2.0 ** 40
 
 
 def test_an_aligned_sum_of_three_factors_over_a_long_axis_is_its_exact_sum():

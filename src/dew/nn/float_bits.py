@@ -1,10 +1,13 @@
 """A float's bits, read and set: its raw fields (`raw_fields`), its sign, exponent and significand
 (`float_bits`, `binade_of`), a power of two set in its exponent bits (`exact_power2`), fp32 scaled by a power
-of two from its bits (`raised_exactly`, `lowered_rounded`), so a process whose float multiply flushes a
-subnormal (XLA's CPU) still reads and scales one. Integer arithmetic on a float's bits alone, which
-`dew.nn.precision`'s arithmetic (`power2`, `aligned_sum`) and the kernel templates read."""
+of two from its bits (`raised_exactly`, `lowered_rounded`) and a float widened exactly (`widened_exactly`),
+so a process whose float multiply or conversion flushes a subnormal (XLA's CPU) still reads, scales and
+widens one. Integer arithmetic on a float's bits alone, which `dew.nn.precision`'s arithmetic (`power2`,
+`aligned_sum`, `float64_sum`) and the kernel templates read."""
 
 from __future__ import annotations
+
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -69,7 +72,8 @@ def float_bits(x: jax.Array) -> tuple[jax.Array, ...]:
     normal one's (a subnormal's leading bit moved up to the implicit bit's place and dropped) and its binary
     exponent `floor(log2 |x|)`, a subnormal's below the least normal: `(sign, biased, fraction, normalized,
     exponent)`. Read from its bits, a subnormal is kept where a process's float multiply flushes a subnormal
-    operand (XLA's CPU, row 4023): the one reading `binade_of`, `raised_exactly` and `aligned_sum` take."""
+    operand (XLA's CPU, row 4023): the one reading `binade_of`, `raised_exactly`, `widened_exactly` and
+    `aligned_sum` take."""
     limits = jnp.finfo(x.dtype)
     signed = jnp.dtype(f"int{limits.bits}")
     bias, width = limits.maxexp - 1, limits.nmant
@@ -127,3 +131,59 @@ def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     lowered = jnp.where((target >= 1) & (biased > 0), normal, subnormal)
     rounded = jax.lax.bitcast_convert_type(lowered, jnp.float32)
     return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
+
+
+WIDENED = frozenset(map(jnp.dtype, (jnp.float16, jnp.bfloat16, jnp.float32)))
+"""The formats `widened_exactly` widens from their bits: IEEE's binary ones a hardware conversion reads as a
+float, flushing a subnormal where its process does (XLA:CPU's float32 to float64). An 8-bit or narrower
+float converts by integer arithmetic, a fraction's bits moved, exactly as it is."""
+
+
+def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
+    """`x` in `dtype`, exactly, where `dtype` is the wider of IEEE's binary formats (float32, float64): a
+    subnormal `x` of a `WIDENED` format set in `dtype`'s bits from its own (`float_bits`' reading of it, its
+    normal exponent where `dtype` holds one, else its fraction on `dtype`'s subnormal grid), a normal one
+    converted, so a process whose conversion flushes a subnormal operand (XLA's CPU, row 4023: float32's
+    `2^-149` widened to zero, row 8966) widens it. Its derivative is declared, the plain conversion of its
+    direction, linear, so a product's linear map that widens its operands transposes as the cast's would.
+    Any other `x` (a Python or NumPy scalar, an integer, a narrower format's, a conversion that narrows)
+    converted as `jnp.asarray` converts it, a host scalar at `dtype` directly."""
+    if not isinstance(x, jax.Array | np.ndarray):
+        return jnp.asarray(x, dtype)
+    dtype = jax.dtypes.canonicalize_dtype(dtype)
+    if (jnp.dtype(x.dtype) not in WIDENED or dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.float64))
+            or jnp.finfo(dtype).bits <= jnp.finfo(x.dtype).bits):
+        return jnp.asarray(x, dtype)
+    return _declared_widening()(jnp.asarray(x), dtype)
+
+
+def _widened_bits(x: jax.Array, dtype: jnp.dtype) -> jax.Array:
+    """`widened_exactly`'s value: a subnormal `x` placed in `dtype` from `float_bits`' reading, a normal one
+    converted."""
+    source, target = jnp.finfo(x.dtype), jnp.finfo(dtype)
+    word = jnp.dtype(f"uint{target.bits}")
+    sign, biased, fraction, normalized, exponent = float_bits(x)
+    normal = (((exponent + (1 << (target.nexp - 1)) - 1).astype(word) << word.type(target.nmant))
+              | (normalized.astype(word) << word.type(target.nmant - source.nmant)))
+    least = int(source.minexp) - int(source.nmant)
+    tiny = fraction.astype(word) << word.type(least - (int(target.minexp) - int(target.nmant)))
+    held = jnp.where(fraction == 0, word.type(0), jnp.where(exponent >= target.minexp, normal, tiny))
+    signed = (sign != 0).astype(word) << word.type(target.bits - 1)
+    subnormal = jax.lax.bitcast_convert_type(signed | held, dtype)
+    return jnp.where(biased == 0, subnormal, x.astype(dtype))
+
+
+def _widened_tangent(dtype: jnp.dtype, primals, tangents) -> tuple[jax.Array, jax.Array]:
+    """`widened_exactly`'s value and tangent: the direction converted, as the cast's derivative is."""
+    (x,), (direction,) = primals, tangents
+    return _declared_widening()(x, dtype), direction.astype(dtype)
+
+
+@functools.cache
+def _declared_widening():
+    """`_widened_bits` with its linear tangent declared (`dew.nn.derivatives.declared_tangent`), a span its
+    numerics need as written (`Protected`), made once a process."""
+    from dew.nn.derivatives import Protected, contracted, declared_tangent
+
+    return contracted("test_an_exact_widening_holds_every_order")(
+        declared_tangent(Protected(), _widened_bits, _widened_tangent, nondiff_argnums=(1,)))

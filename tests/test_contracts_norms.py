@@ -80,6 +80,24 @@ def test_an_aligned_sum_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_an_exact_widening_holds_every_order(edge):
+    """`float_bits.widened_exactly` of bfloat16 to float32 (a subnormal set in float32's bits, its tangent
+    declared the plain cast's, row 8966): every order finite wherever float64 is a normal float32 and the
+    plain cast's is."""
+    from dew.nn.float_bits import widened_exactly
+
+    (x,) = normal_draw(8966, (4, 7), scale=EDGES[edge], dtype=jnp.bfloat16)
+    (direction,) = normal_draw(8967, x.shape, scale=EDGES[edge], dtype=jnp.bfloat16)
+    (cotangent,) = normal_draw(8968, x.shape)
+
+    def plain(x):
+        return x.astype(jnp.float32)
+
+    assert_contract(lambda x: widened_exactly(x, jnp.float32), (x,), (direction,), cotangent,
+                    f"an exact widening {edge}", truth_fn=plain, plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_softplus_holds_every_order(edge):
     """`precision.softplus` (its log1p by its own series, its derivative the logistic, row 7062): every
     order finite wherever float64 is a normal float32 and the plain formula, log(1 + exp(x)) as JAX writes

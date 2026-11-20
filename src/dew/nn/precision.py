@@ -55,7 +55,14 @@ from dew.nn.derivatives import (
     with_gradients_formed_at,
     with_tangents_formed,
 )
-from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, raw_fields, two_factor_reach
+from dew.nn.float_bits import (
+    exact_power2,
+    float_bits,
+    lowered_rounded,
+    raw_fields,
+    two_factor_reach,
+    widened_exactly,
+)
 from dew.nn.nested import nested
 from dew.nn.programs import UNROUNDED, equations
 from dew.nn.sharding import explicit_spec
@@ -759,10 +766,11 @@ def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike, 
 
 def _widened(operands, counts: int = 0) -> list[jax.Array]:
     """`operands` as the float64 operands of their float32 product: each converted to the dtype they
-    multiply in (`products_dtype`), as the product converts them, then widened exactly."""
+    multiply in (`products_dtype`), as the product converts them, then widened exactly, a subnormal from its
+    bits where XLA:CPU's cast flushes it (`widened_exactly`, its derivative the cast's; row 8966)."""
     multiplied = operands[:len(operands) - counts]
     dtype = products_dtype(*multiplied)
-    widened = [operand.astype(dtype).astype(jnp.float64) for operand in multiplied]
+    widened = [widened_exactly(operand.astype(dtype), jnp.float64) for operand in multiplied]
     return widened + list(operands[len(multiplied):])
 
 
@@ -1703,7 +1711,8 @@ def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Arr
         for factor in term:
             if id(factor) not in places:
                 places[id(factor)] = len(factors)
-                factors.append(jnp.asarray(factor, dtype))
+                # Its tangent the cast's, a subnormal kept where XLA:CPU's cast flushes it (row 8966).
+                factors.append(widened_exactly(factor, dtype))
             indices.append(places[id(factor)])
         shape.append(tuple(indices))
     from dew.nn.kernels.launches import interpreting
