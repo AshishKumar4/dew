@@ -314,16 +314,17 @@ def check_pipeline(directory, parts: tuple[str, ...] = PARTS, streamed: bool = F
     reference = dict(np.load(directory / "reference.npz"))
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
     key = jax.random.PRNGKey(17)
-    loaded = {}
+    source = None
     if "walk" in parts:
-        loaded[False] = bundle(directory)
-        qualified(directory.name, loaded[False], reference, meta, key)
+        source = bundle(directory)
+        qualified(directory.name, source, reference, meta, key)
         if streamed:
-            loaded[True] = streamed_parity(directory, loaded[False], reference, meta, key)
+            # The streamed load, the update's: the whole one released here, one pipeline held at a time.
+            source = streamed_parity(directory, source, reference, meta, key)
         print(json.dumps({"directory": str(directory), "walk": "held"}))
     if "update" not in parts:
         return
-    source = loaded[streamed] if streamed in loaded else bundle(directory, streamed=streamed)
+    source = source if source is not None else bundle(directory, streamed=streamed)
     given, null, process, times = selection(source, meta)
     prepared = public_start(source.text_to_image(), source, reference, meta, key, given, null, process, times)
     given, _ = walked(prepared, given, null)
