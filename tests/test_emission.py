@@ -11,7 +11,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from kernel_compile import lowered_for
 
 from dew.nn import derivatives, programs
-from dew.nn.kernels.templates import emission
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import cost, emission
 from dew.nn.kernels.templates.cost import Stated, Work
 
 _STEP = derivatives.marked(derivatives.WalkStep(), lambda index: index)
@@ -460,3 +461,25 @@ def test_an_async_smem_to_tmem_copy_charges_shared_bytes_from_its_source_without
     assert full_work.shared_bytes == 128 * 256 * 2 and full_work.device_bytes == 0
     assert sliced_work.shared_bytes == 128 * 64 * 2 and sliced_work.device_bytes == 0
     assert packed_work.shared_bytes == 128 * 64 // 2 and packed_work.device_bytes == 0
+
+
+
+def test_a_walks_serial_loops_compose_their_paths_before_their_mean():
+    """A walk's loops (its opening, steady and closing segments) run one after another through one ring: a
+    step's path is their paths followed one by the other, then their mean, so two segments of one barrier
+    round trip each take one a step (80.1 ns on a GH200), not half of one (base review 1e0a501f0 F2)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    segment = cost.Work(chains=(cost.Chain(barriers=1),))
+    role = emission.Role(cost.Work(), (segment, segment))
+    assert role.step(lambda work: cost.chained(work, target)) == target.barrier_seconds
+
+
+def test_a_launch_carries_each_warpgroups_paths_its_steps_times():
+    """A launch's paths (`Emitted.paths`) are each warpgroup's work outside its walks followed by its walk's
+    step its steps' times, the warpgroups side by side: a program waiting on four barriers outside its walk
+    keeps them (base review 1e0a501f0 F3)."""
+    waits = cost.Chain(barriers=4)
+    stepping = cost.Chain(products=1, columns=128)
+    roles = (emission.Role(cost.Work(chains=(waits,)), (cost.Work(chains=(stepping,)),)),)
+    assert emission.Emitted(roles).paths(8) == (cost.Chain(products=8, columns=1024, barriers=4),)
+

@@ -1207,6 +1207,19 @@ def test_work_side_by_side_keeps_every_chain_another_does_not_outlast():
     assert (kernel_cost.Work(flops=1.0) + kernel_cost.Work(chains=(more,))).chains == (more,)
 
 
+def test_the_exact_extractor_reads_a_walks_longest_path_as_the_greedy_price_does():
+    """The algebra's walk schedule's peak (`Walk.spanned`, what the exact extractor reads) is the longest
+    dependent path the greedy price takes (`templates.cost.walked`): on a GH200 a form of one reduction and
+    four barrier round trips (463 ns) costs more than one of two reductions (285 ns), where its span alone
+    read 143 ns (base review 1e0a501f0 F1)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    schedule = cost.walk(target)
+    waits = kernel_cost.Work(chains=(kernel_cost.Chain(span=1, barriers=4),))
+    reductions = kernel_cost.Work(span=2)
+    assert schedule.spanned(waits) == kernel_cost.walked(waits, target)
+    assert schedule.spanned(waits) > schedule.spanned(reductions)
+
+
 def test_a_protected_span_is_kept_as_traced_however_often_the_pass_runs():
     """A protected span (`dew.nn.derivatives.Protected`: an error-free transform's) is a boundary no region
     crosses and whose inside no rule touches (docs/design/algebra.md §1.2): two sums the pass rewrites
