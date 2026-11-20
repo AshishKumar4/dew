@@ -395,15 +395,22 @@ def test_the_forward_on_tcgen05s_rows_keeps_a_subnormal_output_interpreted():
         scaled = (signs * mags * jnp.float32(2.0 ** -120)).astype(jnp.bfloat16)
         value = jnp.zeros_like(query).at[:, :1].set(scaled)
         return query, query, value
+    from dew.nn.precision import power2
 
     def ours(query, key, value):
         with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
             return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
 
-    def reference(query, key, value):
+    def exact_ref(query, key, value):
+        del key
+        return jnp.broadcast_to(power2(value[:, :1].astype(jnp.float32), -7).astype(jnp.bfloat16),
+                                query.shape)
+
+    def truth(query, key, value):
         return template.reference(query, key, value, spans)
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "tcgen05.rows subnormal output", seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(exact_ref), draw, "tcgen05.rows subnormal output", seeds=SEEDS,
+                    truth_fn=truth)
 
 
 @INTERPRETS
