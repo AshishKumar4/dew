@@ -272,9 +272,21 @@ def _logical(aval, tree, leaves: Sequence) -> tuple[int, ...]:
 
 
 def _product(equation) -> Work:
-    """A tensor-core product's work, `2 m n k` in its operands' mode: its accumulator `[m, n]` and its left
-    operand `[m, k]` as their transforms read them (the trailing `*_transforms_tree` leaves of its
-    operands)."""
+    """A tensor-core product's work, `2 m n k` in its operands' mode (`_shape`)."""
+    m, n, k = _shape(equation)
+    return _tensor(equation.invars[1].aval.dtype, 2 * m * n * k)
+
+
+def _columns(equation) -> float:
+    """A product's columns as a waited one's latency counts them (`cost.Chain.columns`): its `n` columns, each
+    a step of 128 bytes of its depth (a 16-bit operand 64 deep)."""
+    _, n, k = _shape(equation)
+    return n * k * jnp.dtype(equation.invars[1].aval.dtype).itemsize / 128
+
+
+def _shape(equation) -> tuple[int, int, int]:
+    """A tensor-core product's `m, n, k`: its accumulator `[m, n]` and its left operand `[m, k]` as their
+    transforms read them (the trailing `*_transforms_tree` leaves of its operands)."""
     avals = [variable.aval for variable in equation.invars]
     names = sorted(name for name in equation.params if name.endswith("_transforms_tree"))
     trees = {name: equation.params[name] for name in names}
@@ -289,7 +301,7 @@ def _product(equation) -> Work:
         split[name], at = leaves[at:at + count], at + count
     m, n = _logical(avals[0], trees.get("acc_transforms_tree"), split.get("acc_transforms_tree", ()))[-2:]
     k = _logical(avals[1], trees.get("a_transforms_tree"), split.get("a_transforms_tree", ()))[-1]
-    return _tensor(avals[1].dtype, 2 * m * n * k)
+    return m, n, k
 
 
 def _copied(equation) -> int:
@@ -381,12 +393,44 @@ class _Counting:
         self.fixed = Work()
         self.walks: list[Work] = []
         self.loops = [_Loop() for _ in range(loops)]
+        # The products it issued and has not waited on (each one's columns, `_columns`), and what lands on
+        # each barrier it will wait on: products committed to it, copies arriving on it (`waited`).
+        self.issued: list[float] = []
+        self.landing: dict[jax_core.Var, Chain] = {}
 
     def add(self, work: Work) -> None:
+        # The warpgroup's work in its order: its paths followed one by the next (`_then`).
         if self.loops:
-            self.loops[-1].work = self.loops[-1].work + work
+            self.loops[-1].work = _then(self.loops[-1].work, work)
         else:
-            self.fixed = self.fixed + work
+            self.fixed = _then(self.fixed, work)
+
+    def waited(self, equation) -> None:
+        """A wait the warpgroup's path runs through: products drained (`wgmma_wait`, the oldest past the `n`
+        it lets fly), a barrier's phase (its committed products, its copies, else another warpgroup's
+        arrival, a round trip); what lands on a barrier recorded as it is committed or copied to it. A
+        product waited a trip after it issued (a pipelined walk's) waits no path here: its trip's work hid
+        it."""
+        primitive = equation.primitive
+        if primitive in _PRODUCTS:
+            self.issued.append(_columns(equation))
+        elif primitive is gpu.wgmma_wait_p:
+            drained = self.issued[:max(0, len(self.issued) - equation.params["n"])]
+            self.issued = self.issued[len(drained):]
+            if drained:
+                self.add(Work(chains=(Chain(products=len(drained), columns=sum(drained)),)))
+        elif primitive is gpu.tcgen05_commit_arrive_p:
+            barrier = equation.invars[0]
+            committed = Chain(products=len(self.issued), columns=sum(self.issued))
+            self.landing[barrier] = self.landing.get(barrier, Chain()).then(committed)
+            self.issued = []
+        elif primitive is gpu.copy_gmem_to_smem_p and equation.params.get("has_barrier"):
+            barrier = equation.invars[2]
+            copied = Chain(copies=1, copy_bytes=_copied(equation))
+            self.landing[barrier] = self.landing.get(barrier, Chain()).then(copied)
+        elif primitive is gpu.barrier_wait_p:
+            landed = self.landing.pop(equation.invars[0], None)
+            self.add(Work(chains=(landed if landed is not None else Chain(barriers=1),)))
 
     def run(self, jaxpr: jax_core.Jaxpr, values: list, constants: Sequence = ()) -> list:
         """Count `jaxpr` given its inputs' concrete `values` (None where unknown), and its constants'
@@ -411,6 +455,7 @@ class _Counting:
     def equation(self, equation, values: list) -> list:
         primitive, params = equation.primitive, equation.params
         unknown = [None] * len(equation.outvars)
+        self.waited(equation)
         if primitive is lax.axis_index_p:
             return [self.place(params["axis_name"])]
         if (primitive in programs.SCALAR_FOLDED and values
@@ -639,6 +684,12 @@ _REGIONS = {pallas.run_scoped_p: _Counting.scoped, lax.while_p: _Counting.loop, 
             mpmd.mpmd_map_p: _Counting.warps}
 """The regions a kernel's body counts within it, each by its method: its outputs' concrete values, or none
 where it leaves them unknown."""
+
+
+def _then(first: Work, then: Work) -> Work:
+    """`first`'s work followed by `then`'s on one warpgroup: their units' sum, their paths followed
+    (`cost.followed`)."""
+    return dataclasses.replace(first + then, chains=followed(first.chains, then.chains))
 
 
 def _mean(walks: Sequence[Work]) -> Work:
