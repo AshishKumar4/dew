@@ -42,6 +42,7 @@ from dew.nn.kernels.templates import (
     outputs,
     placed as placed_mod,
     product,
+    resources,
     rings,
     stores,
     swizzling,
