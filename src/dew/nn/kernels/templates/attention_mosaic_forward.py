@@ -41,6 +41,7 @@ from dew.nn.kernels.templates import (
     operands,
     outputs,
     product,
+    resources,
     rings,
     stores,
     swizzling,
@@ -88,6 +89,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     indexed_views,
     issued_into,
     issued_pairs,
+    launch_scope,
     modelled,
     param_types,
     query_swizzle,
@@ -486,6 +488,9 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                   for first, values, held in blocks]
     # In place, a block of the columns reads them where they lie and writes its own of the whole
     # output's (`_launch`'s `column_width`).
+    planned = (walk.products if (walk.products is not None and walk.family.places_on_role
+                                 and form.natural == spec.natural)
+               else (None,) * len(blocks))
     launched = [_launch(q, k, v if into is not None and first is not None else values, at_spans,
                         held._replace(output=()) if split else held,
                         spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
@@ -493,16 +498,13 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         counted=walk.counts and form.natural == spec.natural, finishes=rows, columns=first,
                         splits=splits, registered=walk.registered, in_key=walk.in_key,
                         decides=walk.decides, tmem_columns=walk.tmem_columns,
-                        products=(dict(walk.products).get(values.shape[-1])
-                                  if (walk.products is not None and walk.family.places_on_role
-                                      and form.natural == spec.natural)
-                                  else None),
+                        products=block_products,
                         table=paged, sources=sources,
                         out_dtype=jnp.float32 if split else out_dtype, walks=walks,
                         shared_by=len(blocks),
                         column_width=(values.shape[-1] if into is not None and first is not None
                                       else None), flags=stated and len(blocks) == 1, **in_place)
-                for first, values, held in blocks]
+                for (first, values, held), block_products in zip(blocks, planned, strict=True)]
     if into is not None:
         assert flags is not None, "an in-place rewalk is of live rows"
         return (), None, flags
@@ -536,23 +538,32 @@ def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, spli
     return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
 
 
+def column_slices(total: int, columns: int | None, *, whole: bool = True) -> list[tuple[int | None, int]]:
+    """The `(first, width)` partition of `total` value columns walked `columns` at a time (`value_columns`):
+    `[(None, total)]` where `whole` and one block covers all columns (row 9528)."""
+    width = value_columns(total, columns)
+    if whole and width >= total:
+        return [(None, total)]
+    return [(first, min(width, total - first)) for first in range(0, total, width)]
+
+
 def _column_blocks(value: jax.Array, hooked: _Hooked, columns: int | None, *, whole: bool = True
                    ) -> list[tuple[int | None, jax.Array, _Hooked]]:
-    """The blocks of `value`'s columns a launch walks `columns` at a time, each its first column, its slice
-    and `hooked` with the initial state's sums of its own columns (`_Hooked.initial`, its maximum and
-    denominator the rows'): where `whole`, the whole, first None, where a block holds every column
-    (`Tiles.columns` None)."""
-    width = value_columns(value.shape[-1], columns)
-    if whole and width >= value.shape[-1]:
+    """The blocks of `value`'s columns a launch walks `columns` at a time (`column_slices`), each its first
+    column, its slice and `hooked` with the initial state's sums of its own columns (`_Hooked.initial`, its
+    maximum and denominator the rows'): where `whole`, the whole, first None, where a block holds every
+    column (`Tiles.columns` None)."""
+    slices = column_slices(value.shape[-1], columns, whole=whole)
+    if len(slices) == 1 and slices[0][0] is None:
         return [(None, value, hooked)]
 
-    def held(first: int) -> _Hooked:
+    def held(first: int, width: int) -> _Hooked:
         initial = hooked.initial
         return hooked if initial is None else hooked._replace(
             initial=(*initial[:2], initial[2][..., first:first + width]))
 
-    return [(first, value[..., first:first + width], held(first))
-            for first in range(0, value.shape[-1], width)]
+    return [(first, value[..., first:first + width], held(first, width))
+            for first, width in slices if first is not None]
 
 
 def _unhooked(hooks: Hooks) -> Hooks:
@@ -2076,13 +2087,18 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
                        magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None)
+    reduces = forward_reduces(family, reduced)
     tmem = family.product_columns(products) if scopes_products(family) else 0
+    shared = (resources.shared_bytes(family, launch_scope(family, (scoped, rings, after), reduced,
+                                                          reduces=reduces, products=products,
+                                                          over_rings=True))
+              if family.budgets_registers else None)
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,
                          approx_math=spec.approximate, name=name, cost=cost, model_flops=model,
-                         registers=registers, tmem=tmem, reducing_warpgroups=reduced,
-                         reduces=forward_reduces(family, reduced))(query, key, value, *leaves)
+                         registers=registers, shared=shared, tmem=tmem, reducing_warpgroups=reduced,
+                         reduces=reduces)(query, key, value, *leaves)
 
 
 def _per_role(family: mosaic.Family, consumers: int, consumer: Callable) -> Callable:
