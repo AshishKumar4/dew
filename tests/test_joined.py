@@ -2,6 +2,9 @@
 layer's own projection calls, where a generation's kernel row measured it
 faster."""
 
+import contextlib
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,6 +16,8 @@ from dew.nn.dense import Dense
 from dew.nn.joined import joined_dense
 from dew.nn.kernels import generation
 from dew.nn.linear import GatedDeltaNet
+from dew.nn.mixer_base import MixerContext
+from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 
 
@@ -32,7 +37,7 @@ def dots(function, *args) -> int:
 JOINED_SEEDS = {"recipe gates": 8, ("gate_up", jnp.float32, False): 8, ("gate_up", jnp.float32, True): 8,
                 ("gate_up", jnp.bfloat16, False): 8, ("gate_up", jnp.bfloat16, True): 8,
                 ("delta_gates", jnp.float32): 8, ("delta_gates", jnp.bfloat16): 8, "promoted bias": 8,
-                "gate multiplier": 8}
+                "gate multiplier": 8, ("qkv", False): 8, ("qkv", True): 8}
 """Each joined row's declared draws against its projections apart (check 1), sized by `seeds_for` paired
 with the joined row on the CPU and an A100."""
 
@@ -56,7 +61,11 @@ def assert_joined_as_exact(choice: str, run, draw, wide_run, label: str, *, seed
         return arm
 
     def truth(*operands):
-        with row_joins(choice, joins=False):
+        # The float64 truth through XLA's products, which a float64 product runs on, whatever kernel the
+        # arms name (head review of b68fc2382: the template named around them refused it).
+        # Its routes its own (`routes`' `alone`): the arms' assertion reads theirs (base review 760be77fe F3).
+        with (row_joins(choice, joins=False), generation.chosen(grouped_matmul="xla"),
+              generation.routes(alone=True)):
             return wide_run(*operands)
 
     together, apart = (jax.tree.leaves(jax.jit(under(joins))(*draw(0))) for joins in (True, False))
@@ -331,3 +340,342 @@ def test_a_delta_nets_gates_joined_under_a_recipe_are_as_exact_as_apart_from_flo
     assert_joined_as_exact("delta_gates", under(with_gradients(layer.apply)), draw,
                            with_gradients(layer.clone(dtype=jnp.float64).apply),
                            f"the delta net's gates joined under {recipe}", seeds=JOINED_SEEDS["recipe gates"])
+
+
+def _attention(bias: bool, dtype=jnp.bfloat16) -> CausalSelfAttention:
+    """An attention layer of four query heads over two key heads, 64 wide: its query, key and value
+    projections of 256 features 256, 128 and 128 wide, their bias drawn where `bias`."""
+    return CausalSelfAttention(MixerContext(emb_features=256, num_heads=4, num_kv_heads=2, head_dim=64,
+                                            max_seq_len=64, attention_bias=bias, dtype=dtype))
+
+
+@pytest.mark.parametrize("bias", [False, True])
+def test_an_attention_layers_query_key_and_value_side_by_side_are_as_exact_as_apart_from_float64(bias):
+    """A bf16 attention layer whose query, key and value projections run side by side (`qkv` joined, the GEMM
+    template named and interpreted on an assumed H100, so a launch takes them: one product of unequal widths
+    beside, `joined.beside_dense`, its input gradient chained) computes its output and the gradients of its
+    input and every parameter within tests/reference_error.py's rule of the layer's with them apart, on par
+    from float64 over drawn inputs (check 1), its drawn biases each added to its own projection; the joined
+    arm binds the side-by-side launch (head review of b68fc2382: at this geometry, no template named, both
+    arms ran apart)."""
+    from dew.nn.kernels import tuning
+
+    layer = _attention(bias)
+    params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),
+                          layer.init(jax.random.key(4), jnp.zeros((2, 64, 256), jnp.bfloat16)))
+    with (generation.assumed("sm90", interpreted=True),
+          generation.chosen(attention="xla", grouped_matmul="mosaic"), tuning.seen() as launches):
+        wide = layer.clone(ctx=dataclasses.replace(layer.ctx, dtype=jnp.float64))
+        draw = drawing(params, (2, 64, 256), jnp.bfloat16)
+        assert_joined_as_exact("qkv", with_gradients(layer.apply), draw, with_gradients(wide.apply),
+                               "query, key and value side by side", seeds=JOINED_SEEDS["qkv", bias])
+    assert any(bound.arguments.get("beside") for _, bound in launches.taken), launches.taken
+
+
+def test_an_attention_layers_training_step_takes_its_input_gradient_chained():
+    """A bf16 attention layer's training step traced on an assumed H100 with the GEMM template named, the
+    `qkv` selector's own pick: its query, key and value run side by side (the route `joined`) and their input
+    gradient is one chained launch (`_chained_step`); with the projections named apart, none is. The chained
+    launch's numerics are tests/test_gemm_paired.py's (check 1), the side-by-side layer's the test above."""
+    layer, x, params, under = _watched_layer()
+    assert _qkv_routes(layer, params, x, *under())[:1] == ["joined"]
+    assert _chained_step(layer, params, x, *under())
+    assert not _chained_step(layer, params, x, *under(), generation.chosen(qkv="apart"))
+
+def _qkv_routes(layer, params, x, *contexts, apply=None) -> list:
+    """The `qkv` routes `layer`'s call over `x` (abstract) reports, traced under `contexts` (its `apply`
+    where given: a jitted one, or one asking collections)."""
+    with contextlib.ExitStack() as stack:
+        for context in contexts:
+            stack.enter_context(context)
+        routes = stack.enter_context(generation.routes())
+        jax.eval_shape(apply or layer.apply, params, x)
+    return [route.kernel for route in routes if route.choice == "qkv"]
+
+
+def _training_step(layer):
+    """`layer`'s training step: the gradients of its output's sum by its parameters and its input."""
+    def step(params, x):
+        return jax.grad(lambda params, x: jnp.sum(layer.apply(params, x).astype(jnp.float32)),
+                        argnums=(0, 1))(params, x)
+
+    return step
+
+
+def _chained_step(layer, params, x, *contexts) -> list:
+    """The launches a training step of `layer` over `x` (abstract: traced, run nowhere) binds under
+    `contexts` that take their input gradient's products as one chained call (`gemm._one_launch`)."""
+    from dew.nn.kernels import tuning
+
+    with contextlib.ExitStack() as stack:
+        for context in contexts:
+            stack.enter_context(context)
+        launches = stack.enter_context(tuning.seen())
+        jax.eval_shape(_training_step(layer), params, x)
+    return [bound for _, bound in launches.taken if bound.arguments.get("chained")]
+
+
+def _llama_8b() -> CausalSelfAttention:
+    """An attention layer at Llama-3.1-8B's projections: 4,096 features, 32 query heads over 8 key heads of
+    128, bf16, no query or key norm (Llama's)."""
+    return CausalSelfAttention(MixerContext(emb_features=4096, num_heads=32, num_kv_heads=8, head_dim=128,
+                                            max_seq_len=4096, qk_norm=False, dtype=jnp.bfloat16))
+
+
+def test_an_8b_layers_training_step_takes_its_input_gradient_as_one_chained_launch():
+    """An attention layer at Llama-3.1-8B's projections (4,096 features, 32 query heads over 8 key heads of
+    128) over 12,288 bf16 rows, its training step traced as an assumed H100 runs it, the selectors' own picks
+    (nothing named): its query, key and value run side by side (`qkv` `joined`), and the step binds their
+    input gradient as one chained launch, its products' cell its own (`Kind.together`, M-EM-73's receipt),
+    where the ordinary products' cells, XLA's on Hopper, kept them apart (head review of 4ddd0d7ea F1)."""
+    layer = _llama_8b()
+    x = jax.ShapeDtypeStruct((3, 4096, 4096), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+
+    def under():
+        return generation.assumed("sm90"), generation.chosen(attention="xla")
+    assert _qkv_routes(layer, params, x, *under())[:1] == ["joined"]
+    assert _chained_step(layer, params, x, *under())
+
+
+def test_projections_no_launch_takes_side_by_side_run_apart_where_the_template_is_named():
+    """On an assumed A100 with the GEMM template named, whose cp.async rings take no matrices side by side:
+    the attention layer's query, key and value run apart, each its own call, and the layer traces, where the
+    side-by-side call refused the named kernel (head review of 4ddd0d7ea F1)."""
+    layer = _attention(bias=False)
+    x = jax.ShapeDtypeStruct((2, 64, 256), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+    assert set(_qkv_routes(layer, params, x, generation.assumed("sm80"),
+                           generation.chosen(grouped_matmul="mosaic", attention="xla"))) == {"apart"}
+
+
+@pytest.mark.parametrize("axis", ["data", "fsdp"])
+def test_projections_side_by_side_on_a_mesh_splitting_their_rows_take_each_devices_rows(axis):
+    """An attention layer's training step on an abstract mesh of two H100s splitting its 4 x 64 rows
+    (`generation.gpu_mesh`), its parameters placed by a layout, the GEMM template named: its query, key and
+    value run side by side on each device's 128 rows (`shard_placement`), their input gradient one chained
+    launch over those rows, the kernels gathered whole there under fsdp (an all-gather in the step), where
+    the call over every device's rows refused the named kernel's placement (head review of 4ddd0d7ea F2,
+    b68fc2382: a concrete CUDA topology, and replicated parameters, checked no rows or collectives)."""
+    from jax.sharding import Mesh
+
+    from dew.distributed.placement import Layout
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.kernels import tuning
+    from dew.nn.sharding import placing
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:2]), (axis,)), "sm90")
+    layer = _attention(bias=False)
+    x = jax.ShapeDtypeStruct((4, 64, 256), jnp.bfloat16)
+    params = nn.unbox(jax.eval_shape(layer.init, jax.random.key(0), x))
+    contexts = (jax.sharding.use_abstract_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES),
+                placing(Layout(min_shard=1)), generation.assumed("sm90"),
+                generation.chosen(grouped_matmul="mosaic", attention="xla"))
+    with contextlib.ExitStack() as stack:
+        for context in contexts:
+            stack.enter_context(context)
+        launches = stack.enter_context(tuning.seen())
+        routes = stack.enter_context(generation.routes())
+        graph = jax.make_jaxpr(_training_step(layer))(params, x)
+    assert [route.kernel for route in routes if route.choice == "qkv"][:1] == ["joined"]
+    chained = [bound for _, bound in launches.taken if bound.arguments.get("chained")]
+    assert chained and {bound.arguments["tokens"].shape[0] for bound in chained} == {2 * 64}, chained
+    gathered = any(equation.primitive.name == "all_gather" for equation in equations(graph))
+    assert gathered == (axis == "fsdp"), axis
+
+
+def test_projections_whose_kernels_vary_over_a_shard_map_run_apart():
+    """Llama-3.1-8B's attention layer (`_llama_8b`) over 12,288 bf16 rows applied inside a checked shard_map
+    over two devices, its rows replicated, on an assumed H100, nothing named but the attention kernel: with
+    its parameters whole its query, key and value run side by side (the receipt's geometry); with them
+    varying over the axis (`jax.lax.pcast`) a launch sees its kernels not whole, as `gemm`'s forward and
+    input gradient read them, so they run apart, where the rows alone seen whole admitted them side by side
+    and no compound launch ran (head review of b68fc2382)."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    mesh = Mesh(np.array(jax.devices()[:2]), ("data",))
+    layer = _llama_8b()
+    x = jax.ShapeDtypeStruct((3, 4096, 4096), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+    for varying, kernel in ((False, "joined"), (True, "apart")):
+        def applied(params, x, varying=varying):
+            return layer.apply(jax.lax.pcast(params, ("data",), to="varying") if varying else params, x)
+
+        mapped = jax.shard_map(applied, mesh=mesh, in_specs=(PartitionSpec(), PartitionSpec()),
+                               out_specs=PartitionSpec("data") if varying else PartitionSpec())
+        under = (generation.assumed("sm90"), generation.chosen(attention="xla"))
+        assert _qkv_routes(layer, params, x, *under, apply=mapped)[:1] == [kernel], varying
+
+
+def test_projections_that_cast_their_input_run_apart():
+    """An fp16 attention layer applied to fp32 rows on an assumed H100, the GEMM template named: each
+    projection's call casts the rows to fp16, its input cotangent widened back to fp32 before the three sum,
+    which one product's fp16 sum would not keep (base review b68fc2382 F1: 40,000 and 30,000 summed to
+    fp16's infinity, 70,000 apart), so they run apart; fp16 rows join."""
+    layer = _attention(bias=False, dtype=jnp.float16)
+    for rows, kernel in ((jnp.float32, "apart"), (jnp.float16, "joined")):
+        x = jax.ShapeDtypeStruct((2, 64, 256), rows)
+        params = jax.eval_shape(layer.init, jax.random.key(0), x)
+        under = (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", attention="xla"))
+        assert _qkv_routes(layer, params, x, *under)[:1] == [kernel], rows
+
+
+def test_a_flax_interceptor_of_a_projection_keeps_its_own_call():
+    """A bf16 attention layer traced as an assumed H100 runs it, the GEMM template named and interpreted,
+    under a Flax method interceptor that zeros `v_proj`'s output (`nn.intercept_methods`): its query, key
+    and value run apart, each through its own call, so the interceptor sees the value projection and the
+    layer's output is the one with them named apart, where the joined layer bypassed the call (base review
+    760be77fe F1)."""
+    layer = _attention(bias=False)
+    x = jax.random.normal(jax.random.key(1), (2, 64, 256)).astype(jnp.bfloat16)
+    params = layer.init(jax.random.key(0), x)
+
+    def zero_value(next_fun, args, kwargs, context):
+        out = next_fun(*args, **kwargs)
+        return jnp.zeros_like(out) if context.module.name == "v_proj" else out
+
+    def applied(*named):
+        with (generation.assumed("sm90", interpreted=True),
+              generation.chosen(grouped_matmul="mosaic", attention="xla", **dict(named)),
+              generation.routes() as routes, nn.intercept_methods(zero_value)):
+            out = layer.apply(params, x)
+        return out, [route.kernel for route in routes if route.choice == "qkv"]
+
+    intercepted, kernels = applied()
+    apart, _ = applied(("qkv", "apart"))
+    assert set(kernels) == {"apart"}, kernels
+    np.testing.assert_array_equal(np.asarray(intercepted, np.float32), np.asarray(apart, np.float32))
+
+
+def test_a_named_side_by_side_product_launches_where_legal_and_refuses_by_name_where_not():
+    """An attention layer of 256 bf16 rows (no receipt timed its geometry) with `qkv` named `joined`, nothing
+    else named: on an assumed H100 its query, key and value run side by side and their training step binds
+    the chained input gradient, the template's launches legal there, where the measured route's unmeasured
+    default took them apart (base review 760be77fe F2); on an assumed A100, whose rings take no matrices side
+    by side, the named choice is refused by name (`KernelRefused`)."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    layer = _attention(bias=False)
+    x = jax.ShapeDtypeStruct((4, 64, 256), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+
+    def under(name):
+        return generation.assumed(name), generation.chosen(attention="xla", qkv="joined")
+
+    assert _qkv_routes(layer, params, x, *under("sm90"))[:1] == ["joined"]
+    assert _chained_step(layer, params, x, *under("sm90"))
+    with pytest.raises(KernelRefused):
+        _qkv_routes(layer, params, x, *under("sm80"))
+
+
+def test_a_named_side_by_side_product_keeps_its_callers_grouped_choice_and_refuses_one_it_cannot_run():
+    """`qkv` named `joined` beside `grouped_matmul` named: the template's own (`mosaic`) runs side by side;
+    another (`xla`) is refused by name (`KernelRefused`, code `grouped`), where the side-by-side product
+    replaced the caller's named grouped choice with the template's in its probe and its execution (head
+    review of 0099a4701 F1). Named nothing, the template's is the side-by-side product's own."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    layer = _attention(bias=False)
+    x = jax.ShapeDtypeStruct((4, 64, 256), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+
+    def under(**grouped):
+        return generation.assumed("sm90"), generation.chosen(attention="xla", qkv="joined", **grouped)
+
+    assert _qkv_routes(layer, params, x, *under(grouped_matmul="mosaic"))[:1] == ["joined"]
+    with pytest.raises(KernelRefused) as refused:
+        _qkv_routes(layer, params, x, *under(grouped_matmul="xla"))
+    assert refused.value.first.code == "grouped", refused.value.first
+
+
+def test_a_side_by_side_forward_runs_the_route_its_admission_decided():
+    """An attention layer's query, key and value admitted side by side on an assumed H100, the GEMM template
+    named: their forward runs and reports the grouped route `gemm.side_by_side` decided as it admitted them
+    (its site), once, where the call bound and selected its launch a second time (base review b68fc2382
+    F5)."""
+    layer, x, params, under = _watched_layer()
+    with contextlib.ExitStack() as stack:
+        for context in under():
+            stack.enter_context(context)
+        routes = stack.enter_context(generation.routes())
+        jax.eval_shape(layer.apply, params, x)
+    assert [route.kernel for route in routes if route.choice == "qkv"] == ["joined"]
+    sites = [route.site for route in routes if route.choice == "grouped_matmul"]
+    assert sites.count("dew.nn.kernels.gemm:side_by_side") == 1, sites
+
+
+def _watched_layer():
+    """`_attention`'s layer, its abstract input and parameters, and the contexts its watch cells trace under,
+    made afresh at each call (a context is entered once): an assumed H100, the GEMM template named."""
+    layer = _attention(bias=False)
+    x = jax.ShapeDtypeStruct((2, 64, 256), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+    return layer, x, params, lambda: (generation.assumed("sm90"),
+                                      generation.chosen(grouped_matmul="mosaic", attention="xla"))
+
+
+def test_a_watched_projection_keeps_its_own_call_and_its_output_is_sown():
+    """An attention layer whose key projection a log watches (`inspection.watching`): its query, key and value
+    run apart, and the watch sows the key projection's output (head review of 4ddd0d7ea F5); unwatched they
+    run side by side."""
+    from dew.nn.inspection import INSPECTED, watching
+
+    layer, x, params, under = _watched_layer()
+    assert _qkv_routes(layer, params, x, *under())[:1] == ["joined"]
+
+    def inspected(params, x):
+        return layer.apply(params, x, mutable=[INSPECTED])
+
+    assert set(_qkv_routes(layer, params, x, *under(), watching(("k_proj",)), apply=inspected)) == {"apart"}
+    with contextlib.ExitStack() as stack:
+        for context in (*under(), watching(("k_proj",))):
+            stack.enter_context(context)
+        _, sown = jax.eval_shape(inspected, params, x)
+    assert "k_proj" in sown[INSPECTED], sown[INSPECTED].keys()
+
+
+@pytest.mark.parametrize(("rows", "kernel"), [((4, 3072), "joined"), ((1, 2048), "apart")],
+                         ids=["4x3072", "1x2048"])
+def test_a_4b_layers_query_key_and_value_join_where_a_receipt_timed_their_chain(rows, kernel):
+    """Qwen3.5-4B's attention layer (2,560 features, 16 query heads over 4 key heads of 256, its query
+    doubled by its output gate) traced as an assumed H100 runs it, nothing named but the attention kernel:
+    at 4 x 3072 rows its query, key and value run side by side, their chained input gradient M-EM-73's win
+    (`grouped_cells.TOGETHER`); at 1 x 2048, where the chain took 1.32 times XLA's time, each its own call
+    (head review of 4d6c7a69c F1)."""
+    layer = CausalSelfAttention(MixerContext(emb_features=2560, num_heads=16, num_kv_heads=4, head_dim=256,
+                                             max_seq_len=4096, output_gate=True, dtype=jnp.bfloat16))
+    x = jax.ShapeDtypeStruct((*rows, 2560), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+    assert _qkv_routes(layer, params, x, generation.assumed("sm90"),
+                       generation.chosen(attention="xla"))[:1] == [kernel]
+
+
+def test_captured_intermediates_keep_each_projections_own_call():
+    """An attention layer applied capturing each module's output (Flax's `capture_intermediates`): its query,
+    key and value run apart, and the key projection's output is captured (head review of f7c7072aa F8)."""
+    layer, x, params, under = _watched_layer()
+
+    def captured(params, x):
+        return layer.apply(params, x, capture_intermediates=True, mutable=["intermediates"])
+
+    assert set(_qkv_routes(layer, params, x, *under(), apply=captured)) == {"apart"}
+    with contextlib.ExitStack() as stack:
+        for context in under():
+            stack.enter_context(context)
+        _, state = jax.eval_shape(captured, params, x)
+    assert "k_proj" in state["intermediates"], state["intermediates"].keys()
+
+
+def test_a_tree_missing_a_projections_bias_is_refused_as_its_own_call_refuses_it():
+    """A biased attention layer's variables without the key projection's bias, traced as an assumed H100
+    runs it with the GEMM template named: its key projection's own call reports the missing parameter,
+    where reading the leaves side by side left the bias out (head review of 4ddd0d7ea F4)."""
+    from flax.errors import ScopeParamNotFoundError
+
+    layer = _attention(bias=True)
+    x = jax.ShapeDtypeStruct((2, 64, 256), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+    del params["params"]["k_proj"]["bias"]
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", attention="xla"),
+          pytest.raises(ScopeParamNotFoundError)):
+        jax.eval_shape(layer.apply, params, x)

@@ -50,9 +50,9 @@ from dew.nn.kernels.templates.attention import (
     by_power,
     gradients,
     interpreted_dot,
-    interpreted_rows,
     kept_dtype,
     kernel_dot,
+    kernel_rows,
     key_tiles,
     launch_arguments,
     output_split,
@@ -781,7 +781,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     peak, total = peak_ref[...], total_ref[...]
     product = functools.partial(_issued, interpret=interpret)
     # D's and the anchor's products with dO, summed as `product` sums dP (`gradient.off_anchor_delta`).
-    row_products = interpreted_rows if interpret else gradient.summed_rows
+    row_products = functools.partial(kernel_rows, interpret=interpret)
     intervals = _intervals(start_ref, end_ref)
     query_ids = [ref[...] for ref in id_refs[:1]]
 

@@ -198,6 +198,7 @@ class Choice(enum.StrEnum):
     NVFP4 = 'nvfp4'
     NVFP4_BLOCK = 'nvfp4_block'
     PAGED_DECODE = 'paged_decode'
+    QKV = 'qkv'
     RMS_NORM = 'rms_norm'
     SELECTIVE_SCAN = 'selective_scan'
     SHORT_CONV = 'short_conv'
@@ -335,7 +336,9 @@ class Architecture:
     fp32 operations its vector units do a clock (`vector_per_clock`: a CUDA multiprocessor's fp32 lanes'
     FLOPs, two a lane for its fused multiply-add, which a dot at Precision.HIGHEST takes there too; a TPU's
     VPU's) and the exponentials its special-function units return a clock (`exponentials_per_clock`: a CUDA
-    multiprocessor's, a TPU's transcendental unit's), Blackwell's tensor memory columns (PTX ISA,
+    multiprocessor's, a TPU's transcendental unit's), the 32-bit integer operations its ALU returns a clock
+    (`integer_per_clock`: add, shift, logic and comparison, CUDA C++ Programming Guide 12.6 §5.4.1 Table 4,
+    64 on sm80 to sm90; None where unread), Blackwell's tensor memory columns (PTX ISA,
     tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and the VMEM a kernel may raise its
     limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block into shared memory by TMA, which
     it picks from compute capability 9.0 on (its `emit_pipeline` and `copy_gmem_to_smem`), where below it they
@@ -348,6 +351,7 @@ class Architecture:
     multiprocessor: Multiprocessor | None = Multiprocessor()
     vector_per_clock: float | None = None
     exponentials_per_clock: float | None = None
+    integer_per_clock: float | None = None
     tma: bool = False
     dependent_launch: bool = False
     tmem_columns: int | None = None
@@ -411,13 +415,14 @@ capability from 7.5 to 12.x alike (the CUDA C++ Best Practices Guide 13's §12.1
 row, where CUDA 13 moved the throughput table; 15.97 measured on an H200, the kernel challenge's MUFU.EX2)."""
 _AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024},
                        Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None),
-                       vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS)
+                       vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS, integer_per_clock=64)
 _AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512},
                                 Multiprocessor(register_raises=None),
-                                vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS)
+                                vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,
+                                integer_per_clock=64)
 _ADA = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048},
                     Multiprocessor(resident_blocks=24, register_raises=None),
-                    vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS)
+                    vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS, integer_per_clock=64)
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
 _TURING = Architecture((), {'16bit': 1024}, Multiprocessor(resident_threads=1024, register_raises=None),
                        vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS)
@@ -425,7 +430,8 @@ _TURING = Architecture((), {'16bit': 1024}, Multiprocessor(resident_threads=1024
 # pair CUTLASS's grouped GEMM and cuBLASLt take on an H100).
 _HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192},
                        Multiprocessor(resident_threads=2048, resident_blocks=32),
-                       vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS, tma=True,
+                       vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,
+                       integer_per_clock=64, tma=True,
                        dependent_launch=True, cluster=2)
 # Blackwell's tcgen05 family: tcgen05 (sm_100a) and mma.sync, no wgmma; tensor memory, a pair's 2-CTA
 # products and multicast, block-scaled operands (PTX ISA, tcgen05.mma's kind::mxf8f6f4 and mxf4nvf4).
@@ -519,6 +525,13 @@ class Measured:
     launch: float | None = None
     handoff: float | None = None
     loaded_clock: float | None = None
+    product: tuple[float, float] | None = None
+    """A tile walk's step's latencies (`templates.cost.Chain`, `chained`): a warpgroup product waited on, its
+    fixed seconds and its seconds a column (a 64 x N product of 16-bit operands 64 deep); `barrier`, two
+    warpgroups' round trip through a block's barriers; `copy`, a tile copy into shared memory waited on, read
+    from device memory, its fixed seconds and its seconds a byte. None where not measured."""
+    barrier: float | None = None
+    copy: tuple[float, float] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -706,6 +719,24 @@ class GpuTarget:
         return stated if measured is None else measured
 
     @property
+    def product_latency(self) -> tuple[float, float] | None:
+        """A waited warpgroup product's fixed seconds and seconds a column on the part (`Measured.product`);
+        None where unmeasured."""
+        return None if self.part is None else self.part.product
+
+    @property
+    def barrier_seconds(self) -> float | None:
+        """Two warpgroups' round trip through a block's barriers on the part (`Measured.barrier`); None where
+        unmeasured."""
+        return None if self.part is None else self.part.barrier
+
+    @property
+    def copy_latency(self) -> tuple[float, float] | None:
+        """A waited tile copy's fixed seconds and seconds a byte from device memory on the part
+        (`Measured.copy`); None where unmeasured."""
+        return None if self.part is None else self.part.copy
+
+    @property
     def fixed_seconds(self) -> float | None:
         """The seconds a kernel's stream spends before its bytes arrive, its launch and first byte, measured
         on the part (`Measured.fixed`); None where no one measured it."""
@@ -867,8 +898,12 @@ TARGETS = {target.generation: target for target in (
                         # time-weighted mean of sm__cycles_elapsed.avg.per_second over 18 GEMM launches under
                         # ncu (1.476 to 1.522; the template's, cuBLASLt's and a pair's alike; M-EM-36-gh200),
                         # against its 1.98 GHz clock locked.
+                        # A step's latencies, the slope of a chain of 256 to 4,096 waited steps
+                        # (FS-4123-LATENCIES1-gh200, two rounds: products 12.9 ns and 1.194 ns a column, their
+                        # fit within 1%; a barrier round trip 80.2 and 80.0 ns).
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
-                                                       loaded_clock=1.496e9),
+                                                       loaded_clock=1.496e9, product=(12.9e-9, 1.194e-9),
+                                                       barrier=80.1e-9),
                         'NVIDIA H200': Measured(2.81e-6, 4.617e12)},
               # PCIe Gen5 x16 (the H100 and H200 datasheets' 128 GB/s both ways, SXM, PCIe and NVL alike);
               # the GH200's NVLink-C2C to its Grace (the GH200 datasheet's 900 GB/s both ways).
@@ -1084,7 +1119,8 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
     device memory `memory` where a build states it, else the least of the target's parts (`GpuTarget.memory`),
     never none: XLA's memory-driven passes compiled a recurrence's gradient for a GPU of 0 bytes to values
     O(1) wrong (a GH200 running a step compiled ahead for compile-only sm90 GPUs of no stated memory, row
-    8768)."""
+    8768). Its L2 where the target states it (`l2_bytes`): XLA fuses by it, and a compile-only A100 stating
+    none fused a recurrence gradient's sums apart from its host's compile of it (row 9609)."""
     generation = target.generation
     version = capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
@@ -1097,6 +1133,7 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
         raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
     major, minor = version
     multiprocessor = target.multiprocessor
+    l2 = "" if target.l2_bytes is None else f"\n  l2_cache_size: {target.l2_bytes}"
     return f"""gpu_device_info {{
   threads_per_block_limit: {multiprocessor.block_threads}
   threads_per_warp: {multiprocessor.warp_threads}
@@ -1108,7 +1145,7 @@ def target_config(target: GpuTarget, memory: int | None = None) -> str:
   block_dim_limit_x: 2147483647
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
-  memory_bandwidth: {int(bandwidth)}
+  memory_bandwidth: {int(bandwidth)}{l2}
   device_memory_size: {memory}
   clock_rate_ghz: {clock / 1e9}
   shared_memory_per_block_optin: {shared}
@@ -1435,13 +1472,11 @@ def routes(*, alone: bool = False) -> Iterator[list[Route]]:
 
 
 def reported(found: Sequence[Route]) -> None:
-    """Report `found`, routes a trace's dispatches reported, to every open `routes` block, as each of its
-    dispatches did (`route`): a trace held and reused (`dew.algebra.fusion`'s regions) reports the routes it
-    took where its program is written."""
-    from dew import _cache
-
-    for collected in _cache.KERNEL_ROUTES.value:
-        collected.found.extend(found)
+    """Report `found`, routes a trace's dispatches reported, again, each as its dispatch did (`published`): a
+    trace held and reused (`dew.algebra.fusion`'s regions, a decision cached by its key) reports the routes it
+    took where its program is written (train 1095's review F1: a second appender beside `published`)."""
+    for each in found:
+        published(each)
 
 
 def _site() -> str:
@@ -1459,15 +1494,29 @@ _logged: set[tuple[str, str, str]] = set()
 def route(choice: Choice, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
           forced: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
-    decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` names, else
-    `kernel`. Every `routes` block open records it.
-    A call off its preferred kernel is logged once a process for each kernel and refusal at INFO, naming
-    both and the refusal's reason; one that runs the preferred kernel logs nothing."""
+    decided (`dew.nn.kernels.selection.select`): `routed`'s route, `published`."""
+    return published(routed(choice, kernel=kernel, preferred=preferred, refusal=refusal, forced=forced))
+
+
+def routed(choice: Choice, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
+           forced: str | None = None) -> Route:
+    """The route of a dispatch of `choice` to `kernel`, reported nowhere: what a caller asking which kernel
+    would run holds until the dispatch it decides runs (`published`; `selection.decided`). `preferred`
+    defaults to the kernel `chosen` names, else `kernel`."""
     from dew import _cache
 
-    generation = device_generation()
     preferred = preferred or dict(_cache.KERNEL_CHOICES.value).get(choice) or kernel
-    found = Route(choice, kernel, preferred, refusal, generation, _site(), forced)
+    return Route(choice, kernel, preferred, refusal, device_generation(), _site(), forced)
+
+
+def published(found: Route) -> Route:
+    """`found`, a dispatch that runs, reported: every `routes` block open records it, and a call off its
+    preferred kernel is logged once a process for each kernel and refusal at INFO, naming both and the
+    refusal's reason; one that runs the preferred kernel logs nothing."""
+    from dew import _cache
+
+    choice, kernel, preferred, refusal, generation = (found.choice, found.kernel, found.preferred,
+                                                      found.refusal, found.target)
     for collected in _cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail

@@ -672,9 +672,7 @@ class KernelOp(tokamax.Op):
         derivation offers, which a template's eligibility reads (`Template.holds`) so its route takes another
         implementation before the call. Certification is asked once a config a process (`report.certified`'s
         record), so the call's own taking after its route's asks no compile again."""
-        pins = dict(_cache.KERNEL_PINS.value)
-        if type(self) in pins:
-            pin = self.completed(ba, pins[type(self)])
+        if (pin := self.pinned(ba)) is not None:
             # A pin holds for the call's own shapes, as an explicit config does (`__call__`).
             if not self.pinnable(ba, pin):
                 raise Unpinnable(type(self).__name__, pin, self.unpinnable(ba, pin))
@@ -809,6 +807,19 @@ class KernelOp(tokamax.Op):
 
     def _get_autotuning_configs(self, ba: tokamax.BoundArguments) -> set[Hashable]:
         return set(self.variants(ba))
+
+    def pinned(self, ba: tokamax.BoundArguments) -> Hashable | None:
+        """The pin a block holds for this launch (`pinned`), as the launch of `ba` takes it (`completed`);
+        None where none is held."""
+        pins = dict(_cache.KERNEL_PINS.value)
+        return self.completed(ba, pins[type(self)]) if type(self) in pins else None
+
+    def pin_refuses(self, ba: tokamax.BoundArguments) -> bool:
+        """Whether a pin held for this launch refuses `ba`, where `taken` raises `Unpinnable`: a caller
+        that runs the call's products in another form where it does asks this (`gemm`'s side-by-side and
+        chained launches; row 8694)."""
+        pin = self.pinned(ba)
+        return pin is not None and not self.pinnable(ba, pin)
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pinned or explicit `config` as the launch of `ba` takes it, the parts it leaves to the launch
@@ -1259,11 +1270,10 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         # the whole buffer through the cache.
         # Without command buffers, which CUPTI does not read whole (`benchmark.Ungraphed`).
         lowered = owned_program(behind(launched), step=UNGRAPHED_OPTIONS).lower(flush, (arrays,))
-        # In one of this process's compile slots, as every compile of Dew's is (`report.compile_slots`): a
-        # step's launch waits on its measurement.
-        with report.compile_slots().held(background=False):
-            middle = time.perf_counter()
-            executable = lowered.compile()
+        # Through Dew's one call of XLA's compile (`report.xla_compiled`): in one of this process's compile
+        # slots, a step's launch waiting on its measurement, under the options its target takes (`targeted`).
+        middle = time.perf_counter()
+        executable = report.xla_compiled(lowered, None)
         return executable, (middle - start) * 1e3, (time.perf_counter() - middle) * 1e3
 
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}

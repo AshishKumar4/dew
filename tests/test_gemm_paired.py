@@ -391,20 +391,104 @@ def test_side_by_side_gradients_read_a_wide_cotangent_wide():
     np.testing.assert_array_equal(np.asarray(d_rows), np.full((64, 128), np.float16(70000.0 * 192 / 1024)))
 
 
-@pytest.mark.parametrize(("generation_name", "taken"), [("sm90", True), ("sm80", False)],
-                         ids=["h100", "a100"])
-def test_projections_side_by_side_are_one_launchs_cell_whatever_their_first_matrix(generation_name, taken):
-    """Llama-3.1-8B's query, key and value (4,096 by 4,096, 1,024 and 1,024) over 12,288 bf16 rows, nothing
-    named: on an assumed H100 a launch takes them side by side (`gemm.side_by_side`), their products in one
-    launch a cell of their own (`Kind.together`, M-EM-73's), where the first matrix's ordinary cell, XLA's on
-    Hopper, refused them (head review of 4ddd0d7ea F1); on an A100, whose cp.async rings take no matrices side
-    by side, none does, the template named or not."""
-    rows = jax.ShapeDtypeStruct((12288, 4096), jnp.bfloat16)
-    matrices = tuple(jax.ShapeDtypeStruct((4096, width), jnp.bfloat16) for width in (4096, 1024, 1024))
+@pytest.mark.parametrize(("generation_name", "hidden", "widths", "rows", "dtype", "taken"), [
+    ("sm90", 4096, (4096, 1024, 1024), 12288, jnp.bfloat16, True),
+    ("sm90", 2560, (8192, 1024, 1024), 12288, jnp.bfloat16, True),
+    ("sm90", 2560, (8192, 1024, 1024), 2048, jnp.bfloat16, False),
+    ("sm90", 4096, (4096, 1024, 1024), 12288, jnp.float16, False),
+    ("sm80", 4096, (4096, 1024, 1024), 12288, jnp.bfloat16, False)],
+    ids=["h100-8b-4x3072", "h100-4b-4x3072", "h100-4b-1x2048", "h100-8b-fp16", "a100-8b-4x3072"])
+def test_projections_side_by_side_take_one_launch_where_a_receipt_timed_it(generation_name, hidden, widths,
+                                                                             rows, dtype, taken):
+    """A layer's query, key and value over `dtype` rows, nothing named (`gemm.side_by_side`): on an assumed
+    H100 a launch takes them side by side at the joined geometry, rows and bf16 operands M-EM-73 timed the
+    chained input gradient faster than XLA's products (Llama-3.1-8B's and Qwen3.5-4B's at 4 x 3072 rows:
+    `Kind.together` keyed by its joined matrix, `TOGETHER`), not at the 4B's 1 x 2048, where it lost (base
+    review 156a4595a F4), nor fp16 operands, which no receipt timed (base review b68fc2382 F4); on an A100,
+    whose cp.async rings take no matrices side by side, none does, and the template named refuses them as
+    `gemm` would (`KernelRefused`, which a layer reads as its projections apart, `joined.BesideCase`)."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    matrices = tuple(jax.ShapeDtypeStruct((hidden, width), dtype) for width in widths)
+    lhs = jax.ShapeDtypeStruct((rows, hidden), dtype)
     with generation.assumed(generation_name):
-        assert gemm.side_by_side(rows, matrices, jnp.bfloat16, None, whole=True) is taken
-        with generation.chosen(grouped_matmul="mosaic"):
-            assert gemm.side_by_side(rows, matrices, jnp.bfloat16, None, whole=True) is taken
+        assert (gemm.side_by_side(lhs, matrices, dtype, None, whole=True) is not None) is taken
+        if generation_name == "sm80":
+            with generation.chosen(grouped_matmul="mosaic"), pytest.raises(KernelRefused):
+                gemm.side_by_side(lhs, matrices, dtype, None, whole=True)
+
+
+def _overflow_witness(depth: int, rank: int) -> tuple[np.ndarray, ...]:
+    """LoRA operands (`x [256, depth]`, `W [depth, 256]`, `A [depth, rank]`, `B [rank, 256]`) whose first
+    output's terms over the concatenated depth are -2^127 (the base's `x[0, 0] · W[0, 0]`, 2^63 times
+    -2^64) then +2^127 twice (the rank's, each 2^63 times 2^64): equal depths take `A` the identity and the
+    rank's terms at `x`'s columns 0 and 64; a 127-deep base `A`'s first row's two ones, the rank's terms its
+    rows 0 and 1, at the concatenated depth's offsets 127 and 128 (base review 3f38bf20d F1, F2)."""
+    x, w = np.zeros((256, depth), np.float32), np.zeros((depth, 256), np.float32)
+    b = np.zeros((rank, 256), np.float32)
+    x[0, 0], w[0, 0] = 2.0 ** 63, -(2.0 ** 64)
+    if depth == rank:
+        a = np.eye(depth, dtype=np.float32)
+        x[0, 64] = 2.0 ** 63
+        b[0, 0] = b[64, 0] = 2.0 ** 64
+    else:
+        a = np.zeros((depth, rank), np.float32)
+        a[0, 0] = a[0, 1] = 1.0
+        b[0, 0] = b[1, 0] = 2.0 ** 64
+    return x, w, a, b
+
+
+@pytest.mark.parametrize(("depth", "rank", "out_dtype", "precision"), [
+    (128, 128, jnp.bfloat16, None), (127, 64, jnp.float32, jax.lax.Precision.HIGHEST)],
+    ids=["equal-depths", "ragged-base"])
+def test_an_adapted_products_running_sum_crosses_its_base_and_rank_as_one(depth, rank, out_dtype, precision):
+    """LoRA's adapted product (`low_rank.low_rank`, `gemm.joined_depths`) of `_overflow_witness`'s operands on
+    an assumed H100, the template named and interpreted: its first output's terms -2^127, +2^127, +2^127 sum
+    to 2^127 in one running sum over the concatenated depth, where a pair's two accumulators (equal depths)
+    or padding between the depths moving both positive terms into one exact-sum step (a 127-deep base)
+    overflowed to infinity (base review 3f38bf20d F1, F2)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    operands = (jnp.asarray(each, jnp.bfloat16) for each in _overflow_witness(depth, rank))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", low_rank="fused"):
+        out = low_rank(*operands, 1.0, out_dtype=out_dtype, precision=precision, interpret_on_cpu=True)
+    assert float(np.asarray(out, np.float32)[0, 0]) == 2.0 ** 127
+
+
+def test_an_unmeasured_side_by_side_forward_runs_each_product_in_its_own_cell():
+    """Two of Qwen3.5-4B's key-width matrices (2,560 by 1,024) side by side over 24,576 bf16 rows on an
+    assumed H100, nothing named: no receipt timed them in one launch, so each runs its own call (`APART`, the
+    op's preference), and each is the template's, the cell M-EM-36 timed its product in (`FOUR_B`), where
+    XLA's dot stood for both (base review a1ad2b4ca F3)."""
+    from dew.nn.kernels import grouped_matmul
+
+    rows = jax.ShapeDtypeStruct((24576, 2560), jnp.bfloat16)
+    matrices = [jax.ShapeDtypeStruct((2560, 1024), jnp.bfloat16)] * 2
+    with generation.assumed("sm90"), generation.routes() as routes:
+        jax.eval_shape(lambda rows, *matrices: gemm.gemm(rows, matrices[0], beside=matrices[1:],
+                                                         out_dtype=jnp.bfloat16), rows, *matrices)
+    taken = [route for route in routes if route.choice == "grouped_matmul"]
+    mosaic = grouped_matmul.MosaicGmm.name
+    assert [route.kernel for route in taken] == [grouped_matmul.APART.name, mosaic, mosaic], taken
+    # A policy, not a receipt: the apart route is the op's preference, no measured win claimed (base review
+    # 3f38bf20d F3).
+    assert taken[0].preferred == grouped_matmul.APART.name and taken[0].refusal is None, taken[0]
+
+
+def test_projections_side_by_side_whose_forward_a_pin_refuses_run_apart():
+    """Projections of widths 256, 128 and 128 over 12,288 bf16 rows on an assumed H100, the template pinned
+    at a 256-column Hopper tile: their forward side by side is the launch's, which the pin refuses for their
+    narrower widths, so `gemm.side_by_side` takes none (head review of 4d6c7a69c F5: an input gradient alone
+    admitted them, and the forward raised `Unpinnable`); unpinned, the template named, it takes them."""
+    from dew.nn.kernels import grouped_matmul, tuning
+
+    lhs = jax.ShapeDtypeStruct((12288, 256), jnp.bfloat16)
+    matrices = tuple(jax.ShapeDtypeStruct((256, width), jnp.bfloat16) for width in (256, 128, 128))
+    pin = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        assert gemm.side_by_side(lhs, matrices, jnp.bfloat16, None, whole=True) is not None
+        with tuning.pinned({grouped_matmul.MosaicGmm: pin}):
+            assert gemm.side_by_side(lhs, matrices, jnp.bfloat16, None, whole=True) is None
 
 
 @pytest.mark.parametrize("widths", [(512, 128), (512, 128, 128)], ids=["two-outputs", "three-outputs"])
@@ -691,13 +775,13 @@ def _chained_walk(*, launch: int = 0, flagged: bool = True) -> tuple:
     from ring_protocol import programs
 
     _, matrices, cotangents = _chained_overflow(jnp.bfloat16)
-    (d, w), *rest = [(cotangent, matrix[None]) for cotangent, matrix in zip(cotangents[::-1], matrices[::-1],
-                                                                           strict=True)]
+    products = [(cotangent, matrix[None]) for cotangent, matrix in zip(cotangents[::-1], matrices[::-1],
+                                                                       strict=True)]
+    chain, operands = _chained_call(products, None, jnp.bfloat16, WALKED, interpret=False)
 
-    def chained(d, w):
+    def chained(*operands):
         with generation.assumed("sm90"):
-            return mosaic_gpu.gmm(d, w, None, tiles=WALKED, transpose_rhs=True, out_dtype=jnp.bfloat16,
-                                  multiprocessors=4, interpret=False, dense=True, chained=tuple(rest))
+            return chain(*operands)
 
     def flags(index, aval):
         # The flags, int32 `[row tiles, column tiles, row shares]` (`chained.flags_declared`).
@@ -706,7 +790,7 @@ def _chained_walk(*, launch: int = 0, flagged: bool = True) -> tuple:
             return None
         return np.full(aval.shape, int(flagged), np.int32)
 
-    return programs(chained, d, w, threads=WALKED.warpgroups + 1, launch=launch, known=flags)
+    return programs(chained, *operands, threads=WALKED.warpgroups + 1, launch=launch, known=flags)
 
 
 def test_a_chained_launchs_walk_holds_every_property_in_every_interleaving():
@@ -746,7 +830,10 @@ def test_a_chained_launchs_bounded_walk_holds_every_property_in_every_interleavi
         threads, arrivals = _chained_walk(launch=1, flagged=walked != "clear")
     products = sum(event.kind == "product" for program in threads for event in program)
     if walked == "clear":
+        # No product, and no producer waits for a release its idle consumers never send (base review
+        # 156a4595a F3).
         assert products == 0, products
+        assert explore(threads, arrivals) > 0
         return
     assert products > 0
     if walked == "overcounted":
@@ -831,22 +918,26 @@ def test_a_chained_input_gradient_of_non_finite_cotangents_is_the_plain_programs
     np.testing.assert_array_equal(got[finite], rounded[finite])
 
 
-def _chained_call(products: list, sizes, dtype, tiles=None) -> tuple[Callable, tuple]:
-    """`products`' `(cotangent, matrix)` pairs (NumPy's, a matrix `[groups, features, width]`) as one
-    interpreted chained launch (`mosaic_gpu.gmm`'s `chained`, the first the call's own), at `tiles` (the
-    template's 128 x 256 tile where None: three products' replay a quarter of it, whole column units,
+def _chained_call(products: list, sizes, dtype, tiles=None, *, interpret=grouped_launch.INTERPRETED,
+                  multiprocessors: int = 4) -> tuple[Callable, tuple]:
+    """`products`' `(cotangent, matrix)` pairs (NumPy's, a matrix `[groups, features, width]`, or abstract:
+    `jax.ShapeDtypeStruct`s, given as they are) as one chained launch (`mosaic_gpu.gmm`'s `chained`, the
+    first the call's own) over `multiprocessors`, interpreted as `interpret` says, at `tiles` (the template's
+    128 x 256 tile where None: three products' replay a quarter of it, whole column units,
     `chained.replay_tile`), its groups' rows `sizes` (None: dense), in `dtype`: the launch, a function of its
-    operands, and those operands, each pair's in turn."""
+    operands, and those operands, each pair's in turn; the one fixture of a chained launch its checks vary
+    (base review 3150e8dfc F3)."""
     tiles = tiles or mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
     group_sizes = None if sizes is None else jnp.asarray(sizes, jnp.int32)
 
     def launch(*operands):
         (d, w), *rest = zip(operands[0::2], operands[1::2], strict=True)
         return mosaic_gpu.gmm(d, w, group_sizes, tiles=tiles, transpose_rhs=True, out_dtype=dtype,
-                              multiprocessors=4, interpret=grouped_launch.INTERPRETED, dense=sizes is None,
+                              multiprocessors=multiprocessors, interpret=interpret, dense=sizes is None,
                               chained=tuple(rest))
 
-    return launch, tuple(jnp.asarray(each, dtype) for pair in products for each in pair)
+    return launch, tuple(each if isinstance(each, jax.ShapeDtypeStruct) else jnp.asarray(each, dtype)
+                         for pair in products for each in pair)
 
 
 def _chained_launch(products: list, sizes, dtype, generation_name: str = "sm90", tiles=None) -> np.ndarray:
@@ -958,15 +1049,10 @@ def test_a_direct_chained_launch_whose_replay_no_tile_holds_is_refused(products)
     replay WGMMA cannot run (base review f86cb5b03 F1)."""
     tiles = mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2, family="wgmma")
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    first, *rest = ((shaped((256, 64)), shaped((1, 128, 64))) for _ in range(products))
-
-    def launch(d, w, *rest):
-        chained = tuple(zip(rest[0::2], rest[1::2], strict=True))
-        return mosaic_gpu.gmm(d, w, None, tiles=tiles, transpose_rhs=True, out_dtype=jnp.bfloat16,
-                              multiprocessors=132, dense=True, chained=chained)
-
+    launch, operands = _chained_call([(shaped((256, 64)), shaped((1, 128, 64))) for _ in range(products)],
+                                     None, jnp.bfloat16, tiles, interpret=False, multiprocessors=132)
     with generation.assumed("sm90"), pytest.raises(ValueError):
-        jax.eval_shape(launch, *first, *(each for pair in rest for each in pair))
+        jax.eval_shape(launch, *operands)
 
 
 def test_a_launch_pinned_at_a_tile_no_chain_holds_keeps_its_products_apart():

@@ -113,6 +113,33 @@ class Committed(Ring):
     def issued_by(self, index: int, count: int) -> "Committed":
         return dataclasses.replace(self, share=(index, count))
 
+    def started(self, turn: rings.Turn, view, ahead: rings.Ahead | None = None) -> None:
+        """Where it reads a step's entries ahead (`ahead`), a tile's first step's own fill of them issued
+        (`Started`): every ring's before the load warp's one drain (`drained`) and any ring's gathers
+        (`rings.stepped_in`), so no ring's fill waits on another's drain (base reviews 103007773 F4,
+        b68fc2382 F6)."""
+        del turn  # the step's half of the entries is its `ahead`'s (`rings.Ahead.parity`)
+        if ahead is None:
+            return
+        _, rows = view
+        height, _ = self.block
+        splat = plgpu.Layout.WG_SPLAT(())
+        plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType(), splat, splat))(
+            Started(self.share, rows.tiled))(self.entries, rows.table.at[pl.ds(rows.start, height)],
+                                             jnp.asarray(ahead.parity, jnp.int32),
+                                             jnp.asarray(ahead.held, jnp.int32))
+
+    def drained(self, steps: list[tuple[tuple[jax.Array, rings.Rows], rings.Ahead]]) -> None:
+        """The load warp's one drain of its entries' fills for a step, after every ring's `started` and
+        before any gathers (`Drained`), where a step's fills are pending: every step of a ring that reads
+        the next step's entries ahead (its last step's fill), a tiled ring's first step of a tile alone
+        (`rings.Rows.tiled`: its other steps fill none, base review b68fc2382 F6). `steps`: each ring's view
+        and its next step's (`rings.Ahead`)."""
+        pending = [jnp.asarray(not view[1].tiled, jnp.bool_) | (jnp.asarray(ahead.held, jnp.int32) == 0)
+                   for view, ahead in steps]
+        needed = functools.reduce(jnp.logical_or, pending).astype(jnp.int32)
+        plgpu.inline_mgpu(arg_types=(plgpu.Layout.WG_SPLAT(()),))(Drained(self.share))(needed)
+
     def load(self, turn: rings.Turn, view, ahead: rings.Ahead | None = None) -> None:
         slot = rings.opaque(turn.slot)
         self.free(turn, slot)
@@ -126,11 +153,9 @@ class Committed(Ring):
                     self.full.at[pl.ds(slot, 1)], jnp.asarray(depth * width, jnp.int32))
         refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(swizzle), plgpu.RefType(), splat)
         if ahead is not None:
-            # This step's entries where the step before read them: the step's counter's parity, and whether
-            # the step before read them.
-            operands += (self.entries, jnp.asarray(turn.counter % 2, jnp.int32),
-                         jnp.asarray(ahead.held, jnp.int32))
-            refs += (plgpu.RefType(), splat, splat)
+            # This step's entries where its await left them (`awaited`): the step's parity (`Ahead.parity`).
+            operands += (self.entries, jnp.asarray(ahead.parity, jnp.int32))
+            refs += (plgpu.RefType(), splat)
         plgpu.inline_mgpu(arg_types=refs)(Gathers(bytes_, self.share, ahead is not None))(*operands)
         if ahead is not None:
             @pl.when(ahead.live)
@@ -141,8 +166,8 @@ class Committed(Ring):
                 _, following = ahead.view()
                 next_rows = following.table.at[pl.ds(following.start, height)]
                 plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType(), splat))(
-                    Filled(self.share, height))(self.entries, next_rows, jnp.asarray((turn.counter + 1) % 2,
-                                                                                     jnp.int32))
+                    Filled(self.share))(self.entries, next_rows,
+                                                1 - jnp.asarray(ahead.parity, jnp.int32))
 
     def release(self, turn: rings.Turn) -> None:
         plgpu.tcgen05_commit_arrive(self.consumed.at[rings.opaque(turn.slot)])
@@ -273,7 +298,8 @@ class Gathers:
     (tests/test_ring_protocol.py's gathered walk, every order of the warps' copies and the arrival).
 
     `ahead` (`rings.Ahead`): the step's entries read from `Committed.entries` at its counter's parity, where
-    the step before copied them (`held`) or, a tile's first step, its own copies did; the next step's copied
+    its start and drain left them (`Started`, `Drained`, every ring's before any ring's gathers: the step
+    before copied them, or, a tile's first step, its own copies did); the next step's copied
     into the other parity by the warp's lanes' cp.async copies, an entry a lane, after its gathers (`Filled`,
     the load's next body where the walk has a next step), so their latency
     lies under this step's issue and the slot's wait (an emulated B200's gathered kernel gradient's load
@@ -309,10 +335,8 @@ class Gathers:
             mgpu_nvvm.mbarrier_arrive_expect_tx(tracked.get_ptr(), mgpu_utils.c(total, i32),
                                                 predicate=mgpu_utils.single_thread_predicate(
                                                     mgpu_utils.ThreadSubset.WARP))
-        layout = mgpu_fragments.TMA_INDICES_4_LAYOUT
-        vector = mgpu_ir.VectorType.get((4,), i32)
         # The step's column as the warp holds it uniformly, as its rows' entries are (`_entries`).
-        start = across.lane_value(splat_value(column), 0)
+        start = mgpu_arith.index_cast(index, across.lane_value(splat_value(column), 0))
         issuer = mgpu_utils.single_thread_predicate(mgpu_utils.ThreadSubset.WARP)
         tiles = list(self.tiles(shape[0]))
         held = Held.read(ahead) if self.ahead else None
@@ -320,29 +344,36 @@ class Gathers:
         positions = _positions(self.share, len(tiles), tile_rows)
         entries = self._entries(rows, positions, held)
         for at, tile in enumerate(tiles):
-            # The tile's entries, four a register, every thread the same (`layout`).
-            mine = entries[at * tile_rows:(at + 1) * tile_rows]
-            registers = [mgpu_vector.from_elements(vector, mine[4 * part:4 * (part + 1)])
-                         for part in range(tile_rows // 4)]
-            indices = mgpu_fragments.FragmentedArray(
-                _registers=_registered(registers, layout, tile_rows), _layout=layout, _is_signed=False)
-            ctx.async_copy(src_ref=source, dst_ref=mgpu_utils.memref_slice(slot, mgpu_utils.ds(tile, 1)),
-                           gmem_slice=(indices, mgpu_utils.ds(mgpu_arith.index_cast(index, start), width)),
-                           gmem_transform=mgpu_launch.TileTransform((tile_rows, tile_columns)),
-                           swizzle=self.swizzle, barrier=tracked, arrive=False, predicate=issuer)
+            self._gathered(ctx, source, mgpu_utils.memref_slice(slot, mgpu_utils.ds(tile, 1)),
+                           entries[at * tile_rows:(at + 1) * tile_rows], (start, width),
+                           (tile_rows, tile_columns), tracked, issuer)
+
+    def _gathered(self, ctx, source, slot, entries: list, columns: tuple, tile: tuple, barrier,
+                  issuer) -> None:
+        """One tile's TMA gather into `slot`: its `entries` (the rows of `source`), four a register, every
+        thread the same, at `columns` (a first column and a width), tiled as `tile`, arriving on `barrier`."""
+        i32 = mgpu_ir.IntegerType.get_signless(32)
+        layout = mgpu_fragments.TMA_INDICES_4_LAYOUT
+        vector = mgpu_ir.VectorType.get((4,), i32)
+        registers = [mgpu_vector.from_elements(vector, entries[4 * part:4 * (part + 1)])
+                     for part in range(tile[0] // 4)]
+        indices = mgpu_fragments.FragmentedArray(
+            _registers=_registered(registers, layout, tile[0]), _layout=layout, _is_signed=False)
+        start, width = columns
+        ctx.async_copy(src_ref=source, dst_ref=slot, gmem_slice=(indices, mgpu_utils.ds(start, width)),
+                       gmem_transform=mgpu_launch.TileTransform(tile), swizzle=self.swizzle, barrier=barrier,
+                       arrive=False, predicate=issuer)
 
     def _entries(self, rows, positions: list, held: "Held | None") -> list:
         """The table entries of the warp's tiles (`rows`, a step's table in global memory: tile t's
         `tile_rows` entries from row t * `tile_rows`), at its lanes' `positions` (`_positions`), in order,
         each as every lane of the warp holds it uniformly: its lanes load them a warp's width at a time, an
-        entry a lane (from `held`'s shared memory where the step before copied them, `Held.entry`),
+        entry a lane (from `held`'s shared memory where its await left them, `Held.entry`),
         and each is read from its lane (`across.lane_value`), which ptxas holds in a uniform register, where
         a TMA gather reads its indices. Loaded by every thread and read from a register a lane, each
         gather4's four were moved into uniform registers by R2UR (66% of a load warp's issues at the line
         that loaded them, the emulated B200's gathered kernel gradient, M-EM-71)."""
         index = mgpu_ir.IndexType.get()
-        if held is not None:
-            held.awaited(rows, positions)
         found = []
         for row, _, lanes in positions:
             loaded = (mgpu_memref.load(rows, [mgpu_arith.index_cast(index, row)]) if held is None
@@ -384,64 +415,89 @@ def _positions(share: tuple[int, int], tiles: int, tile_rows: int) -> list:
 @dataclasses.dataclass(frozen=True)
 class Held:
     """A load warp's step entries read a step ahead (`Gathers.ahead`), in its lane-level code: `entries`
-    (`Committed.entries`), `parity` this step's counter's parity, and `held` whether the step before copied
-    this step's entries (an i1)."""
+    (`Committed.entries`) and `parity` this step's counter's parity, where its start and drain left them
+    (`Started`, `Drained`)."""
 
     entries: mgpu_ir.Value
     parity: mgpu_ir.Value
-    held: mgpu_ir.Value
 
     @classmethod
     def read(cls, ahead: tuple) -> "Held":
-        """`Gathers`' trailing operands as the body takes them: the entries' ref, then two splat scalars."""
-        entries, parity, held = ahead
-        i32 = mgpu_ir.IntegerType.get_signless(32)
-        return cls(entries, splat_value(parity),
-                   mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.ne, splat_value(held), mgpu_utils.c(0, i32)))
-
-    def awaited(self, rows, positions: list) -> None:
-        """This step's entries landed in shared memory at its parity and seen by every lane: where the step
-        before filled them nothing more, else (a tile's first step) filled now from `rows` (`filled`); its
-        cp.async group awaited, then the warp met, as a lane's copy is its own until then. Every step reads
-        them there alone (`entry`): one shared-memory read, no branch between it and the table's."""
-        first = mgpu_arith.xori(self.held, mgpu_utils.c(1, mgpu_ir.IntegerType.get_signless(1)))
-        branch = mgpu_scf.IfOp(first)
-        with mgpu_ir.InsertionPoint(branch.then_block):
-            filled(self.entries, rows, self.parity, positions)
-            mgpu_scf.YieldOp([])
-        mgpu_nvvm.cp_async_wait_group(0)
-        mgpu_utils.warp_barrier()
+        """`Gathers`' trailing operands as the body takes them: the entries' ref, then a splat scalar."""
+        entries, parity = ahead
+        return cls(entries, splat_value(parity))
 
     def entry(self, row):
-        """Row `row`'s entry of this step, from shared memory at its parity (`awaited`)."""
+        """Row `row`'s entry of this step, from shared memory at its parity (`Started`, `Drained`)."""
         index = mgpu_ir.IndexType.get()
         return mgpu_memref.load(self.entries, [mgpu_arith.index_cast(index, self.parity),
                                                mgpu_arith.index_cast(index, row)])
 
 
 @dataclasses.dataclass(frozen=True)
+class Started:
+    """`Committed.started`'s body: a load warp's (`share`) step entries in `entries`' `parity`: where the step
+    before filled them (`held`) nothing more, else (a tile's first step) filled now from the step's `rows`
+    (`filled`), its cp.async group drained with the warp's others (`Drained`). Every step's gathers read them
+    there alone (`Held.entry`): one shared-memory read, no branch between it and the table's."""
+
+    share: tuple[int, int]
+    tiled: bool = False
+    """Whether its ring's rows are the tile's (`rings.Rows.tiled`): filled at a tile's first step, held for
+    its others, no step filling the next's (the protocol checker's step count reads it)."""
+
+    def __call__(self, ctx, entries, rows, parity, held) -> None:
+        del ctx
+        i32 = mgpu_ir.IntegerType.get_signless(32)
+        first = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.eq, splat_value(held), mgpu_utils.c(0, i32))
+        branch = mgpu_scf.IfOp(first)
+        with mgpu_ir.InsertionPoint(branch.then_block):
+            filled(entries, rows, splat_value(parity), self.share)
+            mgpu_scf.YieldOp([])
+
+
+@dataclasses.dataclass(frozen=True)
+class Drained:
+    """`Committed.drained`'s body: a load warp's (`share`) cp.async groups awaited, every ring's step entries
+    landed, then the warp met, as a lane's copy is its own until then; where `needed` (a splat: a fill is
+    pending), else nothing."""
+
+    share: tuple[int, int]
+
+    def __call__(self, ctx, needed) -> None:
+        del ctx
+        i32 = mgpu_ir.IntegerType.get_signless(32)
+        pending = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.ne, splat_value(needed), mgpu_utils.c(0, i32))
+        branch = mgpu_scf.IfOp(pending)
+        with mgpu_ir.InsertionPoint(branch.then_block):
+            mgpu_nvvm.cp_async_wait_group(0)
+            mgpu_utils.warp_barrier()
+            mgpu_scf.YieldOp([])
+
+
+@dataclasses.dataclass(frozen=True)
 class Filled:
     """`Committed.load`'s fill of the next step's entries (`rings.Ahead`, under its `live` guard, so its
     slice is formed where the walk has that step): a load warp's (`share`) lanes' cp.async copies of its own
-    tiles' entries of `rows` (`height` of them) into `entries`' `parity` (`filled`), after its step's
-    gathers, once the warp has met: no lane still reads the entries the step before read there."""
+    tiles' entries of `rows` into `entries`' `parity` (`filled`), after its step's gathers, once the warp has
+    met: no lane still reads the entries the step before read there."""
 
     share: tuple[int, int]
-    height: int
 
     def __call__(self, ctx, entries, rows, parity) -> None:
         del ctx
-        tiles = len(warp_tiles(self.share, self.height // swizzling.TILE_ROWS))
         mgpu_utils.warp_barrier()
-        filled(entries, rows, splat_value(parity), _positions(self.share, tiles, swizzling.TILE_ROWS))
+        filled(entries, rows, splat_value(parity), self.share)
 
 
-def filled(entries, table, parity, positions: list) -> None:
-    """`table`'s entries at `positions`' rows (four bytes a lane a pass, the rows the lane holds), each at its
-    address by the table's own stride (a column of a wider table's steps over the others: ae8a242ed F1),
-    copied into `entries`' `parity` by the lanes' cp.async copies, committed as one group."""
+def filled(entries, table, parity, share: tuple[int, int]) -> None:
+    """`table`'s entries of a load warp's (`share`) own tiles of a step's `entries` height (`_positions`, four
+    bytes a lane a pass, the rows the lane holds), each at its address by the table's own stride (a column of
+    a wider table's steps over the others: ae8a242ed F1), copied into `entries`' `parity` by the lanes'
+    cp.async copies, committed as one group: the one owner of a fill's geometry (base review a1ad2b4ca F5)."""
     i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
     height = mgpu_ir.MemRefType(entries.type).shape[1]
+    positions = _positions(share, len(warp_tiles(share, height // swizzling.TILE_ROWS)), swizzling.TILE_ROWS)
     shared = mgpu_utils.memref_ptr(entries)
     source = mgpu_llvm.addrspacecast(mgpu_llvm.PointerType.get(address_space=1), mgpu_utils.memref_ptr(table))
     # A one-axis memref's descriptor: allocated, aligned, offset, sizes, strides.
