@@ -45,6 +45,7 @@ from dew.nn.kernels.templates import (
     attention_decode,
     attention_mosaic,
     attention_portable,
+    attention_route,
     attention_triton,
     mosaic_sm90,
 )
@@ -1196,24 +1197,32 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     default_is_finite(family, "portable")
 
 
-@pytest.mark.skipif(not INTERPRETED, reason="an H100 runs these families in `_mainloops`' Mosaic arms")
+@pytest.mark.skipif(not (INTERPRETED or ON_HOPPER),
+                    reason="runs interpreted as Hopper on CPU or compiled on Hopper (row 6881)")
 @pytest.mark.parametrize("family", ["values at fp32's largest over 2 equal keys",
                                     "values at fp32's largest over 256 equal keys"])
 def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_reference_interpreted(family):
-    """The Mosaic forward in fp32, interpreted on a CPU as an H100 runs it, over values at fp32's limit: check
-    1 over the family's draws, where it summed its operands' bf16 parts and its products' pairs largest first
-    and passed fp32's largest before the smaller terms took it back (inf over 2 keys already, row 6842). A
-    GPU runs it in `_mainloops`' Mosaic arms."""
+    """The Mosaic forward in fp32, routed through `attention_route.attend` (interpreted on a CPU as an H100
+    runs it, or compiled natively on Hopper; rows 6842, 6869, 6881), over values at fp32's limit: check 1
+    over the family's draws, where it summed its operands' bf16 parts and its products' pairs largest first
+    and passed fp32's largest before the smaller terms took it back (inf over 2 keys already)."""
     seeds, family = SEEDS[family], FAMILIES[family]
 
     def forward(query, key, value, extra):
-        with generation.assumed("sm90"):
-            spans = _spans(family, query, key)
-            return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
+        spans = _spans(family, query, key)
+        if INTERPRETED:
+            with generation.assumed("sm90"):
+                return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
+        with generation.chosen(attention_mainloop="mosaic"):
+            return attention_route.attend(query, key, value, spans, None)
 
-    assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
-                    lambda seed: _cast(family, family.draw)(seed)[:4], "mosaic forward at fp32's limit",
-                    seeds=seeds, truth_fn=_reference(family, anchored=True))
+    with generation.routes() as routes:
+        assert_as_exact(jax.jit(forward), as_given(jax.jit(_reference(family, anchored=False))),
+                        lambda seed: _cast(family, family.draw)(seed)[:4], "mosaic forward at fp32's limit",
+                        seeds=seeds, truth_fn=_reference(family, anchored=True))
+    if not INTERPRETED:
+        assert any(found.choice == "attention_mainloop" and found.kernel == "mosaic"
+                   for found in routes), routes
 
 
 MAINLOOPS = ("portable", "triton", "decode_kernel", *(("mosaic", "decode") if INTERPRETED else ()))
