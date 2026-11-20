@@ -1777,13 +1777,17 @@ def fitted_once(trainer: Trainer) -> None:
 
 
 @functools.cache
-def muon_needs() -> tuple[int, int, JSON]:
-    """What the Muon step (`muon_lm`) needs beside what a device holds with its Newton-Schulz stacks joined
-    and parted (`ns_group` 1), and the parted step's remat: measured once for the cells below."""
+def muon_needs() -> tuple[int, JSON]:
+    """The room the cells below free for the Muon step (`muon_lm`) before its state is placed, and the parted
+    step's remat: between what it needs beside what a device holds with its Newton-Schulz stacks joined and
+    with them parted (`ns_group` 1), and the bytes of the arguments the devices hold none of yet, which a fit
+    plans its step beside before placing them (`Trainer._planned_unplaced`). Freed without those, no rung of
+    that plan fits, and the fit searched its ladder twice (row 8606: 129 s a cell). Measured once."""
     with pytest.MonkeyPatch.context() as monkeypatch:
         joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
         parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
-    return joined, parted, trainer.plan["remat"]
+    assert parted < joined, (parted, joined)
+    return (joined + parted) // 2 + trainer.plan["probes"][0]["argument"], trainer.plan["remat"]
 
 
 def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_recomputing(monkeypatch):
@@ -1792,9 +1796,8 @@ def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_rec
     climb's release after the narrow copies, `FitSearch.searched`), and recomputes nothing more, where it
     climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a
     step)."""
-    joined, parted, remat = muon_needs()
-    assert parted < joined, (parted, joined)
-    free(monkeypatch, (parted + joined) // 2)
+    room, remat = muon_needs()
+    free(monkeypatch, room)
     planned = muon_lm()
     fitted_once(planned)
     assert planned.plan["ns_group"] == 1, planned.plan
@@ -1807,8 +1810,8 @@ def test_a_muon_run_that_states_its_stacks_group_keeps_it(monkeypatch):
     planner asks no step of it to join them one at a time (`FitSearch.searched`), whether it then fits
     or is refused (row 8696: in all of the room no release was ever asked, so a stated group overridden
     failed nothing)."""
-    joined, parted, _ = muon_needs()
-    free(monkeypatch, (parted + joined) // 2)
+    room, _ = muon_needs()
+    free(monkeypatch, room)
     stated = muon_lm(ns_group=4)
     try:
         fitted_once(stated)
