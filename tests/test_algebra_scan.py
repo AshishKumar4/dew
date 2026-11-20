@@ -947,15 +947,17 @@ def assert_adjoint(forms, tokenwise_fn, names: tuple[str, ...], chunked, draw_fn
     assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents, label, seeds=seeds)
 
 
+def timed_chunk(values, index):
+    """Chunk `index` of `values`, each along time first."""
+    return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
+
+
 def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16,
                          reads: str = "after") -> None:
     """`forms`' chunk adjoint of the delta rule `update_fn`, on par with its token scan's, each token reading
     as `reads` (`gated_tokenwise`, `assert_adjoint`)."""
-    def chunked(values, index):
-        return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
-
-    assert_adjoint(forms, gated_tokenwise(update_fn, reads), ("q", "k", "v", "g", "beta"), chunked, draw_fn,
-                   ((TOKENS, VALUE), (KEY, VALUE)), label, seeds)
+    assert_adjoint(forms, gated_tokenwise(update_fn, reads), ("q", "k", "v", "g", "beta"), timed_chunk,
+                   draw_fn, ((TOKENS, VALUE), (KEY, VALUE)), label, seeds)
 
 
 @pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
@@ -1300,11 +1302,7 @@ def test_a_two_sided_decays_chunk_adjoint_is_the_token_scans_gradient(steep):
     operand's gradient, its values' decays' among them, on par with the token scan's from float64 (check
     1)."""
     forms = scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
-
-    def chunked(values, index):
-        return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
-
-    assert_adjoint(forms, two_sided_tokenwise, tuple(TWO_SIDED), chunked,
+    assert_adjoint(forms, two_sided_tokenwise, tuple(TWO_SIDED), timed_chunk,
                    functools.partial(two_sided_draw, steep=steep), ((TOKENS, VALUE), (KEY, VALUE)),
                    "two-sided adjoint")
 
