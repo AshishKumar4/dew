@@ -1199,8 +1199,7 @@ def _solves_apart(call: Call) -> bool:
     (`Family.operands_in_registers`). Beside the application's tiles the solve spilled on H100
     (fast32-sm90 at 09bfe984c) and exceeded 99 KB SMEM on consumer mma.sync GPUs (sm86/sm89/sm120, row 8569),
     while 1-part TF32 on `tcgen05` (B200) stays fused and spill-free."""
-    merged = _merged(call)
-    return merged.parts > 1 or (call.family.operands_in_registers and merged.dtype == jnp.float32)
+    return _merged(call).parts > 1 or not solve_persistent(call)
 
 
 def whole_blocks(width: int, block: int) -> list[int]:
