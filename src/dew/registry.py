@@ -107,7 +107,7 @@ type Annotation = type | types.UnionType | types.GenericAlias | typing.TypeAlias
 # module included), and the records and sequences of any of those. This is
 # the width of what may arrive; `build` narrows each one again against the
 # type its member declared before the member ever sees it.
-type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic
+type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic | datetime.timedelta
                    | types.FunctionType | types.BuiltinFunctionType
                    | DataclassInstance | Mapping[str, object]
                    | Mapping[RecordKey, object] | Sequence[Configured])
@@ -268,7 +268,9 @@ def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) ->
     # Only JSON a record holds (`json_value` refuses any other), its every string read once.
     for named in strings_of(json_value(record, "record")):
         module, colon, name = named.partition(":")
-        if colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier():
+        # A string shaped as an import path that names no module (a text field's) is data, not a module.
+        if (colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier()
+                and _importable(module)):
             importlib.import_module(module)
 
 
@@ -714,6 +716,9 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if isinstance(annotation, type) and issubclass(annotation, Enum):
         # An enum's member is recorded as its value, an IntEnum's its int (`to_record`).
         return annotation(value)
+    if annotation is datetime.timedelta and isinstance(value, str):
+        # A duration is recorded as its text (`_records.recorded_duration`), read back by its reader.
+        return _records.duration(value)
     if (isinstance(annotation, type) and annotation in _SCALARS
             and not isinstance(value, (np.generic, np.ndarray, jax.Array))):
         # A field declaring a scalar holds one of its type (`dew._records`' readers), kept as written: a
@@ -805,6 +810,24 @@ def nominal_class(annotation: Annotation) -> type | None:
     return origin
 
 
+def _import_classes(record: JSON) -> None:
+    """Import the module of every class record (`class_record`) `record` holds, nested ones among them,
+    where a trusted package holds it: the classes a build reaches, no other string of the record's."""
+    match record:
+        case dict():
+            named = class_record(record)
+            module = "" if named is None else named[0].partition(":")[0]
+            if module.split(".")[0] in _TRUSTED and module.replace(".", "").isidentifier():
+                importlib.import_module(module)
+            for value in record.values():
+                _import_classes(value)
+        case list():
+            for value in record:
+                _import_classes(value)
+        case _:
+            pass
+
+
 def owned_built(record: JSON, *, called: bool, what: str) -> Configured:
     """What a class record (`class_record`) builds where it names a class of Dew's or of a trusted package
     (`_owned`; with `called`, one whose instances are called), its own module imported where a trusted
@@ -816,9 +839,7 @@ def owned_built(record: JSON, *, called: bool, what: str) -> Configured:
     if named is None:
         raise ValueError(f"{what} is recorded as a class record, {{'class': ..., 'fields': ...}}; got "
                          f"{record!r}")
-    module = named[0].partition(":")[0]
-    if module.split(".")[0] in _TRUSTED and module.replace(".", "").isidentifier():
-        importlib.import_module(module)
+    _import_classes(json_value(record, what))
     member = imported(named[0])
     if not _owned(member, called=called):
         called_so = " whose instances are called" if called else ""

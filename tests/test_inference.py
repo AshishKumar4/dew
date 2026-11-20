@@ -482,6 +482,26 @@ def test_a_saved_runs_processor_keeps_its_fields_as_recorded_and_its_settings_ha
     assert task.processor == Named("> ") and task.processor.dtype == "bfloat16"
 
 
+@dataclasses.dataclass(frozen=True)
+class Timed(PrefixedBytes):
+    """A processor of a user's own holding a duration and a text shaped as an import path."""
+
+    timeout: datetime.timedelta = datetime.timedelta(seconds=3)
+    label: str = "tests.label: text"
+
+
+def test_a_saved_runs_processor_reads_its_durations_and_texts_back(tmp_path):
+    """A saved run's processor holding a duration and a text shaped as an import path rebuilds holding the
+    duration and the text, where the duration read back as its text and the text was imported as a module
+    (row 9065's review)."""
+    objective, state = _tiny_lm(Timed("> "))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    task = TextGeneration.from_run(str(tmp_path / "run"), trust=("tests", Timed.__module__))
+    assert task.processor == Timed("> ")
+
+
 def test_a_processor_its_record_builds_none_of_saves_unrecorded():
     """A processor whose constructor takes its field positionally alone records why it went unrecorded, not
     a record no rebuild reads (row 9065's review)."""

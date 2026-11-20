@@ -1093,7 +1093,7 @@ def recorded_custom(processor: Processor | None) -> JSON:
         record = to_record(processor, Processor | None)
     except Unrecordable as refused:
         return {"unrecorded": f"{type(processor).__qualname__}: {refused}"}
-    named = class_record(_records.record(record, "custom"))
+    named = class_record(record) if isinstance(record, Mapping) else None
     if named is None:
         return {"unrecorded": f"{type(processor).__qualname__}: its record is no class record: {record!r}"}
     try:
