@@ -708,8 +708,8 @@ def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_rol
             pl.run_scoped(
                 scope,
                 plgpu.SMEM((placed.TURNS, dkv.REDUCED, block_q, slot_cols), jnp.float32),
-                plgpu.Barrier(num_barriers=(placed.TURNS, dkv.REDUCED)),
-                plgpu.Barrier(num_barriers=(placed.TURNS, dkv.REDUCED)),
+                tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),
+                tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),
             )
 
         return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(dq_arr.shape, dq_arr.dtype),
