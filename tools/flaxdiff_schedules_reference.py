@@ -42,9 +42,12 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_releases import commit
 from reference_source import loaded, package, published_files, saved_fixture
 
-REPO, COMMIT = "AshishKumar4/FlaxDiff", "15c55b001304604147a2a8002a76cf5d4c32092f"
+REPO, COMMIT = "AshishKumar4/FlaxDiff", commit("flaxdiff-trainer", "flaxdiff")
 # In import order: each module's own imports come before it.
 FILES = {
     "common": "2b7e643c25a09dedd5489b7c62c7c18fb48a5dafb277b1d7aebdd34b7a9748b0",
@@ -73,7 +76,7 @@ def schedulers() -> dict[str, types.ModuleType]:
                                           for name, digest in FILES.items()})
     package("flaxdiff", root / "flaxdiff")
     utils = types.ModuleType("flaxdiff.utils")
-    utils.RandomMarkovState = type("RandomMarkovState", (), {})
+    setattr(utils, "RandomMarkovState", type("RandomMarkovState", (), {}))  # A stand-in module's one name.
     sys.modules["flaxdiff.utils"] = utils
     return {name: loaded(f"flaxdiff.schedulers.{name}", root / "flaxdiff" / "schedulers" / f"{name}.py")
             for name in FILES}

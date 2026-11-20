@@ -77,7 +77,7 @@ def packages(package: Path) -> list[Path]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Check the written blocks without writing them.")
     parser.add_argument("package", nargs="?", type=Path, default=REPO / "src" / "dew")
     args = parser.parse_args()

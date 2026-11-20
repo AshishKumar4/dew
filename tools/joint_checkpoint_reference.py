@@ -61,6 +61,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+COHORT = "fla"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 ROOT = Path(__file__).resolve().parents[1]
 BACKBONE = ROOT / "tests" / "fixtures" / "hf" / "qwen38-dense-tiny"
 OUT = ROOT / "tests" / "fixtures" / "joint_checkpoint" / "tiny"
@@ -127,7 +131,7 @@ def main() -> None:
 
     cases = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())
     layouts, states, logits = {}, {}, {}
-    table = backbone.get_output_embeddings().weight
+    table = backbone.lm_head.weight
     for case, request in cases.items():
         encoded = upstream.encode_record(tokenizer, as_upstream(request))
         layouts[case] = {"ids": list(encoded.input_ids), "questions": [
@@ -154,8 +158,8 @@ def main() -> None:
             logits[f"{case}/{question.question_id}/head64"] = on_fp32.double().numpy()
             logits[f"{case}/{question.question_id}/f64"] = whole.double().numpy()
     (OUT / "layouts.json").write_text(json.dumps(layouts) + "\n")
-    np.savez(OUT / "states.npz", **states)
-    np.savez(OUT / "logits.npz", **logits)
+    np.savez(OUT / "states.npz", allow_pickle=False, **states)
+    np.savez(OUT / "logits.npz", allow_pickle=False, **logits)
 
 
 def on_fla() -> None:
@@ -187,12 +191,14 @@ def on_fla() -> None:
     upstream, _ = upstream_module()
     tokenizer = AutoTokenizer.from_pretrained(BACKBONE)
     backbone = Qwen3_5ForConditionalGeneration.from_pretrained(BACKBONE, dtype=torch.float32,
-                                                               attn_implementation="eager").to(device).eval()
+                                                               attn_implementation="eager")
+    # transformers' `to` wrapper loses its binding to the type checker: called through the class.
+    backbone = Qwen3_5ForConditionalGeneration.to(backbone, device).eval()
     head = upstream.JointSchemaHead(**json.loads((OUT / "joint_head_config.json").read_text())).eval()
     head.load_state_dict(load_file(OUT / "joint_head.safetensors"), strict=True)
     head = head.to(device)
     cases = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())
-    table, text, logits = backbone.get_output_embeddings().weight, backbone.model.language_model, {}
+    table, text, logits = backbone.lm_head.weight, backbone.model.language_model, {}
     for case, request in cases.items():
         encoded = upstream.encode_record(tokenizer, as_upstream(request))
         batch = upstream.collate_records([encoded], tokenizer.pad_token_id, device)
@@ -203,7 +209,7 @@ def on_fla() -> None:
         for question, fp32 in zip(encoded.questions, found, strict=True):
             logits[f"{case}/{question.question_id}"] = fp32.cpu().numpy()
     assert calls, "no layer ran fla's rule"
-    np.savez(OUT / "logits_fla.npz", **logits, precision=upstream_precision())
+    np.savez(OUT / "logits_fla.npz", allow_pickle=False, **logits, precision=upstream_precision())
 
 
 def upstream_precision() -> str:
@@ -327,7 +333,7 @@ def parity() -> None:
     torch.set_float32_matmul_precision("highest")
     upstream, processor, backbone, head, model, exact = released()
     tokenizer, pad = processor.tokenizer, processor.tokenizer.pad_token_id
-    table = backbone.get_output_embeddings().weight
+    table = backbone.lm_head.weight
     with float64():
         exact_table = exact.language_model.get_output_embeddings().weight
     cpu = torch.device("cpu")

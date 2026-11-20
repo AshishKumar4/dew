@@ -18,14 +18,17 @@ from pathlib import Path
 
 import numpy as np
 import tensorflow_datasets as tfds
+from tensorflow_datasets.core.dataset_builder import GeneratorBasedBuilder
+from tensorflow_datasets.core.dataset_info import DatasetInfo
+from tensorflow_datasets.core.utils.version import Version
 from passages import PASSAGES
 
 
-class DewImages(tfds.core.GeneratorBasedBuilder):
-    VERSION = tfds.core.Version("1.0.0")
+class DewImages(GeneratorBasedBuilder):
+    VERSION = Version("1.0.0")
 
     def _info(self):
-        return tfds.core.DatasetInfo(
+        return DatasetInfo(
             builder=self, disable_shuffling=True,
             features=tfds.features.FeaturesDict({
                 "image": tfds.features.Image(shape=(8, 8, 3), encoding_format="png"),
@@ -34,27 +37,28 @@ class DewImages(tfds.core.GeneratorBasedBuilder):
 
     def _split_generators(self, dl_manager):
         del dl_manager
-        return {"train": self._generate_examples(0, 16),
-                "test": self._generate_examples(16, 20)}
+        return {"train": self._generate_examples(start=0, stop=16),
+                "test": self._generate_examples(start=16, stop=20)}
 
-    def _generate_examples(self, start, stop):
-        for index in range(start, stop):
+    def _generate_examples(self, **bounds: int):
+        """Examples `start` to `stop` (`bounds`, by keyword as tfds' signature takes them)."""
+        for index in range(bounds["start"], bounds["stop"]):
             yield index, {"image": np.full((8, 8, 3), index + 10, np.uint8),
                           "label": index % 2}
 
 
-class DewPassages(tfds.core.GeneratorBasedBuilder):
-    VERSION = tfds.core.Version("1.0.0")
+class DewPassages(GeneratorBasedBuilder):
+    VERSION = Version("1.0.0")
 
     def _info(self):
-        return tfds.core.DatasetInfo(builder=self, disable_shuffling=True,
-                                     features=tfds.features.FeaturesDict({"text": tfds.features.Text()}))
+        return DatasetInfo(builder=self, disable_shuffling=True,
+                           features=tfds.features.FeaturesDict({"text": tfds.features.Text()}))
 
     def _split_generators(self, dl_manager):
         del dl_manager
         return {"train": self._generate_examples()}
 
-    def _generate_examples(self):
+    def _generate_examples(self, **_: object):
         for index, passage in enumerate(PASSAGES):
             yield index, {"text": passage}
 

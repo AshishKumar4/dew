@@ -34,13 +34,17 @@ The container holds the environment (`megatron.Containerfile`):
     torchrun --nproc-per-node 2 megatron_lm.py --tp 2 ...
 """
 
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
 import os
+from collections.abc import Callable
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -48,6 +52,16 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from common import WorkloadWork, documents
 from torch_runs import Ranks, Split, finish, record, split, torch_arguments, train
+
+if TYPE_CHECKING:
+    from megatron.core.distributed import DistributedDataParallel, FullyShardedDataParallel
+    from megatron.core.optimizer import MegatronOptimizer
+    from megatron.core.transformer import TransformerConfig
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+COHORT = "megatron"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
 
 
 def arguments(argv=None) -> argparse.Namespace:
@@ -93,7 +107,7 @@ def text_config(model: str) -> dict:
     return config.get("text_config", config)
 
 
-def model_parts(hf: dict, args: argparse.Namespace):
+def model_parts(hf: dict, args: argparse.Namespace) -> tuple[TransformerConfig, ModuleSpec, dict[str, Any]]:
     """Megatron-Core's TransformerConfig, layer spec and GPTModel arguments for the checkpoint's shape."""
     from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
         get_transformer_block_with_experimental_attention_variant_spec,
@@ -101,13 +115,15 @@ def model_parts(hf: dict, args: argparse.Namespace):
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
     from megatron.core.transformer import TransformerConfig
     from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.core.transformer.transformer_block import TransformerBlock
 
     rope = hf.get("rope_parameters") or {"rope_theta": hf.get("rope_theta", 10000.0)}
     if hf.get("attention_bias") or hf.get("mlp_bias"):
         # Megatron-Core biases q/k/v alone or every linear layer; an HF decoder's
         # biased attention also biases its output projection.
         raise SystemExit(f"{args.model} has biased linear layers; this mapping builds bias-free decoders")
-    common = dict(
+    common: dict[str, Any] = dict(
         num_layers=hf["num_hidden_layers"], hidden_size=hf["hidden_size"],
         ffn_hidden_size=hf["intermediate_size"], num_attention_heads=hf["num_attention_heads"],
         num_query_groups=hf["num_key_value_heads"],
@@ -147,12 +163,14 @@ def model_parts(hf: dict, args: argparse.Namespace):
             linear_num_key_heads=hf["linear_num_key_heads"],
             linear_num_value_heads=hf["linear_num_value_heads"])
         # One pipeline stage holds every layer.
-        spec = get_transformer_block_with_experimental_attention_variant_spec(config, pp_rank=0)
+        # The block's submodules as GPTModel's spec names a block: TransformerBlock takes either alike.
+        block = get_transformer_block_with_experimental_attention_variant_spec(config, pp_rank=0)
+        spec = ModuleSpec(module=TransformerBlock, submodules=block)
         rotary_percent = rope.get("partial_rotary_factor", 1.0)
     else:
         raise SystemExit(f"{model_type} has no Megatron-Core mapping here; llama and qwen3_5 do")
     # Llama 3.1's frequency scaling is Megatron-Core's rope_scaling.
-    scaling = {"rope_scaling": True, "rope_scaling_factor": rope["factor"]} \
+    scaling: dict[str, Any] = {"rope_scaling": True, "rope_scaling_factor": rope["factor"]} \
         if rope.get("rope_type") == "llama3" else {}
     return config, spec, dict(
         vocab_size=hf["vocab_size"], share_embeddings_and_output_weights=hf.get("tie_word_embeddings", False),
@@ -165,10 +183,10 @@ class Run:
     """The wrapped model, its optimizer and schedule, the windows a step
     reads and, packed, their documents."""
 
-    model: torch.nn.Module
-    optimizer: object
-    forward_backward: object
-    config: object
+    model: DistributedDataParallel | FullyShardedDataParallel
+    optimizer: MegatronOptimizer
+    forward_backward: Callable[..., list[dict[str, torch.Tensor]]]
+    config: TransformerConfig
     split: Split
     segments: np.ndarray | None
 
@@ -277,7 +295,11 @@ def train_step(args: argparse.Namespace, place: Ranks, run: Run, step: int) -> t
         forward_step_func=forward_step, data_iterator=iter(batches), model=[run.model],
         num_microbatches=layout.accumulation, seq_length=layout.seq, micro_batch_size=layout.micro,
         forward_only=False)
-    _, norm, _ = run.optimizer.step()
+    assert reported is not None  # The last pipeline stage's losses, which this one stage is.
+    # Its success, gradient norm and zero count: what every optimizer get_megatron_optimizer makes returns,
+    # though the base class's step, a stub, reads as returning None.
+    stepped: Any = run.optimizer.step()
+    _, norm, _ = stepped
     return torch.stack([entry["lm loss"] for entry in reported]).sum(dim=0), norm, None
 
 

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import sys
 import types
 from pathlib import Path
 
@@ -47,9 +48,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+# Its neighbours by name whether it runs or a test imports it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_releases import commit
 from reference_source import fetched, ran, selected
 
-COMMIT = "15c55b001304604147a2a8002a76cf5d4c32092f"
+COMMIT = commit("flaxdiff-trainer", "flaxdiff")
 FLAXDIFF = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{COMMIT}/flaxdiff/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flaxdiff_solvers" / "solvers.npz"
 STEPS, SIGMA_MAX, RHO, SIGMA_DATA = 12, 80.0, 7.0, 0.5
@@ -93,6 +97,8 @@ def published(*, wide: bool = False) -> dict:
     holder = ast.parse("class DiffusionSampler:\n"
                        "    def __init__(self, noise_schedule):\n"
                        "        self.noise_schedule = noise_schedule\n").body[0]
+    if not isinstance(holder, ast.ClassDef):
+        raise TypeError("the holder parsed as no class")
     holder.body.extend(methods)
     ran([holder], scope, "flaxdiff/samplers/common.py")
     for path, name in SAMPLERS.values():

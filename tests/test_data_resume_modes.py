@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from data_support import Fetched
 from recording import RecordingTracker
 from test_run_budgets import BATCH, PEAK, Pulled, records
 
@@ -98,6 +99,35 @@ def test_a_run_refuses_a_loader_compiled_to_resume_otherwise():
             trainer.fit(compile(chain, resume=compiled), steps=1)
     trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0, data_resume="exact")
     assert int(trainer.fit(compile(chain, resume="exact"), steps=1).step) == 1
+
+
+def test_an_exact_resume_of_volatile_data_is_refused_and_a_relaxed_one_reads_on():
+    """A position over a volatile step is refused an exact resume, naming its volatility, whose fetched
+    outcomes may change the row read next (row 9012: it was warned of and read on); a relaxed one reads
+    on."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.plan import PlanChanged
+
+    (x,) = records(0)
+    chain = Pipeline(Memory({"x": x}), name="xs").map(Fetched(), identity="fetched@1").repeat().batch(BATCH)
+    for resume in ("exact", "relaxed"):
+        loader = compile(chain, read="streamed", loading=Loading(workers=0), resume=resume)
+        stream = loader.train(DataPartition())
+        next(stream)
+        saved = stream.get_state()
+        stream.close()
+        resumed = loader.train(DataPartition())
+        try:
+            if resume == "exact":
+                with pytest.raises(PlanChanged) as refused:
+                    resumed.set_state(saved)
+                assert "volatile" in refused.value.differs
+            else:
+                resumed.set_state(saved)
+                next(resumed)
+        finally:
+            resumed.close()
 
 
 def test_a_position_read_by_other_rules_names_every_one():

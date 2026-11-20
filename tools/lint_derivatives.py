@@ -47,7 +47,8 @@ def _call_name(node: ast.expr) -> str | None:
     return getattr(node, "attr", None) or getattr(node, "id", None)
 
 
-def derivative_seams(relative: str, tree: ast.Module) -> Iterator[tuple[str, str, ast.AST, ast.expr | None]]:
+def derivative_seams(relative: str, tree: ast.Module
+                     ) -> Iterator[tuple[str, str, ast.stmt | ast.expr, ast.Call | None]]:
     """`relative`'s custom derivatives: each seam's `relative::qualified name`, what makes it, the node to
     report, and its declaration (`contracted(...)`), if any. A seam is a function a maker decorates, its
     declaration a decorator beside it, or any call of a maker elsewhere (`DERIVATIVE_MAKERS`: assigned,
@@ -58,7 +59,7 @@ def derivative_seams(relative: str, tree: ast.Module) -> Iterator[tuple[str, str
                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                   for decorator in node.decorator_list}
 
-    def declared(node: ast.expr) -> ast.expr | None:
+    def declared(node: ast.expr) -> ast.Call | None:
         """The `contracted(...)` call wrapping the call `node` (`contracted(...)(node)`), if any."""
         outer = parents.get(node)
         if (isinstance(outer, ast.Call) and outer.args == [node] and isinstance(outer.func, ast.Call)
@@ -82,14 +83,15 @@ def derivative_seams(relative: str, tree: ast.Module) -> Iterator[tuple[str, str
         of its result (a partial's), else its maker within `scope`."""
         holder = parents.get(call)
         if declared(call) is not None:
-            holder = parents.get(holder)
+            holder = parents.get(holder) if holder is not None else None
         while isinstance(holder, ast.Call) and holder.func is call:
             call, holder = holder, parents.get(holder)
         target = (holder.targets[0] if isinstance(holder, ast.Assign) and len(holder.targets) == 1
                   else holder.target if isinstance(holder, ast.AnnAssign) else None)
         return ".".join([*scope, target.id if isinstance(target, ast.Name) else maker.split(":")[0]])
 
-    def walk(node: ast.AST, scope: list[str]) -> Iterator[tuple[str, str, ast.AST, ast.expr | None]]:
+    def walk(node: ast.AST, scope: list[str]
+             ) -> Iterator[tuple[str, str, ast.stmt | ast.expr, ast.Call | None]]:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if not isinstance(child, ast.ClassDef):
@@ -136,7 +138,8 @@ def missing(relative: str, tree: ast.Module, checkout: Path) -> Iterator[tuple[i
             yield (*where, f"{name} ({maker}) makes a custom derivative with no contract: declare "
                            "`contracted(test)` of dew.nn.derivatives at it")
             continue
-        named = [argument.value for argument in contract.args if isinstance(argument, ast.Constant)]
+        named = [argument.value for argument in contract.args
+                 if isinstance(argument, ast.Constant) and isinstance(argument.value, str)]
         if len(named) != 1 or len(contract.args) != 1 or contract_tests(checkout)[named[0]] != 1:
             yield (*where, f"{name}'s contract names {named}, not one test function of "
                            "tests/test_contracts_*.py")

@@ -35,10 +35,18 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import flux2_ids, perturb, recording, saved_pipeline, tiny_qwen3_encoder
+from diffusers_reference_helpers import (
+    flux2_ids,
+    perturb,
+    recording,
+    returned,
+    saved_pipeline,
+    tiny_qwen3_encoder,
+)
 from reference_releases import RELEASES
 
 from _dew_torch.precision import float64, float64_twin
@@ -89,7 +97,7 @@ def twice(walk, model) -> dict[str, np.ndarray]:
 
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     """The case's saved transformer and its walk in float32 and in float64."""
-    from diffusers import Flux2Transformer2DModel
+    from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
 
     config = {**BASE, **case.config}
     torch.manual_seed(SEED)
@@ -138,19 +146,25 @@ def build_vae(name: str, root: Path) -> dict[str, np.ndarray]:
     it: `_encode_vae_image` (posterior mode, 2x2 fold, batch-norm
     normalization) and the call's decode (the inverse, then `vae.decode`),
     with the gradients of fixed probes against the pixels and the latent."""
-    from diffusers import AutoencoderKLFlux2, Flux2Pipeline
+    from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
+    from diffusers.models.modeling_outputs import AutoencoderKLOutput
+    from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline
 
     torch.manual_seed(SEED)
     model = AutoencoderKLFlux2(**VAE, **VAES[name]).eval()
     generator = torch.Generator().manual_seed(SEED + 2)
     perturb(generator, 0.05, model)
     with torch.no_grad():
-        model.bn.running_mean.copy_(0.3 * torch.randn(model.bn.running_mean.shape, generator=generator))
-        model.bn.running_var.copy_(torch.rand(model.bn.running_var.shape, generator=generator) + 0.2)
+        mean, variance = model.bn.running_mean, model.bn.running_var
+        if mean is None or variance is None:
+            raise ValueError("the VAE's batch norm tracks no running statistics to draw")
+        mean.copy_(0.3 * torch.randn(mean.shape, generator=generator))
+        variance.copy_(torch.rand(variance.shape, generator=generator) + 0.2)
     model.save_pretrained(root / name / "vae", safe_serialization=True)
     image = torch.rand((2, 3, 16, 24), generator=generator) * 2 - 1
     with torch.no_grad():
-        folded = Flux2Pipeline._patchify_latents(model.encode(image).latent_dist.mode()).shape
+        folded = Flux2Pipeline._patchify_latents(
+            returned(model.encode(image), AutoencoderKLOutput).latent_dist.mode()).shape
     probe_latent, code = (torch.randn(folded, generator=generator) for _ in range(2))
     probe = torch.randn(image.shape, generator=generator)
 
@@ -187,7 +201,7 @@ def smooth_image() -> np.ndarray:
 
 def published_vae():
     """The published VAE (`PUBLISHED_VAE`), downloaded, on the CPU."""
-    from diffusers import AutoencoderKLFlux2
+    from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
 
     return AutoencoderKLFlux2.from_pretrained(PUBLISHED_VAE[0], subfolder="vae", revision=PUBLISHED_VAE[1]).eval()
 
@@ -195,7 +209,7 @@ def published_vae():
 def published_walk(model, dtype) -> dict[str, np.ndarray]:
     """`model`'s (the published VAE's) pipeline latent of `smooth_image()` and its decode's top-left `CROP`
     pixels at `dtype`, on the device `model` is on."""
-    from diffusers import Flux2Pipeline
+    from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline
 
     device = next(model.parameters()).device
     with torch.no_grad():
@@ -214,7 +228,7 @@ def published(destination: str) -> None:
     and in float64 (`.fp64`), for `tests/fixtures/flux2_published.npz`."""
     arrays = {key.replace("fp64.vae.", "vae.") + (".fp64" if key.startswith("fp64.") else ""): value
               for key, value in twice(published_walk, published_vae()).items()}
-    np.savez_compressed(destination, **arrays)
+    np.savez_compressed(destination, allow_pickle=False, **arrays)
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 
@@ -241,12 +255,10 @@ def text_encoder(tok):
 
 
 def build_pipeline(root: Path):
-    from diffusers import (
-        AutoencoderKLFlux2,
-        FlowMatchEulerDiscreteScheduler,
-        Flux2KleinPipeline,
-        Flux2Transformer2DModel,
-    )
+    from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
+    from diffusers.models.transformers.transformer_flux2 import Flux2Transformer2DModel
+    from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
     from make_tiny_tokenizer import qwen_byte_tokenizer
 
     tok = qwen_byte_tokenizer(json.loads((SOURCE / "tokenizer" / "tokenizer_config.json").read_text()),
@@ -258,10 +270,14 @@ def build_pipeline(root: Path):
     generator = torch.Generator().manual_seed(SEED + 8)
     perturb(generator, 0.05, vae, transformer)
     with torch.no_grad():
-        vae.bn.running_mean.copy_(0.3 * torch.randn(vae.bn.running_mean.shape, generator=generator))
-        vae.bn.running_var.copy_(torch.rand(vae.bn.running_var.shape, generator=generator) + 0.2)
+        mean, variance = vae.bn.running_mean, vae.bn.running_var
+        if mean is None or variance is None:
+            raise ValueError("the VAE's batch norm tracks no running statistics to draw")
+        mean.copy_(0.3 * torch.randn(mean.shape, generator=generator))
+        variance.copy_(torch.rand(variance.shape, generator=generator) + 0.2)
     scheduler = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
-    pipe = Flux2KleinPipeline(scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler), vae=vae,
+    pipe = Flux2KleinPipeline(scheduler=returned(FlowMatchEulerDiscreteScheduler.from_config(scheduler),
+                                                 FlowMatchEulerDiscreteScheduler), vae=vae,
                               text_encoder=encoder, tokenizer=tok, transformer=transformer, is_distilled=False)
     return saved_pipeline(pipe, root / "pipeline", HEIGHT, WIDTH)
 
@@ -331,7 +347,7 @@ def mistral_tokenizer():
 
 
 def build_mistral3(root: Path) -> dict[str, np.ndarray]:
-    from diffusers import Flux2Pipeline
+    from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline
     from transformers import AutoModelForImageTextToText, Mistral3Config
 
     tok = mistral_tokenizer()
@@ -349,10 +365,13 @@ def build_mistral3(root: Path) -> dict[str, np.ndarray]:
     model.save_pretrained(root / "mistral3" / "text_encoder", safe_serialization=True)
     tok.save_pretrained(root / "mistral3" / "tokenizer")
 
+    # The pipeline types its tokenizer by transformers' factory class, not the tokenizer it is handed.
+    processor: Any = tok
+
     def walk(model, dtype) -> dict[str, np.ndarray]:
         with torch.no_grad():
             return {"context": Flux2Pipeline._get_mistral_3_small_prompt_embeds(
-                model, tok, list(PROMPTS), dtype=dtype, device=torch.device("cpu")).numpy()}
+                model, processor, list(PROMPTS), dtype=dtype, device=torch.device("cpu")).numpy()}
 
     arrays = twice(walk, model)
     print(f"mistral3: context {arrays['context'].shape}")
@@ -373,7 +392,7 @@ def main(destination: str) -> None:
                            "width": WIDTH, "steps": STEPS}, "tokens": TOKENS, "seed": SEED,
               "cases": {name: {"config": {**BASE, **case.config}, "grid": list(case.grid),
                                "guidance": list(case.guidance)} for name, case in CASES.items()}}
-    np.savez_compressed(root / "flux2_transformer.npz", **arrays)
+    np.savez_compressed(root / "flux2_transformer.npz", allow_pickle=False, **arrays)
     (root / "flux2_transformer.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")

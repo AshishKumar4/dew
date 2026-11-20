@@ -1296,13 +1296,14 @@ def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int]
 @dataclasses.dataclass(frozen=True)
 class Start:
     """What `Trainer.place` reads before it places the state (`Trainer._started`): the objective's
-    held tree and the key, the state's shapes and which frozen leaves its init passes through
-    (`traced_draw`), the checkpoint step a run resumes from, the state's placement and its build."""
+    held tree and the key, the state's shapes, which frozen leaves its init passes through and which it
+    builds (`traced_draw`), the checkpoint step a run resumes from, the state's placement and its build."""
 
     initializer: Initializer
     key: jax.Array
     abstract: TrainState
     through: dict[int, int]
+    built: tuple[int, ...]
     resume: int | None
     shardings: Placement[TrainState]
     build: Callable[[Initializer, jax.Array], TrainState]
@@ -1312,7 +1313,7 @@ class Start:
     """Each device's bytes of the state, by its id, as the layout validates its placement
     (`Validation.device_bytes`): its own memory's alone, none of a field kept in the host's."""
     kept: bool = False
-    """Whether its build is the one its process keeps for the trainer's refits (`traced_start`'s, under the
+    """Whether its build is the one its process keeps for the trainer's refits (`traced_draw`'s, under the
     trainer's step key): only such a build's program a refit reads again (`start_build`)."""
 
     def unplaced(self, mesh: Mesh) -> int:
@@ -1342,7 +1343,8 @@ class Start:
         (`placed_host`)."""
         from dew.training.distributed import start_build
 
-        return start_build(self.build, self.initializer, self.shardings, self.through, kept=self.kept)
+        return start_build(self.build, self.initializer, self.shardings, self.through, self.built,
+                           kept=self.kept)
 
 
 def _rollout_admitted(rollout: Rollout | None) -> Rollout | None:

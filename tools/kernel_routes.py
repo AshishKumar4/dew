@@ -123,13 +123,16 @@ def published(config: dict) -> tuple[dict, bool]:
 def audited() -> tuple[str, ...]:
     """The devices the report traces each family on (`generation.assumed`): every CUDA generation of
     `generation.TARGETS` Dew's kernels take (from `generation.BF16_GPU`, `triton_runs`), then Blackwell's
-    datacenter part (sm100), while the targets do not list it, and a TPU (v6e)."""
+    datacenter part (sm100), while the targets do not list it, and every TPU of the targets Dew's templates
+    run on (`generation.architecture`: each one's capabilities its own)."""
     from dew.nn.kernels import generation
 
     taken = tuple(name for name in generation.TARGETS
                   if (capability := generation.capability(name)) is not None
                   and 10 * capability[0] + capability[1] >= generation.BF16_GPU)
-    return (*taken, *(name for name in ("sm100", "v6e") if name not in taken))
+    tpus = tuple(name for name, target in generation.TARGETS.items()
+                 if generation.tpu(target) and generation.architecture(name) is not None)
+    return (*taken, *(name for name in ("sm100",) if name not in taken), *tpus)
 
 
 LAYOUT_GAPS = {"attention": "ledger 838"}

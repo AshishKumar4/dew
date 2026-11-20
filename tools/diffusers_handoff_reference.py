@@ -16,6 +16,7 @@ import contextlib
 import functools
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -23,7 +24,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _dew_torch.precision import float64
-from tools.diffusers_reference_helpers import restore_transformers_names
+from tools.diffusers_reference_helpers import restore_transformers_names, returned
 from tools.diffusers_wan_reference import float64_scheduler
 
 restore_transformers_names()
@@ -33,22 +34,31 @@ PROMPT, NEGATIVE = "cat", "dog"
 
 
 def pipelines(root: Path, dtype: torch.dtype):
-    import diffusers
+    from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+    from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import (
+        StableDiffusionXLImg2ImgPipeline,
+    )
+    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
     from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
     base = root / "xl"
-    config = diffusers.DDIMScheduler.load_config(base, subfolder="scheduler")
-    scheduler = diffusers.DDIMScheduler.from_config(config)
-    first = diffusers.StableDiffusionXLPipeline(
-        vae=diffusers.AutoencoderKL.from_pretrained(base, subfolder="vae", torch_dtype=dtype),
+    config = returned(DDIMScheduler.load_config(base, subfolder="scheduler"), dict)
+    scheduler = returned(DDIMScheduler.from_config(config), DDIMScheduler)
+    # The pipeline types its scheduler as Diffusers' enum of scheduler names, not a scheduler: its
+    # components as the pipeline takes them.
+    components: dict[str, Any] = dict(
+        vae=AutoencoderKL.from_pretrained(base, subfolder="vae", torch_dtype=dtype),
         text_encoder=CLIPTextModel.from_pretrained(base, subfolder="text_encoder", dtype=dtype),
         text_encoder_2=CLIPTextModelWithProjection.from_pretrained(base, subfolder="text_encoder_2",
                                                                    dtype=dtype),
         tokenizer=CLIPTokenizer.from_pretrained(base, subfolder="tokenizer"),
         tokenizer_2=CLIPTokenizer.from_pretrained(base, subfolder="tokenizer_2"),
-        unet=diffusers.UNet2DConditionModel.from_pretrained(base, subfolder="unet", torch_dtype=dtype),
+        unet=UNet2DConditionModel.from_pretrained(base, subfolder="unet", torch_dtype=dtype),
         scheduler=scheduler)
-    second = diffusers.StableDiffusionXLImg2ImgPipeline.from_pretrained(root / "refiner", torch_dtype=dtype)
+    first = StableDiffusionXLPipeline(**components)
+    second = StableDiffusionXLImg2ImgPipeline.from_pretrained(root / "refiner", torch_dtype=dtype)
     return first, second
 
 
@@ -65,6 +75,7 @@ def built(root: Path, wide: bool):
 def handed(root: Path, noise: np.ndarray, *, wide: bool) -> dict[str, np.ndarray]:
     """The base's latents (`prefix`), the refiner's (`final`) and its decoded `images`, channels last, from
     `noise` (channels last), in float32 or (`wide`) float64."""
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
     from diffusers.schedulers import scheduling_ddim
 
     dtype = torch.float64 if wide else torch.float32
@@ -74,8 +85,11 @@ def handed(root: Path, noise: np.ndarray, *, wide: bool) -> dict[str, np.ndarray
         latents = torch.from_numpy(np.ascontiguousarray(np.moveaxis(np.asarray(noise), -1, 1))).to(dtype)
         common = {"prompt": PROMPT, "negative_prompt": NEGATIVE, "num_inference_steps": STEPS,
                   "guidance_scale": GUIDANCE}
-        prefix = base(**common, latents=latents, denoising_end=CUTOFF, output_type="latent").images
-        final = refiner(**common, image=prefix, denoising_start=CUTOFF, output_type="latent").images
+        # Latents, as output_type="latent" asks (the output types its images as decoded ones).
+        prefix = returned(returned(base(**common, latents=latents, denoising_end=CUTOFF, output_type="latent"),
+                                   StableDiffusionXLPipelineOutput).images, torch.Tensor)
+        final = returned(returned(refiner(**common, image=prefix, denoising_start=CUTOFF, output_type="latent"),
+                                  StableDiffusionXLPipelineOutput).images, torch.Tensor)
         images = refiner.vae.decode(final / refiner.vae.config.scaling_factor).sample
     return {"prefix": np.moveaxis(prefix.numpy(), 1, -1), "final": np.moveaxis(final.numpy(), 1, -1),
             "images": np.moveaxis(images.numpy(), 1, -1)}
