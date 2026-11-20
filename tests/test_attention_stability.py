@@ -1290,8 +1290,9 @@ def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
     centre = np.float32(tie * divisor)
     acc = np.concatenate([np.nextafter(centre, -np.inf), centre, np.nextafter(centre, np.inf)])
     divisor, tie, centre = (np.tile(x, 3) for x in (divisor, tie, centre))
-    # A tie's product with a divisor past fp32's largest is no sum a quotient of the tie has.
-    finite = np.isfinite(centre) & np.isfinite(acc)
+    # A tie's product with a divisor past fp32's largest is no sum a quotient of the tie has, and one below
+    # fp32's least normal a sum XLA's CPU flushes (row 4023).
+    finite = np.isfinite(centre) & np.isfinite(acc) & (np.abs(acc) >= np.finfo(np.float32).tiny)
     acc, divisor, tie = acc[finite], divisor[finite], tie[finite]
     rounded = np.asarray(jnp.asarray(acc) / jnp.asarray(divisor))
     settled = algebra.narrowing_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
