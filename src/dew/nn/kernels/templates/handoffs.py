@@ -93,12 +93,25 @@ class Schedule:
     def role(self, name: str) -> Role:
         return next(role for role in self.roles if role.name == name)
 
-    def joined(self, role: Role, count: int) -> Schedule:
-        """The schedule with `count` warps of `role` among its last warpgroup's warp roles (a launch's
-        `REDUCER`, a warp a compute role)."""
-        if not role.warp or not any(other.warp for other in self.roles):
-            raise ValueError(f"{role.name} joins a schedule's warp roles, which {self.roles} holds none of")
-        return dataclasses.replace(self, roles=(*self.roles, dataclasses.replace(role, count=count)))
+    def joined(self, role: Role, count: int, *handoffs: HandOff) -> Schedule:
+        """The schedule with `count` units of `role` and the `handoffs` it fills or gives back: a warp role
+        among its last warpgroup's warp roles (a launch's `REDUCER`, a warp a compute role); a warpgroup role
+        of a weight after its raised roles, before its last warpgroup's (a correction warpgroup beside an
+        attention launch's consumers, FlashAttention-4's), its registers its weight's share of the raise
+        (`registers`). A warpgroup role of weight 0 has no warpgroup to join: the last is the lowered one."""
+        placed = dataclasses.replace(role, count=count)
+        if role.warp:
+            if not any(other.warp for other in self.roles):
+                raise ValueError(f"{role.name} joins a schedule's warp roles, which {self.roles} holds "
+                                 f"none of")
+            roles = (*self.roles, placed)
+        elif role.weight:
+            raised = self.raised
+            roles = (*raised, placed, *self.roles[len(raised):])
+        else:
+            raise ValueError(f"{role.name}, a warpgroup role of weight 0, has no warpgroup of a schedule "
+                             f"to join")
+        return dataclasses.replace(self, roles=roles, handoffs=(*self.handoffs, *handoffs))
 
     def warpgroups(self) -> int:
         """The warpgroups a program of this schedule runs (`kernel`'s `warpgroups`)."""
