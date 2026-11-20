@@ -696,3 +696,120 @@ def _moved(reached: Mapping, started: Mapping, weights: jax.Array) -> Mapping:
     moves = jax.tree.map(lambda end, began: jnp.sum(jnp.where(
         counted.reshape(-1, *[1] * (end.ndim - 1)), end - began, 0), axis=0), reached, started)
     return jax.lax.stop_gradient({"moves": moves, "rows": jnp.sum(counted).astype(jnp.float32)})
+
+
+IN_CONTEXT = "in_context"
+"""The decode cache's entry an adapting decoder keeps its rows' chain in (`InContextDecoder`)."""
+
+
+class InContextDecoder(nn.Module):
+    """`model` decoding with its continuum level stepped in context as its training forward steps it
+    (`adapted_scores` under `adaptation`): the model a language model that adapts in context generates
+    with (row 9066).
+
+    Its trunk and its trunk's cache are `model`'s own, in `model`'s scope, so it reads `model`'s variables
+    as they are. Beside them its decode cache holds each row's chain (`_Chain`'s scan carry: each level's
+    version, its open window's gradient, the row's run and windows) and the state of its last real slot,
+    which waits for its target, the row's next real token. Each real token a call reads is that slot's
+    target: the slot is one block of the training scan (`_Chain.block`), a slot of one token, where a
+    block of the training scan's own size holds several, so a window closed by the token steps its level
+    as training steps it. The token's own slot is then scored at the versions it reads (`_Chain.opened`,
+    `_Chain.scored`), so a row's next token is drawn from the logits its training forward gives that slot.
+    A row is one run, its prompt and what it draws, its windows counted from its first real token.
+
+    A damped step reads bounds over the whole sequence, which a decode has not seen, and a stacked
+    adaptation steps the trunk, whose cache a decode keeps: neither decodes, each refused by name."""
+
+    model: nn.Module
+    adaptation: ChunkAdaptation
+
+    def setup(self):
+        if self.adaptation.damped:
+            raise ValueError("a damped step reads bounds over the whole sequence, which a decode has not "
+                             "seen: generation reads an undamped adaptation alone")
+        if self.adaptation.layers:
+            raise ValueError("a stacked adaptation steps the trunk, whose cache a decode keeps: generation "
+                             "reads a level on the final states alone")
+        self.decoder = self.model.clone()
+        nn.share_scope(self, self.decoder)
+
+    @property
+    def max_seq_len(self) -> int:
+        """The positions the model reads, its own (`dew.nn.protocols.Bounded`)."""
+        return self.model.max_seq_len
+
+    def init_cache(self, batch_size: int):
+        """Open the trunk's decode cache for `batch_size` rows and each row's chain beside it, no slot
+        waiting (`CausalTransformer.init_cache`)."""
+        self.decoder.init_cache(batch_size)
+        self.variable("cache", IN_CONTEXT, functools.partial(self._opened, batch_size))
+
+    def _chain(self, rows: int) -> _Chain:
+        """The training scan's chain over `rows` rows (`adapted_scores`'s), its windows straddling a row's
+        slots one at a time, at the model's variables but its cache."""
+        variables = {name: tree for name, tree in self.variables.items() if name != "cache"}
+        start = _start(self.model, variables, self.adaptation)
+        names = level_names(start)
+        starts = (start,) if not names else tuple(start[name] for name in names)
+        return _Chain(self.model, variables, names, starts, self.adaptation, straddles=True, predict=False,
+                      rows=rows)
+
+    def _opened(self, rows: int) -> dict:
+        """Each row's chain before its first real token (`adapted_scores`'s first carry), no slot waiting."""
+        chain = self._chain(rows)
+        count = len(chain.starts)
+        zeros = tuple(jax.tree.map(jnp.zeros_like, level) for level in chain.started)
+        nothing = _gathered(jnp.zeros((rows, 1), bool), jnp.zeros((rows, 1, _WIDTH), jnp.float32))
+        carry = (chain.started, zeros, (nothing,) * count, jnp.zeros((rows,), jnp.int32),
+                 tuple(jnp.full((rows,), -1, jnp.int32) for _ in range(count)))
+        width = self.model.emb_features
+        return {"chain": carry, "pending": jnp.zeros((rows, width), self.model.dtype or jnp.float32),
+                "waiting": jnp.zeros((rows,), bool), "count": jnp.zeros((rows,), jnp.int32)}
+
+    def __call__(self, tokens, train: bool = False, decode: bool = False, positions=None, segment_ids=None,
+                 attention_mask=None, right_padded: bool = False, coordinates=None, **fields):
+        """The logits `[B, S, vocab]` of `tokens`' slots, each read through its row's levels as they stand
+        when it is read; a call that does not `decode` is `model`'s own."""
+        from dew.batch import token_coordinates
+
+        if not decode:
+            return self.decoder(tokens, train=train, positions=positions, segment_ids=segment_ids,
+                                attention_mask=attention_mask, right_padded=right_padded,
+                                coordinates=coordinates, **fields)
+        if segment_ids is not None:
+            raise ValueError("a row decodes one document: its windows count from its first real token")
+        laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, valid=attention_mask,
+                                 positions=positions, right_padded=right_padded)
+        hidden = self.decoder.hidden_states(tokens, train=train, decode=True, coordinates=laid, **fields)
+        rows = tokens.shape[0]
+        real = jnp.ones(tokens.shape[:2], bool) if laid.valid is None else jnp.asarray(laid.valid, bool)
+        held = self.variable("cache", IN_CONTEXT, functools.partial(self._opened, rows))
+        chain = self._chain(rows)
+        windows = self.adaptation.windows(len(chain.starts))
+        nothing = jnp.zeros((rows, 1), jnp.float32)
+        runs = jnp.ones((rows, 1), jnp.int32)
+
+        def keyed(rank):
+            return tuple((rank // window)[:, None] for window in windows)
+
+        def slot(state, inputs):
+            states, token, valid = inputs
+            carry, pending, waiting, count = (state[name] for name in ("chain", "pending", "waiting",
+                                                                        "count"))
+            # The waiting slot, closed with this token as its target: one block of the training scan.
+            closing = waiting & valid
+            block = (pending[:, None], token[:, None], closing[:, None].astype(jnp.float32), runs,
+                     keyed(count - 1))
+            closed, _ = chain.block(carry, block, logits=False)
+            carry = _where(closing, closed, carry)
+            # This slot's logits at the versions it reads, its target unknown (nothing weighed).
+            here = (states[:, None], token[:, None], nothing, runs, keyed(count))
+            versions, chosen, _, _ = chain.opened(carry, here)
+            _, (_, _, logits, _) = chain.scored(versions, chosen, here[0], here[1], nothing)
+            pending = jnp.where(valid[:, None], states.astype(pending.dtype), pending)
+            state = {"chain": carry, "pending": pending, "waiting": waiting | valid,
+                     "count": count + valid.astype(jnp.int32)}
+            return state, logits[:, 0]
+
+        held.value, logits = jax.lax.scan(slot, held.value, (jnp.moveaxis(hidden, 1, 0), tokens.T, real.T))
+        return jnp.moveaxis(logits, 0, 1)
