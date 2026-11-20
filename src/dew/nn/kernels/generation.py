@@ -1000,7 +1000,13 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     if identifier is None and (found := assumption()) is not None and found.target is not None:
         return found.target
     if identifier is None:
-        device = placed_device()
+        import jax
+
+        # Within `assumed`, the assumed generation's target, this process's own device picking its SKU's
+        # peaks where it is of that generation: no device of the call's placement is read, which a
+        # compile-only one (an abstract mesh of GPUs a CPU process lowers for) has none of. Else the device
+        # the call is placed on (`placed_device`).
+        device = jax.local_devices()[0] if assumption() is not None else placed_device()
         real = device.platform == 'gpu' and assumption() is None
         if real and gpu_placed():
             _one_kind(_run_devices())
