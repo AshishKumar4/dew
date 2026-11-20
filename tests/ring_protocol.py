@@ -472,8 +472,8 @@ SYNC: dict[str, Callable] = {
     "async_copy_smem_to_tmem": _tmem_copy, "copy_gmem_to_smem": _load,
     "copy_smem_to_gmem": _store, "commit_group": _store_group, "wait_smem_to_gmem": _store_wait,
     "commit_smem": _commit,
-    "get": _access("read", 1), "swap": _access("write", 2), "wgmma": _product, "wgmma_ref": _wgmma_product,
-    "wgmma_wait": _product_wait,
+    "get": _access("read", 1), "load": _access("read", 1), "swap": _access("write", 2),
+    "wgmma": _product, "wgmma_ref": _wgmma_product, "wgmma_wait": _product_wait,
 }
 """Each primitive of the toolkit's synchronization and shared memory, as an `Event`."""
 

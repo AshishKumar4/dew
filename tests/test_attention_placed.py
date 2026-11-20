@@ -259,14 +259,32 @@ def test_an_empty_walk_on_tcgen05s_rows_skips_the_q_tmem_copy():
 def test_the_correction_warpgroup_at_d256_holds_protocol_in_every_interleaving(call, moves):
     """Row 5368: at d256 on 1-consumer `tcgen05.rows`, the dedicated `CORRECTION` warpgroup rescales kept
     sums in TMEM off the softmax warpgroup's critical path: every interleaving of consumer, correction, and
-    producer/issuer holds without deadlock or race, both when rescales are skipped (`kept`) and taken
-    (`moved`)."""
-    from ring_protocol import explore, programs
+    producer/issuer holds without deadlock or race over 5 steps (reusing both factor slots) and at 0- and
+    1-step reaches, both when rescales are skipped (`kept`) and taken (`moved`), and dropping a `factor_ready`
+    wait before reading `factors` is caught as a race."""
+    from ring_protocol import Violation, explore, programs
 
-    query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 256, 1, 256), jnp.bfloat16)
-    spans = template.spans(256, 256, 1, **CALLS[call])
+    query, key = jnp.ones((1, 256, 1, 256), jnp.bfloat16), jnp.ones((1, 320, 1, 256), jnp.bfloat16)
+    spans = template.spans(256, 320, 1, **CALLS[call])
     threads, arrivals = programs(_placed_forward(ROWS_TILES, spans), query, key, threads=3, rare=moves)
+    assert any(event.kind == "read" and event.at[0] == "factors"
+               for thread in threads for event in thread), "correction factor load must be traced"
     assert explore(threads, arrivals) > 0
+    # Negative control: dropping the correction warpgroup's factor_ready waits lets the factor read race
+    # with the consumer's factor write.
+    correction_idx = next(i for i, thread in enumerate(threads)
+                          if any(e.kind == "read" and e.at[0] == "factors" for e in thread))
+    mutated = list(threads)
+    mutated[correction_idx] = [e for e in threads[correction_idx]
+                               if not (e.kind == "wait" and e.at[0] == "factor_ready")]
+    with pytest.raises(Violation):
+        explore(mutated, arrivals)
+    if call == "full" and not moves:
+        for lengths in (jnp.asarray([0], jnp.int32), jnp.asarray([64], jnp.int32)):
+            short = template.spans(256, 320, 1, lengths=lengths)
+            short_threads, short_arrivals = programs(_placed_forward(ROWS_TILES, short), query, key,
+                                                     threads=3, rare=False)
+            assert explore(short_threads, short_arrivals) > 0
 
 
 @INTERPRETS

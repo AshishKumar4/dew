@@ -14,7 +14,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import after_walk, handoffs, mosaic, resources, swizzling
+from dew.nn.kernels.templates import after_walk, handoffs, mosaic, resources, rings, swizzling
 from dew.nn.kernels.templates.mosaic_sm100 import (
     STORED,
     TMEM,
@@ -166,7 +166,6 @@ class Tcgen05Placed(Tcgen05Rings):
             scratch[QUERY] = tuple(self.tensor_memory((rows, q_width), q_dtype) for _ in range(consumers))
         if self.corrects(consumers, kept):
             scratch["factor_ready"] = self.signals(2).scratch()
-            scratch["factor_free"] = self.signals(2).scratch()
             scratch[FACTORS] = plgpu.SMEM((2, rows), jnp.float32)
         return scratch
 
@@ -182,7 +181,7 @@ class Tcgen05Placed(Tcgen05Rings):
         # memory.
         barriers = tuple(barrier for name in ("scored", "weighed", "summed")
                          if name in scratch for barrier in scratch[name])
-        extra = tuple(scratch[name] for name in ("factor_ready", "factor_free", FACTORS) if name in scratch)
+        extra = tuple(scratch[name] for name in ("factor_ready", FACTORS) if name in scratch)
         return (*barriers, *extra)
 
     def product_addresses(self, products: tuple | None) -> int:
@@ -195,12 +194,10 @@ class Tcgen05Placed(Tcgen05Rings):
         return (self.signals(2).opened(found["scored"][role]), self.signals(2).opened(found["weighed"][role]),
                 self.signals(2).opened(found["summed"][role]))
 
-    def _correction_signals(self) -> tuple[Signal, Signal, Any]:
-        """The correction warpgroup's factor hand-offs (`product_scratch`'s `factor_ready`, `factor_free`,
-        `FACTORS`)."""
+    def _correction_signals(self) -> tuple[Signal, rings.Ref]:
+        """The correction warpgroup's factor hand-off (`product_scratch`'s `factor_ready`, `FACTORS`)."""
         found = self._scoped()
-        return (self.signals(2).opened(found["factor_ready"]), self.signals(2).opened(found["factor_free"]),
-                found[FACTORS])
+        return self.signals(2).opened(found["factor_ready"]), found[FACTORS]
 
     def _turns(self, name: str, consumer: int | None = None) -> tuple[Accumulator, ...]:
         """A consumer's two turns of the `name` tiles (`product_scratch`'s `LOGITS`, or the `WEIGHTS` over
@@ -241,10 +238,9 @@ class Tcgen05Placed(Tcgen05Rings):
                 if slots.first or not adds:
                     weighed.published(weighed.turn(slots.n))
                     return acc
-                factor_ready, factor_free, factors = self._correction_signals()
+                factor_ready, factors = self._correction_signals()
                 factor_slot = 1 - slots.turn
                 factor_turn = factor_ready.turn(slots.n - 1)
-                pl.when(slots.n >= 3)(lambda: factor_free.wait(factor_free.turn(slots.n - 3)))
                 factor = (self.full((self.rows,), 1.0) if scale is None or scale.factor is None
                           else scale.factor)
                 factors.at[factor_slot][...] = factor
@@ -303,11 +299,6 @@ class Tcgen05Placed(Tcgen05Rings):
                  mosaic.Loop(last, 0, jnp.where((count > 0) & (count % 2 == 0), 1, 0)))
         carry, kept = self.accumulated(loops, start, shapes, interpret, initial)
         _, _, summed = self._signals()
-        if FACTORS in self._scoped():
-            _, factor_free, _ = self._correction_signals()
-            for back in (2, 1):
-                pl.when(count - 1 >= back)(
-                    lambda back=back: factor_free.wait(factor_free.turn(count - 1 - back)))
         # Its last two steps' weighted values, each turn's last phase observed in order.
         for back in (2, 1):
             pl.when(count >= back)(lambda back=back: summed.wait(summed.turn(count - back)))
@@ -315,18 +306,17 @@ class Tcgen05Placed(Tcgen05Rings):
 
     def correcting(self, lo, hi, value_width: int) -> None:
         """The correction warpgroup's walk of steps `lo + 1` to `hi` (row 5368): awaits each step's rescale
-        factor from the softmax warpgroup (`factor_ready`), frees its factor slot (`factor_free`), rescales
-        `SUMS` in tensor memory once the previous step's weighted values are done (`summed`) where any row's
-        factor differs from 1, and publishes `weighed` to the issuer."""
+        factor from the softmax warpgroup (`factor_ready`), rescales `SUMS` in tensor memory once the
+        previous step's weighted values are done (`summed`) where any row's factor differs from 1, and
+        publishes `weighed` to the issuer. Factor-slot reuse is retired by `summed(n - 2)` on the consumer."""
         count = hi - lo
         _, weighed, summed = self._signals(0)
-        factor_ready, factor_free, factors = self._correction_signals()
+        factor_ready, factors = self._correction_signals()
         sums = Accumulator(self._scoped()[SUMS][0], (self.rows, value_width))
 
         def step(n, factor_slot: int):
             factor_ready.wait(factor_ready.turn(n - 1))
             factor = plgpu.load(factors.at[factor_slot], layout=self.native_row, optimized=False)
-            plgpu.barrier_arrive(factor_free.barriers.at[factor_slot])
 
             def rescaled():
                 summed.wait(summed.turn(n - 1))

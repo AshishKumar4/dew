@@ -422,14 +422,19 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         del ba, config, target
         return 0
 
+    def joined_roles(self, ba: tokamax.BoundArguments, config: Config,
+                     target: generation.GpuTarget) -> tuple:
+        """The raised warpgroup roles joined beside this launch's consumers (`MosaicForward` overrides)."""
+        del ba, config, target
+        return ()
+
     def resident(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> int:
         """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
         its registers, shared memory and rounded tensor memory (`resources.register_model`); one on a core
         whose family budgets no registers (a TPU's, `Family.budgets_registers`), and one at the least, a
         legal config's (row 9105)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
-        value_width = ba.arguments["value"].shape[-1]
-        joined = placed.correction_roles(family, config.consumers, value_width)
+        joined = self.joined_roles(ba, config, target)
         if not family.budgets_registers:
             return family.programs(config.consumers, joined=joined)
         staged = self.staged_bytes(ba, config, target) if target.shared_limit else None
@@ -983,7 +988,7 @@ class MosaicForward(_Mainloop[Tiles]):
                 staged = (self._staged_bytes(ba, config, target, products=base)
                           if target.shared_limit else None)
                 regs = self.registers(ba, config)
-                joined = placed.correction_roles(family, config.consumers, value_width)
+                joined = self.joined_roles(ba, config, target)
                 base_most = resources.register_model(family, config.consumers, regs, shared=staged,
                                                      target=target, tmem=family.product_columns(base),
                                                      joined=joined).most
@@ -993,6 +998,14 @@ class MosaicForward(_Mainloop[Tiles]):
                 if with_most >= base_most:
                     return with_query
         return base
+
+    def joined_roles(self, ba: tokamax.BoundArguments, config: Tiles,
+                     target: generation.GpuTarget) -> tuple:
+        del target
+        family = bundle_of(config, ba.arguments["query"].dtype)
+        query, value = ba.arguments["query"], ba.arguments["value"]
+        value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
+        return placed.correction_roles(family, config.consumers, value_width)
 
     def tmem_columns(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
