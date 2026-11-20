@@ -480,7 +480,9 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
     paged, sources, parts = walk.paged, walk.sources, walk.parts
     walks = None if flags is None else flags
     blocks = _column_blocks(v, hooked, at.columns)
-    split = len(blocks) > 1 and hooks.output_mod is not None
+    plan = forward_block_plan(v.shape[-1], at.columns, out_dtype, has_output_mod=hooks.output_mod is not None,
+                              training=False)
+    split = plan.split
     # A scaled launch's keys' magnitudes the call's (`_largest`) but a cache walk's, which its value slots
     # give (a masked or paged walk's, or one over a cache's rows or codes, whose rows its views gather).
     if form.headroom and not walk.masked and paged is None and sources is None and hooked.scales is None:
@@ -500,7 +502,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         decides=walk.decides, tmem_columns=walk.tmem_columns,
                         products=block_products,
                         table=paged, sources=sources,
-                        out_dtype=jnp.float32 if split else out_dtype, walks=walks,
+                        out_dtype=plan.out_dtype, walks=walks,
                         shared_by=len(blocks),
                         column_width=(values.shape[-1] if into is not None and first is not None
                                       else None), flags=stated and len(blocks) == 1, **in_place)
@@ -537,6 +539,25 @@ def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, spli
         return out
     maximum, total = (array[:, :, :queries] for array in rows_of[0])
     return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
+
+
+class BlockPlan(NamedTuple):
+    """How a forward value-column block runs (`forward_block_plan`): whether an inference call splits its
+    output hook into XLA past the block launches (`split`), the block launch's `out_dtype`, and whether an
+    output hook runs inside the kernel (`output_hook`). Shared by legality, residency, and emission
+    (row 9542)."""
+    split: bool
+    out_dtype: object
+    output_hook: bool
+
+
+def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
+                       training: bool) -> BlockPlan:
+    """Derive hook placement and block `out_dtype` from the call's value-column partition (`value_columns`):
+    an inference call whose columns split into multiple blocks runs its `output_mod` in XLA past the launches
+    and emits fp32 per block (row 9542)."""
+    split = not training and has_output_mod and value_columns(total_v, columns) < total_v
+    return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split)
 
 
 def column_slices(total: int, columns: int | None, *, whole: bool = True) -> list[tuple[int | None, int]]:
