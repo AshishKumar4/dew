@@ -642,7 +642,7 @@ def test_a_mosaic_fp16_dropping_forward_with_initial_or_past_binade_is_eligible_
         assert op.derived(ba, generation.gpu_target()) is not None
 
         def ours(q, k, v):
-            return attention_mosaic.forward(q, k, v, spans, hooks, interpret=True)[0]
+            return attention_mosaic.forward(q, k, v, spans, hooks, interpret=True)
 
         def reference(q, k, v):
             return template.reference(q, k, v, spans, hooks)
