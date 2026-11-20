@@ -21,7 +21,7 @@ from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral, _accumulated_dot_general
 from dew.nn.kernels import projections
 from dew.nn.precision import FP32_SUMS, fp32_result_dot_general
-from dew.nn.programs import bodies
+from dew.nn.programs import bodies, read_by
 from dew.quantization import Quantization, quantize_for_serving
 
 PARTITIONED = nn.with_partitioning(nn.initializers.lecun_normal(), (None, None))
@@ -249,13 +249,13 @@ def test_a_biased_layers_reverse_mode_holds_its_cotangent_once(layer):
         trained = {name: params[name] for name in live}
         program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(trained, x).jaxpr
         # Each barrier's operands by size (a bias's cotangent held shaped as the product broadcasts it), each
-        # of its results read past it: the gradients leave through it, not beside it.
+        # of its results one its program returns reads (`read_by`): the gradients leave through it.
         sizes = []
         for jaxpr in programs(program):
-            for at, eqn in enumerate(jaxpr.eqns):
+            returned = read_by(jaxpr, jaxpr.outvars)
+            for eqn in jaxpr.eqns:
                 if eqn.primitive is jax.lax.optimization_barrier_p:
-                    read = {var for later in jaxpr.eqns[at + 1:] for var in later.invars} | set(jaxpr.outvars)
-                    assert all(var in read for var in eqn.outvars)
+                    assert all(var in returned for var in eqn.outvars)
                     sizes.append(sorted(var.aval.size for var in eqn.invars))
         return sizes
 
@@ -275,9 +275,10 @@ def programs(jaxpr):
 
 def test_a_bias_alone_moves_a_projection_whose_input_is_infinite_by_its_own_direction():
     """A projection differentiated in its bias alone moves by the bias's direction, its input and its kernel
-    held, at the first order and at the second (the forward derivative of a forward derivative's value): an
-    infinite input meets no zero direction of theirs (inf * 0, NaN), as the bias's own rule kept it apart
-    from the product (row 6740)."""
+    held, at the first order and at the second (the forward derivative of a forward derivative's value), and
+    the kernel's gradient, which reads no bias, does not move with it (forward over reverse): an infinite
+    input meets no zero direction of theirs (inf * 0, NaN), as the bias's own rule kept it apart from the
+    product (row 6740)."""
     layer = Dense(1)
     x = jnp.full((2, 1), jnp.inf, jnp.float32)
     params = {"kernel": jnp.ones((1, 1), jnp.float32), "bias": jnp.zeros((1,), jnp.float32)}
@@ -290,6 +291,14 @@ def test_a_bias_alone_moves_a_projection_whose_input_is_infinite_by_its_own_dire
     np.testing.assert_array_equal(np.asarray(moved(params["bias"])[1]), np.ones((2, 1), np.float32))
     _, again = jax.jvp(lambda bias: moved(bias)[0], (params["bias"],), (direction,))
     np.testing.assert_array_equal(np.asarray(again), np.ones((2, 1), np.float32))
+
+    def kernel_gradient(bias):
+        return jax.grad(lambda kernel: jnp.sum(layer.apply({"params": {"kernel": kernel, "bias": bias}}, x)))(
+            params["kernel"])
+
+    # The kernel's gradient reads no bias: its forward derivative in the bias alone is zero.
+    _, turned = jax.jvp(kernel_gradient, (params["bias"],), (direction,))
+    np.testing.assert_array_equal(np.asarray(turned), np.zeros((1, 1), np.float32))
 
 
 BIAS_ORDER_SEEDS = 8

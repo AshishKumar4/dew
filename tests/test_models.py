@@ -735,10 +735,10 @@ def test_a_layer_norms_variance_is_its_centered_mean_square():
 
 
 def test_a_layer_norms_recompute_reduces_no_more_than_flaxs():
-    """A layer norm's rematerialized body reads its rows' shift as an input (`dew.nn.norms.LayerNorm`), taken
-    ahead of it: its backward's recompute reduces its rows no more often than flax's own norm rematerialized
-    the same way does, where a shift recomputed inside it was a mean of its own in every norm's backward,
-    98 of a DiT-B step's fusions and its compile's growth (row 6740)."""
+    """A layer norm's forward names and saves its rows' shift (`dew.nn.norms.SHIFT`), which its backward's
+    recompute reuses without reducing the rows again: it reduces them no more often than flax's own norm
+    rematerialized saving nothing does, where a shift recomputed there was a mean of its own in every
+    norm's backward (row 6740)."""
     from jax.extend.core import primitives
 
     from dew.nn.programs import bodies, equations
@@ -869,9 +869,9 @@ LAYER_NORM_SEEDS = 64
 
 
 def test_every_production_layer_norm_is_dews_rematerialized_one():
-    """The decoder block's exact-variance layer norm, the offset layer norm's core and Gemma 4 Unified's
-    patch norm are Dew's `LayerNorm`, rematerialized saving nothing, as every other is (ledger 3010):
-    each one's differentiated program checkpoints its normalization."""
+    """The decoder block's exact-variance layer norm, the offset layer norm's core and Gemma 4 Unified's patch
+    norm are Dew's `LayerNorm`, rematerialized saving nothing but its rows' shift, as every other is (ledger
+    3010): each one's differentiated program checkpoints its normalization."""
     from dew.nn.backbones.decoder_block import decoder_norm
     from dew.nn.norms import OffsetLayerNorm
     from dew.nn.vision.gemma4_unified import Gemma4UnifiedVision
@@ -893,10 +893,10 @@ def test_every_production_layer_norm_is_dews_rematerialized_one():
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize('dtype', [None, jnp.bfloat16, jnp.float32])
 def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_scale, use_bias, dtype):
-    """`dew.nn.norms.LayerNorm` is flax's `nn.LayerNorm` under `nn.remat` saving nothing, its variance
-    centered: the same parameter tree and auto-named scope; its output and the gradients of its input and
-    parameters as near float64 over drawn inputs and parameters as flax's own (check 1); and its
-    pullback holds the input as it arrived, no wider copy of the activations."""
+    """`dew.nn.norms.LayerNorm` is flax's `nn.LayerNorm` under `nn.remat` saving nothing but its rows'
+    shift, its variance centered: the same parameter tree and auto-named scope; its output and the gradients
+    of its input and parameters as near float64 over drawn inputs and parameters as flax's own (check 1);
+    and its pullback holds the input as it arrived, no wider copy of the activations."""
     x = jax.random.normal(rng, (2, 6, 16), jnp.float32)
     x = x.astype(jnp.bfloat16) if dtype is jnp.bfloat16 else x
     fields = {"epsilon": 1e-5, "use_scale": use_scale, "use_bias": use_bias, "dtype": dtype}
