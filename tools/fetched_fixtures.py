@@ -192,12 +192,40 @@ def _url(repo: str, release: str, asset: str) -> str:
     return f"https://github.com/{repo}/releases/download/{release}/{asset}"
 
 
+ATTEMPTS = 4
+"""How many times `downloaded` asks for a file before its failure stands: GitHub's release downloads drop a
+connection now and then (base/kernels CI runs 44663115158 and 44670885709: a reset connection on the release's
+redirect, a short read), which another ask gets past."""
+BACKOFF = 5.0
+"""Seconds `downloaded` waits before its second ask, doubled before each ask after."""
+
+
 def downloaded(url: str) -> bytes:
-    """`url` read anonymously over HTTPS, as every machine a test runs on reads it."""
+    """`url` read anonymously over HTTPS, as every machine a test runs on reads it. A transient failure (a
+    connection dropped, reset or timed out, a short read, HTTP 429 or a 5xx) is asked again, up to
+    `ATTEMPTS` times in all, each said on stderr with its wait; any other failure, or the last, stands."""
+    import http.client
+    import time
+    import urllib.error
     import urllib.request
 
-    with urllib.request.urlopen(url, timeout=600) as response:
-        return response.read()
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=600) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            if (error.code != 429 and error.code < 500) or attempt == ATTEMPTS:
+                raise
+            failure: Exception = error
+        except (urllib.error.URLError, http.client.IncompleteRead, ConnectionError, TimeoutError) as error:
+            if attempt == ATTEMPTS:
+                raise
+            failure = error
+        wait = BACKOFF * 2 ** (attempt - 1)
+        print(f"fetched_fixtures: {url}: {type(failure).__name__}: {failure}; asked again in {wait:.0f} s "
+              f"(attempt {attempt + 1} of {ATTEMPTS})", file=sys.stderr)
+        time.sleep(wait)
+    raise AssertionError("every attempt returns or raises")
 
 
 def _store_path(pin: dict, name: str) -> str:
