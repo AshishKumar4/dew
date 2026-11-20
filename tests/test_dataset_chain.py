@@ -1843,11 +1843,13 @@ def test_a_batched_map_that_keeps_its_rows_groups_the_order_whatever_reads_it(re
         assert data.plan is not None and data.plan.lowering == "global"
         reader = data.train(partition)
         try:
-            batches = list(reader)
+            batches = [next(reader) for _ in range(24 // 2 // partition.count)]
         finally:
             reader.close()
-        return [(int(i), int(group)) for batch in batches for i, group in zip(batch["i"], batch["group"],
-                                                                           strict=True)]
+        ids = [int(i) for batch in batches for i in np.asarray(batch["i"]).ravel()]
+        groups = [int(group) for batch in batches for group in np.asarray(batch["group"]).ravel()]
+        assert len(ids) == len(groups) == 24 // partition.count, (len(ids), np.shape(batches[0]["i"]))
+        return list(zip(ids, groups, strict=True))
 
     whole = read_by(DataPartition())
     grouped = whole == [(index, index // 4 * 4) for index in range(24)]
