@@ -1898,6 +1898,9 @@
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[width no tile divides-paired]",
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[width no tile divides-plain]"
 ],
+"tests/test_gemm_formed.py": [
+"tests/test_gemm_formed.py::test_a_composed_mlps_training_step_compiles_within_its_resources[sm90]"
+],
 "tests/test_gemm_gather.py": [
 "tests/test_gemm_gather.py::test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_says[sm90-2]"
 ],
@@ -2467,16 +2470,15 @@
 "tests/test_lowering.py::test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh[sm90-attention]"
 ],
 "tests/test_mamba.py": [
-"tests/test_mamba.py::test_a_rate_past_float32s_range_scans_as_the_recurrence[16-a decay of e^-3]",
-"tests/test_mamba.py::test_a_rate_past_float32s_range_scans_as_the_recurrence[64-a decay of e^-3]",
+"tests/test_mamba.py::test_a_rate_past_float32s_range_scans_as_the_recurrence[16-vanishing decays]",
 "tests/test_mamba.py::test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence[128]",
 "tests/test_mamba.py::test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence[130]",
+"tests/test_mamba.py::test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence[192]",
 "tests/test_mamba.py::test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence[194]",
 "tests/test_mamba.py::test_an_affine_scan_over_a_long_axis_is_as_exact_as_the_recurrence[65]",
-"tests/test_mamba.py::test_an_affine_scans_second_order_past_a_block_is_zero_where_it_is_structurally[194]",
+"tests/test_mamba.py::test_documents_that_continue_another_read_its_state_and_history_as_their_own_rows_do[one token each]",
 "tests/test_mamba.py::test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence[a cotangent near the largest-16]",
 "tests/test_mamba.py::test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence[a cotangent near the largest-64]",
-"tests/test_mamba.py::test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence[a faint write after it-16]",
 "tests/test_mamba.py::test_the_chunked_scan_near_float32s_largest_is_as_exact_as_the_recurrence[an entering state-16]"
 ],
 "tests/test_mamba2.py": [
@@ -2744,9 +2746,6 @@
 "tests/test_mosaic_toolkit.py": [
 "tests/test_mosaic_toolkit.py::test_a_quantized_stage_converts_into_the_tile_its_products_read[sm86-int8-unscaled]"
 ],
-"tests/test_mtp.py": [
-"tests/test_mtp.py::test_the_term_adds_the_weighted_mean_depth_cross_entropy[mean_stream_trunk]"
-],
 "tests/test_multimodal_model.py": [
 "tests/test_multimodal_model.py::test_a_drawn_site_is_on_par_with_its_reference[llama4]",
 "tests/test_multimodal_model.py::test_a_drawn_sites_slip_fails_its_check[gemma3-inputs]",
@@ -2983,9 +2982,6 @@
 "tests/test_perturbation.py::test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does",
 "tests/test_perturbation.py::test_the_estimate_is_the_gradient_in_expectation[trailing-general]"
 ],
-"tests/test_pipeline_core.py": [
-"tests/test_pipeline_core.py::test_a_repeat_after_the_batch_replays_its_first_pass_draws_included[indexed]"
-],
 "tests/test_pipeline_golden.py": [
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[images_hf-workers=2,shares=1]",
 "tests/test_pipeline_golden.py::test_loader_batches_positions_and_rng_match_the_frozen_reference[prompts-workers=0,shares=1]",
@@ -3017,6 +3013,9 @@
 "tests/test_ppo.py::test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged[default]",
 "tests/test_ppo.py::test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged[sessions]",
 "tests/test_ppo.py::test_ppos_critic_reads_the_progress_its_step_passes"
+],
+"tests/test_precision_policy.py": [
+"tests/test_precision_policy.py::test_an_aligned_sums_derivatives_keep_smaller_terms_below_cancelling_ones[a unit]"
 ],
 "tests/test_prefix_blocks.py": [
 "tests/test_prefix_blocks.py::test_a_prefix_page_is_shared_only_between_prompts_whose_groups_agree[scattered-reach]",
@@ -3674,9 +3673,6 @@
 "tests/test_sd3_source.py::test_native_sd3_matches_the_source_forward_and_every_gradient[plain]",
 "tests/test_sd3_source.py::test_native_sd3_matches_the_source_forward_and_every_gradient[rect_cropped]"
 ],
-"tests/test_selective_template.py": [
-"tests/test_selective_template.py::test_the_backward_holds_its_registers_at_the_residency_it_launches[one sequence]"
-],
 "tests/test_sensenova_loop.py": [
 "tests/test_sensenova_loop.py::test_its_logits_are_on_par_with_the_remote_codes"
 ],
@@ -3941,9 +3937,6 @@
 "tests/test_tier2_parts.py::test_an_embedding_dews_lookup_does_not_compute_is_refused_at_load",
 "tests/test_tier2_parts.py::test_each_code_folder_at_one_commit_is_verified_on_its_own",
 "tests/test_tier2_parts.py::test_ernies_router_divides_by_its_clamped_sum_where_its_bias_picks_a_faint_expert"
-],
-"tests/test_tokens_embedded.py": [
-"tests/test_tokens_embedded.py::test_a_request_holding_an_id_outside_its_models_table_is_refused_by_a_task_and_a_server"
 ],
 "tests/test_tools.py": [
 "tests/test_tools.py::test_layout_parity_anchors_a_model_on_the_references_own_sample[dense_sft]",

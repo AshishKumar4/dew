@@ -1106,6 +1106,85 @@ def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alo
                     truth_fn=truth)
 
 
+def _measured_routes(choice, generation_name: str, run, *shapes, mesh=None) -> list:
+    """The routes `choice`'s selector reports for `run` over operands of `shapes` traced
+    (`jax.eval_shape`) on an assumed `generation_name`, under the abstract `mesh` where given: whether a
+    receipt-backed cell (`Op.declared`) overrode its kernels' order, its route's refusal 'measured'."""
+    with (generation.assumed(generation_name), generation.routes() as found,
+          contextlib.nullcontext() if mesh is None else jax.sharding.use_abstract_mesh(mesh)):
+        jax.eval_shape(run, *shapes)
+    return [(route.kernel, route.refusal is not None and route.refusal.kind == 'measured')
+            for route in found if route.choice == choice]
+
+
+@pytest.mark.parametrize(('rows', 'tokens', 'product', 'packed', 'mesh', 'ported'), [
+    (1, 4096, 'forward', False, None, True), (1, 4096, 'training', False, None, True),
+    (2, 4096, 'forward', False, None, False), (1, 8192, 'forward', False, None, False),
+    (1, 4096, 'forward', True, None, False), (2, 4096, 'forward', False, ('data', 2), True),
+    (1, 4096, 'forward', False, ('tensor', 2), False)],
+    ids=['timed forward', 'timed training', 'two rows', 'longer', 'packed', 'two rows split', 'heads split'])
+def test_a_b200s_port_cell_overrides_only_the_extent_its_receipt_timed(rows, tokens, product, packed, mesh,
+                                                                     ported):
+    """A bf16 gated delta net of Qwen3.5-27B's heads (16 key heads, 48 value heads, 128 wide) on a B200,
+    whose forward and training a receipt timed on fla's port at one unpacked row of 4096 tokens
+    (`recurrence_chunk.PORT_CELLS`, `TIMED`): the delta rule's selector runs the port by that receipt where
+    each launch's shard computes that (two rows split over two devices among them), and for more rows,
+    other tokens, packed documents or heads split apart no receipt overrides its kernels' order, where
+    every length, batch and split at those heads took the port (row 8991)."""
+    # A training step's mesh, its axes automatic: the rules place each operand (`sharding.grouped_heads`).
+    mesh = None if mesh is None else jax.sharding.AbstractMesh((mesh[1],), (mesh[0],),
+                                                               axis_types=(jax.sharding.AxisType.Auto,))
+    gates = (jax.ShapeDtypeStruct((rows, tokens, 48), jnp.float32),
+             jax.ShapeDtypeStruct((rows, tokens, 48), jnp.bfloat16))
+    shapes = [jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16) for heads in (16, 16, 48)]
+    starts = [jax.ShapeDtypeStruct((rows, tokens), jnp.bool_)] if packed else []
+
+    def forward(query, key, value, g, beta, *starts):
+        given = starts[0] if starts else None
+        return recurrence_chunk.chunk_gated_delta_rule(query, key, value, g, beta, starts=given)[0]
+
+    run = forward if product == 'forward' else jax.grad(lambda *o: forward(*o).astype(jnp.float32).sum(),
+                                                        argnums=(0, 1, 2))
+    found = _measured_routes(recurrence_chunk.GATED_DELTA.choice, 'sm100', run, *shapes, *gates, *starts,
+                             mesh=mesh)
+    assert all(measured == ported for _, measured in found) and found, found
+    assert not ported or {kernel for kernel, _ in found} == {'fla'}, found
+
+
+@pytest.mark.parametrize(('rows', 'tokens', 'packed', 'heads', 'width', 'chunk_size', 'keys', 'declared'), [
+    (1, 4096, False, 96, 80, 256, jnp.bfloat16, True), (1, 4096, False, 64, 64, 128, jnp.bfloat16, True),
+    (1, 4096, False, 96, 80, 256, jnp.float32, False), (2, 4096, False, 96, 80, 256, jnp.bfloat16, False),
+    (1, 2048, False, 96, 80, 256, jnp.bfloat16, False), (1, 4096, True, 96, 80, 256, jnp.bfloat16, False),
+    (1, 4096, False, 96, 96, 256, jnp.bfloat16, False), (1, 4096, False, 32, 64, 128, jnp.bfloat16, False),
+    (1, 4096, False, 64, 64, 256, jnp.bfloat16, False)],
+    ids=['4B', '30B', '4B of float32 keys', '4B of two rows', '4B shorter', '4B packed',
+         'heads padded to 4B\'s', 'another head count', 'another chunk'])
+def test_an_a100s_ssd_port_cells_override_only_the_geometries_their_receipt_timed(rows, tokens, packed, heads,
+                                                                                width, chunk_size, keys,
+                                                                                declared):
+    """An SSD's bf16 training on an A100, whose receipt timed mamba_ssm's port faster than the template on
+    Nemotron-H 4B's (96 heads of 80 and chunks of 256) and 30B's (64 heads of 64 and chunks of 128), each
+    eight groups of 128-wide states, at one unpacked row of 4096 tokens (`recurrence_chunk.SCAN_CELLS`): the
+    rated scan's selector runs the port by that receipt on those calls alone, and on another row count,
+    length, chunk or head count, packed documents, heads only padded to the port's width as 4B's are (96
+    wide), or float32 keys, whose call the scan launches in float32, no receipt overrides its kernels' order,
+    where every mma.sync training geometry took the port (row 8991)."""
+    def loss(x, B, C, dt, A, D, *starts):
+        operands = Chunk(C, B, x, beta=dt, rate=A, skip=D, starts=starts[0] if starts else None)
+        out, _ = chunk(FORMED[4], operands, chunk_size=chunk_size, dtype=jnp.float32)
+        return out.sum()
+
+    shapes = (jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16),
+              *[jax.ShapeDtypeStruct((rows, tokens, 8, 128), keys)] * 2,
+              jax.ShapeDtypeStruct((rows, tokens, heads), jnp.float32),
+              *[jax.ShapeDtypeStruct((heads,), jnp.float32)] * 2,
+              *([jax.ShapeDtypeStruct((rows, tokens), jnp.bool_)] if packed else []))
+    found = _measured_routes(recurrence_chunk.SCAN.choice, 'sm80', jax.grad(loss, argnums=(0, 1, 2, 3)),
+                             *shapes)
+    assert any(measured for _, measured in found) == declared, found
+    assert not declared or ('pallas', True) in found, found
+
+
 def test_the_ssd_port_refuses_a_forked_call_named_to_it():
     """mamba_ssm's state passing takes a memory at a sequence's first chunk alone, so no forked call
     (`Chunk.loads`), whose documents take their memories up mid-chunk, is one its port takes (inherently): a

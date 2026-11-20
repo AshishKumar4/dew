@@ -588,7 +588,11 @@ condition may not read a bound of a value that may be a NaN or an infinity (owne
 bounds against float finiteness, row 5780: "yes"). A quotient by a value nothing holds away from zero may be a
 NaN, so its tanh states no bound, and a product of a value that overflowed its dtype states none, its real
 factors' bound notwithstanding; a program that leans on such a bound states what makes the value finite (a
-declared range away from zero).
+declared range away from zero). A window the pass cuts from a program (`program._windows`) takes each value
+it reads from the program as the program proves it (`terms.Proven`: its bound and these facts,
+`program._declared`), not as an input of the program is taken: a NaN's tanh made outside the window bounds
+nothing within it. A tanh or an erf of a number is finite (an infinity's is its side's 1, XLA clamping
+the operand before its polynomial), so a product that may overflow still bounds its tanh.
 
 An exponential of an operand with neither a bound nor a sign, and a quotient by a value nothing holds apart
 from zero, has no bound; an exponential of an operand at most 0 is at most 2, its native implementation's rounding given one

@@ -49,6 +49,52 @@ def nested(kind: str):
 KINDS = ("jit", "checkpoint", "scan", "cond", "while")
 
 
+def test_an_infinite_scale_stays_inside_a_maximum():
+    """`max(x * inf)` over `x = [0, 1, ..., 1023]`: `0 * inf` is NaN, so the maximum is NaN; the pass took an
+    infinite scale for a positive one and hoisted it out of the maximum, `max(x) * inf`, infinite, its work
+    the less (spec alignment, 8992). A scale out of an extremum is a finite positive real's alone."""
+    def scaled(x):
+        return jnp.max(x * jnp.inf)
+
+    x = jnp.arange(1024, dtype=jnp.float32)
+    assert np.isnan(np.asarray(jax.jit(algebra.rewritten(scaled))(x)))
+
+
+def test_a_window_proves_nothing_of_a_value_its_program_proves_no_number():
+    """`sum(tanh(a / b) * c)`, its quotient outside the window a reduction heads (three equations deep):
+    `a / b` may be `0 / 0`, so the program proves `tanh` of it no number and bounds nothing it makes; each
+    window cut from it holds no bound and no finiteness the program does not (`program._declared`: the
+    quotient declared as the program proves it, `terms.Proven`), where the window took its input for a finite
+    real and bounded the tanh, its product and its sum, which a reordering reads (spec alignment, 8993)."""
+    from jax.extend import core as jcore
+
+    def program_of(a, b, c):
+        return jnp.sum(jnp.tanh(a / b) * c)
+
+    closed = jax.make_jaxpr(program_of)(*(jnp.ones(8, jnp.float32) for _ in range(3)))
+    whole = terms.region(closed)
+    windows = program._windows(closed.jaxpr)
+    assert windows
+    proven = program._held(closed.jaxpr)
+    for window, _ in windows:
+        cut = terms.region(jcore.ClosedJaxpr(window, []), program._declared(window, proven))
+        made = [var for equation in window.eqns for var in equation.outvars]
+        assert [var for var in made if cut.held.get(var) is not None and whole.held.get(var) is None] == []
+        assert [var for var in made if cut.apart[var].finite and not whole.apart[var].finite] == []
+
+
+@pytest.mark.parametrize(("function", "finite"), [(jnp.tanh, True), (jax.lax.erf, True), (jnp.sin, False)],
+                         ids=["tanh", "erf", "sin"])
+def test_a_saturating_function_of_a_product_that_may_overflow_keeps_its_bound(function, finite):
+    """`f(a * b)` of two inputs, finite reals whose product may overflow to an infinity: a tanh's and an erf's
+    is finite, so its bound stands (a bound is stated of a finite value alone; an infinity's tanh is its
+    side's 1), and a window reading the product as its program proves it bounds them still; a sine's of an
+    infinity is no number, and stays unbounded (spec alignment, 8993)."""
+    closed = jax.make_jaxpr(lambda a, b: function(a * b))(*(jnp.ones(8, jnp.float32) for _ in range(2)))
+    made = closed.jaxpr.outvars[0]
+    assert (terms.region(closed).held.get(made) is not None) is finite
+
+
 @pytest.mark.parametrize("kind", KINDS)
 def test_a_bodys_math_is_rewritten_in_place(kind):
     """Two sums inside a nested jit, a checkpoint, a scan, a conditional or a loop are rewritten inside that
@@ -292,6 +338,23 @@ def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
     return jnp.dot(a, x) + jnp.dot(a, y)
+
+
+def test_two_roots_of_one_shared_product_are_made_once():
+    """Two outputs reading products of a shared operand, `a x + a y` and `a y + a x` (`_shared_products`'s
+    terms, in either order): the pass prices them together as one factored product, and the program it
+    writes makes that product once, the second output the first's value; each traced apart wrote the
+    product twice, so the program computed what extraction priced as shared twice (spec alignment, 8995).
+    Its values are the written program's on par from float64 (check 1)."""
+    def both(a, x, y):
+        a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
+        return jnp.dot(a, x) + jnp.dot(a, y), jnp.dot(a, y) + jnp.dot(a, x)
+
+    shapes = ((256, 64), (64, 64), (64, 64))
+    written = jax.make_jaxpr(algebra.rewritten(both))(*rows(1, *shapes))
+    assert [equation.primitive for equation in equations(written.jaxpr)].count(jax.lax.dot_general_p) == 1
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *shapes),
+                    "two roots of one shared product", seeds=16)
 
 
 def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
@@ -1210,6 +1273,66 @@ def test_an_algebra_span_joins_the_windows_around_it():
     assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(spanning))(*rows(13, *SHAPES_MARKED))) == []
     assert_as_exact(jax.jit(algebra.rewritten(spanning)), jax.jit(two_sums),
                     lambda seed: rows(seed, *SHAPES_MARKED), "an opened span", seeds=8)
+
+
+def test_an_algebra_span_no_rewrite_crosses_keeps_its_marker():
+    """An Algebra span that no rewrite reaches into (`cumsum(sin(x))`, nothing the rules lower) beside two
+    sums the pass joins elsewhere in the program: the joined sums are spliced, and the span stays one marked
+    call of its kind, as written, where one splice anywhere had opened every span for good (spec alignment,
+    8998, §6.10); the program computes what it computes (check 1)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def both(x, y, a):
+        kept = marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x), axis=-1))(x)
+        return kept, two_sums(x, y, a)
+
+    assert cheaper_spliced(lambda x, y, a: both(x, y, a)[1], *rows(14, *SHAPES_MARKED))
+    assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(both))(*rows(14, *SHAPES_MARKED))) == [Algebra()]
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a span no rewrite crosses beside joined sums", seeds=8)
+
+
+def test_an_algebra_span_a_rewrite_lands_inside_stays_rewritten():
+    """An Algebra span whose body joins two sums (`two_sums`) and takes their cumulative sum, an equation no
+    rule rewrites: the join lands inside the span, which stays opened, so the program holds one sum where it
+    held two; closing the span again, its replaced equations being in the program no more, restored its body
+    as written and undid the join the pass had reported (head review). It computes what it computes
+    (check 1)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def program_of(x, y, a):
+        return marked(Algebra(), lambda x, y, a: jnp.cumsum(two_sums(x, y, a), axis=-1))(x, y, a)
+
+    def summed(closed) -> int:
+        return [equation.primitive for equation in equations(closed.jaxpr)].count(jax.lax.reduce_sum_p)
+
+    shapes = SHAPES_MARKED
+    assert summed(jax.make_jaxpr(algebra.rewritten(program_of))(*rows(16, *shapes))) < summed(
+        jax.make_jaxpr(program_of)(*rows(16, *shapes)))
+    assert_as_exact(jax.jit(algebra.rewritten(program_of)), jax.jit(program_of),
+                    lambda seed: rows(seed, *shapes), "a span a join lands inside", seeds=8)
+
+
+def test_an_algebra_span_returning_one_value_twice_stays_open_beside_a_splice():
+    """An Algebra span returning one value as two outputs, both read, beside sums the pass joins elsewhere:
+    the program the pass writes is a valid program (JAX's own check), the span left opened, where calling
+    it again bound that one value's name twice (head review); it computes what it computes (check 1)."""
+    from jax._src import core as jax_core
+
+    from dew.nn.derivatives import Algebra, marked
+
+    def both(x, y, a):
+        def twice(x):
+            made = jnp.cumsum(jnp.sin(x), axis=-1)
+            return made, made
+
+        first, second = marked(Algebra(), twice)(x)
+        return first * second, two_sums(x, y, a)
+
+    closed = jax.make_jaxpr(both)(*rows(15, *SHAPES_MARKED))
+    jax_core.check_jaxpr(algebra.rewritten_program(closed).jaxpr)
+    assert_as_exact(jax.jit(algebra.rewritten(both)), jax.jit(both), lambda seed: rows(seed, *SHAPES_MARKED),
+                    "a span returning one value twice beside joined sums", seeds=8)
 
 
 def test_an_algebra_span_with_effects_is_rewritten_within_its_call():

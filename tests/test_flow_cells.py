@@ -6,6 +6,7 @@ import inspect
 
 import gpu_flow
 import pytest
+from generation_support import node_topology
 from gpu_flow import Cell, CellsFailed, cells_of, run_cells
 
 
@@ -188,12 +189,9 @@ def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_pa
     import generation_support
     import model_flows
     import tier_wire
-    from jax.experimental import topologies
 
-    from dew.nn.kernels.generation import compile_only_gpus
 
-    topology = tmp_path / "topology.bin"
-    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    topology = node_topology(tmp_path / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
     ran: list[str] = []

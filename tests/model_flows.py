@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
+from generation_support import TOPOLOGY, node_target
 from gpu_flow import Cell, run_cells
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact
@@ -49,10 +50,6 @@ PORTABLE = "portable.json"
 """A flow's store's record that no kernel off the reference path claims a choice it is for on the node's
 GPU (`claimed`), at the stamp and GPU of the prepare that found it: its prepare stores nothing else, and its
 run at that stamp on that GPU skips it."""
-
-TOPOLOGY = "DEW_NODE_TOPOLOGY"
-"""The node's GPUs' serialized topology (dew-ops' session hands a prepare its node's): the GPU a flow's
-programs are compiled for."""
 
 @functools.cache
 def generic_kernels() -> dict[str, frozenset[str]]:
@@ -618,23 +615,6 @@ def _flat(flow: ModelFlow, program: Callable):
         return program(jax.tree.unflatten(tree, arguments[:count]), *arguments[count:])
     shapes = [jax.ShapeDtypeStruct(np.shape(leaf), np.asarray(leaf).dtype) for leaf in leaves]
     return flat, [*shapes, *flow.inputs]
-
-
-def node_target():
-    """The node's GPU (`TOPOLOGY`): its generation, its kind's (`generation.gpu_target`), and the facts its
-    serialized device states of itself, its multiprocessors and its block's shared memory among them
-    (`generation.runtime_facts`), read with no GPU visible, as a prepare runs, so nothing of the CUDA
-    driver's: what its run's load holds the programs to (`BuildTarget.held`)."""
-    from jax.experimental import topologies
-
-    from dew.nn.kernels.generation import compile_only_gpus
-
-    # The CUDA plugin, which a serialized topology deserializes through, initialized with no GPU and no
-    # client (`dew.training.ahead.host_gpus`).
-    compile_only_gpus("sm80", 1)
-    device = topologies.TopologyDescription.deserialize(Path(os.environ[TOPOLOGY]).read_bytes()).devices[0]
-    return generation.runtime_facts(generation.gpu_target(device.device_kind), device,
-                                    read=lambda ordinal, attribute: None)
 
 
 def programs_of(flow: ModelFlow) -> dict[str, tuple[Callable, list]]:

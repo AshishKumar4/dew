@@ -27,7 +27,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -314,12 +314,15 @@ class PortCase:
     and no `Hooks.own_weight`) or after it less its group's writes (`apart`, the group's tokens: 'apart',
     which the template forms and no port's kernels do; zero where it does not), the key pairs its state
     turns (`turns`, `Hooks.turns`), and whether it erases along the values, the delta rule on the transposed
-    memory (`transposed`: Oja's rule, `Hooks.erase` 'values')."""
+    memory (`transposed`: Oja's rule, `Hooks.erase` 'values'); its heads' shape and its extent on a launch's
+    shard (`heads`: key heads, value heads and the values' width; `extent`), which a declared cell's receipt
+    timed (`TIMED`)."""
 
     varying: bool
     dtype: np.dtype
     key_width: int
     heads: tuple[int, int, int]
+    extent: "Extent"
     call: base.Call | None = None
     family: str | None = None
     product: str = 'forward'
@@ -334,14 +337,16 @@ class PortCase:
     transposed: bool = False
 
     @property
-    def cell(self) -> tuple[str | None, str]:
-        """The call's cell, its device's instruction family and its product (`selection.Celled`,
-        `PORT_CELLS`), a decay a key dimension's (`per_key`, Kimi delta attention's) named in it, at its
-        heads' shape (`heads`): a receipt routes the shapes it timed, the owner's rule (PLAN's Priorities: the
-        fastest measured route remains until the template catches up)."""
-        kind = f"{self.product}, a decay a key dimension" if self.per_key else self.product
+    def cell(self) -> tuple[str | None, "PortCell | None"]:
+        """The call's cell (`selection.Celled`, `PORT_CELLS`): its device's instruction family and what a
+        launch's shard computes (`PortCell`): a receipt routes the shapes it timed, the owner's rule (PLAN's
+        Priorities: the fastest measured route remains until the template catches up)."""
+        if self.transposed:
+            # A call erasing along the values, no receipt's workload (`TRANSPOSED_HANDOFF`).
+            return self.family, None
         keys, values, width = self.heads
-        return self.family, f"{kind} at {keys}x{self.key_width} keys, {values}x{width} values"
+        return self.family, PortCell(self.dtype.name, self.product, self.per_key, (keys, self.key_width),
+                                     (values, width), self.extent)
 
     @property
     def widest(self) -> int:
@@ -442,30 +447,63 @@ stores the memories by where they pass, as many as the tokens' chunks, a row's a
 FLA_PORT = Kernel[PortCase]('fla', PORT_SUPPORTS)
 """Dew's port of fla's kernels (`fla_rule`)."""
 
+class Extent(NamedTuple):
+    """A launch's rows and tokens on its shard and whether its rows pack documents (`Chunk.starts`)."""
+
+    rows: int
+    tokens: int
+    packed: bool
+
+
+TIMED = Extent(1, 4096, packed=False)
+"""The extent every declared cell's receipt timed (`PORT_CELLS`, `SCAN_CELLS`): one unpacked row of 4096
+tokens, tools/benchmark_recurrence.py's `Shape` at its default batch and length, as M-JS-106's B200 rows
+(690a7e87d85) and ssd-train-a100-fdab2424c ran it. A call of another is no declared cell's, and its kernels
+take it in their order (row 8991)."""
+
+
+class PortCell(NamedTuple):
+    """A delta rule's cell a receipt declares (`PortCase.cell`): its operands' common dtype, its product,
+    whether its decay is a key dimension's, its key heads and width and its value heads and width on a
+    launch's shard, and its extent."""
+
+    dtype: str
+    product: str
+    per_key: bool
+    keys: tuple[int, int]
+    values: tuple[int, int]
+    extent: Extent
+
+
 B200 = "on a B200, by device time"
 """Where the tcgen05 cells' receipts measured (M-JS-106 at 690a7e87d85: js106 one round, js106c five)."""
 
-PORT_CELLS: dict[tuple[str | None, str], tuple[Kernel[PortCase], str]] = {
-    ('tcgen05', 'forward at 16x128 keys, 48x128 values'): (
+PORT_CELLS: dict[tuple[str | None, PortCell], tuple[Kernel[PortCase], str]] = {
+    ('tcgen05', PortCell('bfloat16', 'forward', per_key=False, keys=(16, 128), values=(48, 128),
+                         extent=TIMED)): (
         FLA_PORT, f"{B200}, the port's forward 0.394 ms against the template's 0.725 on Qwen3.5-27B's gated "
                   "delta net (js106c)"),
-    ('tcgen05', 'forward at 16x128 keys, 32x128 values'): (
+    ('tcgen05', PortCell('bfloat16', 'forward', per_key=False, keys=(16, 128), values=(32, 128),
+                         extent=TIMED)): (
         FLA_PORT, f"{B200}, the port's forward 0.276 ms against the template's 0.399 on Qwen3-Next's gated "
                   "delta net (js106)"),
-    ('tcgen05', 'forward, a decay a key dimension at 32x128 keys, 32x128 values'): (
+    ('tcgen05', PortCell('bfloat16', 'forward', per_key=True, keys=(32, 128), values=(32, 128),
+                         extent=TIMED)): (
         FLA_PORT, f"{B200}, the port's forward 1.118 ms against the template's 2.510 on Kimi Linear's delta "
                   "attention (js106c)"),
-    ('tcgen05', 'training at 16x128 keys, 48x128 values'): (
+    ('tcgen05', PortCell('bfloat16', 'training', per_key=False, keys=(16, 128), values=(48, 128),
+                         extent=TIMED)): (
         FLA_PORT, f"{B200}, the port's forward and gradient 1.747 ms against the template's 1.889 on "
                   "Qwen3.5-27B's gated delta net (js106c)"),
-    ('tcgen05', 'training, a decay a key dimension at 32x128 keys, 32x128 values'): (
+    ('tcgen05', PortCell('bfloat16', 'training', per_key=True, keys=(32, 128), values=(32, 128),
+                         extent=TIMED)): (
         FLA_PORT, f"{B200}, the port's forward and gradient 4.317 ms against the template's 6.642 on Kimi "
                   "Linear's delta attention (js106c)"),
 }
-"""The cells, each an instruction family, a product and the heads' shape (`PortCase.cell`: a receipt routes
-the shapes it timed), where a receipt shows Dew's port of fla's kernels (`fla_rule`; "the port" below) faster
-than the recurrence template, each its old route's kernel and that receipt; every time below sets the
-template against that port, not against upstream fla's own kernels or FlashQLA's
+"""The cells, each an instruction family and what a launch's shard computes (`PortCase.cell`: a receipt
+routes the shapes it timed), where a receipt shows Dew's port of fla's kernels (`fla_rule`; "the port"
+below) faster than the recurrence template, each its old route's kernel and that receipt; every time below
+sets the template against that port, not against upstream fla's own kernels or FlashQLA's
 (tools/benchmark_recurrence.py's `fla` and `flashqla` arms): the delta rule's selector runs the port on them
 where it takes the call (`Op.declared`, owner, bible da64ae5); the list shrinks as the template wins its
 cells, and no cell is picked or ranked at run time. A Blackwell's forward at each timed shape is the port's;
@@ -1114,18 +1152,23 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     call's readout reads the state after its token's update alone (`PortCase.readout`) or after it less its
     own write (`apart`, which its call to the template carries), `turns` the key pairs its state turns
     (`PortCase.turns`, `recurrence.Hooks.turns`)."""
-    # A call erasing along the values binds no template call: no kernel but the portable math reads it.
-    rounded = chunk_rounding(delta, jnp.result_type(query, key, value)) if rounded is None else rounded
-    call = None if transposed else template_call(
-        query, key, value, g, beta, state, starts, firsts, skip, forked, max_segments=max_segments,
-        scale=scale, delta=delta, wide=wide, bound=bound, rounded=rounded, apart=apart,
-        values_gated=values_gated, unit_keys=unit_keys)
+    dtype = jnp.dtype(jnp.result_type(query, key, value))
+    rounded = chunk_rounding(delta, dtype) if rounded is None else rounded
+    call, shards = None, (None, key, value)
+    if not transposed:
+        # A call erasing along the values binds no template call: no kernel but the portable math reads it.
+        call, shards = template_bind(
+            query, key, value, g, beta, state, starts, firsts, skip, forked, max_segments=max_segments,
+            scale=scale, delta=delta, wide=wide, bound=bound, rounded=rounded, apart=apart,
+            values_gated=values_gated, unit_keys=unit_keys)
+    _, shard_key, shard_value, *_ = shards
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
-    case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
-                    dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1],
-                    heads=(key.shape[-2], value.shape[-2], value.shape[-1]), call=call, family=family,
-                    product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
-                    forked=forked is not None, readout=readout, apart=apart, turns=turns,
+    case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying), dtype=dtype,
+                    key_width=key.shape[-1], heads=(shard_key.shape[-2], *shard_value.shape[-2:]),
+                    extent=Extent(shard_value.shape[0], shard_value.shape[1],
+                                  starts is not None or firsts is not None),
+                    call=call, family=family, product=product, delta=delta, decayed=decayed,
+                    per_key=g.ndim == 4, forked=forked is not None, readout=readout, apart=apart, turns=turns,
                     transposed=transposed)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
@@ -1355,19 +1398,22 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     return manual_map(local, specs, out_specs)(*operands)
 
 
-def template_call(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None,
-                  forked: Forked | None = None, **options) -> base.Call:
+def template_bind(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None,
+                  forked: Forked | None = None, **options) -> tuple[base.Call, tuple]:
     """The template's call a selector reads (`port_kernel`, `scan_kernel`), bound as `template_rule` binds
     its launch on each shard (`_template_launch`): each shard's shapes, its documents' firsts and its
     forked call's carried tables, so the launch its eligibility certifies (`Template.holds`) is the one the
-    call runs. Bound to the whole batch, without its firsts and with the whole fork, every packed or sharded
-    training step certified a launch it never ran beside the one it did (train 942's F2)."""
+    call runs; and the operands as each shard holds them (`shard_shapes`, the queries, keys and values
+    first), as the ports lay theirs too (`_shard_specs`, `_ssd_ported`), which a declared cell keys on. Bound
+    to the whole batch, without its firsts and with the whole fork, every packed or sharded training step
+    certified a launch it never ran beside the one it did (train 942's F2)."""
     from .templates.recurrence import template
 
     operands, specs, _, bound = _template_launch(query, key, value, g, beta, state, starts, firsts, skip,
                                                  forked, **options)
-    arguments, keywords = bound(*shard_shapes(operands, specs))
-    return base.call((template.MOSAIC,), *arguments, **keywords)
+    shards = shard_shapes(operands, specs)
+    arguments, keywords = bound(*shards)
+    return base.call((template.MOSAIC,), *arguments, **keywords), shards
 
 
 def _launched_template(context, query, key, value, g, beta, state, skip, entry, turning, **options):
@@ -1455,7 +1501,7 @@ def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, fo
                      **options) -> tuple:
     """The template's launch on each shard: `(operands, specs, out_specs, bound)`, its operands in order with
     their placements (`_shard_specs`), its outputs', and `bound(*local)` the op's arguments and keywords
-    from each shard's operands (`template_rule`'s launch and `template_call`'s bind alike)."""
+    from each shard's operands (`template_rule`'s launch and `template_bind`'s alike)."""
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
     P = jax.sharding.PartitionSpec
     walked = ()
@@ -1729,12 +1775,18 @@ class ScanCase:
     width and chunk (`widths`, padded, `_scan_widths`), the platform the TPU's Pallas scan builds for, None
     where it does not take the scan (`ssd_kernel_platform`), and as the delta rule's case reads them
     (`PortCase`) the recurrence template's implementations bound to the call (`call`), the device's
-    instruction family (`family`), the product (`product`) and whether it is forked (`forked`)."""
+    instruction family (`family`), the product (`product`) and whether it is forked (`forked`); its value
+    heads and key groups on a launch's shard (`shard_heads`), its head and state widths as the call gives
+    them (`logical`, unpadded) and its extent on that shard (`extent`); None where a caller reads no cell
+    (`scan_case`'s `shards`)."""
 
     varying: bool
     dtype: np.dtype
     widths: tuple[int, int, int]
     tpu: str | None
+    logical: tuple[int, int]
+    shard_heads: tuple[int, int] | None = None
+    extent: Extent | None = None
     call: base.Call | None = None
     family: str | None = None
     product: str = 'forward'
@@ -1744,9 +1796,25 @@ class ScanCase:
     turns: int = 0
 
     @property
-    def cell(self) -> tuple[str | None, str]:
-        """The call's cell, its device's instruction family and its product (`SCAN_CELLS`)."""
-        return self.family, self.product
+    def cell(self) -> tuple[str | None, "ScanCell"]:
+        """The call's cell (`SCAN_CELLS`): its device's instruction family and what a launch's shard
+        computes (`ScanCell`, row 8991)."""
+        (heads, groups), (width, state) = self.shard_heads or (None, None), self.logical
+        return self.family, ScanCell(self.dtype.name, self.product, (heads, width), (groups, state),
+                                     self.widths[2], self.extent)
+
+
+class ScanCell(NamedTuple):
+    """A rated scan's cell a receipt declares (`ScanCase.cell`): its values' dtype, its product, its value
+    heads and their width and its key groups and the state's width on a launch's shard, unpadded, its chunk,
+    and its extent: None where its case read no shard (`scan_case`'s `shards`), a cell none declares."""
+
+    dtype: str
+    product: str
+    values: tuple[int | None, int]
+    keys: tuple[int | None, int]
+    chunk: int
+    extent: Extent | None
 
 
 SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
@@ -1784,20 +1852,27 @@ TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
 
 
 def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | None = None,
-              product: str = 'forward', forked: bool = False) -> ScanCase:
+              product: str = 'forward', forked: bool = False, packed: bool = False, shards=None,
+              dtype: jnp.dtype | None = None) -> ScanCase:
     """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
     `chunk_size` chunks, their widths as the port and the TPU's scan take them where `padded`
     (`_scan_widths`, `_rated_scan`); on a TPU, the platform its Pallas scan builds for
-    (`ssd_kernel_platform`); the template's `call` and the `product`."""
+    (`ssd_kernel_platform`); the template's `call`, the `product`, and whether its rows pack documents
+    (`packed`); and where `shards` gives `x` and `B` as each shard holds them (`template_bind`'s, as the port
+    lays its launches too, `_ssd_ported`), its shard's heads, groups and extent, a declared cell's key; in
+    `dtype`, the operands' common one the scan launches in (`_rated_scan`'s), `x`'s where None."""
+    dtype = jnp.dtype(x.dtype if dtype is None else dtype)
     widths = (x.shape[-1], B.shape[-1], chunk_size)
     if padded:
         widths = (_scan_widths(widths[0]), _scan_widths(widths[1]), chunk_size)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
-    return ScanCase(varying=bool(jax.typeof(x).mat.varying),
-                    dtype=jnp.dtype(x.dtype), widths=widths,
-                    tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(x.dtype))
+    held = {} if shards is None else {'shard_heads': (shards[0].shape[2], shards[1].shape[2]),
+                                      'extent': Extent(shards[0].shape[0], shards[0].shape[1], packed)}
+    return ScanCase(varying=bool(jax.typeof(x).mat.varying), dtype=dtype, widths=widths,
+                    tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(dtype))
                          if generation.backend() == 'tpu' else None),
-                    call=call, family=family, product=product, forked=forked)
+                    logical=(x.shape[-1], B.shape[-1]), call=call, family=family, product=product,
+                    forked=forked, **held)
 
 
 def fast_rounding(dtype) -> bool:
@@ -1853,27 +1928,34 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     and its output `wide` or in the operands' dtype), on the target (`generation`'s, an assumed one's within
     `assumed`), at the call's numbers `rounded` (`fast_rounding`'s where None; `port_kernel`'s rule),
     reported as its route."""
-    call = template_call(query, key, value, g, beta, state, starts, firsts, skip, forked,
-                         max_segments=max_segments, scale=1.0, delta=False, wide=wide,
-                         rounded=(fast_rounding(jnp.result_type(query, key, value))
-                                  if rounded is None else rounded))
+    # The scan launches its operands in their common dtype (`_rated_scan`'s `launched`), which its cell and
+    # its rounding read.
+    dtype = jnp.dtype(jnp.result_type(query, key, value))
+    call, (_, shard_key, shard_value, *_) = template_bind(
+        query, key, value, g, beta, state, starts, firsts, skip, forked, max_segments=max_segments, scale=1.0,
+        delta=False, wide=wide, rounded=fast_rounding(dtype) if rounded is None else rounded)
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product,
-                     forked=forked is not None)
+                     forked=forked is not None, packed=starts is not None or firsts is not None,
+                     shards=(shard_value, shard_key), dtype=dtype)
     return select(SCAN, case).kernel
 
 
 SSD_PORT = Kernel[ScanCase]('pallas', SSD_SUPPORTS)
 """Dew's port of mamba_ssm's SSD kernels (`mamba_ssd.ssd_scan`)."""
 
-SCAN_CELLS: dict[tuple[str | None, str], tuple[Kernel[ScanCase], str]] = {
-    ('mma.sync', 'training'): (
+SCAN_CELLS: dict[tuple[str | None, ScanCell], tuple[Kernel[ScanCase], str]] = {
+    ('mma.sync', ScanCell('bfloat16', 'training', (96, 80), (8, 128), 256, TIMED)): (
         SSD_PORT, "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
-                  "4.217 on Nemotron-H 4B's SSD and 1.584 against 2.200 on 30B's (ssd-train-a100-fdab2424c)"),
+                  "4.217 on Nemotron-H 4B's SSD, its 80-wide heads padded to the port's 128 "
+                  "(ssd-train-a100-fdab2424c)"),
+    ('mma.sync', ScanCell('bfloat16', 'training', (64, 64), (8, 128), 128, TIMED)): (
+        SSD_PORT, "on an A100 SXM4 40GB, the port's forward and gradient 1.584 ms against the template's "
+                  "2.200 on Nemotron-H 30B's SSD (ssd-train-a100-fdab2424c)"),
 }
-"""The cells, each an instruction family and a product (`ScanCase.cell`), where a receipt timing the same
-product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows Dew's port of
-mamba_ssm's kernels (`mamba_ssd.ssd_scan`; "the port" below) faster than the recurrence template, each its
-old route's kernel and that receipt; every time below sets the template against that port, not against
+"""The cells, each an instruction family, a product and a geometry (`ScanCase.cell`), where a receipt timing
+the same product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows Dew's
+port of mamba_ssm's kernels (`mamba_ssd.ssd_scan`; "the port" below) faster than the recurrence template, each
+its old route's kernel and that receipt; every time below sets the template against that port, not against
 mamba_ssm's own kernels (tools/benchmark_recurrence.py's `mamba_ssm` arm): the
 scan's selector runs the port on them where it takes the call (`Op.declared`); the list shrinks as the
 template wins its cells. Warpgroup MMA's training is the template's: on a GH200 480GB, by device time, its
