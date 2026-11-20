@@ -95,7 +95,7 @@ def entry_task(ci, monkeypatch, entry: dict, out: Path, artifacts: Path | None =
                inputs: Path | None = None) -> int:
     """Plan entry `entry`'s task as armada starts it: .armada.json's command filled from the entry, with the
     directories armada names to every task (ARMADA_ARTIFACTS, ARMADA_INPUTS) here; its exit status, 0 where it
-    graded its rows: its red exit (`ci.RED_EXIT`, .armada.json's task.redExit) exactly where a row it wrote is
+    graded its rows: its red exit (`ci.red_exit`, .armada.json's task.redExit) exactly where a row it wrote is
     red, which armada reads as its rows (any other exit returned as it is)."""
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
     values = {**entry, "out": out}
@@ -109,8 +109,8 @@ def entry_task(ci, monkeypatch, entry: dict, out: Path, artifacts: Path | None =
     monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
     code = ci.main()
     red = out.is_file() and any(row["exitCode"] for row in json.loads(out.read_text())["rows"])
-    if code in (0, ci.RED_EXIT):
-        assert code == (ci.RED_EXIT if red else 0), (code, red)
+    if code in (0, ci.red_exit()):
+        assert code == (ci.red_exit() if red else 0), (code, red)
         return 0
     return code
 
