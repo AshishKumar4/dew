@@ -95,9 +95,14 @@ reserves no reduction scratch (row 3704, `hook_reduces`)."""
 
 def _gated_hooks(hooks: str, queries: int, width: int):
     """The gate's score hook `SCORE_HOOKS[hooks]` over `queries` queries and keys, four query heads, its
-    parameters' first draw (`score_hooks`), as `template.Hooks`; None for none."""
+    parameters' first draw (`score_hooks`), as `template.Hooks`; None for none; `'dropout'` for fp16/bf16
+    probability dropout at rate 0.1 (row 9526)."""
     if hooks == "none":
         return None
+    if hooks == "dropout":
+        return template.Hooks(drop=template.Dropout(
+            jax.random.key_data(jax.random.key(0)),
+            jnp.arange(1, dtype=jnp.int32), jnp.arange(4, dtype=jnp.int32), 0.1))
     score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, queries, width, rows=1, heads=4)
     params, initial = draw_hooks(0)
     return template.Hooks(score_mod, tuple(template.Param(value, kind) for value, kind in zip(params, kinds,
@@ -153,8 +158,9 @@ FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name i
                  for hooks in COMPILED_HOOKS]
 FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
 FORWARD_GATE = [(*case, jnp.bfloat16) for case in FORWARD_GATE]
-FORWARD_GATE += [(generation_name, width, training, "none", jnp.float16) for generation_name in GATED
-                 for width in (64, 128) for training in (template.Kept.NONE, template.Kept.SPLIT)]
+FORWARD_GATE += [(generation_name, width, training, hook, jnp.float16) for generation_name in GATED
+                 for width in (64, 128) for training in (template.Kept.NONE, template.Kept.SPLIT)
+                 for hook in ("none", "dropout")]
 """The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
 head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
 split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set

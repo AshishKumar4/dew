@@ -1766,10 +1766,11 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
 
 
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
-                       natural: bool = False, params: tuple = (), width: int | None = None,
-                       parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
-                       per_span: int = 1, merged: bool = False, started: bool = False,
-                       weight_parts: int = 1, scaled_products: bool = False) -> int:
+                      natural: bool = False, params: tuple = (), width: int | None = None,
+                      parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
+                      per_span: int = 1, merged: bool = False, started: bool = False,
+                      dropped: bool = False, weight_parts: int = 1,
+                      scaled_products: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -1823,11 +1824,12 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
+    drop_tiles = ([bits, logits] if weight_parts > 1 else [bits]) if dropped else []
     # An fp32 call's weights fp32, their remainder fp32 and the part taken (`_parted_products`); a dropping
-    # fp16 call's kept weights' second part beside the first (`algebra.kept_parts`: an fp16 causal call at a
-    # rate of 0.1, 64 and 128 wide, compiled spill-free at its derived tiles on sm80, sm90 and sm120,
-    # et-fp16w-a; the draw itself is unpriced, row 9526).
-    step = [logits] * (3 if parts > 1 else 1) + [weights] * ((2 if residuals else 1) + weight_parts - 1)
+    # call holds the keep bits' hash tile beside the step's weights (and over fp16, where `weight_parts > 1`,
+    # the scaled fp32 tile for `algebra.kept_parts` beside its two fp16 parts, row 9526).
+    step = ([logits] * (3 if parts > 1 else 1)
+            + [weights] * ((2 if residuals else 1) + weight_parts - 1) + drop_tiles)
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
         if family.operands_in_registers:
@@ -1862,7 +1864,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         # their parts and the parts' accumulator.
         phases.append([logits] * 2 + [bits] + ([*core, *scaled_terms] if scaled else []))
         if residuals:
-            phases.append([logits, weights, weights, bits, bits])
+            phases.append([logits, weights, weights, bits, bits, *drop_tiles])
     kept = residuals and family.keeps_sums(value_width)
     if scopes_products(family):
         phases = _scoped_phases(phases, logits, weights, (block_q, value_width, jnp.float32), kept=kept,
@@ -2020,6 +2022,7 @@ class ForwardRegisters:
     per_span: int = 1
     merged: bool = False
     started: bool = False
+    dropped: bool = False
     weight_parts: int = 1
     scaled_products: bool = False
     prologue: tuple | None = None
@@ -2044,7 +2047,8 @@ class ForwardRegisters:
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
             scaled=self.scaled, codes=self.codes,
             positions=self.positions, per_span=self.per_span, merged=self.merged, started=self.started,
-            weight_parts=self.weight_parts, scaled_products=self.scaled_products))
+            dropped=self.dropped, weight_parts=self.weight_parts,
+            scaled_products=self.scaled_products))
 
 
 def value_columns(padded: int, columns: int | None) -> int:
