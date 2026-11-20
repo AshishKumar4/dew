@@ -692,7 +692,8 @@ def test_a_reference_sized_against_itself_draws_none_of_a_verdicts_seeds():
 
 
 def _tripled(seed):
-    return (np.random.default_rng(seed).standard_normal(64).astype(np.float32), np.int32(seed))
+    """A draw of 64 normals and its seed, as JAX arrays (a NumPy draw makes `x * 3` a NumPy arm)."""
+    return (jnp.asarray(np.random.default_rng(seed).standard_normal(64), jnp.float32), jnp.int32(seed))
 
 
 def test_a_site_held_to_its_truth_rounded_once_evaluates_no_truth_of_its_own():
