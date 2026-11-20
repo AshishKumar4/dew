@@ -129,15 +129,12 @@ class Template[Config: Hashable](tuning.KernelOp):
         derivation steps past it (`report.refused`)."""
         return self.legal(ba, config, target) and self.proposes(ba, config, target)
 
-    def proposes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
+    def proposes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget, *,
+                 held: Callable[[], bool] | None = None) -> bool:
         """Whether the derivation offers `config` for `ba` on `target` to its legality: any config where the
-        call ranks alone (`ranks_alone`), else one its register model holds (`held`)."""
-        return self.proposed(ba, config, target, self.registers(ba, config))
-
-    def proposed(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget,
-                 registers: int | None) -> bool:
-        """`proposes` at an explicit register estimate `registers` (`within`, row 9108)."""
-        return self.ranks_alone(ba, target) or self.within(registers, config)
+        call ranks alone (`ranks_alone`), else one its register model holds (`held`, evaluated lazily so a
+        rank-only launch computes no register estimate, row 9477)."""
+        return self.ranks_alone(ba, target) or (self.held(ba, config) if held is None else held())
 
     def program_shared(self, config: Config, target: generation.GpuTarget) -> int:
         """The shared memory a program of the launch at `config` may stage on `target`: a block's

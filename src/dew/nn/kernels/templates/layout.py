@@ -177,9 +177,11 @@ def _custom(eqn, *operands, **params):
     def holding(*values):
         return _run(primal.jaxpr, primal.consts, values)
 
+    # The pullback's gradients, one an inexact operand, in the call's operand order, None at the others.
+    _, scattered = programs.holes((None,) * len(floating), floating, is_leaf=lambda leaf: leaf is None)
+
     def held_pullback(values, given):
-        grads = iter(_run(pullback.jaxpr, pullback.consts, [*values, *given]))
-        return tuple(next(grads) if moves else None for moves in floating)
+        return tuple(scattered(_run(pullback.jaxpr, pullback.consts, [*values, *given])))
 
     held = contracted("test_a_transposed_hooks_custom_vjp_holds_every_reverse_order")(
         declared_derivative(KernelGlue(), holding, lambda *values: (held(*values), values), held_pullback))
