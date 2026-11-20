@@ -280,7 +280,8 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     """The sequence a token at a time through the decode step's reference, a packed document's first
-    token starting from a zero memory: `(output, final memory)`, the output in the operands' dtype. Host
+    token starting from a zero memory: `(output, final memory)`, the output in the operands' dtype. A
+    token's updates (`Hooks.substeps`) its keys', values' and write gates' in turn, the step's own axis. Host
     operands are taken as JAX arrays: a float64 truth's first call runs on the gate's widened host arrays,
     which the scan's traced token can't index."""
     operands = jax.tree.map(jnp.asarray, operands)
@@ -288,8 +289,16 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     query, key = (jnp.repeat(x, group, axis=2) for x in (operands.query, operands.key))
     work = jnp.promote_types(operands.value.dtype, jnp.float32)
     state = operands.state.astype(work)
-    rows, length = operands.value.shape[:2]
+    rows, length = operands.query.shape[:2]
     starts = jnp.zeros((rows, length), bool) if operands.starts is None else jnp.asarray(operands.starts)
+
+    def by_token(x):
+        # A token's updates (`Hooks.substeps`) on an axis of their own, the step's.
+        if x is None or hooks.substeps == 1:
+            return x
+        return x.reshape(rows, length, hooks.substeps, *x.shape[2:])
+
+    key, value, beta = by_token(key), by_token(operands.value), by_token(operands.beta)
 
     def one_token(state, t):
         state = jnp.where(starts[:, t, None, None, None], 0.0, state)
@@ -297,9 +306,9 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
             return None if x is None else x[:, t]
 
         token = recurrence.Step(
-            state, query=query[:, t], key=key[:, t], value=operands.value[:, t],
+            state, query=query[:, t], key=key[:, t], value=value[:, t],
             log_decay=at(operands.log_decay), gate=at(operands.gate), log_a=operands.log_a,
-            bias=operands.bias, beta=at(operands.beta), skip=operands.skip, z=at(operands.z),
+            bias=operands.bias, beta=at(beta), skip=operands.skip, z=at(operands.z),
             weight=operands.weight, rate=operands.rate, own=operands.own, turn=at(operands.turn))
         out, _, state = recurrence.step_reference(hooks, token)
         return state, out
@@ -368,6 +377,48 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(draw, hooks, packed), f'{hooks} packed={packed}',
                     seeds=SEEDS[hooks, packed])
+
+
+DELTA_PRODUCTS = [recurrence.Hooks(decay='scalar', l2norm=True, substeps=2),
+                  recurrence.Hooks(decay='vector', l2norm=True, substeps=3)]
+"""DeltaProduct's forms (`Hooks.substeps`): Gated DeltaProduct's, a decay a head over two updates a token
+(fla's `chunk_gated_delta_product`), and a decay a key dimension over three."""
+
+
+def substepped_draw(hooks: recurrence.Hooks, packed: bool, seed: int):
+    """`draw`'s operands of `LENGTH` tokens of `hooks.substeps` updates each, and cotangents: its keys,
+    values and write gates fresh at every update, its queries and decays a token's, and with `packed`
+    documents at `draw`'s tokens."""
+    (laid,) = draw(hooks, packed=False, seed=seed, length=LENGTH * hooks.substeps)
+    every = hooks.substeps
+    starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), LENGTH)) if packed else None
+    operands = dataclasses.replace(laid, query=laid.query[:, ::every], log_decay=laid.log_decay[:, ::every],
+                                   starts=starts)
+    out, final = cotangents(laid, seed)
+    return operands, (out[:, ::every], final)
+
+
+@pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
+@pytest.mark.parametrize('hooks', DELTA_PRODUCTS, ids=str)
+def test_a_delta_products_chunks_are_as_exact_as_its_tokens(hooks, packed):
+    """DeltaProduct (`Hooks.substeps`) on the chunked op's portable math, its updates the op's tokens in
+    turn, against the decode step's reference a token at a time, its updates on their own axis
+    (`token_by_token`): the output, the final memory and every operand's gradient from float64 (check 1, row
+    9030)."""
+    dew = jax.jit(with_gradients(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)))
+    reference = jax.jit(with_gradients(functools.partial(token_by_token, hooks)))
+    assert_as_exact(dew, reference, functools.partial(substepped_draw, hooks, packed),
+                    f'{hooks} packed={packed}', seeds=8)
+
+
+@pytest.mark.parametrize(('substeps', 'form'), [(2, {'delta': False}), (2, {'reads': 'before'}),
+                                               (2, {'ranks': 2, 'reads': 'apart', 'delta': False}), (0, {})],
+                         ids=['no delta rule', 'read before', 'ranks', 'none'])
+def test_a_delta_product_outside_its_form_is_refused(substeps, form):
+    """Substeps (`Hooks.substeps`) outside DeltaProduct's form, a token's delta-rule updates read after its
+    last: a ValueError, where Mamba-3's ranks keep their own readout apart (row 9030)."""
+    with pytest.raises(ValueError):
+        recurrence.Hooks(decay='scalar', substeps=substeps, **form)
 
 
 TURNED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True, turns=KEY_WIDTH // 2 - 2)
