@@ -765,8 +765,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's
         # (`Tiles.forward`, the template's primal), which a call its fast backward takes narrows apart.
         tiles = tiles if trained and not walked else tiles.forward or tiles
-        # The fused walk where the forward runs one (`chunk_forward.walks_once`): an mma.sync family's
-        # inference forward runs its states and output launches, whose records it keeps.
+        # The fused walk where the forward runs one (`chunk_forward.walks_once`; mma.sync's runs launches).
         walked = walked and chunk_forward.walks_once(dtype, per_key=g.ndim == 4, family=family, keeps=False)
         chunk = tiles.chunk
 
