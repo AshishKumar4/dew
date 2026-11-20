@@ -337,3 +337,24 @@ def _one_launch(name: str, *, slices: int, width: int) -> None:
     with generation.assumed(name):
         (record,) = compile_kernels([KernelCase("merge", lambda: (merge, (padded, stacked)))], name)
     assert "error" not in record and record["thunks"] == ["merged_padded"], record
+
+
+def test_a_padded_merges_launch_work_counts_both_window_passes_and_span():
+    """`merged.launch_work` prices a native `merged_padded` launch from its Triton body's emitted work across
+    both dependent passes of `means._windows` (placement and summation, row 8845): one kernel, span
+    `2 * chunks` (2 for a 1-chunk 8-slice merge, 8 for a 4-chunk 32-slice merge), and device bytes covering
+    both passes' reads plus outputs written."""
+    target = generation.gpu_target("sm90")
+    spec = SPECS["fold"]
+    one_chunk = merged.launch_work(
+        spec, jax.ShapeDtypeStruct((2, 8, 16, 8, 128), jnp.float32),
+        jax.ShapeDtypeStruct((2, 2, 8, 8, 16), jnp.float32), 4, 128, target)
+    four_chunks = merged.launch_work(
+        spec, jax.ShapeDtypeStruct((2, 32, 16, 8, 128), jnp.float32),
+        jax.ShapeDtypeStruct((2, 2, 8, 32, 16), jnp.float32), 4, 128, target)
+    assert one_chunk.kernels == 1.0 and four_chunks.kernels == 1.0
+    assert one_chunk.span == 2.0 and four_chunks.span == 8.0
+    # Each row of 128 fp32 channels + 2 fp32 stats read across both passes (2x) plus written once.
+    min_one_chunk_bytes = 2 * 4 * 8 * (2 * 8 * (128 + 2) + (128 + 2)) * 4
+    assert one_chunk.device_bytes >= min_one_chunk_bytes
+    assert four_chunks.device_bytes > 3 * one_chunk.device_bytes

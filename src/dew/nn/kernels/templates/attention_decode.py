@@ -370,27 +370,25 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
     cache, row 7420): `rows` rows of `queries` query positions, `heads` query heads over `kv_heads` key heads
     `width` wide in `dtype`, over `keys` keys of a dense cache or, with `page_size`, of a paged pool's pages
     that long. Each Mosaic launch's work as its emission counts it (`emission.work_of`), the launches in
-    sequence (their spans summed), and a split step's merge its slices' fp32 states read and its output
-    written, one kernel more; None where some launch's work its emission does not count."""
+    sequence (their spans summed), and a split step's native `merged_padded` launch from
+    `merged.launch_work` (leaving unobserved XLA merge work unpriced); None where some launch's work its
+    emission does not count."""
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype)
     spans = key_spans(queries, keys, rows)
     pages = None if page_size is None else -(-keys // page_size)
     key = (jax.ShapeDtypeStruct((rows, keys, kv_heads, width), dtype) if pages is None
            else jax.ShapeDtypeStruct((kv_heads, rows * pages, page_size, width), dtype))
     table = None if pages is None else jax.ShapeDtypeStruct((rows, pages), jnp.int32)
-    plans = []
 
     def step(q, k, v, t):
         # The step planned once, as its trace forms it (`planned` packs its rows: operands, never shapes).
-        run, work = _planned_step(q, k, v, spans, None, scale=None, interpret=False, table=t, sources=None,
-                                  scales=None, bounds=None, finished=True, in_key=False)
-        plans.append(work)
+        run, _ = _planned_step(q, k, v, spans, None, scale=None, interpret=False, table=t, sources=None,
+                               scales=None, bounds=None, finished=True, in_key=False)
         return run()
 
     with generation.assumed(target):
         traced = jax.make_jaxpr(step)(query, key, key, table)
     # A step whose walks derive no config refuses as it traces (`_planned_step`).
-    (work,) = plans
     kernels = (equation for equation in programs.equations(traced.jaxpr)
                if equation.primitive in programs.NATIVE_KERNELS)
     found = [emission.work_of(kernel) for kernel in kernels]
@@ -399,13 +397,15 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
         # A launch whose work its emission does not count leaves the step's price unknown, never 0 (the base
         # review of 56a716c95, F3: a full step's spans launch priced none, and a step of no split Work()).
         return None
-    priced = dataclasses.replace(sum(launches, Work()), span=sum(each.span for each in launches))
-    if max(plan.slices for plan in work.values()) > 1:
-        slices = max(plan.slices for plan in work.values())
-        states = slices * rows * queries * heads * (width + 2) * 4
-        written = rows * queries * heads * width * jnp.dtype(dtype).itemsize
-        priced = priced + Work(device_bytes=states + written, kernels=1)
-    return priced
+    merges = [merged.launch_work(
+        equation.params["spec"],
+        jax.ShapeDtypeStruct(equation.invars[0].aval.shape, equation.invars[0].aval.dtype),
+        jax.ShapeDtypeStruct(equation.invars[1].aval.shape, equation.invars[1].aval.dtype),
+        equation.params["queries"], equation.params["width"], target)
+        for equation in programs.equations(traced.jaxpr)
+        if equation.primitive is merged.merged_padded_p and equation.invars[1].aval.dtype == jnp.float32]
+    all_launches = launches + merges
+    return dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches))
 
 
 @overload
