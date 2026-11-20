@@ -258,8 +258,8 @@ def test_a_stream_with_no_batch_ends_its_run_where_it_starts_its_final_checkpoin
     declared = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2,
                           inputs=InputSpec(Field("x", (8,))))
     trainer = Trainer(declared, optax.sgd(0.1), key=jax.random.key(0), checkpoints=Checkpoints(str(tmp_path)))
-    assert int(trainer.fit(empty, log_every=100).step) == 0
+    assert int(trainer.fit(empty, steps=5, log_every=100).step) == 0
     assert trainer.checkpoints.latest == 0
     named = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
     with pytest.raises(ValueError):
-        Trainer(named, optax.sgd(0.1), key=jax.random.key(0)).fit(empty, log_every=100)
+        Trainer(named, optax.sgd(0.1), key=jax.random.key(0)).fit(empty, steps=5, log_every=100)
