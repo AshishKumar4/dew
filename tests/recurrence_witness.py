@@ -511,8 +511,8 @@ def interpreted_lane() -> Lane:
     from certified import lane
 
     exp2 = jax.jit(jnp.exp2)
-    return Lane(exp2_reach(lambda x: launched(exp2, (np.asarray(x, np.float32),), "XLA's exp2")[0]),
-                lane().flushes, mainloop.block_of(mainloop.issued()[0]))
+    reached = exp2_reach(lambda x: launched(exp2, (np.asarray(x, np.float32),), "XLA's exp2", records=False))
+    return Lane(reached, lane().flushes, mainloop.block_of(mainloop.issued()[0]))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -593,10 +593,11 @@ class Run:
                     point(self.entered(n, head)) if carry is None else carry)
 
 
-def launched(program, operands: tuple, role: str):
+def launched(program, operands: tuple, role: str, *, records: bool = True):
     """`program` (a jitted function) over `operands` as a GPU tier runs it, compiled in its prepare and
-    executed in its run, with the launches the program it ran took (`reference_error.ahead_arm`'s
-    `launched`: its prepare's trace's, its run's record's, outside a part its one lowering's), a label a
+    executed in its run, where `records` with the launches the program it ran took (`reference_error.
+    ahead_arm`'s `launched`: its prepare's trace's, its run's record's, outside a part its one lowering's,
+    which lowers and compiles it afresh at each call there: a call that reads none asks none), a label a
     program: the role, which names every option the program closes over, the device assumed and the
     operands' shapes and dtypes, never their values, which a prepare's placeholders change (rows 8497,
     9550): a second call at one program in a prepare reuses its first (`ahead_arm`'s), a call's options
@@ -608,7 +609,7 @@ def launched(program, operands: tuple, role: str):
 
     shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in jax.tree.leaves(operands))
     label = f"recurrence witness, {role}, {generation.assumption()}, {shapes}"
-    return ahead_arm(program, label, launched=True)(*operands)
+    return ahead_arm(program, label, launched=records)(*operands)
 
 
 def _through(operands: tuple, starts, last: int) -> tuple:
@@ -777,7 +778,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
             interpret=generation.backend() != "gpu"))
 
         def kept(*x, starts):
-            return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}")[0]
+            return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}",
+                            records=False)
 
         kept_o, kept_final, (a, (w, h, c, _)) = kept(*operands, starts=starts)
         for native, own in ((o, kept_o), (final, kept_final)):
@@ -1401,8 +1403,8 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
             # The prepared run stays inside the program; the witness reads its records from `Run`.
             return grads, saved._replace(run=None), extras(saved.run)
 
-        (grads, saved, extra), _ = launched(jax.jit(kept), operands,
-                                            f"kept backward of seed {seed}{named}, delta {delta}")
+        grads, saved, extra = launched(jax.jit(kept), operands,
+                                       f"kept backward of seed {seed}{named}, delta {delta}", records=False)
     for mine, theirs in zip(grads[:6], native, strict=True):
         assert np.array_equal(np.asarray(mine).view(np.uint8), np.asarray(theirs).view(np.uint8)), \
             "the certify build is the production program"
