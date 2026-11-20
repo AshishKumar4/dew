@@ -362,8 +362,8 @@ def landed(a: Scaled) -> jax.Array:
 def _chain(x: jax.Array, significand: jax.Array, exponent: jax.Array, reach: int) -> jax.Array:
     """`applied`'s product: the factors of one direction (`applied`'s account), the powers of two first and
     the significand last, so its transpose takes a cotangent by the significand first: a zero coefficient's
-    cotangent is zero before any power reaches it. Uses `precision.power2`'s default saturating single-rounding
-    form (never the two-factor half-split), so a gradual-underflow backend rounds a subnormal product once."""
+    cotangent is zero before any power reaches it. Uses `precision.power2`'s default saturating
+    single-rounding form (never the two-factor half-split), so a gradual-underflow backend rounds once."""
     del reach
     growing = exponent >= 0
     last = jnp.where(growing, significand, 0.5 * significand)
