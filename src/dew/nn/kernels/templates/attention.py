@@ -1383,8 +1383,11 @@ def narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype:
     value, acc = jax.lax.stop_gradient(out), jax.lax.stop_gradient(acc)
     divisor = jax.lax.stop_gradient(jax.lax.broadcast_in_dim(divisor, acc.shape, tuple(range(divisor.ndim))))
     rounded = acc / divisor
-    high, low = two_product(rounded, divisor, bit_split=True)
-    above = (acc - high) - low
+    # Scaled by 2^64 where small, exactly, so the product's error term stays normal: unscaled, a quotient
+    # near fp32's least normal over a divisor near 1 lost it below the least normal to the flush.
+    lift = jnp.where(jnp.abs(rounded) < np.float32(2.0 ** -60), np.float32(2.0 ** 64), np.float32(1.0))
+    high, low = two_product(rounded * lift, divisor, bit_split=True)
+    above = (acc * lift - high) - low
     bits = jax.lax.bitcast_convert_type(rounded, jnp.int32)
     # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side.
     toward = jnp.where((above > 0) == (rounded > 0), 1, -1).astype(jnp.int32)
