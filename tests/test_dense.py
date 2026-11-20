@@ -21,7 +21,7 @@ from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral, _accumulated_dot_general
 from dew.nn.kernels import projections
 from dew.nn.precision import FP32_SUMS, fp32_result_dot_general
-from dew.nn.programs import equations
+from dew.nn.programs import bodies
 from dew.quantization import Quantization, quantize_for_serving
 
 PARTITIONED = nn.with_partitioning(nn.initializers.lecun_normal(), (None, None))
@@ -248,9 +248,16 @@ def test_a_biased_layers_reverse_mode_holds_its_cotangent_once(layer):
 
         trained = {name: params[name] for name in live}
         program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(trained, x).jaxpr
-        # Each barrier's operands by size: a bias's cotangent is held shaped as the product broadcasts it.
-        return [sorted(var.aval.size for var in eqn.invars) for eqn in equations(program)
-                if eqn.primitive is jax.lax.optimization_barrier_p]
+        # Each barrier's operands by size (a bias's cotangent held shaped as the product broadcasts it), each
+        # of its results read past it: the gradients leave through it, not beside it.
+        sizes = []
+        for jaxpr in programs(program):
+            for at, eqn in enumerate(jaxpr.eqns):
+                if eqn.primitive is jax.lax.optimization_barrier_p:
+                    read = {var for later in jaxpr.eqns[at + 1:] for var in later.invars} | set(jaxpr.outvars)
+                    assert all(var in read for var in eqn.outvars)
+                    sizes.append(sorted(var.aval.size for var in eqn.invars))
+        return sizes
 
     kernel, bias = params["kernel"].size, params["bias"].size
     assert held(("kernel", "bias")) == [sorted([x.size, kernel, bias])]
@@ -258,16 +265,31 @@ def test_a_biased_layers_reverse_mode_holds_its_cotangent_once(layer):
     assert held(()) == []
 
 
+def programs(jaxpr):
+    """`jaxpr` and every program within it (`bodies`), each whole, its equations in order."""
+    yield jaxpr
+    for eqn in jaxpr.eqns:
+        for body in bodies(eqn):
+            yield from programs(body)
+
+
 def test_a_bias_alone_moves_a_projection_whose_input_is_infinite_by_its_own_direction():
     """A projection differentiated in its bias alone moves by the bias's direction, its input and its kernel
-    held: an infinite input meets no zero direction of theirs (inf * 0, NaN), as the bias's own rule kept
-    it apart from the product (row 6740)."""
+    held, at the first order and at the second (the forward derivative of a forward derivative's value): an
+    infinite input meets no zero direction of theirs (inf * 0, NaN), as the bias's own rule kept it apart
+    from the product (row 6740)."""
     layer = Dense(1)
     x = jnp.full((2, 1), jnp.inf, jnp.float32)
     params = {"kernel": jnp.ones((1, 1), jnp.float32), "bias": jnp.zeros((1,), jnp.float32)}
-    _, moved = jax.jvp(lambda bias: layer.apply({"params": {**params, "bias": bias}}, x),
-                       (params["bias"],), (jnp.ones((1,), jnp.float32),))
-    np.testing.assert_array_equal(np.asarray(moved), np.ones((2, 1), np.float32))
+    direction = jnp.ones((1,), jnp.float32)
+
+    def moved(bias):
+        return jax.jvp(lambda bias: layer.apply({"params": {**params, "bias": bias}}, x), (bias,),
+                       (direction,))
+
+    np.testing.assert_array_equal(np.asarray(moved(params["bias"])[1]), np.ones((2, 1), np.float32))
+    _, again = jax.jvp(lambda bias: moved(bias)[0], (params["bias"],), (direction,))
+    np.testing.assert_array_equal(np.asarray(again), np.ones((2, 1), np.float32))
 
 
 BIAS_ORDER_SEEDS = 8
@@ -275,14 +297,16 @@ BIAS_ORDER_SEEDS = 8
 armada."""
 
 
-@pytest.mark.parametrize(("layer", "flaxs"), [(Dense(16), nn.Dense(16)),
-                                              (DenseGeneral((2, 8)), nn.DenseGeneral((2, 8)))],
-                         ids=["dense", "general"])
+@pytest.mark.parametrize(("layer", "flaxs"), [
+    (Dense(16), nn.Dense(16)), (DenseGeneral((2, 8)), nn.DenseGeneral((2, 8))),
+    (DenseGeneral((2, 8), batch_dims=(0,)), nn.DenseGeneral((2, 8), batch_dims=(0,)))],
+    ids=["dense", "general", "batched"])
 def test_a_biased_layers_gradient_and_curvature_are_as_exact_as_flaxs(layer, flaxs):
     """A biased projection's gradient and its curvature along a direction of its parameters (the gradient's
     forward derivative: a Hessian's action, its kernel and bias terms mixed) under a loss nonlinear in its
     output, on par with flax's own layer (check 1, its float64 run the truth): the bias's derivatives taken
-    inside the product's rule (`projections.dot_general`'s `bias`) are its own at every order (row 6740)."""
+    inside the product's rule (`projections.dot_general`'s `bias`) are its own at every order, a batched
+    kernel's bias each member's own (row 6740)."""
     x = jnp.zeros((4, 6, 12), jnp.float32)
     shapes = jax.eval_shape(lambda: layer.init(jax.random.key(0), x)["params"])
 

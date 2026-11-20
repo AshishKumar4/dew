@@ -15,6 +15,7 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 
 from .activations import GATE_ACTIVATIONS, logistic, silu
 from .dense import Dense
@@ -401,27 +402,27 @@ class GatedRMSNorm(nn.Module):
         return stream, (normed.astype(wide) * logistic(gate.astype(wide))).astype(normed.dtype)
 
 
-def _row_shift(norm: nn.LayerNorm, x: jax.Array, mask) -> jax.Array:
-    """Each row's mean of `x` over `norm`'s reduction, in float32 at least, as flax's statistics read a
-    narrower input, one over every shard its statistics read (`axis_name`), a constant to the gradient."""
-    axes = (norm.reduction_axes,) if isinstance(norm.reduction_axes, int) else tuple(norm.reduction_axes)
-    shift = jnp.mean(x, axis=axes, keepdims=True, dtype=jnp.promote_types(x.dtype, jnp.float32), where=mask)
-    if norm.axis_name is not None:
-        shift = jax.lax.pmean(shift, norm.axis_name, axis_index_groups=norm.axis_index_groups)
-    return jax.lax.stop_gradient(shift)
+SHIFT = "layer_norm_shift"
+"""The name of a layer norm's row shift (`_Shifted`), the one value its rematerialized body saves
+(`LayerNorm`)."""
 
 
 class _Shifted(nn.LayerNorm):
-    """flax's `nn.LayerNorm` over its input less `shift`, a constant of each row (its mean, `_row_shift`,
-    where none is given), which a layer norm does not change: its statistics read rows centered near zero,
-    so a row whose mean dwarfs its spread rounds as a row near zero does. The shift is a constant to the
-    gradient, whose own term a layer norm's invariance makes zero; its output in the dtype flax gives the
+    """flax's `nn.LayerNorm` over its input less each row's mean, which a layer norm does not change: its
+    statistics read rows centered near zero, so a row whose mean dwarfs its spread rounds as a row near
+    zero does. The shift is a constant to the gradient, whose own term a layer norm's invariance makes
+    zero, named (`SHIFT`); one shift over every shard its statistics read (`axis_name`), and taken in
+    float32 at least, as flax's statistics read a narrower input, its output in the dtype flax gives that
     input."""
 
     @nn.compact
-    def __call__(self, x, *, mask=None, shift=None):
+    def __call__(self, x, *, mask=None):
+        axes = (self.reduction_axes,) if isinstance(self.reduction_axes, int) else tuple(self.reduction_axes)
         wide = jnp.promote_types(x.dtype, jnp.float32)
-        shift = _row_shift(self, x, mask) if shift is None else jax.lax.stop_gradient(shift)
+        shift = jnp.mean(x, axis=axes, keepdims=True, dtype=wide, where=mask)
+        if self.axis_name is not None:
+            shift = jax.lax.pmean(shift, self.axis_name, axis_index_groups=self.axis_index_groups)
+        shift = checkpoint_name(jax.lax.stop_gradient(shift), SHIFT)
         normed = super().__call__(x.astype(wide) - shift, mask=mask)
         # The parameters' values, out of the partitioning box a norm declaring its axes stores them in.
         held = [nn.unbox(self.get_variable("params", name)) for name in ("scale", "bias")
@@ -429,9 +430,9 @@ class _Shifted(nn.LayerNorm):
         return normed.astype(canonicalize_dtype(x, *held, dtype=self.dtype))
 
 
-class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.nothing_saveable)):
-    """flax's `nn.LayerNorm`, rematerialized saving nothing: its backward pass keeps the input as
-    it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps
+class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.save_only_these_names(SHIFT))):
+    """flax's `nn.LayerNorm`, rematerialized saving nothing but its rows' shift: its backward pass keeps the
+    input as it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps
     (2.35 GiB of them on one SimpleDiT step). The parameter tree and the module's name are flax's, so
     checkpoints and scopes move both ways. Its statistics read each row less its mean (`_Shifted`), then
     the shifted rows' mean and mean square in one read (`use_fast_variance`), the variance the second
@@ -442,15 +443,8 @@ class LayerNorm(nn.remat(_Shifted, policy=jax.checkpoint_policies.nothing_saveab
     residual sums alive (291 MiB of its temporaries on a GH200, row 6741). A caller that states
     `use_fast_variance=False` takes the corrected two-pass, its centered rows centered again.
 
-    The shift is taken ahead of the rematerialized body, one value a row its backward keeps and reads, where
-    recomputed inside it each norm's mean was a reduction of its own in the backward (row 6740)."""
-
-    @nn.nowrap
-    def __call__(self, x, *, mask=None, shift=None):
-        """`x` normed, its rows' shift (`_row_shift`, where none is given) taken here, outside the
-        rematerialized body, which reads it as an input; not a method of its own to flax (`nn.nowrap`), so a
-        capture of intermediates holds the body's output alone, as it did."""
-        return super().__call__(x, mask=mask, shift=_row_shift(self, x, mask) if shift is None else shift)
+    The shift (`SHIFT`) is one value a row, which its backward reads where recomputed each norm's mean was a
+    reduction of its own there (row 6740)."""
 
     def spread(self, x: jax.Array) -> jax.Array:
         """Per row, the root mean square of `x` centered, its statistic (`dew.nn.protocols.BoundedNorm`),

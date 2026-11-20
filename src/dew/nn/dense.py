@@ -69,16 +69,15 @@ def _product(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, di
     its own (a head's fp32 result: `fp32_result_dot_general`, `head_dot_general`) is the layer's own: the
     template reads no policy from a callable, and the bias is added past it."""
     extents = projections.extents(inputs.shape, kernel.shape, dimensions)
+    product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     if layer.dot_general_cls is not None:
         refuse_recipe("a quantizer's product class", *extents)
         product = layer.dot_general_cls()
-    else:
-        product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
-        if not intercepted() and layer.dot_general in (None, float32_dot_general):
-            return projections.dot_general(product, projections.kernel_path(layer))(
-                inputs, kernel, dimensions, precision=layer.precision, bias=bias)
-        if intercepted():
-            refuse_recipe("a wrapper's product (an adapter's, a quantizer's)", *extents)
+    elif intercepted():
+        refuse_recipe("a wrapper's product (an adapter's, a quantizer's)", *extents)
+    elif layer.dot_general in (None, float32_dot_general):
+        return projections.dot_general(product, projections.kernel_path(layer))(
+            inputs, kernel, dimensions, precision=layer.precision, bias=bias)
     out = product(inputs, kernel, dimensions, precision=layer.precision)
     return out if bias is None else biased(out, bias)
 

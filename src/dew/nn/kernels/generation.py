@@ -1505,6 +1505,18 @@ def _held_still(forward: Callable, portable: Callable, kind: TangentKind) -> Cal
     return run
 
 
+def _perturbed_tangent(portable: Callable, operands, live: Sequence[bool], moving):
+    """`portable`'s tangent at `operands` along `moving`, the directions of the leaves `live` masks alone,
+    the others held as constants: a zero direction would meet an infinite factor (inf * 0, NaN, where a
+    bias's own tangent was 1: rows 8757, 6740)."""
+    import jax
+
+    from dew.nn import programs
+
+    perturbed, fill = programs.holes(operands, live)
+    return jax.jvp(lambda *values: portable(*fill(values)), tuple(perturbed), tuple(moving))[1]
+
+
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *, kind: TangentKind,
                    live_cotangents: bool = False, zero_cotangents: bool = False,
                    primal: Callable | None = None, nested: bool = True,
@@ -1544,19 +1556,21 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     import jax.numpy as jnp
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
-    from dew.nn import programs
     from dew.nn.derivatives import contracted, declared_tangent
 
     def produced_jvp(primals, tangents):
         output, saved = produced(*primals)
+        directions = jax.tree.leaves(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+        live = [not isinstance(direction, SymbolicZero) for direction in directions]
+        moving = itertools.compress(directions, live)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
-        return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
+        return (output, saved), (_perturbed_tangent(portable, primals, live, moving), zero_from_primal(saved))
 
     def producing(*operands):
         return forward(*operands)
 
     produced = contracted("test_an_embedding_lookup_holds_every_order")(
-        declared_tangent(kind, producing, produced_jvp))
+        declared_tangent(kind, producing, produced_jvp, symbolic_zeros=True))
 
     def pulled_by(saved, operands, cotangent, live):
         arguments = (saved, operands, cotangent) if live is None else (saved, operands, cotangent, live)
@@ -1590,10 +1604,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         def tangent(residuals, moving):
             operands, _ = residuals
-            # `portable` of the perturbed operands, the others held as constants: a zero direction would
-            # meet an infinite factor (inf * 0, NaN, where a bias's own tangent was 1: row 6740).
-            perturbed, fill = programs.holes(operands, [index in live for index in range(len(directions))])
-            return jax.jvp(lambda *values: portable(*fill(values)), tuple(perturbed), tuple(moving))[1]
+            return _perturbed_tangent(portable, operands, [index in live for index in range(len(directions))],
+                                      moving)
 
         def transposed(residuals, cotangent):
             operands, saved = residuals
