@@ -688,7 +688,8 @@ RWKV7_FLOOR = -math.exp(-0.5)
 """RWKV7's least log decay, `w = exp(-e^{-1/2} sigmoid(x))`'s."""
 
 ADDITIVE = recurrence.Hooks(decay='vector', erase='additive', scale=KEY_WIDTH ** -0.5)
-"""RWKV7's additive diagonal plus low rank, which the token loop takes (`recurrence_chunk._token_loop`)."""
+"""RWKV7's additive diagonal plus low rank, a token erasing along its own vector the state it enters beside
+its write (`recurrence_chunk._erases_laid`, `linear_scan.Affine.erased_before`)."""
 
 UNTIED = recurrence.Hooks(decay='vector', erase='untied', scale=KEY_WIDTH ** -0.5)
 """GDN-2's and Comba's erase vectors of their own under a decay a key dimension's, which laid tokens take."""
@@ -701,9 +702,9 @@ TRANSITIONS = [
                  id='two-sided')]
 """The delta rule's transitions beside its tied erase and a decay along the keys (`Hooks.erase`,
 `Hooks.value_decay`, row 9029): GDN-2's and Comba's erase vectors of their own, a head's and a key
-dimension's decay; RWKV7's additive diagonal plus low rank, a token at a time
-(`recurrence_chunk._token_loop`); two-sided GLA's decay along the values (Oja's rule's erase along the
-values, row 9028: test_gated_oja)."""
+dimension's decay; RWKV7's additive diagonal plus low rank, its tokens erasing the state they enter (row
+9670); two-sided GLA's decay along the values (Oja's rule's erase along the values, row 9028:
+test_gated_oja)."""
 
 
 def transition_draw(hooks: recurrence.Hooks, seed: int):
@@ -818,9 +819,10 @@ def test_an_additive_erases_decay_gradient_is_its_decays_alone():
     """RWKV7's additive erase (`Hooks.erase` 'additive', `S' = D S - a (b^T S)`) through the chunked op, one
     token of no decay (`g = 0`) and no write over a memory `(1, 2^-27)`, erase vectors `b = (1, 0)` and `a =
     (0, 1/2)`: its final memory's second key's gradient by the decay exactly 2^-27, the decay's alone, the
-    erase reading the memory before its decay independent of it. Laid as the delta rule's correction of the
-    decayed memory (`b exp(-g)` read through `D S`), its decay entered twice, the second key's `2^-27 - 1/2`
-    rounded to `-1/2` before its decay, and the two cancelled to zero (row 9029's head review)."""
+    erase reading the memory before its decay independent of it (`linear_scan.Affine.erased_before`, row
+    9670). Laid as the delta rule's correction of the decayed memory (`b exp(-g)` read through `D S`), its
+    decay entered twice, the second key's `2^-27 - 1/2` rounded to `-1/2` before its decay, and the two
+    cancelled to zero (row 9029's head review)."""
     hooks = recurrence.Hooks(decay='scalar', erase='additive', scale=1.0)
 
     def held(x, *shape):
@@ -837,10 +839,10 @@ def test_an_additive_erases_decay_gradient_is_its_decays_alone():
 
 
 def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
-    """RWKV7's additive erase (a token at a time, `recurrence_chunk._token_loop`) from no memory entering,
+    """RWKV7's additive erase (its rank-two token, `recurrence_chunk._erases_laid`) from no memory entering,
     its rows split over an Explicit mesh axis: it traces and runs, its output and final memory finite and
     placed as its rows are, the zero memory it starts from placed so (row 9029's head review: seeded whole,
-    the loop's carry changed its sharding at its first token, which `lax.scan` refuses)."""
+    a token loop's carry changed its sharding at its first token, which `lax.scan` refuses)."""
     (operands,) = draw(ADDITIVE, packed=False, seed=0)
     operands = dataclasses.replace(transitioned(ADDITIVE, operands, 0), state=None)
     mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
@@ -881,12 +883,13 @@ def test_a_forked_calls_token_maps_keep_its_rows_on_an_explicit_axis(documents):
         assert jax.typeof(got).sharding.spec[0] == 'data'
 
 
-@pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['laid', 'a token at a time'])
+@pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['after its decay', 'before its decay'])
 def test_a_forked_erase_runs_in_a_shard_map_that_checks_varying_axes(hooks):
-    """A forked call of an erase of its own (`Chunk.loads`, entry writes and given memories), its rows,
-    tables and documents split over a checked `shard_map`'s axis, through laid tokens (an untied erase's) and
-    a token at a time (an additive one's): its outputs, final memory and their tangent along its erase
-    vectors finite, every carry typed as the operands that reach it vary (row 9029's head review)."""
+    """A forked call of an erase of its own (`Chunk.loads`, entry writes and given memories), its rows, tables
+    and documents split over a checked `shard_map`'s axis, its tokens correcting the state after its decay
+    (an untied erase's laid tokens) or before it (an additive one's): its outputs, final memory and their
+    tangent along its erase vectors finite, every carry typed as the operands that reach it vary (row 9029's
+    head review)."""
     operands, _ = entered_draw(hooks, 0, entries=True)
     operands = entering_documents(transitioned(hooks, operands, 0))
     rows = P('data')
@@ -902,13 +905,13 @@ def test_a_forked_erase_runs_in_a_shard_map_that_checks_varying_axes(hooks):
 
 
 @pytest.mark.parametrize('by_firsts', [False, True], ids=['by starts', 'by first slots'])
-@pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['laid', 'a token at a time'])
+@pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['after its decay', 'before its decay'])
 def test_a_forked_erases_documents_are_as_exact_as_each_alone(hooks, by_firsts):
     """A forked call of an erase of its own (`Chunk.loads`), each document entering its table slot's memory
     with an entry write of its own, its documents given by their starts or their first slots alone, through
-    laid tokens (an untied erase's) and a token at a time (an additive one's): its output, last memory and
-    every gradient against each document a sequence of its own a token at a time from float64 (check 1),
-    the stored finals each a document's last laid token's."""
+    tokens correcting the state after its decay (an untied erase's laid tokens) or before it (an additive
+    one's): its output, last memory and every gradient against each document a sequence of its own a token at
+    a time from float64 (check 1), the stored finals each a document's last token's."""
     def drawn(seed):
         operands, seeded = entered_draw(hooks, seed, entries=True)
         return transitioned(hooks, operands, seed), seeded
