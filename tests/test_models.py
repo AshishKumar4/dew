@@ -750,8 +750,9 @@ def test_a_layer_norms_recompute_reduces_no_more_than_flaxs():
             return jnp.sum(norm.apply({"params": params}, x) ** 2)
 
         program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(variables["params"], x).jaxpr
-        # The rematerialized bodies (`jax.checkpoint`'s equations): the forward's, the backward's recompute.
-        bodies = [eqn.params["jaxpr"] for eqn in equations(program) if eqn.primitive.name == "checkpoint"]
+        # The rematerialized bodies (`jax.checkpoint`'s equations, its primitive's name `remat2`): the
+        # forward's and the backward's recompute.
+        bodies = [eqn.params["jaxpr"] for eqn in equations(program) if eqn.primitive.name == "remat2"]
         return sum(each.primitive.name == "reduce_sum" for body in bodies
                    for each in equations(getattr(body, "jaxpr", body)))
 
