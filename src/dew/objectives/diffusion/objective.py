@@ -262,6 +262,17 @@ def _trains_its_grid(source: PipelineSource, process, grid) -> bool:
             and (grid is OMITTED or grid is source.grid))
 
 
+def _averaged(decay: float | optax.Schedule | None) -> EMASpec | None:
+    """A diffusion objective's average of its parameters at `decay`, a constant one stating itself
+    (`EMASpec.stated`), so the trace keys by it (row 6297); a schedule, a function, states none."""
+    if decay is None:
+        return None
+    if callable(decay):
+        return EMASpec(decay=decay, select=under("params"))
+    return EMASpec(decay=optax.constant_schedule(decay), select=under("params"),
+                   stated=("constant", decay, "params"))
+
+
 def _keyed_inputs(inputs: InputSpec) -> TracedSetting:
     """`inputs` as a trace key states it (`DiffusionObjective.traced_by`): its sample, its mask and each
     condition's field and unconditional datum by value, its encoder by its value too (`_encoder_value`),
@@ -419,9 +430,9 @@ class DiffusionObjective(Objective[Ratio]):
         """`Objective.traced_by` with its inputs (`_inputs`) keyed as its loss reads them (`_keyed_inputs`):
         each condition's encoder by the object itself, whose parameters its encoding closes over (row
         6297: an encoder's arrays stated no value, and no key was kept)."""
-        inputs = settings.get("_inputs") if isinstance(settings, Mapping) else None
-        if isinstance(inputs, InputSpec):
-            settings = {**settings, "_inputs": _keyed_inputs(inputs)}
+        match settings:
+            case {"_inputs": InputSpec() as inputs}:
+                settings = {**settings, "_inputs": _keyed_inputs(inputs)}
         return super().traced_by(settings)
 
     @property
@@ -549,12 +560,7 @@ class DiffusionObjective(Objective[Ratio]):
         self.steps = steps
         self.grid = grid
         self.grid_process = grid_process
-        # A constant decay states its average (`EMASpec.stated`), so the trace keys by it (row 6297); a
-        # schedule, a function, states none.
-        self.ema = (None if ema_decay is None else EMASpec(
-            decay=ema_decay if callable(ema_decay) else optax.constant_schedule(ema_decay),
-            select=under("params"),
-            stated=None if callable(ema_decay) else ("constant", ema_decay, "params")))
+        self.ema = _averaged(ema_decay)
         self._grid = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
 
     @property
