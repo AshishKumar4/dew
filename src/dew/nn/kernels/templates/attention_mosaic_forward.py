@@ -2072,15 +2072,16 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                      relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None,
                      bool(after), decides)
 
-    joined = placed_mod.correction_roles(family, consumers, value_width)
-    body = _launch_body(program, layout, spec, hooks, group=group, page=page, batch=batch, queries=queries,
-                        kinds=kinds, peaks=peaks, training=training, finishes=finishes, certified=certified,
-                        interpret=interpret, value_width=value_width, joined=joined)
-
     products = (products if products is not None else
                 forward_products(family, tiles, value_width, query.dtype, peaks=peaks, parts=parts,
                                  ahead=bool(program.ahead), scaled=spec.headroom, training=training,
                                  tmem_columns=tmem_columns))
+    tmem = family.product_columns(products) if scopes_products(family) else 0
+    tmem_limit = (tmem_columns if tmem_columns is not None else generation.gpu_target().tmem_columns) or 0
+    joined = placed_mod.correction_roles(family, consumers, tmem, tmem_limit)
+    body = _launch_body(program, layout, spec, hooks, group=group, page=page, batch=batch, queries=queries,
+                        kinds=kinds, peaks=peaks, training=training, finishes=finishes, certified=certified,
+                        interpret=interpret, value_width=value_width, joined=joined)
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
@@ -2092,7 +2093,6 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                        magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None,
                        joined=joined)
     reduces = forward_reduces(family, reduced)
-    tmem = family.product_columns(products) if scopes_products(family) else 0
     shared = (resources.shared_bytes(family, launch_scope(family, (scoped, rings, after), reduced,
                                                           reduces=reduces, products=products,
                                                           over_rings=True))

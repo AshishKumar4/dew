@@ -988,24 +988,26 @@ class MosaicForward(_Mainloop[Tiles]):
                 staged = (self._staged_bytes(ba, config, target, products=base)
                           if target.shared_limit else None)
                 regs = self.registers(ba, config)
-                joined = self.joined_roles(ba, config, target)
+                tmem_limit = target.tmem_columns or 0
+                base_tmem = family.product_columns(base)
+                with_tmem = family.product_columns(with_query)
+                base_joined = placed.correction_roles(family, config.consumers, base_tmem, tmem_limit)
+                with_joined = placed.correction_roles(family, config.consumers, with_tmem, tmem_limit)
                 base_most = resources.register_model(family, config.consumers, regs, shared=staged,
-                                                     target=target, tmem=family.product_columns(base),
-                                                     joined=joined).most
+                                                     target=target, tmem=base_tmem,
+                                                     joined=base_joined).most
                 with_most = resources.register_model(family, config.consumers, regs, shared=staged,
-                                                     target=target, tmem=family.product_columns(with_query),
-                                                     joined=joined).most
+                                                     target=target, tmem=with_tmem,
+                                                     joined=with_joined).most
                 if with_most >= base_most:
                     return with_query
         return base
 
     def joined_roles(self, ba: tokamax.BoundArguments, config: Tiles,
                      target: generation.GpuTarget) -> tuple:
-        del target
         family = bundle_of(config, ba.arguments["query"].dtype)
-        query, value = ba.arguments["query"], ba.arguments["value"]
-        value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
-        return placed.correction_roles(family, config.consumers, value_width)
+        return placed.correction_roles(family, config.consumers, self.tmem_columns(ba, config, target),
+                                       target.tmem_columns or 0)
 
     def tmem_columns(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
