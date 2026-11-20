@@ -401,8 +401,9 @@ def test_split_output_hook_forward_plans_and_emits_fp32_block_smem_residency():
         cfg_f16 = op_f16.derived(ba_f16, target)
         assert cfg_f16 is not None
         planned_regs = op_f16.registers(ba_f16, cfg_f16)
-        cert_traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.certified(
-            q, k, v, drop_spans, drop_hooks, interpret=False)[1])(q_f16, k_f16, k_f16).jaxpr
+        with report.launching(op_f16, ba_f16, cfg_f16):
+            cert_traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.certified(
+                q, k, v, drop_spans, drop_hooks, interpret=False)[1])(q_f16, k_f16, k_f16).jaxpr
     cert_models = [record.kernels[kernel]
                    for eq in programs.equations(cert_traced)
                    if isinstance(name := eq.params.get("name"), str)
