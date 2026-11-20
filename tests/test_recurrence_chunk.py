@@ -1086,9 +1086,10 @@ def test_an_a100s_ssd_port_cells_override_only_the_geometries_their_receipt_time
     """An SSD's bf16 training on an A100, whose receipt timed mamba_ssm's port faster than the template on
     Nemotron-H 4B's (96 heads of 80 and chunks of 256) and 30B's (64 heads of 64 and chunks of 128), each
     eight groups of 128-wide states, at one unpacked row of 4096 tokens (`recurrence_chunk.SCAN_CELLS`): the
-    rated scan's selector runs the port by that receipt on those calls alone, and on another row count, length,
-    chunk or head count, packed documents, or heads only padded to the port's width as 4B's are (96 wide), no
-    receipt overrides its kernels' order, where every mma.sync training geometry took the port (row 8991)."""
+    rated scan's selector runs the port by that receipt on those calls alone, and on another row count,
+    length, chunk or head count, packed documents, or heads only padded to the port's width as 4B's are (96
+    wide), no receipt overrides its kernels' order, where every mma.sync training geometry took the port (row
+    8991)."""
     def loss(x, B, C, dt, A, D, *starts):
         operands = Chunk(C, B, x, beta=dt, rate=A, skip=D, starts=starts[0] if starts else None)
         out, _ = chunk(FORMED[4], operands, chunk_size=chunk_size, dtype=jnp.float32)
