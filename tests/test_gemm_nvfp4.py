@@ -394,3 +394,18 @@ def test_a_bank_carries_its_forms_version_and_a_load_refuses_another(tmp_path):
         else:
             restored = Checkpoints(str(tmp_path / name)).restore(template({"bank": written}))[0]["bank"]
             np.testing.assert_array_equal(np.asarray(restored.words), np.asarray(written.words))
+    if len(jax.devices()) >= 2:
+        # Row 8958: a two-layer bank sharded by layer across two devices with a foreign digest on shard 1
+        # must be refused both locally (`checked()`) and through collective checkpoint restore.
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), ("layers",))
+        by_layer = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("layers"))
+        mixed = jax.tree.map(lambda *layers: jax.device_put(jnp.stack(layers), by_layer), bank, other)
+        with pytest.raises(ValueError):
+            mixed.checked()
+        sharded_ckpt = Checkpoints(str(tmp_path / "sharded_mixed"))
+        sharded_ckpt.save(1, {"bank": mixed})
+        sharded_ckpt.wait()
+        sharded_template = jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=by_layer), {"bank": mixed})
+        with pytest.raises(ValueError):
+            Checkpoints(str(tmp_path / "sharded_mixed")).restore(sharded_template)

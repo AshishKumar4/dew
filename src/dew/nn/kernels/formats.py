@@ -44,14 +44,23 @@ class NvFp4:
     """The version of the form its words were packed by (`FORM`'s bytes; a stack of banks' one a layer),
     stored with them, so a checkpoint's words carry the encoder that packed them (`checked`)."""
 
-    def checked(self) -> "NvFp4":
+    def checked(self, form=None) -> "NvFp4":
         """Itself, where its words are the checked-in form's (`FORM`), every layer's; refused otherwise:
         words another encoder packed (a checkpoint an earlier Dew wrote) read wrong through this form's
-        decode, so they are repacked from the source weights, never decoded. A host check of its stored
-        bytes (one replicated shard's, on any host)."""
-        form = self.form
-        held = np.asarray(form.addressable_shards[0].data if isinstance(form, jax.Array) else form)
-        found = {bytes(row).hex() for row in held.reshape(-1, FORM.size)}
+        decode, so they are repacked from the source weights, never decoded. A local host check of its
+        stored bytes (every addressable shard, or the gathered `form` a collective restore hands it,
+        row 8958)."""
+        target = self.form if form is None else form
+        if isinstance(target, jax.Array):
+            found: set[str] = set()
+            for shard in target.addressable_shards:
+                data = np.asarray(shard.data)
+                if data.shape[-1] != FORM.size:
+                    raise ValueError(f"NVFP4 form digest sharded across its {FORM.size} bytes "
+                                     f"(shard shape {data.shape}); pass the gathered form to checked()")
+                found.update(bytes(row).hex() for row in data.reshape(-1, FORM.size))
+        else:
+            found = {bytes(row).hex() for row in np.asarray(target).reshape(-1, FORM.size)}
         if found != {FORM.tobytes().hex()}:
             raise ValueError(f"NVFP4 words packed by form version {', '.join(sorted(found))}, where this Dew "
                              f"decodes form version {FORM.tobytes().hex()}: repack them from the source "
