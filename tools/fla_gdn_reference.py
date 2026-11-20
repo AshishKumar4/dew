@@ -8,8 +8,8 @@ GPU, forward and every gradient, at each site tests/fla_sites.py names, over the
 
 on a GPU, Dew's environment recording and a second Python with torch and fla-core (`--serve`, the
 "fla" cohort, tools/reference_releases.py) running fla and its reference, each run a unit of named sites
-(`--list` names them all), the units then merged. What lands is tests/fixtures/fla/gdn_seeded.npz, a
-summary recording (`record_case(..., summary=True)`): per site, seed and
+(`--list` names them all), the units then merged. What lands is tests/fixtures/fla/gdn_seeded.npz (fla's
+simple GLA's sites in simple_gla_seeded.npz, `fla_sites.SIMPLE_RECORDED`), a summary recording (`record_case(..., summary=True)`): per site, seed and
 leaf, fla's distance from float64 at the site's inputs, which the test draws again (`Site.arrays`), and the
 truth's sketch, which Dew's float64 token recurrence is held to.
 
@@ -36,7 +36,34 @@ COHORT = "fla"
 """The reference releases this tool runs against (tools/reference_releases.py), and the environment
 tools/check_tool_types.py checks it in."""
 
-FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "fla" / "gdn_seeded.npz"
+TRUTHS = {False: "fla's naive_recurrent_gated_delta_rule and naive_recurrent_kda on each sequence in torch "
+                 "float64",
+          True: "fla's naive_recurrent_simple_gla on each sequence in torch float64"}
+"""Each recording's truth (`fla_sites.RECORDED`'s as its pinned units state it, `SIMPLE_RECORDED`'s, by
+whether its sites are fla's simple GLA's), the provenance its units must agree in to merge."""
+
+
+def recording_of(names) -> bool:
+    """Whether `names`' sites are fla's simple GLA's (`fla_sites.SIMPLE_RECORDED`'s) or the delta rules' and
+    RWKV6's (`RECORDED`'s): a unit records one recording's sites alone."""
+    from fla_sites import simple_gla, sites
+
+    kinds = {simple_gla(sites()[name].hooks) for name in names}
+    if len(kinds) != 1:
+        raise ValueError("a unit records fla's simple GLA's sites or the other sites, not both: "
+                         f"{sorted(names)}")
+    return kinds.pop()
+
+
+def fixture_of(units) -> Path:
+    """The recording a merge's `units` land in, by their sites (`recording_of`)."""
+    from fla_sites import RECORDED, SIMPLE_RECORDED
+
+    names = set()
+    for unit in units:
+        with np.load(unit, allow_pickle=False) as part:
+            names |= {key.split(".", 1)[0] for key in part if key != "provenance"}
+    return SIMPLE_RECORDED if recording_of(names) else RECORDED
 GRADIENTS = ("q", "k", "v", "g", "beta", "h0")
 """The delta rules' differentiated operands; RWKV6's take its own weight in the write gate's place."""
 
@@ -207,7 +234,7 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
     from dew.nn.kernels.selection import KernelRefused
 
     version, device = worker.started.split(maxsplit=1)
-    stored = {}
+    simple, stored = recording_of(names), {}
     for name in names:
         site, began = sites()[name], time.perf_counter()
         sample = site.arrays(0)
@@ -259,8 +286,7 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
         version, version, device.strip(),
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python> <unit> "
         "<site>...",
-        truth="fla's naive_recurrent_gated_delta_rule, naive_recurrent_kda, naive_recurrent_rwkv6 and "
-              "naive_recurrent_simple_gla on each sequence in torch float64",
+        truth=TRUTHS[simple],
         cross_check="Dew's token recurrence in float64; assert_computes_the_oracle with its traced "
                     "chain_roundings")
     np.savez(out, allow_pickle=False, **stored)
@@ -269,10 +295,12 @@ def write_seeded(worker, names: list[str], out: Path) -> None:
 
 def main() -> None:
     """The recorder's command line (`reference_worker.recording_command`), its sites `fla_sites`'s."""
+    from fla_sites import RECORDED
     from reference_worker import recording_command
 
-    recording_command(__file__, "fla_sites", serve=serve, write_seeded=write_seeded,
-                      fixture=FIXTURE, license="MIT")
+    fixture = fixture_of(sys.argv[2:]) if sys.argv[1:2] == ["--merge"] else RECORDED
+    recording_command(__file__, "fla_sites", serve=serve, write_seeded=write_seeded, fixture=fixture,
+                      license="MIT")
 
 
 if __name__ == "__main__":
