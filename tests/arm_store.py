@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 
 import jax
 import numpy as np
-from arm_arithmetic import as_written, summed_as_run, unrewritten
+from arm_arithmetic import as_written, products_held, summed_as_run, unrewritten
 from arm_forms import _bounded, _declared, _given, _own_function, _refuse_numpy_arms, _RunToRun, _Windowed
 from truths_ahead import AT_RUN, CompiledTruths, arm_role, named
 
@@ -42,13 +42,15 @@ def _arm_compile(compile: Callable, written: dict | None) -> Callable:
     """How the gate compiles a site's arms (`arm_forms._arms`), its results placed
     (`dew.training.ahead.compile_programs`' `compiled`): by `compile` (`arm_forms._compile_for`'s: as Dew's
     users compile them, `jax.jit`, beside an arm run as given, else without YNNPACK's fusions, `without_ynn`),
-    with the `written` options where they are a twin's (`arm_forms._written_twin`)."""
+    with the `written` options where they are a twin's (`arm_forms._written_twin`), its products held
+    (`arm_arithmetic.products_held`)."""
     def compiled(function, *, out_shardings):
         # An arm held whole (`_Whole`) is a jit of its own compiler options, lowered as itself: no other jit
         # may hold it.
         if isinstance(function, _Whole):
             return function
-        return compile(function, out_shardings=out_shardings, compiler_options=written)
+        return compile(function if written is None else products_held(function), out_shardings=out_shardings,
+                       compiler_options=written)
 
     return compiled
 

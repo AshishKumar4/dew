@@ -1539,16 +1539,30 @@ class Transport[Allocated, Opened](abc.ABC):
     (`base.TemplateOp.registers` None) and a core runs one program of it (`resources.register_programs`)."""
 
     @abc.abstractmethod
-    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
+                  joined: tuple = ()) -> int:
         """The registers a thread of each of `consumers` consumer roles may hold, `programs` programs a
         multiprocessor at once, beside a producer role lowered to `producer` where the family has one
-        (`roles`; setmaxnreg's least where None); asked of a family that budgets them alone
-        (`budgets_registers`)."""
+        (`roles`; setmaxnreg's least where None) and the `joined` roles (`role_schedule`); asked of a family
+        that budgets them alone (`budgets_registers`)."""
 
-    def warpgroups(self, consumers: int) -> int:
-        """The warpgroups a program of `consumers` compute roles runs: theirs, and a producer's where the
-        family streams from a role of its own (`roles`)."""
-        return self.roles(consumers).warpgroups()
+    def role_schedule(self, consumers: int, producer: int | None = None, joined: tuple = ()
+                      ) -> handoffs.Schedule:
+        """The family's roles (`roles`) with `joined`'s, each `(role, count)` (`handoffs.Schedule.joined`: a
+        correction warpgroup beside the consumers, a launch's reducing warps)."""
+        return functools.reduce(lambda schedule, each: schedule.joined(*each), joined,
+                                self.roles(consumers, producer))
+
+    @staticmethod
+    def joined_shares(joined: tuple) -> "resources.Joined":
+        """`joined`'s raised warpgroup roles as the register model reads them, each its weight and count
+        (`resources.Joined`); its warp roles share the last warpgroup's least."""
+        return tuple((role.weight, count) for role, count in joined if not role.warp)
+
+    def warpgroups(self, consumers: int, joined: tuple = ()) -> int:
+        """The warpgroups a program of `consumers` compute roles runs: theirs, a producer's where the
+        family streams from a role of its own (`roles`), and its `joined` roles' (`role_schedule`)."""
+        return self.role_schedule(consumers, joined=joined).warpgroups()
 
     def program_index(self, name: str, *, fresh: bool = False) -> jax.Array:
         """The program's coordinate on its launch grid's axis `name` (`kernel`'s `grid_names`): Mosaic GPU
@@ -1566,8 +1580,9 @@ class Transport[Allocated, Opened](abc.ABC):
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None, tmem: int = 0,
-               moves: bool | None = None) -> Callable:
-        """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
+               moves: bool | None = None, joined: tuple = ()) -> Callable:
+        """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own and its
+        `joined` roles (`role_schedule`: their warpgroups among its threads, their registers in its model),
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
         compile fits its registers to them, `compiler_params`, and its roles raise to their share), with
         `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`), named
@@ -1607,16 +1622,17 @@ class Transport[Allocated, Opened](abc.ABC):
         (setmaxnreg's least where None: a launch states more where its producer's issue loop holds more)."""
 
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
-                  exclusive: bool = False, issuer: Callable | None = None, reducer: Callable | None = None):
-        """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)`, `producer()`,
-        `issuer()` where it issues on a role (`Issuer.places_on_role`) and `reducer(index)` on a warp a
-        consumer (`handoffs.REDUCER`), each a branch of one switch where `exclusive`; the consumers' value."""
-        schedule = self.roles(consumers, floor)
-        schedule = schedule if reducer is None else schedule.joined(handoffs.REDUCER, consumers)
+                  exclusive: bool = False, issuer: Callable | None = None, joined: tuple = ()):
+        """The family's roles run (`role_schedule`, its producer lowered to `floor`): `consumer(index)`,
+        `producer()`, `issuer()` where it issues on a role (`Issuer.places_on_role`) and each `joined`
+        role's body at its index, `(role, count, body)` (a correction warpgroup's, a launch's reducing warps':
+        `(handoffs.REDUCER, consumers, reduce)`), each a branch of one switch where `exclusive`; the
+        consumers' value."""
+        schedule = self.role_schedule(consumers, floor, tuple((role, count) for role, count, _ in joined))
         # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
         units = {"producer": producer, "issuer": issuer}
-        bodies = {"consumer": consumer, "reducer": reducer, **{name: lambda index, body=body: body()
-                                                               for name, body in units.items()}}
+        bodies = {"consumer": consumer, **{role.name: body for role, _, body in joined},
+                  **{name: lambda index, body=body: body() for name, body in units.items()}}
         return schedule.run(exclusive=exclusive, **{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
@@ -2040,13 +2056,14 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         self.published()
         return into
 
-    def programs(self, consumers: int, registers: int | None = None, producer: int | None = None) -> int:
+    def programs(self, consumers: int, registers: int | None = None, producer: int | None = None,
+                 joined: tuple = ()) -> int:
         """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
         consumer roles holding `registers` (None: the family's budget, `registers`) beside a producer
         lowered to `producer`: at warpgroup MMA's budget, one, its consumers raised to the register file's
         share beside its producer (`resources.consumer_registers`). Each stages its share of the
         multiprocessor's shared memory (`resources.program_shared`), which may hold no tile at that many."""
-        return resources.register_programs(self, consumers, registers, producer)
+        return resources.register_programs(self, consumers, registers, producer, joined)
 
     def fixed_up(self, summed, partials, ready, program, first, gathered, store,
                  combine=operator.add, firsts=None) -> None:
@@ -2167,8 +2184,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     stores_through_registers = False
     copy_extent = 256
 
-    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
-        return resources.consumer_registers(consumers, programs, producer)
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
+                  joined: tuple = ()) -> int:
+        return resources.consumer_registers(consumers, programs, producer, self.joined_shares(joined))
 
     def column_unit(self, dtype) -> int:
         return swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES)
@@ -2183,19 +2201,19 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None, tmem: int = 0,
-               moves: bool | None = None) -> Callable:
+               moves: bool | None = None, joined: tuple = ()) -> Callable:
         # Its programs read a table from global memory as any operand.
         del scalars
         if cluster > self.cluster:
             raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
-                      warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
+                      warpgroups=self.warpgroups(consumers, joined), family=self.name, interpret=interpret,
                       name=name, approx_math=approx_math, cluster=cluster, cost=cost,
                       model_flops=model_flops, resident=resident, prefetched=prefetched,
                       model=(None if registers is None
                              else resources.register_model(self, consumers, registers, producer=producer,
                                                            programs=resident, shared=shared, tmem=tmem,
-                                                           moves=moves)),
+                                                           moves=moves, joined=joined)),
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       reduction_scratch=((self.reduction_scratch if reduces else 0)
                                          + self.warpgroup_reduction_scratch * reducing_warpgroups))

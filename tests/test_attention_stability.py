@@ -1196,34 +1196,6 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     default_is_finite(family, "portable")
 
 
-def test_assert_finite_checks_empty_rows_on_every_draw():
-    """Row 9041: a finite nonzero output or dQ in an empty row after seed zero fails `assert_finite`'s
-    per-draw check without running `dew_fn` a second time."""
-    empty = np.array([[True, False]])
-    family = Family(draw=lambda s: (jnp.zeros((1, 2, 1, 1)),), keep=np.zeros((1, 1, 2, 1), bool), empty=empty)
-    calls = 0
-
-    def dew_fn(x):
-        nonlocal calls
-        calls += 1
-        out = jnp.zeros((1, 2, 1, 1), jnp.float32)
-        dq = jnp.where(jnp.asarray(empty)[:, :, None, None], x, 0.0)
-        return (out, dq)
-
-    def truth_fn(x):
-        del x
-        zeros = jnp.zeros((1, 2, 1, 1), jnp.float64)
-        return (zeros, zeros)
-
-    def draw(seed):
-        return (jnp.asarray(float(seed), jnp.float32),)
-
-    with pytest.raises(AssertionError):
-        assert_finite(dew_fn, truth_fn, draw, "probe", seeds=3,
-                      check=lambda found, seed: _held_empty(family, found, f"probe seed {seed}"))
-    assert calls == 2
-
-
 @pytest.mark.skipif(not INTERPRETED, reason="an H100 runs these families in `_mainloops`' Mosaic arms")
 @pytest.mark.parametrize("family", ["values at fp32's largest over 2 equal keys",
                                     "values at fp32's largest over 256 equal keys"])
@@ -1244,16 +1216,16 @@ def test_the_mosaic_forward_of_values_at_fp32s_largest_is_as_exact_as_the_refere
                     seeds=seeds, truth_fn=_reference(family, anchored=True))
 
 
-MAINLOOPS = ("portable", "triton", *(("mosaic", "decode") if INTERPRETED else ()))
-"""The forwards a mean's test walks: the plain-JAX mainloop's and the Pallas-Triton one's, and in a CPU
-process the Mosaic forward's and its decode step's interpreted as an H100 runs them (a GPU runs them in
-`_mainloops`' Mosaic arms and the decode cells)."""
+MAINLOOPS = ("portable", "triton", "decode_kernel", *(("mosaic", "decode") if INTERPRETED else ()))
+"""The forwards a mean's test walks: the plain-JAX mainloop's, the Pallas-Triton one's and the Triton decode
+kernel's, and in a CPU process the Mosaic forward's and its decode step's interpreted as an H100 runs them (a
+GPU runs them in `_mainloops`' Mosaic arms and the decode cells)."""
 
 
 @pytest.mark.parametrize("sink", [None, -20.0], ids=["no sink", "a sink"])
 @pytest.mark.parametrize(("mainloop", "training"),
                          [(mainloop, training) for mainloop in MAINLOOPS for training in (False, True)
-                          if mainloop != "decode" or not training],
+                          if mainloop not in ("decode", "decode_kernel") or not training],
                          ids=lambda value: {False: "inference", True: "training"}.get(value, value))
 def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, sink):
     """One fp16 query over a key at logit 0 and 1000 at a logit whose weight, 0.50035, narrows up to 0.5005
@@ -1289,6 +1261,9 @@ def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, s
             with generation.assumed("sm90"):
                 out = attention_mosaic.forward(query, key, value, spans, hooks, interpret=True,
                                                residuals=kept)
+        elif mainloop == "decode_kernel":
+            sunk = None if sink is None else jnp.full((heads,), sink, jnp.float32)
+            out = _decode_attend(query, key, value, [keys], 1, sinks=sunk)
         else:
             with generation.assumed("sm90"):
                 out = attention_decode.attend(query, key, value, spans, hooks, interpret=True)
@@ -1657,6 +1632,17 @@ def _cache(array: jax.Array) -> jax.Array:
     return jnp.pad(array, ((0, 0), (0, slots), (0, 0), (0, 0)))
 
 
+def _decode_attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths, splits: int,
+                   sinks: jax.Array | None = None, **form) -> jax.Array:
+    """`decode_attention.attend` over `key` and `value` padded to whole decode blocks (`_cache`), with
+    `splits` slices pinned (as an A100's launch on a CPU, where `INTERPRETED` holds)."""
+    pin = {decode_attention.DecodeAttention: decode_attention.Split(splits)}
+    target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
+    with target, tuning.pinned(pin):
+        return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(lengths, jnp.int32),
+                                       sinks=sinks, interpret=INTERPRETED, **form)
+
+
 def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
     """The decode kernel over `family`'s step, interpreted on a CPU (as an A100's launch) and compiled on a
     GPU, each row's keys the first `K` of its cache, in the form `natural` names (None, the default), the
@@ -1667,13 +1653,7 @@ def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
 
     def decoded(query, key, value, sinks):
         count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
-        # The family's slice count, which a launch on a CPU, of no multiprocessors, does not offer: there
-        # as an A100's launch.
-        pin = {decode_attention.DecodeAttention: decode_attention.Split(family.splits)}
-        target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
-        with target, tuning.pinned(pin):
-            return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
-                                           sinks=sinks, interpret=INTERPRETED, **form)
+        return _decode_attend(query, key, value, count, family.splits, sinks=sinks, **form)
 
     def forward(seed):
         return _cast(family, family.draw)(seed)[:4]

@@ -359,31 +359,58 @@ def test_the_forward_on_tcgen05s_rows_holds_check_1_over_short_walks_interpreted
 @INTERPRETS
 def test_the_forward_on_tcgen05s_rows_streams_values_its_keys_columns_as_handed_interpreted():
     """A forward whose values are its keys' leading columns (`in_key`) on a B200's tcgen05 rows, whose
-    issuing role declares the values' stream (`MosaicForward.reads_key_slot`), streams the value array it
-    was handed: bit for bit the same call without `in_key`, under the interpreter (row 6643)."""
+    issuing role declares the values' stream (`MosaicForward.reads_key_slot`), holds check 1 against the
+    reference over seeded draws under the interpreter (rows 6643, 6695)."""
     shape = (1, 128, 1, 64)
-    query, key = (jax.random.normal(stream, shape, jnp.float32).astype(jnp.bfloat16)
-                  for stream in jax.random.split(jax.random.key(0), 2))
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
-    with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
-        keyed, unkeyed = (attention_mosaic.forward(query, key, key, spans, None, interpret=True,
-                                                   in_key=in_key) for in_key in (True, False))
-    np.testing.assert_array_equal(np.asarray(keyed, np.float32), np.asarray(unkeyed, np.float32))
+
+    def draw(seed: int):
+        query, key = (jax.random.normal(stream, shape, jnp.float32).astype(jnp.bfloat16)
+                      for stream in jax.random.split(jax.random.key(seed), 2))
+        return query, key
+
+    def ours(query, key):
+        with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
+            return attention_mosaic.forward(query, key, key, spans, None, interpret=True, in_key=True)
+
+    def reference(query, key):
+        return template.reference(query, key, key, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "tcgen05.rows in_key forward", seeds=SEEDS)
 
 
 @INTERPRETS
 def test_the_forward_on_tcgen05s_rows_keeps_a_subnormal_output_interpreted():
     """The forward on a B200's tcgen05 rows, its sums kept in tensor memory and taken by their rows' ratio
     as stored (`mosaic.Kept.scale`), under the interpreter on XLA's CPU, which flushes a subnormal product:
-    a full bf16 call of 128 keys, every logit 0, one key's values 2^-120 and the rest 0, returns 2^-127
-    (below fp32's and bf16's least normal) at every entry, exactly, as every other forward finish does
-    (`algebra.quotient`, row 6302), where the product by the inverse total returned 0."""
-    query = jnp.zeros((1, 128, 1, 64), jnp.bfloat16)
-    value = jnp.zeros_like(query).at[:, 0].set(2.0 ** -120)
+    a full bf16 call of 128 keys, every logit 0, one key's values near 2^-120 and the rest 0, holds check 1
+    against the reference over seeded draws (subnormal outputs near 2^-127, rows 6302, 6711)."""
     spans = template.spans(128, 128, 1)
-    with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
-        out = attention_mosaic.forward(query, query, value, spans, None, interpret=True)
-    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full(out.shape, 2.0 ** -127, np.float32))
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        signs = jnp.where(jax.random.bernoulli(streams[0], shape=(1, 1, 1, 64)), 1.0, -1.0)
+        mags = jax.random.uniform(streams[1], (1, 1, 1, 64), jnp.float32, minval=1.0, maxval=2.0)
+        query = jnp.zeros((1, 128, 1, 64), jnp.bfloat16)
+        scaled = (signs * mags * jnp.float32(2.0 ** -120)).astype(jnp.bfloat16)
+        value = jnp.zeros_like(query).at[:, :1].set(scaled)
+        return query, query, value
+    from dew.nn.precision import power2
+
+    def ours(query, key, value):
+        with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
+            return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
+
+    def exact_ref(query, key, value):
+        del key
+        return jnp.broadcast_to(power2(value[:, :1].astype(jnp.float32), -7).astype(jnp.bfloat16),
+                                query.shape)
+
+    def truth(query, key, value):
+        return template.reference(query, key, value, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(exact_ref), draw, "tcgen05.rows subnormal output", seeds=SEEDS,
+                    truth_fn=truth)
 
 
 @INTERPRETS
@@ -668,6 +695,69 @@ def test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_inte
     residuals = jax.tree.map(lambda shaped: jnp.zeros(shaped.shape, shaped.dtype), tuple(residuals))
     threads, arrivals = programs(backward, query, key, query, residuals, threads=3)
     assert explore(threads, arrivals) > 0
+
+
+def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_role():
+    """Row 8979: a focused producer/reducer trace of `attention_mosaic_dkv._PlacedDq` covering ordinals 0
+    and 1 on the same compute role (`lo=0, hi=3, role=0`): explores every interleaving with zero violations,
+    and fails with `Violation` when `_PlacedDq._turn` drops its `ordinal` term."""
+    import types
+
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+    from ring_protocol import Violation, explore, programs
+
+    from dew.nn.kernels.templates import attention_mosaic_dkv as dkv, placed, rings
+
+    block_q, width, slot_cols = 64, 64, 64
+    dq_out = jnp.zeros((1, 1, 3 * block_q, 1, width), jnp.float32)
+    walk = types.SimpleNamespace(
+        interpret=False,
+        program=types.SimpleNamespace(family=placed.KEYS, tiles=types.SimpleNamespace(block_q=block_q)))
+
+    class _NoOrdinal(dkv._PlacedDq):
+        def _turn(self, ordinal, piece: int):
+            del ordinal
+            return rings.Turn.of(piece, dkv.REDUCED)
+
+    def traced(ring_cls, name: str):
+        def launch(dq_arr):
+            def body(dq_ref):
+                def scope(stage, filled, emptied):
+                    ring = ring_cls(walk, dq_ref, (None, stage, filled, emptied), (0, 0))
+                    half = jnp.zeros((block_q, width), jnp.float32)
+                    role = jax.lax.axis_index("wg")
+
+                    @pl.when(role == 0)
+                    def _():
+                        ring.added((half,), 0, types.SimpleNamespace(turn=0, n=0))
+                        ring.added((half,), 2 * block_q, types.SimpleNamespace(turn=0, n=placed.TURNS))
+                        ring.drained(0, 3, role=0)
+
+                    @pl.when(role == 1)
+                    def _():
+                        ring.reduced(0, 3, role=0)
+
+                pl.run_scoped(
+                    scope,
+                    plgpu.SMEM((placed.TURNS, dkv.REDUCED, block_q, slot_cols), jnp.float32),
+                    tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),
+                    tuple(plgpu.Barrier(num_barriers=dkv.REDUCED) for _ in range(placed.TURNS)),
+                )
+
+            return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(dq_arr.shape, dq_arr.dtype),
+                                grid=(1,), grid_names=("p",), num_threads=2, thread_name="wg",
+                                kernel_name=name)()
+
+        return programs(launch, dq_out, threads=2)
+
+    threads, arrivals = traced(dkv._PlacedDq, "dq_ring_ordinals")
+    assert explore(threads, arrivals) > 0
+
+    # Dropping `ordinal` in `_PlacedDq._turn` must be caught by `explore`.
+    bad_threads, bad_arrivals = traced(_NoOrdinal, "dq_ring_ordinals_mutated")
+    with pytest.raises(Violation):
+        explore(bad_threads, bad_arrivals)
 
 
 @COMPILES_ON_CPU

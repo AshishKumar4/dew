@@ -349,6 +349,12 @@ def triton_evidence(calls: dict[str, int], launched: list[tuple[str, int]]) -> d
     return {"shared": max(size for name in calls for size in launches[name])}
 
 
+def _uncertified_since(uncertified: dict) -> list[str]:
+    """Each launch the lowering could not certify since `uncertified` was read (`report.uncertified`)."""
+    return [f"{type(key[0]).__name__ if not isinstance(key[0], str) else key[0]} at {key[1]}: {why}"
+            for key, why in report.uncertified().items() if key not in uncertified]
+
+
 def _certified_since(count: int) -> list[dict]:
     """Each launch certification compiled since the first `count` (`report.certifications`): its op and
     config and each kernel's registers, stack frame and verdict (`Binary.refused`), what a cell a family
@@ -395,15 +401,15 @@ def _compiled(case, generation: str, record: dict,
             record["error"] = f"it does not lower: {str(error)[-800:]}"
         else:
             record["shared"] = int(refused.group(1))
-        # A derivation the assembler exhausted refuses at trace: its certifications are its proof.
+        # A derivation the assembler exhausted refuses at trace: preserve typed exhaustion, uncertified
+        # failures and certifications so unrelated lowering failures cannot masquerade as exhaustion (6730).
+        record["exhausted"] = isinstance(error, report.Exhausted)
+        record["uncertified"] = _uncertified_since(uncertified)
         record["certifications"] = _certified_since(certifying)
         return None
     # A launch the lowering could not certify (`report.certified`) is a failure of its own: its run would
     # find its spills only as its whole program compiles.
-    record["uncertified"] = [f"{type(key[0]).__name__ if not isinstance(key[0], str) else key[0]} at "
-                             f"{key[1]}: {why}" for key, why in report.uncertified().items()
-                             if key not in uncertified]
-    # Each kernel once, as JAX lowered it (a function's kernels however many calls reach them).
+    record["uncertified"] = _uncertified_since(uncertified)
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
     modules = report.kernel_modules(calls)
     record["modules"] = modules

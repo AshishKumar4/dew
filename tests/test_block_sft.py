@@ -551,7 +551,7 @@ def image_run(inputs):
     return batch, data, jax.random.key(2)
 
 
-@pytest.mark.check1_shards(seeds=512, per_task=15)
+@pytest.mark.check1_shards(seeds=512, per_task=180)
 def test_an_image_sft_trainers_gradient_is_the_objectives(image_source):
     """The image SFT trainer's gradient is the objective's at the step's draws, the float64 twin of the
     loaded multimodal fixture the truth (`assert_the_objectives_gradient`)."""
