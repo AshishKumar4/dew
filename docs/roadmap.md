@@ -10,7 +10,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - finished_merged's mean is 0 where its slices' masses total past fp32's largest. [6904]
 - finished_merged's derivative along its denominators is NaN where (o - out) / W passes fp32 though its product with the tangent does not. [6905]
-- Jax fork, sm80: lax_test RaggedTest.test_ragged_dot_prefix_rounds_once's F16_F16_F32 cells (8, 9) fail on an A100 with INVALID_ARGUMENT 'Unsupported dot…. [8554]
 - Kernels/attention: dropout at the stability extremes gives non-finite results where the float64 truth rounded to bf16 is finite, in both Mosaic backward forms. [8652]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392]
@@ -39,7 +38,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests/test_gemm_gather.py:200-242 (the strided-table gathers kernel) duplicates tests/test_ring_protocol.py:382-424's gathered walk fixture. [8679]
 - A launch's certification traces it a second time. [8720]
 - Pallas Mosaic GPU lowering cache, certification against the step. [8793]
-- The recurrence suite's wall: every case within CI's group target. [8835]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
