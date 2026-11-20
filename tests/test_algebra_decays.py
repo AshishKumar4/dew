@@ -6,6 +6,7 @@ rounding of the whole accumulated magnitude."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from reference_error import assert_as_exact
 
 from dew.algebra import scan
@@ -185,3 +186,62 @@ def test_a_per_key_spreads_factored_pair_keeps_a_result_its_whole_decay_loses():
     found = np.asarray(scan.spread(readers, values, keys, between))
     factors = np.asarray(between[SUB - 1, SUB - 2]), np.asarray(between[SUB, SUB - 1])
     np.testing.assert_array_equal(found[SUB], keys[SUB - 2] * factors[0] * factors[1])
+
+
+def lone_pair(reader: float, value: float, decays, *, width: int = 2, later: int = 2):
+    """A per-key spread's operands of `later + 1` tokens whose one pair is the last's reader and the first's
+    write, its score `reader value`, every other score zero: unit keys, the pair's decay `decays` a key, its
+    factors across a sub-chunk's reference consistent with it (`recurrence_algebra.SUB`: `decays` up to the
+    reference and one after), every other pair's zero, exact as given (no `scan.between`): `(readers, values,
+    keys, between)`."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    readers, values = np.zeros((later + 1, 1), np.float32), np.zeros((later + 1, 1), np.float32)
+    readers[later], values[0] = reader, value
+    between = np.zeros((later + 1, later + 1, width), np.float32)
+    between[later, 0] = decays
+    if later >= SUB:
+        reference = later // SUB * SUB - 1
+        between[reference, 0], between[later, reference] = decays, 1.0
+    return readers, values, np.ones((later + 1, width), np.float32), between
+
+
+@pytest.mark.parametrize("later", [2, 18], ids=["own sub-chunk", "an earlier sub-chunk"])
+@pytest.mark.parametrize("read", ["overflowed", "a NaN"])
+def test_a_per_key_spreads_read_through_an_underflowed_decay_is_zero(read, later):
+    """`scan.spread` under a decay a key dimension, one pair of its last token's reader and its first's
+    write, within a sub-chunk or across one, its decay zero at every key: a read of 2^70 times 2^70, which
+    overflows, zero at every key, the rule of row 9547 (base review of ce6ad9298 F1), and a NaN read NaN."""
+    reader = np.nan if read == "a NaN" else 2.0 ** 70
+    found = np.asarray(scan.spread(*lone_pair(reader, 2.0 ** 70, 0.0, later=later)))
+    if read == "overflowed":
+        np.testing.assert_array_equal(found, np.zeros_like(found))
+    else:
+        assert np.all(np.isnan(found[later])), found
+
+
+def test_a_per_key_spreads_finite_read_through_a_small_decay_is_its_product():
+    """`scan.spread` under a decay a key dimension, one pair of a sub-chunk: a read 2^-80 through a decay
+    2^-80 of a key 2^80, exactly 2^-80, the key scaling the read before its decay (head review of
+    04b2ec480 F1: the decay taken first rounded 2^-160 to zero)."""
+    readers, values, keys, between = lone_pair(2.0 ** -80, 1.0, 2.0 ** -80, later=1)
+    keys[0] = 2.0 ** 80
+    found = np.asarray(scan.spread(readers, values, keys, between))
+    np.testing.assert_array_equal(found[1], np.full(2, 2.0 ** -80, np.float32))
+
+
+def test_a_per_key_spreads_masked_key_carries_no_derivative():
+    """`scan.spread` under a decay a key dimension, a sub-chunk's own pair whose read of 2^70 times 2^70
+    overflows through decays of zero at its first key and one at its second: the first key's output zero,
+    its tangent along the decays zero and its decay's gradient zero under a cotangent on that key alone,
+    where the rejected product's transpose formed infinity times zero (head review of 04b2ec480 F3)."""
+    readers, values, keys, between = lone_pair(2.0 ** 70, 2.0 ** 70, (0.0, 1.0))
+
+    def first_key(between):
+        return scan.spread(readers, values, keys, between)[:, 0]
+
+    out, tangent = jax.jvp(first_key, (between,), (np.ones_like(between),))
+    (gradient,) = jax.vjp(first_key, between)[1](np.ones(3, np.float32))
+    np.testing.assert_array_equal(np.asarray(out), np.zeros(3, np.float32))
+    np.testing.assert_array_equal(np.asarray(tangent)[2], np.float32(0.0))
+    np.testing.assert_array_equal(np.asarray(gradient)[..., 0], np.zeros(gradient.shape[:2], np.float32))
