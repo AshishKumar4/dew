@@ -41,6 +41,7 @@ from dew.nn.precision import (
     compensated_add,
     compensated_difference,
     exact_products,
+    float64_sum,
     fp32_result_dot_general,
     two_product,
     two_sum,
@@ -1330,6 +1331,36 @@ def test_a_host_scalar_widens_at_its_destination():
     F2)."""
     found = widened_exactly(2 ** 40, jnp.float32)
     assert found.dtype == jnp.float32 and float(found) == 2.0 ** 40
+
+
+def test_a_float64_sum_widens_its_subnormal_operands_exactly():
+    """`float64_sum`, Dew's wide CPU arithmetic's sum, of fp32 operands below the least normal: `2^-149 2^127`
+    and `(2^-126 - 2^-149) 2^127` taken in float64 and rounded once to fp32, `2^-22` and `2 - 2^-22`, where
+    widened by a cast XLA:CPU flushed them and each product was 0 (row 8966)."""
+    lhs = jnp.asarray(np.asarray([[1], [0x7FFFFF]], np.uint32).view(np.float32))
+    found = float64_sum(jnp.matmul, lhs, jnp.asarray([[2.0 ** 127]], jnp.float32), dtype=jnp.float32)
+    assert found.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(found), np.float32([[2.0 ** -22], [2.0 - 2.0 ** -22]]))
+
+
+def test_an_exact_widening_transposes_as_a_cast():
+    """`jax.linear_transpose` of `widened_exactly` from bfloat16 to float32 at a float32 cotangent of 1:
+    bfloat16's 1, the cotangent cast back, where the widening's select on its operand's bits took no
+    transpose (base review 20ad463a7 F1)."""
+    transposed = jax.linear_transpose(lambda x: widened_exactly(x, jnp.float32), jnp.bfloat16(1))
+    (pulled,) = transposed(jnp.float32(1))
+    assert pulled.dtype == jnp.bfloat16 and float(pulled) == 1.0
+
+
+def test_an_aligned_sums_subnormal_direction_widens_exactly():
+    """The tangent of `aligned_sum([(a, 2^149)])` of a float32 `a` and a float64 `2^149`, with x64 on, at
+    `a = 0` in the direction `2^-149` (built from its bits): float64's 1, the direction widened from its
+    bits, where XLA:CPU's cast flushed it to zero (base review 20ad463a7 F2)."""
+    direction = jnp.asarray(np.asarray(1, np.uint32).view(np.float32))
+    with jax.enable_x64(new_val=True):
+        _, tangent = jax.jvp(lambda a: aligned_sum([(a, jnp.float64(2.0 ** 149))]), (jnp.float32(0.0),),
+                             (direction,))
+    assert tangent.dtype == jnp.float64 and float(tangent) == 1.0
 
 
 def test_an_aligned_sum_of_three_factors_over_a_long_axis_is_its_exact_sum():

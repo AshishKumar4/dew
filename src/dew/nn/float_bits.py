@@ -7,8 +7,6 @@ widens one. Integer arithmetic on a float's bits alone, which `dew.nn.precision`
 
 from __future__ import annotations
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -144,8 +142,9 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
     subnormal `x` of a `WIDENED` format set in `dtype`'s bits from its own (`float_bits`' reading of it, its
     normal exponent where `dtype` holds one, else its fraction on `dtype`'s subnormal grid), a normal one
     converted, so a process whose conversion flushes a subnormal operand (XLA's CPU, row 4023: float32's
-    `2^-149` widened to zero, row 8966) widens it. Its derivative is declared, the plain conversion of its
-    direction, linear, so a product's linear map that widens its operands transposes as the cast's would.
+    `2^-149` widened to zero, row 8966) widens it. A linear map (`generation.linear_map`) whose transpose is
+    the cotangent converted back to `x`'s format, so a direction widens exactly too, and a product's linear
+    map that widens its operands transposes, however JAX reaches it (`jax.linear_transpose` among them).
     Any other `x` (a Python or NumPy scalar, an integer, a narrower format's, a conversion that narrows)
     converted as `jnp.asarray` converts it, a host scalar at `dtype` directly."""
     if not isinstance(x, jax.Array | np.ndarray):
@@ -154,11 +153,17 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
     if (jnp.dtype(x.dtype) not in WIDENED or dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.float64))
             or jnp.finfo(dtype).bits <= jnp.finfo(x.dtype).bits):
         return jnp.asarray(x, dtype)
-    return _declared_widening()(jnp.asarray(x), dtype)
+    from dew.nn.kernels.generation import linear_map
+
+    x = jnp.asarray(x)
+    source = x.dtype
+    return linear_map(lambda _, moving: _widened_bits(moving, dtype),
+                      lambda _, cotangent: cotangent.astype(source), (), x,
+                      out_aval=jax.typeof(x).update(dtype=dtype))
 
 
 def _widened_bits(x: jax.Array, dtype: jnp.dtype) -> jax.Array:
-    """`widened_exactly`'s value: a subnormal `x` placed in `dtype` from `float_bits`' reading, a normal one
+    """`widened_exactly`'s map: a subnormal `x` placed in `dtype` from `float_bits`' reading, a normal one
     converted."""
     source, target = jnp.finfo(x.dtype), jnp.finfo(dtype)
     word = jnp.dtype(f"uint{target.bits}")
@@ -171,19 +176,3 @@ def _widened_bits(x: jax.Array, dtype: jnp.dtype) -> jax.Array:
     signed = (sign != 0).astype(word) << word.type(target.bits - 1)
     subnormal = jax.lax.bitcast_convert_type(signed | held, dtype)
     return jnp.where(biased == 0, subnormal, x.astype(dtype))
-
-
-def _widened_tangent(dtype: jnp.dtype, primals, tangents) -> tuple[jax.Array, jax.Array]:
-    """`widened_exactly`'s value and tangent: the direction converted, as the cast's derivative is."""
-    (x,), (direction,) = primals, tangents
-    return _declared_widening()(x, dtype), direction.astype(dtype)
-
-
-@functools.cache
-def _declared_widening():
-    """`_widened_bits` with its linear tangent declared (`dew.nn.derivatives.declared_tangent`), a span its
-    numerics need as written (`Protected`), made once a process."""
-    from dew.nn.derivatives import Protected, contracted, declared_tangent
-
-    return contracted("test_an_exact_widening_holds_every_order")(
-        declared_tangent(Protected(), _widened_bits, _widened_tangent, nondiff_argnums=(1,)))
