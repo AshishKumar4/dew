@@ -22,6 +22,7 @@ from dew.nn.kernels.templates.attention_algebra import (
     WEIGHT_SHIFT,
     Parts,
     Recompute,
+    anchor_split,
     expand,
     exponent,
     finite,
@@ -151,16 +152,14 @@ def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Arr
     """A tile's weights `exp(s - m)` at the forward's maximum, fp32, at the forward's weights' shift,
     `2^-min(shift, WEIGHT_SHIFT)`; them narrowed to the values' `dtype` as the forward rounds
     them, zero at the anchor key (`at_anchor`), the left operand of `B`'s product; the anchor key's
-    narrowed weight, fp32; and the weights that shift would push below fp32's least normal, unshifted
-    and narrowed, whose product the mainloop issues apart (`off_anchor`), as the forward's small weights'
-    (`at_scale`)."""
+    weight as it is, fp32, as the forward keeps it (`algebra.anchor_split`); and the weights that shift
+    would push below fp32's least normal, unshifted and narrowed, whose product the mainloop issues apart
+    (`off_anchor`), as the forward's small weights' (`at_scale`)."""
     exponentials = below(logits, maximum, how)
     weight = expand(jnp.minimum(shift, WEIGHT_SHIFT), exponentials)
     small = jnp.where(exponentials < power2(jnp.float32(1.0), weight - 126.0), exponentials, 0.0)
     exponentials = power2(exponentials - small, -weight)
-    rounded = exponentials.astype(dtype)
-    rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
-    own = jnp.where(at_anchor, rounded, jnp.zeros_like(rounded)).astype(jnp.float32).sum(axis=-1)
+    rest, own = anchor_split(exponentials, at_anchor, dtype)
     return exponentials, rest, own, small.astype(dtype)
 
 

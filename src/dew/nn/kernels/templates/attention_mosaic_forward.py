@@ -689,7 +689,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         # call's over the rest of its multiplier too, in the one division (`algebra.dropped_total`).
         total = rows[1] if not form.headroom else power2(rows[1], -split.shift, reach=TWO_FACTOR_REACH)
         out = algebra.output_of(*algebra.dropped_total(form, acc, total),
-                                guarded=form.guarded or hooks.initial is not None)
+                                guarded=form.guarded or hooks.initial is not None, held=form.largest)
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None
 
@@ -755,7 +755,8 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                            dropped=1.0 if hooks.drop is None else hooks.drop.bound,
                            # Its sums hold the reach: no state beside a walk of no headroom (`refused`).
                            units=sums_units(hooks.drop, headroom=algebra.headroom(weights),
-                                                    initial=hooks.initial is not None))
+                                                    initial=hooks.initial is not None),
+                           largest=algebra.largest_of(weights, hooks))
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     hooked = _hooked_of(hooks, call, unit)
     if scales is not None:
@@ -1520,7 +1521,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             if interpret:
                 total = family.stored_row(total, row_smem)
             def ratio(block: jax.Array) -> jax.Array:
-                taken = algebra.quotient(lambda held: held * factor[:, None], block, total)
+                taken = algebra.quotient(lambda held: held * factor[:, None], block, total, held=spec.largest)
                 return jnp.where(factor[:, None] != 0, taken, 0.0)
 
             kept = state.acc.scaled(ratio)

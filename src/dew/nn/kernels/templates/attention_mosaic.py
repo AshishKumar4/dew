@@ -1048,7 +1048,8 @@ class MosaicForward(_Mainloop[Tiles]):
     def registered(self, query, value, score_params, residuals, table=None, sources=None,
                    scales=None, initial=None, drop=None) -> ForwardRegisters:
         """The call's base register facts (`ForwardRegisters`): an `initial` state merges past an inference
-        walk's keys (`attention_mosaic_forward._started`), a split training walk starting from it."""
+        walk's keys (`attention_mosaic_forward._started`), a split training walk starting from it; a `drop`
+        over fp16 values takes its kept weights in two parts (`algebra.kept_parts`)."""
         params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype) for param in score_params),
                            strict=True))
         computed = query.dtype if scales is not None else value.dtype
@@ -1060,6 +1061,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                 merged=initial is not None and residuals is not Kept.SPLIT,
                                 started=initial is not None and residuals is Kept.SPLIT,
                                 dropped=drop is not None,
+                                weight_parts=2 if drop is not None and value.dtype == jnp.float16 else 1,
                                 prologue=(None if self.query_mod is None
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)))
 
@@ -1283,7 +1285,7 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                          f"the call derives {family.name}, whose sums its issuer keeps in tensor memory")
     arguments = ba.arguments
     registered = op.registered(arguments["query"], arguments["value"], arguments["score_params"], Kept.NONE,
-                               drop=arguments["drop"])
+                               drop=arguments.get("drop"))
     if hooks.query_mod is not None and op.query_mod is None:
         # A query prologue the launch does not take where it loads the query (`_forward_call`), taken here.
         query = prologued(query, hooks.query_mod, hooks.query_params)
