@@ -18,6 +18,7 @@ from jax.extend import core as jcore
 from dew.algebra import program, terms
 from dew.nn import programs
 from dew.nn.derivatives import stated_operation
+from dew.nn.kernels.templates.layout import PLACEMENTS
 from dew.nn.precision import float32_dot_general
 
 
@@ -187,9 +188,6 @@ def inlined(function: Callable) -> Callable:
     return run
 
 
-PLACEMENTS = (jcore.primitives.reshard_p, jax.lax.sharding_constraint_p)
-"""The equations that place a value on a mesh and leave it as it is (each output its operand), taken as
-the identity where a walk's tiles are traced (`evaluated_inline`)."""
 
 
 def _platform_default(equation: jcore.JaxprEqn,

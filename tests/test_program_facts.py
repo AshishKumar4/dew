@@ -14,7 +14,7 @@ from test_algebra import rows
 
 from dew import algebra
 from dew.nn import flops, programs
-from dew.nn.kernels.templates import layout
+from dew.nn.kernels.templates import attention, attention_mosaic_program, layout
 
 
 def named(name: str, function, operands: int = 1) -> jcore.Primitive:
@@ -103,7 +103,8 @@ def test_a_tile_layout_takes_a_placement_inside_a_nested_call_as_the_identity():
     """A function of a tile whose nested call places a value on a mesh (a sharding constraint, as a GPU's
     trace of a plain program's attention holds a reshard in its score hook: rows 9570 and 9571) is held
     transposed as the function without it: the placement binds nothing, the tile being placed already, so
-    the transposed program holds none for a kernel's lowering to meet."""
+    the transposed program holds none for a kernel's lowering to meet; and as a score hook the Mosaic
+    backward takes it (`transposable`), its placement one entry at a time (head review)."""
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("rows",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
@@ -116,4 +117,7 @@ def test_a_tile_layout_takes_a_placement_inside_a_nested_call_as_the_identity():
     traced = jax.make_jaxpr(held)(tile.T)
     assert not any(eqn.primitive in (jax.lax.sharding_constraint_p, primitives.reshard_p)
                    for eqn in traced.jaxpr.eqns)
+    # The Mosaic backward's legality of such a score hook: transposed, and one entry at a time in its logits.
+    hooks = attention.Hooks(score_mod=lambda logits, q_pos, k_pos: scored(logits))
+    assert attention_mosaic_program.transposable(hooks)
 
