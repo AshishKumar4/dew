@@ -198,6 +198,7 @@ class Choice(enum.StrEnum):
     NVFP4 = 'nvfp4'
     NVFP4_BLOCK = 'nvfp4_block'
     PAGED_DECODE = 'paged_decode'
+    QKV = 'qkv'
     RMS_NORM = 'rms_norm'
     SELECTIVE_SCAN = 'selective_scan'
     SHORT_CONV = 'short_conv'
@@ -1495,15 +1496,29 @@ _logged: set[tuple[str, str, str]] = set()
 def route(choice: Choice, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
           forced: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
-    decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` names, else
-    `kernel`. Every `routes` block open records it.
-    A call off its preferred kernel is logged once a process for each kernel and refusal at INFO, naming
-    both and the refusal's reason; one that runs the preferred kernel logs nothing."""
+    decided (`dew.nn.kernels.selection.select`): `routed`'s route, `published`."""
+    return published(routed(choice, kernel=kernel, preferred=preferred, refusal=refusal, forced=forced))
+
+
+def routed(choice: Choice, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
+           forced: str | None = None) -> Route:
+    """The route of a dispatch of `choice` to `kernel`, reported nowhere: what a caller asking which kernel
+    would run holds until the dispatch it decides runs (`published`; `selection.decided`). `preferred`
+    defaults to the kernel `chosen` names, else `kernel`."""
     from dew import _cache
 
-    generation = device_generation()
     preferred = preferred or dict(_cache.KERNEL_CHOICES.value).get(choice) or kernel
-    found = Route(choice, kernel, preferred, refusal, generation, _site(), forced)
+    return Route(choice, kernel, preferred, refusal, device_generation(), _site(), forced)
+
+
+def published(found: Route) -> Route:
+    """`found`, a dispatch that runs, reported: every `routes` block open records it, and a call off its
+    preferred kernel is logged once a process for each kernel and refusal at INFO, naming both and the
+    refusal's reason; one that runs the preferred kernel logs nothing."""
+    from dew import _cache
+
+    choice, kernel, preferred, refusal, generation = (found.choice, found.kernel, found.preferred,
+                                                      found.refusal, found.target)
     for collected in _cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail

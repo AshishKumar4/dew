@@ -6,9 +6,21 @@ declared cells), a call stacks their kernels and runs one
 product: one wide GEMM fills the device where narrower ones over the same
 rows do not, and reads the input once. Stacking copies the kernels once a
 call, small beside the activations, and their gradients unstack the same way.
+
+Projections of unequal widths (a layer's query, key and value) run side by
+side (`beside_dense`): one launch over their columns, each its own output,
+and their input gradient chained in one accumulator (`gemm.gemm`'s
+`beside`), where a launch takes that product (`side_by_side`).
+
+A caller that reads a projection's own call (any Flax method interceptor: a
+watch, node perturbation; Flax's captured intermediates) keeps it apart, as a
+wrapper that intercepts it does.
 """
 
+import contextlib
 import dataclasses
+import functools
+import math
 from collections.abc import Callable, Sequence
 from typing import TypeGuard
 
@@ -16,14 +28,18 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
+from flax.linen.dtypes import promote_dtype
+from flax.typing import PrecisionLike
 
-from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, _rounds_once, intercepted
-from dew.nn.precision import float32_dot_general
+from dew import _cache
+from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, _rounds_once
+from dew.nn.precision import biased, float32_dot_general
 
+from .kernels import gemm, generation
 from .kernels.generation import INHERENT, Choice, device_generation
-from .kernels.projections import kernel_path, mapped_shards, recipe_takes
+from .kernels.projections import kernel_path, mapped_shards, recipe_takes, shard_placement
 from .kernels.selection import Kernel, Op, Requirement, select
-from .sharding import on_shards
+from .sharding import on_shards, seen_whole
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,41 +47,98 @@ class Projections:
     """A layer's projections as a selector that stands in for their own calls reads them (the join's, the
     fused gated MLP's, `dew.nn.gated_mlp`): whether each is a plain Dense (`dense`) on the default product
     (`dot_general`), whether a wrapper intercepts their own calls (`intercepted`), whether each holds
-    its own kernel (`held`), and whether the run's low-precision recipe takes any one's product apart
-    or their joined product (`recipe`: `projections.recipe_takes`), each quantized as its own, which a
-    join of them would not be."""
+    its kernel and bias as its own call declares them (`held`, `_held`), whether the run's low-precision
+    recipe takes any one's product apart or their joined product (`recipe`: `projections.recipe_takes`),
+    each quantized as its own, which a join of them would not be, and whether a caller reads any one's own
+    call (`observed`, `_observed`); `leaves` the held leaves, the one read of them a join's operands are
+    prepared from (`prepared`), None where any is not held."""
 
     dense: bool
     dot_general: bool
     intercepted: bool
     held: bool
     recipe: bool
+    observed: bool
+    leaves: "Leaves | None" = dataclasses.field(default=None, compare=False)
 
 
-def projections_of(projections: Sequence[nn.Module]) -> Projections:
+@dataclasses.dataclass(frozen=True)
+class Leaves:
+    """Projections' leaves as their own calls declare them (`_leaves`), unboxed: each one's kernel `[depth,
+    features]` and its bias as stored (None where it takes none)."""
+
+    kernels: tuple[jax.Array, ...]
+    stored: tuple[jax.Array | None, ...]
+
+
+def _dense(projections: Sequence[nn.Module]) -> TypeGuard[Sequence[Dense]]:
+    """Whether every one of `projections` is a plain Dense (`dense._plain_dense`)."""
+    return all(_plain_dense(projection) for projection in projections)
+
+
+def projections_of(projections: Sequence[nn.Module], depth: int | None = None) -> Projections:
     """The `Projections` of `projections`: whether a wrapper owns their products each asks within its own
-    scope (`Dense.product_owned`), a rule over its module path matching it there."""
-    dense = all(_plain_dense(projection) for projection in projections)
+    scope (`Dense.product_owned`), a rule over its module path matching it there, or any Flax method
+    interceptor is installed (`_intercepting`). Of projections not every
+    one a plain Dense nothing more is read (a module that is no projection, a Dropout, has none of a
+    Dense's fields): none stands in for them."""
+    if not _dense(projections):
+        return Projections(dense=False, dot_general=False, intercepted=False, held=False, recipe=False,
+                           observed=False)
+    leaves = _leaves(projections, depth)
     return Projections(
-        dense=dense,
+        dense=True,
         dot_general=all(projection.dot_general in (None, float32_dot_general)
                         and projection.dot_general_cls is None for projection in projections),
-        intercepted=(any(projection.product_owned() for projection in projections) if dense
-                     else intercepted()),
-        held=all(projection.has_variable('params', 'kernel') for projection in projections),
-        recipe=_recipe_differs(projections))
+        intercepted=_intercepting() or any(projection.product_owned() for projection in projections),
+        held=leaves is not None, recipe=leaves is not None and _recipe_differs(leaves.kernels),
+        observed=_observed(projections), leaves=leaves)
 
 
-def _recipe_differs(projections: Sequence[nn.Module]) -> bool:
-    """Whether the run's low-precision recipe takes any of `projections` apart or their joined product
-    (`projections.recipe_takes`, the one decision `recipe_projection` reads, of each kernel's `[depth,
+def _intercepting() -> bool:
+    """Whether a Flax method interceptor is installed (`nn.intercept_methods`, Flax's own stack): any of them
+    may intercept a projection's own call, which a join standing in for the calls would bypass (base review
+    760be77fe F1: an interceptor zeroing `v_proj`'s output, the joined layer returned it)."""
+    from flax.linen import module as flax_module
+
+    return bool(flax_module._global_interceptor_stack)
+
+
+def _leaves(projections: Sequence[Dense], depth: int | None) -> Leaves | None:
+    """`projections`' leaves (`Leaves`) where each holds its kernel, and its bias where it takes one, of the
+    shapes its own call declares them (`Dense._linear`'s params: `[depth, features]`, `depth` its input's
+    width where given, and `[features]`), else None: its own call reports the tree's error, which a read of
+    its leaves would pass by (a missing bias left out, a one-wide one broadcast)."""
+    kernels, stored = [], []
+    for projection in projections:
+        kernel = projection.get_variable('params', 'kernel')
+        bias = projection.get_variable('params', 'bias') if projection.use_bias else None
+        if kernel is None or (projection.use_bias and bias is None):
+            return None
+        kernel, bias = meta.unbox(kernel), None if bias is None else meta.unbox(bias)
+        width = projection.features
+        if not (kernel.ndim == 2 and kernel.shape[1] == width and depth in (None, kernel.shape[0])
+                and (bias is None or bias.shape == (width,))):
+            return None
+        kernels.append(kernel)
+        stored.append(bias)
+    return Leaves(tuple(kernels), tuple(stored))
+
+
+def _observed(projections: Sequence[Dense]) -> bool:
+    """Whether a caller reads `projections`' own calls' outputs as Flax captures every module's (their
+    `intermediates` collection open: `capture_intermediates`); a caller intercepting them is `_intercepting`'s
+    (a watch's, node perturbation's: base review 760be77fe F1)."""
+    return projections[0].is_mutable_collection('intermediates')
+
+
+def _recipe_differs(kernels: Sequence[jax.Array]) -> bool:
+    """Whether the run's low-precision recipe takes any of projections' `kernels` apart or their joined
+    product (`projections.recipe_takes`, the one decision `recipe_projection` reads, of each kernel's `[depth,
     width]` and of the joined `[depth, their widths' sum]` the join multiplies by): either way one GEMM of
     them would not be quantized as they are apart (train 928 F1: two 16-wide gates no MXFP8 block takes,
     joined 32 wide, which one does)."""
-    shapes = [meta.unbox(kernel).shape[-2:] for projection in projections
-              if (kernel := projection.get_variable('params', 'kernel')) is not None]
-    if not shapes:
-        return False
+    shapes = [kernel.shape[-2:] for kernel in kernels]
     joined = (shapes[0][0], sum(width for _, width in shapes))
     return any(recipe_takes(*shape) for shape in (*shapes, joined))
 
@@ -84,8 +157,13 @@ def projection_requirements[C](of: Callable[[C], Projections], stands_in: str) -
         Requirement('intercepted', lambda case: not of(case).intercepted,
                     "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
                     "projection's own call", row=INHERENT, kind='handoff'),
-        Requirement('kernel', lambda case: of(case).held, "a projection holds no kernel of its own",
-                    row=INHERENT, kind='handoff'),
+        Requirement('kernel', lambda case: of(case).held,
+                    "a projection holds no kernel or bias of the width its own call declares, whose error "
+                    "its own call reports", row=INHERENT, kind='handoff'),
+        Requirement('observed', lambda case: not of(case).observed,
+                    f"a caller reads a projection's own output as Flax captures it "
+                    f"(`capture_intermediates`), which {stands_in} does not make", row=INHERENT,
+                    kind='handoff'),
         Requirement('recipe', lambda case: not of(case).recipe,
                     f"the run's low-precision recipe takes the projections' products (`projections."
                     f"recipe_projection`), each quantized as its own, which {stands_in} does not",
@@ -121,10 +199,15 @@ agreement in what one GEMM's columns share."""
 
 def join_case(projections: Sequence[nn.Module]) -> JoinCase:
     """The `JoinCase` of `projections`."""
-    return JoinCase(
-        projections=projections_of(projections),
-        uniform=len({(projection.features, projection.use_bias, projection.dtype, projection.precision,
-                      projection.promote_dtype, projection.dot_general) for projection in projections}) == 1)
+    return JoinCase(projections=projections_of(projections), uniform=_agree(projections, widths=True))
+
+
+def _agree(projections: Sequence[nn.Module], *, widths: bool) -> bool:
+    """Whether `projections` agree in bias, dtype, precision, promotion and product, and in width where
+    `widths`: what one GEMM's columns share."""
+    return len({(projection.features if widths else None, projection.use_bias, projection.dtype,
+                 projection.precision, projection.promote_dtype, projection.dot_general)
+                for projection in projections}) == 1
 
 
 DELTA_GATES_FASTER = ("e5198da4e: a gated delta net's b and a, 24,576 tokens, forward and backward 5.44 -> "
@@ -171,36 +254,64 @@ def joins(projections: Sequence[nn.Module], choice: Choice) -> TypeGuard[Sequenc
     return select(JOINS[choice], join_case(projections)).kernel == 'joined'
 
 
+@dataclasses.dataclass(frozen=True)
+class Prepared:
+    """Projections' operands as each one's own call casts them (`dense._promoted`): each one's input, kernel
+    and bias as promoted, and each bias as stored (`dense._biased`'s `stored`: its rounding reads it)."""
+
+    inputs: tuple[jax.Array, ...]
+    kernels: tuple[jax.Array, ...]
+    biases: tuple[jax.Array | None, ...]
+    stored: tuple[jax.Array | None, ...]
+
+
+def prepared(x: jax.Array, projections: Sequence[Dense], leaves: Leaves) -> Prepared:
+    """`projections`' operands over `x` (`Prepared`) from their held `leaves` (`_leaves`), each kernel and
+    bias cast as its own call casts it (`dense._promoted`)."""
+    promoted = [_promoted(projection, x, kernel, bias)
+                for projection, kernel, bias in zip(projections, leaves.kernels, leaves.stored, strict=True)]
+    inputs, kernels, biases = (tuple(each) for each in zip(*promoted, strict=True))
+    return Prepared(inputs, kernels, biases, leaves.stored)
+
+
+def _mapped[R](product: Callable[..., R], inputs: jax.Array, kernels: tuple,
+               shards: tuple[jax.sharding.PartitionSpec, dict] | None) -> R:
+    """`product(inputs, *kernels)`, or, with `shards` (a split and the kernels' placements, `mapped_shards`'
+    or `shard_placement`'s), each device's rows its own call, the kernels entering apart, each placed by the
+    layout and gathered whole there (`on_shards`), so each one's gradient leaves the map at its own shape."""
+    if shards is None:
+        return product(inputs, *kernels)
+    split, gathered = shards
+    return on_shards(product, split, (inputs, *kernels), gathered=gathered)
+
+
 def joined_dense(x: jax.Array, projections: Sequence[Dense], *, axis: int) -> jax.Array:
     """`projections`' outputs of `x` from one GEMM, stacked on output axis `axis`: -2 gives
     `[..., n, features]`, -1 `[..., features, n]`. Each kernel and bias is read and cast as its
-    own call casts it, and the product taken and biased by a Dense's own arithmetic (`dense._biased`: a
-    16-bit product with an fp32-stored bias rounded once with it, as each projection apart rounds its own);
-    `joins` says when the result is theirs."""
+    own call casts it (`prepared`), and the product taken and biased by a Dense's own arithmetic
+    (`dense._biased`: a 16-bit product with an fp32-stored bias rounded once with it, as each projection
+    apart rounds its own); `joins` says when the result is theirs."""
     if axis not in (-2, -1):
         raise ValueError(f"the projections stack on output axis -2 or -1, not {axis}")
-    first = projections[0]
-    stored = [meta.unbox(projection.get_variable('params', 'bias')) if first.use_bias else None
-              for projection in projections]
-    promoted = [_promoted(projection, x, meta.unbox(projection.get_variable('params', 'kernel')), bias)
-                for projection, bias in zip(projections, stored, strict=True)]
-    inputs = promoted[0][0]
+    leaves = _leaves(projections, x.shape[-1])
+    if leaves is None:
+        raise ValueError("the joined projections hold no kernel or bias of the shapes their calls declare: "
+                         "`joins` takes none such")
+    first, operands = projections[0], prepared(x, projections, leaves)
+    inputs, kernels = operands.inputs[0], operands.kernels
     # A kernel is [inputs, features]; the stacked axis sits beside its features as it will in the output,
     # and the biases beside theirs, so the kernels side by side and the biases flattened alike pair each
     # output column with its own bias.
-    def flat(biases: list) -> jax.Array | None:
+    def flat(biases: tuple) -> jax.Array | None:
         return None if biases[0] is None else jnp.stack(biases, axis=axis + 2).reshape(-1)
 
     dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
-    kernels = tuple(kernel for _, kernel, _ in promoted)
-
-    biases = [bias for _, _, bias in promoted]
     # Where a launch takes a device's rows' product (`projections.mapped_shards`), each device's rows are
-    # their own product, the kernels entering apart, each placed by the layout, and joined there, so each
-    # one's gradient is summed at its own shape; the bias is added past it, its gradient summed as a
+    # their own product (`_mapped`), joined there; the bias is added past it, its gradient summed as a
     # Dense's. A product its layer rounds once with an fp32 bias (`_rounds_once`) is XLA's widened one, as
     # a Dense's is, and stays with the partitioner.
-    widened = first.use_bias and _rounds_once(first, inputs, kernels[0], flat(biases), flat(stored))
+    widened = first.use_bias and _rounds_once(first, inputs, kernels[0], flat(operands.biases),
+                                              flat(operands.stored))
     shards = None if widened else mapped_shards(inputs, kernels, tuple(map(kernel_path, projections)),
                                                 inputs.dtype, first.precision)
 
@@ -209,12 +320,162 @@ def joined_dense(x: jax.Array, projections: Sequence[Dense], *, axis: int) -> ja
         def joined(inputs, *held):
             return product(inputs, jnp.stack(held, axis=axis + 3).reshape(inputs.shape[-1], -1))
 
-        if shards is None:
-            return joined(inputs, *kernels)
-        split, gathered = shards
-        return on_shards(joined, split, (inputs, *kernels), gathered=gathered)
+        return _mapped(joined, inputs, kernels, shards)
 
-    y = _biased(first, inputs, kernels[0], dimensions, flat(biases), lambda bias: bias, flat(stored),
-                taken=taken)
+    y = _biased(first, inputs, kernels[0], dimensions, flat(operands.biases), lambda bias: bias,
+                flat(operands.stored), taken=taken)
     stacked = (len(kernels), kernels[0].shape[1]) if axis == -2 else (kernels[0].shape[1], len(kernels))
     return y.reshape(*y.shape[:-1], *stacked)
+
+
+@dataclasses.dataclass(frozen=True)
+class BesidePlan:
+    """Projections' outputs side by side as their selector admitted them (`side_by_side`): their operands
+    (`prepared`), the placement a mesh splitting their rows alone gives each device's own (`shard_placement`:
+    its split, the kernels' placements and a device's rows; None elsewhere), and their product's precision;
+    called, each projection's output (`beside_dense`)."""
+
+    operands: Prepared
+    placement: tuple[jax.sharding.PartitionSpec, dict, jax.ShapeDtypeStruct] | None
+    precision: PrecisionLike
+    named: bool = False
+    """Whether the call names the side-by-side product (`qkv` `joined`): its launches the template's where
+    legal, whatever a receipt measured (`_launching`; base review 760be77fe F2)."""
+
+    def __call__(self) -> tuple[jax.Array, ...]:
+        return beside_dense(self)
+
+
+def _launching(named: bool):
+    """The scope a named side-by-side product's launches run in: the grouped GEMM's template named, its
+    products' launches taken where legal and refused by name where not (`generation.chosen`); else the
+    selectors' own (an unnamed call's measured routes)."""
+    return generation.chosen(grouped_matmul='mosaic') if named else contextlib.nullcontext()
+
+
+class BesideCase:
+    """The projections of one input `x` as the side-by-side selector reads them (`side_by_side`), each fact
+    formed where a requirement first reads it, in the requirements' order (`BESIDE_SUPPORTS`), so a
+    structural handoff refuses them before their operands are prepared, and every requirement before a
+    launch is asked: their `Projections` (`found`); whether their calls agree in all their columns share but
+    their widths and promote by dtype alone (`agreed`); whether they give one input and kernels of its one
+    dtype (`uniform`); whether any one's 16-bit product rounds once with its fp32 bias (`widened`: XLA's
+    widened product, `dense._rounds_once`, which no launch takes); and whether a launch takes their product
+    side by side (`launched`: `gemm.side_by_side`, of a device's own rows where a mesh splits them alone,
+    `plan`), its forward and its input gradient independent choices (`gemm.side_by_side`)."""
+
+    def __init__(self, projections: Sequence[Dense], x: jax.Array):
+        self.projections, self.x = projections, x
+
+    @functools.cached_property
+    def found(self) -> Projections:
+        return projections_of(self.projections, self.x.shape[-1])
+
+    @functools.cached_property
+    def agreed(self) -> bool:
+        return _agree(self.projections, widths=False) and self.projections[0].promote_dtype is promote_dtype
+
+    @functools.cached_property
+    def plan(self) -> BesidePlan:
+        # The leaves `found` read and checked, once (`Projections.leaves`): read only past its handoffs.
+        leaves = self.found.leaves
+        assert leaves is not None, "a plan of projections that hold no leaves their calls declare"
+        operands = prepared(self.x, self.projections, leaves)
+        paths = tuple(map(kernel_path, self.projections))
+        placement = shard_placement(operands.inputs[0], operands.kernels, paths)
+        named = dict(_cache.KERNEL_CHOICES.value).get(Choice.QKV) == 'joined'
+        return BesidePlan(operands, placement, self.projections[0].precision, named)
+
+    @functools.cached_property
+    def uniform(self) -> bool:
+        operands = self.plan.operands
+        return len({each.dtype for each in (*operands.inputs, *operands.kernels)}) == 1
+
+    @functools.cached_property
+    def kept(self) -> bool:
+        # The input as its calls take it, uncast: a cast of `x` (fp32 activations into fp16 projections) has
+        # each call's input cotangent widened back before they sum, where one product's sums them in its
+        # dtype (base review b68fc2382 F1: 40,000 and 30,000 summed to fp16's infinity, 70,000 apart).
+        return self.plan.operands.inputs[0].dtype == jnp.asarray(self.x).dtype
+
+    @functools.cached_property
+    def widened(self) -> bool:
+        operands = self.plan.operands
+        return any(bias is not None and _rounds_once(projection, inputs, kernel, bias, stored)
+                   for projection, inputs, kernel, bias, stored in zip(
+                       self.projections, operands.inputs, operands.kernels, operands.biases, operands.stored,
+                       strict=True))
+
+    @functools.cached_property
+    def launched(self) -> bool:
+        inputs, kernels = self.plan.operands.inputs[0], self.plan.operands.kernels
+        placement = self.plan.placement
+        rows = (placement[2] if placement is not None
+                else jax.ShapeDtypeStruct((math.prod(inputs.shape[:-1]), inputs.shape[-1]), inputs.dtype))
+        matrices = tuple(jax.ShapeDtypeStruct(kernel.shape, kernel.dtype) for kernel in kernels)
+        # Seen whole where a placement maps the rows, else where the rows and every kernel are, as `gemm`'s
+        # forward and input gradient read them (head review of b68fc2382: replicated rows by a varying kernel
+        # in a shard_map took no compound launch there).
+        whole = placement is not None or all(map(seen_whole, (inputs, *kernels)))
+        with _launching(self.plan.named):
+            return gemm.side_by_side(rows, matrices, inputs.dtype, self.plan.precision, whole=whole)
+
+
+BESIDE_SUPPORTS: tuple[Requirement[BesideCase], ...] = (
+    *projection_requirements(lambda case: case.found, "the side-by-side product"),
+    Requirement('agreed', lambda case: case.agreed,
+                "the projections differ in bias, dtype, precision, promotion or product, or promote other "
+                "than by dtype", row=INHERENT, kind='handoff'),
+    Requirement('uniform', lambda case: case.uniform,
+                "the projections' calls give their input or kernels different dtypes", row=INHERENT,
+                kind='handoff'),
+    Requirement('kept', lambda case: case.kept,
+                "the projections' calls cast their input, each one's cotangent widened back before they sum",
+                row=INHERENT, kind='handoff'),
+    Requirement('widened', lambda case: not case.widened,
+                "a 16-bit product rounds once with its fp32 bias, XLA's widened product", row=INHERENT,
+                kind='handoff'),
+    Requirement('launched', lambda case: case.launched,
+                "no launch takes the projections' product side by side, its forward or its input gradient "
+                "(`gemm.side_by_side`)", row=INHERENT),
+)
+"""What one side-by-side launch needs to stand in for the projections' own calls
+(`projection_requirements`), what its columns share, and, last, a launch that takes it (head review of
+4d6c7a69c F4: the launch asked before the structural refusals)."""
+
+BESIDE = Op(Choice.QKV, (Kernel[BesideCase]('joined', BESIDE_SUPPORTS), Kernel('apart', (), generic=True)))
+"""The side-by-side product's selector: the projections side by side where every requirement holds, a launch
+taking that product the last (`BesideCase.launched`), else each its own call."""
+
+
+def side_by_side(projections: Sequence[nn.Module], x: jax.Array) -> BesidePlan | None:
+    """Several projections of `x` side by side as `BESIDE` admits them (`BesidePlan`: called, their
+    outputs), else None, each its own call: one projection, or initialization, which creates each one's
+    parameters through its own call, takes none."""
+    if len(projections) < 2 or projections[0].is_initializing() or not _dense(projections):
+        return None
+    case = BesideCase(projections, x)
+    return case.plan if select(BESIDE, case).kernel == 'joined' else None
+
+
+def beside_dense(plan: BesidePlan) -> tuple[jax.Array, ...]:
+    """The projections' outputs `plan` admitted, each its own, from one `gemm` of their columns side by side
+    (`gemm.gemm`'s `beside`): its forward one launch where the grouped selector takes it so, else each
+    product its own call (Hopper's measured route: the forward apart, the input gradient one chained launch,
+    `grouped_matmul._grouped_preferred`); each bias added past its product as a Dense adds it
+    (`precision.biased`). Where a mesh splits the rows alone, each device's rows are their own call
+    (`_mapped`, `plan.placement`), as the selector asked of them. A named side-by-side product runs the
+    template's launches, its pullback too (`_launching`, `GROUPED.bound`)."""
+    operands = plan.operands
+
+    def side_by_side(inputs, *kernels):
+        rows = inputs.reshape(-1, inputs.shape[-1])
+        with _launching(plan.named):
+            outs = gemm.gemm(rows, kernels[0], beside=kernels[1:], out_dtype=inputs.dtype,
+                             precision=plan.precision)
+        return tuple(out.reshape(*inputs.shape[:-1], out.shape[-1]) for out in outs)
+
+    placement = None if plan.placement is None else plan.placement[:2]
+    outs = _mapped(side_by_side, operands.inputs[0], operands.kernels, placement)
+    return tuple(out if bias is None else biased(out, bias)
+                 for out, bias in zip(outs, operands.biases, strict=True))
