@@ -163,8 +163,10 @@ def imported(path: str) -> Callable[..., Configured]:
     module, _, name = path.partition(":")
     if not module or not name:
         raise ValueError(f"{path!r} is not an import path, `module:Qualified.name`")
-    if module != "dew" and not module.startswith("dew.") and module not in sys.modules:
-        package = module.split(".")[0]
+    package = module.split(".")[0]
+    if (module != "dew" and not module.startswith("dew.") and module not in sys.modules
+            and not (package in _TRUSTED and module.replace(".", "").isidentifier() and _importable(module))):
+        # A module of a trusted package a record names is imported where the registry reaches it.
         raise ValueError(f"{path!r} names {module}, which is outside Dew and not imported; import it "
                          f"first, or trust its package where the run loads (trust=({package!r},), "
                          f"--trust {package})")
@@ -810,36 +812,17 @@ def nominal_class(annotation: Annotation) -> type | None:
     return origin
 
 
-def _import_classes(record: JSON) -> None:
-    """Import the module of every class record (`class_record`) `record` holds, nested ones among them,
-    where a trusted package holds it: the classes a build reaches, no other string of the record's."""
-    match record:
-        case dict():
-            named = class_record(record)
-            module = "" if named is None else named[0].partition(":")[0]
-            if module.split(".")[0] in _TRUSTED and module.replace(".", "").isidentifier():
-                importlib.import_module(module)
-            for value in record.values():
-                _import_classes(value)
-        case list():
-            for value in record:
-                _import_classes(value)
-        case _:
-            pass
-
-
 def owned_built(record: JSON, *, called: bool, what: str) -> Configured:
     """What a class record (`class_record`) builds where it names a class of Dew's or of a trusted package
-    (`_owned`; with `called`, one whose instances are called), its own module imported where a trusted
-    package holds it, read as `from_record` reads a record (every module it shares built once, a `dtype`
-    field kept as its record states it): a value a record carries beside the fields any class declares (a
-    run's own processor). Any other record (a function's among them, which builds by running it) is refused,
-    as is a class no trust admits, naming `what` and `trust=`."""
+    (`_owned`; with `called`, one whose instances are called), read as `from_record` reads a record (a
+    trusted package's module imported where the registry reaches it, every module it shares built once, a
+    `dtype` field kept as its record states it): a value a record carries beside the fields any class
+    declares (a run's own processor). Any other record (a function's among them, which builds by running
+    it) is refused, as is a class no trust admits, naming `what` and `trust=`."""
     named = class_record(_records.record(record, what))
     if named is None:
         raise ValueError(f"{what} is recorded as a class record, {{'class': ..., 'fields': ...}}; got "
                          f"{record!r}")
-    _import_classes(json_value(record, what))
     member = imported(named[0])
     if not _owned(member, called=called):
         called_so = " whose instances are called" if called else ""
@@ -1216,11 +1199,13 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
             # scalar or a dtype's name is read as before (`_rebuilt`).
             return value
         return _rebuilt(declared, configured(value), dtypes=dtypes, name=name)
-    if not (isinstance(value, (Mapping, list)) or (dtypes and name == "dtype")):
-        return value
     named = parameters(member)[0]
-    return _rebuilt(parameter_type(named[name][1], name) if name in named else None, value,
-                    dtypes=dtypes, name=name)
+    declared = parameter_type(named[name][1], name) if name in named else None
+    # A duration a constructor declares is recorded as its text (`_records.recorded_duration`).
+    if not (isinstance(value, (Mapping, list)) or (dtypes and name == "dtype")
+            or (declared is datetime.timedelta and isinstance(value, str))):
+        return value
+    return _rebuilt(declared, value, dtypes=dtypes, name=name)
 
 
 def argument_records(member: type | Callable[..., Configured], fields: Mapping[str, object]
