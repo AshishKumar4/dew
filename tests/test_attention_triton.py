@@ -881,26 +881,26 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     return staged
 
 
+@pytest.mark.parametrize("config", STAGED_TILES, ids=lambda t: f"{t.block_q}x{t.block_k}")
 @pytest.mark.parametrize("step", [False, True], ids=["forward", "step"])
 @pytest.mark.parametrize(("generation_name", "dtype", "width", "hooks"), STAGED_CALLS.values(),
                          ids=STAGED_CALLS)
-def test_a_triton_launchs_shared_memory_is_what_triton_allocates(generation_name, dtype, width, hooks, step):
+def test_a_triton_launchs_shared_memory_is_what_triton_allocates(generation_name, dtype, width, hooks, step,
+                                                                 config):
     """Each Triton launch of a call, compiled by XLA's CUDA backend for a compile-only GPU on this CPU at
     tiles either side of each staging rule's turns: the shared memory its model counts (`Staging`:
     `TritonForward.staging`, `_dq_staging`, `_dkv_staging`) is the bytes Triton launched it with, where
     Triton's rules determine them, and at or above them where it counts a tile whole that Triton's
     allocator overlaps by liveness. An undercount once derived an A100's fp32 training forward Triton
     refused (180224 bytes asked of 166912, where 131072 were counted)."""
-    compiled = 0
-    for config in STAGED_TILES:
-        staged = _staged_launches(generation_name, dtype, width, hooks, config, step=step)
-        compiled += bool(staged)
-        for kernel, (launched, staging) in staged.items():
-            if staging.whole:
-                assert staging.bytes >= launched, (kernel, config, staging, launched)
-            else:
-                assert staging.bytes == launched, (kernel, config, staging, launched)
-    assert compiled
+    staged = _staged_launches(generation_name, dtype, width, hooks, config, step=step)
+    if config == STAGED_TILES[0]:
+        assert staged
+    for kernel, (launched, staging) in staged.items():
+        if staging.whole:
+            assert staging.bytes >= launched, (kernel, config, staging, launched)
+        else:
+            assert staging.bytes == launched, (kernel, config, staging, launched)
 
 
 def _trained(spans: template.KeySpans):
@@ -911,9 +911,10 @@ def _trained(spans: template.KeySpans):
     return backward
 
 
+@pytest.mark.parametrize("phase", ["forward", "backward"])
 @pytest.mark.parametrize("width", [64, 128, 256])
 @pytest.mark.parametrize("generation_name", ["sm120", "sm86"])
-def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, width):
+def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, width, phase):
     """The forward and a training step's backward (its forward kept) at the tiles they derive on a GPU of a
     99 KB block (an RTX PRO 6000's, an A10's), causal, bf16, compiled by XLA's CUDA backend for a
     compile-only device of it on this CPU (tests/kernel_compile.py): every Triton launch within the block
@@ -928,10 +929,10 @@ def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, widt
     def forward(query, key, value):
         return attention_triton.forward(query, key, value, spans, None, natural=True)
 
-    found = compile_kernels([KernelCase("forward", lambda: (forward, (shape,) * 3)),
-                             KernelCase("backward", lambda: (_trained(spans), (shape,) * 4))],
-                            generation_name)
-    assert len(found) == 2
+    case = (KernelCase("forward", lambda: (forward, (shape,) * 3)) if phase == "forward"
+            else KernelCase("backward", lambda: (_trained(spans), (shape,) * 4)))
+    found = compile_kernels([case], generation_name)
+    assert len(found) == 1
     assert not failures(found), "\n".join(failures(found))
 
 

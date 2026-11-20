@@ -600,11 +600,39 @@ class Violation(AssertionError):
 
     kind: str
     what: str
-    trace: list
+    trace: list | tuple | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.trace, list):
+            self.trace = _trace_list(self.trace)
 
     def __str__(self) -> str:
         shown = "\n".join(f"  {mover}: {event}" for mover, event in self.trace[-24:])
         return f"{self.what}\n{shown}"
+
+
+_SYNC_KINDS = frozenset({"wait", "arrive", "expect", "committed", "fill", "fill_wait"})
+"""Event kinds that synchronize or alter `_State`'s barriers, flight set or tracked parities."""
+
+
+def _is_local(event: Event) -> bool:
+    """Whether `event` is thread-local to `_State` (never blocks, touches no barrier/flight/tracked state):
+    consecutive local events advance deterministically (exact tau-reduction, rows 8935, 9775)."""
+    return event.kind not in _SYNC_KINDS and not (event.kind in ("load", "copy") and event.argument)
+
+
+def _trace_list(trace) -> list:
+    """Materialize a linked trace `(parent, entry)` (or None) into a chronological list."""
+    if trace is None:
+        return []
+    if isinstance(trace, list):
+        return trace
+    out = []
+    while trace is not None:
+        trace, entry = trace
+        out.append(entry)
+    out.reverse()
+    return out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -625,8 +653,10 @@ def explore(threads: list[list[Event]], arrivals: dict[str, int], *, limit: int 
     Returns the states explored; raises `Violation` with its interleaving where a property fails."""
     counts = [_waits(program) for program in threads]
     awaited = [_awaited(program) for program in threads]
+    observed = [_observed(program) for program in threads]
     seen: set = set()
-    stack: list = [(_State(len(threads)), [])]
+    start = _State(len(threads))
+    stack: list = [(start, start.advance_local(threads, None))]
     completed = None
     while stack:
         state, trace = stack.pop()
@@ -640,11 +670,11 @@ def explore(threads: list[list[Event]], arrivals: dict[str, int], *, limit: int 
         if not moves:
             if not state.ended(threads):
                 raise Violation("deadlock", "no warpgroup can move and some has not ended", trace)
-            state.whole(arrivals, [_observed(program) for program in threads], trace)
+            state.whole(arrivals, observed, trace)
             completed = trace if completed is None else completed
             continue
         stack.extend(moves)
-    _races(threads, completed or [], arrivals)
+    _races(threads, _trace_list(completed), arrivals)
     return len(seen)
 
 
@@ -759,12 +789,27 @@ class _State:
             self.barriers[at] = _Barrier(state.phases, pending, transactions,
                                          state.arrived | ({thread} if count else frozenset()))
 
+    def advance_local(self, threads, trace):
+        """Advance every thread past consecutive local non-synchronizing events in program order."""
+        positions = list(self.positions)
+        changed = False
+        for thread, program in enumerate(threads):
+            pos = positions[thread]
+            while pos < len(program) and _is_local(program[pos]):
+                trace = (trace, (thread, (thread, pos)))
+                pos += 1
+                changed = True
+            positions[thread] = pos
+        if changed:
+            self.positions = tuple(positions)
+        return trace
+
     def moves(self, threads, arrivals, counts, awaited, trace) -> Iterator:
         for flight in sorted(self.flight):
             issuer, position, barrier = flight
             made = self.copy()
             made.flight = self.flight - {flight}
-            moved = [*trace, ("landed", (issuer, position))]
+            moved = (trace, ("landed", (issuer, position)))
             if threads[issuer][position].kind == "committed":
                 # A commit's completion: its arrival, the issuing thread's.
                 made.arrive(barrier, arrivals, issuer, moved)
@@ -775,11 +820,12 @@ class _State:
             position = self.positions[thread]
             if position == len(program):
                 continue
-            moved = [*trace, (thread, (thread, position))]
+            moved = (trace, (thread, (thread, position)))
             made = self.step(thread, program[position], arrivals, counts, moved)
             if made is not None:
                 made.positions = (*self.positions[:thread], position + 1, *self.positions[thread + 1:])
                 made.check(awaited, moved)
+                moved = made.advance_local(threads, moved)
                 yield made, moved
 
     def step(self, thread, event, arrivals, counts, trace) -> "_State | None":
