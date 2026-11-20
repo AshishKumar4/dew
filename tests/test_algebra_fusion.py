@@ -82,7 +82,33 @@ def grouped_kernel_gradient(x, w, bias, other):
     return jax.lax.ragged_dot_general(x, other, jnp.asarray(SIZES, jnp.int32), numbers)
 
 
-LAYERS = [biased, escaping, widened, chained, bare, kernel_gradient, grouped, grouped_kernel_gradient]
+def scaled_by_its_first_bias(x, w, bias, other):
+    """A projection times a scalar the program reads from its bias: an epilogue capturing an array that
+    follows no launch axis, which the template refuses, so its product is weighed alone (row 8996)."""
+    del other
+    return (x @ w) * bias[0]
+
+
+def formed_and_added_back(x, w, bias, other):
+    """Rows formed before a square projection (its prologue), its product scaled by a scalar after it (an
+    epilogue the template refuses) and the rows added back: the region without its epilogue keeps the rows
+    its restored consumer reads (row 8996's head review: it removed them)."""
+    del x, w
+    rows = other * jnp.bfloat16(2)
+    return (rows @ other) * bias[0] + rows
+
+
+def formed_and_returned(x, w, bias, other):
+    """Rows formed before a projection and returned beside it, its product scaled by a scalar after it: a
+    prologue the region replays though the program keeps it, whose operand the region without its epilogue
+    reads (row 8996's head review: its inputs missed it)."""
+    del other
+    rows = x * jnp.bfloat16(2)
+    return (rows @ w) * bias[0], rows
+
+
+LAYERS = [biased, escaping, widened, chained, bare, kernel_gradient, grouped, grouped_kernel_gradient,
+          scaled_by_its_first_bias, formed_and_added_back, formed_and_returned]
 
 
 def as_written(layer, *operands):
@@ -264,6 +290,28 @@ def test_a_prologue_the_template_refuses_leaves_the_rows_computed_once():
     rows = [var.aval.dtype for equation in projections for var in equation.invars
             if isinstance(var, jax.extend.core.Var) and var.aval.shape == (256, 512)]
     assert len(projections) == 2 and rows == [jnp.bfloat16, jnp.bfloat16], rows
+
+
+def scaled_by_an_array(x, w, scale):
+    """A projection times a scalar array: an epilogue capturing an array that follows no launch axis tile by
+    tile, which the template refuses (`fused_gemm`'s 'value_off_axes')."""
+    return (x @ w) * scale
+
+
+def test_a_product_whose_epilogue_the_template_refuses_is_fused_without_it():
+    """A projection times a scalar array, on an H100 whose call names the template: the template refuses the
+    epilogue, so the region is weighed again without it, its product the template's launch and the multiply
+    after it as the program wrote it, outside the written region (row 8996: the region refused, its product
+    stayed a plain dot)."""
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16),
+              jax.ShapeDtypeStruct((), jnp.bfloat16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), generation.routes() as found:
+        traced = jax.jit(algebra.rewritten(scaled_by_an_array, kernels=True)).trace(*shapes)
+    assert {route.kernel for route in found if route.choice == "grouped_matmul"} == {"mosaic"}, [
+        (route.choice, route.kernel) for route in found]
+    program = traced.jaxpr.jaxpr
+    (last,) = (equation for equation in program.eqns if set(equation.outvars) & set(program.outvars))
+    assert last.primitive is jax.lax.mul_p
 
 
 def named_gate(x, w, up):

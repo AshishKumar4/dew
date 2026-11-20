@@ -30,6 +30,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tier_wire
 from delta_rule_support import fla_layer_side
 from gpu_flow import cell
 from kernel_matrix import AXES
@@ -37,11 +38,14 @@ from reference_error import FEWEST_SEEDS, assert_as_exact, indexed_recording, re
 from ssd_support import mamba_side
 from test_recurrence_chunk import (
     FORMED,
+    LENGTH,
+    PACKED_DOCUMENTS,
     VALUE_HEADS,
     against_the_portable_math,
     chunk_on,
     draw,
     hosted,
+    marked,
     oracle,
     release,
     token_by_token,
@@ -167,11 +171,11 @@ def _leaves(results) -> dict:
 
 
 def _starts(case: dict[str, str]):
-    """`case`'s documents' first tokens (`draw`'s, the same for every seed), None for one sequence."""
+    """`case`'s documents' first tokens (`draw`'s, `PACKED_DOCUMENTS`, the same for every seed), None for one
+    sequence: the host's NumPy marks, which place nothing on a device before a site (row 7868)."""
     if case["documents"] != "packed":
         return None
-    (operands,) = draw(FORMS[case["form"]], packed=True, seed=0)
-    return operands.starts
+    return marked(PACKED_DOCUMENTS, LENGTH)
 
 
 def _step(case: dict[str, str], kernel: str):
@@ -241,11 +245,13 @@ CASES = (
     ('sm90', 'gated delta net', 'xla', 'float32', 'one'),
     ('sm90', 'rated scan', 'xla', 'float32', 'one'),
     ('sm90', 'write gate', 'mosaic_gpu', 'bfloat16', 'one'),
+    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'one'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change), under
 the suite's lane environment: at its 'highest' an fp32 training call is served by the portable math alone,
-the reference."""
+the reference, but the rated scan's, which the template's fp32 fast backward serves on an H100 (row 7673),
+its one cell added beside the covering's others."""
 
 SEEDS = {
     ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'): 256,
@@ -261,13 +267,14 @@ SEEDS = {
     ('sm90', 'gated delta net', 'xla', 'float32', 'one'): 256,
     ('sm90', 'rated scan', 'xla', 'float32', 'one'): 512,
     ('sm90', 'write gate', 'mosaic_gpu', 'bfloat16', 'one'): 64,
+    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'one'): 512,
 }
 """Each cell's declared seeds, sized by `seeds_for` on its own GPU, paired against its oracle (`_reference`,
 the upstream run live or the token recurrence; an H100 and an A100, M-JS-75d at b44df0fea0e, and the fp32
 cells over `FP32_HEADS` on an A100 and a GH200, M-JS-77 and M-JS-77b at 89af07e0eda); a cell the covering
 took for its red row at fdb49a44d0a its form, kernel and dtype's sized cell's until its own GPU sizes it, and
-the write gate's on the template (its bf16 training on it since 55cd6a126de) its form and dtype's on the
-portable math's until an H100 sizes it."""
+the write gate's on the template (its bf16 training on it since 55cd6a126de) and the rated scan's fp32 one
+(row 7673) its form and dtype's on the portable math's until an H100 sizes it."""
 
 TPU_CASES = (
     ('v6e', 'rated scan', 'tpu', 'bfloat16', 'one'),
@@ -313,18 +320,24 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
         return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
 
     step = jax.jit(_step(named, named["kernel"]))
-    # Its routes read from one draw's step: a check-1 site's judge pools its map tasks' records, running none.
-    with generation.routes() as found:
-        jax.block_until_ready(step(*_drawn(named, 0)))
-    assert {route.choice for route in found} <= CHOICES
-    assert any(route.kernel == named["kernel"] for route in found)
+    # A GPU tier part's prepare compiles the cell's sites on a device that computes nothing: the routes' run
+    # and the portable math's report are its run's, where a step run here deferred the cell, every site, to
+    # its GPU (row 7868: an A100 tier's prepare reached none of its six cells' sites).
+    run = not tier_wire.preparing()
+    if run:
+        # Its routes read from one draw's step: a check-1 site's judge pools its map tasks' records, running
+        # none.
+        with generation.routes() as found:
+            jax.block_until_ready(step(*_drawn(named, 0)))
+        assert {route.choice for route in found} <= CHOICES
+        assert any(route.kernel == named["kernel"] for route in found)
     reference = _reference(named)
     upstream = reference.removeprefix("upstream ") if reference.startswith("upstream ") else None
     if upstream is not None and not os.environ.get(INTERPRETERS[upstream]):
         _on_par_recorded(named, step, with_gradients(truth), upstream, seeds)
         return
     held_to = jax.jit(with_gradients(truth)) if upstream is None else _upstream(named, (1 + REDRAW) * seeds)
-    if named["kernel"] != "xla" and (distance := against_the_portable_math(
+    if run and named["kernel"] != "xla" and (distance := against_the_portable_math(
             "-".join(case), _step(named, named["kernel"]), _step(named, "xla"),
             functools.partial(_drawn, named), with_gradients(truth), FEWEST_SEEDS)) is not None:
         print(f"{'-'.join(case)} under the {generation.numerics().forms} forms, its distance against Dew's "

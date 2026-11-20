@@ -403,6 +403,28 @@ def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budg
         assert (model.budget, model.producer) == (budget, stated)
 
 
+def test_a_launch_with_a_joined_correction_warpgroup_counts_its_registers_in_its_residency_and_budget():
+    """A B200 launch of two softmax consumers beside a correction warpgroup joined at half their weight
+    (`Family.role_schedule`'s `joined`, FlashAttention-4's three warpgroups and their producer): its program
+    runs one warpgroup more, its consumers' budget is its schedule's (below two consumers' alone, the
+    program's launch pool shared four ways), its correction role's half of it, and its register model counts
+    the correction's registers in what a program allocates, so a multiprocessor holds no more programs of it
+    than its registers do (row 5368)."""
+    from dew.nn.kernels.templates import mosaic_sm100, resources
+
+    with generation.assumed("sm100"):
+        family = mosaic_sm100.RINGS
+        joined = ((handoffs.Role("correction", weight=0.5), 1),)
+        held = family.role_schedule(2, joined=joined).registers()
+        assert family.warpgroups(2, joined=joined) == family.warpgroups(2) + 1
+        assert family.registers(2, joined=joined) == held["consumer"] < family.registers(2)
+        assert 0 < held["correction"] < held["consumer"]
+        model = resources.register_model(family, 2, held["consumer"], joined=joined)
+        alone = resources.register_model(family, 2, held["consumer"])
+        assert model.resident(held["consumer"]) <= alone.resident(held["consumer"])
+        assert model.most == family.programs(2, held["consumer"], joined=joined)
+
+
 def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_configs():
     """A pair's step (`rings.Paired` indices) is the pair's block, the slot's twice along the axis its CTAs
     split, at the indices in the pair's blocks (`viewed`'s `Split`), where a plain step is the slot's block;
@@ -498,6 +520,27 @@ def test_warp_roles_take_their_warps_in_turn_within_one_warpgroup():
     with pytest.raises(ValueError):
         every_warp = handoffs.Role("load", handoffs.WARPS, warp=True, weight=0)
         handoffs.Schedule((handoffs.Role("epilogue"), every_warp, mosaic_sm100.PRODUCTS)).places()
+
+
+def test_a_joined_warpgroup_role_takes_its_weights_share_of_the_raised_registers():
+    """A warpgroup role joined to a schedule (`Schedule.joined`: a correction warpgroup beside two consumers,
+    FlashAttention-4's) runs after its raised roles and before its last warpgroup's, its warpgroups counted
+    in the program's, its registers its weight's share of the raise beside the consumers' (lighter, no
+    more than theirs), and the hand-offs it fills or gives back the schedule's; a role of weight 0 joins
+    only as a warp of the last warpgroup (row 5368)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    base = handoffs.Schedule((handoffs.Role("consumer", 2, weight=2), *mosaic_sm100.ISSUING))
+    factors = handoffs.HandOff("factors", None, "consumer", ("correction",))
+    joined = base.joined(handoffs.Role("correction", weight=1), 1, factors)
+    assert [role.name for role in joined.roles] == ["consumer", "correction", "load", "mma"]
+    assert joined.warpgroups() == base.warpgroups() + 1
+    assert joined.handoffs == (factors,)
+    with generation.assumed("sm100"):
+        held = joined.registers()
+    assert held["correction"] < held["consumer"] and held["correction"] > held["mma"]
+    with pytest.raises(ValueError):
+        base.joined(handoffs.Role("correction", weight=0), 1)
 
 
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():

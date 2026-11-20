@@ -26,6 +26,7 @@ from dew.nn.kernels.templates import (
     axes,
     bundles,
     emission,
+    handoffs,
     layout,
     mosaic,
     operands,
@@ -161,8 +162,9 @@ def scheduled_roles(family: mosaic.Family, consumers: int, consumer: Callable[[i
         del index
         consumer(role)
 
+    reducers = () if reducer is None else ((handoffs.REDUCER, consumers, reducer),)
     return walked.scheduled(consumers, functools.partial(mosaic.per_role, roles=consumers, run=compute),
-                            producer, issuer=lambda: issued(walked), reducer=reducer)
+                            producer, issuer=lambda: issued(walked), joined=reducers)
 
 
 def placed_scratch(family: mosaic.Family, walked: int, dtype, fused: tuple[int, ...], kept: tuple[int, ...]
@@ -1867,10 +1869,10 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
-    drop_tiles = [bits, logits] if dropped else []
+    drop_tiles = ([bits, logits] if weight_parts > 1 else [bits]) if dropped else []
     # An fp32 call's weights fp32, their remainder fp32 and the part taken (`_parted_products`); a dropping
-    # call holds the keep bits' hash and multiplier tile beside the step's weights (row 9526), and over fp16
-    # its kept weights' second part beside the first (`algebra.kept_parts`).
+    # call holds the keep bits' hash tile beside the step's weights (and over fp16, where `weight_parts > 1`,
+    # the scaled fp32 tile for `algebra.kept_parts` beside its two fp16 parts, row 9526).
     step = ([logits] * (3 if parts > 1 else 1)
             + [weights] * ((2 if residuals else 1) + weight_parts - 1) + drop_tiles)
     if residuals:

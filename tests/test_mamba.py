@@ -211,6 +211,109 @@ def decayed(fn):
     return run
 
 
+def channelled(fn, leaf):
+    """`fn(x, dt, A, B, C, D, state)` as `run(x, dt, A, B, C, D, state, cotangent)`, which returns the
+    gradient of `B` or of `C` (`leaf`) under the cotangent alone: each a sum over the channels of its own
+    transpose, measured apart (row 8563)."""
+    def run(x, dt, A, B, C, D, state, cotangent):
+        moving = {"B": B, "C": C}
+
+        def scanned(value):
+            given = {**moving, leaf: value}
+            return fn(x, dt, A, given["B"], given["C"], D, state)
+
+        _, pull = jax.vjp(scanned, moving[leaf])
+        return pull(cotangent)[0]
+
+    return run
+
+
+@pytest.mark.parametrize('leaf', ['B', 'C'])
+@pytest.mark.parametrize('case', RATES_PAST_THE_RANGE)
+def test_a_scans_b_and_c_gradients_sum_their_channels_as_the_recurrence(case, leaf):
+    """The gradient of B and of C, each apart (`channelled`), of the chunked scan at a rate past float32's
+    range (`rate_past_the_range`, 128 channels): on par from float64 with the recurrence a token at a time
+    (`stepwise`, check 1), their channel sums paired as its autodiff's. C's: where the readout's transpose
+    summed 128 channels in a dot, red here (row 8563). B's: a parity guard on the write's spread, which
+    XLA:CPU's reduce of a broadcast's transpose held before too."""
+    def scan(x, dt, A, B, C, D, state):
+        return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=16)
+
+    exact = jax.jit(channelled(stepwise, leaf))
+    assert_as_exact(jax.jit(channelled(scan, leaf)), exact, functools.partial(rate_past_the_range, case),
+                    f"the chunked scan's {leaf} gradient at a rate past float32's range, {case}",
+                    seeds=FEWEST_SEEDS, truth_fn=exact)
+
+
+def test_a_wide_cpu_readouts_c_gradient_sums_its_channels_before_it_rounds(monkeypatch):
+    """C's gradient of the chunked scan under Dew's wide CPU arithmetic, two channels each holding `2^100`
+    in one state through a token that neither decays nor writes, read under cotangents `2^30` and `-2^30`:
+    zero, the channels' products summed in float64 and rounded once, where C's cotangent rounded each
+    channel's product to float32 first, `inf - inf`, NaN (review of fb050ba39)."""
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC
+
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    # On the CPU, at a precision that states no fp32 sums: where the wide sum runs.
+    with jax.default_device(jax.devices("cpu")[0]), jax.default_matmul_precision("highest"):
+        x = dt = jnp.zeros((1, 1, 2), jnp.float32)
+        A, D = jnp.zeros((2, 2), jnp.float32), jnp.zeros((2,), jnp.float32)
+        B = C = jnp.zeros((1, 1, 2), jnp.float32)
+        state = jnp.asarray([[[2.0 ** 100, 0.0], [2.0 ** 100, 0.0]]], jnp.float32)
+        _, pull = jax.vjp(lambda C: selective_scan(x, dt, A, B, C, D, state=state, chunk_size=1), C)
+        (gradient,) = pull((jnp.asarray([[[2.0 ** 30, -(2.0 ** 30)]]], jnp.float32), jnp.zeros_like(state)))
+    np.testing.assert_array_equal(np.asarray(gradient), np.zeros((1, 1, 2), np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_scan_whose_states_an_explicit_axis_splits_scans_as_one_unsplit():
+    """The chunked scan's output and B's and C's gradients with its rate and entering state split over the
+    states by an Explicit axis of two devices, C replicated: on par from float64 with the recurrence a token
+    at a time (check 1), where the readout's spread C placed as the states whole split both contracted
+    operands, which JAX refuses (review of fb050ba39)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("state",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+
+    def gradients(fn, placed=False):
+        def run(x, dt, A, B, C, D, state, cotangent):
+            out, pull = jax.vjp(lambda B, C: fn(x, dt, A, B, C, D, state), B, C)
+            if placed:
+                # Each cotangent placed as its output is: the final state's split over the states.
+                cotangent = jax.tree.map(lambda c, o: jax.sharding.reshard(c, jax.typeof(o).sharding),
+                                         cotangent, out)
+            return out, *pull(cotangent)
+        return run
+
+    def split(x, dt, A, B, C, D, state):
+        A = jax.sharding.reshard(A, NamedSharding(mesh, PartitionSpec(None, "state")))
+        state = jax.sharding.reshard(state, NamedSharding(mesh, PartitionSpec(None, None, "state")))
+        return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=16)
+
+    def draw(seed):
+        return rate_past_the_range("vanishing decays", seed)
+
+    exact = jax.jit(gradients(stepwise))
+    with jax.set_mesh(mesh):
+        assert_as_exact(jax.jit(gradients(split, placed=True)), exact, draw,
+                        "the chunked scan with its states split by an Explicit axis", seeds=FEWEST_SEEDS,
+                        truth_fn=exact)
+
+
+def test_a_scan_of_no_channels_takes_zero_b_and_c_gradients():
+    """The chunked scan over no channels gives B and C zero gradients of their own shapes, where a channel
+    sum that indexed an empty axis raised (row 8563's review)."""
+    x = jnp.zeros((1, 8, 0), jnp.float32)
+    B = C = jnp.ones((1, 8, 4), jnp.float32)
+    A = jnp.zeros((0, 4), jnp.float32)
+
+    def loss(B, C):
+        out, final = selective_scan(x, x, A, B, C, jnp.zeros((0,), jnp.float32), chunk_size=4)
+        return jnp.sum(out) + jnp.sum(final)
+
+    for gradient in jax.grad(loss, argnums=(0, 1))(B, C):
+        assert gradient.shape == (1, 8, 4) and not np.any(np.asarray(gradient))
+
+
 @pytest.mark.parametrize('case', RATES_PAST_THE_RANGE)
 @pytest.mark.parametrize('chunk', [16, 64])
 def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk, case):
@@ -218,7 +321,8 @@ def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk, case):
     output, final state and its decay's step's and rate's gradients (`decayed`) on par from float64 with the
     recurrence a token at a time (`stepwise`, check 1), where the rate taken to base 2 before the step was
     -inf and a padded token's zero step made its decay NaN (row 8491), and under steps of 2^-126 each decay
-    e^-3, which no clamp of that rate gives (row 8609). Its B's and C's gradients there are row 8563's."""
+    e^-3, which no clamp of that rate gives (row 8609). Its B's and C's gradients there are their own cell's
+    (`test_a_scans_b_and_c_gradients_sum_their_channels_as_the_recurrence`)."""
     def scan(x, dt, A, B, C, D, state):
         return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=chunk)
 

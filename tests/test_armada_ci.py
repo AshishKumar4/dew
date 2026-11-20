@@ -1275,6 +1275,61 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
             ci.plan(300.0, {})
 
 
+def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_as_the_plan_cuts_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Tests marked shared_setup with `by` share the setup the first match of `by` in their parameter ids
+    keys, across test functions, a model's ids though they hold dashes and another parameter's id beside
+    them: the plan cuts the split file's record and each task its collected tests alike, each model's tests
+    in one group, so its programs are compiled once (Main, 2026-11-20: 7 model files cut in node-id order
+    paid each model's compile in every group its tests fell in); a test whose id has no match shares
+    nothing. A `by` that is no literal regular expression, or a keyword other than `by`, refuses the file."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
+    (tmp_path / "tests/test_models.py").write_text(
+        "from pathlib import Path\nimport pytest\nMODELS = ['m-a-tiny', 'm-b-tiny', 'm-c-tiny', 'plain']\n"
+        "@pytest.mark.shared_setup('models', by=r'm-[a-z]-tiny')\n@pytest.mark.parametrize('name', MODELS)\n"
+        "def test_forward(name):\n    with Path('runs').open('a') as runs: runs.write(f'f {name}\\n')\n"
+        "@pytest.mark.shared_setup('models', by=r'm-[a-z]-tiny')\n@pytest.mark.parametrize('name', MODELS)\n"
+        "@pytest.mark.parametrize('dtype', ['f32'])\n"
+        "def test_gradient(dtype, name):\n"
+        "    with Path('runs').open('a') as runs: runs.write(f'g {name}\\n')\n")
+    node = "tests/test_models.py::{}"
+    models = ("m-a-tiny", "m-b-tiny", "m-c-tiny", "plain")
+    nodes = [node.format(f"test_forward[{model}]") for model in models] + [
+        node.format(f"test_gradient[f32-{model}]") for model in models]
+    # Node-id order parts each model's two tests; 100 s each, a 300 s target cuts the file in three. The two
+    # plain tests, matching no model, 200 s each: sharing nothing, they run apart.
+    plain = {node.format("test_forward[plain]"), node.format("test_gradient[f32-plain]")}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {each: 200.0 if each in plain else 100.0 for each in nodes}))
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert all(row["exitCode"] == 0 for row in rows)
+    ran = {row["name"]: set(row["tests"]) for row in rows if "test_models" in row["name"]}
+    assert len(ran) > 1 and sorted(node for tests in ran.values() for node in tests) == sorted(nodes)
+    for model in models[:3]:
+        both = {node.format(f"test_forward[{model}]"), node.format(f"test_gradient[f32-{model}]")}
+        assert sum(both <= tests for tests in ran.values()) == 1, ran
+    assert not any(plain <= tests for tests in ran.values()), ran
+    # An id beyond ASCII keys nothing, whatever the pattern's flags: no Python reads it otherwise.
+    key = ci.session.setup_key
+    for beyond in ("\U000105c0", "\u00e9"):
+        assert key(node.format(f"test_forward[{beyond}]"), ("models", r"^.")) is None
+    assert key(node.format("test_forward[m-a-tiny]"), ("models", r"m-[a-z]-tiny")) == ("models", "m-a-tiny")
+    count = len(ran)
+    assert [set(ci.members("tests/test_models.py", f"{group}/{count}")) for group in range(1, count + 1)] == [
+        ran[f"3.12:tests/test_models.py#{group}/{count}"] for group in range(1, count + 1)]
+    assert sorted((tmp_path / "runs").read_text().splitlines()) == sorted(
+        f"{kind} {model}" for kind in "fg" for model in models)
+    for refused in ("by=NAME", "by=r'['", "by='x', other='y'", "other='y'", "by=r'\\N{BULLET}'",
+                    "by=r'(?u)x'", "by=r'(?u:^\\w)'", "by=r'(?i)m'"):
+        (tmp_path / "tests/test_refused.py").write_text(
+            f"import pytest\nNAME = 'x'\n@pytest.mark.shared_setup('s', {refused})\n"
+            "def test_one():\n    pass\n")
+        with pytest.raises(SystemExit):
+            ci.plan(300.0, {})
+        (tmp_path / "tests/test_refused.py").unlink()
+
 def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does(ci, tmp_path):
     """Every row's shared key holds the SHARED harness modules by their code (`code_of`): an edit to what one
     says of itself, a comment or a docstring, reuses every row, as it changes no run (row 2730: a docstring

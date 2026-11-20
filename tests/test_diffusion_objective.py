@@ -692,3 +692,19 @@ def test_a_validation_set_beside_phases_that_batch_their_own_is_read_in_their_ba
         reader.close()
     assert [len(batch["image"]) for batch in batches] == [8, 8]
     assert all("input_ids" in batch["text"] and "caption" not in batch for batch in batches)
+
+
+def test_an_objectives_trace_key_is_its_encoders_kind_and_record_not_their_weights(conditional_mmdit):
+    """Two objectives over one encoder's kind and record but other weights key their step alike: the
+    weights are the step's arguments (the state's `encoders`), never read off the encoder object, so no
+    digest of them is part of the key (row 9692: each fit host-copied and hashed every encoder's weights,
+    which a multi-process run's sharded tower cannot be)."""
+    objective = conditional_mmdit[0]
+    condition = objective.inputs.conditions["textcontext"]
+    moved = replace(condition.encoder, params=jax.tree.map(
+        lambda leaf: leaf + 1.0 if np.issubdtype(leaf.dtype, np.floating) else leaf,
+        condition.encoder.params))
+    inputs = replace(objective.inputs, conditions={"textcontext": replace(condition, encoder=moved)})
+    other = DiffusionObjective(objective.model, objective.process, inputs, steps=3, solver=Euler())
+    alike = DiffusionObjective(objective.model, objective.process, objective.inputs, steps=3, solver=Euler())
+    assert alike.trace_key() is not None and alike.trace_key() == other.trace_key()

@@ -206,9 +206,10 @@ SINK_CASES = tuple(tuple(case.values()) for case in covering({
     "dtype": ("bfloat16", "float32"), "hooks": tuple(DECODE_HOOKS),
     "form": ("fold", "natural"), "splits": CHECKED_SPLITS}))
 """Pairwise covering set of hooked decode cases `(dtype, hooks, form, slice count)` (`covering`)."""
-LONG_SINK_CASES = (("float32", "both", "natural", CHECKED_SPLITS[2]),)
-"""The hooked cases past two minutes in one process (137 and 126 s on armada in a verdict on main 495ef4e0e),
-their check 1's draws run as armada's map tasks and a judge (`check1_shards`), each within two minutes."""
+LONG_SINK_CASES = tuple(case for case in SINK_CASES
+                        if case[0] == "float32" and case[3] == CHECKED_SPLITS[-1])
+"""The `SINK_CASES` at float32 and the largest slice count, whose draws run as armada's map tasks and a judge
+(`check1_shards`) so every task fits within two minutes (row 9717)."""
 
 
 @CUDA_OR_CPU

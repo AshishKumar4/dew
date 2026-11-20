@@ -57,8 +57,15 @@ decision workflow's cells are its axes' (`tests/test_decision_workflow.py`). fp8
 file's scenarios take their own axes (family and dtype; format and use). A scenario's flows are axes too:
 masked or block diffusion, a language or diffusion policy's RL method, and serving by one call, a paged
 server or a server drafting speculative blocks. Its cells are the combinations its flows admit: a block
-diffusion LM trains on the stream's windows, and a checkpoint that quantizes its activations is trained,
-not served.
+diffusion LM trains on the stream's windows. A checkpoint that quantizes its activations (ModelOpt's W4A4) is
+served with no forward as its oracle: an activation at its format's grid midpoint quantizes to either
+neighbour under another path's rounding (a cached decode's, a full forward's, a float64 twin's), a step no
+margin of rounding bounds, so a greedy continuation held to a walk at a margin would fail at random. Its
+cell holds what one arithmetic shows instead: a repeated call draws the same, bit for bit; a paged server
+draws the call's tokens and, past the prompt's step, its log-probabilities bit for bit (each decode step
+reduces in one order whichever cache it reads; the prompt's step heads a batch of another width); and
+every draw is a token of the vocabulary with a finite log-probability. Its forward is held to its author's
+(`tests/test_codec_checkpoints.py`).
 
 Once a flow of a scenario, on its first cell, the contracts a run of their own shows: its run, paused and
 resumed in fresh processes over one persistent cache, ends on its uninterrupted run, every checkpointed leaf

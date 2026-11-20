@@ -25,12 +25,13 @@ class Role:
     """One of a program's roles (`Schedule`): `count` units, warpgroups or (`warp`) warps of the program's
     last warpgroup (`places`), each running the body `Schedule.run` binds to `name` at its index among them;
     `weight` its warpgroups' share of
-    the registers the program's raises divide (`resources.role_registers`), 0 lowering them to setmaxnreg's
-    least (the last warpgroup's). Warp roles share their warpgroup, so its least too."""
+    the registers the program's raises divide (`resources.role_registers`), a fraction of a consumer's where a
+    role holds fewer (a correction warpgroup's half), 0 lowering them to setmaxnreg's least (the last
+    warpgroup's). Warp roles share their warpgroup, so its least too."""
     name: str
     count: int = 1
     warp: bool = False
-    weight: int = 1
+    weight: float = 1
 
     @property
     def arrivals(self) -> int:
@@ -94,12 +95,25 @@ class Schedule:
     def role(self, name: str) -> Role:
         return next(role for role in self.roles if role.name == name)
 
-    def joined(self, role: Role, count: int) -> Schedule:
-        """The schedule with `count` warps of `role` among its last warpgroup's warp roles (a launch's
-        `REDUCER`, a warp a compute role)."""
-        if not role.warp or not any(other.warp for other in self.roles):
-            raise ValueError(f"{role.name} joins a schedule's warp roles, which {self.roles} holds none of")
-        return dataclasses.replace(self, roles=(*self.roles, dataclasses.replace(role, count=count)))
+    def joined(self, role: Role, count: int, *handoffs: HandOff) -> Schedule:
+        """The schedule with `count` units of `role` and the `handoffs` it fills or gives back: a warp role
+        among its last warpgroup's warp roles (a launch's `REDUCER`, a warp a compute role); a warpgroup role
+        of a weight after its raised roles, before its last warpgroup's (a correction warpgroup beside an
+        attention launch's consumers, FlashAttention-4's), its registers its weight's share of the raise
+        (`registers`). A warpgroup role of weight 0 has no warpgroup to join: the last is the lowered one."""
+        placed = dataclasses.replace(role, count=count)
+        if role.warp:
+            if not any(other.warp for other in self.roles):
+                raise ValueError(f"{role.name} joins a schedule's warp roles, which {self.roles} holds "
+                                 f"none of")
+            roles = (*self.roles, placed)
+        elif role.weight:
+            raised = self.raised
+            roles = (*raised, placed, *self.roles[len(raised):])
+        else:
+            raise ValueError(f"{role.name}, a warpgroup role of weight 0, has no warpgroup of a schedule "
+                             f"to join")
+        return dataclasses.replace(self, roles=roles, handoffs=(*self.handoffs, *handoffs))
 
     def warpgroups(self) -> int:
         """The warpgroups a program of this schedule runs (`kernel`'s `warpgroups`)."""
@@ -224,3 +238,10 @@ class Schedule:
             index = jnp.where(wg >= first, 0, index + 1)
         lax.switch(index, branches)
         return None
+
+
+def runs_alone(family: str, joined: tuple) -> None:
+    """Refuse `joined` roles (`Family.role_schedule`'s) to `family`, whose program runs its own roles alone:
+    one warpgroup, or a core, moving no registers between roles."""
+    if joined:
+        raise ValueError(f"{family} runs its own roles alone, no {[role.name for role, *_ in joined]}")

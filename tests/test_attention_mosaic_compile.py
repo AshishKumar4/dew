@@ -578,12 +578,12 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
                                           accurate=accurate)
         return grads.query, grads.key, grads.value
 
+    mandatory = (generation_name in ("sm86", "sm89") and width == 64 and not accurate
+                 and hooks == "temperature")
     op, ba, config = _gated_backward(generation_name, width, accurate, hooks)
     if config is None:
-        # No tile its block holds: the least the model takes past it (`_least_beyond`) fails the compile
-        # too, past the block or spilling, the refusal true (an sm86's 64 x 64 dQ launch 101,392 bytes at
-        # width 128 under a score hook, its dK/dV 131,088, of 101,376; the Pallas-Triton backward takes the
-        # call).
+        assert not mandatory, (f"mandatory Mosaic backward cell derived no config: "
+                               f"{generation_name} {width} {hooks}")
         least = _least_beyond(op, ba, generation_name)
         assert least is not None, f"the Mosaic backward derives no config {width} wide on {generation_name}"
         with generation.assumed(generation_name):
@@ -617,9 +617,12 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
                                                                    for cert in offered)))
     if not failed:
         return
-    # Declined: the family claims no config of the call, every one it derives refused by the assembler,
-    # spilling or serializing (each certification's own record, not the failure's message), and none failing
-    # to build for another reason; the Pallas-Triton backward takes it (`attention_route.backward`).
+    if mandatory:
+        assert not failed, "\n".join(failed)
+    # Declined: the family claims no config of the call, proven by typed exhaustion with every derived
+    # config refused by the assembler (spilling or serializing) and no uncertified failure (row 6730);
+    # the Pallas-Triton backward takes it (`attention_route.backward`).
+    assert all(record.get("exhausted") for record in found), "\n".join(failed)
     assert not any(record.get("uncertified") for record in found), found
     assert offered and all(any(refused for _, _, refused in cert["kernels"].values()) for cert in offered), (
         "\n".join(failed))
