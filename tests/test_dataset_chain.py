@@ -1739,8 +1739,8 @@ def test_a_nested_records_numbers_stack_beside_its_opaque_messages():
 
 def test_a_token_holdouts_spans_are_resolved_by_one_scan_of_its_order():
     """A token holdout's spans are resolved once, by one scan of the order before it, which the plan's
-    fingerprint and the reader's split share: each document is mapped once by that scan and once more for
-    each row a read of the trained branch takes of it (row 9011: the plan and the reader each scanned it)."""
+    fingerprint and the reader's split share: a document the trained branch takes none of is mapped once,
+    by that scan (row 9011: the plan and each reader scanned it, three maps of it)."""
     mapped: collections.Counter[int] = collections.Counter()
 
     @dataclass(frozen=True)
@@ -1761,5 +1761,6 @@ def test_a_token_holdouts_spans_are_resolved_by_one_scan_of_its_order():
         assert loader.plan is not None and loader.plan.record()
     finally:
         stream.close()
-    read = collections.Counter(int(row["text"][0][0]) - int(row["text"][0][0]) % 100 for row in rows)
-    assert all(mapped[start] == 1 + read[start] for start in range(0, 800, 100)), (mapped, read)
+    read = {int(row["text"][0][0]) // 100 * 100 for row in rows}
+    held = [start for start in range(0, 800, 100) if start not in read]
+    assert held and all(mapped[start] == 1 for start in held), (mapped, read)
