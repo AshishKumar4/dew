@@ -717,9 +717,8 @@ def tf32_conversion(family) -> Literal["plain", "rna", "read"]:
     return "rna" if family.rounds_tf32 else "read"
 
 
-def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
-             carried: bool = True, delta: bool = True,
-             rounded: bool | None = None, walked: bool = False) -> Run:
+def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None, carried: bool = True,
+             delta: bool = True, rounded: bool | None = None, walked: bool = False) -> Run:
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
     JAX's own default precision as a model trains it: `chunk_forward.kept_forward` at the tiles the route
     takes (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
@@ -761,8 +760,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                                                        write_bound=1.0)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
-        # The options the call's programs close over, which name their launches (`launched`): the starts by
-        # their dtype, shape and elements' fingerprint.
+        # The options the call's programs close over name their launches (`launched`), the starts' by digest.
         hasher = hashlib.sha1()
         if starts is not None:
             array_fingerprint(hasher, np.asarray(starts))
@@ -836,8 +834,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide), walked=walked,
-               pairing=intra.pairing_parts(family, held),
-               tf32=tf32_conversion(family), trained=bool(trained),
+               pairing=intra.pairing_parts(family, held), tf32=tf32_conversion(family), trained=bool(trained),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
