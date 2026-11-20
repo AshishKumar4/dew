@@ -87,12 +87,20 @@ def buffer_waits(chunks: int, buffers: int) -> tuple[int, ...]:
     return tuple(waits)
 
 
+def column_ranges(total: int, width: int) -> list[tuple[int, int]]:
+    """The `(first, count)` column spans of a `total`-column tile taken `width` columns at a time, the whole
+    where `width >= total`: one chunk plan shared by `column_chunks` and a dQ reducer (`_PlacedDq.pieces`,
+    row 8813)."""
+    if width >= total:
+        return [(0, total)]
+    return [(first, width) for first in range(0, total, width)]
+
+
 def column_chunks(value: jax.Array, width: int) -> list[tuple[int, jax.Array]]:
     """`value` `width` of its columns at a time, each chunk with its first column, the whole where it is no
     wider: a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
-    if width >= value.shape[-1]:
-        return [(0, value)]
-    return [(first, value[..., first:first + width]) for first in range(0, value.shape[-1], width)]
+    return [(first, value[..., first:first + count])
+            for first, count in column_ranges(value.shape[-1], width)]
 
 
 def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
