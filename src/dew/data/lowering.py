@@ -762,8 +762,8 @@ class _GroupedRows(_WrappingDataset):
         group = index // self._size
         if self._held is None or self._held[0] != group:
             first = group * self._size
-            members = [record(self._parent[place], "batched input")
-                       for place in range(first, min(first + self._size, len(self)))]
+            members: list[Record] = [self._parent[place]
+                                     for place in range(first, min(first + self._size, len(self)))]
             self._held = group, self._groups.flat_map(members)
         return record(self._held[1][index % self._size], "batched row")
 
