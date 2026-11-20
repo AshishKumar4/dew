@@ -58,6 +58,7 @@ from dew.objectives.base import (
     Ratio,
     Step,
 )
+from dew.objectives.routing import RoutedStatistics
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
@@ -103,7 +104,13 @@ def _refuse_other_tokenizers(student: str, teacher: str) -> None:
                          f"{student}: the term compares one id's probabilities on both sides")
 
 
-class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
+def prediction_of(statistics: Ratio | RoutedStatistics) -> Ratio:
+    """The token statistics a loss's `statistics` hold (`Objective.predict`): a `Ratio` itself, routed
+    statistics' prediction beside their router terms."""
+    return statistics.prediction if isinstance(statistics, RoutedStatistics) else statistics
+
+
+class DistillationObjective(Objective[Ratio | RoutedStatistics, Effects], Generic[Loss, Effects]):
     """Mixes the student's own loss with a frozen teacher's soft targets."""
 
     untraced: ClassVar[Mapping[str, str]] = {
@@ -335,7 +342,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         return replace(step, ema=None if step.ema is None else self.student_variables(step.ema))
 
     def _predictions(self, params: Variables, batch: Batch, step: Step
-                     ) -> tuple[Ratio, Aux[Effects], Prediction, Prediction]:
+                     ) -> tuple[Ratio | RoutedStatistics, Aux[Effects], Prediction, Prediction]:
         """Score the student in the step's mode and the frozen teacher in evaluation mode, each with its
         whole logits where the divergence reads every column (`full`), and none where it reads the
         sampled ids' likelihoods alone (`selected`), each loss scoring its head as it trains."""
@@ -364,8 +371,13 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             return optax.cosine_distance(student, teacher, epsilon=1e-6)
         return jnp.mean(jnp.square(student - teacher), axis=-1)
 
-    def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux[Effects]]:
-        statistics, aux, student, teacher = self._predictions(variables, batch, step)
+    def loss(self, variables: Variables, batch: Batch, step: Step
+             ) -> tuple[Ratio | RoutedStatistics, Aux[Effects]]:
+        """The student's own loss mixed with the teacher's soft targets over the student's token mass, the
+        student's router terms (a mixture's balance and z-loss, `RoutedStatistics`) kept beside it as its own
+        loss keeps them, each over its own count (`reduce_loss`; row 9071: refused)."""
+        routed, aux, student, teacher = self._predictions(variables, batch, step)
+        statistics = prediction_of(routed)
         # The terms' dtype: the losses', at least fp32, so a float64 run keeps float64 throughout.
         dtype = at_least_fp32(jnp.result_type(student.losses, teacher.losses))
         alpha, temperature, beta = (jnp.asarray(_schedule(weight)(step.step), dtype) for weight in
@@ -417,7 +429,14 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
                        / len(self.features))
             total = total + beta * feature
             reported.update({"distill/beta": beta, "distill/feature": Ratio(feature, mass)})
-        return Ratio(total, mass), replace(aux, metrics=reported)
+        mixed = Ratio(total, mass)
+        return (replace(routed, prediction=mixed) if isinstance(routed, RoutedStatistics) else mixed,
+                replace(aux, metrics=reported))
+
+    def reduce_loss(self, stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
+        """The objective value of the mixed statistics: the student's own reduction, which adds its router
+        terms to the mixed token loss where it has any (`RoutedStatistics`)."""
+        return self.student.reduce_loss(stats)
 
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         return self.student.apply_effects(self.student_variables(variables), effects)
