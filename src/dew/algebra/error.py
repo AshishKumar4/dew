@@ -88,13 +88,20 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     candidates += [found for candidate in candidates
                    if (found := compensated(candidate, operands, tree)) is not None]
     candidates.sort(key=lambda candidate: (candidate.compensated, candidate.seconds))
-    # Under the accurate numerics, every candidate as exact as the form as written is a reference: one
-    # that is not (a regrouping past the float's range where the form as written is finite) raises no bar.
+    if not accurate:
+        for candidate in candidates:
+            if candidate is written or admits(candidate.function, written.function):
+                return Choice(candidate, tuple(candidates))
+    # Under the accurate numerics, every candidate as exact as the form as written is a reference, each
+    # admitted against it once: one that is not (a regrouping past the float's range where the form as
+    # written is finite) raises no bar and is never chosen.
     references = [written, *(candidate for candidate in candidates if candidate is not written
-                             and admits(candidate.function, written.function))] if accurate else [written]
+                             and admits(candidate.function, written.function))]
+    admissible = {id(reference) for reference in references}
     for candidate in candidates:
-        if all(candidate is reference or admits(candidate.function, reference.function)
-               for reference in references):
+        if id(candidate) in admissible and all(
+                admits(candidate.function, reference.function) for reference in references
+                if reference is not candidate and (candidate is written or reference is not written)):
             return Choice(candidate, tuple(candidates))
     raise ValueError("no candidate is as exact as every other: the gate admits none")
 
@@ -109,7 +116,7 @@ def compensated(candidate: Candidate, operands: Sequence[jax.ShapeDtypeStruct], 
     compensation's arithmetic lies in protected spans, which the cost model prices as the values they
     make."""
     closed = jax.make_jaxpr(candidate.function)(*operands)
-    if printed.refused(closed) is not None:
+    if printed.refused(closed, compensated=True) is not None:
         return None
     text, used = printed.source(closed, "compensated", compensated=True)
     if not used:

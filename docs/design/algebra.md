@@ -215,8 +215,10 @@ floating-point expressions:
   rows), as check 1 measures error.
 - **The declared accuracy** is the precision policy's (`dew.nn.precision`), read once:
   - default numerics: check 1 at the gate's parity (§3) against the form as written;
-  - the accurate numerics (`precision="accurate"`): check 1 at the gate's parity against every other candidate proposed (§6.5; the gate
-is pairwise, so no single most accurate candidate is ranked, and none may be admitted).
+  - the accurate numerics (`precision="accurate"`): check 1 at the gate's parity against the form as written
+    and every other candidate as exact as it (§6.5; the gate is pairwise, so no single most accurate candidate
+    is ranked, and none may be admitted; a proposal not as exact as the form as written, one past the
+    float's range where it is finite, raises no bar).
 - **Among the candidates that meet it,** the generator takes the cheapest by time (§1.6). A candidate that
   misses it is never chosen, however cheap.
 - **At compile time no candidate is measured;** admission is by rounding class alone (§1.4).

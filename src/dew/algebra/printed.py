@@ -243,10 +243,11 @@ def _compensated(printer: _Printer, equation: jcore.JaxprEqn) -> None:
                  [printer.pair(left), printer.pair(right, negated=equation.primitive is lax.sub_p)])
 
 
-def refused(closed: core.Jaxpr) -> str | None:
-    """Why no plain call writes `closed` (`Unprintable`'s reason), None where it is printable."""
+def refused(closed: core.Jaxpr, *, compensated: bool = False) -> str | None:
+    """Why no plain call writes `closed` (`Unprintable`'s reason), compensated where asked (a compensated
+    sum returns its result strong, so a weak one's print is refused), None where it is printable."""
     try:
-        source(closed, "printable")
+        source(closed, "printable", compensated=compensated)
     except Unprintable as refusal:
         return str(refusal)
     return None
