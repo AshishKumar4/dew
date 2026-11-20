@@ -173,11 +173,8 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
     `corrected_by`, `D h + beta k (v + c^T D h)^T`): the first the token's decay and its erase, keys `a`,
     values zero, gate `beta` and reader `c = -b`; the second no decay and its write, keys `k`, values `v`,
     gate `beta`, no correction; its query on the second, a packed document from its first. The erase vectors
-    each key head's over its value heads.
-    `(query, key, value, g, beta, correction, starts, firsts)`, laid `[B, 2S, ...]`, its second token's
-    output the call's; a call of the keys' own erase as given, no correction."""
-    if hooks.erase != 'untied':
-        return query, key, value, g, beta, None, starts, firsts
+    each key head's over its value heads. `(query, key, value, g, beta, correction, starts, firsts)`, laid
+    `[B, 2S, ...]`, its second token's output the call's (`_laid`)."""
     heads = value.shape[2]
     a, b = (jnp.repeat(given[name], heads // given[name].shape[2], axis=2).astype(g.dtype)
             for name in ('erase_key', 'erase_read'))
@@ -378,8 +375,9 @@ def _laid(hooks: recurrence.Hooks, tokens: tuple, given: dict, starts, firsts, m
         query, g, starts, firsts, max_segments = _substeps_laid(hooks.substeps, query, g, starts, firsts,
                                                                 max_segments)
         return (query, key, value, g, beta, None, starts, firsts, max_segments), hooks.substeps
-    laid = _erases_laid(hooks, query, key, value, g, beta, given, starts, firsts)
-    return (*laid, max_segments), 1 if laid[5] is None else 2
+    if hooks.erase == 'untied':
+        return (*_erases_laid(hooks, query, key, value, g, beta, given, starts, firsts), max_segments), 2
+    return (query, key, value, g, beta, None, starts, firsts, max_segments), 1
 
 
 def _substeps_laid(substeps: int, query, g, starts, firsts, max_segments: int | None):
