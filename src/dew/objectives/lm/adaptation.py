@@ -752,6 +752,16 @@ def decoded_alone(adaptation: ChunkAdaptation) -> str | None:
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class InContext:
+    """How a run's generation steps its continuum level in context (`InContextDecoder`), as its saved task
+    records it (`dew.inference.tasks.TextSettings.adaptation`): its adaptation, and the id whose targets its
+    loss never counted (`LMObjective.pad_id`), which its level's steps take none of."""
+
+    adaptation: ChunkAdaptation
+    pad_id: int | None = None
+
+
 IN_CONTEXT = "in_context"
 """The decode cache's entry an adapting decoder keeps its rows' chain in (`InContextDecoder`), beside
 the model's own."""
