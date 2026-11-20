@@ -1788,11 +1788,15 @@ class Trainer(Generic[Loss, Effects]):
         the run reads its stream from its beginning: that stream, handed on; else a stream opened now, the
         primed one closed."""
         primed, run.primed = run.primed, None
-        # Handed on where it was read from the position the run reads from, its beginning or a resume's,
-        # restored there once (row 9663); a relaxed resume starting a stage again (`FitRun.restarted`, which
-        # `_prefetched` moves a staged stream to) reads elsewhere.
-        if (primed is not None and primed[0] == partition and primed[4] == position
-                and run.restarted is None):
+        # Handed on where read from the run's position, restored there once (row 9663), not where a relaxed
+        # resume starts a stage again (`FitRun.restarted`); a resume's on every process or none, so each runs
+        # the same collectives (`resumed_on`'s; row 9713: a share that read nothing there agreed alone).
+        mine = (primed is not None and primed[0] == partition and primed[4] == position
+                and run.restarted is None)
+        if position is not None and jax.process_count() > 1:
+            from dew._coordination import from_every_process
+            mine = all(from_every_process(mine))
+        if mine and primed is not None:
             return primed[1], (primed[2], primed[3])
         if primed is not None:
             _closed(primed[1])

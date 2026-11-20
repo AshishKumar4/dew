@@ -22,7 +22,7 @@ from flax import linen as nn
 from interop_support import extract_fixture
 from placement_parity import layouts_agree
 from run_kinds import blockwise, cli_settings, lm, saved_record, scalars
-from scenario_called import DIFFUSION_RL, GGUF, STEPS, quantized_loaded
+from scenario_called import CODECS, DIFFUSION_RL, GGUF, STEPS, quantized_loaded
 from scenario_contract import (
     Called,
     Phase,
@@ -576,13 +576,28 @@ ACTIVATIONS_QUANTIZED = ("modelopt/tiny",)
 """The formats whose forward quantizes its activations as well as its weights."""
 
 
-def served_whole(cell: Mapping) -> bool:
-    """Whether a quantized interchange cell is one its flow admits: a checkpoint whose forward quantizes its
-    activations is trained and not served, an activation on its format's rounding boundary rounding either
-    way under a float32 and a float64 forward's own rounding, so that no float64 forward is the truth of its
-    served continuation at a margin (`assert_served_as_its_forward`; tests/test_codec_checkpoints.py holds
-    its forward to its author's)."""
-    return cell["use"] == "train" or cell["format"] not in ACTIVATIONS_QUANTIZED
+def assert_served_alike(task: TextGeneration, vocab: int) -> None:
+    """A checkpoint that quantizes its activations served greedily (row 9704): three prompts of one width
+    served by one call and again, and by a server over a paged cache. The repeated call draws what the
+    first drew, bit for bit. Each server row draws the call's tokens, and every log-probability past the
+    prompt's step bit for bit: each decode step reduces in one order whichever cache it reads, where the
+    prompt's step heads a batch of another width. Every token is in the vocabulary, every row draws each of
+    its steps, and every log-probability is finite. No forward is the truth of its continuation at a margin:
+    an activation at its format's grid midpoint quantizes either way under another path's rounding
+    (docs/design/testing.md)."""
+    prompts, steps = [[3, 4, 5], [6, 7, 8], [9, 10, 11]], 4
+    once = called_on(task)(prompts, steps)
+    again = called_on(task)(prompts, steps)
+    paged = served_through({"serving": "paged"}, task)(prompts, steps)
+    for (tokens, length, log_probs), (tokens_again, length_again, log_probs_again), (
+            served_tokens, served_length, served_log_probs) in zip(once, again, paged, strict=True):
+        assert (length, length_again, served_length) == (steps, steps, steps)
+        drawn = tokens[:len(prompts[0]) + steps]
+        assert drawn.tobytes() == tokens_again[:len(drawn)].tobytes() == served_tokens[:len(drawn)].tobytes()
+        assert log_probs[:steps].tobytes() == log_probs_again[:steps].tobytes()
+        assert log_probs[1:steps].tobytes() == served_log_probs[1:steps].tobytes()
+        assert ((drawn >= 0) & (drawn < vocab)).all()
+        assert np.isfinite(log_probs[:steps]).all() and np.isfinite(served_log_probs[:steps]).all()
 
 
 def quantized_source(cell: Mapping, root: Path):
@@ -607,13 +622,18 @@ def quantized_served(cell: Mapping, root: str) -> np.ndarray:
 
 def quantized_interchange(cell: Mapping, root: Path) -> None:
     """Quantized interchange: a quantized checkpoint of the cell's format (`FORMATS`) loaded, then trained on
-    from its decoded weights (`quantized_trained`) or served, its greedy continuation its float64
-    forward's."""
+    from its decoded weights (`quantized_trained`) or served: a weight-only format's greedy continuation its
+    float64 forward's, one that quantizes its activations served alike by a call and a server
+    (`assert_served_alike`)."""
     if cell["use"] == "train":
         quantized_run(cell, root).trained()
         return
     source = quantized_source(cell, root)
     task = TextGeneration(source.model, source.variables, sampling=Sampling(temperature=0))
+    if cell["format"] in ACTIVATIONS_QUANTIZED:
+        vocab = json.loads((CODECS / cell["format"] / "config.json").read_text())["vocab_size"]
+        assert_served_alike(task, vocab)
+        return
     assert_served_as_its_forward(task, called_on(task), source.model, 1, source.model.dtype)
 
 
@@ -688,7 +708,7 @@ SCENARIOS: Mapping[str, Scenario] = {
         sampled="served", sampled_from="root", apart=("serving",)),
     "Quantized interchange": Scenario(
         {"format": FORMATS, "use": ("train", "serve")}, quantized_interchange, quantized_run,
-        "quantized_served", "root", admits=served_whole),
+        "quantized_served", "root"),
     "Published diffusion pipelines": Scenario(
         {"family": _pipelines(), "dtype": ("float32", "bfloat16")}, published_pipeline,
         sampled="pipeline_sampled", sampled_from="root"),

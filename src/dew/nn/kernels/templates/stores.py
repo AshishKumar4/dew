@@ -90,7 +90,8 @@ def buffer_waits(chunks: int, buffers: int) -> tuple[int, ...]:
 def column_spans(columns: int, width: int) -> list[tuple[int, int]]:
     """`columns` `width` at a time, each span its first column and its width, the last clipped to what is
     left, one span of all of them where they are no wider: the partition `column_chunks` slices a value by,
-    its shape alone (a plan's, before any value)."""
+    its shape alone (a plan's, before any value), and a dQ reducer's chunks (`_PlacedDq.pieces`, row
+    8813)."""
     if width >= columns:
         return [(0, columns)]
     return [(first, min(width, columns - first)) for first in range(0, columns, width)]
