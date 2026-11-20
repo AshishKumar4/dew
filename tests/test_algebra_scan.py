@@ -1246,7 +1246,8 @@ def two_sided_readout(h, q, k, v, g, e, beta):
     return (q @ h) * KEY ** -0.5
 
 
-TWO_SIDED = {**KIMI, "e": ("time", "value")}
+TWO_SIDED = {**{name: KIMI[name] for name in ("q", "k", "v", "g")}, "e": ("time", "value"), "beta": ("time",)}
+"""Its operands in its update's order, as its draw gives them."""
 
 
 def two_sided_draw(seed, steep: bool = False):
@@ -1270,43 +1271,49 @@ def two_sided_tokenwise(q, k, v, g, e, beta):
     return outputs, final
 
 
+TWO_SIDED_FORMS = scan.Scan(two_sided, two_sided_readout, TWO_SIDED, walked="time",
+                            state=((KEY, VALUE), jnp.float32))
+
+
 @pytest.mark.parametrize("target", ["sm90", "v5e"])
 @pytest.mark.parametrize("steep", [False, True], ids=["mild", "steep values"])
 def test_a_two_sided_decays_chunks_compute_their_token_scan(target, steep):
     """Two-sided GLA (`two_sided`: a decay along the state's keys and its values) walked in chunks through
     its derived forms, the dual form an H100's extraction takes and the token loop a v5e's (its step's latency
-    unpriced): outputs and final state, and the operands' gradients and the outputs' tangents along them, on
-    par with the token scan's from float64 (check 1), its values' decays mild or steep past fp32's exponents
-    across a chunk."""
+    unpriced): outputs and final state on par with the token scan's from float64 (check 1), its values'
+    decays mild or steep past fp32's exponents across a chunk."""
     with generation.assumed(target):
-        forms = scan.derive_scan(scan.Scan(two_sided, two_sided_readout, TWO_SIDED, walked="time",
-                                           state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+        forms = scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
 
         def walked(q, k, v, g, e, beta):
             values = {"q": q, "k": k, "v": v, "g": g, "e": e, "beta": beta}
             outputs, state = walk(forms, values, range(TOKENS // CHUNK), forms.init({}), TWO_SIDED)
             return jnp.concatenate(outputs), forms.finish(state, values)
 
-        def orders(run):
-            def ran(q, k, v, g, e, beta):
-                primals = (q, k, v, g, e, beta)
-                (out, final), pull = jax.vjp(run, *primals)
-                tangents = tuple(jnp.full_like(x, 1e-2) for x in primals)
-                return {"out": out, "final": final,
-                        "gradients": pull((jnp.ones_like(out), jnp.ones_like(final))),
-                        "tangent": jax.jvp(run, primals, tangents)[1]}
-            return ran
-
-        assert_as_exact(jax.jit(orders(walked)), jax.jit(orders(two_sided_tokenwise)),
+        assert_as_exact(jax.jit(walked), jax.jit(two_sided_tokenwise),
                         functools.partial(two_sided_draw, steep=steep), f"two-sided on {target}", seeds=16)
+
+
+@pytest.mark.parametrize("steep", [False, True], ids=["mild", "steep values"])
+def test_a_two_sided_decays_chunk_adjoint_is_the_token_scans_gradient(steep):
+    """Two-sided GLA's chunk adjoint (`backward`, its token update replayed), walked back: each token
+    operand's gradient, its values' decays' among them, on par with the token scan's from float64 (check
+    1)."""
+    forms = scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
+
+    def chunked(values, index):
+        return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
+
+    assert_adjoint(forms, two_sided_tokenwise, tuple(TWO_SIDED), chunked,
+                   functools.partial(two_sided_draw, steep=steep), ((TOKENS, VALUE), (KEY, VALUE)),
+                   "two-sided adjoint")
 
 
 def test_two_two_sided_walks_merged_give_the_final_state():
     """Two-sided GLA's tokens walked in two halves, the second from a zero state, merged (each walk's decay
     along the values summed, `Walk.across`): the final state on par with the token scan's from float64
     (check 1)."""
-    forms = scan.derive_scan(scan.Scan(two_sided, two_sided_readout, TWO_SIDED, walked="time",
-                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    forms = scan.derive_scan(TWO_SIDED_FORMS, saturation=SATURATION)
     half = TOKENS // CHUNK // 2
 
     def merged(q, k, v, g, e, beta):
