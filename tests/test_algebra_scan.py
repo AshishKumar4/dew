@@ -1237,11 +1237,12 @@ def test_a_delta_rule_reading_apart_from_its_own_write_reads_its_decayed_enterin
         gated_walk(grouped, operands)(*draw_fn(0))
 
 
-def two_sided(h, q, k, v, g, e, beta):
+def two_sided(h, q, k, v, g, e, beta, exponential=jnp.exp):
     """Two-sided GLA's token: the state decayed along its keys and its values, `exp(g)` each key's and
-    `exp(e)` each value's, then written, `h = diag(exp(g)) h diag(exp(e)) + beta k v^T`."""
+    `exp(e)` each value's, then written, `h = diag(exp(g)) h diag(exp(e)) + beta k v^T`; its decays
+    `exponential`'s (`jnp.exp2`: in base 2, exact at integer exponents)."""
     del q
-    return jnp.exp(g)[:, None] * h * jnp.exp(e)[None, :] + beta * k[:, None] * v[None, :]
+    return exponential(g)[:, None] * h * exponential(e)[None, :] + beta * k[:, None] * v[None, :]
 
 
 def two_sided_readout(h, q, k, v, g, e, beta):
@@ -1368,12 +1369,6 @@ def plain_readout(h, q, k, v, g, e, beta):
     return q @ h
 
 
-def two_sided_base2(h, q, k, v, g, e, beta):
-    """`two_sided` in base 2: its decays `2^g` and `2^e`, exact at integer exponents."""
-    del q
-    return jnp.exp2(g)[:, None] * h * jnp.exp2(e)[None, :] + beta * k[:, None] * v[None, :]
-
-
 def test_a_two_sided_decays_pairs_across_a_sub_chunk_are_decayed_before_they_are_summed():
     """Two-sided GLA's dual form (an H100's), two writes of a key of 2^63 and a unit value before a
     sub-chunk's reference (`recurrence_algebra.SUB`) read by a query of 2^64 after it, the value's gate 1/4
@@ -1394,8 +1389,9 @@ def test_a_two_sided_decays_pairs_across_a_sub_chunk_are_decayed_before_they_are
               "v": at((CHUNK, VALUE), ((0, 0), 1.0), ((1, 0), 1.0)), "g": jnp.zeros((CHUNK, KEY)),
               "e": at((CHUNK, VALUE), ((SUB, 0), -2.0)), "beta": jnp.ones((CHUNK,))}
     with generation.assumed("sm90"):
-        forms = scan.derive_scan(dataclasses.replace(TWO_SIDED_FORMS, update=two_sided_base2,
-                                                     readout=plain_readout), saturation=SATURATION)
+        base2 = dataclasses.replace(TWO_SIDED_FORMS, update=functools.partial(two_sided, exponential=jnp.exp2),
+                                    readout=plain_readout)
+        forms = scan.derive_scan(base2, saturation=SATURATION)
         outputs = forms.mapped(forms.prepare(values), forms.init({}))
     assert float(outputs[reader, 0]) == 2.0 ** 126
 
