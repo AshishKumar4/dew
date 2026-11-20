@@ -996,7 +996,12 @@ equation the language has no constructor for is a leaf. The algebra's identities
 sums commute and associate, products distribute and factor, and a contraction is linear in each operand.
 Where the update is affine, its class then holds the form: a decay `exp(z)` (or `exp2`) on the state, a
 scalar's or each key's, a rank-one input `B U^T`, and corrections along `B` that read the decayed state
-(`Affine.decayed`, `corrected`). The readout's form is a contraction of the state with a vector plus a free part, over the keys
+(`Affine.decayed`, `corrected`: `D h + B (U + C^T D h)^T`) or the state the token enters (`corrected_before`:
+`D h + B (U + C^T h)^T`, RWKV7's erase, whose decay a read after it would take twice). The pre-decay form's
+WY system reads each earlier write and the entering state through the decays a token back, to the token
+before the reader's (`entering_before`, `between_before`: `entering` and `between` shifted a row, never a
+token's exponent taken away); where a decay a head's commutes into the read, the after-decay form is the
+cheaper and is extracted. The readout's form is a contraction of the state with a vector plus a free part, over the keys
 (`Affine.readout`, `reader^T h + free`, a vector along the values) or over the values (`Affine.applied`,
 `h reader + free`, a vector along the keys). An update or readout that reaches no such form is refused. The affine update then
 enters a second e-graph as its chunk's token loop, and the identities of affine scans hold every equal
