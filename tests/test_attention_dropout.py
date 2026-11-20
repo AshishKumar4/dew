@@ -647,12 +647,15 @@ def test_a_mosaic_fp16_dropping_forward_with_initial_or_past_binade_is_eligible_
         def reference(q, k, v):
             return template.reference(q, k, v, spans, hooks)
 
+        value_scale = 2.0 ** -14 if rate > 0.5 else 1.0
+
         def draw(seed):
             streams = jax.random.split(jax.random.key(seed), 3)
-            return tuple(jax.random.normal(s, shape, jnp.float16)
-                         for s, shape in zip(streams, ((1, 1, 1, WIDTH), (1, 2, 1, WIDTH),
-                                                       (1, 2, 1, WIDTH)), strict=True))
-
+            q = jax.random.normal(streams[0], (1, 1, 1, WIDTH), jnp.float16)
+            k = jax.random.normal(streams[1], (1, 2, 1, WIDTH), jnp.float16)
+            v = (jax.random.normal(streams[2], (1, 2, 1, WIDTH), jnp.float32) * value_scale).astype(
+                jnp.float16)
+            return q, k, v
         assert_as_exact(ours, reference, draw, f"fp16 mosaic drop rate={rate} initial={with_initial}",
                         seeds=FEWEST_SEEDS)
 
