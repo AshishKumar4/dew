@@ -422,9 +422,12 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def resident(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> int:
         """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
-        its registers, shared memory and rounded tensor memory (`resources.register_model`); one at the
-        least, a legal config's (row 9105)."""
+        its registers, shared memory and rounded tensor memory (`resources.register_model`); one on a core
+        whose family budgets no registers (a TPU's, `Family.budgets_registers`), and one at the least, a
+        legal config's (row 9105)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
+        if not family.budgets_registers:
+            return 1
         staged = self.staged_bytes(ba, config, target) if target.shared_limit else None
         tmem = self.tmem_columns(ba, config, target)
         return max(1, resources.register_model(family, config.consumers, self.registers(ba, config),
