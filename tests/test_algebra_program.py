@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, equations
+from reference_error import assert_as_exact, assert_computes_the_oracle, equations
 from test_algebra import cheaper_spliced, rows, traces_cheaper, two_sums
 
 from dew import algebra
@@ -1160,6 +1160,51 @@ def test_a_template_walks_span_is_priced_at_its_gpus_kernel_step(generation_name
     target = generation.gpu_target(generation_name)
     step = kernel_cost.walked(kernel_cost.Work(flops=1.0, span=1), target)
     assert kernel_cost.walked(kernel_cost.Work(flops=1.0, span=10_000), target) == 10_000 * step > 0
+
+
+def test_a_template_walks_chain_is_priced_at_its_parts_latencies():
+    """A tile walk's dependent path (`Chain`) waits on its products and its warpgroups' barriers, each at the
+    part's measured latency (a GH200's: a waited 64 x N product 12.9 ns and 1.194 ns a column, a barrier
+    round trip 80.1 ns, FS-4123-LATENCIES1-gh200): a recurrence chunk step waiting on four products of 128
+    columns and two round trips costs their sum, where its span alone priced one reduction (row 4123: a states
+    launch's chunk step measured 13 times one)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    chain = kernel_cost.Chain(span=1, products=4, columns=4 * 128, barriers=2)
+    chained = kernel_cost.walked(kernel_cost.Work(flops=1.0, chains=(chain,)), target)
+    spanned = kernel_cost.walked(kernel_cost.Work(flops=1.0, span=1), target)
+    expected = target.kernel_step_seconds + 4 * 12.9e-9 + 512 * 1.194e-9 + 2 * 80.1e-9
+    assert_computes_the_oracle(np.float64(chained), np.float64(expected), "the chain's seconds", roundings=8)
+    assert chained > 4 * spanned
+
+
+def test_a_rings_stages_hide_a_tile_copy_its_steps_outlast():
+    """A step's tile copy through a ring of S stages is waited on only past what S - 1 steps ahead hide: a
+    step of C seconds takes max(C, (L + C) / S) for a copy of L seconds, so a 4-stage ring hides a copy of
+    1.5 of a step's 663 ns and a 2-stage ring of the same copy waits on part of it (row 4123)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    copy = dataclasses.replace(target.part, copy=(1000e-9, 0.0))
+    target = dataclasses.replace(target, measured={target.device_kind: copy})
+    step = kernel_cost.Chain(products=4, columns=4 * 128)
+    work = kernel_cost.walked(kernel_cost.Work(chains=(step,)), target)
+    hidden = kernel_cost.Chain(products=4, columns=4 * 128, copies=1, stages=4)
+    waited = dataclasses.replace(hidden, stages=2)
+    assert kernel_cost.walked(kernel_cost.Work(chains=(hidden,)), target) == work
+    waiting = kernel_cost.walked(kernel_cost.Work(chains=(waited,)), target)
+    assert_computes_the_oracle(np.float64(waiting), np.float64((1000e-9 + work) / 2),
+                               "the waited ring's step", roundings=4)
+
+
+def test_work_side_by_side_keeps_every_chain_another_does_not_outlast():
+    """Works summed side by side keep each chain no other outlasts at every part's latencies, so their price
+    is the longest of their chains whatever the part, and adding work never lowers it: a chain of more of
+    every event through no more stages replaces the lesser, two that stress different events are both kept."""
+    products, barriers = kernel_cost.Chain(products=4, columns=512), kernel_cost.Chain(barriers=6)
+    more = kernel_cost.Chain(products=5, columns=640, barriers=6)
+    assert (kernel_cost.Work(chains=(products,)) + kernel_cost.Work(chains=(barriers,))).chains == (
+        products, barriers)
+    both = kernel_cost.Work(chains=(products, barriers))
+    assert (both + kernel_cost.Work(chains=(more,))).chains == (more,)
+    assert (kernel_cost.Work(flops=1.0) + kernel_cost.Work(chains=(more,))).chains == (more,)
 
 
 def test_a_protected_span_is_kept_as_traced_however_often_the_pass_runs():
