@@ -723,7 +723,8 @@ def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_rol
     assert explore(threads, arrivals) > 0
 
     # Dropping `ordinal` in `_PlacedDq._turn` must be caught by `explore`.
-    monkeypatch.setattr(dkv._PlacedDq, "_turn", lambda self, ordinal, piece: rings.Turn.of(piece, dkv.REDUCED))
+    monkeypatch.setattr(dkv._PlacedDq, "_turn",
+                        lambda self, ordinal, piece: rings.Turn.of(piece, dkv.REDUCED))
     bad_threads, bad_arrivals = traced("dq_ring_ordinals_mutated")
     with pytest.raises(Violation):
         explore(bad_threads, bad_arrivals)
