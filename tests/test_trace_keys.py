@@ -129,13 +129,12 @@ def rolled_out(name: str, batch, objective):
     if name != "flow_grpo":
         return batch
     from dew.objectives.rl.flow import transition_rows
-    from dew.sampling.flow import FlowTrajectory
 
     rows = len(next(iter(batch.values())))
-    walk = FlowTrajectory(np.zeros((rows, 3, *objective.latent_shape), np.float32),
-                          np.asarray([1.0, 0.5, 0.25], np.float32), np.zeros((rows, 2), np.float32),
-                          np.ones((rows, 2), bool))
-    return {**batch, **transition_rows(walk, np.zeros((rows,), np.float32))}
+    states = np.zeros((rows, 3, *objective.latent_shape), np.float32)
+    times = np.asarray([1.0, 0.5, 0.25], np.float32)
+    return {**batch, **transition_rows(states, times, np.zeros((rows, 2), np.float32), np.ones((rows, 2), bool),
+                                       np.zeros((rows,), np.float32))}
 
 
 def unvalued(objective) -> list[str]:

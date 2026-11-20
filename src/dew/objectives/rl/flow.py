@@ -537,35 +537,36 @@ class FlowRollout(GroupedRollout):
                                                  context[condition.field])
                     for condition in self.objective.inputs.conditions.values()}
         # This rank's rows of the walk, laid out as every flow batch is (`transition_rows`).
-        mine = FlowTrajectory(np.asarray(generated.states)[owned], np.asarray(generated.times),
-                              np.asarray(generated.log_probs)[owned], np.asarray(generated.stochastic)[owned])
-        trains = mine.stochastic[:, :selected] & (local_advantages[:, None] != 0) & real[:, None]
-        prepared.update({**transition_rows(mine, local_advantages, selected=selected, trains=trains),
+        stochastic = np.asarray(generated.stochastic)[owned]
+        trains = stochastic[:, :selected] & (local_advantages[:, None] != 0) & real[:, None]
+        prepared.update({**transition_rows(np.asarray(generated.states)[owned], np.asarray(generated.times),
+                                           np.asarray(generated.log_probs)[owned], stochastic,
+                                           local_advantages, selected=selected, trains=trains),
                          REWARDS_KEY: rewards[owned]})
         if spatial:
             prepared["spatial"] = {name: np.asarray(value)[owned] for name, value in spatial.items()}
         return prepared
 
-def transition_rows(trajectory: FlowTrajectory, advantages: ArrayLike, *, selected: int | None = None,
-                    trains: ArrayLike | None = None) -> Batch:
-    """A walk's transitions as the flow objective trains on them (`FlowGRPOObjective`; the one layout, a
-    rollout's (`FlowRollout`) and a caller's alike, row 9694): its first `selected` transitions (every one
-    where None), each row's states and the states they step to, both endpoints' times, its walk's grid
-    points (`rollout_steps`), its recorded log densities, which transitions train (`trains`, the walk's
-    stochastic ones where None) and each row's advantage. In NumPy over a walk on the host, in JAX over a
-    traced one."""
-    xp = jnp if isinstance(trajectory.states, jax.core.Tracer) else np
-    states, times = xp.asarray(trajectory.states), xp.asarray(trajectory.times)
+def transition_rows(states: ArrayLike, times: ArrayLike, log_probs: ArrayLike, stochastic: ArrayLike,
+                    advantages: ArrayLike, *, selected: int | None = None, trains: ArrayLike | None = None
+                    ) -> Batch:
+    """A walk's transitions (a `FlowTrajectory`'s parts) as the flow objective trains on them
+    (`FlowGRPOObjective`; the one layout, a rollout's (`FlowRollout`) and a caller's alike, row 9694): its
+    first `selected` transitions (every one where None), each row's states and the states they step to,
+    both endpoints' times, its walk's grid points (`rollout_steps`), its recorded log densities, which
+    transitions train (`trains`, the walk's stochastic ones where None) and each row's advantage. In NumPy
+    over a walk on the host, in JAX over one on the devices or traced."""
+    xp = np if isinstance(states, np.ndarray) else jnp
+    states, times = xp.asarray(states), xp.asarray(times)
     count, points = states.shape[:2]
-    selected = points - 1 if selected is None else selected
-    shape = (count, selected)
-    return {"latents": states[:, :selected], "next_latents": states[:, 1:selected + 1],
-            "timesteps": xp.broadcast_to(times[:selected], shape),
-            "next_timesteps": xp.broadcast_to(times[1:selected + 1], shape),
+    taken = points - 1 if selected is None else selected
+    shape = (count, taken)
+    return {"latents": states[:, :taken], "next_latents": states[:, 1:taken + 1],
+            "timesteps": xp.broadcast_to(times[:taken], shape),
+            "next_timesteps": xp.broadcast_to(times[1:taken + 1], shape),
             "rollout_steps": xp.full(shape[:1], points, xp.int32),
-            OLD_LOG_PROBS_KEY: xp.asarray(trajectory.log_probs)[:, :selected],
-            "transition_mask": xp.asarray(trajectory.stochastic)[:, :selected] if trains is None
-            else xp.asarray(trains),
+            OLD_LOG_PROBS_KEY: xp.asarray(log_probs)[:, :taken],
+            "transition_mask": xp.asarray(stochastic)[:, :taken] if trains is None else xp.asarray(trains),
             ADVANTAGES_KEY: xp.asarray(advantages)}
 
 

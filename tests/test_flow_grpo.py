@@ -175,7 +175,8 @@ def recorded_and_rescored(walk, rescore, variables):
 def trajectory_batch(trajectory, advantages, mask=None):
     """`trajectory`'s every transition as the flow objective trains on it (`transition_rows`), `mask` the
     transitions that train where given."""
-    return transition_rows(trajectory, advantages, trains=mask)
+    return transition_rows(trajectory.states, trajectory.times, trajectory.log_probs, trajectory.stochastic,
+                           advantages, trains=mask)
 
 
 @pytest.mark.parametrize("prediction", ["clean", "v"])
