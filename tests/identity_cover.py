@@ -3,6 +3,12 @@
 target, held to their reach by `test_the_identity_tests_cover_is_its_targets_reach`, whose message
 regenerates them."""
 
+COVER_PRECISION = "highest"
+"""The matmul precision the cover is derived and its shards lowered at (`jax.default_matmul_precision`): the
+suite's lane's (tests/lane_environment.py), which an fp32 call's rounding reads (`precision.rounds_products`:
+at the default, lightning attention's fp32 forward rounds as its bf16 one, and sm100's cover is a group
+fewer), held whatever a run's environment sets."""
+
 IDENTITY_COVER = {
     'sm90': ('qwen3.5-27b-gdn-bfloat16-forward', 'qwen3.5-27b-gdn-bfloat16-forward-variant-0',
              'qwen3.5-27b-gdn-bfloat16-training', 'qwen3.5-27b-gdn-bfloat16-training-variant-two roles',
