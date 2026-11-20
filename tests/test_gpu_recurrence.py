@@ -312,7 +312,8 @@ def port_training_cells() -> list[Cell]:
 
 TURNED_TAKEN = ("sm90", "sm100")
 """The generations whose template takes a turned state's forked training (jsf-turnroute at main 079c0949c:
-an sm80's refuses its fast backward, `mainloop_backward.fast_backward_form`'s, under either precision)."""
+an sm80's refuses it at its backward's eligibility, `template.Mosaic.trains`, under either precision; an
+sm90's and an sm100's take it)."""
 
 
 def forked_cells() -> list[Cell]:
