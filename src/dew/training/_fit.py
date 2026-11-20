@@ -778,8 +778,10 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     """The training stream's next batch, its wait counted in `interval`, or None where it has run out
     on every process, which ends the run as its length would. Where `agree` (`FitRun.agrees`), the
     read is agreed (`agreed_next`): one that fails, or runs out on some processes only, stops every
-    process, as does a stream with no batch for a run at step 0. A batch read ahead (`FitRun.ahead`) is
-    this read's. Where `peek`, an agreed read of the stream's first batch as its source gives it, on
+    process. A stream with no batch at all ends its run where it starts, as its length would, its final
+    checkpoint written (row 9068: refused at step 0), where its start declares all it builds; one whose
+    start reads its input off a batch is refused there (`first_batch`). A batch read ahead (`FitRun.ahead`)
+    is this read's. Where `peek`, an agreed read of the stream's first batch as its source gives it, on
     the host, placed at the run's first read (`DevicePrefetchIterator.peek`)."""
     if run.ahead is not None:
         (batch,), run.ahead = run.ahead, None
@@ -794,8 +796,6 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
         else:
             batch = agreed_next(phase, stream) if agree or peek else run.read()
         interval.waited += time.perf_counter() - asked
-    if batch is None and not run.current:
-        raise ValueError("the training data holds no batch to train on")
     return batch
 
 
