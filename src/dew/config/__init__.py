@@ -1642,7 +1642,9 @@ class RunConfig:
         resumed: dict[str, Mapping[str, object]] = {}
 
         def check_resumed() -> None:
-            if checkpoints.resumed(resume) is not None and (
+            from dew.training.startup import resumed_step
+
+            if resumed_step(built, resume) is not None and (
                     record := self._saved_record(checkpoints.directory, checkpoints)) is not None:
                 self.check_resume(record)
                 resumed["record"] = record

@@ -1246,12 +1246,13 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
 
     from dew.data.dataset import DataPartition
     from dew.training._fit import data_resumed, first_batch
+    from dew.training.startup import resumed_step
 
     trainer._declare_input(lambda: first_batch(loader, trainer._stream_partition()))
     trainer.reading(loader, examples=examples, steps=steps)
     trainer.validate(steps=steps)
     checkpoints = trainer.checkpoints
-    resumed = None if checkpoints is None else checkpoints.resumed(resume)
+    resumed = resumed_step(trainer, resume)
     if resumed is not None and steps is not None and resumed >= steps:
         raise ValueError(f"the run is complete at step {resumed}, its last checkpoint written, so it has no "
                          "step to take")

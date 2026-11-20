@@ -460,10 +460,9 @@ def test_older_kept_steps_hold_their_model_alone_and_the_latest_resumes(tmp_path
 
 def test_a_directory_holding_only_a_model_alone_is_no_fresh_runs(tmp_path):
     """A directory whose committed steps hold their model alone (`Keep(weights_only=True)`), none of them a
-    step a resume reads, is occupied: a fresh run there, asked (`resume="never"`) or chosen (`"auto"`) where
-    the step is another run's (`unrelated`), is refused, as one beside a run's steps is, never started
-    beside them (row 9019: read as empty, a fresh run wrote its steps among them); the run's own starts
-    afresh under "auto"; one that must continue (`"require"`) finds none to continue."""
+    step a resume reads, is occupied: a fresh run asked there (`resume="never"`) is refused, as one beside a
+    run's steps is (row 9019: read as empty); one that must continue (`"require"`) finds none to continue;
+    "auto" starts afresh, a trainer refusing it where the model is another run's (`resumed_step`)."""
     state = trainer(tmp_path / 'run').initial_state()
     held = tmp_path / 'held'
     written = Checkpoints(str(held))
@@ -471,12 +470,10 @@ def test_a_directory_holding_only_a_model_alone_is_no_fresh_runs(tmp_path):
     written.wait()
     assert _items(held, 2) == ['model']
     alone = Checkpoints(str(held))
-    assert alone.latest is None and alone.resumed("auto", unrelated=lambda step: False) is None
+    assert alone.latest is None and alone.resumed("auto") is None
     for resume in ("never", "require"):
         with pytest.raises(ValueError):
             alone.resumed(resume)
-    with pytest.raises(ValueError):
-        alone.resumed("auto", unrelated=lambda step: step == 2)
 
 def saved_twice(directory, keep: Keep):
     """A run under `keep` with its fit's step 1 and a save of step 2 landed, and the state it saved."""
