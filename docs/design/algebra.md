@@ -157,7 +157,9 @@ glue is (ยง6.2), reorderings over its values held by the dominance rule alone (ย
     is zero where the magnitude keeps its bits), nor for a complex value; an exponential's logarithm is the
     stable set's (log space, below), and a logarithm's exponential holds only over a sign and a range. None of
     these is built;
-  - **reuse** (`reuse`, compile time and dev time, `reorders`; row 9035): a value the forward already
+  - **reuse** (`reuse`, `reorders`, row 9035; dev time until its receipt is measured, row 9777: of the nine
+    perf-gate steps compiled ahead for an H100 it changes finetune-4b's program alone, whose timing with and
+    without it is M-DC-14's; compile time once measured): a value the forward already
     computed. An equal term is one e-class and extraction prices a shared one once, so a value written twice is
     read once without a rule. The rules relate a new value to another the program holds: a quotient by a value
     whose reciprocal it holds, `a / y` as `a (1/y)`, and by a root whose reciprocal root it holds, `a /
@@ -698,7 +700,7 @@ class RuleFamily:
 
 @dataclass(frozen=True)
 class Rules:
-    name: str                                # "identities", "contracted", "stable", "linear", "joined"
+    name: str                                # "identities", "contracted", "stable", "reuse", "linear", "joined"
     rounding: Literal["exact", "reorders", "bounded"]   # the rounding class each of its rewrites gives
     ruleset: egglog.Ruleset                  # its families' rules (`Rules.declared`)
     receipt: str                             # the measurement it ships with: a ledger row and its receipts
@@ -1284,10 +1286,10 @@ each joins `DECLARATIONS` when one of its forms is generated rather than traced.
 ```python
 @dataclass(frozen=True)
 class Generated:
-    declaration: str                  # the declaring module and name
+    declarations: tuple[str, ...]     # the declaring module's declarations it holds, each module and name
     module: str                       # the generated module, beside the declaring one: *_derived.py
-    tests: str                        # its gate sites and stability suite
-    rules: tuple[str, ...]            # the rule sets and their receipts
+    tests: str                        # the one suite that holds every generated module (`TESTS`)
+    rules: tuple[str, ...]            # the rule sets it was saturated with
     egglog: str                       # the pinned version
 
 @dataclass(frozen=True)
