@@ -132,6 +132,12 @@ class Hooks:
     readout 'apart' reads none of them: its scores keep the pairs of later tokens alone (`i // R > j //
     R`, `mamba3_mimo_fwd.py`)."""
     turns: int = 0
+    substeps: int = 1
+    """The delta rule's updates a token takes in turn (DeltaProduct's, fla's `chunk_gated_delta_product`): its
+    keys, values and write gates `substeps` of each a token, the chunked op's laid in turn (`[B, S m, ...]`)
+    and a decode token's on an axis of their own (`[rows, m, ...]`), its decay taken before the first and its
+    query read after the last (the readout's row selector, kernel-templates.md §5); its queries and decays a
+    token's."""
 
     @property
     def inverse_bound(self) -> float | None:
@@ -180,6 +186,12 @@ class Hooks:
             raise ValueError('the gates form one log decay a head: their decay is scalar')
         if self.rated and (self.decay != 'scalar' or self.gates is not None):
             raise ValueError('a rated decay is one a head without the gates, which rate their own')
+        if self.substeps < 1 or (self.substeps > 1 and (
+                not self.delta or self.reads != 'after' or self.ranks > 1 or self.own_weight or self.turns
+                or self.gates is not None or self.skip or self.conv is not None)):
+            raise ValueError(f"a token's delta-rule updates are one or more, more read after the last, its "
+                             f"decay a given log decay's, without ranks, turns, an own write's weight, a "
+                             f"skip or a conv: not {self.substeps} under {self}")
         if self.turns < 0 or (self.turns and (self.delta or self.own_weight or self.rated
                                               or self.decay != 'scalar' or self.reads == 'before')):
             raise ValueError(f"a state turns its key pairs under a decay a head's, unrated, without the "
@@ -532,12 +544,16 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     operand = given['token' if hooks.conv is not None else 'value'].dtype
     work = at_least_fp32(jnp.promote_types(operand, state.dtype))
     key_width = state.shape[2]
-    query, key, value, history = _prologue(hooks, given, work)
-    decay, write = _gates(hooks, given, work, key_width)
-    own = given['own'].astype(work) if hooks.own_weight else None
-    turn = given['turn'].astype(work) if hooks.turns else None
-    out, updated = update(state.astype(work), query, key, value, decay, write[..., None], delta=hooks.delta,
-                          reads=hooks.reads, own=own, turn=turn)
+    if hooks.substeps > 1:
+        out, key, value, updated = _substeps(hooks, given, work)
+        history = None
+    else:
+        query, key, value, history = _prologue(hooks, given, work)
+        decay, write = _gates(hooks, given, work, key_width)
+        own = given['own'].astype(work) if hooks.own_weight else None
+        turn = given['turn'].astype(work) if hooks.turns else None
+        out, updated = update(state.astype(work), query, key, value, decay, write[..., None],
+                              delta=hooks.delta, reads=hooks.reads, own=own, turn=turn)
     out = normed(hooks, skipped(hooks, out, value, given, work), given, work)
     held = _held(updated, key, value, state.dtype)
     if operands.active is not None:
@@ -547,6 +563,23 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
         if history is not None:
             history = jnp.where(active[:, None, None], history, given['held'])
     return out.astype(operand if dtype is None else dtype), history, held
+
+
+def _substeps(hooks: Hooks, given: dict, work):
+    """A decode token's `hooks.substeps` delta-rule updates in turn (`Hooks.substeps`, DeltaProduct's) in
+    `work`, the state held there between them: each update's keys, values and write gates `given`'s at its
+    substep, its decay before the first alone. `(output, last keys, last values, state)`, the output the
+    state after the last read by the query."""
+    state = given['state'].astype(work)
+    for substep in range(hooks.substeps):
+        taken = {**given, **{name: given[name][:, substep] for name in ('key', 'value', 'beta')
+                             if name in given}}
+        if substep and 'log_decay' in given:
+            taken['log_decay'] = jnp.zeros_like(given['log_decay'])
+        query, key, value, _ = _prologue(hooks, taken, work)
+        decay, write = _gates(hooks, taken, work, state.shape[2])
+        out, state = update(state, query, key, value, decay, write[..., None], delta=True, reads='after')
+    return out, key, value, state
 
 
 def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
@@ -598,8 +631,10 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
             {name: value for name, value in values.items() if name not in rows})
         return (dataclasses.replace(pulled_operands, **inputs, **formed),)
 
-    # The template's decode step turns no state (`Hooks.turns`): a turned token's launch is the reference.
-    launched = functools.partial(step_reference if hooks.turns else _launched, hooks, dtype=dtype)
+    # The template's decode step turns no state (`Hooks.turns`) and takes one update a token
+    # (`Hooks.substeps`): a turned or substepped token's launch is the reference.
+    launched = functools.partial(step_reference if hooks.turns or hooks.substeps > 1 else _launched, hooks,
+                                 dtype=dtype)
     return contracted("test_the_decode_step_holds_every_order")(
         linear_tangent(lambda operands: (launched(operands), ()), pulled, portable,
                        kind=KernelGlue()))(operands)

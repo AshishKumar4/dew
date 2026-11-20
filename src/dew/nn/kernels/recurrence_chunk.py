@@ -173,6 +173,13 @@ def _read_checked(hooks: recurrence.Hooks, operands: Chunk) -> dict:
     if 'log_decay' in given and given['log_decay'].ndim != ranks[hooks.decay]:
         raise ValueError(f"a {hooks.decay} decay is {ranks[hooks.decay]}-dimensional, [B, S, Hv"
                          f"{', Dk' * (hooks.decay == 'vector')}], not {given['log_decay'].shape}")
+    tokens = given['query'].shape[1]
+    stepped = {name: given[name].shape[1] for name in ('key', 'value', 'beta') if name in given}
+    held = {name: given[name].shape[1] for name in ('log_decay',) if name in given}
+    if any(length != tokens * hooks.substeps for length in stepped.values()) or any(
+            length != tokens for length in held.values()):
+        raise ValueError(f"{tokens} tokens of {hooks.substeps} updates each take keys, values and write "
+                         f"gates of {tokens * hooks.substeps} and a decay of {tokens}, not {stepped | held}")
     return given
 
 
@@ -210,9 +217,11 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         query, key = (l2norm(x.astype(work)).astype(x.dtype) for x in (query, key))
     scale = (key.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
     g, beta = recurrence.log_gates(hooks, given, work)
+    state, starts, firsts = operands.state, operands.starts, operands.firsts
+    if hooks.substeps > 1:
+        query, g, starts, firsts = _substeps_laid(hooks.substeps, query, g, starts, firsts)
     g = jnp.zeros(value.shape[:3], work) if g is None else g
     beta = jnp.ones(value.shape[:3], work) if beta is None else beta
-    state, starts, firsts = operands.state, operands.starts, operands.firsts
     forked = None
     if operands.loads is not None:
         forked = Forked.of(operands, starts, firsts, work)
@@ -289,8 +298,23 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         out, final = _per_product(GATED_DELTA.bound(product_kernel), run, query, key, value, g, beta, skip,
                                   state, starts, firsts, given.get('turn'),
                                   *(() if forked is None else forked.walked), parameters=(5,))
-    # The epilogue in the working precision, and the output rounded once.
+    # A token's output its last update's (`Hooks.substeps`), the epilogue in the working precision, and the
+    # output rounded once.
+    out = out[:, hooks.substeps - 1::hooks.substeps]
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
+
+
+def _substeps_laid(substeps: int, query, g, starts, firsts):
+    """A call of `substeps` delta-rule updates a token (`Hooks.substeps`, DeltaProduct's) as the op's tokens,
+    its keys', values' and write gates' own in turn: each token's query on its last update (zeros on the
+    others, whose outputs the op drops) and its decay on its first (zeros, no decay, on the others), a packed
+    document from its first token's first update; fla's `chunk_gated_delta_product`'s layout."""
+    def spread(x, at: int):
+        laid = jnp.zeros((x.shape[0], x.shape[1], substeps, *x.shape[2:]), x.dtype).at[:, :, at].set(x)
+        return laid.reshape(x.shape[0], x.shape[1] * substeps, *x.shape[2:])
+
+    return (spread(query, -1), None if g is None else spread(g, 0),
+            None if starts is None else spread(starts, 0), None if firsts is None else firsts * substeps)
 
 
 @dataclasses.dataclass(frozen=True)
