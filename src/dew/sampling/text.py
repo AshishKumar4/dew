@@ -563,8 +563,10 @@ def refuse_closed_holes(model: nn.Module, real: np.ndarray, closing: str) -> Non
     token a row at a time (`DrawsAlone`), whose state steps by its tokens' adjacency, a hole breaking it,
     where `closing` (a LongRoPE rebuild's replay, `_rebuilt`; a server's prefill) reads the row's ids with
     its holes closed."""
+    if not isinstance(model, DrawsAlone):
+        return
     held = np.cumsum(real, axis=1) > 0
-    if isinstance(model, DrawsAlone) and np.any(real[:, 1:] & ~real[:, :-1] & held[:, :-1]):
+    if np.any(real[:, 1:] & ~real[:, :-1] & held[:, :-1]):
         raise ValueError(f"{closing} reads a row's ids with its holes closed, and {model.draws_alone}: a "
                          "prompt with a hole between its real tokens is refused")
 
