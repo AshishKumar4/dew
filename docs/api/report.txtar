@@ -622,7 +622,6 @@ dew.config.trainer.TrainerConfig
   mesh: MeshSpec = dew.distributed.placement.MeshSpec()
   microbatches: int | None = None
   layout: Annotated[Layout, tyro.conf.subcommand('layout')] | None = None
-  layout_unsettable: Annotated[bool, tyro.conf.Suppress] = True
   profile: ProfileWindow | None = None
   run_profile: RunProfile | None = dew.training.profiling.RunProfile()
   compilation_cache_dir: str | None = None
