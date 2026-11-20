@@ -39,7 +39,7 @@ from jax.typing import DTypeLike
 
 from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted
-from dew.nn.float_bits import binade_of, raised_exactly
+from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import bodies
 from dew.nn.precision import (
@@ -1370,36 +1370,51 @@ def mean_held(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
 
 
 def narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
-    """`out`, the sums `acc` over `divisor` (fp32), as their quotient rounded to odd where it narrows to the
-    16-bit `dtype`: the quotient rounded to nearest, and where that lands exactly between two values of
-    `dtype` (`_between`) and is not the exact quotient, one fp32 ulp toward it, so the narrowing rounds once
-    as the exact quotient would: the exact output 65519.9995 of one kept key of 65504 rounded to fp32's
-    65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544). The side is the sign of
-    `acc` less the quotient times `divisor`, both exact (`two_product`'s bit split, no splitter to pass fp32's
-    largest at bf16's midpoint; `acc` less the product's rounded part exact by Sterbenz, the two within a
-    factor of two). `out` as it is where the quotient is not within its ulp of it (a held, guarded or
-    flushed one: `quotient`). The bound left at fp32's resolution, as the fp32 reference's: `divisor` is
-    the one rounded (a dropping call's total times its multiplier's rest, `dropped_total`), and the sums
-    and exponentials before it round as the reference's do, so an exact output within their rounding of
-    a boundary may narrow past it. Its derivative is `out`'s: the nudge is no function a derivative reads
-    (an empty row's quotient of a zero divisor took NaN through it)."""
-    value, acc = jax.lax.stop_gradient(out), jax.lax.stop_gradient(acc)
+    """`out`, the sums `acc` over `divisor` as the finish formed it (fp32; a recovered subnormal's bits,
+    `attention_algebra.quotient`), rounded to odd where it narrows to the 16-bit `dtype`: where it lands
+    exactly between two values of `dtype` (`_between`) and is not the exact quotient, one fp32 ulp toward it,
+    so the narrowing rounds once as the exact quotient would: the exact output 65519.9995 of one kept key of
+    65504 rounded to fp32's 65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544).
+    The side is the sign of `acc` less `out` times `divisor`, exact (`_remainder_sign`). A finite `out` over
+    a positive divisor alone; any other, a held one (its dtype's largest, no tie) and a guarded zero as
+    they are, selected, no arithmetic on them (an infinite one's difference from itself NaN; a subnormal's
+    sum with zero flushed on XLA's CPU). Its derivative is `out`'s, a nudged entry's none. The bound left at
+    fp32's resolution, as the fp32 reference's: `divisor` is the one rounded (a dropping call's total times
+    its multiplier's rest, `dropped_total`), and the sums and exponentials before it round as the
+    reference's do, so an exact output within their rounding of a boundary may narrow past it."""
+    value = jax.lax.stop_gradient(out)
+    if value.dtype != jnp.float32:
+        return out
+    acc = jax.lax.stop_gradient(acc)
     divisor = jax.lax.stop_gradient(jax.lax.broadcast_in_dim(divisor, acc.shape, tuple(range(divisor.ndim))))
-    rounded = acc / divisor
-    # Scaled by 2^64 where small, exactly, so the product's error term stays normal: unscaled, a quotient
-    # near fp32's least normal over a divisor near 1 lost it below the least normal to the flush.
-    lift = jnp.where(jnp.abs(rounded) < np.float32(2.0 ** -60), np.float32(2.0 ** 64), np.float32(1.0))
-    high, low = two_product(rounded * lift, divisor, bit_split=True)
-    above = (acc * lift - high) - low
-    bits = jax.lax.bitcast_convert_type(rounded, jnp.int32)
+    above = _remainder_sign(acc, value, divisor)
+    bits = jax.lax.bitcast_convert_type(value, jnp.int32)
     # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side.
-    toward = jnp.where((above > 0) == (rounded > 0), 1, -1).astype(jnp.int32)
+    toward = jnp.where((above > 0) == (value > 0), 1, -1).astype(jnp.int32)
     odd = jax.lax.bitcast_convert_type(bits + toward, jnp.float32)
-    settled = jnp.where(_between(bits, dtype) & (above != 0), odd, rounded)
-    close = jnp.abs(value - rounded) <= jnp.abs(rounded) * np.float32(2.0 ** -23)
-    # The nudged value with `out`'s derivative: `out` less its own value is zero, where the nudge itself, an
-    # fp32 ulp at fp32's least normal, is subnormal, which XLA's CPU flushes (row 4023).
-    return jnp.where(close, settled, value) + (out - value)
+    nudged = (_between(bits, dtype) & (above != 0) & jnp.isfinite(value) & jnp.isfinite(acc)
+              & (divisor > 0))
+    return jnp.where(nudged, odd, out)
+
+
+def _remainder_sign(acc: jax.Array, quotient: jax.Array, divisor: jax.Array) -> jax.Array:
+    """A value of the sign of `acc - quotient * divisor` (fp32, finite), exact: `quotient` and `divisor` each
+    normalized to [1, 2) from its bits (`float_bits.binade_of`, raised or lowered exactly, a subnormal's
+    too), so their product's rounding and its residual (`two_product`'s bit split) are normal, and `acc`
+    taken by the same powers of two, which leaves it near the product where the quotient is near
+    `acc / divisor`: no operand or residual passes fp32's range or flushes, at bf16's midpoint over a
+    divisor near 2^126 as at a quotient near fp32's least normal."""
+    def normalized(x):
+        binade = binade_of(x)
+        return jnp.where(binade < 0, raised_exactly(x, jnp.maximum(-binade, 0)),
+                         lowered_rounded(x, jnp.maximum(binade, 0))), binade
+
+    (quotient, at), (divisor, by) = normalized(quotient), normalized(divisor)
+    high, low = two_product(quotient, divisor, bit_split=True)
+    shift = at + by
+    taken = jnp.where(shift < 0, raised_exactly(acc, jnp.maximum(-shift, 0)),
+                      lowered_rounded(acc, jnp.maximum(shift, 0)))
+    return (taken - high) - low
 
 
 def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:

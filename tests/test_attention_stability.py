@@ -1301,7 +1301,9 @@ def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
     narrow = jnp.dtype(dtype)
     rng = np.random.default_rng([9544, len(dtype)])
     ties = np.asarray(NARROWING_TIES[dtype], np.float64)
-    divisors = np.float32(np.ldexp(1 + rng.random(64), rng.integers(-6, 7, 64)))
+    # Drawn divisors and one just below 1, whose tie's product rounds so the quotient lies off it.
+    divisors = np.append(np.float32(np.ldexp(1 + rng.random(64), rng.integers(-6, 7, 64))),
+                         np.float32(1 - 2.0 ** -24))
     tie, divisor = (np.ravel(x) for x in np.meshgrid(ties, divisors, indexing="ij"))
     divisor = divisor.astype(np.float32)
     centre = np.float32(tie * divisor)

@@ -1940,11 +1940,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
         state = state._replace(acc=acc, total=total)
         out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
                        held=jnp.float32 if held else spec.largest)
-        # Narrowed as it is: a hook reads the fp32 quotient unsettled. A register epilogue (a Mosaic
-        # forward's tile, `Forward.registered`) settles the overflow midpoint alone, at a row's cost.
-        if spec.narrowed is not None and output_mod is None:
-            settle = midpoint_settled if spec.registered else narrowing_settled
-            out = settle(out, state.acc, state.total, spec.narrowed)
+        out = settled_store(spec, out, state.acc, state.total, hooked=output_mod is not None)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
@@ -1972,18 +1968,37 @@ def midpoint_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: 
     whose narrowing turns a finite output to inf), at a row's cost, where a whole tile's settle costs
     registers: a Mosaic forward's epilogue settling its tile per element took an H100's bf16 forward to
     168 registers and a 328-byte frame, an sm120's 128-wide inference forward 16 bytes spilled. The exact
-    quotient is below the midpoint where `|acc|` is below the midpoint times `divisor`, that product formed
-    exact once a row (`two_product`'s bit split, range-safe at bf16's midpoint), `|acc|` less its rounded
-    part exact beside it; there `out` an fp32 ulp nearer zero, which narrows to the largest. Every other
-    value `out` as it is: a narrowing in the kernel rounds an ordinary tie twice, its bound with its sums'
-    and exponentials' roundings at fp32's resolution (`narrowing_settled`)."""
+    quotient is below the midpoint where `|acc|` is below the midpoint times `divisor`: the row's divisor
+    taken to [1/2, 1) by a power of two from its bits, exactly, the midpoint's product with it formed exact
+    once a row (`two_product`'s bit split, its residual normal however small the divisor, its rounded part
+    within fp32's range at bf16's midpoint), and `|acc|` taken by the same power, an element's one product,
+    exact where it is near the midpoint's; there `out` an fp32 ulp nearer zero, which narrows to the
+    largest. Every other value `out` as it is: a narrowing in the kernel rounds an ordinary tie twice, its
+    bound with its sums' and exponentials' roundings at fp32's resolution (`narrowing_settled`)."""
     found = jnp.finfo(dtype)
     midpoint = np.float32(float(found.max) + float(found.eps) * 2.0 ** (found.maxexp - 2))
     nearer = np.nextafter(midpoint, np.float32(0.0))
-    high, low = two_product(divisor, jnp.full_like(divisor, midpoint), bit_split=True)
-    below = (jnp.abs(acc) - expand(high, acc)) < expand(low, acc)
+    # 2^-(binade + 1) a row from its exponent's bits (a normal divisor's; one past fp32's range is no
+    # midpoint's, its product passing fp32's largest).
+    power = jax.lax.bitcast_convert_type(
+        jnp.left_shift(jnp.clip(126 - binade_of(divisor), 1, 254), 23).astype(jnp.int32), jnp.float32)
+    high, low = two_product(divisor * power, jnp.full_like(divisor, midpoint), bit_split=True)
+    below = (jnp.abs(acc) * expand(power, acc) - expand(high, acc)) < expand(low, acc)
     within = (jnp.abs(out) == midpoint) & below
     return jnp.where(within, jnp.where(out > 0, nearer, -nearer), out)
+
+
+def settled_store(spec: Forward, out: jax.Array, acc: jax.Array, divisor: jax.Array, *,
+                  hooked: bool) -> jax.Array:
+    """A finished quotient `out` of `acc` over `divisor` as its call stores it: where it narrows to 16 bits
+    (`Forward.narrowed`) unhooked (a hook reads the fp32 quotient as it is), settled for its narrowing,
+    the overflow midpoint alone in a register epilogue (`Forward.registered`, `midpoint_settled`), else
+    rounded to odd (`narrowing_settled`). The one policy `finish` and the Mosaic forward's split join
+    take."""
+    if spec.narrowed is None or hooked:
+        return out
+    settle = midpoint_settled if spec.registered else narrowing_settled
+    return settle(out, acc, divisor, spec.narrowed)
 
 
 def inverse(total: jax.Array) -> jax.Array:

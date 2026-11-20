@@ -665,14 +665,14 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                else kept(split.own, anchor_multipliers(hooks.drop, anchors), form.units))
         acc = algebra.split_output(split.others, own, value_rows)
         # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`), a dropping
-        # call's over the rest of its multiplier too, in the one division (`algebra.dropped_total`), rounded
-        # to odd where a 16-bit output narrows it unhooked (`algebra.narrowing_settled`), in XLA.
+        # call's over the rest of its multiplier too, in the one division (`algebra.dropped_total`), stored as
+        # the finish stores it (`algebra.settled_store`), in XLA.
         total = rows[1] if not form.headroom else power2(rows[1], -split.shift, reach=TWO_FACTOR_REACH)
         dropped, divisor = algebra.dropped_total(form, acc, total)
         out = algebra.output_of(dropped, divisor, guarded=form.guarded or hooks.initial is not None,
                                 held=form.largest)
-        if (narrowed := algebra.narrowed_of(q.dtype)) is not None and hooks.output_mod is None:
-            out = algebra.narrowing_settled(out, dropped, divisor, narrowed)
+        stored = dataclasses.replace(form, narrowed=algebra.narrowed_of(q.dtype), registered=False)
+        out = algebra.settled_store(stored, out, dropped, divisor, hooked=hooks.output_mod is not None)
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None
 
