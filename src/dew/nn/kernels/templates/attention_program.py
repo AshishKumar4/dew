@@ -40,7 +40,7 @@ def finished(spec: algebra.Forward, walked, rows: Callable[[jax.Array], jax.Arra
     """A program's outputs from its walk (`walk`): the normalized output, its rows' maximum and denominator
     (`algebra.finish`), and with `training` its anchor keys and split sums and their rows' shift
     (`algebra.split_residuals`)."""
-    state = algebra.joined(walked, rows) if training else walked
+    state = algebra.joined(walked, rows, spec.units) if training else walked
     out, m, denominator = algebra.finish(spec, state, initial=resumed is not None, output_mod=output_mod,
                                          output_params=output_params)
     if not training:

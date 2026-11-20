@@ -887,7 +887,7 @@ DROPPING_FORWARDS = [(call, training, jnp.bfloat16) for call in CALLS
 DROPPING_FORWARDS += [("causal", training, jnp.float16)
                       for training in (template.Kept.NONE, template.Kept.SPLIT)]
 """The dropping forward's cases: each call form, plain and training, over bf16; over fp16 a causal call's,
-whose dropped weights narrow as they are (`algebra.dropped_parts`), the walk bf16's otherwise."""
+whose kept weights narrow as they are (`attention.kept`), the walk bf16's otherwise."""
 
 
 @ON_EACH_FAMILY
@@ -897,8 +897,8 @@ whose dropped weights narrow as they are (`algebra.dropped_parts`), the walk bf1
                               for call, training, dtype in DROPPING_FORWARDS])
 def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
     """The forward and the training forward under probability dropout, its draw the reference's bit for bit
-    (`template.Draw`), over bf16 or fp16 operands, fp16's dropped weights narrowed as they are and summed in
-    place (`algebra.dropped_parts`), under the interpreter."""
+    (`template.Draw`), over bf16 or fp16 operands, the kept weights narrowed exact and summed in place, the
+    draw's multiplier the output's (`attention.kept`, `Forward.dropped`), under the interpreter."""
     _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True, training=training,
                    drop=True)
 
@@ -1041,7 +1041,7 @@ def test_a_deciding_forward_whose_finite_sums_cancelled_walks_scaled_interpreted
 def test_the_backward_is_on_par_dropping_interpreted(form, dtype):
     """The backward in each form under probability dropout over a causal call, the fast form's one launch
     too (each consumer's tile its own draw), its D the forward's dropped split sums' about the anchor's
-    value as its draw keeps it (`algebra.anchor_multipliers`), under the interpreter; over fp16 operands at
+    value as its draw keeps it (`attention.anchor_multipliers`), under the interpreter; over fp16 operands at
     its derivation's tiles."""
     _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True, dtype=dtype)
 

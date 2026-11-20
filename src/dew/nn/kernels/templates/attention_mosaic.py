@@ -572,7 +572,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # bit the scaled walk's there.
         may = algebra.may_scale(product.joined(value, self.parts), keys_axis=1,
                                 initial=None if initial is None else initial.acc,
-                                amplified=1.0 if drop is None else drop.bound)
+                                amplified=1.0 if drop is None else drop.reach)
         arguments = (query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
                      drop, table, sources, scales, query_params)
 
