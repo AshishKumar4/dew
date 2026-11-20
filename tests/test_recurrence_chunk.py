@@ -179,7 +179,8 @@ memory entering and a document starting on a chunk's first token."""
 
 
 PACKED_DOCUMENTS = ((0, 23, 40), (9, 48))
-"""`draw`'s packed documents: each row's documents' first tokens."""
+"""`draw`'s packed documents, the turned and transition sites' too: each row's documents' first tokens, a
+row's first continuing its given memory."""
 
 
 def marked(documents, length: int) -> np.ndarray:
@@ -393,18 +394,14 @@ and angles to bf16 (mamba_ssm/ops/triton/mamba3/mamba3_siso_combined.py:384-392)
 layer sites are held to it recorded (row 7923)."""
 
 
-TURNED_DOCUMENTS = ((0, 23, 40), (9, 48))
-"""The turned sites' packed documents' first tokens: a row's first continuing its given memory."""
-
-
 def steep_draw(seed: int):
-    """`draw`'s operands for `TURNED` and cotangents, each row's even documents (`TURNED_DOCUMENTS`) decaying
+    """`draw`'s operands for `TURNED` and cotangents, each row's even documents (`PACKED_DOCUMENTS`) decaying
     steeply, each token's log decay in (-120, -60), its others mildly, in (-1, 0): a chunk's earlier
     document's prefix past its later one's by more than fp32's exponents span."""
     (operands,) = draw(TURNED, packed=False, seed=seed)
     tokens = np.arange(LENGTH)
     steep = np.stack([np.sum(tokens[:, None] >= np.asarray(begins)[None, :], axis=1) % 2 == 1
-                      for begins in TURNED_DOCUMENTS])
+                      for begins in PACKED_DOCUMENTS])
     rng = np.random.default_rng([seed, 8288])
     mild = rng.uniform(-1.0, 0.0, operands.log_decay.shape)
     log_decay = np.where(steep[..., None], rng.uniform(-120.0, -60.0, operands.log_decay.shape), mild)
@@ -414,7 +411,7 @@ def steep_draw(seed: int):
 
 VANISHED = (5, 9, 30, 33)
 """The tokens whose decays vanish in `vanishing`'s draws: two in one chunk of each row's first two
-documents (`TURNED_DOCUMENTS`, `CHUNK`)."""
+documents (`PACKED_DOCUMENTS`, `CHUNK`)."""
 
 
 def vanishing(operands):
@@ -457,7 +454,7 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
         return operands, cotangents(operands, seed)
 
     drawing = {None: drawn, 'steep': steep_draw, 'vanishing': vanishing_draw}[regime]
-    assert_packed_on_par(turned, tokens, drawing, f'{TURNED}', packed=packed, documents=TURNED_DOCUMENTS,
+    assert_packed_on_par(turned, tokens, drawing, f'{TURNED}', packed=packed, documents=PACKED_DOCUMENTS,
                          length=LENGTH, seeds=32)
 
 
@@ -604,7 +601,7 @@ def test_a_transitions_chunks_are_as_exact_as_its_tokens(hooks, packed):
         return token_by_token(hooks, dataclasses.replace(operands, starts=starts))
 
     assert_packed_on_par(ours, tokens, functools.partial(transition_draw, hooks), f'{hooks}', packed=packed,
-                         documents=TURNED_DOCUMENTS, length=LENGTH, seeds=8)
+                         documents=PACKED_DOCUMENTS, length=LENGTH, seeds=8)
 
 
 def transition_token(kind: str, state, query, key, value, log_decay, beta, a, b, e):
