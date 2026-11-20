@@ -1441,9 +1441,9 @@ def test_an_aligned_sums_subnormal_direction_widens_exactly():
 def test_aligned_cotangents_are_the_aligned_sums_vjp(axis):
     """`aligned.aligned_cotangents` of an entry write's three-factor term (a weight near 2^60, keys and
     values) and a two-factor term of factors of their own, elementwise and summed along an axis: each
-    factor's cotangent bit for bit what `jax.vjp` of `aligned_sum` gives it, compiled, so a backward that
-    takes no autodiff (a Pallas TPU kernel's) forms an aligned sum's transpose as its reverse mode does (row
-    8666)."""
+    distinct factor's cotangent bit for bit what `jax.vjp` of `aligned_sum` gives it, compiled, so a
+    backward that takes no autodiff (a Pallas TPU kernel's) forms an aligned sum's transpose as its reverse
+    mode does (row 8666)."""
     from dew.nn.aligned import aligned_cotangents
 
     rng = np.random.default_rng(8666)
@@ -1461,9 +1461,29 @@ def test_aligned_cotangents_are_the_aligned_sums_vjp(axis):
     want = jax.jit(pullback)(cotangent)
     found = jax.jit(lambda *factors: aligned_cotangents([factors[:3], factors[3:]], cotangent, axis))(
         weight, key, value, left, right)
-    for got, wanted in zip([*found[0], *found[1]], want, strict=True):
+    for got, wanted in zip(found, want, strict=True):
         assert got.dtype == wanted.dtype and got.shape == wanted.shape
         np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
+
+
+def test_aligned_cotangents_sum_a_shared_factors_terms_before_they_round():
+    """`aligned_cotangents` of terms `(w, 2^70, 2^70)`, `(w, -2^70, 2^70)` and `(w, 1, 1)` sharing one
+    float32 `w` (an entry write's weight) at a cotangent of one: `w`'s one cotangent, 1, as `jax.vjp` gives
+    it, its terms' products summed together before they round, where each term's rounded alone was
+    `+inf`, `-inf` and 1, summed NaN (review of bba02dcf8 F2); and a float64 factor's beside a float32 one
+    under x64 at a weak cotangent of `2^100`: `2^200`, the cotangent in the sum's float64, where taken
+    against the float32 factor it overflowed (F4)."""
+    from dew.nn.aligned import aligned_cotangents
+
+    w, big, one = jnp.float32(3.0), jnp.float32(2.0 ** 70), jnp.float32(1.0)
+    terms = [(w, big, big), (w, -big, big), (w, one, one)]
+    (shared, *_) = jax.jit(lambda w: aligned_cotangents([(w, *term[1:]) for term in terms], one))(w)
+    _, pullback = jax.vjp(lambda w: aligned_sum([(w, *term[1:]) for term in terms]), w)
+    assert float(shared) == float(pullback(one)[0]) == 1.0
+    with jax.enable_x64(new_val=True):
+        a, b = jnp.float32(2.0 ** 100), jnp.float64(1.0)
+        _, of_b = aligned_cotangents([(a, b)], 2.0 ** 100)
+    assert of_b.dtype == jnp.float64 and float(of_b) == 2.0 ** 200
 
 
 def test_an_aligned_sum_of_three_factors_over_a_long_axis_is_its_exact_sum():
