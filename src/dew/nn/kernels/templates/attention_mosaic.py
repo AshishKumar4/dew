@@ -64,6 +64,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _trained_forward,
     certified_walk,
     column_slices,
+    forward_block_plan,
     forward_products,
     logits_ahead,
 )
@@ -507,9 +508,9 @@ class MosaicForward(_Mainloop[Tiles]):
                             arguments.get("drop"))
 
     def _decided_model(self, query, value, score_params, residuals: Kept | None, config: Tiles,
-                       table=None, sources=None, scales=None, initial=None, drop=None, *, peaks: bool = False,
-                       columns: int | None = None, decides: bool | None = None, priced: bool = True
-                       ) -> tuple[bool, ForwardRegisters, int | None]:
+                       table=None, sources=None, scales=None, initial=None, drop=None, *,
+                       peaks: bool = False, columns: int | None = None, decides: bool | None = None,
+                       priced: bool = True) -> tuple[bool, ForwardRegisters, int | None]:
         """Resolve whether `config` decides its scaled walk, its `ForwardRegisters`, and (when `priced`) its
         register count in one pass (row 8843): builds the register facts once and reuses the scaled price so
         planning, residency and emission agree without double-pricing prologues."""
@@ -938,17 +939,19 @@ class MosaicForward(_Mainloop[Tiles]):
                       products: tuple, decides: bool | None = None) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
-        width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
+        width, full_v = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         # A launch of a block of the value columns (`Tiles.columns`) stages that block.
-        value_width = value_columns(value_width, config.columns)
+        value_width = value_columns(full_v, config.columns)
         steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
+        training = ba.arguments.get("residuals") is Kept.SPLIT
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
+        plan = forward_block_plan(full_v, config.columns, out_dtype,
+                                  has_output_mod=self.output_mod is not None, training=training)
         # A paged call's key tile of several pages loaded as its launch loads it (`paged_reads`).
         page = _page(ba)
         deciding = self.deciding(ba, config) if decides is None else decides
-        allocations = _forward_allocations(family, config, width, value_width, query.dtype,
-                                           ba.arguments.get("residuals") is Kept.SPLIT,
-                                           min(config.stages, steps), out_dtype=out_dtype, page=page,
+        allocations = _forward_allocations(family, config, width, value_width, query.dtype, training,
+                                           min(config.stages, steps), out_dtype=plan.out_dtype, page=page,
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
                                            parts=self.parts, params=self.score_types,
                                            in_key=self.reads_key_slot(family), decides=deciding)
@@ -957,7 +960,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # (`reducing`).
         arguments = ba.arguments
         cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
-        reduced = reducing(family, config.consumers, self.score_reduces or self.output_mod is not None,
+        reduced = reducing(family, config.consumers, self.score_reduces or plan.output_hook,
                            magnitudes=(cached and self.scales_in_kernel(ba)) or deciding)
         return resources.shared_bytes(family, launch_scope(family, allocations, reduced,
                                                            reduces=forward_reduces(family, reduced),
@@ -1057,8 +1060,8 @@ class MosaicForward(_Mainloop[Tiles]):
         return self._decided_model(arguments["query"], arguments["value"], arguments["score_params"],
                                    arguments.get("residuals"), config, arguments.get("table"),
                                    arguments.get("sources"), arguments.get("scales"),
-                                   arguments.get("initial"), arguments.get("drop"), peaks=peaks,
-                                   columns=columns, decides=decides)[2]
+                                   arguments.get("initial"), arguments.get("drop"),
+                                   peaks=peaks, columns=columns, decides=decides)[2]
 
     def registered(self, query, value, score_params, residuals, table=None, sources=None,
                    scales=None, initial=None, drop=None) -> ForwardRegisters:
@@ -1075,6 +1078,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                 if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span,
                                 merged=initial is not None and residuals is not Kept.SPLIT,
                                 started=initial is not None and residuals is Kept.SPLIT,
+                                dropped=drop is not None,
                                 weight_parts=2 if drop is not None and value.dtype == jnp.float16 else 1,
                                 prologue=(None if self.query_mod is None
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)))
