@@ -626,12 +626,14 @@ def launched(program, operands: tuple, role: str):
     return found
 
 
-def digested(arrays) -> str:
-    """A digest of `arrays`' bytes (a pytree's leaves), which names the values a program closes over."""
-    import jax
+def digested(array) -> str:
+    """A fingerprint of `array`, its dtype, shape and elements (`dew._hashing.array_fingerprint`), which names
+    a value a program closes over."""
+    from dew._hashing import array_fingerprint
 
-    joined = b"".join(np.ascontiguousarray(x).tobytes() for x in jax.tree.leaves(arrays))
-    return hashlib.sha1(joined).hexdigest()[:16]
+    hasher = hashlib.sha1()
+    array_fingerprint(hasher, np.asarray(array))
+    return hasher.hexdigest()[:16]
 
 
 def _through(operands: tuple, starts, last: int) -> tuple:
