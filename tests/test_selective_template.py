@@ -149,7 +149,7 @@ def test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted(
     """Large `B` across four states on a selector-supported shape (`length=32`, `states=4`) through the
     public `recurrence_chunk.selective_scan` route (`mosaic_gpu`) with normal (`2^-4`), zero (`0.0`),
     skip-cancelling (`dt = 1`, `D = -2^127`, `A = 0` or `-3`), subnormal skip-cancelling (`dt = 2^-110`,
-    `D = -2^-10`, `B = (2^100, 2^70)`), or subnormal (`dt = 2^-130`, `B = (2^120, 0)`) steps: its output,
+    `D = -2^-10`, `B = (2^100, 2^71)`), or subnormal (`dt = 2^-130`, `B = (2^120, 0)`) steps: its output,
     final state and every input's gradient on par from float64 with an independent range-safe reference
     (check 1; rows 8722, 9072, 9089, base reviews b9f004f74 F7, da734bf54 F3, c486fe8d7 F1)."""
     cases = ("normal step", "zero step", "skip cancelling", "subnormal skip cancelling", "subnormal step",
@@ -188,7 +188,7 @@ def test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted(
             dt = np.full((1, length, channels), 2.0 ** -110, np.float32)
             skip = np.full((channels,), -(2.0 ** -10) * factor, np.float32)
             b[:, :, 0] = (2.0 ** 100) * factor
-            b[:, :, 1] = (2.0 ** 70) * factor
+            b[:, :, 1] = (2.0 ** 71) * factor
         dy = np.zeros((1, length, channels), np.float32)
         dy[:, -1, :] = 1.0
         dfinal = np.zeros((1, channels, states), np.float32)
