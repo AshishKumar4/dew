@@ -193,6 +193,18 @@ def test_the_narrowing_settle_holds_every_order(edge):
                           plain_fn=plain)
 
 
+def test_a_nudged_quotient_narrows_once_and_keeps_its_tangent():
+    """`attention.narrowing_settled` at an fp16 tie it nudges: the quotient 1 + 2^-11 formed of sums
+    1 + 2^-11 - 2^-23 over a divisor 1 - 2^-24, whose exact value is below the tie, narrows to 1 as that
+    value rounds once, and its tangent along the quotient is the quotient's own, 1 (the head review of
+    fd1af38ac, F1: a nudged entry's tangent was none)."""
+    tie = jnp.float32(1 + 2.0 ** -11)
+    acc, divisor = jnp.float32(1 + 2.0 ** -11 - 2.0 ** -23), jnp.float32(1 - 2.0 ** -24)
+    settled, tangent = jax.jvp(lambda out: template.narrowing_settled(out, acc, divisor, jnp.float16), (tie,),
+                               (jnp.float32(1.0),))
+    assert settled.astype(jnp.float16) == 1.0 and tangent == 1.0
+
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_sink_softmax_holds_every_order(edge):
     """The sink softmax (`attention_sinks.sink_softmax`: its reverse mode returning the logits' cotangent
