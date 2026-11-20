@@ -411,21 +411,26 @@ def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
         np.testing.assert_array_equal(new, old)
 
 
-def test_a_model_with_no_stacked_run_asks_nothing_of_its_optimizers_update(monkeypatch):
+def test_a_model_with_no_stacked_run_asks_nothing_of_its_optimizers_update():
     """A step whose model holds no stacked run its backward could update (`_stage_runs`) plans no update in
-    the backward and never traces its optimizer's update to ask whether it could (`leaf_local`; row 6740: a
-    finetune's step traced a whole update it then discarded, a second of every compile)."""
+    the backward and never traces its optimizer's update apart to ask whether it could (`leaf_local`, its
+    own program; row 6740: a finetune's step traced a whole update it then discarded, a second of every
+    compile). The step's own trace reads the update inline, no program of its own."""
     from dew.data.dataset import Loader
     from dew.objectives.supervised import Supervised
-    from dew.training import transaction
+    from dew.telemetry.compiles import Ledger
 
-    def asked(*args, **kwargs):
-        raise AssertionError("a model with no stacked run asked whether its update is leaf-local")
+    inner = optax.adamw(1e-3)
 
-    monkeypatch.setattr(transaction, "leaf_local", asked)
+    def counted_update(updates, state, params=None):
+        return inner.update(updates, state, params)
+
     rows = 2 * jax.device_count()
     batch = {"x": np.ones((rows, 8), np.float32), "y": np.zeros((rows, 4), np.float32)}
     data = Loader(train=lambda partition: iter([batch] * 2), val=None, batch=rows, records=None)
     objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
-    assert int(Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0)).fit(data, steps=1,
-                                                                               log_every=100).step) == 1
+    counted = optax.GradientTransformation(inner.init, counted_update)
+    trainer = Trainer(objective, counted, key=jax.random.key(0))
+    with Ledger("counted_update") as traced:
+        assert int(trainer.fit(data, steps=1, log_every=100).step) == 1
+    assert not traced.programs, traced.programs
