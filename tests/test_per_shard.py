@@ -14,7 +14,7 @@ import importlib
 import re
 
 import pytest
-from generation_support import here, runnable
+from generation_support import INTERPRETS, here
 from kernel_matrix import CELLS
 from model_flows import FLOWS, flow_flags, flow_named
 from sharded import Shard, assert_kernel_runs_per_shard, interprets
@@ -83,11 +83,13 @@ def cells(test: str, natively: bool = False) -> list:
             for label, shard in stated(module, choice, kernel).items()]
 
 
+@INTERPRETS
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize(("module", "choice", "kernel", "label"), cells("test_a_kernel_runs_per_shard"))
 def test_a_kernel_runs_per_shard(module, choice, kernel, label):
     """One kernel's per-shard cell as the CPU's devices interpret it, as its generation
-    (`sharded.interprets`), skipped where they do not; its run on its own generation's devices is
+    (`sharded.interprets`), on a CPU alone (`INTERPRETS`: an accelerator runs its route natively), skipped
+    where they do not; its run on its own generation's devices is
     `test_a_kernel_runs_per_shard_natively`'s."""
     shard = stated(module, choice, kernel)[label]
     if not interprets(choice, kernel, shard):
@@ -100,14 +102,14 @@ def test_a_kernel_runs_per_shard(module, choice, kernel, label):
                          cells("test_a_kernel_runs_per_shard_natively", natively=True))
 def test_a_kernel_runs_per_shard_natively(module, choice, kernel, label):
     """One kernel's per-shard cell on its own generation's devices: admitted to that generation's tier
-    (`native`: a GPU's `gpu` session pinned to its `generations`, the TPU tier's `tpu` one) and run where
-    this process's devices run its generation's kernels (`generation_support.runnable`: a Hopper's
-    warpgroup cell on a Hopper alone, a TPU's on its own generation), skipped on any other (row 9002: a GPU
-    took any GPU generation's cell for its own). Its run takes two devices of one generation (`mesh`),
-    which a tier's host of one device skips by that mark, naming both counts."""
+    (`native`: a GPU's `gpu` session pinned to its `generations`, the TPU tier's `tpu` one) and run on
+    devices of that generation alone (`generation_support.here`), skipped on any other: a newer GPU that
+    could run an older one's launches runs its own routes, not the cell's (row 9002: a GPU took any GPU
+    generation's cell for its own). Its run takes two devices of one generation (`mesh`), which a tier's
+    host of one device skips by that mark, naming both counts."""
     shard = stated(module, choice, kernel)[label]
-    if not runnable(shard.target):
-        pytest.skip(f"{choice} {kernel} runs as {shard.target}, which this {here()} does not")
+    if here() != shard.target:
+        pytest.skip(f"{choice} {kernel} runs as {shard.target}, not as this {here()}")
     assert_kernel_runs_per_shard(choice, kernel, shard)
 
 
