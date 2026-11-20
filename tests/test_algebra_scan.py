@@ -1278,12 +1278,15 @@ def rwkv_widened(h, q, k, v, g, beta, a, c):
     ids=["an erase vector given wide", "an erase part widened in the update", "a query given wide"])
 def test_a_pre_decay_walks_carry_follows_its_updates_parts(update_fn, wide, carried):
     """RWKV7's token over float32 operands, its erase vector given in float64, or widened in its update by a
-    float64 vector it closes over, or its query given in float64 (x64's), walked by a token loop (a v5e's)
-    and replayed (`Derived.replay`): each carries its state in the type its update's parts widen it to,
-    float64 where its erase part is, float32 where a readout's operand alone is (the loop's and the replay's
-    alike), where the replay's carry typed by its state alone changed type mid-scan, which `lax.scan`
-    refuses."""
-    with jax.enable_x64(new_val=True), program.passes(target="v5e"):
+    float64 vector it closes over, or its query given in float64 (x64's), walked by a token loop (an A10's,
+    its step unpriced, the extraction guarded) and replayed (`Derived.replay`): each carries its state in the
+    type its update's parts widen it to (`scan._carry_type`), float64 where its erase part is, float32 where
+    a readout's operand alone is, where the replay's carry typed by its state alone changed type mid-scan,
+    which `lax.scan` refuses."""
+    extents = linear_scan.Extents(CHUNK, KEY, VALUE, 1, before=True, erased=True)
+    with jax.enable_x64(new_val=True), generation.assumed("sm86"):
+        form = scan._form(extents, corrected=True, saturation=SATURATION)
+        assert linear_scan.looped((form.outputs, form.state))
         forms = scan.derive_scan(scan.Scan(update_fn, rwkv_readout, RWKV, walked="time",
                                            state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
         drawn = dict(zip(RWKV, rwkv_draw(0), strict=True))

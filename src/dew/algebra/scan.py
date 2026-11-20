@@ -456,12 +456,15 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             output = _read(h, q, affine.values_read, affine.reader_scale) + r
         return (h, apart, index + 1), output if entering is None else entering
 
-    # The state carried in the type its update's parts and itself widen to, as the token loop carries it (a
-    # float32 state's replay under a float64 erase vector, x64's; a readout's parts widen none of it).
-    z, b, u, strength, c, _, _, across, erase = jax.eval_shape(
-        lambda step: _at_token(declaration, names, affine, step), jax.tree.map(lambda x: x[0], along))
-    updating = (z, b, u, strength, c, across, erase)
-    carried = at_least_fp32(jnp.result_type(h, *(part.dtype for part in updating)))
+    # The state carried in the type its update's parts widen it to (`_carry_type`, the token loop's), its
+    # token's parts typed from the operands' token shapes and types, so a walk of no tokens is one too.
+    def carry_typed(step):
+        z, b, u, strength, c, _, _, across, erase = _at_token(declaration, names, affine, step)
+        return jnp.zeros((), _carry_type(h, z, b, u, strength, c, across, erase))
+
+    one = {name: jax.ShapeDtypeStruct(x.shape[1:], x.dtype, weak_type=jax.typeof(x).weak_type)
+           for name, x in along.items()}
+    carried = jax.eval_shape(carry_typed, one).dtype
     h = h.astype(carried)
     if walked is None:
         (h, _, _), outputs = lax.scan(token, (h, h, 0), along)
@@ -932,9 +935,8 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
     stepped = jnp.concatenate([_scaled(1.0, jax.tree.map(lambda x: x[:1], decays.entering)), between])
     # A decay along the values too (`across`, each token's own gates `[C, V]`).
     valued = jnp.ones((count, values.shape[-1]), stepped.dtype) if across is None else across
-    # The state carried in the type its first step leaves it in: operands wider than it widen it (a float32
-    # state's walk over float64 operands, x64's).
-    h = h.astype(jnp.result_type(h, stepped, B, values, *((s, C, A) if corrected else ())))
+    # The state carried in the type its update's parts widen it to (`_carry_type`, the replay's).
+    h = h.astype(_carry_type(h, stepped, B, values, s, C, valued, A))
     # The decays a token back, cut where a document starts alone (`_decays_value`): what a correction reading
     # the state a token enters reads it through.
     back = jnp.concatenate([_scaled(1.0, jax.tree.map(lambda x: x[:1], decays.entering_before)),
@@ -963,6 +965,14 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
 
     (h, _, _), outputs = lax.scan(step, (h, h, 0), (stepped, B, s, C, Q, R, values, valued, A, back))
     return outputs, h
+
+
+def _carry_type(h, *parts) -> jnp.dtype:
+    """The type a token walk carries its state in, the token loop's and the replay's alike: the state's and
+    its update's parts' (each token's decay, input and values, its correction's strength and vector, its
+    decay along the values and its erase's vector; its readout's none), float32 at least, so operands wider
+    than the state widen it once (a float32 state's walk over float64 operands, x64's)."""
+    return at_least_fp32(jnp.result_type(h, *parts))
 
 
 def _substituted(lower, given):
