@@ -2174,7 +2174,7 @@ def _tpu_documents(state, forked: Forked, length: int, chunk_size: int, work, wi
                    for t, fill in zip((loads, stores, begun, adds), (-1, 0, 0, 0), strict=True))
     given = zero_padded(zero_padded(jnp.swapaxes(state, -1, -2).astype(work), 3, widths[0]), 4, widths[1])
     entry = None
-    if forked.entry is not None:
+    if forked.entry is not None and forked.entry[0].shape[2] > 0:
         key, value, weight = forked.entry
         heads = value.shape[3]
         key = jnp.repeat(key, heads // key.shape[3], axis=3)
