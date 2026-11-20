@@ -11,6 +11,7 @@ test_architectures.py trains that climbs a ladder, and a decoder with a continuu
 rung."""
 
 import dataclasses
+import functools
 import itertools
 
 import jax
@@ -369,7 +370,15 @@ def _inputs(case) -> tuple:
 
 
 def _built(case) -> tuple:
-    """The case's model, its variables and its inputs (`_inputs`)."""
+    """The case's model, its variables and its inputs (`_inputs`): built once a process for every test of
+    the case (`_built_named`), which reads them and changes none, the case's tests one CI group
+    (`shared_setup("architectures")`)."""
+    return _built_named(case.name)
+
+
+@functools.cache
+def _built_named(name: str) -> tuple:
+    (case,) = [case for case in RECOMPUTED if case.name == name]
     model = models.build(case.architecture, **case.config)
     inputs = _inputs(case)
     return model, nn.unbox(model.init(jax.random.key(0), *inputs)), inputs
@@ -379,6 +388,7 @@ COVERED = [case for case in RECOMPUTED if case.name in GRADIENT_SEEDS]
 """The architectures that stand for a class of the gradient's covering (`GRADIENT_COVERING`)."""
 
 
+@pytest.mark.shared_setup("architectures", by=r"[a-z0-9_+]+")
 @pytest.mark.parametrize("case", RECOMPUTED, ids=[case.name for case in RECOMPUTED])
 def test_an_architectures_remat_rungs_climb_and_restore(case):
     """Every architecture test_architectures.py trains that climbs a remat
@@ -386,11 +396,13 @@ def test_an_architectures_remat_rungs_climb_and_restore(case):
     _climbs_and_restores(*_built(case))
 
 
+@pytest.mark.shared_setup("architectures", by=r"[a-z0-9_+]+")
 @pytest.mark.parametrize("case", RECOMPUTED, ids=[case.name for case in RECOMPUTED])
 def test_an_architectures_top_rung_steps_its_forward_as_it_does(case):
     _steps_its_forward(*_built(case))
 
 
+@pytest.mark.shared_setup("architectures", by=r"[a-z0-9_+]+")
 @pytest.mark.parametrize("case", COVERED, ids=[case.name for case in COVERED])
 def test_a_covering_architectures_top_rung_steps_its_gradient_as_it_does(case):
     _steps_its_gradient(case.name, *_built(case))
