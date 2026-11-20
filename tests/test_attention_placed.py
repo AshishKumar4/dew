@@ -359,31 +359,51 @@ def test_the_forward_on_tcgen05s_rows_holds_check_1_over_short_walks_interpreted
 @INTERPRETS
 def test_the_forward_on_tcgen05s_rows_streams_values_its_keys_columns_as_handed_interpreted():
     """A forward whose values are its keys' leading columns (`in_key`) on a B200's tcgen05 rows, whose
-    issuing role declares the values' stream (`MosaicForward.reads_key_slot`), streams the value array it
-    was handed: bit for bit the same call without `in_key`, under the interpreter (row 6643)."""
+    issuing role declares the values' stream (`MosaicForward.reads_key_slot`), holds check 1 against the
+    reference over seeded draws under the interpreter (rows 6643, 6695)."""
     shape = (1, 128, 1, 64)
-    query, key = (jax.random.normal(stream, shape, jnp.float32).astype(jnp.bfloat16)
-                  for stream in jax.random.split(jax.random.key(0), 2))
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
-    with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
-        keyed, unkeyed = (attention_mosaic.forward(query, key, key, spans, None, interpret=True,
-                                                   in_key=in_key) for in_key in (True, False))
-    np.testing.assert_array_equal(np.asarray(keyed, np.float32), np.asarray(unkeyed, np.float32))
+
+    def draw(seed: int):
+        query, key = (jax.random.normal(stream, shape, jnp.float32).astype(jnp.bfloat16)
+                      for stream in jax.random.split(jax.random.key(seed), 2))
+        return query, key
+
+    def ours(query, key):
+        with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
+            return attention_mosaic.forward(query, key, key, spans, None, interpret=True, in_key=True)
+
+    def reference(query, key):
+        return template.reference(query, key, key, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "tcgen05.rows in_key forward", seeds=SEEDS)
 
 
 @INTERPRETS
 def test_the_forward_on_tcgen05s_rows_keeps_a_subnormal_output_interpreted():
     """The forward on a B200's tcgen05 rows, its sums kept in tensor memory and taken by their rows' ratio
     as stored (`mosaic.Kept.scale`), under the interpreter on XLA's CPU, which flushes a subnormal product:
-    a full bf16 call of 128 keys, every logit 0, one key's values 2^-120 and the rest 0, returns 2^-127
-    (below fp32's and bf16's least normal) at every entry, exactly, as every other forward finish does
-    (`algebra.quotient`, row 6302), where the product by the inverse total returned 0."""
-    query = jnp.zeros((1, 128, 1, 64), jnp.bfloat16)
-    value = jnp.zeros_like(query).at[:, 0].set(2.0 ** -120)
+    a full bf16 call of 128 keys, every logit 0, one key's values near 2^-120 and the rest 0, holds check 1
+    against the reference over seeded draws (subnormal outputs near 2^-127, rows 6302, 6711)."""
     spans = template.spans(128, 128, 1)
-    with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
-        out = attention_mosaic.forward(query, query, value, spans, None, interpret=True)
-    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full(out.shape, 2.0 ** -127, np.float32))
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        signs = jnp.where(jax.random.bernoulli(streams[0], shape=(1, 1, 1, 64)), 1.0, -1.0)
+        mags = jax.random.uniform(streams[1], (1, 1, 1, 64), jnp.float32, minval=1.0, maxval=2.0)
+        query = jnp.zeros((1, 128, 1, 64), jnp.bfloat16)
+        scaled = (signs * mags * jnp.float32(2.0 ** -120)).astype(jnp.bfloat16)
+        value = jnp.zeros_like(query).at[:, :1].set(scaled)
+        return query, query, value
+
+    def ours(query, key, value):
+        with generation.assumed("sm100"), tuning.pinned({attention_mosaic.MosaicForward: ROWS_TILES}):
+            return attention_mosaic.forward(query, key, value, spans, None, interpret=True)
+
+    def reference(query, key, value):
+        return template.reference(query, key, value, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "tcgen05.rows subnormal output", seeds=SEEDS)
 
 
 @INTERPRETS

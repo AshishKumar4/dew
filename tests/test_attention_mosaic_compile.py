@@ -602,9 +602,14 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
                                                                    for cert in offered)))
     if not failed:
         return
-    # Declined: the family claims no config of the call, every one it derives refused by the assembler,
-    # spilling or serializing (each certification's own record, not the failure's message), and none failing
-    # to build for another reason; the Pallas-Triton backward takes it (`attention_route.backward`).
+    # sm86/sm89 fast width-64 temperature cells are repaired Mosaic support and must compile spill-free
+    # rather than falling back to a declined exhaustion (row 7370).
+    if generation_name in ("sm86", "sm89") and width == 64 and not accurate and hooks == "temperature":
+        assert not failed, "\n".join(failed)
+    # Declined: the family claims no config of the call, proven by typed exhaustion with every derived
+    # config refused by the assembler (spilling or serializing) and no uncertified failure (row 6730);
+    # the Pallas-Triton backward takes it (`attention_route.backward`).
+    assert all(record.get("exhausted") for record in found), "\n".join(failed)
     assert not any(record.get("uncertified") for record in found), found
     assert offered and all(any(refused for _, _, refused in cert["kernels"].values()) for cert in offered), (
         "\n".join(failed))
