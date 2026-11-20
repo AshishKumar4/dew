@@ -65,6 +65,15 @@ WIDE_HEADS = {
 """Each delta-rule mixer with heads its scan's work dwarfs its projections' on: four key heads 32 wide."""
 
 
+PAIRED_HEADS = {
+    "gated delta net": GatedDeltaNet(emb_features=WIDTH, num_k_heads=2, num_v_heads=4, head_k_dim=64,
+                                     head_v_dim=64, chunk_size=4, dtype=jnp.float32),
+    "kimi delta attention": KimiDeltaAttention(emb_features=WIDTH, num_heads=2, head_dim=64, conv_kernel=4,
+                                               lower_bound=-5.0, chunk_size=4),
+}
+"""Each delta-rule mixer with two key heads its scan's work dwarfs its projections' on: a tensor axis of 2
+divides them, the tensor and sequence axes together do not."""
+
 HEADS_BEFORE_TIME = (("activation_heads", ("tensor", "sequence")),)
 """A rule under which the heads would take the sequence axis too: the split keeps it the sequence's."""
 
@@ -93,13 +102,18 @@ def test_a_delta_rule_split_over_the_sequence_and_its_heads_runs_its_rows_as_who
 
 
 @pytest.mark.mesh
+@pytest.mark.parametrize(("mixers", "rules"), [(WIDE_HEADS, ()), (PAIRED_HEADS, HEADS_BEFORE_TIME)],
+                         ids=["default rules", "heads before time, two key heads"])
 @pytest.mark.parametrize("name", sorted(WIDE_HEADS))
-def test_a_delta_rule_split_over_the_sequence_divides_its_heads_work_over_a_tensor_axis(name):
+def test_a_delta_rule_split_over_the_sequence_divides_its_heads_work_over_a_tensor_axis(name, mixers, rules):
     """Under a sequence axis of 2, a tensor axis of 2 beside it divides the mixer's heads (`linear.
     sequence_delta_rule`): each device's compiled forward and backward on the host's devices (XLA's count of
     the portable math's every dot) does under three quarters of the work it does with no tensor axis, its
-    scan's and conv's half (row 1437: each device ran every head, 0.99 of it)."""
-    module = WIDE_HEADS[name]
+    scan's and conv's half (row 1437: each device ran every head, 0.99 of it), and so under rules giving the
+    heads the sequence axis too where the tensor axis alone divides them (two key heads)."""
+    from dew.mesh import DEFAULT_RULES
+
+    module = mixers[name]
     hidden = jnp.asarray(np.random.default_rng(0).standard_normal((2, 32, WIDTH)), jnp.float32)
     variables = module.init(jax.random.key(7), hidden)
 
@@ -109,7 +123,8 @@ def test_a_delta_rule_split_over_the_sequence_divides_its_heads_work_over_a_tens
 
     def work(tensor: int) -> float:
         # On the host's devices, which take the portable math, whose every dot XLA's count holds.
-        with jax.set_mesh(MeshSpec(sequence=2, tensor=tensor).build(jax.devices("cpu")[:2 * tensor])):
+        mesh = MeshSpec(sequence=2, tensor=tensor).build(jax.devices("cpu")[:2 * tensor])
+        with jax.set_mesh(mesh), nn.logical_axis_rules((*rules, *DEFAULT_RULES)):
             return jax.jit(step).lower(variables, hidden).compile().cost_analysis()["flops"]
 
     assert work(2) < 0.75 * work(1)
