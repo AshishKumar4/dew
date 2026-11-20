@@ -201,8 +201,13 @@ def entry_write(key, value, weight, *, values_first: bool = False) -> jax.Array:
     `[..., Dv, R]` and the write `[..., Dv, Dk]` (the TPU forked scan's layout); `weight` broadcast against
     the write. Its terms summed aligned to the largest (`precision.aligned_sum`), so a sum in range is its
     value though its terms leave fp32's range: the one form the portable walk's opening, the template's
-    chunks (`ForkedChunks.entries`) and the TPU forked scan take."""
+    chunks (`ForkedChunks.entries`) and the TPU forked scan take. Of rank zero it is zero, the memory it
+    enters unchanged, as the einsum before it gave (row 8967: an aligned sum of no terms raised)."""
     rank = key.shape[-2]
+    if not rank:
+        width = (value.shape[-2], key.shape[-1]) if values_first else (key.shape[-1], value.shape[-1])
+        shape = jnp.broadcast_shapes(jnp.shape(weight), key.shape[:-2] + width)
+        return jnp.zeros(shape, jnp.result_type(jnp.float32, weight, key, value))
     if values_first:
         return aligned_sum([(weight, value[..., :, r:r + 1], key[..., r:r + 1, :]) for r in range(rank)])
     return aligned_sum([(weight, key[..., r, :, None], value[..., r, None, :]) for r in range(rank)])
@@ -584,7 +589,8 @@ class ForkedChunks:
         own, formed once a chunk."""
         if forked.entry is None:
             return None
-        key, value, weight = (x.reshape(-1, *x.shape[2:]) for x in forked.entry)
+        # Each row's documents flat, by their count: a write of no terms leaves `-1` nothing to infer.
+        key, value, weight = (x.reshape(x.shape[0] * x.shape[1], *x.shape[2:]) for x in forked.entry)
         taken = jnp.maximum(self.taken, 0)
         key, value, weight = (x[taken] for x in (key, value, weight))
         group = value.shape[-2] // key.shape[-2]
