@@ -151,7 +151,8 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
     converted as `jnp.asarray` converts it, a host scalar at `dtype` directly."""
     if not isinstance(x, jax.Array | np.ndarray):
         return jnp.asarray(x, dtype)
-    dtype = jax.dtypes.canonicalize_dtype(dtype)
+    # The destination as JAX resolves an explicit request (x64, or its explicit dtypes allowed without it).
+    dtype = jax.eval_shape(lambda: jnp.zeros((), dtype)).dtype
     if (jnp.dtype(x.dtype) not in WIDENED or dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.float64))
             or jnp.finfo(dtype).bits <= jnp.finfo(x.dtype).bits):
         return jnp.asarray(x, dtype)
