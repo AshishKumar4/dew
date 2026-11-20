@@ -62,5 +62,6 @@ def test_native_attention_witness_cells_prepare_without_deferring(tmp_path, monk
     assert not (store_dir / DEFERRED).exists(), (store_dir / DEFERRED).read_text()
     assert not (store_dir / UNPREPARED).exists(), (store_dir / UNPREPARED).read_text()
     labels = {json.loads(path.read_text())["label"] for path in store_dir.rglob("site.json")}
-    assert any("attention witness, causal," in label for label in labels), labels
-    assert any("attention witness, full," in label for label in labels), labels
+    for expected in ("attention witness, witness, causal,", "attention witness, witness, full,",
+                     "attention witness, faults, causal,", "attention witness, faults, full,"):
+        assert any(expected in label for label in labels), (expected, labels)

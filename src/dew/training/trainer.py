@@ -127,6 +127,7 @@ from dew.training._fit import (
     FitPlan,
     FitRun,
     HandedSplits,
+    Resumed,
     Start,
     _rollout_admitted,
     _rollout_resumed,
@@ -749,7 +750,7 @@ class Trainer(Generic[Loss, Effects]):
         self._compiler.ahead = self._ahead_handed.runnable(list(self.device_mesh.devices.flat))
         self._ahead_handed = None
 
-    def _started(self, resume: Resume = "auto") -> Start:
+    def _started(self, resume: Resume = "auto", known: Resumed | None = None) -> Start:
         """What placing the state reads before it places anything: the objective's held tree and
         the key, resolved once, so that the shapes and the values are the same inputs through the
         same overridable method and the objective is asked for what it holds exactly once; the
@@ -767,7 +768,8 @@ class Trainer(Generic[Loss, Effects]):
                                stated and (stated, self._start_owner()))
         abstract, checkpoints = draw.abstract, self.checkpoints
         # Each process lists the checkpoints itself, one listing may lag another's: all resume or none.
-        step = resumed_step(self, resume)
+        # The step a fit's start read already (`known`, `_resumed`), else as `resume` asks.
+        step = known.step if known is not None else resumed_step(self, resume)
         if checkpoints is not None and step is not None:
             abstract = self._staging.state(abstract.with_window(checkpoints.accumulation_template(step)),
                                           self._staging.staged_shapes)
@@ -1521,8 +1523,9 @@ class Trainer(Generic[Loss, Effects]):
         objective that names its input field alone declares it first (`_declare_input`), a resume's from the
         first batch its saved position admits (`_resumed_position`)."""
         checkpoints = self.checkpoints
-        self._declare_input(lambda: self._primed_first(
-            run, dataset, None if initial is not None else self._resumed_position(resume)))
+        resumed = None if initial is not None else self._resumed(run, resume)
+        self._declare_input(lambda: self._primed_first(run, dataset,
+                                                       None if resumed is None else resumed.position))
         if resume == "require" and (checkpoints is None or initial is not None):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")
@@ -1553,16 +1556,12 @@ class Trainer(Generic[Loss, Effects]):
                 with attempting(begun):
                     return self._placed(start, positioned=False)[:2]
             return 0, None, placed, start.abstract, start
-        # Its saved position, which the stream the run opens restores, or starts again where its plan
-        # changed (`_prefetched`); a position saved for other shares is none of this run's to read.
-        try:
-            position = checkpoints.position(start.resume, DataPartition.of(self.device_mesh))
-        except PlanChanged as changed:
-            if self.data_resume == "exact":
-                raise
-            position = None
-            self._restarting(run, tuple(changed.differs))
-        return (start.resume, position, lambda begun=None: self._placed(start, positioned=False)[:2],
+        # Its saved position, read once (`_resumed`), which the stream the run opens restores, or starts
+        # again where its plan changed (`_prefetched`).
+        resumed = self._resumed(run, resume)
+        if resumed.differs:
+            self._restarting(run, resumed.differs)
+        return (start.resume, resumed.position, lambda begun=None: self._placed(start, positioned=False)[:2],
                 start.abstract, None)
 
     def _stream_partition(self) -> DataPartition:
@@ -1582,7 +1581,8 @@ class Trainer(Generic[Loss, Effects]):
         run.stages = stages_of(stream)
         try:
             if saved is not None and isinstance(stream, Checkpointable):
-                restored_or_restarted(stream, saved, resume=self.data_resume, step=run.current)
+                self._restarting(run, restored_or_restarted(stream, saved, resume=self.data_resume,
+                                                            step=run.current))
             batch = next(iter(stream), None)
             position = stream.get_state() if isinstance(stream, Checkpointable) else None
         except BaseException:
@@ -1591,21 +1591,26 @@ class Trainer(Generic[Loss, Effects]):
         if batch is None:
             _closed(stream)
             return first_batch(dataset, partition)
-        run.primed = (partition, stream, batch, position)
+        run.primed = (partition, stream, batch, position, saved)
         return batch
 
-    def _resumed_position(self, resume: Resume) -> bytes | None:
-        """The data position a resume of this run reads from (`Checkpoints.position`), none for a fresh run,
-        one that saved none, or one resumed relaxed whose saved position no reader here reads."""
-        checkpoints, step = self.checkpoints, resumed_step(self, resume)
-        if checkpoints is None or step is None:
-            return None
-        try:
-            return checkpoints.position(step, DataPartition.of(self.device_mesh))
-        except PlanChanged:
-            if self.data_resume == "exact":
-                raise
-            return None
+    def _resumed(self, run: FitRun, resume: Resume) -> Resumed:
+        """What this fit resumes (`Resumed`), read once for its start and kept on `run`: the step every
+        process agrees (`resumed_step`) and, where it continues one, this share's saved data position
+        (`Checkpoints.position`), none where its plan changed and the run resumes relaxed (what changed its
+        `differs`); a position saved for other shares is none of this run's to read."""
+        if run.resumed is None:
+            checkpoints, step = self.checkpoints, resumed_step(self, resume)
+            position, differs = None, ()
+            if checkpoints is not None and step is not None:
+                try:
+                    position = checkpoints.position(step, DataPartition.of(self.device_mesh))
+                except PlanChanged as changed:
+                    if self.data_resume == "exact":
+                        raise
+                    differs = tuple(changed.differs)
+            run.resumed = Resumed(step, position, differs)
+        return run.resumed
 
     def _declare_input(self, first: Callable[[], Batch]) -> None:
         """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
@@ -1669,7 +1674,8 @@ class Trainer(Generic[Loss, Effects]):
                          resumed=current if resumed and position is None and run.restarted is None else None)
             self._shape = staged(self._shape, stages_of(run.source))
             run.partition = partition
-            run.train = self._prefetched(plan, run, opened, position, ahead)
+            # A stream handed on (`ahead`) stands where it was restored already: restored once.
+            run.train = self._prefetched(plan, run, opened, None if ahead is not None else position, ahead)
             run.source = None  # Lifetime transferred to the prefetch worker.
             if self.rollout is None:
                 # Read on the host before the state is placed, and agreed: a process whose read failed
@@ -1782,9 +1788,11 @@ class Trainer(Generic[Loss, Effects]):
         the run reads its stream from its beginning: that stream, handed on; else a stream opened now, the
         primed one closed."""
         primed, run.primed = run.primed, None
-        # Handed on only where the stream reads from its beginning: a resume, or a relaxed one starting a
-        # stage again (`FitRun.restarted`, which `_prefetched` moves a staged stream to), reads elsewhere.
-        if primed is not None and primed[0] == partition and position is None and run.restarted is None:
+        # Handed on where it was read from the position the run reads from, its beginning or a resume's,
+        # restored there once (row 9663); a relaxed resume starting a stage again (`FitRun.restarted`, which
+        # `_prefetched` moves a staged stream to) reads elsewhere.
+        if (primed is not None and primed[0] == partition and primed[4] == position
+                and run.restarted is None):
             return primed[1], (primed[2], primed[3])
         if primed is not None:
             _closed(primed[1])

@@ -715,12 +715,13 @@ class Param:
 class Initial:
     """Where each query's online softmax starts: its running maximum `m` `[B, H, Q]` (natural log), its
     unnormalized denominator `total` `[B, H, Q]` and numerator `acc` `[B, H, Q, Dv]`, fp32 or wider.
-    Sinks are `m` the head's sink, `total` one and `acc` zero (`sinks`); a resumed partial is its own
-    state."""
+    Sinks are `m` the head's sink, `total` one and `acc` zero (`sinks`), `valueless`: the output a mean of
+    the values and zeros (`attention_algebra.largest_of`); a resumed partial is its own state."""
 
     m: jax.Array
     total: jax.Array
     acc: jax.Array
+    valueless: bool = dataclasses.field(default=False, metadata={"static": True})
 
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
@@ -728,7 +729,7 @@ def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     dtype (`at_least_fp32`), each head's gradient its rows' terms summed once rounded (`_spread_sinks`)."""
     wide = at_least_fp32(values.dtype)
     m = _spread_sinks((batch, values.shape[0], queries))(values.astype(wide))
-    return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
+    return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide), valueless=True)
 
 
 @functools.cache
@@ -1300,11 +1301,25 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
     total = total0 * carried + jnp.sum(p, axis=-1)
 
-    def valued(weights: jax.Array) -> jax.Array:
-        # The weights narrowed to the values' dtype times the values, a query group's over its key head.
-        grouped = weights.astype(value.dtype).reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
-        return float32_einsum("bhgqk,bkhd->bhgqd", grouped, value, precision=REFERENCE_PRECISION,
-                              preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
+    def valued(weights: jax.Array, *, cotangent_wide: bool = False) -> jax.Array:
+        # The weights narrowed to the values' dtype times the values, a query group's over its key head. With
+        # `cotangent_wide` the weights' cotangent dO·Vᵀ fp32, the product's value and the values' cotangent
+        # the narrowed one's as they are: an fp16 dropping call's reached 8 x 2^15 before the small weight
+        # that takes it finite, inf in fp16 (row 9506's gradients).
+        def product(grouped, operand):
+            return float32_einsum("bhgqk,bkhd->bhgqd", grouped, operand, precision=REFERENCE_PRECISION,
+                                  preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
+
+        grouped = weights.reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
+        narrowed = product(grouped.astype(value.dtype), value)
+        if not cotangent_wide:
+            return narrowed
+        # Its value the narrowed product's; its derivatives at every order the same bilinear product's in
+        # fp32, the narrowing straight through, both operands live (`derivative_of`).
+        rounded = grouped.astype(value.dtype).astype(grouped.dtype)
+        wide_product = product(grouped + jax.lax.stop_gradient(rounded - grouped),
+                               value.astype(grouped.dtype))
+        return jax.lax.stop_gradient(narrowed) + derivative_of(wide_product)
 
     drop = hooks.drop
     if hooks.rounds is not None:
@@ -1314,6 +1329,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     elif drop is None:
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
+        if hooks.initial is None or hooks.initial.valueless:
+            normalized = held_mean(normalized, acc, value.dtype)
     else:
         # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's z
         # times its normalized weight stays in the values' range where z times the unnormalized one may not
@@ -1328,11 +1345,36 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 
         drawn = jax.vmap(jax.vmap(multiplier, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch),
                                                                                     jnp.arange(heads))
-        normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn)
+        normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn,
+                                                                   cotangent_wide=value.dtype == jnp.float16)
 
     out = output_hooked(normalized, hooks.output_mod, hooks.output_params)
     out = jnp.swapaxes(out.astype(query.dtype), 1, 2)
     return (out, safe, total) if residuals else out
+
+
+def mean_held(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
+    """`out`, the weighted values `sums` over their denominator, held at `dtype`'s largest where it passes it
+    from finite sums: a mean of finite values of `dtype` is within it, so one past it is its weights'
+    rounding (narrowed to fp16 for their product, the weights round up by as much as 2^-11 of each where the
+    denominator sums them unrounded, the mean of 1001 values of 65504 at 65522, inf in fp16, row 9519). An
+    infinite or NaN sum's (an infinite value's) stays as it is. The one hold every mainloop's quotient
+    (`attention_algebra.quotient`) and the reference (`held_mean`) take."""
+    largest = jnp.finfo(dtype).max
+    past = (jnp.abs(sums) < jnp.inf) & (jnp.abs(out) > largest)
+    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
+
+
+def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
+    """The reference's `mean_held`: its value, its derivative the mean's, `out`'s (`derivative_of`)."""
+    return mean_held(jax.lax.stop_gradient(out), sums, dtype) + derivative_of(out)
+
+
+def derivative_of(out: jax.Array) -> jax.Array:
+    """Zero with `out`'s derivative, where `out` is finite (an infinite one's difference from itself NaN):
+    added to a value formed from `out`'s, it carries `out`'s derivative and leaves the value as it is."""
+    value = jax.lax.stop_gradient(out)
+    return jnp.where(jnp.isfinite(value), out - value, 0.0)
 
 
 def output_hooked(out: jax.Array, output_mod: Callable | None, output_params: tuple[Param, ...]) -> jax.Array:
@@ -1933,9 +1975,11 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
             return jnp.where(nonzero, lowered_divide(numerator, divisor, raised), 0.0)
 
         weighed = bodies.subnormals(weighed_by, delta.dtype)
-        initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
-                          total=(-weighed).astype(state.total.dtype),
-                          acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
+        # In the state's own structure, its static marks with it (`Initial.valueless`).
+        initial = dataclasses.replace(
+            state, m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
+            total=(-weighed).astype(state.total.dtype),
+            acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded

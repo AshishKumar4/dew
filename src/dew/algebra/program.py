@@ -637,7 +637,7 @@ def _products(region: terms.Region) -> list:
         facts.append(set_(rules.contracted_length(term)).to(i64(max(length - 1, 0).bit_length() + slack)))
         wanted = params.get("preferred_element_type")
         operands = {left, right}
-        # Plain only of one dtype: a product of two makes neither's (`terms.product_dtype`), no plain one a
+        # Plain only of one dtype: a product of two makes neither's (`terms.Product.made`), no plain one a
         # rule may move (base review 3232beb7c).
         if len(operands) == 1 and (wanted is None or operands == {jnp.dtype(wanted)}):
             facts.append(rules.plain(i64(index)))

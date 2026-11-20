@@ -1003,6 +1003,8 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
     ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "cold"), ({"locks/cpu.txt": "jax==9\n"}, "cold"),
+    ({"locks/cuda12.txt": "jax-cuda12-plugin==9\n"}, "on"), ({"locks/site.txt": "jax==9\n"}, "on"),
+    ({".gitignore": "*.pyc\n"}, "off"),
     ({"tools/armada/session.py": "# the session\n"}, "cold"),
     ({"tools/armada/executed.py": "# the recorder\n"}, "cold"),
     ({".github/workflows/ci.yml": "on: []\n"}, "on"),
@@ -1011,12 +1013,15 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"kernels/flash_attn/dew_flash_attn/__init__.py": "VALUE = 2\n"}, "on"),
     ({"stubs/pkg/__init__.pyi": "VALUE: int\n"}, "on"), ({"licenses/NOTICE": "notice\n"}, "on"),
     ({".thresh/seams.toml": "[seam]\n"}, "on"), ({"MANIFEST.in": "include LICENSE\n"}, "on"),
-    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 400}\n'}, "on"),
-    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "cold"),
+    ({".armada.json": '{"environment": {"base": "debian", "key": ["locks/cpu.txt"]}, "env": {"MODE": "1"}, '
+                      '"pool": 400}\n'}, "on"),
+    ({".armada.json": '{"environment": {"base": "debian", "key": ["locks/cpu.txt"]}, "env": {"MODE": "2"}, '
+                      '"pool": 160}\n'}, "cold"),
     ({"tools/armada/followed.py": '"""Followed, as each run reads."""\n\n\n# A note.\ndef read(path):\n'
                                   '    return path\n'}, "on"),
     ({"tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n    return [path]\n'}, "cold"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
+        "a CUDA lock", "the site lock", "the ignore list",
         "the test session", "the recorder", "a workflow", "a file no record places", "the changelog",
         "a native kernel package's wrapper", "a type stub", "a license", "thresh's annotations",
         "the manifest",
@@ -1032,8 +1037,11 @@ def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_
     10 trains ran with the cache off, and 0.75% of rows were reused). The recorder (executed.py, followed.py,
     watched.py) stays every file's input: an old record may lack a dependency a new recorder finds, by its
     code alone, so an edit of what it says of itself keeps the cache on (Main, 2026-11-07: 12 of 20 trains ran
-    cold on harness edits)."""
-    armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
+    cold on harness edits). A lock the environment is not built from (a CUDA lock, the site lock) is a GPU
+    lane's input alone, and leaves the CPU cache on (Main, 2026-11-20: a CUDA wheel bump ran train 1089's
+    suite cold)."""
+    armada = ('{"environment": {"base": "debian", "key": ["locks/cpu.txt"]}, "env": {"MODE": "1"}, '
+              '"pool": 160}\n')
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
                        "locks/cpu.txt": "jax==1\n", ".armada.json": armada,
                        "tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n'
@@ -1280,6 +1288,23 @@ def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does
     assert ci.shared("3.12") == before
     module.write_text('"""Followed."""\n\n\ndef read(path):\n    """The file."""\n    return [path]\n')
     assert ci.shared("3.12") != before
+
+
+def test_a_cuda_lock_rekeys_a_gpu_lanes_files_and_no_cpu_tasks(ci, tmp_path):
+    """A CPU task's shared key holds the lock its environment is built from (.armada.json's key) and no other,
+    so a CUDA or site lock's change reuses every CPU row; a GPU lane's (`lane_inputs`) holds every lock, so
+    the same change reruns its files on the new wheels (Main, 2026-11-20: a CUDA wheel bump ran a train's CPU
+    suite cold)."""
+    for name, text in {".armada.json": '{"environment": {"base": "debian", "key": ["locks/cpu.txt"]}}\n',
+                       "locks/cpu.txt": "jax==1\n", "locks/cuda12.txt": "jax-cuda12-plugin==1\n"}.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    cpu, gpu = ci.shared("3.12"), ci.lane_inputs("3.12")
+    (tmp_path / "locks/cuda12.txt").write_text("jax-cuda12-plugin==2\n")
+    assert ci.shared("3.12") == cpu and ci.lane_inputs("3.12") != gpu
+    gpu = ci.lane_inputs("3.12")
+    (tmp_path / "locks/cpu.txt").write_text("jax==2\n")
+    assert ci.shared("3.12") != cpu and ci.lane_inputs("3.12") != gpu
 
 
 def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_code_does(

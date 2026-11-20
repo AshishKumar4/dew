@@ -20,7 +20,7 @@ from egglog import DagCostModel, EGraph, get_callable_args
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import CONTRACTED, shape
-from dew.algebra.terms import OPERATIONS, RESCALE, Region, Term, integer, key, product_dtype, text
+from dew.algebra.terms import OPERATIONS, RESCALE, Region, Term, integer, key, text
 from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost, emission
@@ -113,15 +113,14 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         free = (math.prod(size for axis, size in enumerate(left) if axis not in (*contracted, *batch))
                 * math.prod(size for axis, size in enumerate(right)
                             if axis not in (*right_contracted, *right_batch)))
-        operands = region.products[index]
+        product = region.products[index]
         read = sum(math.prod(extent) * np.dtype(dtype).itemsize
-                   for extent, dtype in zip((left, right), operands, strict=True))
+                   for extent, dtype in zip((left, right), product.operands, strict=True))
         elements = math.prod(left[axis] for axis in batch) * free
-        # Its result at the dtype the product makes (`terms.product_dtype`, JAX's own rule: a bfloat16 by a
+        # Its result at the dtype the product makes (`terms.Product.made`, JAX's own rule: a bfloat16 by a
         # float16 product is bfloat16, which NumPy's promotion refused, base review 0b8b7ed98 F1).
-        mode, passes = _mode(params.get("precision"), *operands)
-        return Work(shared_bytes=read, kernels=1.0,
-                    kept_bytes=kept(elements, product_dtype(region, index).itemsize),
+        mode, passes = _mode(params.get("precision"), *product.operands)
+        return Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, product.made.itemsize),
                     **{_MODES[mode]: 2.0 * elements * length * passes})
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1], held))

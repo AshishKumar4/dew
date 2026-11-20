@@ -100,13 +100,6 @@ def test_a_bf16_gradient_over_one_sequence_is_as_exact_as_its_reference():
     memories kept."""
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=24)
-@interpreted_gradient('a ragged length', 'bf16', 'recomputed')
-def test_a_recomputed_ragged_bf16_gradient_is_as_exact_as_its_reference():
-    """`the_mosaic_gradient_is_as_exact_as_its_reference` at a ragged length in bf16, its forward's memories
-    recomputed under a remat rung (`recomputing`)."""
-
-
 @pytest.mark.check1_shards(seeds=128, per_task=16)
 @interpreted_gradient('a decay a key dimension', 'bf16', 'kept')
 def test_a_bf16_gradient_under_a_decay_a_key_dimension_is_as_exact_as_its_reference():
@@ -254,15 +247,13 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
                     truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
 
 
-def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward():
-    """Kimi delta attention's gradient through the template (interpreted off a GPU) under the remat rung that
-    recomputes the forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse
-    the forward kept (row 3591), over one draw of its recorded site: bitwise the gradient its kept memories
-    give, whose check 1 against recorded fla holds both
-    (`the_mosaic_gradient_is_as_exact_as_its_reference`)."""
+@pytest.mark.parametrize('case', ['a ragged length', 'a decay a key dimension'])
+def test_a_recomputed_gradient_trains_as_its_kept_forward(case):
+    """The gradient through the template (interpreted off a GPU) under the remat rung that recomputes the
+    forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse the forward
+    kept (row 3591), over one draw of its recorded site: bitwise the gradient its kept memories give, whose
+    check 1 against recorded fla holds both (`the_mosaic_gradient_is_as_exact_as_its_reference`)."""
     from fla_sites import LEAVES, ruled, sites
-
-    case = 'a decay a key dimension'
     on = on_the_mainloop(case_hooks(case), case, jnp.bfloat16)
     arrays = sites()[recorded_site(case, jnp.bfloat16)].arrays(0)
 
