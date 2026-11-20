@@ -17,7 +17,7 @@ uses; the preview hook limits itself to the display count.
 from __future__ import annotations
 
 from abc import abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
@@ -259,6 +259,9 @@ def _trains_its_grid(source: PipelineSource, process, grid) -> bool:
 
 class DiffusionObjective(Objective[Ratio]):
     """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
+
+    untraced: ClassVar[Mapping[str, str]] = {
+        "_grid": "derived from `_inputs`' sample shape, which the key holds"}
 
     saved_task = TextToImage
     settings = ImageSettings

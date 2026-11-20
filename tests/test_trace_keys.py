@@ -411,3 +411,20 @@ def test_a_trainers_refit_traces_its_step_again_where_xlas_flags_change(monkeypa
         traced.append(sum(program.kind == "traced" for program in heard.programs))
     first, changed, unchanged = traced
     assert first > 0 and changed > 0 and unchanged == 0, traced
+
+
+def test_a_diffusion_objectives_process_and_grid_state_values(built_objectives):
+    """Each diffusion objective's process (its schedule and prediction transform, `ByValue`) states a value,
+    equal to a process of its settings built anew and to no other, and its grid's class is left out by name
+    (derived from its inputs' sample shape): what keeps it among `KEYLESS` is its inputs' encoders and,
+    guidance distillation's, its teacher (row 6297)."""
+    from dew.diffusion.presets import EDM, Flow, build_process
+    from dew.diffusion.process import Process
+
+    for name in sorted(KEYLESS):
+        objective, _ = built_objectives[name]()
+        assert {"process", "_grid"}.isdisjoint(unvalued(objective)), (name, unvalued(objective))
+    for preset, other in ((Flow(), Flow(shift=3.0)), (EDM(regime="pixel"), EDM(regime="latent"))):
+        built = build_process(preset)
+        assert isinstance(built, Process) and built == build_process(preset), preset
+        assert hash(built) == hash(build_process(preset)) and built != build_process(other), preset
