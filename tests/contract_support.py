@@ -310,7 +310,7 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
     8429's 300 s): the mesh's program is another, partitioned, whose floats no common bits hold
     (docs/design/testing.md), and a sum it counts twice fails by its own size. Where the cell set its own
     mesh, its orders already run under it."""
-    from arm_forms import as_given
+    from arm_forms import as_given, dew_path
     from jax.sharding import NamedSharding, PartitionSpec
     from reference_error import assert_as_exact, seeds_for
 
@@ -341,6 +341,8 @@ def _on_a_mesh(fn, primals, direction, cotangent, label: str, *, truth_fn, taken
         if draw is None:
             continue
 
+        # The same program off the mesh: one of Dew's own paths, an invariance claim (`dew_path`).
+        @dew_path
         def off(primals, direction, cotangent, name=name):
             return orders(fn, primals, direction, cotangent)[name]()
 

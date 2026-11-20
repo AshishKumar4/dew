@@ -12,7 +12,7 @@ import pytest
 from decision_support import decision_rows
 from flax import linen as nn
 from model_support import float64_twin
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, dew_path
 
 from dew.batch import PHASE, VALID_ROWS, Phase
 from dew.data.dataset import DataPartition
@@ -172,9 +172,10 @@ def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_wei
             return loss, grad
         return run
 
-
-    assert_as_exact(jax.jit(loss_of(weighed)), jax.jit(apart(model)), draw, "pass-weighed decision loss",
-                    seeds=PASS_SEEDS, truth_fn=jax.jit(apart(float64_twin(model), float64_twin(head))))
+    # Each pass's own model is Dew's (`dew_path`): an invariance claim, held against it compiled alike.
+    assert_as_exact(jax.jit(loss_of(weighed)), dew_path(jax.jit(apart(model))), draw,
+                    "pass-weighed decision loss", seeds=PASS_SEEDS,
+                    truth_fn=jax.jit(apart(float64_twin(model), float64_twin(head))))
 
 
 @pytest.mark.parametrize("loss", [False, True], ids=["metrics alone", "with the loss"])
