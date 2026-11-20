@@ -7,13 +7,17 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import enum
 import functools
+import json
 from collections.abc import Callable, Hashable, Sequence
 
 import jax
 from jax._src import config as jax_config
 
 from dew._cache import holding
+from dew._records import JSON
+from dew._stated import tree_shape
 from dew.algebra.program import replaying
 from dew.nn.kernels.options import OuterProgram, abstract_signature, held_context, owned_program
 
@@ -106,41 +110,30 @@ _TRACED: collections.OrderedDict[Hashable, TracedDraw] = collections.OrderedDict
 
 
 def held_signature[Tree](tree: Tree) -> Hashable:
-    """What a kept trace over `tree` is keyed by: its structure, every node's kind, its keys and its
-    children, an empty collection and a None among them (`_shape_of`), and its leaves' abstract signatures
-    (`abstract_signature`). Of a node's static data only what is a plain value (keys, names, numbers), its
-    kind for any other (an initializer's bound init, `Partial`'s function), so a trace held past its trainer
-    keeps none of what its nodes bind alive. Two trees of leaves alike under other keys (row 8989), or apart
-    only by an empty collection (row 9548: `{**variables, "batch_stats": {}}` replayed without it) are two
-    keys."""
-    return _shape_of((jax.tree.structure(tree),)), abstract_signature(jax.tree.leaves(tree))
+    """What a kept trace over `tree` is keyed by: its structure node by node (`dew._stated.tree_shape`), an
+    empty collection and a None among its nodes, each node's data as plain data (`_plainly`), and its leaves'
+    abstract signatures (`abstract_signature`). Two trees of leaves alike under other keys (row 8989), or
+    apart only by an empty collection (row 9548: `{**variables, "batch_stats": {}}` replayed without it),
+    are two keys; a node's data that is no plain value (`Partial`'s bound function) by its kind alone, so
+    a trace held past its trainer keeps none of what its nodes bind alive."""
+    shape = tree_shape(jax.tree.structure(tree), "a kept draw's held tree", _plainly)
+    return json.dumps(shape, sort_keys=True), abstract_signature(jax.tree.leaves(tree))
 
 
-_Structure = tuple[jax.tree_util.PyTreeDef]
-"""A tree's structure in a one-element tuple: JAX declares `PyTreeDef` as a value, which a type admits only
-inside another (`dew.nn.kernels.options._Structure`)."""
-
-
-def _shape_of(held: _Structure) -> Hashable:
-    """A tree's structure (`_Structure`) as a value of plain data alone: each node its kind, its static data
-    as plain data (`_static`) and its children's, a leaf none."""
-    (structure,) = held
-    node = structure.node_data()
-    if node is None:
-        return None
-    kind, static = node
-    return (kind.__module__, kind.__qualname__, _static(static),
-            tuple(_shape_of((child,)) for child in structure.children()))
-
-
-def _static(value: Hashable | list[Hashable]) -> Hashable:
-    """A node's static data as plain data: None, a truth value, a number or a string as itself, a sequence
-    of them (a mapping's keys) as a tuple, anything else (a bound function) as its kind's name alone."""
+def _plainly(value: Hashable | list[Hashable], *, at: str) -> JSON:
+    """A node's kind or data as a kept draw's key states it (`held_signature`): a class by its path, an enum
+    member by its class's path and its name, a number, a string, a truth value or None as itself, a sequence
+    (a mapping's keys) item by item; anything else by its kind's path alone."""
+    del at
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
+    if isinstance(value, enum.Enum):
+        return [_plainly(type(value), at=""), value.name]
     if isinstance(value, list | tuple):
-        return tuple(_static(part) for part in value)
+        return [_plainly(part, at="") for part in value]
     if value is None or isinstance(value, bool | int | float | str):
         return value
-    return type(value).__qualname__
+    return _plainly(type(value), at="")
 
 
 def traced_draw[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array], Built], held: Tree,
