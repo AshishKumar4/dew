@@ -2114,15 +2114,20 @@ def test_a_streamed_token_mix_of_stated_counts_draws_as_its_indexed_read(tmp_pat
     states (row 9010: the streams kept a deficit of the targets they read, whatever their members stated)."""
     members = [published_tokens(tmp_path, "short", 1), published_tokens(tmp_path, "long", 2)]
 
-    def ids(read: str, chains: list[Pipeline]) -> list[int]:
-        mixed = mix(chains, weights=[1, 3], by="tokens")
-        reader = compile(mixed.repeat().batch(1), read=read, loading=READ).train(DataPartition())
+    from dew.data.analysis import STATED_SHARES
+
+    def read(how: str, chains: list[Pipeline]) -> tuple[list[int], str]:
+        loader = compile(mix(chains, weights=[1, 3], by="tokens").repeat().batch(1), read=how, loading=READ)
+        reader = loader.train(DataPartition())
         try:
-            return [int(identity) for batch in itertools.islice(reader, 40) for identity in batch["id"]]
+            ids = [int(identity) for batch in itertools.islice(reader, 40) for identity in batch["id"]]
         finally:
             reader.close()
+        assert loader.plan is not None
+        return ids, str(loader.plan.order["shares"])
 
-    assert ids("streamed", [member.prefetch() for member in members]) == ids("indexed", members)
+    streamed, shares = read("streamed", [member.prefetch() for member in members])
+    assert shares == STATED_SHARES and streamed == read("indexed", members)[0]
 
 
 TEXTS = {"short": " ".join(["short"] * 3), "long": " ".join(["long"] * 10)}
