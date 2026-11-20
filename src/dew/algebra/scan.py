@@ -775,7 +775,7 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
     (`inverse_merge`), an application (`apply`) and a write's `Kᵀ V` (`carry`). A token loop's reads are
     apart from its group's writes where `apart` (`Scan.group`). Where the form decays the state along its
     values (`across`), its decays along them are the tokens' exponents "E"'s (`_decays`, `exp2` where
-    `base2`), formed once (`known`'s "across")."""
+    `base2`; `linear_scan.Chunk.across_prefix`), and its token loop's each token's own."""
     issue = issue or _issued
     from egglog import get_callable_args
 
@@ -788,24 +788,21 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
         return _evaluated(child, tokens, decays, h, known, issue, values_read=values_read, apart=apart,
                           base2=base2, across=across)
 
-    def valued() -> _Decays:
-        if "across" not in known:
-            known["across"] = _decays(tokens["E"], base2)
-        return known["across"]
-
     if (args := get_callable_args(node, Chunk.token)) is not None:
         value = tokens[terms.text(args[0])]
     elif get_callable_args(node, Chunk.entering) is not None:
         value = h
     elif (args := get_callable_args(node, Chunk.decay)) is not None:
         value = getattr(decays, terms.text(args[0]))
+    elif get_callable_args(node, Chunk.across_prefix) is not None:
+        value = _decays(tokens["E"], base2)
     elif (args := get_callable_args(node, Chunk.across)) is not None:
-        value = getattr(valued(), terms.text(args[0]))
+        value = getattr(of(args[1]), terms.text(args[0]))
     elif (args := get_callable_args(node, Chunk.loop)) is not None:
         value = _looped(tokens, decays, h, of(args[0]), corrected=True, values_read=values_read, apart=apart)
     elif (args := get_callable_args(node, Chunk.plain)) is not None:
         value = _looped(tokens, decays, h, of(args[0]), corrected=False, values_read=values_read,
-                        apart=apart, across=valued() if across else None)
+                        apart=apart, across=_exp(base2, tokens["E"]) if across else None)
     elif (args := get_callable_args(node, Chunk.pair)) is not None:
         value = (of(args[0]), of(args[1]))
     elif (args := get_callable_args(node, Chunk.outputs)) is not None:
@@ -817,6 +814,9 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
                         apart=terms.integer(args[2]))
     elif (args := get_callable_args(node, Chunk.spread)) is not None:
         value = spread(of(args[0]), of(args[1]), of(args[2]), of(args[3]), issue=issue)
+    elif (args := get_callable_args(node, Chunk.weighed)) is not None:
+        # Each pair's score times the earlier token's values decayed to the reader along them, summed.
+        value = _each_decayed(of(args[0]), of(args[1]), of(args[2]), issue)
     elif (args := get_callable_args(node, Chunk.applied)) is not None:
         value = issue("apply", of(args[1]), of(args[0]).T)
     elif (value := _elementwise(node, of)) is not None:
@@ -841,8 +841,8 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
 
 
 def _elementwise(node, of: Callable):
-    """`node`'s value where it is elementwise in its operands (`of`'s values) or a decay's scaling of them, a
-    pair's values decayed along them (`weighed`) among them; None for any other."""
+    """`node`'s value where it is elementwise in its operands (`of`'s values) or a decay's scaling of them;
+    None for any other."""
     from egglog import get_callable_args
 
     Chunk = linear_scan.Chunk
@@ -866,14 +866,11 @@ def _elementwise(node, of: Callable):
         return of(args[1])[:, None] * of(args[0])
     if (args := get_callable_args(node, Chunk.columns)) is not None:
         return of(args[0]) * of(args[1])[None, :]
-    if (args := get_callable_args(node, Chunk.weighed)) is not None:
-        # Each pair's score times the earlier token's values decayed to the reader along them, summed.
-        return _portable_einsum("ij,jv,ijv->iv", of(args[0]), of(args[1]), of(args[2]))
     return None
 
 
 def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, values_read: bool = False,
-            apart: int = 0, across: _Decays | None = None):
+            apart: int = 0, across=None):
     """The token loop over the chunk, a scan of one token's step (its decay `exp(z_t)` the pair of it and the
     token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs, a row a token, and the state
     it leaves, each token's read apart from its group's writes where `apart` (`Scan.group`). Split by its
@@ -882,10 +879,8 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
     count = B.shape[0]
     between = decays.between[jnp.arange(1, count), jnp.arange(count - 1)]
     stepped = jnp.concatenate([decays.entering[:1], between])
-    # A decay along the values too (`across`), each token's own, the pair of it and the token before.
-    valued = (jnp.ones((count, values.shape[-1]), stepped.dtype) if across is None else
-              jnp.concatenate([across.entering[:1], across.between[jnp.arange(1, count),
-                                                                   jnp.arange(count - 1)]]))
+    # A decay along the values too (`across`, each token's own gates `[C, V]`).
+    valued = jnp.ones((count, values.shape[-1]), stepped.dtype) if across is None else across
     # The state carried in the type its first step leaves it in: operands wider than it widen it (a float32
     # state's walk over float64 operands, x64's).
     h = h.astype(jnp.result_type(h, stepped, B, values, *((s, C) if corrected else ())))
@@ -1087,8 +1082,6 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
     through a decay that underflows to zero, each key's within a sub-chunk and a pair's whole across one:
     the term the recurrence decays to its range there, which float32's scores-then-decay order cannot form,
     where infinity times that zero was NaN (rows 9547 and train 1079's review F1). A NaN read reads NaN."""
-    from dew.nn.kernels import recurrence_algebra
-
     issue = issue or _issued
     active, scalar = jnp.any(~_crossed(between), axis=-1), between.shape[-1] == 1
     reads = jnp.where(active, issue("scores", readers, values.T), 0.0)
@@ -1099,20 +1092,33 @@ def spread(readers, values, keys, between, *, weights=None, issue: Callable | No
         reads = reads * weights
     if scalar:
         return issue("apply", reads * between[..., 0], keys)
-    count = keys.shape[0]
+    return _each_decayed(reads, keys, between, issue)
+
+
+def _each_decayed(reads, rows, between, issue: Callable):
+    """`sum_{j <= i} reads_ij rows_jk between_ijk` `[C, K]`: pairs' reads `[C, C]` applied to the earlier
+    tokens' `rows` `[C, K]`, each column decayed to the reader by its own `between` `[C, C, K]` (`spread`'s
+    keys, `weighed`'s values along a decay across them), factored around each sub-chunk's reference
+    (`recurrence_algebra.SUB`): an earlier sub-chunk's rows decayed to the reference `p` before the row's
+    sub-chunk and applied (`_read_earlier`), the row's decay from it after, each factor at most 1, which keeps
+    a pair whose whole decay underflows; a sub-chunk's own pairs elementwise, an overflowed read zero at each
+    column its decay underflows (`_kept`)."""
+    from dew.nn.kernels import recurrence_algebra
+
+    count = rows.shape[0]
     sub = recurrence_algebra.SUB
-    rows = []
+    found = []
     for first in range(0, count, sub):
         own = slice(first, min(first + sub, count))
-        row = _portable_einsum("ijk,jk,ijk->ik", _kept(reads[own, own], between[own, own]), keys[own],
+        row = _portable_einsum("ijk,jk,ijk->ik", _kept(reads[own, own], between[own, own]), rows[own],
                                between[own, own])
         if first:
             reference = first - 1
-            earlier = _read_earlier(reads[own, :first], keys[:first] * between[reference, :first],
+            earlier = _read_earlier(reads[own, :first], rows[:first] * between[reference, :first],
                                     between[own, :first], issue)
             row = row + between[own, reference] * earlier
-        rows.append(row)
-    return jnp.concatenate(rows, axis=0)
+        found.append(row)
+    return jnp.concatenate(found, axis=0)
 
 
 def _kept(reads, between):

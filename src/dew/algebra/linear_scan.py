@@ -514,10 +514,14 @@ class Chunk(Expr):
     `gamma_last`, "between" each pair's, each an exponential of the shared `prefix` (`decayed_by`)."""
 
     @classmethod
-    def across(cls, part: StringLike) -> Chunk: ...
-    """The chunk's decays along the state's values (`Parts.across`; `scan._Decays` of the tokens'
-    exponents along them, the token "E"): "entering", "to_last", "whole", "between" as `decay`'s, each a
-    value's."""
+    def across_prefix(cls) -> Chunk: ...
+    """The compensated prefix of the tokens' exponents along the state's values (`Parts.across`, the token
+    "E"), as `prefix` the keys'."""
+
+    @classmethod
+    def across(cls, part: StringLike, prefix: Chunk) -> Chunk: ...
+    """The chunk's decays along the state's values (`scan._Decays` of `prefix`, `across_prefix`):
+    "entering", "to_last", "whole", "between" as `decay`'s, each a value's."""
 
     @classmethod
     def loop(cls, values: Chunk) -> Chunk: ...
@@ -609,6 +613,11 @@ def decayed_by(part: str) -> Chunk:
     return Chunk.decay(part, Chunk.prefix())
 
 
+def across_by(part: str) -> Chunk:
+    """The chunk's decay `part` along the state's values (`Chunk.across`) of the shared prefix."""
+    return Chunk.across(part, Chunk.across_prefix())
+
+
 def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: int = 0,
                 across: bool = False):
     """The identities of the module's account, `wy` where tokens correct the state. A `scalar` decay's
@@ -644,10 +653,10 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: 
                       "chunk form here")
     scores = Chunk.gram(queries, Chunk.token("B"), apart, between)
     if across:
-        local = Chunk.weighed(scores, given, Chunk.across("between"))
-        memory = memory.times(Chunk.across("entering"))
-        carried = Chunk.columns(Chunk.decayed(h, decayed_by("whole")), Chunk.across("whole"))
-        written = given.times(Chunk.across("to_last"))
+        local = Chunk.weighed(scores, given, across_by("between"))
+        memory = memory.times(across_by("entering"))
+        carried = Chunk.columns(Chunk.decayed(h, decayed_by("whole")), across_by("whole"))
+        written = given.times(across_by("to_last"))
     else:
         local = (Chunk.spread(queries, given, Chunk.token("B"), between) if values_read
                  else scores.matmul(given))
@@ -740,8 +749,9 @@ def _leaves(extents: Extents) -> list:
               Chunk.token("U"): (c, v), Chunk.token("R"): (c, out), Chunk.token("s"): (c, 1),
               Chunk.entering(): (k, v), Chunk.prefix(): (c, d), decayed_by("entering"): (c, d),
               decayed_by("to_last"): (c, d), decayed_by("whole"): (d, 1), decayed_by("between"): (c, c),
-              **({Chunk.token("E"): (c, v), Chunk.across("entering"): (c, v), Chunk.across("to_last"): (c, v),
-                  Chunk.across("whole"): (v, 1), Chunk.across("between"): (c, c)} if extents.across else {})}
+              **({Chunk.token("E"): (c, v), Chunk.across_prefix(): (c, v), across_by("entering"): (c, v),
+                  across_by("to_last"): (c, v), across_by("whole"): (v, 1), across_by("between"): (c, c)}
+                 if extents.across else {})}
     return [fact for value, (rows, columns) in shapes.items()
             for fact in (set_(rows_of(value)).to(i64(rows)), set_(columns_of(value)).to(i64(columns)))]
 
@@ -834,7 +844,7 @@ CONSTRUCTORS = (
     Chunk.token, Chunk.entering, Chunk.prefix, Chunk.decay, Chunk.loop, Chunk.plain, Chunk.pair,
     Chunk.outputs, Chunk.state, Chunk.gram, Chunk.spread, Chunk.applied, Chunk.rows, Chunk.times,
     Chunk.matmul, Chunk.plus, Chunk.minus, Chunk.decayed, Chunk.written, Chunk.solve, Chunk.doubled,
-    Chunk.substituted, Chunk.across, Chunk.weighed, Chunk.columns)
+    Chunk.substituted, Chunk.across_prefix, Chunk.across, Chunk.weighed, Chunk.columns)
 """Every constructor of the chunk's language, as `get_callable_args` matches a node."""
 
 
@@ -854,12 +864,13 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
         # A token's step: the state decayed, read by its correction (a contraction over keys) and corrected,
         # written, and read out, each over the state's keys and values; its dependent steps a reduction and
         # the update that reads it (two launches a token on XLA's path).
-        per_token = k * v * (6.0 if corrected else 3.0) + 2.0 * k * v
+        # A decay along the values too scales the state's columns, each token's gates its own (`across`).
+        per_token = k * v * (6.0 if corrected else 3.0) + 2.0 * k * v + (k * v if extents.across else 0.0)
         # Its states a token: the state, and where a token reads apart from its group's writes the state its
         # group entered too (`scan._looped`'s `held`), a group of one token's the current state's.
         states = 2 if extents.apart > 1 else 1
-        return Work(operations=c * per_token, exponentials=c * d, span=2.0 * c,
-                    kept_bytes=kept(c * states * k * v))
+        return Work(operations=c * per_token, exponentials=c * (d + (v if extents.across else 0)),
+                    span=2.0 * c, kept_bytes=kept(c * states * k * v))
     if get_callable_args(node, Chunk.prefix) is not None:
         # The compensated prefix (`scan._decays`): one pass over the tokens' exponents, one kernel.
         return Work(operations=12.0 * c * d, kernels=1.0, kept_bytes=kept(c * d))
@@ -880,11 +891,14 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
                         else Work(operations=3.0 * c * c * k, kernels=1.0, kept_bytes=kept(c * k)))
     if get_callable_args(node, Chunk.applied) is not None:
         return product(c, v, k)
+    if get_callable_args(node, Chunk.across_prefix) is not None:
+        # The values' compensated prefix, as `prefix`'s over the keys: one pass, one kernel.
+        return Work(operations=12.0 * c * v, kernels=1.0, kept_bytes=kept(c * v))
     if (args := get_callable_args(node, Chunk.across)) is not None:
-        # Along the values, as `decay`'s along the keys: its pairs' exponentials of its prefix's differences.
+        # Its pairs' exponentials of the values' prefix's differences, fused with its pass, as `decay`'s.
         part = terms.text(args[0])
         elements = {"entering": c * v, "to_last": c * v, "whole": v, "between": c * c * v}[part]
-        return Work(operations=13.0 * elements, exponentials=elements, kept_bytes=kept(elements))
+        return Work(operations=elements, exponentials=elements)
     if get_callable_args(node, Chunk.weighed) is not None:
         # Each pair's score times its values decayed along them, summed over the earlier tokens.
         return Work(operations=3.0 * c * c * v, kernels=1.0, kept_bytes=kept(c * v))
