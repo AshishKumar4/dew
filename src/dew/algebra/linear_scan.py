@@ -154,6 +154,13 @@ class Affine(Expr):
                   correction: Token) -> Affine: ...
     """`D h + left (right + correction^T (D h))^T`: an input and the corrections along one vector."""
 
+    @classmethod
+    def erased_before(cls, base2: i64Like, per_key: i64Like, exponent: Token, erase: Token, correction: Token,
+                      left: Token, right: Token) -> Affine: ...
+    """`D h + erase (correction^T h)^T + left right^T`: an erase along its own vector reading the state the
+    token enters beside a write along another (RWKV7's, `D S - (kk a) (kk^T S) + k v^T`), a rank-two token
+    one triangular system solves (`_identities`' `erased`), where the shared-left form lays two."""
+
     @method(cost=2)
     @classmethod
     def corrected_before(cls, base2: i64Like, per_key: i64Like, exponent: Token, left: Token, right: Token,
@@ -184,7 +191,7 @@ _MINUS_ONE = Token.scalar(Token.literal(-1.0))
 
 def _token_rules():
     """The algebra's identities, freeness, and the affine forms (the module's account)."""
-    a, b, c, m, x, z, t = vars_("a b c m x z t", Token)
+    a, b, c, e, m, x, z, t = vars_("a b c e m x z t", Token)
     (index,), (number,) = vars_("index", i64), vars_("number", f64)
     h = Token.state()
     found = [
@@ -232,6 +239,10 @@ def _token_rules():
                 rule(eq(t).to(decayed.plus(Token.column(a).times(Token.row(b.plus(Token.read(c, h)))))),
                      free(z), free(a), free(b), free(c)).then(
                     union(form_of(t)).with_(Affine.corrected_before(base2, per_key, z, a, b, c))),
+                rule(eq(t).to(decayed.plus(Token.column(e).times(Token.row(Token.read(c, h))))
+                              .plus(Token.column(a).times(Token.row(b)))),
+                     free(z), free(a), free(b), free(c), free(e)).then(
+                    union(form_of(t)).with_(Affine.erased_before(base2, per_key, z, e, c, a, b))),
             ]
     found += [rule(eq(t).to(Token.read(a, h)), free(a)).then(
                   union(form_of(t)).with_(Affine.readout(a, Token.zero()))),
@@ -270,6 +281,9 @@ class Parts:
     reader_scale: float | np.floating = 1.0
     across: Token | None = None
     before: bool = False
+    erase: Token | None = None
+    """An erase's own vector beside the write's (`Affine.erased_before`: `erase (correction^T h)^T`, its
+    corrections reading the state the token enters), None where the corrections run along `left`."""
 
 
 def _chain(traced: Program) -> int:
@@ -300,7 +314,11 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
     stopped = (f" (its saturation stopped at its limits, {limits[0]} nodes and {limits[1]} iterations, short "
                f"of its fixpoint)" if saturated.limited else "")
     made, read = graph.extract(form_of(made)), graph.extract(form_of(read))
-    before = get_callable_args(made, Affine.corrected_before)
+    erase = None
+    if (erased := get_callable_args(made, Affine.erased_before)) is not None:
+        base2, per_key, exponent, erase, correction, left, right = erased
+        erased = (base2, per_key, exponent, left, right, correction)
+    before = erased if erased is not None else get_callable_args(made, Affine.corrected_before)
     corrected = before if before is not None else get_callable_args(made, Affine.corrected)
     args = corrected if corrected is not None else get_callable_args(made, Affine.decayed)
     across = None
@@ -326,7 +344,7 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
     return Parts(update, readout, tuple(atoms), bool(terms.integer(base2)),
                  bool(terms.integer(per_key)), exponent, left, right,
                  correction[0] if correction else None, reader, free, values_read=values_read,
-                 reader_scale=reader_scale, across=across, before=before is not None)
+                 reader_scale=reader_scale, across=across, before=before is not None, erase=erase)
 
 
 def _reader_scale(reader: Token, atoms: list, dtype: np.dtype) -> tuple[Token, float | np.floating]:
@@ -633,7 +651,7 @@ def across_by(part: str) -> Chunk:
 
 
 def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: int = 0,
-                across: bool = False, before: bool = False):
+                across: bool = False, before: bool = False, erased: bool = False):
     """The identities of the module's account, `wy` where tokens correct the state. A `scalar` decay's
     memory is read and then decayed, `(Q h) exp(G)`, as the template's output (`recurrence_algebra.
     chunk_output`): a memory past fp32's range reads finite, within 2.5 times the fp32 recurrence's distance
@@ -645,7 +663,10 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: 
     `across` the state's values (`Parts.across`) decays each read pair's values to the reader along them
     (`weighed`), the entering state's reads and the state left along its values too (`columns`). Corrections
     reading the state a token enters, `before` its decay (`Parts.before`), read each earlier write and the
-    entering state through the decays up to the token before (`entering_before`, `between_before`)."""
+    entering state through the decays up to the token before (`entering_before`, `between_before`); an erase
+    along a vector of its own beside the write's (`erased`, `Parts.erase`: `D h - s A (C^T h)^T + B U^T`)
+    solves its erased values `W` in one system, `(I + s gram(C, A)) W = s (C entering) h + s gram(C, B) U`,
+    its writes known, and its outputs and state are both rank-one sums, the writes' less the erases'."""
     values = Chunk.token("U")
     given, other, lower, left, right = vars_("given other lower left right", Chunk)
     h = Chunk.entering()
@@ -656,7 +677,7 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: 
     else:
         memory = queries.matmul(h).times(entering) if scalar else queries.times(entering).matmul(h)
     found = []
-    if corrects:
+    if corrects and not erased:
         read, through = ((decayed_by("entering_before"), decayed_by("between_before")) if before
                          else (entering, between))
         system = Chunk.gram(Chunk.token("C"), Chunk.token("B"), 1, through).rows(Chunk.token("s"))
@@ -669,6 +690,9 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: 
     if across and (corrects or values_read):
         raise Refused("a decay along the state's values beside corrections or a readout along them has no "
                       "chunk form here")
+    if erased and (values_read or apart):
+        raise Refused("an erase along a vector of its own beside a readout along the values or apart from "
+                      "its group's writes has no chunk form here")
     scores = Chunk.gram(queries, Chunk.token("B"), apart, between)
     if across:
         local = Chunk.weighed(scores, given, across_by("between"))
@@ -679,6 +703,20 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False, apart: 
         local = (Chunk.spread(queries, given, Chunk.token("B"), between) if values_read
                  else scores.matmul(given))
         carried, written = Chunk.decayed(h, decayed_by("whole")), given
+    if erased:
+        erase, strength, through = Chunk.token("A"), Chunk.token("s"), decayed_by("between_before")
+        system = Chunk.gram(Chunk.token("C"), erase, 1, through).rows(strength)
+        erased_values = Chunk.solve(system, Chunk.token("C").times(decayed_by("entering_before")).rows(
+            strength).matmul(h).plus(Chunk.gram(Chunk.token("C"), Chunk.token("B"), 1, through).rows(
+                strength).matmul(values)))
+        found += [
+            rewrite(Chunk.loop(values)).to(Chunk.pair(
+                memory.plus(scores.matmul(values)).minus(Chunk.gram(queries, erase, apart, between).matmul(
+                    erased_values)).plus(Chunk.token("R")),
+                carried.plus(Chunk.written(Chunk.token("B"), values, decayed_by("to_last"))).minus(
+                    Chunk.written(erase, erased_values, decayed_by("to_last"))))),
+            rewrite(Chunk.solve(lower, other.matmul(h).plus(given))).to(
+                Chunk.solve(lower, other).matmul(h).plus(Chunk.solve(lower, given)))]
     found += [
         rewrite(Chunk.plain(given)).to(Chunk.pair(
             memory.plus(local).plus(Chunk.token("R")),
@@ -709,6 +747,8 @@ class Extents:
     """Whether its update decays the state along its values too (`Parts.across`)."""
     before: bool = False
     """Whether its corrections read the state a token enters, before its decay (`Parts.before`)."""
+    erased: bool = False
+    """Whether its corrections erase along a vector of their own beside the write's (`Parts.erase`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -724,6 +764,8 @@ class Form:
     """Its extents' `across`, by which its token loop decays the state along its values too."""
     before: bool = False
     """Its extents' `before`, by which its token loop's corrections read the state a token enters."""
+    erased: bool = False
+    """Its extents' `erased`, by which its token loop's corrections erase along their own vector."""
 
 
 @function(merge=lambda old, new: old)
@@ -773,6 +815,7 @@ def _leaves(extents: Extents) -> list:
               decayed_by("to_last"): (c, d), decayed_by("whole"): (d, 1), decayed_by("between"): (c, c),
               **({decayed_by("entering_before"): (c, d), decayed_by("between_before"): (c, c)}
                  if extents.before else {}),
+              **({Chunk.token("A"): (c, k)} if extents.erased else {}),
               **({Chunk.token("E"): (c, v), Chunk.across_prefix(): (c, v), across_by("entering"): (c, v),
                   across_by("to_last"): (c, v), across_by("whole"): (v, 1), across_by("between"): (c, c)}
                  if extents.across else {})}
@@ -797,7 +840,7 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
     sized = program.node_count(graph)
     saturated = program.run_within(
         graph, _identities(corrects, extents.decay_keys == 1, extents.values_read, extents.apart,
-                           extents.across, extents.before) | _shapes(extents),
+                           extents.across, extents.before, extents.erased) | _shapes(extents),
         saturation.sized(sized, _depth(root)), "a scan's chunk")
 
     def marginal(egraph: EGraph, node) -> cost.Seconds:
@@ -814,7 +857,7 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
     shape_of = functools.partial(_shape_of, graph)
     price = cost.Seconds(_priced((outputs, state), extents, shape_of, precision), schedule)
     kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, price.value))
-    return Form(outputs, state, price, extents.apart, extents.across, extents.before)
+    return Form(outputs, state, price, extents.apart, extents.across, extents.before, extents.erased)
 
 
 def _shape_of(graph: EGraph, value: Chunk) -> tuple[int, int]:

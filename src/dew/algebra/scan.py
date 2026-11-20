@@ -203,7 +203,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         tokens, entering = _read_entering(read, chunk, dict(zip(TOKENS, values, strict=True)))
         apart = _apart(declaration, affine, tokens["B"].shape[0])
         extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1],
-                                      affine.values_read, apart, affine.across is not None, affine.before)
+                                      affine.values_read, apart, affine.across is not None, affine.before,
+                                      affine.erase is not None)
         corrected = affine.correction is not None
         form = _form(extents, corrected, saturation)
         # The form's largest values that read no state, prepared with the chunk's decays and tokens: the
@@ -213,7 +214,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         # A split is priced and traced where it is derived (`derive.context`): one derived under another
         # target, precision, numerics or mesh is none of this one's.
         key = (derive.context(), affine.base2, corrected, affine.values_read, apart, extents.across,
-               extents.before, *((value.shape, str(value.dtype)) for value in given))
+               extents.before, extents.erased, *((value.shape, str(value.dtype)) for value in given))
         split = _cache.holding(splits, key, lambda: _split(
             declaration, names, chunk, affine, form, tuple(held), given, jax.ShapeDtypeStruct(shape, carried),
             extents.tokens, saturation), splits_held)
@@ -351,8 +352,8 @@ def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping
 
 def _with_reader_scale(affine, parts: tuple) -> tuple:
     """The chunk forms' reader includes its scalar, as their products and range bounds read it."""
-    exponent, b, u, strength, c, q, r, across = parts
-    return exponent, b, u, strength, c, affine.reader_scale * q, r, across
+    exponent, b, u, strength, c, q, r, across, erase = parts
+    return exponent, b, u, strength, c, affine.reader_scale * q, r, across, erase
 
 
 def _windowed(parts: tuple, window) -> tuple:
@@ -394,7 +395,7 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
 
     def token(carry, step):
         h, apart, index = carry
-        z, b, u, strength, c, q, r, across = _at_token(declaration, names, affine, step)
+        z, b, u, strength, c, q, r, across, erase = _at_token(declaration, names, affine, step)
         # A token that reads the state entering it (`Scan.reads`) reads it before its decay and its write: a
         # reset's zero, any other's whole, a decay that vanishes at this token erasing nothing it reads.
         entering = None
@@ -420,7 +421,10 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             # (`u - s corr`), its low digits were rounded into the write's magnitude before it met the
             # state it cancels (a packed additive erase's gradient 3.2 times the token loop's, jsf-addpack).
             correction = jnp.sum(c[:, None] * h, axis=0)
-            h = (h * decay[:, None] - b[:, None] * (strength * correction)[None, :]) + b[:, None] * u[None, :]
+            # An erase along its own vector (`linear_scan.Parts.erase`) where the token has one, else its
+            # write's, each its own outer product.
+            erased = (erase if affine.erase is not None else b)[:, None] * (strength * correction)[None, :]
+            h = (h * decay[:, None] - erased) + b[:, None] * u[None, :]
             output = _read(h, q, affine.values_read, affine.reader_scale) + r
         elif not affine.per_key:
             correction = jnp.sum(c[:, None] * h, axis=0)
@@ -612,9 +616,10 @@ def _transition(prepared: Prepared, h: jax.Array) -> jax.Array:
     return columns.reshape(keys, blocks * width)[:, :keys]
 
 
-TOKENS = ("B", "U", "s", "C", "Q", "R", "E")
+TOKENS = ("B", "U", "s", "C", "Q", "R", "E", "A")
 """A token's values (`_token`'s), as the chunk's form names them (`linear_scan.Chunk.token`): "E" its
-exponents along the state's values (`linear_scan.Parts.across`), zero where its update decays none."""
+exponents along the state's values (`linear_scan.Parts.across`), zero where its update decays none; "A" its
+erase's own vector (`linear_scan.Parts.erase`), zero where its corrections run along "B"."""
 
 
 def _form(extents: linear_scan.Extents, corrected: bool,
@@ -745,9 +750,11 @@ def _chunk(form: linear_scan.Form, held: tuple, values_read: bool, base2: bool, 
     # The language's own products (`_plain`), which the split's forms name and issue themselves
     # (`carry.split`'s roles): a declared product's tangent in this trace reads the state opaquely.
     return (_evaluated(form.outputs, tokens, decays, h, known, _plain, values_read=values_read,
-                       apart=form.apart, base2=base2, across=form.across, before=form.before),
+                       apart=form.apart, base2=base2, across=form.across, before=form.before,
+                       erased=form.erased),
             _evaluated(form.state, tokens, decays, h, known, _plain, values_read=values_read,
-                       apart=form.apart, base2=base2, across=form.across, before=form.before))
+                       apart=form.apart, base2=base2, across=form.across, before=form.before,
+                       erased=form.erased))
 
 
 def _plain(name: str, left, right):
@@ -774,7 +781,7 @@ def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays, issue: C
 
 def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Callable | None = None, *,
                values_read: bool = False, apart: int = 0, base2: bool = False, across: bool = False,
-               before: bool = False):
+               before: bool = False, erased: bool = False):
     """A node of the chunk's language (`linear_scan.Chunk`) at the chunk's tokens, decays and entering state
     `h`, each node once (`known`, by node), each matrix product `issue(role, lhs, rhs)`'s (`_issued`, Dew's,
     where none is given): a pair's scores (`scores`) or a strict gram (`gram`), the inverse's doubling
@@ -793,7 +800,7 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
 
     def of(child):
         return _evaluated(child, tokens, decays, h, known, issue, values_read=values_read, apart=apart,
-                          base2=base2, across=across, before=before)
+                          base2=base2, across=across, before=before, erased=erased)
 
     if (args := get_callable_args(node, Chunk.token)) is not None:
         value = tokens[terms.text(args[0])]
@@ -807,7 +814,7 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Ca
         value = getattr(of(args[1]), terms.text(args[0]))
     elif (args := get_callable_args(node, Chunk.loop)) is not None:
         value = _looped(tokens, decays, h, of(args[0]), corrected=True, values_read=values_read, apart=apart,
-                        before=before)
+                        before=before, erased=erased)
     elif (args := get_callable_args(node, Chunk.plain)) is not None:
         value = _looped(tokens, decays, h, of(args[0]), corrected=False, values_read=values_read,
                         apart=apart, across=_exp(base2, tokens["E"]) if across else None)
@@ -881,13 +888,15 @@ def _elementwise(node, of: Callable):
 
 
 def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, values_read: bool = False,
-            apart: int = 0, across=None, before: bool = False):
+            apart: int = 0, across=None, before: bool = False, erased: bool = False):
     """The token loop over the chunk, a scan of one token's step (its decay `exp(z_t)` the pair of it and the
     token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs, a row a token, and the state
     it leaves, each token's read apart from its group's writes where `apart` (`Scan.group`), its corrections
-    reading the state it enters where `before` (`linear_scan.Parts.before`). Split by its construction
-    (`_looped_split`), never unrolled into an e-graph."""
+    reading the state it enters where `before` (`linear_scan.Parts.before`), erasing along their own vector
+    where `erased` (`linear_scan.Parts.erase`). Split by its construction (`_looped_split`), never unrolled
+    into an e-graph."""
     B, s, C, Q, R = (tokens[name] for name in ("B", "s", "C", "Q", "R"))
+    A = tokens["A"] if erased else B
     count = B.shape[0]
     between = decays.between[jnp.arange(1, count), jnp.arange(count - 1)]
     stepped = jnp.concatenate([_scaled(1.0, jax.tree.map(lambda x: x[:1], decays.entering)), between])
@@ -899,7 +908,7 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
 
     def step(carry, token):
         h, held, index = carry
-        decay, b, strength, c, q, r, value, along = token
+        decay, b, strength, c, q, r, value, along, a = token
         # Apart from its group's writes: the state its group entered, decayed by every token since it.
         held = decay[:, None] * (jnp.where(index % apart == 0, h, held) if apart else h)
         # Read before the decay where the token's corrections read the state it enters, a cut key's (a
@@ -908,14 +917,14 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
                    else None)
         h = decay[:, None] * h * along[None, :]
         if corrected:
-            h = h - strength * b[:, None] * (_portable(c[None, :], h) if entered is None else entered)
+            h = h - strength * a[:, None] * (_portable(c[None, :], h) if entered is None else entered)
         h = h + b[:, None] * value[None, :]
         read_from = held if apart else h
         read = (_portable(read_from, q[:, None])[:, 0] if values_read
                 else _portable(q[None, :], read_from)[0])
         return (h, held, index + 1), read + r
 
-    (h, _, _), outputs = lax.scan(step, (h, h, 0), (stepped, B, s, C, Q, R, values, valued))
+    (h, _, _), outputs = lax.scan(step, (h, h, 0), (stepped, B, s, C, Q, R, values, valued, A))
     return outputs, h
 
 
@@ -959,7 +968,8 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     exponent = along(parts.exponent, keys if parts.per_key else 1)
     reader, out = (values, keys) if parts.values_read else (keys, values)
     across = jnp.zeros((values,), carried) if parts.across is None else along(parts.across, values)
-    return exponent, B, U, s, C, along(parts.reader, reader), along(parts.free, out), across
+    erase = jnp.zeros_like(B) if parts.erase is None else along(parts.erase, keys)
+    return exponent, B, U, s, C, along(parts.reader, reader), along(parts.free, out), across, erase
 
 
 @functools.cache

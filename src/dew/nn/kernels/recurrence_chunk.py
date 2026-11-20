@@ -164,20 +164,23 @@ class Chunk(recurrence.Gated):
 
 
 def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict, starts, firsts):
-    """A call erasing with vectors of its own (`recurrence.Hooks.erase` 'untied' or 'additive') as two tokens
-    of the delta rule's algebra a token, each of one rank-one write corrected along its own vector
-    (`_delta_forms`' `corrected_by`): the first the token's decay and its erase, keys `a`, values zero and
-    reader `c = -b`, gate `beta` reading the decayed state (untied: `D h + beta a (-b^T D h)^T`) or one
-    reading the state the token enters (additive, RWKV7's: `D h - a (b^T h)^T`, `corrected_by` 'before');
-    the second no decay and its write, keys `k`, values `v`, gate `beta`, no correction; its query on the
-    second, a packed document from its first. The erase vectors each key head's over its value heads.
-    `(query, key, value, g, beta, correction, starts, firsts)`, laid `[B, 2S, ...]`, its second token's
-    output the call's; a call of the keys' own erase as given, no correction."""
+    """A call erasing with vectors of its own (`recurrence.Hooks.erase` 'untied' or 'additive'): an additive
+    one (RWKV7's) as it is, one token a token of the algebra's erase along its own vector reading the state
+    the token enters (`_delta_forms`' `corrected_by` 'erased', `D h + a (c^T h)^T + beta k v^T`, reader `c =
+    -b`); an untied one (GDN-2's, Comba's) as two tokens of the delta rule's algebra a token, each of one
+    rank-one write corrected along its own vector (`corrected_by` 'after', `D h + beta k (v + c^T D h)^T`):
+    the first the token's decay and its erase, keys `a`, values zero, gate `beta` and reader `c = -b`; the
+    second no decay and its write, keys `k`, values `v`, gate `beta`, no correction; its query on the second,
+    a packed document from its first. The erase vectors each key head's over its value heads. `(query, key,
+    value, g, beta, erase, starts, firsts)`, `erase` the additive erase's `(a, c)`, the untied's `(None, c)`
+    laid `[B, 2S, ...]` (its second token's output the call's), None for the keys' own erase."""
     if hooks.erase not in ('untied', 'additive'):
         return query, key, value, g, beta, None, starts, firsts
     heads = value.shape[2]
     a, b = (jnp.repeat(given[name], heads // given[name].shape[2], axis=2).astype(g.dtype)
             for name in ('erase_key', 'erase_read'))
+    if hooks.erase == 'additive':
+        return query, key, value, g, beta, (a, -b), starts, firsts
     reader = -b
     zero_keys = jnp.zeros_like(reader)
 
@@ -188,9 +191,8 @@ def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dic
     keys = jnp.repeat(key, group, axis=2).astype(g.dtype)
     queries = jnp.repeat(query, group, axis=2)
     return (laid(jnp.zeros_like(queries), queries), laid(a, keys), laid(jnp.zeros_like(value), value),
-            laid(g, jnp.zeros_like(g)),
-            laid(jnp.ones_like(beta) if hooks.erase == 'additive' else beta, beta),
-            laid(reader, zero_keys), None if starts is None else laid(starts, jnp.zeros_like(starts)),
+            laid(g, jnp.zeros_like(g)), laid(beta, beta), (None, laid(reader, zero_keys)),
+            None if starts is None else laid(starts, jnp.zeros_like(starts)),
             None if firsts is None else firsts * 2)
 
 
@@ -263,8 +265,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call)."""
     given, query, key, value, g, beta, scale, dtype, work = _prologue_of(hooks, operands, dtype)
     state, starts, firsts = operands.state, operands.starts, operands.firsts
-    query, key, value, g, beta, correction, starts, firsts = _erases_laid(hooks, query, key, value, g, beta,
-                                                                           given, starts, firsts)
+    query, key, value, g, beta, erase, starts, firsts = _erases_laid(hooks, query, key, value, g, beta, given,
+                                                                      starts, firsts)
+    erase_left, correction = (None, None) if erase is None else erase
     forked = None
     if operands.loads is not None:
         forked = Forked.of(operands, starts, firsts, work)
@@ -312,7 +315,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                transition=transition)
 
         def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, turn, correction, across,
-                *walked):
+                erase_left, *walked):
             # Every kernel walks the packed rows, each document from its own memory, its values read once
             # with the skip's (`_read_once`). Without the delta rule the template takes the skip, its
             # values' gradient summed with the recurrence's before it rounds once (`chunk_forward.forward`):
@@ -335,7 +338,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 out, final = _on_portable(hooks, query, key, wide, g, beta, state, turn, starts=starts,
                                           firsts=firsts, forked=carried, scale=scale, dtype=work,
                                           own=given['own'] if hooks.own_weight else None,
-                                          chunk_size=chunk_size, correction=correction, across=across)
+                                          chunk_size=chunk_size, correction=correction, across=across,
+                                          erase_left=erase_left)
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
 
@@ -343,9 +347,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         out, final = _per_product(GATED_DELTA.bound(product_kernel), run, query, key, value, g, beta, skip,
                                   state, starts, firsts, given.get('turn'), correction,
                                   given['value_decay'].astype(work) if hooks.value_decay else None,
-                                  *(() if forked is None else forked.walked), parameters=(5,))
-    # An erased token's output its second laid token's; the epilogue in work, the output rounded once.
-    out = out if correction is None else out[:, 1::2]
+                                  erase_left, *(() if forked is None else forked.walked), parameters=(5,))
+    # An untied erase's token's output its second laid token's; the epilogue in work, the output rounded once.
+    out = out[:, 1::2] if hooks.erase == 'untied' else out
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
 
@@ -725,7 +729,7 @@ def _chunked(named: dict, starts, chunk_size: int, work) -> dict:
 def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, firsts=None, *,
                  scale: float, delta: bool, dtype=None, bound: float | None = None,
                  forked: Forked | None = None, reads: Reads = 'after', own=None, group: int = 1,
-                 correction=None, correction_before: bool = False, across=None, values_read: bool = False):
+                 correction=None, erase_left=None, across=None, values_read: bool = False):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
     forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
@@ -762,7 +766,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     facts = (("delta", delta), ("scale", scale), ("per_key", g.ndim == 4), ("width", width),
              ("columns", columns), ("work", jnp.dtype(work)), ("reset", starts is not None), ("bound", bound),
              ("reads", reads), ("own", own is not None), ("group", group),
-             ("corrected_by", None if correction is None else 'before' if correction_before else 'after'),
+             ("corrected_by", None if correction is None else 'after' if erase_left is None else 'erased'),
              ("across", across is not None),
              ("values_read", values_read))
     held = 0 if forked is None else forked.held
@@ -772,6 +776,8 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
                                            strict=True))
     if correction is not None:
         given["c"] = correction
+    if erase_left is not None:
+        given["a"] = erase_left
     if across is not None:
         given["e"] = across
     operands = _chunked(given, starts, config.chunk, work)
@@ -782,7 +788,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     # The memory entering, and each carry below, typed as every operand varies (a checked `shard_map`'s
     # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
     # do, keys, gates or resets replicated or not.
-    varying = (query, key, value, g, beta, starts, correction, across,
+    varying = (query, key, value, g, beta, starts, correction, erase_left, across,
                *(() if forked is None else jax.tree.leaves((tokens, forked.entry, forked.adds))))
     if tokens is not None and forked is not None and state is not None:
         # The table's given memories `[B, Hv, S', Dk, Dv]`, each token's load, store and document
@@ -820,8 +826,9 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
     """The delta rule's (or a plain linear recurrence's, without `delta`) chunk forms (`scan.derive_scan`) for
     these facts, every one its declaration reads: the update `h = D h - beta k (k^T D h) + beta k v^T` (`D h
     + beta k v^T` without the delta rule; `D h + beta k (v + c^T D h)^T` with a correction reader `c` of its
-    own, `corrected_by` 'after', or `D h + beta k (v + c^T h)^T`, 'before', reading the state the token
-    enters: an erase of its own's laid tokens, `_erases_laid`; `D h E + beta k v^T` with a decay
+    own, `corrected_by` 'after': an untied erase's laid tokens, `_erases_laid`; `D h + a (c^T h)^T + beta k
+    v^T`, 'erased', an erase along its own vector `a` reading the state the token enters beside the write:
+    an additive erase's tokens; `D h E + beta k v^T` with a decay
     `E = exp(e)` along the values, `across`: two-sided GLA's) of a `[width, columns]` state in
     `work`, `D = exp(g)` a head's or each key's (`per_key`), read `scale q^T h` (`scale h q` along its values,
     `values_read`: Oja's rule's transposed state; of the state entering the token where `reads` is 'before',
@@ -833,19 +840,21 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
     caches a declaration's) again, 0.25 s a split (a 4B decoder's plan, row 5556)."""
     from dew.algebra import SATURATION, scan
 
-    def update(h, q, k, v, g, beta, own=None, c=None, e=None):
+    def update(h, q, k, v, g, beta, own=None, c=None, e=None, a=None):
         del q, own
         # The language's exp, which the algebra reads as the decay `exp(z)` and evaluates by `scan._exp`
         # (accurate on every backend): Dew's own on a TPU is a protected span it reads no operation of.
         decayed = jnp.exp(g).reshape(-1, 1) * h
         if e is not None:
             decayed = decayed * jnp.exp(e)[None, :]
-        read = h if corrected_by == 'before' else decayed
-        written = v + c @ read if c is not None else v - k @ decayed if delta else v
+        if corrected_by == 'erased':
+            # Its erase along its own vector, reading the state the token enters, beside its write.
+            return decayed + a[:, None] * (c @ h)[None, :] + beta * k[:, None] * v[None, :]
+        written = v + c @ decayed if c is not None else v - k @ decayed if delta else v
         return decayed + beta * k[:, None] * written[None, :]
 
-    def readout(h, q, k, v, g, beta, own=None, c=None, e=None):
-        del g, c, e
+    def readout(h, q, k, v, g, beta, own=None, c=None, e=None, a=None):
+        del g, c, e, a
         out = scale * (h @ q if values_read else q @ h)
         # The token's own write weighed a key (`recurrence.Hooks.own_weight`, no delta rule's correction).
         return out if own is None else out + scale * jnp.sum(q * own * beta * k) * v
@@ -853,7 +862,8 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
     axes = {"q": ("time", "value" if values_read else "key"), "k": ("time", "key"), "v": ("time", "value"),
             "g": ("time", "key") if per_key else ("time",), "beta": ("time",),
             **({"own": ("key",)} if own else {}), **({"c": ("time", "key")} if corrected_by else {}),
-            **({"e": ("time", "value")} if across else {})}
+            **({"e": ("time", "value")} if across else {}),
+            **({"a": ("time", "key")} if corrected_by == 'erased' else {})}
     declared = {**axes, RESET: ("time",)} if reset else axes
     # A log decay at most 0 (its decay at most 1); with a bound, keys of unit norm and gates at most it, so
     # two tokens' corrections overlap by at most it (Cauchy-Schwarz).
@@ -1258,9 +1268,10 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
 
 
 def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, starts, firsts, *,
-              scale: float, dtype, forked, own, correction=None, across=None):
-    """The portable math's unturned chunked op (`xla_mainloop`) under `hooks`' readout, a laid erase's
-    `correction` and a decay along the values `across` its own: a readout apart from
+              scale: float, dtype, forked, own, correction=None, across=None, erase_left=None):
+    """The portable math's unturned chunked op (`xla_mainloop`) under `hooks`' readout, an erase's
+    `correction` (along its own vector `erase_left` where given) and a decay along the values `across` its
+    own: a readout apart from
     its group's writes (`Hooks.reads` 'apart', the group a token's `Hooks.ranks`) the scan's own
     (`scan.Scan.group`: each rank reads the state after its token's decay less every rank's write of its
     token, no write read and taken back off), its walk's chunk the largest multiple of the group within the
@@ -1284,8 +1295,8 @@ def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta,
         return out, jnp.swapaxes(final, -1, -2)
     return xla_mainloop(tiles, query, key, value, g, beta, state, starts, firsts, scale=scale,
                         delta=hooks.delta, dtype=dtype, bound=hooks.inverse_bound, forked=forked,
-                        reads=hooks.reads, own=own, group=group, correction=correction,
-                        correction_before=hooks.erase == 'additive', across=across)
+                        reads=hooks.reads, own=own, group=group, correction=correction, erase_left=erase_left,
+                        across=across)
 
 
 def _read_once(value, work) -> tuple[jax.Array, jax.Array]:
@@ -1527,7 +1538,7 @@ def _on_template(query, key, value, g, beta, state, skip, turn, *, starts, first
 
 
 def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, turn, *, starts, firsts, forked,
-                 scale: float, dtype, own, chunk_size: int, correction=None, across=None):
+                 scale: float, dtype, own, chunk_size: int, correction=None, across=None, erase_left=None):
     """The chunked op's `(output, final memory)` on the portable math (`_portable`, its chunk `held_chunk`'s
     under the delta rule; a turned call's through `_turned_or_plain`; an erase of its own's laid tokens'
     (`correction`, `chunk`'s), a decay along the values' (`across`) and Oja's rule's their own, which turn
@@ -1537,7 +1548,8 @@ def _on_portable(hooks: recurrence.Hooks, query, key, value, g, beta, state, tur
     size = held_chunk(chunk_size, width) if hooks.delta else chunk_size
     if correction is not None or across is not None or hooks.erase == 'values':
         return _portable(hooks, Tiles(size), query, key, value, g, beta, state, starts, firsts, scale=scale,
-                         dtype=dtype, forked=forked, own=own, correction=correction, across=across)
+                         dtype=dtype, forked=forked, own=own, correction=correction, across=across,
+                         erase_left=erase_left)
     launch = functools.partial(_portable_launch, hooks, Tiles(size), scale=scale, dtype=dtype, own=own)
     return _turned_or_plain(launch, query, key, value, g, beta, state, None, turn, starts=starts,
                             firsts=firsts, forked=forked, scale=scale,
