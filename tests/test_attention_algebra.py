@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from arm_arithmetic import as_written
+from arm_arithmetic import as_written, products_held
 from low_precision_support import edge_values
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
@@ -1140,13 +1140,13 @@ def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int
     product with its reciprocal and a sum of products into one of unrounded products, so each order is held
     as written and as compiled. As written is op by op (`as_given`, which the gate runs uncompiled) where the
     draw reaches fp32's subnormals (`_reaches_subnormals`), which XLA's CPU keeps one primitive at a time and
-    flushes in a compiled program (row 4023); compiled with no rewrite (`arm_arithmetic.as_written`, its own
-    program, run as given) for every other draw, where op by op compiled each primitive of the
-    merge's windows apart (the cotangent cell 6.81 GiB op by op, 1.28 jitted). The reference runs op by
-    op, so none of those rewrites reaches the bar it sets (row 6909: a compiled reference summing products
-    shared Dew's error)."""
+    flushes in a compiled program (row 4023); compiled with no rewrite, its products held from any fused
+    multiply-add (`arm_arithmetic.as_written`, `products_held`, its own program run as given) for every
+    other draw, where op by op compiled each primitive of the merge's windows apart (the cotangent cell
+    6.81 GiB op by op, 1.28 jitted). The reference runs op by op, so none of those rewrites reaches the bar
+    it sets (row 6909: a compiled reference summing products shared Dew's error)."""
     written = as_given(ours if getattr(draw, "reaches_subnormals", False)
-                       else jax.jit(ours, compiler_options=as_written()))
+                       else jax.jit(products_held(ours), compiler_options=as_written()))
     for program, run in ((jax.jit(ours), "jitted"), (written, "as written")):
         assert_as_exact(program, as_given(reference), draw, f"{label} {run}", seeds=seeds)
 
@@ -1742,28 +1742,3 @@ def test_a_padded_query_walks_nothing_again_where_a_real_row_past_fp32_does(form
     later = jnp.asarray([0.0, 3.0, 1.0, 0.5, 2.0, 1e6, -jnp.inf, -jnp.inf], jnp.float32)
     sliced, _ = algebra.rewalks(spec, jnp.stack([maxima, later]))
     np.testing.assert_array_equal(np.asarray(sliced), [expected, [False] * 5 + [True, False, False]])
-
-
-def test_saturated_is_the_one_saturation_rule():
-    """Row 6882: `saturated`, `base2_maximum`, `raw_maximum` and `quotient(..., held=jnp.float32)` share one
-    saturation rule: finite operands whose result overflows clamp to `±finfo(dtype).max`, while infinite
-    operands, finite results and NaNs pass through unchanged."""
-    largest = np.float32(np.finfo(np.float32).max)
-    x = jnp.asarray([jnp.inf, -jnp.inf, jnp.inf, -jnp.inf, 3.5, jnp.nan], jnp.float32)
-    finite_ops = jnp.asarray([True, True, False, False, True, True])
-    got = np.asarray(algebra.saturated(x, finite_ops))
-    np.testing.assert_array_equal(got[:5], np.asarray([largest, -largest, np.inf, -np.inf, 3.5], np.float32))
-    assert np.isnan(got[5])
-
-    m = jnp.asarray([largest, -largest, jnp.inf, -jnp.inf, 1.0], jnp.float32)
-    np.testing.assert_array_equal(
-        np.asarray(algebra.base2_maximum(m)),
-        np.asarray([largest, -largest, np.inf, -np.inf, np.float32(algebra.LOG2E)], np.float32))
-    np.testing.assert_array_equal(
-        np.asarray(algebra.raw_maximum(m, 0.5)),
-        np.asarray([largest, -largest, np.inf, -np.inf, 2.0], np.float32))
-
-    acc = jnp.asarray([[largest, -largest, jnp.inf, 2.0]], jnp.float32)
-    total = jnp.asarray([0.5], jnp.float32)
-    held = np.asarray(algebra.quotient(lambda sums: sums / total[:, None], acc, total, held=jnp.float32))
-    np.testing.assert_array_equal(held, np.asarray([[largest, -largest, np.inf, 4.0]], np.float32))

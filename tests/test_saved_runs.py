@@ -383,8 +383,9 @@ def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_pat
     resumes_one_step(run, last, built, kind)
 
 
-@pytest.mark.parametrize("given", ["chain", "loader"])
-@pytest.mark.parametrize("named", [None, "another"])
+# The name `train` is given and the data's form are apart from each other and from the main that saved the
+# run: each main's run resumes through both forms, one under its trainer's name and one under another's.
+@pytest.mark.parametrize(("named", "given"), [(None, "chain"), ("another", "loader")])
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, monkeypatch, recorded, kind,
                                                                       named, given):

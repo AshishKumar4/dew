@@ -425,3 +425,43 @@ def test_mosaic_held_prices_backward_launches_when_reverse_is_true():
             template.MOSAIC._forwards(ba, tiles, target), family)
         assert template.MOSAIC.held(ba, tiles, reverse=True) == template.MOSAIC._launches_hold(
             template.MOSAIC.launches(ba, tiles, target, backward=True), family)
+@pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
+def test_an_fp32_turned_call_on_the_template_trains_as_the_portable_math_interpreted(packed):
+    """Mamba-3's turned form (`TURNED`) in fp32 (three bf16 parts under the accurate forms, row 7673) trains
+    on the recurrence template's fast backward, output, final memory and every operand's gradient on par
+    with the portable math from float64 (check 1)."""
+    from test_recurrence_chunk import assert_packed_on_par
+    from test_recurrence_mosaic import LENGTH, TURNED, hooked_draw
+
+    def on(route, operands, starts=None):
+        return chunk_on(route, TURNED, dataclasses.replace(operands, starts=starts))
+
+    def drawn(seed):
+        (operands,) = hooked_draw(TURNED, packed=False, seed=seed)
+        return operands, cotangents(operands, seed)
+
+    assert_packed_on_par(formed("accurate", functools.partial(on, "mosaic_gpu")),
+                         functools.partial(on, "xla"), drawn, f"{TURNED} fp32 on the template",
+                         packed=packed, documents=((0, 24, 40), (10, 48)), length=LENGTH, seeds=8)
+
+
+@COMPILES_ON_CPU
+def test_an_fp32_turned_training_step_certifies_on_h100():
+    """Mamba-3's turned form (`TURNED`) in fp32 lowers and certifies its training gradient on a compile-only
+    H100 through the template's fast backward (row 7673), taking `mosaic_gpu` with every kernel unspilled."""
+    from kernel_compile import lowered_for
+    from test_recurrence_mosaic import TURNED, _certified_bodies, hooked_draw
+
+    from dew.nn.kernels.generation import compile_only_gpus
+    from dew.nn.kernels.templates import report
+
+    (operands,) = hooked_draw(TURNED, packed=False, seed=0)
+    shaped = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), operands)
+    before = {id(certified) for certified in report.certifications()}
+    with report.refusals(), report.certifying(compile_only_gpus("sm90")[0]):
+        lowered_for(jax.grad(lambda given: jnp.sum(chunk_on("mosaic_gpu", TURNED, given)[0])),
+                    (shaped,), "sm90")
+    found = [each for each in report.certifications()
+             if id(each) not in before and each.op == type(template.MOSAIC).__name__]
+    bodies = _certified_bodies(found)
+    assert bodies and all(not entries[-1].refused for entries in bodies.values()), bodies

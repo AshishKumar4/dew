@@ -87,6 +87,7 @@ from dew.nn.kernels.options import (
     collecting,
     owned_program,
     program_digest,
+    program_name,
     shapes_of,
     stated_digest,
     taking,
@@ -1182,12 +1183,10 @@ class AheadTarget:
                 with report.for_devices():
                     return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
             except report.Untuned as refused:
-                # Named by its digest where its trees state one, else by its text's (a host step's VJP
-                # results' tree states no form, `stated_digest`).
+                # Named as every untuned program is (`program_name`), a host step's VJP results stating no
+                # form.
                 _log.warning("a host step is not preparable here: %s", refused)
-                named = (stated_digest(refused.lowered)
-                         or hashlib.sha256(refused.lowered.as_text().encode()).hexdigest())
-                return CompiledAhead(None, None, (named,))
+                return CompiledAhead(None, None, (program_name(refused.lowered),))
         topology = None if self.topology is None else Path(self.topology).read_bytes()
         if self.path is not None and not self.phases:
             # Over a host's own GPUs (`topology`), as its run compiles it: every tuned choice the GPU kind's
@@ -1227,7 +1226,7 @@ class AheadTarget:
                 # Its run compiles it on the device, which tunes it (and the next prepare finds it), or makes
                 # the choice a compile without it cannot (`report.CompiledOnDevice`).
                 _log.warning("a step is not preparable here: %s", refused)
-                untuned.append(program_digest(refused.lowered))
+                untuned.append(program_name(refused.lowered))
                 continue
             _log.info("a step compiled ahead into the cache in %.1f s", ahead.planned_seconds)
         return CompiledAhead(None, ahead, tuple(untuned))

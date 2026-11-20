@@ -74,18 +74,25 @@ def test_the_accurate_policy_takes_the_log_sum_exp_fold_whose_error_its_written_
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 def test_the_candidates_are_proposed_cheapest_first_and_the_first_admitted_chosen(accurate):
     """The softmax through its log-sum-exp: its candidates, each root's forms enumerated beside the
-    cheapest and the most stable extractions, come in order of price, and the chosen is the first the gate
-    admits in that order (docs/design/algebra.md §6.5), where three fixed proposals came as written first."""
+    cheapest and the most stable extractions, come in order of price, the compensated forms after every
+    uncompensated one, each at its form's price, and the chosen is the first the gate admits in that order
+    (docs/design/algebra.md §6.5): against the form as written, or under the accurate policy against it and
+    every candidate as exact as it, where three fixed proposals came as written first."""
     admits = gate(softmax_with_lse, logits)
     choice = choose(softmax_with_lse, OPERANDS * 3, accurate=accurate, saturation=algebra.SATURATION,
                     admits=admits)
-    prices = [candidate.seconds for candidate in choice.candidates]
+    prices = [(candidate.compensated, candidate.seconds) for candidate in choice.candidates]
     assert prices == sorted(prices)
-    references = choice.candidates if accurate else [
-        next(candidate for candidate in choice.candidates if candidate.name == "as written")]
+    assert any(candidate.compensated for candidate in choice.candidates)
+    written = next(candidate for candidate in choice.candidates if candidate.name == "as written")
+    references = [written]
+    if accurate:
+        references += [candidate for candidate in choice.candidates
+                       if candidate is not written and admits(candidate.function, written.function)]
     first = next(candidate for candidate in choice.candidates
-                 if all(candidate is reference or admits(candidate.function, reference.function)
-                        for reference in references))
+                 if (not accurate or any(candidate is reference for reference in references))
+                 and all(candidate is reference or admits(candidate.function, reference.function)
+                         for reference in references))
     assert choice.chosen is first
 
 
@@ -162,3 +169,52 @@ def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
         product_precision(*shape, jnp.float32, admits=lambda preset: False)
     eight = product_precision(*shape, jnp.float8_e4m3fn, admits=lambda preset: True)
     assert programs.dot_arithmetic(eight, jnp.float8_e4m3fn, jnp.float8_e4m3fn).operand_bits == (8, 8)
+
+
+def cancelled(seed):
+    """Terms near a hundred million, a term of unit size, and the first's negation: a sum whose large terms
+    cancel exactly, leaving the small one, which float32 rounds away beside the large."""
+    rng = np.random.default_rng(seed)
+    large = (rng.uniform(1e7, 1e8, SHAPE) * rng.choice([-1.0, 1.0], SHAPE)).astype(np.float32)
+    small = rng.standard_normal(SHAPE).astype(np.float32)
+    return jnp.asarray(large), jnp.asarray(small), jnp.asarray(-large)
+
+
+def three_terms(a, b, c):
+    """`(a + b) + c`, its first sum rounded before the last term is added."""
+    return (a + b) + c
+
+
+def test_the_accurate_policy_takes_a_compensated_sum_where_every_form_rounds_its_terms_away():
+    """`(a + b) + c` of `c = -a` large: every form the e-graph holds (each order of each sum) rounds `b`
+    away beside `a`, and the e-graph holds no compensated form (its equality is the reals', in which an
+    addition's rounding error is zero); the chooser's error-free derivation does (`error.compensated`), and
+    under the accurate policy it is taken, the form as written not as exact as it (check 1)."""
+    admits = gate(three_terms, cancelled)
+    choice = choose(three_terms, OPERANDS * 3, accurate=True, saturation=algebra.SATURATION, admits=admits)
+    assert choice.chosen.compensated
+    assert not admits(three_terms, choice.chosen.function)
+
+
+def ranged(seed):
+    """Operands whose product rounds in range and is brought back by its divisor, `a = c` of `1e-20`, `b`
+    of `1e20`: the form as written, `(a b) / c`, is finite, where the regrouped `a (b / c)` passes float32's
+    largest."""
+    rng = np.random.default_rng(seed)
+    small = (rng.uniform(1.0, 2.0, SHAPE) * 1e-20).astype(np.float32)
+    large = (rng.uniform(1.0, 2.0, SHAPE) * 1e20).astype(np.float32)
+    return jnp.asarray(small), jnp.asarray(large), jnp.asarray(small)
+
+
+def product_over(a, b, c):
+    """`(a b) / c`, the stable set's regrouping's left side."""
+    return (a * b) / c
+
+
+def test_the_accurate_policy_chooses_past_a_proposal_that_leaves_the_floats_range():
+    """`(a b) / c` where `a (b / c)` overflows: the regrouped proposal is not as exact as the form as
+    written, so it raises no bar under the accurate policy, which chooses a form as exact as the written
+    (it raised, every finite form failing against the infinite one)."""
+    admits = gate(product_over, ranged)
+    choice = choose(product_over, OPERANDS * 3, accurate=True, saturation=algebra.SATURATION, admits=admits)
+    assert admits(choice.chosen.function, product_over)

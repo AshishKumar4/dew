@@ -46,7 +46,7 @@ from dew.diffusion.transforms import ConsistencyBoundary, EpsilonPredictionTrans
 from dew.inputs import Field, InputSpec
 from dew.nn.autoencoders.api import AutoEncoder
 from dew.objectives.base import Step
-from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
+from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout, transition_rows
 from dew.sampling import CFG, sample
 from dew.sampling.flow import FlowSDE, flow_transition
 from dew.telemetry.records import RECORD_TYPES
@@ -173,17 +173,10 @@ def recorded_and_rescored(walk, rescore, variables):
 
 
 def trajectory_batch(trajectory, advantages, mask=None):
-    count, points = trajectory.states.shape[:2]
-    return {
-        "latents": trajectory.states[:, :-1],
-        "next_latents": trajectory.states[:, 1:],
-        "timesteps": jnp.broadcast_to(trajectory.times[:-1], (count, points - 1)),
-        "next_timesteps": jnp.broadcast_to(trajectory.times[1:], (count, points - 1)),
-        "rollout_steps": jnp.full((count,), points, jnp.int32),
-        "old_log_probs": trajectory.log_probs,
-        "transition_mask": trajectory.stochastic if mask is None else jnp.asarray(mask),
-        "advantages": jnp.asarray(advantages),
-    }
+    """`trajectory`'s every transition as the flow objective trains on it (`transition_rows`), `mask` the
+    transitions that train where given."""
+    return transition_rows(trajectory.states, trajectory.times, trajectory.log_probs, trajectory.stochastic,
+                           advantages, trains=mask)
 
 
 @pytest.mark.parametrize("prediction", ["clean", "v"])

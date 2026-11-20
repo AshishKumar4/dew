@@ -1361,16 +1361,16 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     return (out, safe, total) if residuals else out
 
 
-def mean_held(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
-    """`out`, the weighted values `sums` over their denominator, held at `dtype`'s largest where it passes it
-    from finite sums: a mean of finite values of `dtype` is within it, so one past it is its weights'
-    rounding (narrowed to fp16 for their product, the weights round up by as much as 2^-11 of each where the
-    denominator sums them unrounded, the mean of 1001 values of 65504 at 65522, inf in fp16, row 9519). An
-    infinite or NaN sum's (an infinite value's) stays as it is. The one hold every mainloop's quotient
-    (`attention_algebra.quotient`) and the reference (`held_mean`) take."""
-    largest = jnp.finfo(dtype).max
-    past = (jnp.abs(sums) < jnp.inf) & (jnp.abs(out) > largest)
-    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
+def saturated(x: jax.Array, finite_operands: jax.Array, dtype=None) -> jax.Array:
+    """`x` saturated at `dtype`'s (default `x.dtype`'s) largest magnitude where `finite_operands` holds and
+    `|x|` passes it (rows 6882, 9519): one rule shared by `base2_maximum`, `raw_maximum`,
+    `attention_algebra.quotient` and `held_mean`. A mean of finite values of `dtype` is within `dtype`'s
+    largest, so one past it is its weights' or sums' rounding (narrowed to fp16 for their product, the
+    weights round up by as much as 2^-11 of each where the denominator sums them unrounded, the mean of 1001
+    values of 65504 at 65522, inf in fp16). An infinite or NaN operand's result stays as it is."""
+    largest = jnp.finfo(x.dtype if dtype is None else dtype).max
+    past = finite_operands & (jnp.abs(x) > largest)
+    return jnp.where(past, jnp.where(x > 0, largest, -largest).astype(x.dtype), x)
 
 
 def _narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
@@ -1442,8 +1442,9 @@ def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
 
 
 def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
-    """The reference's `mean_held`: its value, its derivative the mean's, `out`'s (`derivative_of`)."""
-    return mean_held(jax.lax.stop_gradient(out), sums, dtype) + derivative_of(out)
+    """The reference's mean saturation (`saturated`): its value, its derivative the mean's, `out`'s
+    (`derivative_of`)."""
+    return saturated(jax.lax.stop_gradient(out), jnp.abs(sums) < jnp.inf, dtype) + derivative_of(out)
 
 
 def derivative_of(out: jax.Array) -> jax.Array:

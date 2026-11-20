@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import plain_merged
 from generation_support import COMPILES_ON_CPU
 from kernel_compile import compile_kernels
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, dew_path
@@ -40,21 +41,9 @@ def _drawn(seed):
 
 
 def _plain(spec):
-    """The plain merge of a split row's slices, normalized (flash-decoding's: each slice's output weighed by
-    its denominator times the exponential of its maximum over the largest held, summed and divided), as
-    JAX differentiates it: check 1's reference, independent of the law."""
-    rate = 1.0 if spec.natural else spec.scale
-
-    def merge(padded, stacked):
-        out = padded[:, :, :QUERIES, :, :WIDTH]
-        maxima, totals = (jnp.moveaxis(x[..., :QUERIES], 1, 3) for x in (stacked[0], stacked[1]))
-        # Each slice weighed by its denominator at the largest maximum: a slice of zero total weighs
-        # nothing and the weight's derivative along that total is its factor, the law's (row 7124).
-        top = jax.lax.stop_gradient(jnp.max(maxima, axis=1, keepdims=True))
-        weights = jnp.exp((maxima - top) * rate) * totals
-        mass = jnp.sum(weights, axis=1)
-        return jnp.sum(weights[..., None] * out, axis=1) / jnp.where(mass > 0, mass, 1.0)[..., None]
-    return merge
+    """The plain merge (`attention_oracle.plain_merged`) at a drawn split's rows and columns: check 1's
+    reference, independent of the law."""
+    return functools.partial(plain_merged, rate=_rate(spec), queries=QUERIES, width=WIDTH)
 
 
 def _top(stacked):
@@ -281,17 +270,18 @@ def test_a_split_merged_with_a_subnormal_initial_mass_keeps_its_output():
     assert float(out.reshape(())) == 1.0
 
 
+@pytest.mark.parametrize("run", ["jitted", "op by op"])
 @pytest.mark.parametrize("form", sorted(SPECS))
-def test_a_padded_merge_and_its_derivatives_are_on_par(form):
+def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
     """The padded merge's finished output, its state's mass, the output's gradient and that gradient's
     derivative along a direction on par with the plain merge's (`_plain_state`, JAX's differentiation of it,
-    independent of the law) against float64 (check 1), jitted and op by op (`as_given`), the reference run
-    op by op."""
+    independent of the law) against float64 (check 1), jitted or op by op (`as_given`), each a case (both
+    in one took 225 s over the two forms), the reference run op by op."""
     spec, ours, _ = _merges(form)
     reference = as_given(state_orders(_plain_state(spec)))
     orders = state_orders(finished_state(ours, spec))
-    for program, run in ((jax.jit(orders), "jitted"), (as_given(orders), "op by op")):
-        assert_as_exact(program, reference, _drawn, f"a padded merge, {form}, {run}", seeds=MERGE_SEEDS)
+    program = jax.jit(orders) if run == "jitted" else as_given(orders)
+    assert_as_exact(program, reference, _drawn, f"a padded merge, {form}, {run}", seeds=MERGE_SEEDS)
 
 
 @COMPILES_ON_CPU
