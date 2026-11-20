@@ -3,6 +3,7 @@ runs its slice from the memory it enters with, its summary's composition over th
 (`recurrence_chunk.entering_memory`), and its conv after the real tokens before it (`linear.sequence_conv`),
 checked against the same layer on one device (row 1437)."""
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -55,18 +56,28 @@ def test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones(name, 
                           width=WIDTH)
 
 
+HEADS_BEFORE_TIME = (("activation_heads", ("tensor", "sequence")),)
+"""A rule under which the heads would take the sequence axis too: the split keeps it the sequence's."""
+
+
 @pytest.mark.mesh
+@pytest.mark.parametrize("rules", [(), HEADS_BEFORE_TIME], ids=["default rules", "heads before time"])
+@pytest.mark.parametrize("row", ["packed", "empty_shard_packed"])
 @pytest.mark.parametrize("name", sorted(MIXERS))
-def test_a_delta_rule_split_over_the_sequence_and_its_heads_runs_its_rows_as_whole_ones(name):
+def test_a_delta_rule_split_over_the_sequence_and_its_heads_runs_its_rows_as_whole_ones(name, row, rules):
     """Under a sequence axis of 2 beside a tensor axis of 2, which splits the mixer's heads (each device its
     share of the queries', keys' and values' heads and of their conv's taps, `linear.sequence_delta_rule`),
-    the mixer runs packed rows, one document continuing across the cut, as on one device
-    (`assert_split_as_whole`)."""
+    the mixer runs packed rows as on one device (`assert_split_as_whole`): one starting a document at the
+    cut, one carrying a document's conv and memory across it past padding, under the default rules and
+    under rules giving the heads the sequence axis too, which the split keeps the sequence's."""
+    from dew.mesh import DEFAULT_RULES
+
     module = MIXERS[name]
     hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
     variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
-    assert_split_as_whole(module, variables, "packed", SEEDS["packed"],
-                          f"{name} split over the sequence and its heads", width=WIDTH, shards=2, tensor=2)
+    with nn.logical_axis_rules((*rules, *DEFAULT_RULES)):
+        assert_split_as_whole(module, variables, row, SEEDS[row], f"{name} split over the sequence and its "
+                              f"heads, {row}, {rules}", width=WIDTH, shards=2, tensor=2)
 
 
 WIDE_HEADS = {
@@ -82,9 +93,9 @@ WIDE_HEADS = {
 @pytest.mark.parametrize("name", sorted(WIDE_HEADS))
 def test_a_delta_rule_split_over_the_sequence_divides_its_heads_work_over_a_tensor_axis(name):
     """Under a sequence axis of 2, a tensor axis of 2 beside it divides the mixer's heads (`linear.
-    sequence_delta_rule`): each device's compiled forward and backward does under three quarters of the work
-    it does with no tensor axis, its scan's and conv's half (row 1437: each device ran every head, 0.99 of
-    it)."""
+    sequence_delta_rule`): each device's compiled forward and backward on the host's devices (XLA's count of
+    the portable math's every dot) does under three quarters of the work it does with no tensor axis, its
+    scan's and conv's half (row 1437: each device ran every head, 0.99 of it)."""
     module = WIDE_HEADS[name]
     hidden = jnp.asarray(np.random.default_rng(0).standard_normal((2, 32, WIDTH)), jnp.float32)
     variables = module.init(jax.random.key(7), hidden)
@@ -94,7 +105,8 @@ def test_a_delta_rule_split_over_the_sequence_divides_its_heads_work_over_a_tens
         return out, pull(jnp.ones_like(out))
 
     def work(tensor: int) -> float:
-        with jax.set_mesh(MeshSpec(sequence=2, tensor=tensor).build(jax.devices()[:2 * tensor])):
+        # On the host's devices, which take the portable math, whose every dot XLA's count holds.
+        with jax.set_mesh(MeshSpec(sequence=2, tensor=tensor).build(jax.devices("cpu")[:2 * tensor])):
             return jax.jit(step).lower(variables, hidden).compile().cost_analysis()["flops"]
 
     assert work(2) < 0.75 * work(1)

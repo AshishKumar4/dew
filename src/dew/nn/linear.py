@@ -765,33 +765,36 @@ def sequence_delta_rule(mixed, taps, g, beta, coordinates, valid, *, shards: int
                         parts: Pieces, dtype, rule):
     """A delta-rule mixer's conv and rule (`split_delta_rule`) on shards that split the rows and the
     sequence as `over_sequence`'s do, and its heads where the rule table splits a `[B, S, H, D]`
-    activation's and the split divides its `key_heads` (`grouped_heads`, the unsplit rule's own): each of
-    `parts`' channels of `mixed` `[B, S, C]` and of the conv's `taps` `[C, K]` placed by its heads, the
-    queries', keys' and values' laid in turn on each shard, `g` and `beta` by theirs. Where a tensor axis
-    held every head whole, each of its devices ran the whole mixer's conv and scan (row 1437)."""
+    activation's over axes the sequence leaves and the split divides its `key_heads` (`grouped_heads`, the
+    unsplit rule's own): each of `parts`' channels of `mixed` `[B, S, C]` and of the conv's `taps` `[C, K]`
+    placed by its heads, the queries', keys' and values' laid in turn on each shard, `g` and `beta` by
+    theirs. Where a tensor axis held every head whole, each of its devices ran the whole mixer's conv and
+    scan (row 1437); each still runs its heads over its slice of the sequence whole."""
     batch, length, _ = mixed.shape
     if length % shards:
         raise LayoutRefused(f"the sequence of {length} tokens splits {shards} ways over the mesh's sequence "
                             f"axis, and it does not divide")
+    rows, sequence = logical_spec(("activation_batch", "activation_length"), (batch, length))
     value_heads = beta.shape[2]
-    rows, heads = grouped_heads((batch, length, value_heads, parts[2][0] // value_heads), key_heads)
-    spec = logical_spec(("activation_batch", "activation_length"), (batch, length))
-    tokens, channels = P(rows, spec[1], heads), P(heads, None)
+    # The heads' axes the rows and the sequence leave: a rule giving them the sequence's too keeps it time's.
+    taken = {*mesh_axes(rows), *mesh_axes(sequence)}
+    heads = [axis for axis in mesh_axes(grouped_heads((batch, length, value_heads, 1), key_heads)[1])
+             if axis not in taken]
+    tokens, channels = P(rows, sequence, tuple(heads) or None), P(tuple(heads) or None, None)
     edges = np.cumsum([width for width, _ in parts])[:-1]
-    shard = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in mesh_axes(heads))
 
-    def local(*given):
-        pieces, (g, beta, segments, starts, valid), held = given[:3], given[3:8], given[8:]
-        # Each shard's heads of each part laid in turn, its parts' widths its own.
-        mine = tuple((width // shard, head) for width, head in parts)
+    def local(pieces, g, beta, segments, starts, valid, held):
+        # Each shard's heads of each part laid in turn, each part's width its own piece's.
+        mine = tuple((piece.shape[-1], head) for piece, (_, head) in zip(pieces, parts, strict=True))
         return split_delta_rule(jnp.concatenate(pieces, axis=-1), g, beta, segments, starts, valid,
                                 jnp.concatenate(held, axis=0), widths=widths, parts=mine, dtype=dtype,
                                 rule=rule)
 
-    operands = (*jnp.split(mixed, edges, axis=-1), g, beta, coordinates.segments, coordinates.starts, valid,
-                *jnp.split(taps, edges, axis=0))
-    specs = tuple(None if operand is None else spec for operand, spec in
-                  zip(operands, (tokens,) * 5 + (P(rows, spec[1]),) * 3 + (channels,) * 3, strict=True))
+    operands = (tuple(jnp.split(mixed, edges, axis=-1)), g, beta, coordinates.segments, coordinates.starts,
+                valid, tuple(jnp.split(taps, edges, axis=0)))
+    masks = P(rows, sequence)
+    specs = ((tokens,) * len(parts), tokens, tokens, *(None if operand is None else masks
+                                                      for operand in operands[3:6]), (channels,) * len(parts))
     return manual_map(local, specs, tokens)(*operands)
 
 
