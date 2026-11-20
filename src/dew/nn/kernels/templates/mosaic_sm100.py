@@ -476,9 +476,10 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     def read(self, acc: Accumulator, *, first: int = 0, columns: int | None = None, pending: int = 0,
              layout=STORED) -> jax.Array:
         # Its columns out of tensor memory in `layout` (an epilogue's, `STORED`, or tensor memory's own,
-        # `TMEM`), the load in flight until the value is read or `Signal.published`; zeros for a tile that
-        # multiplies nothing. Its products are awaited by a signal their commit arrives at (`signals`,
-        # `Tensor.ready`), not by `pending`.
+        # `TMEM`), the load in flight until `wait_load_tmem` (`write` before overwriting tensor memory,
+        # `Tensor.release` before releasing an accumulator); zeros for a tile that multiplies nothing. Its
+        # products are awaited by a signal their commit arrives at (`signals`, `Tensor.ready`), not by
+        # `pending`.
         del pending
         rows, width = acc.shape
         count = width - first if columns is None else columns
@@ -491,7 +492,9 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         column), from the layout it was read in, visible to a product once a signal publishes it
         (`Signal.published`):
         a softmax's narrowed weights for P·V, a keys-first backward's `Pᵀ` and `dSᵀ` for dV and dK, each the
-        left operand of its product (`products`' TS form), a state rescaled in place."""
+        left operand of its product (`products`' TS form), a state rescaled in place. Awaits any in-flight
+        `async_load_tmem` of this thread (`wait_load_tmem`) before overwriting tensor memory (row 8980)."""
+        plgpu.wait_load_tmem()
         plgpu.async_store_tmem(column_span(_tensor_memory(acc), first, value.shape[-1]),
                                value.astype(jnp.dtype(acc.dtype)))
 
