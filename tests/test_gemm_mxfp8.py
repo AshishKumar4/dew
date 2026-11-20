@@ -47,6 +47,19 @@ def test_an_mxfp8_scale_reads_the_exponent_of_a_magnitude_just_under_a_power_of_
                                       np.asarray(getattr(operand, field)).view(np.uint8))
 
 
+def test_an_mxfp8_scale_byte_0xff_decodes_its_block_nan():
+    """An MX operand whose first block's E8M0 scale byte is 0xFF (OCP MX 5.4.1: E8M0's NaN) decodes that
+    block NaN and every other block as its codes times its scale, where 0xFF read as the exponent 128 gave
+    infinities and zeros (spec alignment SA20261119pm F52)."""
+    operand = formats.MxFp8.quantized(jnp.ones((2, 2 * product.MXFP8.depth), jnp.float32))
+    held = np.asarray(operand.scales).view(np.uint8).copy()
+    held[0, 0] = 0xFF
+    nan = formats.MxFp8(operand.codes, jnp.asarray(held).view(operand.scales.dtype)).decoded()
+    per = product.MXFP8.depth
+    assert bool(jnp.all(jnp.isnan(nan[0, :per]))) and not bool(jnp.any(jnp.isnan(nan[0, per:])))
+    np.testing.assert_array_equal(np.asarray(nan[1]), np.asarray(operand.decoded()[1]))
+
+
 GROUP_BLOCKS = (1, 0, 2, 1)
 """Each group's 128-row blocks: a one-block group, an empty one, two blocks, one."""
 

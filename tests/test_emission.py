@@ -11,7 +11,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from kernel_compile import lowered_for
 
 from dew.nn import programs
-from dew.nn.kernels.templates import emission, mosaic
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import cost, emission, mosaic
 from dew.nn.kernels.templates.cost import Stated, Work
 
 _ROW = jax.ShapeDtypeStruct((128,), jnp.float32)
@@ -510,6 +511,101 @@ def test_an_async_smem_to_tmem_copy_charges_shared_bytes_from_its_source_without
     assert full_work.shared_bytes == 128 * 256 * 2 and full_work.device_bytes == 0
     assert sliced_work.shared_bytes == 128 * 64 * 2 and sliced_work.device_bytes == 0
     assert packed_work.shared_bytes == 128 * 64 // 2 and packed_work.device_bytes == 0
+
+
+
+def test_a_walks_serial_loops_compose_their_paths_before_their_mean():
+    """A walk's loops (its opening, steady and closing segments) run one after another through one ring: a
+    step's path is their paths followed one by the other, then their mean, so two segments of one barrier
+    round trip each take one a step (80.1 ns on a GH200), not half of one (base review 1e0a501f0 F2)."""
+    target = generation.gpu_target("NVIDIA GH200 480GB")
+    segment = cost.Work(chains=(cost.Chain(barriers=1),))
+    role = emission.Role(cost.Work(), (segment, segment))
+    assert role.step(lambda work: cost.chained(work, target)) == target.barrier_seconds
+
+
+def test_a_launch_carries_each_warpgroups_paths_its_steps_times():
+    """A launch's paths (`Emitted.paths`) are each warpgroup's work outside its walks followed by its walk's
+    step its steps' times, the warpgroups side by side: a program waiting on four barriers outside its walk
+    keeps them (base review 1e0a501f0 F3)."""
+    waits = cost.Chain(barriers=4)
+    stepping = cost.Chain(products=1, columns=128)
+    roles = (emission.Role(cost.Work(chains=(waits,)), (cost.Work(chains=(stepping,)),)),)
+    assert emission.Emitted(roles).paths(8) == (cost.Chain(products=8, columns=1024, barriers=4),)
+
+
+_SWIZZLED = (plgpu.TilingTransform((8, 64)), plgpu.SwizzleTransform(128))
+
+
+def _waits(body, *scratch, warpgroups: int = 1) -> tuple:
+    """The paths a kernel of `body` over `scratch` waits through, each warpgroup's work outside its walks."""
+    kernel = plgpu.kernel(body, out_type=_ROW, num_threads=warpgroups, thread_name="wg",
+                          scratch_types=list(scratch))
+    return tuple(role.fixed.chains for role in emission.emitted(jax.make_jaxpr(kernel)(), warpgroups,
+                                                                 "wg").roles)
+
+
+@pytest.mark.parametrize("allowed, waited", [(0, (cost.Chain(products=1, columns=128),)), (1, ())])
+def test_a_warpgroup_waits_on_the_products_it_drains(allowed, waited):
+    """A 64 x 128 product of 16-bit operands 64 deep, waited down to `allowed` in flight: drained, the
+    warpgroup's path waits on it, its 128 columns (`cost.Chain.columns`); let fly, a later trip waits on it,
+    which this one's work hides (row 4123)."""
+    def body(out_gmem, a, b):
+        del out_gmem
+
+        def scope(acc):
+            plgpu.wgmma(acc, a, b)
+            plgpu.wgmma_wait(allowed)
+            return acc[...]
+
+        pl.run_scoped(scope, plgpu.ACC((64, 128), jnp.float32))
+
+    assert _waits(body, plgpu.SMEM((64, 64), jnp.bfloat16, transforms=_SWIZZLED),
+                  plgpu.SMEM((64, 128), jnp.bfloat16, transforms=_SWIZZLED)) == (waited,)
+
+
+def test_a_warpgroup_waits_on_a_copy_its_barrier_lands_or_on_another_warpgroups_arrival():
+    """A barrier's wait the warpgroup's path runs through: a tile copy landing on it (its bytes), or, where
+    none of its copies or products lands on it, another warpgroup's arrival, a round trip (row 4123)."""
+    def copied(out_gmem, tile, ready):
+        plgpu.copy_gmem_to_smem(out_gmem, tile, ready)
+        plgpu.barrier_wait(ready)
+
+    def handed(out_gmem, ready):
+        del out_gmem
+        plgpu.barrier_wait(ready)
+
+    assert _waits(copied, plgpu.SMEM((128,), jnp.float32), plgpu.Barrier()) == (
+        (cost.Chain(copies=1, copy_bytes=512),),)
+    assert _waits(handed, plgpu.Barrier()) == ((cost.Chain(barriers=1),),)
+
+
+def test_an_integer_operation_counts_on_the_integer_units_not_the_fp32_lanes():
+    """A row's integer XOR, shift, add and comparison each count one integer operation an element
+    (`Work.integer_operations`: the ALU's LOP3, SHF, IADD3 and ISETP, issued every 2 cycles a sub-partition,
+    half the fp32 lanes' rate) and none of the fp32 lanes (row 5386)."""
+    row = jax.ShapeDtypeStruct((1, 128), jnp.int32)
+    operations = (lambda x: x ^ 7, lambda x: x >> 3, lambda x: x + 1, lambda x: (x < 5).astype(jnp.int32))
+    for operation in operations:
+        role = _emitted(operation, row).roles[0]
+        assert (role.fixed.integer_operations, role.fixed.operations) == (128, 0), role.fixed
+
+
+@pytest.mark.parametrize("longest, span", [(None, 10 / 3), (4, 4)])
+def test_a_launchs_span_is_its_longest_programs_walk_where_its_programs_walk_unequal_shares(longest, span):
+    """A launch of three programs walking ten steps among them: its span, the dependent steps on its critical
+    path, is the most one program walks where the launch states it (`cost.Stated.longest`: a causal walk's
+    tiles split 3, 3 and 4), else their mean, where the mean of unequal walks read 10 / 3 (base review
+    14020e321 F3)."""
+    def body(x_ref, o_ref):
+        o_ref[...] = x_ref[...]
+
+    launch = plgpu.kernel(body, out_type=_ROW, grid=(3,), grid_names=("programs",))
+    stated = Stated(steps=10, bytes_accessed=0, longest=longest)
+    traced = jax.make_jaxpr(emission.costed(launch, stated))(_ROW)
+    (kernel,) = [equation for equation in programs.equations(traced.jaxpr)
+                 if "cost_estimate" in equation.params]
+    assert emission.work_of(kernel).span == span
 
 
 def test_identical_scale_smem_bodies_keep_independent_emission_work():

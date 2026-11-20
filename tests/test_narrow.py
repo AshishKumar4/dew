@@ -44,6 +44,18 @@ def test_only_a_weight_read_once_through_its_cast_is_copied():
     assert paths == {("once",): jnp.dtype(jnp.bfloat16), ("rematted",): jnp.dtype(jnp.bfloat16)}
 
 
+def test_a_weight_whose_other_read_the_program_discards_is_copied():
+    """A weight cast once where the loss reads it, and cast again where nothing reads the cast (a selector's
+    plan that declined it, the side-by-side product's of q, k and v: 0099a4701's), is read once by the
+    program as it runs: it is copied, as its one live cast reads it."""
+    def loss(params, x):
+        params["w"].astype(jnp.bfloat16)  # a cast nothing reads
+        return jnp.sum((x @ params["w"].astype(jnp.bfloat16)).astype(jnp.float32))
+
+    paths = narrowed_paths(loss, {"w": jnp.ones((4, 4), jnp.float32)}, jnp.ones((2, 4), jnp.bfloat16))
+    assert paths == {("w",): jnp.dtype(jnp.bfloat16)}
+
+
 def test_a_users_primitive_named_as_a_cast_is_read_as_its_own():
     """A primitive of a user's that takes the name of JAX's cast (`convert_element_type`) and none of its
     parameters is read as its own, not the cast its name spells (an operation is known by its object): a

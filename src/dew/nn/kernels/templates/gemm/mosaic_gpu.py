@@ -1550,8 +1550,8 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
     lhs_view = ((lhs_gmem.at[:, rows], lambda j: (first + j, 0)) if transpose_lhs
                 else chained_rows.view(row_block, row_step, first) if chained_rows is not None
                 else (row_block(lhs_gmem), row_step) if gather_gmem is None
-                # A gathered product's rows each where its table says (`rings.Rows`, a row a run).
-                else (lhs_gmem, lambda j: rings.Rows(gather_gmem, row_start, (first + j,), 1)))
+                # A gathered product's rows where its table says (a row a run), the tile's at every step.
+                else (lhs_gmem, lambda j: rings.Rows(gather_gmem, row_start, (first + j,), 1, tiled=True)))
     # Each stream's view and its step's block index (`(row, column)` of a matrix, four of a scale tile's).
     matrices: dict[str, Any] = {
         name: (gmem.columns(group.matrix, column_tile, matrix_step) if isinstance(gmem, BesideRefs)
