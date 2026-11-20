@@ -1292,7 +1292,7 @@ class _Decays(NamedTuple):
     between: jax.Array
 
 
-_DECAYS_TREE = jax.tree.structure(_Decays(*(_Split(0.0, 0.0),) * 3, 0.0))
+_DECAYS_TREE = jax.tree.structure(_Decays(*(_Split(*(jnp.zeros(()),) * 2),) * 3, jnp.zeros(())))
 DECAYS = _DECAYS_TREE.num_leaves
 """The chunk function's leading operands: its decays (`_Decays`' leaves), its tokens' values after."""
 
@@ -1309,7 +1309,7 @@ def _normal_floor(dtype, base2: bool) -> float:
     return math.ceil(math.log(float(jnp.finfo(dtype).tiny)) / (math.log(2.0) if base2 else 1.0))
 
 
-def _split(base2: bool, exponent, kept) -> _Split:
+def _two_factors(base2: bool, exponent, kept) -> _Split:
     """`exp(exponent)` (`exp2` where `base2`) as its two factors (`_Split`) where `kept`, else a crossed
     decay's negative zero (`_crossed`) and one; each exponent masked before its exponential."""
     floor = _normal_floor(exponent.dtype, base2)
@@ -1396,9 +1396,9 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     # Each exponent masked before its exponential, as each span's: one across a vanished token is no sum
     # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN), and its
     # decay negative zero, which no exponential is (`_crossed`).
-    return _Decays(entering=_split(base2, high + low, started),
-                   to_last=_split(base2, (high[-1] - high) + (low[-1] - low), ending),
-                   whole=_split(base2, high[-1] + low[-1], started[-1]),
+    return _Decays(entering=_two_factors(base2, high + low, started),
+                   to_last=_two_factors(base2, (high[-1] - high) + (low[-1] - low), ending),
+                   whole=_two_factors(base2, high[-1] + low[-1], started[-1]),
                    between=jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), -0.0))
 
 
