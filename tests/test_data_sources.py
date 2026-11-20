@@ -24,6 +24,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
+import pyarrow.parquet as pq
 import pytest
 from reader_support import assert_a_rewrite_moves_the_identity, assert_resumes_where_it_stopped
 from storage_support import moto_bucket
@@ -31,6 +32,7 @@ from token_support import export_byte_tokens
 
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
+from dew.data.pipeline import Pipeline, mix
 from dew.data.shards import streamed
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
@@ -318,7 +320,6 @@ def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
 def test_a_predicate_held_in_memory_keeps_the_rows_it_selects(tmp_path):
     """A memory read of a filtered parquet source holds the rows the predicate keeps, as a
     streamed read does, from a row group it filters in part and one it filters whole."""
-    import pyarrow.parquet as pq
 
     pq.write_table(pa.table({"x": [0, 1, 2, 3]}), tmp_path / "rows.parquet", row_group_size=2)
     for where, kept in ((ds.field("x") > 0, [1, 2, 3]), (ds.field("x") > 1, [2, 3])):
@@ -612,6 +613,37 @@ def test_a_directory_of_committed_exports_reads_their_shards_raw(tmp_path):
     export(Memory(rows), str(tmp_path / "a"), format=ArrowFiles(), rows_per_shard=4)
     stored = Files(str(tmp_path), format="arrow").records("indexed")
     assert sorted(stored[index]["id"] for index in range(len(stored))) == list(range(10))
+
+
+SCHEMAS_READ: list[str] = []
+"""The stores whose files' schema a `SchemaCounted` store read."""
+
+
+class SchemaCounted(Files):
+    """A file store that notes each time its files' schema is read (`SCHEMAS_READ`)."""
+
+    @property
+    def arrow(self):
+        SCHEMAS_READ.append(str(self.url))
+        return Files.arrow.func(self)
+
+
+def test_a_seeded_streamed_mix_of_raw_parquet_stores_reads_no_schema_to_compile(tmp_path):
+    """A seeded mix of raw Parquet stores read as streams compiles reading none of its members' schemas,
+    which its plan asks nothing of (row 9009: pinning each member read its files' schema before any draw);
+    its first read opens the members it draws."""
+    for name in ("a", "b"):
+        pq.write_table(pa.table({"x": list(range(8))}), tmp_path / f"{name}.parquet")
+    members = [Pipeline(SchemaCounted(str(tmp_path / f"{name}.parquet")), name=name) for name in ("a", "b")]
+    SCHEMAS_READ.clear()
+    loader = compile(mix(members, seed=3).batch(2), read="streamed", loading=Loading(workers=0))
+    assert SCHEMAS_READ == []
+    stream = loader.train(DataPartition())
+    try:
+        next(stream)
+    finally:
+        stream.close()
+    assert SCHEMAS_READ
 
 
 @pytest.mark.parametrize("kind", ["jsonl", "text"])
@@ -1062,7 +1094,6 @@ def test_a_parquet_store_reads_with_the_credentials_its_profile_names(tmp_path, 
     store was given reaches the reads, not only those Arrow's own S3 client can take."""
     import boto3
     import fsspec
-    import pyarrow.parquet as pq
     from moto.core import set_initial_no_auth_action_count
     from moto.server import ThreadedMotoServer
 
@@ -1114,7 +1145,6 @@ def test_an_anonymous_storage_profile_reads_parquet_though_it_names_keys():
     """A storage profile over S3 that reads anonymously reads a Parquet store's rows, though it
     names keys too, which an anonymous client does not sign with."""
     import fsspec
-    import pyarrow.parquet as pq
     from moto.server import ThreadedMotoServer
 
     from dew.data.compile import iterate
@@ -1952,7 +1982,6 @@ def test_a_chain_that_states_no_read_reads_as_its_sources_choose(tmp_path):
     """Records held in memory read from memory, a store that reads by index
     reads by index and a stream streams, when the chain states no read; a read
     it states wins over each."""
-    import pyarrow.parquet as pq
 
     rows = [{"value": index} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
@@ -2228,7 +2257,6 @@ def test_a_directory_of_arrow_files_reads_its_feather_files_too(tmp_path):
 def test_a_directory_named_for_its_format_declares_it_with_a_trailing_separator_too(tmp_path):
     """A directory whose name carries a format's suffix declares that format, spelled with a
     trailing separator or without: either spelling reads every file it holds."""
-    import pyarrow.parquet as pq
 
     directory = tmp_path / "train.parquet"
     directory.mkdir()
