@@ -15,7 +15,7 @@ import pytest
 from diffusion_stubs import batch_for
 from diffusion_support import TanhLayer, images_of, saved_after_one_step
 from flax import linen as nn
-from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
+from reference_error import as_given, assert_as_exact, declared_seeds, dew_path, indexed_recording, recording
 from tool_support import run_from
 
 import dew
@@ -264,7 +264,10 @@ def test_each_sides_gradient_is_the_whole_losss_there():
         heads, student = (split(sided(task, held, batch, step, names)) for names in (CRITIC, STUDENT))
         return {"heads": heads["heads"], "student": student["student"]}
 
-    assert_as_exact(jax.jit(whole(jnp.float32)), jax.jit(sides), lambda seed: (generator().draw(seed),),
+    # An invariance claim: the reference is Dew's own loss summed by side (`dew_path`), the arm the whole
+    # loss, no reference written apart from Dew to compile as written.
+    assert_as_exact(jax.jit(whole(jnp.float32)), dew_path(jax.jit(sides)),
+                    lambda seed: (generator().draw(seed),),
                     "the whole loss's gradient against each side's", seeds=SIDED_SEEDS,
                     truth_fn=whole(jnp.float64))
 
