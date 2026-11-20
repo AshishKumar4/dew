@@ -369,6 +369,20 @@ def free(monkeypatch, room):
                         lambda device: {"bytes_limit": LIMIT, "bytes_in_use": LIMIT - room})
 
 
+def free_until_placed(monkeypatch, room):
+    """Every device reports `room` bytes of its LIMIT free, less the arrays this process places on it after:
+    the reading a device gives a fit that plans its step before placing its state, beside that state's
+    bytes (`Trainer._planned_unplaced`), and judges it again once the state holds them, where `free`'s
+    reading holds still."""
+    def held(device) -> int:
+        return sum(array.nbytes for array in jax.live_arrays() if device in array.devices())
+
+    gc.collect()
+    before = {device: held(device) for device in jax.devices()}
+    monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {
+        "bytes_limit": LIMIT, "bytes_in_use": LIMIT - room + max(0, held(device) - before[device])})
+
+
 def needs(monkeypatch, trainer, run=None):
     """The bytes the step `trainer` compiles first needs beside what a device holds: the headroom that
     compile left of all of LIMIT free, taken from LIMIT. `run` compiles it; None compiles it for BATCH."""
@@ -1778,11 +1792,13 @@ def fitted_once(trainer: Trainer) -> None:
 
 @functools.cache
 def muon_needs() -> tuple[int, JSON]:
-    """The room the cells below free for the Muon step (`muon_lm`) before its state is placed, and the parted
-    step's remat: between what it needs beside what a device holds with its Newton-Schulz stacks joined and
-    with them parted (`ns_group` 1), and the bytes of the arguments the devices hold none of yet, which a fit
-    plans its step beside before placing them (`Trainer._planned_unplaced`). Freed without those, no rung of
-    that plan fits, and the fit searched its ladder twice (row 8606: 129 s a cell). Measured once."""
+    """The room the cells below free for the Muon step (`muon_lm`) before its state is placed
+    (`free_until_placed`), and the parted step's remat: between what it needs beside what a device holds with
+    its Newton-Schulz stacks joined and with them parted (`ns_group` 1), and the bytes of the arguments the
+    devices hold none of yet, which a fit plans its step beside before placing them. Freed as `free` frees,
+    without those and never taken by them, no rung of that plan fitted and the placed devices' room passed
+    the joined step: the fit searched its ladder again once placed (row 8606: 129 s a cell). Measured
+    once."""
     with pytest.MonkeyPatch.context() as monkeypatch:
         joined = needs(monkeypatch, trainer := muon_lm(), lambda: fitted_once(trainer))
         parted = needs(monkeypatch, trainer := muon_lm(ns_group=1), lambda: fitted_once(trainer))
@@ -1797,7 +1813,7 @@ def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_rec
     climbed the remat rungs (row 5889: the joined copies held 11.3 GB of a 4B step's peak for 82 ms a
     step)."""
     room, remat = muon_needs()
-    free(monkeypatch, room)
+    free_until_placed(monkeypatch, room)
     planned = muon_lm()
     fitted_once(planned)
     assert planned.plan["ns_group"] == 1, planned.plan
@@ -1811,7 +1827,7 @@ def test_a_muon_run_that_states_its_stacks_group_keeps_it(monkeypatch):
     or is refused (row 8696: in all of the room no release was ever asked, so a stated group overridden
     failed nothing)."""
     room, _ = muon_needs()
-    free(monkeypatch, room)
+    free_until_placed(monkeypatch, room)
     stated = muon_lm(ns_group=4)
     try:
         fitted_once(stated)
