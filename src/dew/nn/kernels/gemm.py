@@ -35,6 +35,7 @@ import contextvars
 import dataclasses
 import enum
 import functools
+from collections.abc import Sequence
 from typing import Literal
 
 import jax
@@ -46,7 +47,7 @@ from jax.custom_derivatives import zero_from_primal
 
 from dew import _cache
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_gradients_formed
-from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
+from dew.nn.kernels import generation, grouped_matmul, selection, tuning, xla_products
 from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic_sm100
 from dew.nn.kernels.templates.axes import GROUPS
@@ -363,6 +364,22 @@ BATCHED: selection.Op[BatchedCase] = selection.Op(generation.Choice.GROUPED_MATM
     selection.Kernel('xla', (), generic=True)))
 """A batched product's selector (`batched_product`): the template's grouped product, its batches the groups,
 where a receipt names it; else XLA's dot as the caller wrote it."""
+
+
+def joined_depths(products: Sequence[tuple[jax.Array, jax.Array]], *, transpose_rhs: bool = False, out_dtype,
+                  precision: PrecisionLike = None, interpret_on_cpu: bool = False) -> jax.Array:
+    """The sum of `products`' `rows @ matrix` (`rows` `[rows, depth_i]`, `matrix` `[depth_i, width]`, or
+    `[width, depth_i]` where `transpose_rhs`), as one `gemm` over their unpadded concatenated depth in the
+    first rows' dtype, rounded to `out_dtype`: the operands joined along the depth, nothing between them (the
+    launch pads the end, `grouped_matmul.gmm_call`), its accumulation, depth split and check-1 contract
+    `gemm`'s own. The one owner of that product for LoRA's adapted product (`low_rank`; base review d0bc7dee6
+    F5). A streamed pair's two accumulators, and padding between the depths, each overflowed where this
+    product's sums stay finite (base review 3f38bf20d F1, F2)."""
+    dtype = products[0][0].dtype
+    joined_rows = jnp.concatenate([rows.astype(dtype) for rows, _ in products], axis=1)
+    joined = jnp.concatenate([matrix.astype(dtype) for _, matrix in products], axis=1 if transpose_rhs else 0)
+    return gemm(joined_rows, joined, transpose_rhs=transpose_rhs, out_dtype=out_dtype, precision=precision,
+                interpret_on_cpu=interpret_on_cpu)
 
 
 def batched_product(a: jax.Array, b: jax.Array, contract: tuple[int, int], *,
@@ -1238,10 +1255,12 @@ def _added(acc, prior):
 def side_by_side(rows, matrices: tuple, out_dtype, precision: PrecisionLike, *, whole: bool) -> bool:
     """Whether a launch takes `rows` (`[rows, depth]`) by `matrices` side by side (`gemm`'s `beside`, each
     `[depth, width]`, one output each in `out_dtype`) as `gemm` binds them: their forward, or their input
-    gradient whole (`_one_launch`, of cotangents in `out_dtype`), Mosaic GPU's launch read unreported, a
-    refusal of either a no. The operands abstract (`jax.ShapeDtypeStruct`) or arrays, `whole` whether a
-    launch sees them whole (`seen_whole`; a device's own rows where the caller maps them per shard): a
-    layer's choice of the side-by-side product over its projections apart (`dew.nn.joined.side_by_side`)."""
+    gradient whole (`_one_launch`, of cotangents in `out_dtype`), Mosaic GPU's launch read unreported: the
+    forward and the input gradient independent choices, but a forward that would not run (a named kernel's
+    or a pin's refusal of it) a no. The operands abstract (`jax.ShapeDtypeStruct`) or arrays, `whole`
+    whether a launch sees them whole (`seen_whole`; a device's own rows where the caller maps them per
+    shard): a layer's choice of the side-by-side product over its projections apart
+    (`dew.nn.joined.side_by_side`)."""
     sizes = jnp.full((1,), rows.shape[0], jnp.int32)
     grouped = tuple(jax.ShapeDtypeStruct((1, *matrix.shape), matrix.dtype) for matrix in matrices)
     dtypes = (jnp.dtype(out_dtype),) * len(matrices)
@@ -1249,8 +1268,16 @@ def side_by_side(rows, matrices: tuple, out_dtype, precision: PrecisionLike, *, 
                                transpose_rhs=False, interpret=False, precision=precision, dense=True,
                                paired=None, first=None, gather=None, scatter=None, summed_as=(),
                                beside=grouped[1:])
-    if _mosaic_route(call, product, whole):
-        return True
+    case = grouped_matmul.grouped_case(*call, product=product, whole=whole)
+    try:
+        forward = selection.decided(grouped_matmul.GROUPED, case)
+    except selection.KernelRefused:
+        # A named kernel refusing the forward side by side: `gemm` would raise it, so they run apart.
+        return False
+    if forward.kernel == grouped_matmul.MosaicGmm.name:
+        # Its forward a launch's, which runs where its pin does (head review of 4d6c7a69c F5: a forward the
+        # pin refused raised where its input gradient alone was asked).
+        return not _pin_refuses(call)
     reached = [(jax.ShapeDtypeStruct((rows.shape[0], matrix.shape[-1]), out_dtype), matrix)
                for matrix in grouped]
     options = {'interpret_on_cpu': False, 'precision': precision, 'transpose_rhs': True, 'dense': True,
@@ -1303,25 +1330,35 @@ def _launch_route(d, matrix, form: dict, group_sizes, dtype, prologue, options: 
 
 def _mosaic_route(call: tuple, product, whole: bool) -> "generation.Route | Literal[False]":
     """The route `grouped_matmul.GROUPED` selects Mosaic GPU's launch for `call` (`_gemm_call`'s: products
-    in one launch, `side_by_side`'s and `_one_launch`'s) of `product` by, its operands seen `whole`, found
-    unreported (`generation.routes`' `alone`), else False: another kernel's, a refusal of a named kernel, or
-    a launch pinned at a tile the call does not hold (base review 2e4651b2e F1: a chain narrowed a
-    64-column pin to 16). Each is the products' decision to run apart, as before."""
-    pin = dict(_cache.KERNEL_PINS.value).get(grouped_matmul.MosaicGmm)
-    if pin is not None:
-        launch = grouped_matmul.MosaicGmm()
-        bound = launch.bind(*call[1], **call[2])
-        if not launch.pinnable(bound, launch.completed(bound, pin)):
-            return False
+    in one launch, `side_by_side`'s and `_one_launch`'s) of `product` by, its operands seen `whole`, decided
+    and reported nowhere (`selection.decided`: the dispatch that runs it publishes it), else False: another
+    kernel's, a refusal of a named kernel, or a pin the launch's own resolution refuses for the call
+    (`tuning.KernelOp.taken`'s `Unpinnable`: base review 2e4651b2e F1, a chain narrowed a 64-column pin to
+    16). Each is the products' decision to run apart, as before."""
     case = grouped_matmul.grouped_case(*call, product=product, whole=whole)
     try:
-        with generation.routes(alone=True):
-            route = selection.select(grouped_matmul.GROUPED, case)
+        route = selection.decided(grouped_matmul.GROUPED, case)
     except selection.KernelRefused:
         # A named kernel refusing the products in one launch: they run apart, each through its own call,
         # where that refusal is reported if it refuses one.
         return False
-    return route if route.kernel == grouped_matmul.MosaicGmm.name else False
+    if route.kernel != grouped_matmul.MosaicGmm.name or _pin_refuses(call):
+        return False
+    return route
+
+
+def _pin_refuses(call: tuple) -> bool:
+    """Whether a pin of Mosaic GPU's launch refuses `call` (`_gemm_call`'s) as the launch resolves it
+    (`tuning.KernelOp.taken`'s `Unpinnable`): products one launch would take whole an optional form, whose
+    refusal runs them apart (base review 156a4595a F5); none where no pin is held."""
+    if grouped_matmul.MosaicGmm not in dict(_cache.KERNEL_PINS.value):
+        return False
+    launch = grouped_matmul.MosaicGmm()
+    try:
+        launch.taken(launch.bind(*call[1], **call[2]))
+    except tuning.Unpinnable:
+        return True
+    return False
 
 
 def _keeps_launch(lhs, rhs, group_sizes, hook, sides: tuple, outs: tuple, summed_as: tuple,

@@ -87,20 +87,24 @@ def buffer_waits(chunks: int, buffers: int) -> tuple[int, ...]:
     return tuple(waits)
 
 
-def column_ranges(total: int, width: int) -> list[tuple[int, int]]:
-    """The `(first, count)` column spans of a `total`-column tile taken `width` columns at a time, the whole
-    where `width >= total`: one chunk plan shared by `column_chunks` and a dQ reducer (`_PlacedDq.pieces`,
-    row 8813)."""
-    if width >= total:
-        return [(0, total)]
-    return [(first, width) for first in range(0, total, width)]
+def column_spans(columns: int, width: int) -> list[tuple[int, int]]:
+    """`columns` `width` at a time, each span its first column and its width, the last clipped to what is
+    left, one span of all of them where they are no wider: the partition `column_chunks` slices a value by,
+    its shape alone (a plan's, before any value), and a dQ reducer's chunks (`_PlacedDq.pieces`, row
+    8813)."""
+    if width >= columns:
+        return [(0, columns)]
+    return [(first, min(width, columns - first)) for first in range(0, columns, width)]
 
 
 def column_chunks(value: jax.Array, width: int) -> list[tuple[int, jax.Array]]:
     """`value` `width` of its columns at a time, each chunk with its first column, the whole where it is no
-    wider: a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
-    return [(first, value[..., first:first + count])
-            for first, count in column_ranges(value.shape[-1], width)]
+    wider (`column_spans`): a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue,
+    `staged_columns`)."""
+    spans = column_spans(value.shape[-1], width)
+    if len(spans) == 1:
+        return [(0, value)]
+    return [(first, value[..., first:first + span]) for first, span in spans]
 
 
 def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
