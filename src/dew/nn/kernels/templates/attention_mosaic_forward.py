@@ -646,7 +646,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         acc = algebra.split_output(split.others, own, value_rows)
         # The joined sums over the denominator at their rows' scale (`algebra.split_residuals`), a dropping
         # call's over the rest of its multiplier too, in the one division (`algebra.dropped_total`), rounded
-        # to odd where a 16-bit output narrows it unhooked (`algebra.narrowing_settled`).
+        # to odd where a 16-bit output narrows it unhooked (`algebra.narrowing_settled`), in XLA.
         total = rows[1] if not form.headroom else power2(rows[1], -split.shift, reach=TWO_FACTOR_REACH)
         dropped, divisor = algebra.dropped_total(form, acc, total)
         out = algebra.output_of(dropped, divisor, guarded=form.guarded or hooks.initial is not None,
@@ -1823,7 +1823,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
     # An output narrowed to 16 bits settles at its overflow midpoint (`algebra.Forward.narrowed`); an fp32
     # call's parts' (`parts`) stays fp32.
     spec = dataclasses.replace(spec, narrowed=None if training or parts > 1
-                               else algebra.narrowed_of(out_dtype or query.dtype))
+                               else algebra.narrowed_of(out_dtype or query.dtype), registered=True)
     return _launched(query, key, value,
                      _Read(spans, hooked, anchors, None if table is None else table[0],
                            None if walks is None else walks.blocks, sources, block, into, kept=keeping),

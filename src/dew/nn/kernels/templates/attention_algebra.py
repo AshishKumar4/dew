@@ -115,6 +115,9 @@ class Forward:
     narrowed: DTypeLike | None = None
     """The 16-bit dtype its fp32 output is narrowed to, its quotient rounded to odd there
     (`narrowing_settled`, `narrowed_of`); None where it stays fp32."""
+    registered: bool = False
+    """Whether its output is finished in a kernel's registers, a tile at once (a Mosaic forward's), where
+    its narrowing settles the overflow midpoint alone (`midpoint_settled`)."""
 
     @property
     def reach(self) -> float:
@@ -1936,9 +1939,11 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
         state = state._replace(acc=acc, total=total)
         out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
                        held=jnp.float32 if held else spec.largest)
-        # Narrowed as it is: a hook reads the fp32 quotient unsettled.
+        # Narrowed as it is: a hook reads the fp32 quotient unsettled. A register epilogue (a Mosaic
+        # forward's tile, `Forward.registered`) settles the overflow midpoint alone, at a row's cost.
         if spec.narrowed is not None and output_mod is None:
-            out = narrowing_settled(out, state.acc, state.total, spec.narrowed)
+            settle = midpoint_settled if spec.registered else narrowing_settled
+            out = settle(out, state.acc, state.total, spec.narrowed)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
@@ -1985,6 +1990,25 @@ def narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype:
     settled = jnp.where(_between(bits, dtype) & (above != 0), odd, rounded)
     close = jnp.abs(out - rounded) <= jnp.abs(rounded) * np.float32(2.0 ** -23)
     return jnp.where(close, settled, out)
+
+
+def midpoint_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """`narrowing_settled` at `dtype`'s overflow midpoint alone (its largest and half an ulp, the one tie
+    whose narrowing turns a finite output to inf), at a row's cost, where a whole tile's settle costs
+    registers: a Mosaic forward's epilogue settling its tile per element took an H100's bf16 forward to
+    168 registers and a 328-byte frame, an sm120's 128-wide inference forward 16 bytes spilled. The exact
+    quotient is below the midpoint where `|acc|` is below the midpoint times `divisor`, that product formed
+    exact once a row (`two_product`'s bit split, range-safe at bf16's midpoint), `|acc|` less its rounded
+    part exact beside it; there `out` an fp32 ulp nearer zero, which narrows to the largest. Every other
+    value `out` as it is: a narrowing in the kernel rounds an ordinary tie twice, its bound with its sums'
+    and exponentials' roundings at fp32's resolution (`narrowing_settled`)."""
+    found = jnp.finfo(dtype)
+    midpoint = np.float32(float(found.max) + float(found.eps) * 2.0 ** (found.maxexp - 2))
+    nearer = np.nextafter(midpoint, np.float32(0.0))
+    high, low = two_product(divisor, jnp.full_like(divisor, midpoint), bit_split=True)
+    below = (jnp.abs(acc) - expand(high, acc)) < expand(low, acc)
+    within = (jnp.abs(out) == midpoint) & below
+    return jnp.where(within, jnp.where(out > 0, nearer, -nearer), out)
 
 
 def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
