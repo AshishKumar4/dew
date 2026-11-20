@@ -1983,19 +1983,20 @@ def midpoint_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, residua
     """`out`, the sums `acc` over `divisor` (fp32), where it is exactly `dtype`'s overflow midpoint, its
     largest and half an ulp, settled to the side the exact quotient lies on before its narrowing: the
     divisor taken with the `residual` its own rounding left (a dropping call's multiplier's rest,
-    `dropped_residual`), `acc - out x divisor` exact (`two_product`) less `out` times it, whose sign says it;
-    below it, the fp32 value an ulp nearer zero, which narrows to the largest, beyond it or on it, `out`,
-    which narrows to inf as the exact quotient does. The exact output 65519.9995 of one kept key of 65504 at
-    a multiplier of 1.000244 rounded to fp32's 65520, which tied to inf in fp16 (the base review of
-    545370f65, F3; row 9544). Every other value `out` as it is."""
+    `dropped_residual`): the exact quotient is below the midpoint where `|acc|` is below the midpoint times
+    that divisor, a row's product formed exact once (`two_product`), `|acc|` less its rounded part exact
+    beside it (the two within a factor of two where `out` is the midpoint); below it, the fp32 value an ulp
+    nearer zero, which narrows to the largest, beyond it or on it, `out`, which narrows to inf as the exact
+    quotient does. The exact output 65519.9995 of one kept key of 65504 at a multiplier of 1.000244 rounded
+    to fp32's 65520, which tied to inf in fp16 (the base review of 545370f65, F3; row 9544). Every other
+    value `out` as it is. An element's cost is a subtraction and a comparison: a product formed exact an
+    element took an H100's bf16 forward epilogue from 122 registers to 168, spilling."""
     found = jnp.finfo(dtype)
     midpoint = np.float32(float(found.max) + float(found.eps) * 2.0 ** (found.maxexp - 2))
     nearer = np.nextafter(midpoint, np.float32(0.0))
-    divisor = expand(divisor, acc)
-    product, error = two_product(out, divisor)
-    lower = ((acc - product) - error) - out * (expand(residual, acc) if isinstance(residual, jax.Array)
-                                               else np.float32(residual))
-    within = (jnp.abs(out) == midpoint) & jnp.where(out > 0, lower < 0, lower > 0)
+    high, low = two_product(divisor, jnp.full_like(divisor, midpoint))
+    below = (jnp.abs(acc) - expand(high, acc)) < expand(low + midpoint * residual, acc)
+    within = (jnp.abs(out) == midpoint) & below
     return jnp.where(within, jnp.where(out > 0, nearer, -nearer), out)
 
 
