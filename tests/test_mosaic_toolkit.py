@@ -409,10 +409,10 @@ def test_a_launch_with_a_joined_correction_warpgroup_counts_its_registers_in_its
     more, its consumer's budget is its schedule's (below a lone consumer's), its correction role's half of
     it, and its register model counts the correction's registers in what a program allocates, so a
     multiprocessor holds no more programs of it than its registers do (row 5368)."""
-    from dew.nn.kernels.templates import bundles, resources
+    from dew.nn.kernels.templates import mosaic_sm100, resources
 
     with generation.assumed("sm100"):
-        family = bundles.of("sm100", jnp.bfloat16)
+        family = mosaic_sm100.RINGS
         joined = ((handoffs.Role("correction", weight=0.5), 1),)
         held = family.role_schedule(1, joined=joined).registers()
         assert family.warpgroups(1, joined=joined) == family.warpgroups(1) + 1
