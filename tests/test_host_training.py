@@ -1759,7 +1759,9 @@ def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companion
     topology.write_bytes(b"")
     data = Loader(train=lambda partition: iter([{"text": tokens}] * 2), val=None, batch=len(tokens),
                   records=None)
-    done = AheadTarget("sm90", 1, topology=str(topology)).compiled(trainer, data, steps=1)
+    configured = streaming_decoder(HOST, dtype=jnp.bfloat16)
+    configured.device_mesh = trainer.device_mesh
+    done = AheadTarget("sm90", 1, topology=str(topology)).compiled(configured, data, steps=1)
     compiled = {} if done.startup is None else done.startup.by_backend
     assert done.untuned or compiled.get("gpu", {}).get("programs", 0) > 0, (done.untuned, compiled)
     # Targeted as compile_ahead targets a step (`ahead._targeted`): a run that tunes its kernels, which no
