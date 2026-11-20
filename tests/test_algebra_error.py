@@ -76,18 +76,23 @@ def test_the_candidates_are_proposed_cheapest_first_and_the_first_admitted_chose
     """The softmax through its log-sum-exp: its candidates, each root's forms enumerated beside the
     cheapest and the most stable extractions, come in order of price, the compensated forms after every
     uncompensated one, each at its form's price, and the chosen is the first the gate admits in that order
-    (docs/design/algebra.md §6.5), where three fixed proposals came as written first."""
+    (docs/design/algebra.md §6.5): against the form as written, or under the accurate policy against it and
+    every candidate as exact as it, where three fixed proposals came as written first."""
     admits = gate(softmax_with_lse, logits)
     choice = choose(softmax_with_lse, OPERANDS * 3, accurate=accurate, saturation=algebra.SATURATION,
                     admits=admits)
     prices = [(candidate.compensated, candidate.seconds) for candidate in choice.candidates]
     assert prices == sorted(prices)
     assert any(candidate.compensated for candidate in choice.candidates)
-    references = choice.candidates if accurate else [
-        next(candidate for candidate in choice.candidates if candidate.name == "as written")]
+    written = next(candidate for candidate in choice.candidates if candidate.name == "as written")
+    references = [written]
+    if accurate:
+        references += [candidate for candidate in choice.candidates
+                       if candidate is not written and admits(candidate.function, written.function)]
     first = next(candidate for candidate in choice.candidates
-                 if all(candidate is reference or admits(candidate.function, reference.function)
-                        for reference in references))
+                 if (not accurate or any(candidate is reference for reference in references))
+                 and all(candidate is reference or admits(candidate.function, reference.function)
+                         for reference in references))
     assert choice.chosen is first
 
 
@@ -213,3 +218,16 @@ def test_the_accurate_policy_chooses_past_a_proposal_that_leaves_the_floats_rang
     admits = gate(product_over, ranged)
     choice = choose(product_over, OPERANDS * 3, accurate=True, saturation=algebra.SATURATION, admits=admits)
     assert admits(choice.chosen.function, product_over)
+
+
+def test_a_weak_inputs_sum_is_chosen_where_its_compensated_print_is_refused():
+    """A sum of a weak float32 input keeps the weak type, which its compensated sum returns strong: that
+    print is refused (no plain call keeps the program's type), and the chooser takes the sum's own forms,
+    where it had aborted on the refusal."""
+    weak = jax.ShapeDtypeStruct(SHAPE, jnp.float32, weak_type=True)
+
+    def summed(x):
+        return jnp.sum(x, axis=0)
+
+    choice = choose(summed, (weak,), accurate=True, saturation=algebra.SATURATION, admits=gate(summed, small))
+    assert not any(candidate.compensated for candidate in choice.candidates)
