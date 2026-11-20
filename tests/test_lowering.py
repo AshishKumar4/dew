@@ -1281,6 +1281,18 @@ def test_a_call_reads_its_facts_from_the_devices_its_context_places_it_on():
         assert generation.placed_devices() == [devices[1]]
 
 
+def test_an_assumed_gpus_target_reads_no_device_of_a_compile_only_placement():
+    """Within `generation.assumed`, a call placed on compile-only GPUs (their abstract mesh, which a CPU
+    process lowers a GPU's program under) takes the assumed generation's target, reading no device of that
+    placement, which this process has none of (row 8990's placed device read outside `assumed` alone)."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    mesh = Mesh(np.asarray(compile_only_gpus("sm90", 1)), ("x",))
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        assert generation.gpu_target().generation == "sm90"
+
+
 def test_a_run_over_gpus_of_two_kinds_is_refused():
     """Each process's kernel choices read its first GPU's facts and must agree with every other's, so a
     run whose processes' first GPUs are of two kinds is refused; first GPUs of one kind pass, whatever
