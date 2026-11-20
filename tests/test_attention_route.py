@@ -1351,8 +1351,9 @@ def test_backward_route_certifies_with_its_rounded_flag(monkeypatch):
     monkeypatch.setattr(attention_mosaic, "backward", fake_backward)
     q = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
     spans = template.spans(64, 64, 1)
-    residuals = (jnp.zeros((1, 1, 64), jnp.float32), jnp.ones((1, 1, 64), jnp.float32),
-                 jnp.zeros((1, 1, 64), jnp.int32), template.Split(q, q, jnp.ones((1, 1, 64), jnp.float32)))
+    row = jnp.zeros((1, 1, 64), jnp.float32)
+    residuals = (row, jnp.ones_like(row), jnp.zeros((1, 1, 64), jnp.int32),
+                 template.Split(q, q, jnp.ones_like(row), row))
     with generation.assumed("sm90"):
         attention_route.backward(q, q, q, spans, template.Hooks(), q, residuals=residuals, rounded=False,
                                  interpret=True)
