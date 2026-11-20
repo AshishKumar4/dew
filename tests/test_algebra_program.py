@@ -664,7 +664,8 @@ def test_a_pass_without_a_rule_set_leaves_its_rewrites_untaken():
     """A pass that leaves sets out (`algebra.program.passes`' `without`, a rule set's receipt's arm) admits
     them nowhere and takes none of their rewrites: the sums the `linear` set joins (as the test above
     records) are rewritten without it by `joined`, the other set that joins them, and by no `linear` match,
-    and without both by none at all, their program computing what the program with no pass computes. A
+    and without every set that changes a program (both, and `reuse`) by none at all, their program
+    computing what the program with no pass computes. A
     derivation's own set an arm may name (`carry`'s) is taken; a dev-time set, a derivation's defining set
     and a name no set registers are refused, as an arm without them would measure nothing."""
     from dew.algebra.program import passes
@@ -677,7 +678,7 @@ def test_a_pass_without_a_rule_set_leaves_its_rewrites_untaken():
         options.program(joined).compiled(x, y, a)
         [made] = report.rewrites()
     assert "linear" not in made.admitted and "linear" not in made.fired and made.fired.get("joined", 0) > 0
-    with report.refusals(), passes(without=("linear", "joined")):
+    with report.refusals(), passes(without=("linear", "joined", "reuse")):
         computed = options.program(joined).compiled(x, y, a)(x, y, a)
         assert not report.rewrites()
     with passes(on=False):

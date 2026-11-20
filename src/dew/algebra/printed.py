@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from jax._src import core
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -63,12 +64,12 @@ class _Printer:
         return f"{prefix}{self.count}"
 
     def emit(self, target: str, call: str, arguments: list[str]) -> None:
-        self.lines.extend(_wrapped(f"    {target} = {call}(", arguments, ")"))
+        self.lines.extend(wrapped(f"    {target} = {call}(", arguments, ")"))
 
     def atom(self, atom) -> str:
         """An operand's text: a literal's value, or a value's name, a double word read as its high word."""
         if isinstance(atom, jcore.Literal):
-            return _value(atom.val, atom.aval.dtype)
+            return _value(atom.val, _dtype(atom))
         if atom in self.pairs and atom not in self.read:
             self.read.add(atom)
             self.lines.append(f"    {self.names[atom]} = {self.pairs[atom]}[0]")
@@ -83,7 +84,7 @@ class _Printer:
         return f"({'-' if negated else ''}{value}, jnp.zeros_like({value}))"
 
 
-def source(closed: jcore.ClosedJaxpr, name: str, *, compensated: bool = False) -> tuple[str, bool]:
+def source(closed: core.ClosedJaxpr, name: str, *, compensated: bool = False) -> tuple[str, bool]:
     """`closed` printed as a function `name` over its inputs returning its outputs as a tuple, and whether a
     sum was compensated (`compensated`: always False where it is not asked). Raises `Unprintable` for an
     equation no plain call writes."""
@@ -95,7 +96,7 @@ def source(closed: jcore.ClosedJaxpr, name: str, *, compensated: bool = False) -
         printer.lines.extend(_constant(printer.names[var], np.asarray(value)))
     _body(printer, closed.jaxpr)
     outputs = [printer.atom(atom) for atom in closed.jaxpr.outvars]
-    returned = _wrapped("    return (", outputs, ",)" if len(outputs) == 1 else ")")
+    returned = wrapped("    return (", outputs, ",)" if len(outputs) == 1 else ")")
     return "\n".join([f"def {name}({', '.join(inputs)}):", *printer.lines, *returned]) + "\n", printer.used
 
 
@@ -108,8 +109,8 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
             continue
         inner, operands = _inlined(printer, equation)
         if inner is not None:
-            body = inner.jaxpr if isinstance(inner, jcore.ClosedJaxpr) else inner
-            consts = inner.consts if isinstance(inner, jcore.ClosedJaxpr) else []
+            body: core.Jaxpr = inner.jaxpr if isinstance(inner, core.ClosedJaxpr) else inner
+            consts = inner.consts if isinstance(inner, core.ClosedJaxpr) else []
             for var, value in zip(body.constvars, consts, strict=True):
                 printer.names[var] = printer.fresh("c")
                 printer.lines.extend(_constant(printer.names[var], np.asarray(value)))
@@ -150,11 +151,19 @@ def _alias(printer: _Printer, var: jcore.Var, atom) -> None:
     """`var` named as `atom` is: a call's input as its operand, its output as its body's."""
     if isinstance(atom, jcore.Literal):
         printer.names[var] = printer.fresh()
-        printer.lines.append(f"    {printer.names[var]} = {_value(atom.val, atom.aval.dtype)}")
+        printer.lines.append(f"    {printer.names[var]} = {_value(atom.val, _dtype(atom))}")
         return
     printer.names[var] = printer.names[atom]
     if atom in printer.pairs:
         printer.pairs[var] = printer.pairs[atom]
+
+
+def _dtype(atom) -> np.dtype:
+    """A literal's or a value's dtype, as its abstract value states it."""
+    aval = atom.aval
+    if not isinstance(aval, ShapedArray):
+        raise Unprintable(f"no literal form of a {type(aval).__name__} value")
+    return np.dtype(aval.dtype)
 
 
 def _floating(var) -> bool:
@@ -187,15 +196,23 @@ def _compensated(printer: _Printer, equation: jcore.JaxprEqn) -> None:
                  [printer.pair(left), printer.pair(right, negated=equation.primitive is lax.sub_p)])
 
 
+def refused(closed: core.ClosedJaxpr) -> str | None:
+    """Why no plain call writes `closed` (`Unprintable`'s reason), None where it is printable."""
+    try:
+        source(closed, "printable")
+    except Unprintable as refusal:
+        return str(refusal)
+    return None
+
+
 def reprinted(function: Callable, operands, tree) -> Callable | None:
     """`function` over operands of `operands`' shapes as its printed text computes it (`source`, `loaded`),
     returning its outputs in their structure `tree`: what a generated module of it would compute, where a
-    platform's choice takes its default branch; None where it is not printable (`Unprintable`)."""
-    try:
-        text, _ = source(jax.make_jaxpr(function)(*operands), "reprinted")
-    except Unprintable:
+    platform's choice takes its default branch; None where it is not printable (`refused`)."""
+    closed = jax.make_jaxpr(function)(*operands)
+    if refused(closed) is not None:
         return None
-    flat = loaded(text, "reprinted")
+    flat = loaded(source(closed, "reprinted")[0], "reprinted")
     return lambda *values: jax.tree.unflatten(tree, list(flat(*values)))
 
 
@@ -252,7 +269,7 @@ def _param(value) -> str:
     if isinstance(value, float):
         return _float(value)
     if isinstance(value, tuple | list):
-        inner = ", ".join(_param(item) for item in value)
+        inner = ", ".join(_param(entry) for entry in value)
         return f"({inner}{',' if len(value) == 1 else ''})"
     if isinstance(value, np.dtype) or (isinstance(value, type) and issubclass(value, np.generic)):
         return f"jnp.dtype({np.dtype(value).name!r})"
@@ -261,9 +278,9 @@ def _param(value) -> str:
     raise Unprintable(f"no literal form of a {type(value).__name__} parameter")
 
 
-def _wrapped(head: str, arguments: list[str], tail: str) -> list[str]:
-    """A call's lines within `WIDTH`: on one where it fits, else its arguments packed onto lines after its
-    head, each indented four more."""
+def wrapped(head: str, arguments: list[str], tail: str) -> list[str]:
+    """A call's (or a literal's) lines within `WIDTH`: on one where it fits, else its arguments packed onto
+    lines after its head, each at eight spaces' indent, the generated code's deepest."""
     whole = head + ", ".join(arguments) + tail
     if len(whole) <= WIDTH:
         return [whole]

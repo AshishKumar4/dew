@@ -103,11 +103,10 @@ def compensated(candidate: Candidate, operands: Sequence[jax.ShapeDtypeStruct], 
     keeps. Proposed after every uncompensated form at its own form's price (`Candidate.compensated`): its
     compensation's arithmetic lies in protected spans, which the cost model prices as the values they
     make."""
-    try:
-        text, used = printed.source(jax.make_jaxpr(candidate.function)(*operands), "compensated",
-                                    compensated=True)
-    except printed.Unprintable:
+    closed = jax.make_jaxpr(candidate.function)(*operands)
+    if printed.refused(closed) is not None:
         return None
+    text, used = printed.source(closed, "compensated", compensated=True)
     if not used:
         return None
     flat = printed.loaded(text, "compensated")

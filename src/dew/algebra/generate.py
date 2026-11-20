@@ -89,15 +89,24 @@ def admits(function: Callable, operands: tuple[jax.ShapeDtypeStruct, ...], cases
            label: str) -> Callable[[Callable, Callable], bool]:
     """The gate a candidate is admitted by (`error.choose`'s `admits`): whether it is as exact as a
     reference from `function`'s float64 truth over the cases' draws of `operands` (check 1,
-    `dew.parity.judge`: a site over or left unresolved admits none)."""
-    def admitted(candidate: Callable, reference: Callable) -> bool:
-        ours, theirs = jax.jit(candidate), jax.jit(reference)
+    `dew.parity.judge`: a site over or left unresolved admits none), each compiled through Dew's compile
+    point with the pass off (`options.owned_program`, `algebra.passes`)."""
+    from dew import algebra
+    from dew.nn.kernels import options
 
+    truth = options.owned_program(function)
+
+    def admitted(candidate: Callable, reference: Callable) -> bool:
+        ours, theirs = options.owned_program(candidate), options.owned_program(reference)
+
+        # Each form computed as it is: the pass off, as the gate holds it for a reference and the truth.
         def draw(seed: int):
             values = cases.draw(seed, operands)
-            with jax.enable_x64(new_val=True):
-                truth = jax.jit(function)(*(jnp.asarray(value, jnp.float64) for value in values))
-            return ours(*values), theirs(*values), truth
+            with algebra.passes(on=False):
+                mine, other = ours(*values), theirs(*values)
+                with jax.enable_x64(new_val=True):
+                    true = truth(*(jnp.asarray(value, jnp.float64) for value in values))
+            return mine, other, true
 
         try:
             parity.judge(draw, cases.seeds, label)
@@ -152,24 +161,26 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
              f"egglog {importlib.metadata.version('egglog')}; measured on {jax.default_backend()}.",
              "", "Receipts:"]
     lines += [f"- {found.name}: {found.receipt}" for found in sets]
-    lines += ['"""', ""]
+    lines = [*_flowed(lines), '"""', ""]
     body: list[str] = []
     for found in chosen:
         form = found.candidate.form or found.candidate.function
         text, _ = printed.source(jax.make_jaxpr(form)(*found.operands), found.function,
                                  compensated=found.candidate.compensated)
-        body += ["", text.rstrip("\n"), ""]
+        body += ["", "", *text.rstrip("\n").split("\n")]
     for name in sorted({found.name for found in chosen}):
         own = [found for found in chosen if found.name == name]
-        body += ["", f"def {name}(*operands, policy: str = 'default', target: str = {own[0].target!r}):",
+        body += ["", "", f"def {name}(*operands, policy: str = 'default', target: str = {own[0].target!r}):",
                  f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
                  "    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)",
                  "    forms = {"]
-        body += [f"        {(found.policy, found.target, _case(found.operands))!r}: {found.function},"
-                 for found in own]
-        body += ["    }", "    return forms[(policy, target, case)](*operands)", ""]
-    lines += [*printed.imports("\n".join(body)), *body]
-    return "\n".join(_flowed(lines)).rstrip("\n") + "\n"
+        for found in own:
+            operands = [repr(operand) for operand in _case(found.operands)]
+            body += printed.wrapped(f"        ({found.policy!r}, {found.target!r}, (", operands,
+                                    ",)):" if len(operands) == 1 else ")):")
+            body.append(f"            {found.function},")
+        body += ["    }", "    return forms[(policy, target, case)](*operands)"]
+    return "\n".join([*lines, *printed.imports("\n".join(body)), *body]) + "\n"
 
 
 def _case(operands: tuple[jax.ShapeDtypeStruct, ...]) -> tuple:

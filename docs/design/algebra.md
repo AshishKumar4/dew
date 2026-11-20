@@ -166,7 +166,8 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     every program the pass saw, bodies included) the only pattern of note was a divisor shared by several
     quotients (42 to 452 of 423 to 794 divisions a suite). A shared reciprocal unguarded overflows where `a /
     y` is finite (a subnormal `y`), makes a NaN of a zero `a`, and flushes to zero where a large `y`'s quotient
-    keeps its value, so each rule fires only where its divisor is held away from zero (its floor,
+    keeps its value, so each rule reads a divisor an epsilon floors (a maximum's or a sum's, so a window
+    opens at a division by one alone) and fires only where its divisor is held away from zero (its floor,
     `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest float's
     least normal power, `rules.least`) and its dividend bounded, the product under the reach (§6.3). A
     training step's values are mostly unbounded, so it fires on bounded ones alone (an epsilon's floor over a

@@ -391,17 +391,22 @@ _POSITIVE = Drawn(((64, 1024), ()), scale=lambda rng, shape, drawn: (
 _ROW_SCALED = Drawn(((64, 1024), (64,), (64, 1024)))
 
 
-_LOGITS = Drawn(((64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: rng.standard_normal(shape) * 10.0)
-"""Logits of a spread of ten, whose exponentials and their quotients stay in float32's range: a logarithm
-of them is the logit, which the form in log space keeps and the exponential rounds."""
+_LOGITS = Drawn(((64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: rng.standard_normal(shape) * 5.0)
+"""Logits of a spread of five, whose exponentials stay in float32's range, and their quotients and products
+too where the adversarial families cancel or repeat them (`Drawn.adversarial`): a logarithm of them is the
+logit, which the form in log space keeps and the exponential rounds."""
 _NEAR = Drawn(((64, 1024), (64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: (
     rng.standard_normal(shape) * (1e4 if not drawn else 1.0)))
 """A large term and two small ones: the large one's rounding is what a sum of each carries, which their
 difference cancels exactly where the large one is taken out."""
-_CONTRACTED_SCALE = Drawn(((64, 128), (128,), (128, 32)), scale=lambda rng, shape, drawn: (
-    rng.uniform(1.0, 1e3, shape) if len(shape) == 1 else rng.standard_normal(shape)))
-"""A matrix product's operands and a positive scale along its contraction (a softmax's totals, each at least
-one): the scale on either operand's contracted axis."""
+_CONTRACTED_SCALE = Drawn(((64, 128), (1, 128), (32, 128)), scale=lambda rng, shape, drawn: (
+    rng.uniform(1.0, 1e3, shape) if shape[0] == 1 else rng.standard_normal(shape)))
+"""A matrix product's left operand, a positive scale along its contraction (a softmax's totals, each at
+least one) as a row, and its right operand transposed, so each operand's leading axis is one no other
+shares (check 2 reads each operand's first rows)."""
+_NORMAL = Drawn(((64, 1024), (64, 1024), (64, 1024)),
+                scale=lambda rng, shape, drawn: rng.standard_normal(shape))
+"""Operands of unit scale: a regrouping's roundings compared where no draw's range dominates the error."""
 _NARROW = Drawn(((64, 4096),))
 """Rows long enough that a sum of a narrow float's terms rounds in its own precision at every step."""
 
@@ -488,12 +493,12 @@ def _ranged() -> tuple[RuleFamily, ...]:
             rewrite(a.binary("mul", b, multiplied).binary("div", c, divided)).to(
                 a.binary("mul", b.binary("div", c, divided), multiplied), plain(multiplied), plain(divided),
                 *same),),
-            (lambda a, b, c: (a * b) / c, lambda a, b, c: a * (b / c), _ROWS)),
+            (lambda a, b, c: (a * b) / c, lambda a, b, c: a * (b / c), _NORMAL)),
         RuleFamily("a quotient by a product as two quotients", (
             rewrite(a.binary("div", b.binary("mul", c, multiplied), divided)).to(
                 a.binary("div", b, divided).binary("div", c, divided), plain(multiplied), plain(divided),
                 *same),),
-            (lambda a, b, c: a / (b * c), lambda a, b, c: (a / b) / c, _ROWS)))
+            (lambda a, b, c: a / (b * c), lambda a, b, c: (a / b) / c, _NORMAL)))
 
 
 def _moved_scales() -> tuple[RuleFamily, ...]:
@@ -524,8 +529,8 @@ def _moved_scales() -> tuple[RuleFamily, ...]:
                 union(t).with_(made), set_(shape(s.shaped("broadcast_in_dim", spread))).to(extent)))
         families.append(RuleFamily(
             f"a {'scale' if op == 'mul' else 'divisor'} along a contraction moved to the other operand",
-            tuple(moved), (lambda x, s, y, scale_of=scale_of: jnp.dot(scale_of(x, s[None, :]), y),
-                           lambda x, s, y, scale_of=scale_of: jnp.dot(x, scale_of(y, s[:, None])),
+            tuple(moved), (lambda x, s, w, scale_of=scale_of: jnp.dot(scale_of(x, s), w.T),
+                           lambda x, s, w, scale_of=scale_of: jnp.dot(x, scale_of(w, s).T),
                            _CONTRACTED_SCALE)))
     return tuple(families)
 
@@ -553,32 +558,40 @@ def _reuse() -> tuple[RuleFamily, ...]:
     """A value the program already computed read in a new one's place (§1.4's reuse): a quotient by a value
     whose reciprocal the program holds, `a / y` as `a (1 / y)`, and by a root whose reciprocal root it holds,
     `a / sqrt(v)` as `a rsqrt(v)` (a normalization's `x / max(|y|, eps)` beside its reciprocal, a norm's
-    `rsqrt(mean(x^2) + eps)`). Each reorders a rounding, and each fires only where the reciprocal is a
-    normal finite float and the product finite (§6.3's dominance rule): the divisor held away from zero
+    `rsqrt(mean(x^2) + eps)`), a reciprocal's divisor made by a maximum or a sum (an epsilon's floor, so a
+    window opens at a division by one alone, not at every division a program holds). Each reorders a
+    rounding, and each fires only where the reciprocal is a normal finite float and the product finite
+    (§6.3's dominance rule): the divisor held away from zero
     (`log2_floor`: its reciprocal at most `2**-floor`, under the program's reach), and bounded (`log2_bound`:
     its reciprocal at least `2**-bound`, above the narrowest float's least normal power, so no flushing lane
     reads it as zero), and the dividend's bound with the reciprocal's under the reach. A reciprocal of an
     unguarded divisor overflows where the quotient is finite (a subnormal one) and makes a NaN of a zero
     dividend, so it is never shared (the reuse probe, 2026-11-05)."""
-    a, y, v, one, t, r = vars_("a y v one t r", Term)
-    divided, inverted, rooted, reciprocal, multiplied = vars_("divided inverted rooted reciprocal multiplied",
-                                                              i64)
+    a, u, w, v, one, t, r = vars_("a u w v one t r", Term)
+    divided, inverted, rooted, reciprocal, multiplied, made = vars_(
+        "divided inverted rooted reciprocal multiplied made", i64)
     floor, bound, held, reached, lowest = vars_("floor bound held reached lowest", i64)
     guarded = (eq(reached).to(reach()), eq(lowest).to(least()), eq(held).to(log2_bound(a)),
                eq(multiplied).to(stock("mul")), plain(divided), eq(shape(a)).to(shape(t)))
-    return (
-        RuleFamily("a quotient by a value whose reciprocal the program holds", (rule(
+    # A divisor's reciprocal is a normal finite float, the product finite (the docstring's guards).
+    normal = (i64(0) - floor <= reached, lowest <= i64(0) - bound - 1)
+    reciprocals = []
+    for maker in ("max", "add"):
+        y = u.binary(maker, w, made)
+        reciprocals.append(rule(
             eq(t).to(a.binary("div", y, divided)), eq(r).to(one.binary("div", y, inverted)), unit(one),
             plain(inverted), eq(shape(r)).to(shape(t)), eq(floor).to(log2_floor(y)),
-            eq(bound).to(log2_bound(y)), *guarded, i64(0) - floor <= reached,
-            lowest <= i64(0) - bound - 1, held - floor <= reached).then(
-            union(t).with_(a.binary("mul", r, multiplied))),),
-            (lambda a, y: a / y, lambda a, y: a * (1 / y), _FLOORED)),
+            eq(bound).to(log2_bound(y)), *guarded, *normal, held - floor <= reached).then(
+            union(t).with_(a.binary("mul", r, multiplied))))
+    return (
+        RuleFamily("a quotient by a value whose reciprocal the program holds", tuple(reciprocals),
+                   (lambda a, y: a / jnp.maximum(y, 1e-3), lambda a, y: a * (1 / jnp.maximum(y, 1e-3)),
+                    _FLOORED)),
         RuleFamily("a quotient by a root whose reciprocal the program holds", (rule(
             eq(t).to(a.binary("div", v.unary("sqrt", rooted), divided)),
             eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(t)),
-            eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *guarded, i64(0) - floor <= reached,
-            lowest <= i64(0) - bound - 1, held + (i64(0) - floor).max(i64(0)) <= reached).then(
+            eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *guarded, *normal,
+            held + (i64(0) - floor).max(i64(0)) <= reached).then(
             union(t).with_(a.binary("mul", r, multiplied))),),
             (lambda a, v: a / jnp.sqrt(v), lambda a, v: a * jax.lax.rsqrt(v), _FLOORED)))
 
