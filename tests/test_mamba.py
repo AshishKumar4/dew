@@ -273,9 +273,13 @@ def test_a_scan_whose_states_an_explicit_axis_splits_scans_as_one_unsplit():
 
     mesh = jax.make_mesh((2,), ("state",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
 
-    def gradients(fn):
+    def gradients(fn, placed=False):
         def run(x, dt, A, B, C, D, state, cotangent):
             out, pull = jax.vjp(lambda B, C: fn(x, dt, A, B, C, D, state), B, C)
+            if placed:
+                # Each cotangent placed as its output is: the final state's split over the states.
+                cotangent = jax.tree.map(lambda c, o: jax.sharding.reshard(c, jax.typeof(o).sharding),
+                                         cotangent, out)
             return out, *pull(cotangent)
         return run
 
@@ -289,7 +293,7 @@ def test_a_scan_whose_states_an_explicit_axis_splits_scans_as_one_unsplit():
 
     exact = jax.jit(gradients(stepwise))
     with jax.set_mesh(mesh):
-        assert_as_exact(jax.jit(gradients(split)), exact, draw,
+        assert_as_exact(jax.jit(gradients(split, placed=True)), exact, draw,
                         "the chunked scan with its states split by an Explicit axis", seeds=FEWEST_SEEDS,
                         truth_fn=exact)
 
