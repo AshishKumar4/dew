@@ -183,7 +183,7 @@ _ATTENTION_MAINLOOPS = (
 )
 FOREIGN |= dict.fromkeys(
     ("dew.nn.attention", "dew.nn.attention_kernels", "dew.nn.kernels.templates.attention_route",
-     "dew.nn.linear"),
+     "dew.nn.kv_cache"),
     _ATTENTION_MAINLOOPS,
 )
 
