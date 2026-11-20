@@ -15,7 +15,7 @@ IDENTITY_COVER = {
              'qwen3.5-27b-gdn-bfloat16-forward-packed', 'qwen3.5-27b-gdn-float32-forward',
              'kimi-linear-kda-bfloat16-forward', 'kimi-linear-kda-bfloat16-training',
              'nemotron-h-4b-ssd-bfloat16-forward', 'minimax-text-01-lightning-bfloat16-forward',
-             'a write gate-bfloat16-forward'),
+             'minimax-text-01-lightning-float32-forward', 'a write gate-bfloat16-forward'),
     'sm100': ('qwen3.5-27b-gdn-bfloat16-forward', 'qwen3.5-27b-gdn-bfloat16-forward-variant-0',
               'qwen3.5-27b-gdn-bfloat16-training', 'qwen3.5-27b-gdn-bfloat16-training-variant-two roles',
               'qwen3.5-27b-gdn-bfloat16-forward-packed', 'qwen3.5-27b-gdn-float32-forward',
