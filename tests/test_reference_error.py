@@ -719,6 +719,26 @@ def test_a_site_held_to_its_truth_rounded_once_evaluates_no_truth_of_its_own():
                         "an ulp past x thrice", seeds=8, truth_fn=as_given(truth))
 
 
+def test_rounded_is_refused_where_it_would_run_or_round_no_one_truth():
+    """`ROUNDED` is never run: a sizing or null run of it against itself (no arm of Dew's beside it), a site
+    without the truth it rounds, a further reference beside no truth, and a weighed sizing (its reference's
+    own rounding), are each refused before any arm is called."""
+    def truth(x, seed):
+        return np.asarray(x, np.float64) * 3.0
+
+    given = as_given(truth)
+    for refused in (
+            lambda: seeds_for(ROUNDED, _tripled, "itself", truth_fn=given),
+            lambda: null_runs(ROUNDED, _tripled, "null runs", seeds=8, runs=2, truth_fn=given),
+            lambda: assert_as_exact(lambda x, seed: x * 3, ROUNDED, _tripled, "no truth", seeds=8),
+            lambda: assert_as_exact(lambda x, seed: x * 3, lambda x, seed: x * 3, _tripled, "further",
+                                    seeds=8, also={"rounded": ROUNDED}),
+            lambda: seeds_for(ROUNDED, _tripled, "weighed", truth_fn=given, dew_fn=lambda x, seed: x * 3,
+                              conditioning=True)):
+        with pytest.raises(ValueError):
+            refused()
+
+
 def test_a_sites_held_condition_meets_every_result_of_dews_arm_and_fails_it():
     """A site's `held(outputs, inputs)` is called on each result of Dew's arm the gate draws, its draws'
     every seed among them, and its failure is the site's."""

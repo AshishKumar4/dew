@@ -70,6 +70,29 @@ def test_a_whole_recording_with_pilots_is_sized_against_itself_on_its_pilots_alo
     assert min(asked) >= SIZING_FROM
 
 
+@pytest.mark.parametrize("missing", ["a leaf", "a row"])
+def test_a_whole_recordings_pilots_that_leave_out_a_verdict_leaf_or_row_are_refused(missing):
+    """A whole recording's pilots hold every leaf of its verdict seeds, one row a pilot in each: pilots of
+    one leaf where the verdict holds two would size the count on that leaf alone, and an array short of a
+    row is no pilot (head review)."""
+    from dew.parity import SIZING_FROM
+
+    stored = {"site.redraw": np.asarray(REDRAW)}
+    for under, count in (("site", staged_units(8)), ("site.pilot", 32)):
+        seeds = range(count) if under == "site" else range(SIZING_FROM, SIZING_FROM + count)
+        drawn = [_draw(seed) for seed in seeds]
+        x, w = np.stack([x for x, _ in drawn]), np.stack([w for _, w in drawn])
+        stored.update({f"{under}.input.x": x, f"{under}.input.w": w})
+        for kind, dtype in (("reference", np.float32), ("truth", np.float64)):
+            stored[f"{under}.{kind}.y"] = np.einsum("sij,sjk->sik", x, w).astype(dtype)
+            if under == "site" or missing == "a row":
+                stored[f"{under}.{kind}.z"] = stored[f"{under}.{kind}.y"]
+    if missing == "a row":
+        stored["site.pilot.truth.z"] = stored["site.pilot.truth.z"][:-1]
+    with pytest.raises(AssertionError):
+        indexed_recording(stored, "site", 8)
+
+
 def _tiny_row_recording(live):
     """A recording's draw and evaluation of `live` (`_tiny_row`'s reference): each seed's inputs by name,
     and the reference's float32 outputs beside their float64 truth."""

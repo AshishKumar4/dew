@@ -45,9 +45,8 @@ def whole_recording(stored, site: str, seeds: int, inputs_of):
 
     pilot = {kind: tree(f"pilot.{kind}") for kind in ("input", "reference", "truth", "replayed")}
     pilot_digests = stored.get(f"{site}.pilot.input_digest")
-    pilots = min((len(value) for value in (*pilot["reference"].values(), *pilot["truth"].values(),
-                                           *(pilot["input"].values() if inputs_of is None else
-                                             [] if pilot_digests is None else [pilot_digests]))), default=0)
+    pilots = _pilots(site, pilot, pilot_digests, {"input": inputs, "reference": reference, "truth": truth,
+                                                  "replayed": replayed}, drawn_again=inputs_of is not None)
 
     def at(seed: int, verdict: dict, piloted: dict):
         """`seed`'s row: a verdict seed's in `verdict`, a pilot's (from SIZING_FROM on) in `piloted`."""
@@ -95,3 +94,22 @@ def whole_recording(stored, site: str, seeds: int, inputs_of):
         return as_recorded(recorded, range(SIZING_FROM, SIZING_FROM + pilots) if pilots else None)
 
     return draw, lookup(reference, pilot["reference"]), lookup(truth, pilot["truth"])
+
+
+def _pilots(site: str, pilot: dict, digests, verdict: dict, *, drawn_again: bool) -> int:
+    """How many pilots a whole recording holds: none where it holds no pilot entry; else each kind's leaves
+    (`pilot`: input, reference, truth, replayed) named as the verdict's are, its inputs' digests (`digests`)
+    beside them where its inputs are drawn again (`drawn_again`), and every array one row a pilot: a sizing
+    on pilots that hold some of the verdict's leaves alone would certify a count none of the others' draws
+    sized."""
+    if not any(pilot.values()) and digests is None:
+        return 0
+    differing = sorted(kind for kind, leaves in verdict.items() if set(pilot[kind]) != set(leaves))
+    if differing or (drawn_again and digests is None):
+        raise AssertionError(f"{site}: its pilots hold other leaves than its verdict seeds' ({differing}) or "
+                             f"no digest of inputs drawn again; record every leaf of every pilot")
+    counts = {len(value) for leaves in pilot.values() for value in leaves.values()}
+    counts |= set() if digests is None else {len(digests)}
+    if len(counts) != 1:
+        raise AssertionError(f"{site}: its pilot arrays hold {sorted(counts)} rows; one row a pilot in each")
+    return counts.pop()

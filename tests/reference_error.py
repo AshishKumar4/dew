@@ -1406,11 +1406,11 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     two Dew paths without YNNPACK's fusions, a Dew arm beside an arm run `as_given` with them.
 
     `orders(inputs)` lists a draw's inputs at K orders of an orbit of summation orders, the draw's own first
-    (`_judged_site`). `ROUNDED` as the reference (`arm_forms.ROUNDED`, with `truth_fn`) holds Dew to check
-    1's own float64 truth of each draw rounded once, no evaluation of its own: the reference of draws whose
-    truth float32 holds exactly or rounds once, which Dew must equal (rows 9481, 9515, 9532). `held(outputs,
-    inputs)`, where given, is called on every result of Dew's arm a draw of the site's makes (its stages, a
-    sizing's and a map task's draws, a prepared run's), its AssertionError the site's failure.
+    (`_judged_site`). `ROUNDED` as the reference (`arm_forms.ROUNDED`, with `truth_fn`) is check 1's own
+    float64 truth of each draw rounded once, no evaluation of its own, judged by parity as any reference is:
+    the reference of draws whose truth float32 holds exactly or rounds once (rows 9481, 9515, 9532).
+    `held(outputs, inputs)`, where given, is called on every result of Dew's arm a draw of the site's makes
+    (its stages, a sizing's and a map task's draws, a prepared run's), its AssertionError the site's failure.
 
     A leaf passes when its pooled ratio (`_pooled`) is at most PARITY and its seeds resolve it: the
     ratio's bootstrap interval over them (tails LOWER_TAIL and UPPER_TAIL, widened to hold the ratio)
@@ -1480,7 +1480,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     # are the plain pair's still: sizing reads no terms, so such a site sized nothing and never went stale
     # (spec alignment, 9044).
     plain = not (library_fn or also or callable(terms) or conditioning)
-    refuse_rounded(label, reference_fn, truth_fn=truth_fn, followed=followed, conditioning=conditioning)
+    refuse_rounded(label, reference_fn, *(also or {}).values(), truth_fn=truth_fn, followed=followed,
+                   conditioning=conditioning)
     store = COMPILED.get()
     if store is not None and conditioning is not None:
         raise ValueError(f"{label}: a weighed site reads its reference's own rounding at its truth's inputs, "
@@ -1835,6 +1836,8 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
         raise ValueError(f"{label}: a sizing draws seeds past a prepared site's, whose truths' programs no "
                          "prepare compiled")
     paired = dew_fn is not None
+    refuse_rounded(label, reference_fn, truth_fn=truth_fn, followed=followed, conditioning=conditioning,
+                   beside_dew=paired)
     held = _paired_most(reference_fn, most, paired=paired)
     if held is None:
         raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a sizing's "
@@ -1908,6 +1911,8 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
     # The reference and the truth run their programs unrewritten, as a site's do (`_arms`, `_truth_program`).
+    refuse_rounded(label, reference_fn, truth_fn=truth_fn, conditioning=conditioning,
+                   beside_dew=dew_fn is not None)
     reference_fn, truth_fn = unrewritten(reference_fn), unrewritten(truth_fn)
     verdicts = []
     # Each run's draws: both budgets whole, the unweighted check's and the weighed one's, and the

@@ -215,9 +215,12 @@ class _RoundedTruth:
     `reference_error._draw_truth`) rounded once to float32 (`rounded_like`), formed from that truth by the
     gate (`reference_error._arm_ran`) and never run: an arm run as given, so Dew's arm compiles as its users
     run it, with the fusions (`_arms`), and holds no program a store compiles. The reference of draws whose
-    truth float32 holds exactly or rounds once, which Dew must equal: a second float64 run of the truth,
-    computed under the arms' arithmetic preset (a CPU's float32 sums), was a second owner of check 1's truth
-    and computed it otherwise (rows 9481, 9515, 9532)."""
+    truth float32 holds exactly or rounds once, judged by check 1's parity as any reference is: where the
+    truth is a float32 the reference's error is zero and Dew must equal it; where it rounds, Dew is held
+    within PARITY of that one rounding's error (not bit for bit: a tie rounded away from even has the
+    reference's error). A second float64 run of the truth, computed under the arms' arithmetic preset (a
+    CPU's float32 sums), was a second owner of check 1's truth and computed it otherwise (rows 9481, 9515,
+    9532)."""
 
     as_given, recorded, rounded, programs = True, False, True, None
 
@@ -244,14 +247,17 @@ def rounded_like(truth, made):
     return jax.tree.map(once, truth, made)
 
 
-def refuse_rounded(label: str, reference_fn, *, truth_fn, followed, conditioning) -> None:
-    """Refuse `ROUNDED` as `label`'s reference without the `truth_fn` it rounds (it has none of its own),
-    beside `followed` roundings (each arm's own truth) or a weighed check (`conditioning`, its reference's
-    own rounding)."""
-    if reference_fn is ROUNDED and (truth_fn is None or followed is not None or conditioning is not None):
-        raise ValueError(f"{label}: ROUNDED is the site's float64 truth rounded once: it takes `truth_fn`, "
-                         f"and no followed roundings or weighed check, whose truths or scales are no one "
-                         f"truth")
+def refuse_rounded(label: str, *references, truth_fn, followed=None, conditioning=None,
+                   beside_dew: bool = True) -> None:
+    """Refuse `ROUNDED` among `label`'s `references` (its reference and further ones) without the `truth_fn`
+    it rounds (it has none of its own), beside `followed` roundings (each arm's own truth) or a weighed check
+    (`conditioning`, its reference's own rounding), or with no arm of Dew's beside it (`beside_dew`: a sizing
+    or null run of the reference against itself), where it would be the arm run."""
+    if any(fn is ROUNDED for fn in references) and (
+            truth_fn is None or followed is not None or conditioning not in (None, False) or not beside_dew):
+        raise ValueError(f"{label}: ROUNDED is the site's float64 truth rounded once, beside an arm of "
+                         f"Dew's: it takes `truth_fn`, and no followed roundings, weighed check or run of "
+                         f"itself")
 
 
 def as_given(fn, programs: Callable | None = None):
