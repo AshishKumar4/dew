@@ -1,6 +1,8 @@
 """A program written back as Python (docs/design/algebra.md §6.11): a jaxpr printed as a plain JAX function,
 each equation its primitive bound at its own parameters (`lax.<name>_p.bind`), so the function computes
-exactly what the jaxpr does, bit for bit; and the same function with its float sums compensated
+exactly what the jaxpr does, bit for bit, but for a choice by the platform it lowers for, printed as its
+default branch (a GPU's and a TPU's: Dew's products under a CPU's wide arithmetic choose the CPU's own,
+`dew.nn.precision`); and the same function with its float sums compensated
 (`compensated`: the error-free derivation, §6.9), each addition's rounding carried beside it as a double word
 (`dew.nn.precision.compensated_add`) and each sum's reduction compensated (`compensated_sum`), both protected
 from the pass. What the generator writes and what dev time measures are one text (`source`, `loaded`)."""
@@ -43,12 +45,14 @@ class Unprintable(ValueError):
 
 @dataclasses.dataclass
 class _Printer:
-    """One function's text as it is printed: its lines, each value's name, and, compensated, each sum's
-    double word by the value it computes and the values already read from one."""
+    """One function's text as it is printed: its lines, each value's name, each platform choice's index
+    (`platforms`: the platforms its `platform_index` equation names), and, compensated, each sum's double word
+    by the value it computes and the values already read from one."""
 
     compensated: bool
     lines: list[str] = dataclasses.field(default_factory=list)
     names: dict[jcore.Var, str] = dataclasses.field(default_factory=dict)
+    platforms: dict[jcore.Var, tuple] = dataclasses.field(default_factory=dict)
     pairs: dict[jcore.Var, str] = dataclasses.field(default_factory=dict)
     read: set[jcore.Var] = dataclasses.field(default_factory=set)
     count: int = 0
@@ -99,14 +103,17 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
     """Each equation of `jaxpr` printed in order, a call's body in its place (`INLINED`)."""
     for equation in jaxpr.eqns:
         primitive = equation.primitive
-        if primitive.name in INLINED:
-            inner = equation.params.get("jaxpr", equation.params.get("call_jaxpr"))
+        if primitive is jcore.primitives.platform_index_p:
+            printer.platforms[equation.outvars[0]] = tuple(equation.params["platforms"])
+            continue
+        inner, operands = _inlined(printer, equation)
+        if inner is not None:
             body = inner.jaxpr if isinstance(inner, jcore.ClosedJaxpr) else inner
             consts = inner.consts if isinstance(inner, jcore.ClosedJaxpr) else []
             for var, value in zip(body.constvars, consts, strict=True):
                 printer.names[var] = printer.fresh("c")
                 printer.lines.extend(_constant(printer.names[var], np.asarray(value)))
-            for var, atom in zip(body.invars, equation.invars, strict=True):
+            for var, atom in zip(body.invars, operands, strict=True):
                 _alias(printer, var, atom)
             _body(printer, body)
             for var, atom in zip(equation.outvars, body.outvars, strict=True):
@@ -124,6 +131,19 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
         arguments += [f"{key}={_param(value)}" for key, value in equation.params.items()]
         target = ", ".join(outputs) if primitive.multiple_results else outputs[0]
         printer.emit(target, f"lax.{primitive.name}_p.bind", arguments)
+
+
+def _inlined(printer: _Printer, equation: jcore.JaxprEqn) -> tuple:
+    """The body an equation is printed as in its place and the operands its inputs are, or `(None, ())`: a
+    call's body (`INLINED`), or a platform choice's default branch (a `cond` on a `platform_index` that names
+    one, `printer.platforms`), its index dropped."""
+    if equation.primitive.name in INLINED:
+        return equation.params.get("jaxpr", equation.params.get("call_jaxpr")), equation.invars
+    index = equation.invars[0] if equation.primitive is lax.cond_p and equation.invars else None
+    platforms = printer.platforms.get(index) if isinstance(index, jcore.Var) else None
+    if platforms is not None and None in platforms:
+        return equation.params["branches"][platforms.index(None)], equation.invars[1:]
+    return None, ()
 
 
 def _alias(printer: _Printer, var: jcore.Var, atom) -> None:
@@ -165,6 +185,18 @@ def _compensated(printer: _Printer, equation: jcore.JaxprEqn) -> None:
     printer.pairs[out] = pair
     printer.emit(pair, "precision.compensated_add",
                  [printer.pair(left), printer.pair(right, negated=equation.primitive is lax.sub_p)])
+
+
+def reprinted(function: Callable, operands, tree) -> Callable | None:
+    """`function` over operands of `operands`' shapes as its printed text computes it (`source`, `loaded`),
+    returning its outputs in their structure `tree`: what a generated module of it would compute, where a
+    platform's choice takes its default branch; None where it is not printable (`Unprintable`)."""
+    try:
+        text, _ = source(jax.make_jaxpr(function)(*operands), "reprinted")
+    except Unprintable:
+        return None
+    flat = loaded(text, "reprinted")
+    return lambda *values: jax.tree.unflatten(tree, list(flat(*values)))
 
 
 def loaded(text: str, name: str) -> Callable:

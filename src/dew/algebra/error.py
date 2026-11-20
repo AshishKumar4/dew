@@ -71,15 +71,18 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     for index, variants in enumerate(graph.extract_multiple(list(roots), VARIANTS)):
         for number, form in enumerate(variants):
             proposed[f"root {index}'s form {number}"] = [*cheapest[:index], form, *cheapest[index + 1:]]
-    written = Candidate("as written", written_seconds.value, function)
+    # Each candidate measured as its printed text computes it (`printed.reprinted`), what a generated
+    # module of it computes; one no plain call writes as it is (`printed.Unprintable`), as it is.
+    written = Candidate("as written", written_seconds.value,
+                        printed.reprinted(function, operands, tree) or function)
     candidates, seen = [written], set()
     for name, chosen in proposed.items():
         if (key := tuple(map(terms.key, chosen))) in seen:
             continue
         seen.add(key)
+        valued = _valued(region, closed.consts, dict(zip(map(terms.key, roots), chosen, strict=True)), tree)
         candidates.append(Candidate(name, _priced(region, chosen, timed),
-                                    _valued(region, closed.consts, dict(zip(map(terms.key, roots), chosen,
-                                                                            strict=True)), tree)))
+                                    printed.reprinted(valued, operands, tree) or valued))
     candidates += [found for candidate in candidates
                    if (found := compensated(candidate, operands, tree)) is not None]
     candidates.sort(key=lambda candidate: (candidate.compensated, candidate.seconds))
