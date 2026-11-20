@@ -68,7 +68,7 @@ from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.projections import packed_owned
-from dew.nn.protocols import Bounded, CacheCapacity, StatesVocabulary, TokenModel, refuse_prefix
+from dew.nn.protocols import Bounded, CacheCapacity, DrawsAlone, StatesVocabulary, TokenModel, refuse_prefix
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping, id_row
 from dew.sampling.solvers import Solver
@@ -294,6 +294,16 @@ def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
 
 
 @functools.cache
+def _drawn_alone(model: nn.Module, strategy: Strategy | None) -> None:
+    """Refuse a strategy other than a token a row at a time (`Sample`, the default) for a decoder whose
+    decode state moves with every token it reads (`dew.nn.protocols.DrawsAlone`), naming its reason."""
+    from dew.sampling.strategies import Sample
+
+    if isinstance(model, DrawsAlone) and strategy is not None and not isinstance(strategy, Sample):
+        raise ValueError(f"{type(strategy).__name__} reads tokens it then rejects or reorders, and "
+                         f"{model.draws_alone}: this decoder draws a token a row at a time (Sample)")
+
+
 def cache_sized(model: nn.Module, capacity: int | None) -> nn.Module:
     """Return `model` with a decode cache of `capacity` slots, one model per capacity.
 
@@ -915,6 +925,10 @@ class TextSettings(TaskSettings):
     sampling: Sampling
     prefix: int | Literal["prompt"] | None = None
     """The prefix run's blocks a served prompt takes (`TextGeneration.prefix`); None serves causally."""
+    adaptation: JSON = dataclasses.field(default=None, metadata={ADDED: True})
+    """How the run's continuum level steps in context, its `ChunkAdaptation`'s record
+    (`LMObjective.adaptation`, `dew.registry.to_record`), which its task's generation steps as its
+    training forward does (`InContextDecoder`, row 9066); None where it steps none, as runs before it."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1326,6 +1340,7 @@ class TextGeneration(_NativeTextTask):
     def __post_init__(self) -> None:
         super().__post_init__()
         refuse_prefix(self.model, self.prefix, longest=cache_ceiling(self.model))
+        _drawn_alone(self.model, self.strategy)
         if self.sampling.stop:
             self._listing()
 
@@ -1426,6 +1441,11 @@ class TextGeneration(_NativeTextTask):
         """The task `settings` describe over `model` and `variables`, reading text through
         `processor`: the previews' policy and budget become its defaults. A live objective
         (`LMObjective.build_task`) and a saved run (`from_saved`) build it alike."""
+        if settings.adaptation is not None:
+            from dew.objectives.lm.adaptation import ChunkAdaptation, InContextDecoder
+            from dew.registry import from_record
+
+            model = InContextDecoder(model, from_record(settings.adaptation, ChunkAdaptation))
         return cls(model, variables, processor, sampling=settings.sampling,
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
@@ -1442,6 +1462,7 @@ class TextGeneration(_NativeTextTask):
                                           max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, cache_ceiling(self.model))
             policy, chain, criteria = self.controls(sampling, logits, stopping)
+            _drawn_alone(self.model, strategy)
             generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
                                  stopping=criteria, strategy=self.strategy if strategy is None else strategy,

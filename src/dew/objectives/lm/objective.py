@@ -121,9 +121,11 @@ from dew.objectives.base import (
 from dew.objectives.lm.adaptation import (
     CARRIED,
     ChunkAdaptation,
+    InContextDecoder,
     _carried_start,
     _carried_update,
     adapted_scores,
+    decoded_alone,
 )
 from dew.objectives.lm.chunked import (
     final_read,
@@ -869,27 +871,25 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
         A rollout uses one snapshot of the policy and draws every completion from it;
         the result records the actual and raw-policy likelihoods that the objective's
-        ratio needs. An objective that steps its level in context (`adaptation`) has no
-        generation that steps it, so it refuses (ValueError) rather than draw from the
-        level it starts with.
+        ratio needs. An objective that steps its level in context (`adaptation`) draws with its level
+        stepped as its training forward steps it (`InContextDecoder`, row 9066).
         """
-        if self.adaptation is not None:
-            raise ValueError("an objective that steps its continuum level in context scores what no "
-                             "generation draws yet: a generation reads the level it starts with")
-        return TextGeneration(self.model, params, sampling=self.sampled(sampling), prefix=self.prefix,
+        model = self.model if self.adaptation is None else InContextDecoder(self.model, self.adaptation)
+        return TextGeneration(model, params, sampling=self.sampled(sampling), prefix=self.prefix,
                               progress=progress)
 
     def task_settings(self) -> TextSettings | None:
-        """The decoder's row length, preview budget, sampling policy (`sampled`), and tokenizer or
-        source processor. None for an objective that steps its level in context (`adaptation`), which
-        no generation task serves yet: its saved runs restore their trained state, and build no task."""
-        if self.adaptation is not None:
-            return None
+        """The decoder's row length, preview budget, sampling policy (`sampled`), tokenizer or source
+        processor, and how its level steps in context (`adaptation`'s record), which its saved run's task
+        steps as its training forward does (row 9066)."""
+        from dew.registry import to_record
+
         samples = self.samples
         return TextSettings(seq_len=self.seq_len,
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
                             sampling=self.sampled(Sampling() if samples is None else samples.sampling),
-                            **processor_settings(self.processor), prefix=self.prefix)
+                            **processor_settings(self.processor), prefix=self.prefix,
+                            adaptation=None if self.adaptation is None else to_record(self.adaptation))
 
     def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
         """Refuse a batch's blocks where no trunk layer reads them, where prediction depths would read
@@ -1520,9 +1520,10 @@ class LMObjective(TokenScorer):
             if not adaptation.layers and not _steps_in_context(self.model):
                 raise ValueError("adaptation steps a continuum level, which this model does not have "
                                  "(CausalTransformer.continuum, `SteppedInContext`)")
-            if samples is not None:
-                raise ValueError("adaptation scores through a level stepped in context, which a preview's "
-                                 "generation does not step; train it without samples")
+            if samples is not None and decoded_alone(adaptation) is not None:
+                # A preview's generation steps the level as the forward does (`InContextDecoder`), where
+                # the adaptation decodes.
+                raise ValueError(f"{decoded_alone(adaptation)}; train it without samples")
         self.adaptation = adaptation
         self.loss_role = loss_role
         self.mtp_weight = mtp_weight

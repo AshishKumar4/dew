@@ -698,6 +698,19 @@ def _moved(reached: Mapping, started: Mapping, weights: jax.Array) -> Mapping:
     return jax.lax.stop_gradient({"moves": moves, "rows": jnp.sum(counted).astype(jnp.float32)})
 
 
+def decoded_alone(adaptation: ChunkAdaptation) -> str | None:
+    """Why `adaptation` decodes none (`InContextDecoder`): a damped step reads bounds over the whole
+    sequence, which a decode has not seen, and a stacked one steps the trunk, whose cache a decode keeps;
+    None where it decodes."""
+    if adaptation.damped:
+        return ("a damped step reads bounds over the whole sequence, which a decode has not seen: "
+                "generation steps an undamped adaptation alone")
+    if adaptation.layers:
+        return ("a stacked adaptation steps the trunk, whose cache a decode keeps: generation steps a level "
+                "on the final states alone")
+    return None
+
+
 IN_CONTEXT = "in_context"
 """The decode cache's entry an adapting decoder keeps its rows' chain in (`InContextDecoder`)."""
 
@@ -723,13 +736,18 @@ class InContextDecoder(nn.Module):
     model: nn.Module
     adaptation: ChunkAdaptation
 
+    @property
+    def draws_alone(self) -> str:
+        """Why it draws a token a row at a time (`dew.nn.protocols.DrawsAlone`)."""
+        return "its rows' levels step with every token they read, past what a cache's cursor rewinds"
+
+    def __post_init__(self):
+        refused = decoded_alone(self.adaptation)
+        if refused is not None:
+            raise ValueError(refused)
+        super().__post_init__()
+
     def setup(self):
-        if self.adaptation.damped:
-            raise ValueError("a damped step reads bounds over the whole sequence, which a decode has not "
-                             "seen: generation reads an undamped adaptation alone")
-        if self.adaptation.layers:
-            raise ValueError("a stacked adaptation steps the trunk, whose cache a decode keeps: generation "
-                             "reads a level on the final states alone")
         self.decoder = self.model.clone()
         nn.share_scope(self, self.decoder)
 

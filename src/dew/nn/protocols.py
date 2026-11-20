@@ -100,6 +100,7 @@ __all__ = [
     "DecoderTraining",
     "Decoding",
     "DenoisingModel",
+    "DrawsAlone",
     "Exposing",
     "Generating",
     "HiddenStates",
@@ -1354,6 +1355,17 @@ class IntervalModel(Protocol):
 
     @property
     def interval(self) -> bool: ...
+
+
+@runtime_checkable
+class DrawsAlone(Protocol):
+    """A decoder whose decode state moves with every token it reads, past what a cache's cursor rewinds
+    (an in-context level's chain, `dew.objectives.lm.adaptation.InContextDecoder`): it draws one token a
+    row at a time (`dew.sampling.strategies.Sample`), and a strategy that reads tokens it then rejects or
+    reorders (a speculative block's, a beam's) is refused, naming `draws_alone`'s reason."""
+
+    @property
+    def draws_alone(self) -> str: ...
 
 
 @runtime_checkable
