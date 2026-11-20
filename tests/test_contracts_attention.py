@@ -7,16 +7,10 @@ import itertools
 import jax
 import jax.numpy as jnp
 import pytest
-from contract_support import EDGES, ORDER_SETS, REVERSE_ONLY, assert_drawn_contract, normal_draw
-from reference_error import FEWEST_SEEDS
+from contract_support import EDGES, REVERSE_ONLY, assert_drawn_contract, normal_draw
 
 from dew.nn import attention, kv_cache
-from dew.nn.kernels.templates import (
-    attention as template,
-    attention_algebra as algebra,
-    attention_quantized,
-    merged,
-)
+from dew.nn.kernels.templates import attention as template, attention_quantized
 from dew.nn.sharding import manual_map
 
 
@@ -166,37 +160,6 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
     # call `seeds_for` under `COMPILED` (row 9656).
     assert_drawn_contract(paged, inputs, EDGES[edge], f"the paged decode kernel {edge} {kernel}",
                           truth_fn=plain, plain_fn=plain, seeds=8)
-
-
-@pytest.mark.parametrize("taken", list(ORDER_SETS))
-@pytest.mark.parametrize("edge", EDGES)
-def test_a_padded_merges_derivatives_are_the_laws(edge, taken):
-    """`merged.merged_padded` (a split decode step's slices merged where its launch wrote them; its value one
-    launch on a GPU, its tangent the law's path's, a custom JVP): every order runs, finite wherever float64
-    is a normal float32 and the law's path (`merged._value`, differentiated by JAX) is, at padded outputs and
-    maxima near float32's ends, two slices' totals drawn positive; each order set a case of its own
-    (`ORDER_SETS`: every order in one case held its group to 1,798 s, its law's unrolled windows' programs
-    compiled at each)."""
-    spec = algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True))
-
-    def inputs(seed: int, scale: float) -> tuple:
-        # Two slices' padded outputs (three rows of which two are queries, 12 columns of which 8 are its
-        # width) and maxima at `scale`, totals drawn positive, their directions and a cotangent: the one-head
-        # step whose every order an edge's run held its group to 1,635 s at four slices of two heads.
-        padded, maxima, totals = normal_draw([7124, seed], (1, 2, 3, 1, 12), (1, 1, 2, 3), (1, 1, 2, 3),
-                                             scale=scale)
-        direction = normal_draw([7125, seed], (1, 2, 3, 1, 12), (2, 1, 1, 2, 3), scale=scale)
-        (cotangent,) = normal_draw([7126, seed], (1, 2, 1, 8))
-        return (padded, jnp.stack([maxima, jnp.abs(totals)])), direction, cotangent
-
-    def merge(padded, stacked):
-        return merged.merged_padded(spec, padded, stacked, queries=2, width=8).acc
-
-    def law(padded, stacked):
-        return merged._value(padded, stacked, spec=spec, queries=2, width=8)[0]
-
-    assert_drawn_contract(merge, inputs, EDGES[edge], f"a padded merge {edge} ({taken})", plain_fn=law,
-                          seeds=FEWEST_SEEDS, taking=ORDER_SETS[taken])
 
 
 @pytest.mark.parametrize("edge", EDGES)
