@@ -1377,9 +1377,8 @@ def narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype:
     flushed one: `quotient`). The bound left at fp32's resolution, as the fp32 reference's: `divisor` is
     the one rounded (a dropping call's total times its multiplier's rest, `dropped_total`), and the sums
     and exponentials before it round as the reference's do, so an exact output within their rounding of
-    a boundary may narrow past it. Its derivative is `out`'s: the nudge, exact (within two fp32 ulps of
-    `out`, by Sterbenz), is no function a derivative reads (an empty row's quotient of a zero divisor took
-    NaN through it)."""
+    a boundary may narrow past it. Its derivative is `out`'s: the nudge is no function a derivative reads
+    (an empty row's quotient of a zero divisor took NaN through it)."""
     value, acc = jax.lax.stop_gradient(out), jax.lax.stop_gradient(acc)
     divisor = jax.lax.stop_gradient(jax.lax.broadcast_in_dim(divisor, acc.shape, tuple(range(divisor.ndim))))
     rounded = acc / divisor
@@ -1394,7 +1393,9 @@ def narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype:
     odd = jax.lax.bitcast_convert_type(bits + toward, jnp.float32)
     settled = jnp.where(_between(bits, dtype) & (above != 0), odd, rounded)
     close = jnp.abs(value - rounded) <= jnp.abs(rounded) * np.float32(2.0 ** -23)
-    return out + (jnp.where(close, settled, value) - value)
+    # The nudged value with `out`'s derivative: `out` less its own value is zero, where the nudge itself, an
+    # fp32 ulp at fp32's least normal, is subnormal, which XLA's CPU flushes (row 4023).
+    return jnp.where(close, settled, value) + (out - value)
 
 
 def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
