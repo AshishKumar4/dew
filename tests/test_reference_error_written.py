@@ -35,6 +35,26 @@ def test_a_rewrite_both_arms_would_carry_fails_dews_arm_against_its_reference_as
 
 
 
+def test_a_twins_products_are_rounded_as_written_its_fusions_kept():
+    """`a * b + c` of `c` the product rounded and negated: compiled with every pass, a fusion sums the product
+    unrounded beside `c` (XLA:CPU's fused multiply-add) and leaves its rounding error; compiled as a twin is,
+    its fusions kept and its products held (`arm_arithmetic.products_held`), it sums the rounded product,
+    zero at every element, as NumPy's float32 does."""
+    import jax
+    from arm_arithmetic import as_written, products_held
+
+    rng = np.random.default_rng(6909)
+    a, b = (rng.standard_normal(4096).astype(np.float32) for _ in range(2))
+    c = -(a * b)
+
+    def summed(a, b, c):
+        return a * b + c
+
+    assert np.count_nonzero(np.asarray(jax.jit(summed)(a, b, c))) > 0
+    twin = jax.jit(products_held(summed), compiler_options=as_written())
+    np.testing.assert_array_equal(np.asarray(twin(a, b, c)), np.zeros(4096, np.float32))
+
+
 def test_a_reference_compiled_without_ynnpacks_fusions_is_held_as_written_too():
     """The combination as its reference compiled by its site without YNNPACK's fusions (`without_ynn`), a
     policy and not a claim: written apart from Dew, its own function is compiled as written too
