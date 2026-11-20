@@ -8,9 +8,7 @@ import contextlib
 import dataclasses
 import functools
 import itertools
-import logging
 import math
-import re
 from collections.abc import Callable
 
 import jax
@@ -2425,40 +2423,45 @@ def test_turned_gradient_p0_regressions_f1_f2_f3():
         assert float(grad3[0, 1, 0, 0]) > 0.0
 
 
-def test_a_forked_training_walk_traces_once_under_every_route_receipt(caplog):
-    """A forked call's training (documents taking their memories up, three layers of it) traced twice, each
-    under a route receipt of its own (`generation.routes`), on the portable math: the second traces no walk
-    (`_walk_once`'s, run unrecorded; no tracing cache miss JAX explains of it), its routes
-    recorded alike by both receipts, where each receipt's identity keyed the walk a trace of its own (row
-    6740: a decision step's walk traced twice, 0.84 s of its lowering against 0.30)."""
+def walk_programs(jaxpr) -> list:
+    """Every forked walk's program (`recurrence_chunk._walk_once`'s nested `recurrence_walk`) a traced
+    program calls, at any depth, as its calls hold them."""
+    found = []
+    for eqn in jaxpr.eqns:
+        inner = [value for value in eqn.params.values() if isinstance(value, jax.extend.core.ClosedJaxpr)]
+        if eqn.params.get("name") == "recurrence_walk":
+            found.extend(inner)
+        for program in inner:
+            found.extend(walk_programs(program.jaxpr))
+    return found
+
+
+def test_a_forked_walk_traces_once_under_every_route_receipt():
+    """A forked call (documents taking their memories up, three layers of it) traced twice, each under a route
+    receipt of its own (`generation.routes`), on the portable math: every call of its walk in the second
+    trace holds the very program its call held in the first (`_walk_once`'s, run unrecorded, its trace
+    cached), its routes recorded alike by both receipts, where each receipt's identity keyed the walk a
+    trace of its own (row 6740: a decision step's walk traced twice, 0.84 s of its lowering against 0.30;
+    its body run twice over two receipts' training on main, once on this fix, jsf-walktr)."""
     sig = jax.ShapeDtypeStruct
     queries, values = sig((4, 2048, 1, 8), jnp.float32), sig((4, 2048, 3, 8), jnp.float32)
     gates, state = sig((4, 2048, 3), jnp.float32), sig((4, 1, 3, 8, 8), jnp.float32)
     starts, slots = sig((4, 2048), jnp.bool_), sig((4, 7), jnp.int32)
 
-    def loss(q, k, v, g, beta, state, starts, loads, stores):
+    def layers(q, k, v, g, beta, state, starts, loads, stores):
         for _ in range(3):
             v, _ = recurrence_chunk.chunk_gated_delta_rule(q, k, v, g, beta, state, starts=starts,
                                                            loads=loads, stores=stores, held=3,
                                                            write_bound=1.0)
-        return v.sum()
+        return v
 
     def traced():
         with generation.routes() as found:
-            jax.make_jaxpr(jax.value_and_grad(loss, argnums=(0, 1, 2, 3, 4)))(
-                queries, queries, values, gates, gates, state, starts, slots, slots)
-        return collections.Counter(found)
+            program = jax.make_jaxpr(layers)(queries, queries, values, gates, gates, state, starts, slots,
+                                             slots)
+        return walk_programs(program.jaxpr), collections.Counter(found)
 
-    # JAX's own account of each trace its jits' caches miss (`jax_explain_cache_misses`), on for both traces,
-    # its setting part of what the walk's derivation is keyed on (`derive.context`).
-    with (generation.chosen(gated_delta_rule='xla'), jax.explain_cache_misses(new_val=True),
-          caplog.at_level(logging.WARNING)):
-        routed = traced()
-        caplog.clear()
-        rerouted = traced()
-    # The walk's own misses, not those JAX explains of the rules it calls as it linearizes the walk's one
-    # trace under the second receipt (their miss located in the walk, the function missed theirs).
-    walks = [record for record in caplog.records
-             if re.search(r"TRACING CACHE MISS[^\n]*\n\s*(for |never seen function:\s*)recurrence_walk\b",
-                          record.getMessage())]
-    assert (walks, bool(routed), routed == rerouted) == ([], True, True)
+    with generation.chosen(gated_delta_rule='xla'):
+        (first, routed), (second, rerouted) = traced(), traced()
+    held = [one is other for one, other in zip(first, second, strict=True)]
+    assert (len(first), all(held), bool(routed), routed == rerouted) == (3, True, True, True)
