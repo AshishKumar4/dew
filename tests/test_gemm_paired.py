@@ -18,7 +18,7 @@ from test_gemm_template import CASES, SEEDS, _dew, _draw, _drop, _rounded_throug
 
 from dew.nn.kernels import gemm, generation, grouped_launch, xla_products
 from dew.nn.kernels.templates import mosaic_sm90, resources
-from dew.nn.kernels.templates.gemm import chained, derivation, mosaic_gpu
+from dew.nn.kernels.templates.gemm import chained, derivation, mosaic_gpu, tiling
 
 
 def swiglu(gate, up):
@@ -30,7 +30,7 @@ def swiglu(gate, up):
 
 def test_a_grouped_call_no_cooperative_tile_holds_derives_one_consumer_alone():
     """Where no two-consumer tile holds a grouped call, its derivation falls back to one consumer, which
-    runs on one multiprocessor: a pair is two consumers' (`mosaic_gpu.Tiles`), so the fallback derives a
+    runs on one multiprocessor: a pair is two consumers' (`tiling.Tiles`), so the fallback derives a
     tile rather than refusing one it built."""
 
     tile = derivation.derived((mosaic_sm90.WGMMA,), rows=512, depth=2048, width=1536, dtype=jnp.bfloat16,
@@ -319,7 +319,7 @@ def test_matrices_side_by_side_are_each_ones_product_in_one_launch(dense):
     times its own matrix, on par with XLA's products apart against float64, a dense call's and a grouped
     call's (ragged groups, one empty), each column tile reading and storing its own matrix's (row 6794: a
     join without its kernels concatenated or its output split); an A100's pipeline walk refuses them."""
-    tiles = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family="wgmma")
+    tiles = tiling.Tiles(128, 128, 64, 3, 1, warpgroups=2, family="wgmma")
     sizes = (200,) if dense else (70, 0, 130)
     draw = _side_by_side_draw(dense, 256, sizes)
 
@@ -339,7 +339,7 @@ def test_matrices_side_by_side_are_each_ones_product_in_one_launch(dense):
     rows, matrices, _ = draw(0)
     with generation.assumed("sm80"), pytest.raises(ValueError):
         mosaic_gpu.gmm(rows, matrices[0], None if dense else jnp.asarray(sizes, jnp.int32),
-                       tiles=mosaic_gpu.Tiles(64, 128, 32, 3, 1, family="mma.sync"), transpose_rhs=False,
+                       tiles=tiling.Tiles(64, 128, 32, 3, 1, family="mma.sync"), transpose_rhs=False,
                        out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_launch.INTERPRETED,
                        dense=dense, beside=matrices[1:])
 
@@ -481,7 +481,7 @@ def test_projections_side_by_side_whose_forward_a_pin_refuses_run_apart():
 
     lhs = jax.ShapeDtypeStruct((12288, 256), jnp.bfloat16)
     matrices = tuple(jax.ShapeDtypeStruct((256, width), jnp.bfloat16) for width in (256, 128, 128))
-    pin = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
+    pin = tiling.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         assert gemm.side_by_side(lhs, matrices, jnp.bfloat16, None, whole=True)
         with tuning.pinned({grouped_matmul.MosaicGmm: pin}):
@@ -597,7 +597,7 @@ def test_matrices_side_by_side_compile_for_an_h100_within_its_resources(dense):
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, warpgroups=2, family="wgmma")
+    tiles = tiling.Tiles(128, 128, 64, 4, 1, warpgroups=2, family="wgmma")
     groups = 1 if dense else 3
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     operands = (shaped((4096, 2048)), *(shaped((groups, 2048, width)) for width in (512, 128, 128)),
@@ -760,7 +760,7 @@ def test_a_chained_input_gradient_is_as_finite_as_its_products_sum(generation_na
         a_chained_input_gradient_is_as_finite_as_its_products_sum(interpret=True)
 
 
-WALKED = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
+WALKED = tiling.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
 """The chained launch's tile the protocol checker walks: 128 x 256 x 64 over a two-stage ring."""
 
 
@@ -803,7 +803,7 @@ def test_a_chained_launchs_walk_holds_every_property_in_every_interleaving():
 
 @pytest.mark.parametrize("walked", ["flagged", "clear", "overcounted"])
 def test_a_chained_launchs_bounded_walk_holds_every_property_in_every_interleaving(walked):
-    """The chained launch's second, bounded walk (`chained.guarded_walk`, `mosaic_gpu.GUARDED_GMM`;
+    """The chained launch's second, bounded walk (`chained.guarded_walk`, `tiling.GUARDED_GMM`;
     `_chained_walk`'s second), its flags given: its tile flagged, every interleaving of its warpgroups and its
     loads' landings explored, each slot given back once the products reading it retire; clear, its consumers
     issue no product. Its steps each issue one product's groups (`Issuer.issued_one_of`); counted as every
@@ -848,7 +848,7 @@ def test_a_ping_pong_chained_launch_flags_its_tiles():
     _, matrices, cotangents = _chained_overflow(jnp.float32)
     products = [(np.asarray(d), np.asarray(w)[None]) for d, w in zip(cotangents[::-1], matrices[::-1],
                                                                        strict=True)]
-    pingpong = mosaic_gpu.Tiles(64, 256, 64, 3, 1, warpgroups=2, family="wgmma", pingpong=True)
+    pingpong = tiling.Tiles(64, 256, 64, 3, 1, warpgroups=2, family="wgmma", pingpong=True)
     got = _chained_launch(products, None, jnp.bfloat16, tiles=pingpong)
     expected = _plain_sum(products, None, jnp.bfloat16)
     assert expected[0, 0] == 2.0 ** 127 and not expected[:, 1:].any()
@@ -882,7 +882,7 @@ def test_a_chained_call_is_derived_as_it_is_launched(depths):
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         ba, target = launch.bind(*args, **options), generation.gpu_target()
         tile = launch.derived(ba, target)
-        narrow = mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2, family='wgmma')
+        narrow = tiling.Tiles(128, 64, 64, 2, 1, warpgroups=2, family='wgmma')
         assert tile is None or launch.legal(ba, tile, target), tile
         if depths == (128, 128, 128):
             assert tile is not None and tile.block_n % chained.narrowing(len(depths)) == 0, tile
@@ -924,7 +924,7 @@ def _chained_call(products: list, sizes, dtype, tiles=None, *, interpret=grouped
     `chained.replay_tile`), its groups' rows `sizes` (None: dense), in `dtype`: the launch, a function of its
     operands, and those operands, each pair's in turn; the one fixture of a chained launch its checks vary
     (base review 3150e8dfc F3)."""
-    tiles = tiles or mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
+    tiles = tiles or tiling.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
     group_sizes = None if sizes is None else jnp.asarray(sizes, jnp.int32)
 
     def launch(*operands):
@@ -996,7 +996,7 @@ def test_a_tiles_flag_reads_only_the_rows_it_stores():
     launch, operands = _chained_call(products, sizes, jnp.float16)
     with generation.assumed("sm90"):
         found = launched_outputs(launch, *operands)
-    flags = [output for name, outputs in found if mosaic_gpu.GUARDED_GMM not in name for output in outputs
+    flags = [output for name, outputs in found if tiling.GUARDED_GMM not in name for output in outputs
              if output.dtype == np.int32]
     assert flags and not any(np.asarray(each).any() for each in flags), flags
     expected = _plain_sum(products, sizes, jnp.float16)
@@ -1044,7 +1044,7 @@ def test_a_direct_chained_launch_whose_replay_no_tile_holds_is_refused(products)
     products narrow its replay to four columns, 65 to none, no whole column unit of the family, so the launch
     refuses the call (`chained.replay_tile`, the one replay plan selection reads too) rather than lower a
     replay WGMMA cannot run (base review f86cb5b03 F1)."""
-    tiles = mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2, family="wgmma")
+    tiles = tiling.Tiles(128, 64, 64, 2, 1, warpgroups=2, family="wgmma")
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     launch, operands = _chained_call([(shaped((256, 64)), shaped((1, 128, 64))) for _ in range(products)],
                                      None, jnp.bfloat16, tiles, interpret=False, multiprocessors=132)
@@ -1070,7 +1070,7 @@ def test_a_launch_pinned_at_a_tile_no_chain_holds_keeps_its_products_apart():
         return gemm.gemm(x, matrices[0], sizes, beside=tuple(matrices[1:]), out_dtype=jnp.bfloat16,
                          interpret_on_cpu=True)
 
-    pin = mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2, family="wgmma")
+    pin = tiling.Tiles(128, 64, 64, 2, 1, warpgroups=2, family="wgmma")
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
           tuning.pinned({grouped_matmul.MosaicGmm: pin}), tuning.seen() as launches):
         got = jax.vjp(projected, x)[1](tuple(cotangents))[0]
@@ -1136,7 +1136,7 @@ def test_a_chained_input_gradient_compiles_for_an_h100_within_its_resources(dens
 
     # The tile the derivation takes for three products: its replay's a quarter of its columns, whole column
     # units (`grouped_matmul.MosaicGmm._replays`).
-    tiles = mosaic_gpu.Tiles(128, 256, 64, 4, 1, warpgroups=2, family="wgmma")
+    tiles = tiling.Tiles(128, 256, 64, 4, 1, warpgroups=2, family="wgmma")
     groups = 1 if dense else 3
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     widths = (4096, 1024, 1024)

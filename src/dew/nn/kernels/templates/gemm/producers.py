@@ -1,15 +1,15 @@
 """Dew: a GEMM launch's producer registers (`templates.gemm`): the rungs a tile's producer climbs where a
 compile finds its kernel spilling, the recurrence's ladder (`resources.Producers.stepped`) on a GEMM's tile
-(`mosaic_gpu.Tiles.producers`), as `grouped_matmul`'s Mosaic launches derive and certify it."""
+(`tiling.Tiles.producers`), as `grouped_matmul`'s Mosaic launches derive and certify it."""
 
 import dataclasses
 from collections.abc import Iterator
 
 from dew.nn.kernels.templates import report, resources
-from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+from dew.nn.kernels.templates.gemm import pricing, tiling
 
 
-def started(op, ba, config: mosaic_gpu.Tiles) -> mosaic_gpu.Tiles:
+def started(op, ba, config: tiling.Tiles) -> tiling.Tiles:
     """`config` with its producer at its ladder's top (`_top`) where it states no registers of its own yet and
     its consumers hold their accumulators in tensor memory (`mosaic.Issuer.tensor_columns`), so its first
     compile is its last: at setmaxnreg's least each of a B200's gathered launches spilled, its issue loop
@@ -26,7 +26,7 @@ def started(op, ba, config: mosaic_gpu.Tiles) -> mosaic_gpu.Tiles:
     return dataclasses.replace(config, producers=config.producers.stepped({op.KERNEL: top}))
 
 
-def _top(op, ba, config: mosaic_gpu.Tiles) -> int | None:
+def _top(op, ba, config: tiling.Tiles) -> int | None:
     """The top of `config`'s producer's ladder, its program's entry share (`resources.entry_registers`),
     where its program has a producer and that producer gathers a step's rows (`mosaic.Family.gathers_rows`,
     a table among the call's); None elsewhere."""
@@ -39,7 +39,7 @@ def _top(op, ba, config: mosaic_gpu.Tiles) -> int | None:
     return resources.entry_registers(warpgroups, config.programs)
 
 
-def rungs(op, ba, config: mosaic_gpu.Tiles) -> Iterator[mosaic_gpu.Tiles]:
+def rungs(op, ba, config: tiling.Tiles) -> Iterator[tiling.Tiles]:
     """The tiles a refused `config`'s gathering producer (`_top`) steps through where a compile refused it
     with `op`'s kernel (`op.KERNEL`) spilling: its ladder below it in turn, its top first where `config`
     states none, then a setmaxnreg step lower each (`resources.Producers.stepped`), each the next rung's
@@ -55,7 +55,7 @@ def rungs(op, ba, config: mosaic_gpu.Tiles) -> Iterator[mosaic_gpu.Tiles]:
         yield config
 
 
-def settled(op, ba, config: mosaic_gpu.Tiles) -> mosaic_gpu.Tiles:
+def settled(op, ba, config: tiling.Tiles) -> tiling.Tiles:
     """`config` started (`started`), then its ladder's rungs (`rungs`) while a compile refused each: the tile
     a derivation takes, refused (`report.refused`) where its ladder's foot spilled too."""
     config = started(op, ba, config)
@@ -66,7 +66,7 @@ def settled(op, ba, config: mosaic_gpu.Tiles) -> mosaic_gpu.Tiles:
     return config
 
 
-def _spilled(op, ba, config: mosaic_gpu.Tiles) -> bool:
+def _spilled(op, ba, config: tiling.Tiles) -> bool:
     """Whether a compile of this process refused `config`, `op`'s kernel spilling (`report.refused_at`)."""
     return any(kernel.startswith(op.KERNEL) for kernel in report.refused_at(op, ba, config))
 

@@ -1,5 +1,7 @@
 """Dew: a grouped product's Pallas-Triton launches (`Gmm`, `Tgmm`), `grouped_matmul`'s."""
 
+from __future__ import annotations
+
 import abc
 import dataclasses
 from typing import ClassVar
@@ -9,7 +11,6 @@ import jax.numpy as jnp
 
 from . import generation
 from .grouped_launch import EXACT_STEP, MOST_STAGES, Tile, _GroupedLaunch, _side_tile_bytes
-from .templates import bundles
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 
 
@@ -106,6 +107,8 @@ class _Triton(_GroupedLaunch[Tile]):
         # prologue's side tiles load in the same steps.
         # A GPU outside every template family (a Turing part) issues no MMA reading shared memory: its
         # operands are registers' too.
+        from .templates import bundles
+
         dtype, issuer = ba.arguments['tokens'].dtype, generation.family(target.generation)
         held = int(issuer is None or bundles.named(issuer, jnp.bfloat16).operands_in_registers)
         step = self.loaded(config) * jnp.dtype(dtype).itemsize + _side_tile_bytes(
@@ -217,6 +220,7 @@ class Gmm(_Triton):
         if dense:
             # One group of every row: the plain tiled kernel, which finds no group and masks no row.
             from .templates.gemm import triton_dense
+
             options = hooks.kernel_options()
             outs = triton_dense.gmm(tokens, kernel[0], tile=config, transpose_rhs=trans_rhs,
                                     out_dtypes=tuple(jnp.dtype(d) for d in (options.pop('out_dtypes')
@@ -225,6 +229,7 @@ class Gmm(_Triton):
                                     epilogue_operands=epilogue_operands, exact_sums=exact_sums, **options)
             return (outs if hooks.out_dtypes else outs[0]), None
         from . import ragged_dot
+
         return ragged_dot.gmm(tokens, kernel, sizes, block_m=config.block_m, block_k=config.block_k,
                               block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
                               trans_rhs=trans_rhs, interpret=interpret, compute_dtype=tokens.dtype,
@@ -284,11 +289,13 @@ class Tgmm(_Triton):
         if dense:
             # One group of every row: the plain tiled kernel (`Gmm._fwd`).
             from .templates.gemm import triton_dense
+
             return triton_dense.tgmm(tokens, cotangent, tile=config, out_dtype=jnp.dtype(out_dtype),
                                      interpret=interpret, prologue=hooks.before(),
                                      prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
                                      exact_sums=exact_sums)[None], None
         from . import ragged_dot
+
         return ragged_dot.tgmm(tokens, cotangent, sizes, block_m=config.block_m, block_k=config.block_k,
                                block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
                                interpret=interpret, compute_dtype=tokens.dtype,
