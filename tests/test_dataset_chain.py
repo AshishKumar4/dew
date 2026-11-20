@@ -1858,3 +1858,42 @@ def test_a_batched_map_that_keeps_its_rows_groups_the_order_whatever_reads_it(re
     shares = sorted(read_by(DataPartition(0, 2)) + read_by(DataPartition(1, 2)))
     alike = shares == whole
     assert alike, (len(shares), [pair for pair in shares if pair not in whole][:4])
+
+
+GROUPS_MADE: list[int] = []
+"""Each group a `counted_group_firsts` step made, by its first `i`."""
+
+
+def counted_group_firsts(columns: dict[str, list]) -> dict[str, list]:
+    """`group_firsts`, noting each group it makes (`GROUPS_MADE`)."""
+    GROUPS_MADE.append(int(columns["i"][0]))
+    return group_firsts(columns)
+
+
+@pytest.mark.parametrize("threads", [0, 16])
+def test_a_batched_map_that_keeps_its_rows_makes_each_group_once_however_its_rows_are_read(threads):
+    """A batched map that keeps its rows makes each of its groups once, read by one thread or by many
+    sharing its groups, every row its own group's (row 9711: one slot every read thread wrote, so a row
+    could read another group's). Followed by a shuffle it reads as a stream, a window shuffling it, and a
+    global shuffle is refused as after any step that does not keep its rows one for one, where each
+    shuffled read made a row's whole group again."""
+    def read(chain) -> list[tuple[int, int]]:
+        GROUPS_MADE.clear()
+        data = compile(chain, read="indexed", loading=dataclasses.replace(READ, threads=threads))
+        reader = data.train(DataPartition())
+        try:
+            batches = [next(reader) for _ in range(24 // 2)]
+        finally:
+            reader.close()
+        return [(int(i), int(group)) for batch in batches
+                for i, group in zip(np.asarray(batch["i"]).ravel(), np.asarray(batch["group"]).ravel(),
+                                    strict=True)]
+
+    grouped = Memory(rows("a", 24)).map(counted_group_firsts, batched=True, batch_size=4)
+    ordered = read(grouped.batch(2))
+    assert ordered == [(index, index // 4 * 4) for index in range(24)]
+    assert sorted(GROUPS_MADE) == list(range(0, 24, 4)), GROUPS_MADE
+    shuffled = read(grouped.shuffle(seed=1, window=8).batch(2))
+    assert sorted(shuffled) == ordered and len(GROUPS_MADE) == 6, GROUPS_MADE
+    with pytest.raises(ValueError):
+        compile(grouped.shuffle(seed=1).batch(2), read="indexed", loading=READ)

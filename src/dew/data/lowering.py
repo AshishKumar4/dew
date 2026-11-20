@@ -18,6 +18,7 @@ the last `map_with_index`, which is the only step that reads it.
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import contextlib
 import dataclasses
@@ -26,6 +27,7 @@ import hashlib
 import itertools
 import logging
 import math
+import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Protocol, TypedDict, Unpack, overload, runtime_checkable
 
@@ -747,25 +749,42 @@ class _GroupedRows(_WrappingDataset):
     """A batched step that keeps its rows (`Batched.same_rows`) over an indexed order: each record read as
     its group of `size` consecutive records of the order makes it (`BatchedGroups`), the group the record's
     place decides, so the rows are the same however many readers share the order and wherever a read
-    resumes (row 9007: grouped after the share cut, each reader's groups were its own). The last group read
-    is kept, as a reader reads its records in order."""
+    resumes (row 9007: grouped after the share cut, each reader's groups were its own). The groups the
+    read's threads are in are kept, each made once (`held`, at most `held` of them), so threads reading
+    rows of one group share it and none hands on another group's row (row 9711: one slot every thread
+    wrote)."""
 
-    def __init__(self, parent: pygrain.MapDataset, groups: BatchedGroups, size: int):
+    def __init__(self, parent: pygrain.MapDataset, groups: BatchedGroups, size: int, held: int):
         super().__init__(parent)
-        self._groups, self._size = groups, size
-        self._held: tuple[int, Sequence[Record]] | None = None
+        self._groups, self._size, self._held = groups, size, max(2, held)
+        self._made: collections.OrderedDict[int, concurrent.futures.Future] = collections.OrderedDict()
+        self._lock = threading.Lock()
 
     def __len__(self) -> int:
         return len(self._parent)
 
     def record(self, index: int) -> Batch:
         group = index // self._size
-        if self._held is None or self._held[0] != group:
-            first = group * self._size
-            members: list[Record] = [self._parent[place]
-                                     for place in range(first, min(first + self._size, len(self)))]
-            self._held = group, self._groups.flat_map(members)
-        return record(self._held[1][index % self._size], "batched row")
+        with self._lock:
+            made, owner = self._made.get(group), False
+            if made is None:
+                made, owner = concurrent.futures.Future(), True
+                self._made[group] = made
+                while len(self._made) > self._held:
+                    self._made.popitem(last=False)
+            self._made.move_to_end(group)
+        if owner:
+            try:
+                first = group * self._size
+                members: list[Record] = [self._parent[place]
+                                         for place in range(first, min(first + self._size, len(self)))]
+                made.set_result(self._groups.flat_map(members))
+            except BaseException as error:
+                made.set_exception(error)
+                with self._lock:
+                    self._made.pop(group, None)
+                raise
+        return record(made.result()[index % self._size], "batched row")
 
 
 class _TokenSplit(_WrappingDataset):
@@ -2056,9 +2075,11 @@ class _Build:
             # A Grain step reads cache fills through an iterator that owns them (`_Filled`).
             given = _as_iter(rows, self.loading) if _fills(rows) else rows
             rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
-        elif isinstance(stage, Batched) and stage.same_rows and isinstance(rows, pygrain.MapDataset):
-            # Its groups the order's own consecutive records, whatever reads them (row 9007).
-            rows = _GroupedRows(rows, BatchedGroups(stage), stage.size)
+        elif (isinstance(stage, Batched) and not _drops(stage, pipeline.stages[at + 1:])
+              and isinstance(rows, pygrain.MapDataset)):
+            # Its groups the order's own consecutive records, whatever reads them (row 9007), where no
+            # global shuffle after it reads them out of order (`_drops`, row 9711).
+            rows = _GroupedRows(rows, BatchedGroups(stage), stage.size, 2 * max(1, self.loading.threads))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))

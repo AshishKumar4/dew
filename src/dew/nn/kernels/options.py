@@ -165,6 +165,13 @@ def program_digest(lowered: jax.stages.Lowered, options: jax.stages.CompilerOpti
     return hashlib.sha256(f"{_text_digest(lowered)}\n{trees}\n{types}{stated}".encode()).hexdigest()
 
 
+def program_name(lowered: jax.stages.Lowered) -> str:
+    """A program's one name where it is counted rather than kept (a step no device run has tuned,
+    `dew.training.ahead.CompiledAhead.untuned`): its digest as a file holds it (`stated_digest`), or its
+    text's where its trees state no form (a host step's VJP results)."""
+    return stated_digest(lowered) or _text_digest(lowered)
+
+
 def stated_digest(lowered: jax.stages.Lowered,
                   options: jax.stages.CompilerOptions | None = None) -> str | None:
     """`lowered`'s digest under `options` as a file of programs holds it (`program_digest`), None (logged,
