@@ -735,6 +735,23 @@ def test_a_launch_spilling_at_two_configs_steps_down_alone_and_its_program_compi
     assert compiles.count == 1
 
 
+@lowers("sm90")
+def test_a_program_lowered_before_another_compile_refused_its_config_is_relowered_past_it():
+    """Two lowerings of one step through a launch whose first tile spills (`Uncounted`), both traced before
+    either compiles, compiled for a compile-only H100 one after the other (`report.compiled`), as another
+    thread's compile or a certification elsewhere commits a refusal after a program's trace took the config:
+    the second, whose compile spills at the config the first's refused, is lowered afresh past it, so no
+    program kept spills (no miss left unstepped), where its spill read as already held kept it (row 8603)."""
+    devices, lowered = _paired_step(Uncounted())
+    with (report.refusals(), generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        first, second = lowered(), lowered()
+        report.compiled(first, relower=lowered)
+        report.compiled(second, relower=lowered)
+        misses = report.misses()
+    assert misses and all(miss.stepped for miss in misses), misses
+
+
 class SpillingOnly(Uncounted):
     """`Uncounted`'s first tile alone, which spills in every compile, and no tile once a compile refused it: a
     launch whose every legal config spills."""
