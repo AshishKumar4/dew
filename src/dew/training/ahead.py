@@ -361,9 +361,10 @@ class AheadOfTime:
     before its first step on those GPUs."""
     planned_parts: Mapping[str, float] = dataclasses.field(default_factory=dict)
     """The seconds of that search's work by part, summed over its threads (a compile at once runs several):
-    JAX's traces (`traced`), the algebra's passes over the traced programs (`algebra`, `report.passes`),
-    JAX's lowerings (`lowered`) and XLA's compiles (`compiled`; the planner's reading,
-    `planning.spending`)."""
+    the step's JAX traces (`traced`), the algebra's passes over the traced programs (`algebra`,
+    `report.passes`), the step's lowerings (`lowered`) and XLA's compiles (`compiled`; the planner's reading,
+    `planning.spending`), and a fresh state's start, traced, lowered and compiled beside them (`start`,
+    `distributed.START_PROGRAM`'s, row 6740)."""
     capacity: int | None = None
     """The allocator's limit each target GPU holds the plan to, derived from the memory stated for it
     (`dew._devices.allocator_limit`); None for a TPU's, whose topology states its own."""
@@ -1509,13 +1510,20 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     """`compile_ahead`'s step and programs, the evaluations' with `plan`, what the run's `fit` is asked for
     (`Trainer._fit_plan`), over its own data or a configured run's loader (`AheadTarget.compiled`), with its
     planning's seconds by their parts (`AheadOfTime.planned_parts`)."""
+    from dew.telemetry.compiles import Ledger
+    from dew.training.distributed import START_PROGRAM
     from dew.training.planning import spending
 
-    with report.recording() as recorded, spending() as spent:
+    with report.recording() as recorded, spending() as spent, Ledger(START_PROGRAM) as start:
         ahead = _planned_ahead(trainer, batch, frontier=frontier, plan=plan, topology=topology)
-    # The planning's seconds by its parts, which perf_gate reports beside its whole (row 5339): JAX's traces,
-    # lowerings and compiles (the planner's own reading of them, `spending`) and the algebra's passes.
-    return dataclasses.replace(ahead, planned_parts={**spent, "algebra": sum(recorded.passes)})
+    # The planning's seconds by its parts, which perf_gate reports beside its whole (row 5339): the step's
+    # JAX traces, lowerings and compiles (the planner's own reading of them, `spending`), the fresh state's
+    # start compiled beside them (`start`, its own program's; row 6740: the gate read it as the step's) and
+    # the algebra's passes.
+    started = {kind: sum(made.seconds for made in start.programs if made.kind == kind) for kind in spent}
+    stepped = {kind: seconds - started[kind] for kind, seconds in spent.items()}
+    return dataclasses.replace(ahead, planned_parts={**stepped, "start": sum(started.values()),
+                                                     "algebra": sum(recorded.passes)})
 
 
 class _Targeted(NamedTuple):

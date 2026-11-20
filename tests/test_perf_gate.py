@@ -625,7 +625,7 @@ def test_a_step_compiled_ahead_for_an_absent_gpu_is_a_sample_of_its_planners_sec
     assert isinstance(seconds, float) and seconds > 0
     assert set(plan) == set(gate.SELECTED) and plan["split"] == 1
     # Its seconds by their parts: JAX's traces, lowerings and compiles, and the algebra's passes.
-    assert set(parts) == {"traced", "lowered", "compiled", "algebra"} and parts["compiled"] > 0
+    assert set(parts) == {"traced", "lowered", "compiled", "algebra", "start"} and parts["compiled"] > 0
 
 
 def paired(rates: dict[str, list[float]], session: str = "s") -> dict[str, list[dict]]:
