@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
-import jax
-import jax.numpy as jnp
 from flax import linen as nn
 from jax.typing import DTypeLike
 
@@ -26,7 +24,7 @@ from dew.inference.tasks import TaskSettings
 from dew.interop.weights import AUTO
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import Numerics
-from dew.nn.protocols import Bounded, ComputesIn
+from dew.nn.protocols import Bounded, ComputesIn, computes_in
 from dew.registry import DtypeName, dtype_name, from_record, record_fields
 
 if TYPE_CHECKING:
@@ -130,8 +128,7 @@ def computed_in(numerics: Numerics | None, model: nn.Module, variables: Variable
         return dtype_name(stated)
     if numerics is not None:
         return dtype_name(numerics.dtypes.compute)
-    return dtype_name(jnp.result_type(*(leaf.dtype for leaf in jax.tree.leaves(unboxed(variables))
-                                        if jnp.issubdtype(leaf.dtype, jnp.floating))))
+    return dtype_name(computes_in(None, unboxed(variables).get("params", {})))
 
 
 def released(directory: Path) -> ReleaseTask:

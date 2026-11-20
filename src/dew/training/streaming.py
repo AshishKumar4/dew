@@ -16,7 +16,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import logging
-import math
 from collections.abc import Iterator
 
 import jax
@@ -27,14 +26,14 @@ from jax.sharding import Mesh
 from dew._coordination import agreed_same, broadcast_from_process_zero
 from dew._records import JSON, listed, record, text
 from dew.batch import FROZEN
-from dew.distributed.batches import placed_abstract, prefetched_bytes, split_fields
+from dew.distributed.batches import placed_abstract, prefetched_bytes
 from dew.distributed.host import companion_mesh
-from dew.distributed.placement import Layout
+from dew.distributed.placement import Layout, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.generation import gpu_target
-from dew.nn.protocols import ComputesIn
+from dew.nn.protocols import ComputesIn, computes_in
 from dew.telemetry.instrumentation import step_flops
-from dew.training._fit import Start, closes_window
+from dew.training._fit import Start, handed, staged
 from dew.training.diloco import DILOCO_ON_HOST
 from dew.training.distributed import marked, microbatch_shapes
 from dew.training.execution import HostExecution, frozen_trees, stack_sites, unscanned
@@ -161,44 +160,57 @@ def priced(plan, dtype) -> StepPrice:
     return device_price(None if flops is None else plan.split * flops, gpu_target(), dtype)
 
 
-def streamed(trainer, start: Start, batch, dtype, device_steps: tuple
+def streamed(trainer, start: Start, batch, dtype, device_steps: tuple, update: float
              ) -> tuple[bool, int | None, StepPrice | None]:
     """Whether the devices hold the step of `trainer`, laid out streamed, that streams `start`'s parameters
-    from the host over `batch`, the loader's `device_steps` run in it, traced in the run's own context
+    from the host over `batch`, the loader's `device_steps` run in it, its update on the host `update`
+    seconds (`host_update_seconds` of `host_updated`), traced in the run's own context
     (`Trainer._traced_on`; `HostExecution.compiled_whole`), admitted before anything is placed as a
     plan's candidate is (`_candidates._candidate`: `step_fits`, the inputs each realization places counted
     as built, and the batches the run prefetches beside them, `prefetched_bytes`), and its price
     (`streamed_price`), None where its part rates no step computing in `dtype`, with the bytes its fit check
-    found the tightest device had to spare (`step_fits`'s headroom, None where it read none). Its bytes are
-    each device's: the shards its link moves, and the shards its process's update reads and writes on its
-    host, every local device's."""
+    found the tightest device had to spare (`step_fits`'s headroom, None where it read none). A run that
+    inspects (`Trainer.inspection`) is admitted where its sampled step fits too, its forward differentiating
+    the watched outputs' probes (`loss_arguments`' `watched`), as a device plan's rung is
+    (`FitSearch.measured`). Its bytes are each device's: the shards its link moves, and the shards its
+    process's update reads and writes on its host, every local device's."""
     mesh, abstract = trainer.device_mesh, start.abstract
     # The batch read in the split the run states, each microbatch an attempt of its own that fetches the
     # parameters again (`StepCompiler._compile_host`).
-    split = trainer.split or 1
+    split = trainer._shape.split or 1
     whole_batch, batch = batch, microbatch_shapes(batch, split)
     # The CPU companion read before the devices' mesh is in place: its probe runs a CPU program, which no
     # trace under a GPU's mesh may (M-MC-24b: refused on a GH200).
     companion = companion_mesh(mesh)
+    watched = None if trainer.inspection is None else trainer.inspection.watched
     with trainer._traced_on(mesh):
-        variables, step = loss_arguments(trainer.objective, abstract, batch, split * trainer.accumulation,
-                                         split)
         execution = HostExecution(trainer.objective, trainer.layout, mesh, companion,
                                   stack_sites(trainer.objective, abstract.variables), device=device_steps,
                                   gathered=layer_gathers(trainer.objective, abstract.variables,
                                                          mesh.devices.size))
-        compiled, (primal, frozen, rest, _, here) = execution.compiled_whole(variables, batch, step)
+        window = split * trainer.accumulation
+        steps = []
+        for sampled in (None, *(() if watched is None else (watched,))):
+            arguments = loss_arguments(trainer.objective, abstract, batch, window, split, watched=sampled)
+            steps.append(execution.compiled_whole(arguments[0], batch, arguments[1]))
+    (compiled, (primal, frozen, rest, _, here)), *sampled_steps = steps
     devices = local_devices(mesh)
-    built = max(_shard_bytes((primal, frozen, rest, here), device) for device in devices)
+    built = max(placed_bytes((primal, frozen, rest, here), device=device, memory="device")
+                for device in devices)
     prefetched = prefetched_bytes(whole_batch, jax.tree.map(lambda leaf: leaf.sharding, whole_batch),
                                   trainer._shape.prefetch)
     # A process whose compile XLA refused for memory (None) takes part in the agreement as one that does
     # not fit, as a plan's candidate's does: every process answers alike, and none waits on another.
     fits, headroom = step_fits(compiled, mesh, prefetched + built, built, placed=False)
+    for sampled, _ in sampled_steps:
+        # The tighter margin of the two, unknown where the sampled step's is.
+        held, room = step_fits(sampled, mesh, prefetched + built, built, placed=False)
+        fits = fits and held
+        headroom = None if headroom is None or room is None else min(headroom, room)
     if not fits or compiled is None:
         return False, headroom, None
     # The parameters the step trains, the vjp's primal, moved there and back each attempt.
-    parameters = max(_shard_bytes(primal, device, memory=None) for device in devices)
+    parameters = max(placed_bytes(primal, device=device) for device in devices)
     # Read once an attempt, beside them, and differentiated by nothing: the averaged weights the step reads
     # (an EMA reference, `Step.ema`), and the banks of every frozen tree the host keeps, its frozen
     # parameters' (a LoRA base, the run's frozen collection) and its frozen roots' (`frozen_trees`: a
@@ -207,43 +219,27 @@ def streamed(trainer, start: Start, batch, dtype, device_steps: tuple
     # The run's own frozen collection is among the primal's frozen leaves (`frozen`), the snapshot's
     # parameters holding it; its nested roots' trees are the snapshot's other collections' (`rest`).
     banked = [frozen, *(tree for path, tree, _ in frozen_trees(rest, execution.sites) if path != (FROZEN,))]
-    averaged = max(_shard_bytes(here.ema, device, memory=None)
-                   + _shard_bytes(banked, device, memory="pinned_host") for device in devices)
+    averaged = max(placed_bytes(here.ema, device=device)
+                   + placed_bytes(banked, device=device, memory="pinned_host") for device in devices)
     try:
         flops = step_flops(compiled)
         price = streamed_price(None if flops is None else split * flops, gpu_target(), dtype,
-                               split * parameters, host_updated(start, companion), host_memory_rate(),
-                               read_once=split * averaged)
+                               split * parameters, update, read_once=split * averaged)
     except Unpriced:
         price = None
     return fits, headroom, price
 
 
 def host_updated(start: Start, companion: Mesh) -> int:
-    """The bytes a streamed step's update reads and writes on this process's host (`streamed_price`'s
+    """The bytes a streamed step's update reads and writes on this process's host (`host_update_seconds`'
     `updated`): each of its CPU companion's devices its shards of the parameters, the optimizer's state and
     the averaged weights, read and written, and the gradient's, read, `start` laid out streamed."""
     abstract = start.abstract
     weights, held = abstract.variables["params"], start.shardings.variables["params"]
-    return sum(_shard_bytes((weights, abstract.opt_state, abstract.ema), device,
-                            (held, start.shardings.opt_state, start.shardings.ema), memory=None)
-               + _shard_bytes(weights, device, held, memory=None)
+    return sum(placed_bytes((weights, abstract.opt_state, abstract.ema),
+                            (held, start.shardings.opt_state, start.shardings.ema), device=device)
+               + placed_bytes(weights, held, device=device)
                for device in local_devices(companion))
-
-
-def _shard_bytes(tree, device, placement=None, *, memory: str | None = "device") -> int:
-    """The bytes `device` holds of `tree`'s leaves (shapes, each placed by its own sharding or by
-    `placement`'s): each leaf's shard there, those in `memory` alone (a device's own memory: a bank in its
-    host's pinned memory is none of it), or every one where `memory` is None."""
-    shardings = (jax.tree.leaves(placement) if placement is not None
-                 else [leaf.sharding for leaf in jax.tree.leaves(tree)])
-    total = 0
-    for leaf, sharding in zip(jax.tree.leaves(tree), shardings, strict=True):
-        held = memory is None or (sharding.memory_kind or "device") == memory
-        sized = hasattr(leaf, "dtype") and not jnp.issubdtype(leaf.dtype, jax.dtypes.extended)
-        if held and sized and device in sharding.device_set:
-            total += math.prod(sharding.shard_shape(leaf.shape)) * np.dtype(leaf.dtype).itemsize
-    return total
 
 
 def chosen(held: bool, fits: bool, device: StepPrice | None, stream: StepPrice | None) -> bool:
@@ -277,8 +273,9 @@ def compute_dtype(trainer, start: Start) -> np.dtype:
     does."""
     stated = [entry.module.dtype for entry in trainer.objective.program_key()
               if entry.trained and isinstance(entry.module, ComputesIn) and entry.module.dtype is not None]
-    found = stated or [leaf.dtype for leaf in jax.tree.leaves(start.abstract.variables["params"])]
-    return np.dtype(jnp.result_type(*found))
+    if stated:
+        return np.dtype(jnp.result_type(*stated))
+    return np.dtype(computes_in(None, start.abstract.variables["params"]))
 
 
 def resumed_layout(trainer, resume) -> Layout | None:
@@ -340,13 +337,14 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     given = trainer._given_layout
     trainer._laid_out(given)
     first = run.primed[2] if run.primed is not None else trainer._primed_first(run, dataset)
+    # Staged as the stream the start read first stages it, as the run's first compile reads it.
+    trainer._shape = staged(trainer._shape, run.stages)
     # As the loop hands its step the batch, counted on the host and its rows marked (`FitRun.marked`), so
-    # the run's first compile takes the plan made here (`StepCompiler.holds_unplaced`), where it planned
+    # the run's first compile takes the plan made here (`FitRun.searched`), where it planned
     # and compiled its step again (M-MC-26: 196 s of an H100's 375 s to its first step).
     partition = run.primed[0] if run.primed is not None else trainer._stream_partition()
-    placed = split_fields(placed_abstract(trainer.device_mesh,
-                                          marked(partition, trainer._counted_batch)(first)))[0]
-    batch = closes_window(placed, trainer._shape.examples)
+    batch = handed(placed_abstract(trainer.device_mesh, marked(partition, trainer._counted_batch)(first)),
+                   trainer._shape.examples)
     # The step's phase the first batch's, as the run's first compile takes it (`Trainer._compiled_fresh`),
     # and its objective, at that phase's pass count, as it stands before the device plan's search climbs
     # its ladder: the streamed layout starts from it where it is taken, both plans priced at that count.
@@ -355,7 +353,7 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     rung = Rung.of(active, xla_defaults=False, narrow=True)
     try:
         start = trainer._started(resume)
-        trainer._planned_unplaced(start, batch)
+        trainer._planned_unplaced(run, start, batch)
     except LayoutRefused:
         start = None
     plan = trainer._compiler.unplaced if start is not None else None
@@ -366,23 +364,32 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     trainer._compiler = devices_compiler.anew()
     laid = trainer._started(resume)
     dtype = compute_dtype(trainer, laid)
+    unpriced = None
     try:
         device = None if plan is None else priced(plan, dtype)
-    except Unpriced:
-        device = None
+    except Unpriced as rated:
+        device, unpriced = None, str(rated)
     held = plan is not None
-    # The streamed step is never priced under its update on the host (`host_update_seconds`): a device plan
-    # priced no dearer than that is the cheaper whatever the streamed step compiles to, so it compiles
-    # nothing (M-MC-26: the whole host program, 56 s of an H100's start, for a device plan of 1.8 s against
-    # an update of 4.5 s). Every process decides as the first does, as each takes the plan it chooses.
+    # A held device plan gives way to the streamed step only where it is priced dearer (`chosen`), and the
+    # streamed step is never priced under its update on the host (`host_update_seconds`): a held plan
+    # priced no dearer than that update, or priced not at all (its dtype rated by no datasheet), is the run's
+    # whatever the streamed step compiles to, so it compiles nothing (M-MC-26: the whole host program, 56 s
+    # of an H100's start, for a device plan of 1.8 s against an update of 4.5 s). Every process decides as
+    # the first does, as each takes the plan it chooses.
     update = host_update_seconds(host_updated(laid, companion_mesh(trainer.device_mesh)), host_memory_rate())
-    if broadcast_from_process_zero(device is not None and device.seconds <= update):
-        trainer.layout_choice = Choice(held, fits=False, device=device, streamed=None, refused=(
-            f"the device plan's step is priced no dearer than the streamed step's update on the host alone "
-            f"({update:.3g} s)"), streams=False)
+    kept = None if not held else (
+        f"the device plan's step is unpriced, which keeps its plan ({unpriced})" if device is None
+        else f"the device plan's step is priced no dearer than the streamed step's update on the host alone "
+             f"({update:.3g} s)" if device.seconds <= update else None)
+    # The first process's reason, which every process takes.
+    kept = broadcast_from_process_zero(kept)
+    if kept is not None:
+        trainer.layout_choice = Choice(held, fits=False, device=device, streamed=None, refused=kept,
+                                       streams=False)
     else:
         with phases.scoped(trainer, trainer._compiler):
-            fits, headroom, price = streamed(trainer, laid, model_batch(batch), dtype, trainer._shape.device)
+            fits, headroom, price = streamed(trainer, laid, model_batch(batch), dtype, trainer._shape.device,
+                                             update)
         trainer.layout_choice = Choice(held, fits, device, price, None,
                                        streams=broadcast_from_process_zero(chosen(held, fits, device, price)),
                                        streamed_headroom=headroom)

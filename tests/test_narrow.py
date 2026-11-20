@@ -1,5 +1,7 @@
 """The narrow copies of the parameters the forward reads (`dew.training.narrow`)."""
+import contextlib
 import gc
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -532,11 +534,12 @@ def test_a_step_that_does_not_fit_drops_its_copies_before_it_recomputes_where_th
 
 def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monkeypatch):
     """Row 1661's run (1765): devices that hold the state a run keeps between steps, its parameters,
-    optimizer state and the window's accumulator, but not that state and its narrow bf16 copies. The
-    check `fit` makes before it places anything holds that state alone, which `validate` reports the
-    same with the copies on as off: the copies are the plan's first rung, dropped where the step does
-    not fit with them. On devices of that capacity, whose free bytes lie between the step's footprints
-    with and without its copies, fit trains, its plan without them."""
+    optimizer state and the window's accumulator, and that `validate` reports the same with the copies on
+    as off: the copies are the plan's first rung, dropped where the step does not fit with them. Where the
+    step's measured need without its copies is below its need with them (a CPU's), devices whose free
+    bytes lie between the two train it without them, at its own rung; where dropping them frees nothing
+    (a GPU's step, whose temporaries hold its fusions' casts either way: GH200 68.352 MB against 68.344 MB,
+    row 6310), devices short of the need with them keep the copies and climb the ladder (row 8562)."""
     from model_support import allocating
     from token_support import repeated_token_batch
 
@@ -589,18 +592,21 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     # the state's bytes, which a GPU step's temporaries dwarf (M-MC-22: a 349,744 B state, a 68 MB step).
     # The plan made before the state is placed (`Trainer._planned_unplaced`), which reads those bytes as
     # holding the state too, holds none, and the step is planned once the state is placed.
-    free = (with_copies + without) // 2
-    assert without < free < with_copies and state < free, (without, free, with_copies, state)
+    frees = without < with_copies
+    free = (with_copies + without) // 2 if frees else with_copies - 1
+    assert state < free < with_copies, (without, free, with_copies, state)
     gc.collect()
     allocating(monkeypatch, limit, limit, limit - free)
     stream = streamed()
     with chosen(narrow_copies='on'):
         run.fit(stream, steps=2)
-    # It trains without its copies, at its own rung: dropping them freed what it was short, and nothing is
-    # recomputed for it.
     probes = run.plan["probes"]
-    assert run.plan["narrow"] is False and probes[-1]["fits"] is True
-    assert run.plan["remat"] == probes[0]["remat"] and not probes[0]["fits"]
+    rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
+    own = {key: probes[0][key] for key in rung} == {key: run.plan[key] for key in rung}
+    assert probes[-1]["fits"] is True and not probes[0]["fits"]
+    # Where dropping them freed what it was short, it trains without them at its own rung, nothing
+    # recomputed for it; where it frees nothing, they come back and the ladder climbs past its own rung.
+    assert (run.plan["narrow"], own) == ((False, True) if frees else (True, False)), run.plan
     # A pool grown to the state's size, half of it one free block, whose limit holds the state and the step
     # with its copies in all, the step in what the pool can still take: a fresh GH200 4B run's (M-MC-3m).
     # The step is planned before the state is placed on the pool's bytes in all, not on its largest block,
@@ -621,6 +627,69 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     # Here what it places beside the step, its outputs and its batches, is under the state's bytes.
     placed, own = run.plan["placed"], run.plan["probes"][0]
     assert own["headroom"] == placed["headroom"] and own["beside"] < state, (own, placed, state)
+
+
+def test_a_fresh_plan_refused_with_its_copies_built_deletes_them_before_it_is_searched_again(monkeypatch):
+    """A fresh run's first step planned with its narrow copies before its state is placed, on devices whose
+    free bytes in all hold the step and its copies, and whose pool, the state and the copies on it, has no
+    block for its temporaries, nor growth to give one: the placed check builds the copies where they land
+    (`Building.fits`), is refused, and deletes them before the plan is searched again on the placed devices,
+    whose allocator then reads the copies' bytes free (row 8766; the cells above cover the bound and the
+    copies taken)."""
+    from model_support import allocating, device_buffers
+    from token_support import repeated_token_batch
+
+    from dew.data.dataset import Loader
+    from dew.nn.kernels import options
+    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.planning import PlanRefused
+
+    device = MeshSpec().build(jax.devices()[:1])
+
+    def built() -> Trainer:
+        objective, _ = _decoder(remat="full")
+        return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
+                       layout=Layout(min_shard=1, tolerance=1.0))
+
+    def streamed() -> Loader:
+        return Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+
+    narrow, _, _ = _trained(ADAM_3, copies=True, steps=1, remat="full", mesh=device)
+    copies = sorted(leaf.nbytes for leaf in jax.tree.leaves(narrow.compute))
+    del narrow
+    # The fresh plan's need with its copies, the state and its batches among it, and its temporaries, as a
+    # roomy allocator's run measured them.
+    free, limit = 2 ** 39, 2 ** 40
+    gc.collect()
+    allocating(monkeypatch, limit, limit, limit - free)
+    roomy = built()
+    with chosen(narrow_copies="on"):
+        roomy.fit(streamed(), steps=1)
+    probe = roomy.plan["probes"][0]
+    assert probe["narrow"] and probe["fits"] and copies, (probe, copies)
+    need, temporaries = free - probe["headroom"], probe["temp"]
+    del roomy
+    options.unhold()
+    # Free in all, the need and half the temporaries: the plan made before the state is placed holds. The
+    # pool's growth one byte short of the temporaries, and its blocks, the state and copies on it, the
+    # rest: half the temporaries and what is placed beside them, no block for them.
+    gc.collect()
+    allocating(monkeypatch, limit, limit - temporaries + 1, limit - need - temporaries // 2)
+    stats, buffers = jax.Device.memory_stats, []
+
+    def reading(device):
+        # The buffers on the device at each of its allocator's reads, as the read stands.
+        buffers.append(device_buffers(device))
+        return stats(device)
+    monkeypatch.setattr(jax.Device, "memory_stats", reading)
+    run = built()
+    with chosen(narrow_copies="on"), contextlib.suppress(PlanRefused):
+        run.fit(streamed(), steps=1)
+    # Between the judgement with the copies built and the search after it, the copies' buffers alone are
+    # gone, one a leaf, the state's left: the buffers each read's next no longer holds.
+    freed = [sorted(size for address, size in before.items() if address not in after)
+             for before, after in itertools.pairwise(buffers)]
+    assert copies in freed, (copies, [each for each in freed if each])
 
 
 def test_a_fresh_plan_its_placed_devices_refuse_records_no_rung(monkeypatch, tmp_path):

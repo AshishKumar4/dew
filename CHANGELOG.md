@@ -7,13 +7,21 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A host step's startup, a sampled streamed step's admission, a rollout's and a fetched executable's
+  admission share the planner's paths: the streamed step of an inspecting run is admitted with its
+  sampled step; a rollout's copy and generation are admitted as a step is (`memory.admitted`); an
+  executable fetched to be called each step enters every `running` block; a startup's compiles are read
+  from the one ledger of JAX's events, another thread's compiles none of them; a host step under AutoPGLE
+  reports what its trial guided in its compile record, and its trial steps a window of its own.
+- One rule for the dtype a model computes in (`dew.nn.protocols.computes_in`): a release of fp8 codes that
+  states no dtype computes in its scales' dtype.
 - `Trainer(lower_for=...)` lowers a step that keeps its variables on the host: its dry run's `Lowered`
   holds each program its steady steps call (`Lowered.programs`), the realizations' lowered for the GPU and
   the companion's for this host, none compiled. `Lowered.lowered` is a device step's one program.
 - A run that keeps its variables on the host samples its rollout from a copy of its weights on its
   devices, made once a call; the copy and each program the rollout compiles beside it (a generation's KV
   cache and activations) are refused by name where the devices cannot hold them, and the copy's bytes are
-  logged (`train/rollout_copied_gib`). The streamed layout's choice keeps a run with a rollout on its
+  logged (`train/rollout_copied_gib`, on a run that copies any). The streamed layout's choice keeps a run with a rollout on its
   devices: its stream's first batch is the rollout's input, no step's, so no step is priced before a
   rollout runs.
 - A step's fit counts the bytes placed beside its temporaries (its copies, its window, its batches) where a
@@ -21,9 +29,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   its narrow copies before it is judged on the allocator holding them. An H100's 4B run was admitted with
   its copies in the one block its temporaries needed, and refused on its first step.
 - A fresh fit plans its step once over the batch its loop hands the step, where the layout's choice
-  planned over the batch as read and the first compile planned and compiled it again, and compiles no
-  streamed step where the device plan is priced no dearer than the streamed step's update on the host
-  alone.
+  planned over the batch as read and the first compile planned and compiled it again, a ramped or phased
+  run's too, whose choice planned before its stages were read; it compiles no streamed step where the
+  device plan is priced no dearer than the streamed step's update on the host alone, or where it is not
+  priced at all (a float32 or float16 step, which no datasheet rates), which keeps the devices' plan.
+- A step's fit is agreed with each process's read of its devices in one exchange: a process whose read
+  fails ends every process's check with its error, where its peers waited on it.
+- A fresh run searches its first step before placing its state once, where a run whose devices held
+  neither its step nor the streamed one searched it again in its start.
 - Under AutoPGLE (`jax_enable_pgle`) a step that keeps its variables on the host is profiled on a trial
   after its startup and runs its accelerator programs guided by the profile, as a device plan does
   (`HostStartup.pgle` records it); the streamed layout's choice considers such a run.
