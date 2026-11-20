@@ -125,8 +125,9 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         write = (dt_c * x_c)[..., None] * _spread(B_c, channels)
         # The chunk's states a token at a time from the state entering it (`ssm.affine_states`).
         states = affine_states(decay, write, h, axis=1)
-        # The readout's contraction over the states as it was, each channel its own batch.
-        read = recurrence_algebra.portable_einsum('bcdn,bcdn->bcd', states, _spread(C_c, channels))
+        # The readout `sum_n C_n h_n` as the recurrence reads a token's, an elementwise product summed over
+        # the states, so C spread over the channels meets the states' own placement as B meets the writes'.
+        read = jnp.sum(states * _spread(C_c, channels), axis=-1)
         return states[:, -1], read
 
     steps = tuple(chunks(t) for t in (x, dt, B, C, resets))
