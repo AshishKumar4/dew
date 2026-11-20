@@ -45,9 +45,8 @@ from flax.typing import PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 
-from dew import _cache
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_gradients_formed
-from dew.nn.kernels import generation, grouped_matmul, selection, tuning, xla_products
+from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic_sm100
 from dew.nn.kernels.templates.axes import GROUPS
@@ -1338,7 +1337,7 @@ def _mosaic_route(call: tuple, product, whole: bool) -> "generation.Route | Lite
     in one launch, `side_by_side`'s and `_one_launch`'s) of `product` by, its operands seen `whole`, decided
     and reported nowhere (`selection.decided`: the dispatch that runs it publishes it), else False: another
     kernel's, a refusal of a named kernel, or a pin the launch's own resolution refuses for the call
-    (`tuning.KernelOp.taken`'s `Unpinnable`: base review 2e4651b2e F1, a chain narrowed a 64-column pin to
+    (`tuning.KernelOp.pin_refuses`: base review 2e4651b2e F1, a chain narrowed a 64-column pin to
     16). Each is the products' decision to run apart, as before."""
     case = grouped_matmul.grouped_case(*call, product=product, whole=whole)
     try:
@@ -1354,16 +1353,10 @@ def _mosaic_route(call: tuple, product, whole: bool) -> "generation.Route | Lite
 
 def _pin_refuses(call: tuple) -> bool:
     """Whether a pin of Mosaic GPU's launch refuses `call` (`_gemm_call`'s) as the launch resolves it
-    (`tuning.KernelOp.taken`'s `Unpinnable`): products one launch would take whole an optional form, whose
-    refusal runs them apart (base review 156a4595a F5); none where no pin is held."""
-    if grouped_matmul.MosaicGmm not in dict(_cache.KERNEL_PINS.value):
-        return False
+    (`tuning.KernelOp.pin_refuses`): products one launch would take whole an optional form, whose refusal
+    runs them apart (base review 156a4595a F5); none where no pin is held."""
     launch = grouped_matmul.MosaicGmm()
-    try:
-        launch.taken(launch.bind(*call[1], **call[2]))
-    except tuning.Unpinnable:
-        return True
-    return False
+    return launch.pin_refuses(launch.bind(*call[1], **call[2]))
 
 
 def _keeps_launch(lhs, rhs, group_sizes, hook, sides: tuple, outs: tuple, summed_as: tuple,
