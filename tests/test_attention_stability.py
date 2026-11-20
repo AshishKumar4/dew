@@ -1254,13 +1254,8 @@ def test_an_fp16_mean_of_values_at_fp16s_largest_is_finite(mainloop, training, s
                 out = attention_mosaic.forward(query, key, value, spans, hooks, interpret=True,
                                                residuals=kept)
         elif mainloop == "decode_kernel":
-            target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
-            pin = {decode_attention.DecodeAttention: decode_attention.Split(1 if sink is None else 2)}
             sunk = None if sink is None else jnp.full((heads,), sink, jnp.float32)
-            with target, tuning.pinned(pin):
-                out = decode_attention.attend(query, _cache(key), _cache(value),
-                                              jnp.asarray([keys], jnp.int32), sinks=sunk,
-                                              interpret=INTERPRETED)
+            out = _decode_attend(query, key, value, [keys], 1, sinks=sunk)
         else:
             with generation.assumed("sm90"):
                 out = attention_decode.attend(query, key, value, spans, hooks, interpret=True)
@@ -1570,6 +1565,17 @@ def _cache(array: jax.Array) -> jax.Array:
     return jnp.pad(array, ((0, 0), (0, slots), (0, 0), (0, 0)))
 
 
+def _decode_attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths, splits: int,
+                   sinks: jax.Array | None = None, **form) -> jax.Array:
+    """`decode_attention.attend` over `key` and `value` padded to whole decode blocks (`_cache`), with
+    `splits` slices pinned (as an A100's launch on a CPU, where `INTERPRETED` holds)."""
+    pin = {decode_attention.DecodeAttention: decode_attention.Split(splits)}
+    target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
+    with target, tuning.pinned(pin):
+        return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(lengths, jnp.int32),
+                                       sinks=sinks, interpret=INTERPRETED, **form)
+
+
 def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
     """The decode kernel over `family`'s step, interpreted on a CPU (as an A100's launch) and compiled on a
     GPU, each row's keys the first `K` of its cache, in the form `natural` names (None, the default), the
@@ -1580,13 +1586,7 @@ def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
 
     def decoded(query, key, value, sinks):
         count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
-        # The family's slice count, which a launch on a CPU, of no multiprocessors, does not offer: there
-        # as an A100's launch.
-        pin = {decode_attention.DecodeAttention: decode_attention.Split(family.splits)}
-        target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
-        with target, tuning.pinned(pin):
-            return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
-                                           sinks=sinks, interpret=INTERPRETED, **form)
+        return _decode_attend(query, key, value, count, family.splits, sinks=sinks, **form)
 
     def forward(seed):
         return _cast(family, family.draw)(seed)[:4]
