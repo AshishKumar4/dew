@@ -841,10 +841,10 @@ def _on_tiles() -> bool:
     return launches.interpreting() is not None
 
 
-def _shaped(aval, on_tiles: bool) -> jax.ShapeDtypeStruct:
-    """`aval`'s shape and dtype, its manual axes' type kept on whole arrays (`_on_tiles`)."""
-    return jax.ShapeDtypeStruct(aval.shape, aval.dtype,
-                                manual_axis_type=None if on_tiles else jax.typeof(aval).mat)
+def _shaped(aval, on_tiles: bool):
+    """`aval` (a value's type: an aval, or a struct stating its manual axes' type) as a stage is pulled at
+    it: its shape and dtype alone on a kernel's tiles (`_on_tiles`), as it is on whole arrays."""
+    return jax.ShapeDtypeStruct(aval.shape, aval.dtype) if on_tiles else aval
 
 
 def _unchecked(on_tiles: bool):

@@ -3,6 +3,7 @@ call held to the per-shard boundary (`dew.nn.sharding.per_shard`), so no route l
 operands an automatic mesh axis splits, where every device would run the whole batch (rows 1897, 1923,
 4077)."""
 
+import contextlib
 import contextvars
 import functools
 from collections.abc import Callable, Sequence
@@ -85,17 +86,26 @@ def interpreting() -> bool | None:
     return _INTERPRETING.get()
 
 
+@contextlib.contextmanager
+def tracing_body(interpret):
+    """Within the block, a launch's body traces (`interpreting`), run in Pallas's interpreter where
+    `interpret` is given: a launch's own (`_traced`), or a probe of what one traces on its tiles (a hook's
+    primitives, `templates.gemm.hooks`)."""
+    token = _INTERPRETING.set(bool(interpret))
+    try:
+        yield
+    finally:
+        _INTERPRETING.reset(token)
+
+
 def _traced(body: Callable, interpret) -> Callable:
     """`body`, tracing within its launch, run in Pallas's interpreter where `interpret` is given
-    (`interpreting`)."""
+    (`tracing_body`)."""
 
     @functools.wraps(body)
     def traced(*refs, **options):
-        token = _INTERPRETING.set(bool(interpret))
-        try:
+        with tracing_body(interpret):
             return body(*refs, **options)
-        finally:
-            _INTERPRETING.reset(token)
 
     return traced
 

@@ -13,7 +13,7 @@ from jax._src.pallas.mosaic_gpu import (
 )
 
 from dew.nn.derivatives import marked_call_p
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, launches
 from dew.nn.programs import equations
 
 
@@ -101,8 +101,11 @@ def _lowers(hook, tiles: tuple, sides, rules) -> bool:
     takes. A marked span (`derivatives.marked_call_p`) lowers as its body, whose primitives are read."""
     if hook is None:
         return True
+    # Traced as a launch's body traces it, on tiles (`launches.tracing_body`).
+    with launches.tracing_body(interpret=False):
+        traced = jax.make_jaxpr(hook)(*tiles, *sides)
     return all(equation.primitive in rules or equation.primitive is marked_call_p
-               for equation in equations(jax.make_jaxpr(hook)(*tiles, *sides).jaxpr))
+               for equation in equations(traced.jaxpr))
 
 
 def lowering_rules(target) -> dict:
