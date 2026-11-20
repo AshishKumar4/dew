@@ -1335,6 +1335,16 @@ class _Order:
         elif event.argument:
             self.arrived(event.argument, landing, counted=False, transaction=-1)
 
+    def _check_tmem_filled(self, thread, event, clock) -> None:
+        prior_writes = [(prior, writer) for where, prior, writer in self.writes
+                        if _overlaps(where, event.at) and _before(prior, clock)]
+        latest = [writer for prior, writer in prior_writes
+                  if not any(_before(prior, other) and not _before(other, prior)
+                             for other, _ in prior_writes)]
+        if not latest or any(writer.kind == "product" for writer in latest):
+            raise Violation("unwritten", f"read of {event.at}, which no fill ordered before it wrote",
+                            [(thread, event)])
+
     def moved(self, thread, position, event) -> None:
         clock = self.clocks[thread]
         clock[("thread", thread)] += 1
@@ -1366,14 +1376,7 @@ class _Order:
                 raise Violation("unwritten", f"read of {event.at}, whose last write ordered before it is no "
                                 f"fill of its step ({event.argument[1]})", [(thread, event)])
             if kind == "read" and event.argument == "tmem_filled":
-                prior_writes = [(prior, writer) for where, prior, writer in self.writes
-                                if _overlaps(where, event.at) and _before(prior, clock)]
-                latest = [writer for prior, writer in prior_writes
-                          if not any(_before(prior, other) and not _before(other, prior)
-                                     for other, _ in prior_writes)]
-                if not latest or any(writer.kind == "product" for writer in latest):
-                    raise Violation("unwritten", f"read of {event.at}, which no fill ordered before it wrote",
-                                    [(thread, event)])
+                self._check_tmem_filled(thread, event, clock)
             self.ordered(event.at, clock, event, write=kind == "write")
             (self.writes if kind == "write" else self.reads).append((event.at, dict(clock), event))
             if kind == "write":
