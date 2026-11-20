@@ -313,11 +313,9 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
         return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
 
     step = jax.jit(_step(named, named["kernel"]))
-    # Its routes read from one draw's trace, running nothing: a check-1 site's judge pools its map tasks'
-    # records, running none, and a GPU tier part's prepare compiles its sites on a device that computes
-    # nothing, where a step run here deferred the cell, every site, to its GPU (row 7868).
+    # Its routes read from one draw's step: a check-1 site's judge pools its map tasks' records, running none.
     with generation.routes() as found:
-        step.trace(*_drawn(named, 0))
+        jax.block_until_ready(step(*_drawn(named, 0)))
     assert {route.choice for route in found} <= CHOICES
     assert any(route.kernel == named["kernel"] for route in found)
     reference = _reference(named)
