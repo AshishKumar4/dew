@@ -156,3 +156,19 @@ def test_an_initial_state_from_another_initializer_draws_that_initializer():
     other = jax.tree.leaves(trainer.initial_state(Partial(sevens)).variables["params"])
     assert not all(bool(jnp.all(leaf == 7.0)) for leaf in own)
     assert all(bool(jnp.all(leaf == 7.0)) for leaf in other)
+
+
+def test_a_kept_draw_over_trees_apart_by_an_empty_collection_draws_each_tree_its_own():
+    """Two held trees apart only by an empty collection (a model's `batch_stats` it holds none of yet) are
+    two kept draws (`dew.objectives.drawn.held_signature`): each call builds its own tree, the empty
+    collection kept, where keyed by its leaves' paths alone the second replayed the first's (row 9548)."""
+    from dew.objectives.drawn import WHOLE, drawn_once
+
+    def doubled(tree, key):
+        return jax.tree.map(lambda leaf: 2 * leaf, tree)
+
+    variables = {"params": {"w": jnp.full(3, 1.0)}}
+    key = jax.random.key(0)
+    assert sorted(drawn_once(doubled, variables, key, WHOLE, kept="stats")) == ["params"]
+    drawn = drawn_once(doubled, {**variables, "batch_stats": {}}, key, WHOLE, kept="stats")
+    assert sorted(drawn) == ["batch_stats", "params"] and drawn["batch_stats"] == {}, drawn

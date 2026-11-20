@@ -94,14 +94,35 @@ _TRACED: collections.OrderedDict[Hashable, TracedDraw] = collections.OrderedDict
 
 
 def held_signature[Tree](tree: Tree) -> Hashable:
-    """What a kept trace over `tree` is keyed by: each leaf's path in it, as a string, and the leaves'
-    abstract signatures (`abstract_signature`). The paths and not the tree's structure, which holds what
-    its nodes bind (an initializer's objective, its bound init), so a trace held past its trainer keeps none
-    of it alive; the paths all the same, so two trees of leaves alike under other keys are two keys (row
-    8989: flattened first, they shared one trace, the second replaying the first's structure)."""
-    flat = jax.tree_util.tree_flatten_with_path(tree)[0]
-    return (tuple(jax.tree_util.keystr(path) for path, _ in flat),
-            abstract_signature([leaf for _, leaf in flat]))
+    """What a kept trace over `tree` is keyed by: its structure, every node's kind, its keys and its
+    children, an empty collection and a None among them (`_shape_of`), and its leaves' abstract signatures
+    (`abstract_signature`). Of a node's static data only what is a plain value (keys, names, numbers), its
+    kind for any other (an initializer's bound init, `Partial`'s function), so a trace held past its trainer
+    keeps none of what its nodes bind alive. Two trees of leaves alike under other keys (row 8989), or apart
+    only by an empty collection (row 9548: `{**variables, "batch_stats": {}}` replayed without it) are two
+    keys."""
+    return _shape_of(jax.tree.structure(tree)), abstract_signature(jax.tree.leaves(tree))
+
+
+def _shape_of(structure: jax.tree_util.PyTreeDef) -> Hashable:
+    """`structure` as a value of plain data alone: each node its kind, its static data as plain data
+    (`_static`) and its children's, a leaf none."""
+    data = structure.node_data()
+    if data is None:
+        return None
+    kind, static = data
+    return (kind.__module__, kind.__qualname__, _static(static),
+            tuple(_shape_of(child) for child in structure.children()))
+
+
+def _static(value: Hashable | list[Hashable]) -> Hashable:
+    """A node's static data as plain data: None, a truth value, a number or a string as itself, a sequence
+    of them (a mapping's keys) as a tuple, anything else (a bound function) as its kind's name alone."""
+    if isinstance(value, list | tuple):
+        return tuple(_static(part) for part in value)
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    return type(value).__qualname__
 
 
 def traced_draw[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array], Built], held: Tree,
