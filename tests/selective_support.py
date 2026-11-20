@@ -230,12 +230,20 @@ def mamba_selective_side(drawn: list, starts) -> list:
 
 def recurred(decay, write, entering, axis: int):
     """`ssm.affine_states`' recurrence a token at a time, `h_t = a_t h_(t-1) + b_t` along `axis` from
-    `entering`, a Python loop of its tokens: the affine scan's token oracle."""
-    states, state = [], entering
-    for a, b in zip(*(jnp.moveaxis(t, axis, 0) for t in (decay, write)), strict=True):
+    `entering`, one token a step of a `lax.scan` (each step the loop's multiply and add, the entering state
+    in the steps' type as the first step's product promotes it): the affine scan's token oracle, compiled
+    once a step where a Python loop of 192 tokens unrolled every order of it, 198 s of a cold run's cell
+    (row 9511)."""
+    dtype = jnp.result_type(decay, write, entering)
+
+    def step(state, token):
+        a, b = token
         state = a * state + b
-        states.append(state)
-    return jnp.stack(states, axis=axis % decay.ndim)
+        return state, state
+
+    _, states = jax.lax.scan(step, jnp.asarray(entering, dtype),
+                             tuple(jnp.moveaxis(t, axis, 0) for t in (decay, write)))
+    return jnp.moveaxis(states, 0, axis % decay.ndim)
 
 
 FAINT_BESIDE_THE_LARGEST = ("a faint write", "a faint cotangent")
