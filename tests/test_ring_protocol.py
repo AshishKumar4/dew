@@ -15,10 +15,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import ring_protocol
-from ring_protocol import Event, Violation, explore, programs
+from gathered_walks import gathered_kernel, tile_value
+from ring_protocol import Event, Violation, _Splat, explore, programs
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic_sm90, mosaic_sm100, rings
+from dew.nn.kernels.templates import mosaic_sm90, rings
 
 BLOCK = (64, 64)
 
@@ -50,11 +51,6 @@ SEGMENT_CASES = [
 """One walk's six steps in one segment or adjacent segments, including empty and short segments."""
 
 
-def _at(tile, values):
-    """A tile's value of `values`, scalars alone (a kernel closes over no array)."""
-    return sum(jnp.where(tile == index, jnp.int32(value), jnp.int32(0)) for index, value in enumerate(values))
-
-
 @functools.cache
 def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: bool,
            streams: tuple = ("a",), pingpong: bool = False, empty_active: bool = False, joined: bool = False,
@@ -73,8 +69,8 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
         def scope(*, streams):
             def schedule(index):
                 tile = index[0]
-                steps = _at(tile, tiles)
-                view = (x_gmem, lambda step: (_at(tile, starts) + step, 0))
+                steps = tile_value(tile, tiles)
+                view = (x_gmem, lambda step: (tile_value(tile, starts) + step, 0))
                 source = rings.Among(lambda step: tile % 2, (view, view)) if among else view
                 views = dict.fromkeys(names, source)
                 return (steps > 0) | empty_active, steps, views, tile
@@ -381,48 +377,32 @@ hold."""
 
 
 @functools.cache
-def gathered_walk(stages: int, tiles: tuple):
-    """The tcgen05 family's persistent walk (`mosaic_sm100.RINGS.persist`) over a gathered stream
-    (`gathered.Committed`: each step's rows where a table says, its tiles spread over the issuing
-    warpgroup's load warps) and a plain one the first load warp copies whole, each step a tcgen05 product of
-    the plain slot times the gathered one, the products' commit releasing them: each program, the epilogue
-    warpgroup's and each of the issuing warpgroup's warps' (`ring_protocol.programs`), and the barriers'
-    arrivals."""
-    family = mosaic_sm100.RINGS
+def gathered_walk(stages: int, tiles: tuple, streams: int = 1, tiled: bool = False):
+    """The tcgen05 family's persistent walk over `streams` gathered streams and a plain one the first load
+    warp copies whole (`gathered_walks.gathered_kernel`, unstored), its tiles' rows `tiles`: each program,
+    the epilogue warpgroup's and each of the issuing warpgroup's warps' (`ring_protocol.programs`), and the
+    barriers' arrivals; its rows the tile's at every step where `tiled` (`rings.Rows.tiled`, a gathered
+    product's)."""
     starts = [sum(tiles[:index]) for index in range(len(tiles))]
     height, width = GATHERED
+    names = tuple(f"x{index}" for index in range(streams))
 
-    def body(x_gmem, table_gmem, w_gmem, out_gmem):
-        def scope(*, streams):
-            def schedule(index):
-                tile = index[0]
-                steps = _at(tile, tiles)
-                views = {"x": (x_gmem, lambda step: rings.Rows(table_gmem, tile * height, (step,), 1)),
-                         "w": (w_gmem, lambda step: (_at(tile, starts) + step, 0))}
-                return steps > 0, steps, views, tile
+    def views(operands, tile):
+        x_gmem, table_gmem, w_gmem, _ = operands
 
-            def issue(index, tile, walk, *, active):
-                def step(at, slots, carry, accumulators):
-                    (accumulator,) = accumulators
-                    return carry, (family.products(accumulator, slots["w"], slots["x"]),)
+        def rows(step):
+            return rings.Rows(table_gmem, tile * height, (step,), 1, tiled=tiled)
 
-                return walk(step, None, (ACCUMULATOR,))
+        start = tile_value(tile, starts)
+        return {**dict.fromkeys(names, (x_gmem, rows)), "w": (w_gmem, lambda step: (start + step, 0))}
 
-            def finish(*_, **__):
-                pass
-
-            family.persist(streams, (len(tiles),), schedule, issue, finish, consumers=1, axis="programs",
-                           outputs=(), interpret=False, accumulators=(ACCUMULATOR,))
-
-        blocks = {"x": (GATHERED, jnp.bfloat16), "w": (PLAIN, jnp.bfloat16)}
-        family.scoped(scope, streams=family.streams(blocks, stages, 1, gathered=("x",)))
-
+    blocks = {**dict.fromkeys(names, (GATHERED, jnp.bfloat16)), "w": (PLAIN, jnp.bfloat16)}
+    kernel = gathered_kernel(blocks, names, tiles, views, ACCUMULATOR, stages=stages, stored=False,
+                             out=jax.ShapeDtypeStruct((8, 8), jnp.float32), name="gathered_model")
     operands = (jnp.zeros((len(tiles) * height, width * max(tiles)), jnp.bfloat16),
                 jnp.zeros((len(tiles) * height,), jnp.int32),
                 jnp.zeros((max(sum(tiles), 1) * PLAIN[0], PLAIN[1]), jnp.bfloat16))
     with generation.assumed("sm100"):
-        kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((8, 8), jnp.float32), grid=(1,),
-                               grid_names=("programs",), consumers=1, interpret=False, name="gathered_model")
         return programs(kernel, *operands, threads=2)
 
 
@@ -518,6 +498,21 @@ def test_a_write_between_two_commits_is_unordered_with_a_read_after_the_first_co
         explore([products, reader], {"A": 1, "B": 1})
 
 
+@pytest.mark.parametrize(("kept", "races"), [(0, False), (1, True)], ids=["drained", "in-flight"])
+def test_a_product_wait_retires_whole_issues(kept, races):
+    """A thread issuing one warpgroup MMA reading two slots, then rewriting the first after a wait leaving
+    `kept` issues in flight: none left, both reads have ended and the write is ordered after them; one left,
+    the issue may still read both, which the checker finds, where retiring its operands one by one as groups
+    ended the first slot's read (base review 156a4595a F1)."""
+    program = [Event("product", (), (("smem", 0), ("smem", 1))), Event("product_wait", (), kept),
+               Event("write", ("smem", 0))]
+    if races:
+        with pytest.raises(Violation):
+            explore([program], {})
+    else:
+        assert explore([program], {}) > 0
+
+
 @pytest.mark.parametrize(("kept", "races"), [(1, False), (2, True)], ids=["derived", "loosened"])
 def test_a_store_wait_retires_whole_groups(kept, races):
     """A thread storing three chunks through two buffers, a chunk's two copies one group (the second
@@ -556,18 +551,83 @@ def test_the_load_warps_read_each_steps_entries_a_step_ahead():
         assert fills == reads and fills[0] != fills[1], (fills, reads)
 
 
-def test_a_load_warp_reading_its_entries_before_their_fills_land_is_caught():
-    """The gathered walk's programs with a load warp's waits for its entries' fills left out (`fill_wait`,
-    cp.async's wait for its group): its read of a step's entries may come before the fill the step before
-    issued lands, which the explorer finds."""
-    threads, arrivals = gathered_walk(1, (3,))
-    [at, *_] = [index for index, program in enumerate(threads)
-                if any(event.kind == "fill" for event in program)]
-    mutated = [*threads]
-    mutated[at] = [event for event in threads[at] if event.kind != "fill_wait"]
-    assert len(mutated[at]) < len(threads[at])
+def _other_parity(self, row):
+    """`gathered.Held.entry` mutated: row `row`'s entry from the other step's half of the entries."""
+    from jax.extend.mlir import ir
+    from jax.extend.mlir.dialects import arith, memref
+
+    from dew.nn.kernels.templates import gathered
+
+    index = ir.IndexType.get()
+    other = arith.subi(gathered.mgpu_utils.c(1, ir.IntegerType.get_signless(32)), self.parity)
+    return memref.load(self.entries, [arith.index_cast(index, other), arith.index_cast(index, row)])
+
+
+def _other_half_filled(filled):
+    """`gathered.filled` mutated: its copies' destination the other step's half of the entries."""
+    from jax.extend.mlir import ir
+    from jax.extend.mlir.dialects import arith
+
+    from dew.nn.kernels.templates import gathered
+
+    def mutated(entries, table, parity, share):
+        other = arith.subi(gathered.mgpu_utils.c(1, ir.IntegerType.get_signless(32)), parity)
+        return filled(entries, table, other, share)
+
+    return mutated
+
+
+def _ahead_other_parity(call):
+    """`gathered.Gathers.__call__` mutated where it hands its step's operands on: the parity it reads its
+    entries ahead at (`gathered.Held.read`) the other step's."""
+    from jax.extend.mlir import ir
+    from jax.extend.mlir.dialects import arith
+
+    from dew.nn.kernels.templates import gathered
+
+    def mutated(self, ctx, *operands):
+        *given, entries, parity = operands
+        other = arith.subi(gathered.mgpu_utils.c(1, ir.IntegerType.get_signless(32)),
+                           gathered.splat_value(parity))
+        return call(self, ctx, *given, entries, _Splat(other))
+
+    return mutated
+
+
+@pytest.mark.parametrize("mutation", [None, "no-wait", "no-warp-barrier", "one-in-flight", "other-parity",
+                                      "other-half-filled", "ahead-other-parity"])
+def test_a_load_warp_reading_its_entries_before_their_fills_land_is_caught(mutation):
+    """The gathered walk as the kernel builds it, every interleaving holding; and built with its load warps'
+    entries mutated in the kernel, each read from its lowered bodies' ops (`_lowered`, `_lowered_reads`):
+    their wait for their entries' cp.async groups removed, or leaving one group in flight
+    (`cp_async_wait_group(1)`), or the warp not meeting after it (each lane's copy its own till then, base
+    review 760be77fe F4), a step's read may come before the fill it needs lands; their loads reading
+    the other step's half of the entries, or their copies filling it, or their gathers handing the read the
+    other step's parity, a read no fill of its step wrote. The explorer finds each (row 8657; base reviews
+    0991196fb F2 and 9d013a4b9 F1: the checker read the wait, the read and the fill's half from the body's
+    fields, so each mutated kernel passed; head review of 0099a4701 F2: it read the entries from a Held of
+    its own, so a gather handing on another parity passed)."""
+    from dew.nn.kernels.templates import gathered
+
+    wait = gathered.mgpu_nvvm.cp_async_wait_group
+    mutated = {"no-wait": (gathered.mgpu_nvvm, "cp_async_wait_group", lambda count: None),
+               "no-warp-barrier": (gathered.mgpu_utils, "warp_barrier", lambda: None),
+               "one-in-flight": (gathered.mgpu_nvvm, "cp_async_wait_group", lambda count: wait(1)),
+               "other-parity": (gathered.Held, "entry", _other_parity),
+               "other-half-filled": (gathered, "filled", _other_half_filled(gathered.filled)),
+               "ahead-other-parity": (gathered.Gathers, "__call__",
+                                      _ahead_other_parity(gathered.Gathers.__call__))}
+    gathered_walk.cache_clear()
+    with pytest.MonkeyPatch.context() as patch:
+        if mutation is not None:
+            patch.setattr(*mutated[mutation])
+        threads, arrivals = gathered_walk(1, (3,))
+    gathered_walk.cache_clear()
+    if mutation is None:
+        assert explore(threads, arrivals) > 0
+        return
     with pytest.raises(Violation):
-        explore(mutated, arrivals)
+        explore(threads, arrivals)
 
 
 def test_a_load_warp_reading_entries_no_fill_wrote_is_caught():
@@ -584,6 +644,77 @@ def test_a_load_warp_reading_entries_no_fill_wrote_is_caught():
     with pytest.raises(Violation) as found:
         explore(mutated, arrivals)
     assert found.value.kind == "unwritten"
+
+
+@pytest.mark.parametrize(("stages", "tiles"), [(1, (3,)), (1, (2, 0, 2))], ids=["one-tile", "three-tiles"])
+def test_a_tiles_rows_are_read_once_a_tile(stages, tiles):
+    """A gathered walk whose rows are the tile's at every step (`rings.Rows.tiled`, a gathered product's):
+    each load warp fills its entries at a tile's first step alone and reads them there at every step, no
+    step filling the next's (base review ae8a242ed F6), and every interleaving holds."""
+    threads, arrivals = gathered_walk(stages, tiles, tiled=True)
+    loaders = [program for program in threads if any(event.kind == "copy" for event in program)]
+    walked = sum(1 for count in tiles if count)
+    for program in loaders:
+        assert sum(event.kind == "fill" for event in program) == walked, program
+        assert sum(event.kind == "read" for event in program) == sum(tiles), program
+    assert explore(threads, arrivals) > 0
+
+
+@pytest.mark.parametrize(("read", "caught"), [(2, False), (0, True)], ids=["latest", "overwritten"])
+def test_a_read_of_entries_takes_their_last_fill(read, caught):
+    """One warp fills a location's entries for step 0, waits, fills them again for step 2, waits, and reads
+    them as step `read`'s: step 2's read holds, step 0's is refused ("unwritten"), its fill overwritten,
+    where any earlier fill of the step matched (base review 3f38bf20d F4)."""
+    at = ("entries", 0, 0)
+    program = [Event("fill", at, 0), Event("fill_wait"), Event("fill", at, 2), Event("fill_wait"),
+               Event("read", at, ("filled", read))]
+    if not caught:
+        assert explore([program], {}) > 0
+        return
+    with pytest.raises(Violation) as found:
+        explore([program], {})
+    assert found.value.kind == "unwritten"
+
+
+def test_a_load_warp_reading_a_stale_steps_entries_is_caught():
+    """The gathered walk's programs with a load warp's fill of its third step's entries left out (the fill
+    its second step issues, `gathered.Filled`): the third step reads the parity its first step's entries
+    still hold, which a fill wrote and its wait ordered, and the explorer refuses it ("unwritten": no fill of
+    that step's), where an untagged read passed a stale step's entries (base review 571a5ee10 F2)."""
+    threads, arrivals = gathered_walk(1, (3,))
+    [at, *_] = [index for index, program in enumerate(threads)
+                if any(event.kind == "fill" for event in program)]
+    mutated = [*threads]
+    mutated[at] = [event for event in threads[at] if not (event.kind == "fill" and event.argument == 2)]
+    assert len(mutated[at]) == len(threads[at]) - 1
+    with pytest.raises(Violation) as found:
+        explore(mutated, arrivals)
+    assert found.value.kind == "unwritten"
+
+
+def test_a_load_warps_rings_await_their_entries_before_either_gathers():
+    """A walk of two gathered rings (`gathered_walk`'s `streams`): each load warp starts both rings' entries
+    (`gathered.Started`), then drains its fills once (`gathered.Drained`, its one `fill_wait`) before either
+    ring's gathers, so neither ring's wait waits on the other's next-step fill issued after its gathers (base
+    reviews 103007773 F4, b68fc2382 F6: each ring's own drain), and every interleaving holds."""
+    threads, arrivals = gathered_walk(1, (2,), streams=2)
+    loaders = [program for program in threads if any(event.kind == "copy" for event in program)]
+    for program in loaders:
+        # The program's steps, each from its first wait for entries after a step's gathers: every step's waits
+        # all before any of its gathers (base review a1ad2b4ca F6: a check of the first step alone passed
+        # steady-state waits in each ring's gathers), the warp's one drain.
+        kinds = [event.kind for event in program if event.kind in ("fill_wait", "copy")]
+        steps, gathered = [], True
+        for kind in kinds:
+            if kind == "fill_wait" and gathered:
+                steps.append([])
+            gathered = kind == "copy"
+            steps[-1].append(kind)
+        assert len(steps) == 2, kinds
+        for step in steps:
+            waits = step.index("copy")
+            assert waits == 1 and "fill_wait" not in step[waits:], step
+    assert explore(threads, arrivals) > 0
 
 
 def test_a_gathered_load_warp_skipping_its_slots_release_wait_is_caught():
@@ -639,3 +770,17 @@ def test_a_slot_under_a_roles_index_is_ordered_against_a_read_of_the_roles_whole
         with pytest.raises(Violation) as found:
             explore([writer, apart, [*reader, Event("wait", ("filled", 1), 0)]], {"filled": 1})
         assert found.value.kind == "unordered"
+
+
+def test_an_asynchronous_landing_aliasing_an_implicit_wait_is_caught():
+    """An asynchronous commit landing past the completion an implicit wait awaits must raise `aliased` even
+    when local events between the commit and wait advance in bulk."""
+    barrier = ("B", 0)
+    program = [
+        Event("arrive", barrier), Event("wait", barrier, 0), Event("wait", barrier, 0),
+        Event("arrive", barrier), Event("committed", barrier), Event("read", ("x", 0)),
+        Event("wait", barrier, None), Event("wait", barrier, 2),
+    ]
+    with pytest.raises(Violation) as found:
+        explore([program], {"B": 1})
+    assert found.value.kind == "aliased"
