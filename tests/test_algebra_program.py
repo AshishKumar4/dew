@@ -302,6 +302,39 @@ def test_a_factored_product_is_admitted_only_under_the_reach(name):
     assert held == {1.0: True, largest: False}
 
 
+REUSED = {
+    "a reciprocal": (lambda a, w: (a / jnp.maximum(jnp.abs(w), 1e-3), 1 / jnp.maximum(jnp.abs(w), 1e-3)),
+                     lambda a, w: (a / jnp.abs(w), 1 / jnp.abs(w))),
+    "a reciprocal root": (
+        lambda a, w: (a / jnp.sqrt(jnp.square(w) + 1e-3), jax.lax.rsqrt(jnp.square(w) + 1e-3)),
+        lambda a, w: (a / jnp.sqrt(jnp.square(w)), jax.lax.rsqrt(jnp.square(w)))),
+}
+"""Each reuse's program, its quotient beside the reciprocal it reads: its divisor held away from zero by an
+epsilon (a normalization's `max(|w|, eps)`, a norm's `w^2 + eps`), and the same with no epsilon."""
+
+
+@pytest.mark.parametrize("name", list(REUSED))
+@pytest.mark.parametrize(("floored", "bounded", "admitted"), [(True, True, True), (False, True, False),
+                                                              (True, False, False)],
+                         ids=["held", "no floor", "no bound"])
+def test_a_quotient_reads_the_reciprocal_its_program_holds_only_where_its_divisor_is_held(name, floored,
+                                                                                       bounded, admitted):
+    """A quotient by a value whose reciprocal (or reciprocal root) the program holds is that reciprocal's
+    product (the reuse set) only where the reciprocal is a normal finite float and the product finite
+    (§6.3): its divisor held away from zero by an epsilon and bounded by its operand's declared range, the
+    dividend bounded too. With no epsilon, a subnormal divisor's reciprocal overflows where the quotient is
+    finite; with no bound, a large divisor's flushes to zero; neither is shared."""
+    from egglog import eq, i64
+
+    program_of = REUSED[name][0 if floored else 1]
+    closed = jax.make_jaxpr(program_of)(*rows(1, (64, 32), (64, 32)))
+    region = terms.region(closed, {0: 4.0, 1: 4.0} if bounded else {0: 4.0})
+    graph, _, (quotient, reciprocal) = program.graphed(region)
+    program.saturate(graph, region, (algebra.rules.RULES["reuse"],), algebra.SATURATION)
+    product = terms.Term.leaf(i64(0)).binary("mul", reciprocal, i64(region.stock["mul"]))
+    assert graph.check_bool(eq(quotient).to(product)) == admitted
+
+
 @pytest.mark.parametrize("fn", [
     lambda x, y, s: jnp.max(jnp.tanh(x) * 0.5, axis=1),
     lambda x, y, s: jnp.min(0.5 * jnp.tanh(x), axis=1),

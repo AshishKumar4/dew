@@ -74,13 +74,15 @@ def test_the_accurate_policy_takes_the_log_sum_exp_fold_whose_error_its_written_
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 def test_the_candidates_are_proposed_cheapest_first_and_the_first_admitted_chosen(accurate):
     """The softmax through its log-sum-exp: its candidates, each root's forms enumerated beside the
-    cheapest and the most stable extractions, come in order of price, and the chosen is the first the gate
-    admits in that order (docs/design/algebra.md §6.5), where three fixed proposals came as written first."""
+    cheapest and the most stable extractions, come in order of price, the compensated forms after every
+    uncompensated one, each at its form's price, and the chosen is the first the gate admits in that order
+    (docs/design/algebra.md §6.5), where three fixed proposals came as written first."""
     admits = gate(softmax_with_lse, logits)
     choice = choose(softmax_with_lse, OPERANDS * 3, accurate=accurate, saturation=algebra.SATURATION,
                     admits=admits)
-    prices = [candidate.seconds for candidate in choice.candidates]
+    prices = [(candidate.compensated, candidate.seconds) for candidate in choice.candidates]
     assert prices == sorted(prices)
+    assert any(candidate.compensated for candidate in choice.candidates)
     references = choice.candidates if accurate else [
         next(candidate for candidate in choice.candidates if candidate.name == "as written")]
     first = next(candidate for candidate in choice.candidates
@@ -162,3 +164,28 @@ def test_a_products_precision_is_a_stated_algorithm_its_sites_gate_admits():
         product_precision(*shape, jnp.float32, admits=lambda preset: False)
     eight = product_precision(*shape, jnp.float8_e4m3fn, admits=lambda preset: True)
     assert programs.dot_arithmetic(eight, jnp.float8_e4m3fn, jnp.float8_e4m3fn).operand_bits == (8, 8)
+
+
+def cancelled(seed):
+    """Terms near a hundred million, a term of unit size, and the first's negation: a sum whose large terms
+    cancel exactly, leaving the small one, which float32 rounds away beside the large."""
+    rng = np.random.default_rng(seed)
+    large = (rng.uniform(1e7, 1e8, SHAPE) * rng.choice([-1.0, 1.0], SHAPE)).astype(np.float32)
+    small = rng.standard_normal(SHAPE).astype(np.float32)
+    return jnp.asarray(large), jnp.asarray(small), jnp.asarray(-large)
+
+
+def three_terms(a, b, c):
+    """`(a + b) + c`, its first sum rounded before the last term is added."""
+    return (a + b) + c
+
+
+def test_the_accurate_policy_takes_a_compensated_sum_where_every_form_rounds_its_terms_away():
+    """`(a + b) + c` of `c = -a` large: every form the e-graph holds (each order of each sum) rounds `b`
+    away beside `a`, and the e-graph holds no compensated form (its equality is the reals', in which an
+    addition's rounding error is zero); the chooser's error-free derivation does (`error.compensated`), and
+    under the accurate policy it is taken, the form as written not as exact as it (check 1)."""
+    admits = gate(three_terms, cancelled)
+    choice = choose(three_terms, OPERANDS * 3, accurate=True, saturation=algebra.SATURATION, admits=admits)
+    assert choice.chosen.compensated
+    assert not admits(three_terms, choice.chosen.function)
