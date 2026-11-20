@@ -1181,8 +1181,12 @@ class AheadTarget:
                 with report.for_devices():
                     return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
             except report.Untuned as refused:
+                # Named by its digest where its trees state one, else by its text's (a host step's VJP
+                # results' tree states no form, `stated_digest`).
                 _log.warning("a host step is not preparable here: %s", refused)
-                return CompiledAhead(None, None, (program_digest(refused.lowered),))
+                named = (stated_digest(refused.lowered)
+                         or hashlib.sha256(refused.lowered.as_text().encode()).hexdigest())
+                return CompiledAhead(None, None, (named,))
         topology = None if self.topology is None else Path(self.topology).read_bytes()
         if self.path is not None and not self.phases:
             # Over a host's own GPUs (`topology`), as its run compiles it: every tuned choice the GPU kind's
