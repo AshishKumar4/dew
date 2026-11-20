@@ -84,6 +84,14 @@ def _along(key: str) -> Callable:
 
 
 _cumulated = _along("axis")
+@_rule(jax_core.primitives.reshard_p, jax.lax.sharding_constraint_p)
+def _placed(eqn, operand, **params):
+    # A value's placement on a mesh, which a tile has already (`dew.algebra.forms.PLACEMENTS`): the identity,
+    # binding nothing, so no kernel's lowering meets a sharding inside a tile (a GPU's trace of a plain
+    # program's attention holds a reshard in its score hook's nested call, rows 9570 and 9571).
+    return operand
+
+
 RULES[jax.lax.concatenate_p] = _along("dimension")
 
 

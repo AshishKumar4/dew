@@ -97,3 +97,23 @@ def test_a_tile_layout_refuses_an_operation_it_does_not_know():
     reversed_rows = named("exp", lambda tile: tile[::-1])
     with pytest.raises(layout.Untransposable):
         layout.transposed(reversed_rows.bind)(jnp.ones((3, 5), jnp.float32))
+
+
+def test_a_tile_layout_takes_a_placement_inside_a_nested_call_as_the_identity():
+    """A function of a tile whose nested call places a value on a mesh (a sharding constraint, as a GPU's
+    trace of a plain program's attention holds a reshard in its score hook: rows 9570 and 9571) is held
+    transposed as the function without it: the placement binds nothing, the tile being placed already, so
+    the transposed program holds none for a kernel's lowering to meet."""
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("rows",))
+    placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    def scored(tile):
+        return jax.jit(lambda t: jax.lax.with_sharding_constraint(t * 2.0, placed))(tile) + tile
+
+    tile = jnp.asarray(np.random.default_rng(9570).standard_normal((3, 5)), jnp.float32)
+    held = layout.transposed(scored)
+    np.testing.assert_array_equal(np.asarray(held(tile.T)), np.asarray(scored(tile).T))
+    traced = jax.make_jaxpr(held)(tile.T)
+    assert not any(eqn.primitive in (jax.lax.sharding_constraint_p, primitives.reshard_p)
+                   for eqn in traced.jaxpr.eqns)
+
