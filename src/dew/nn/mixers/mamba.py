@@ -40,6 +40,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
+from jax.typing import DTypeLike
 
 from dew.nn.activations import silu
 from dew.nn.blocks import normal_kernel
@@ -61,13 +62,41 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, accurate_exp, at_least_fp32, float32_dot_general, softplus
 from dew.nn.residuals import Residual
-from dew.nn.sharding import rows_like
+from dew.nn.sharding import explicit_spec, rows_like
 from dew.nn.ssm import affine_states
 
 CHUNK_SIZE = 64
 """Tokens per recurrence chunk (`ssm.affine_states`). Each chunk materialises
 its `[B, C, D, N]` decays and writes, so the chunk bounds the scan's memory;
 the output does not depend on it."""
+
+
+def _spread(t: jax.Array, channels: int) -> jax.Array:
+    """`t` `[B, C, N]` broadcast over `channels` as `[B, C, D, N]` by doubling concatenations, then sliced:
+    every order of its derivative transposes it with JAX's own rules as a balanced tree of halves, so B's
+    and C's gradients sum their channels pairwise, as the recurrence's autodiff reduces a token's, where a
+    broadcast's transpose became a dot of the channels in turn (row 8563); zeros past the channels, which
+    a slice's transpose pads, add exactly."""
+    spread = t[:, :, None, :]
+    while spread.shape[2] < channels:
+        spread = jnp.concatenate([spread, spread], axis=2)
+    return spread[:, :, :channels]
+
+
+def _readout(channels: int, states: jax.Array, C: jax.Array, *,
+             precision: jax.lax.PrecisionLike = recurrence_algebra.STATE_PRECISION,
+             preferred_element_type: DTypeLike | None = None) -> jax.Array:
+    """`sum_n C_n h_n` `[B, C, D]` of `states` `[B, C, D, N]` and `C` `[B, C, N]` spread over the channels
+    (`_spread`), placed as the states' batch dimensions are where an Explicit axis splits them, the
+    contracted states whole as `C` is: the readout's product at `STATE_PRECISION`."""
+    spread = _spread(C, channels)
+    placed = explicit_spec(states)
+    if placed is not None:
+        batch = jax.sharding.PartitionSpec(*tuple(placed.spec)[:3], None)
+        spread = jax.sharding.reshard(spread, jax.sharding.NamedSharding(placed.mesh, batch))
+    # At `STATE_PRECISION` but where the sum states its own (a wide CPU sum's, `accumulated`).
+    return jnp.einsum('bcdn,bcdn->bcd', states, spread, precision=precision,
+                      preferred_element_type=preferred_element_type)
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE, *,
@@ -110,10 +139,13 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         # The kernels' decay (`recurrence_algebra.selective_decay`), zero at a reset.
         kept = 1.0 - reset_c[..., None, None].astype(work)
         decay = recurrence_algebra.selective_decay(dt_c[..., None], A, kept)
-        write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
+        write = (dt_c * x_c)[..., None] * _spread(B_c, channels)
         # The chunk's states a token at a time from the state entering it (`ssm.affine_states`).
         states = affine_states(decay, write, h, axis=1)
-        read = recurrence_algebra.portable_einsum('bcdn,bcn->bcd', states, C_c)
+        # The readout's contraction over the states as it was (`portable_einsum`'s, its accumulation policy),
+        # each channel its own batch: C spread over the channels inside the product, so a wide sum widens C
+        # itself and rounds its cotangent after the channels' tree.
+        read = accumulated(functools.partial(_readout, channels), states, C_c)
         return states[:, -1], read
 
     steps = tuple(chunks(t) for t in (x, dt, B, C, resets))

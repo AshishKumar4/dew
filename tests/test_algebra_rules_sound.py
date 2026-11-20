@@ -6,11 +6,11 @@ declarations), so no rule escapes and none drifts from its proof (docs/design/al
   of the symbols a maximum or a minimum compares, `_ordered`), at every
   instantiation the rule's conditions admit over a universe of shapes (scalars, vectors, matrices, a batch
   of matrices) and parameters (plain, transposed and batched products, every broadcast of a lower rank),
-  each side of one shape. Its conditions on dtypes (`plain`), on a scale's being a power of two
-  (`exact_scale`) and on magnitudes (`log2_bound`, `reach`: bible §6's dominance rule) are rounding's,
-  which a real identity reads nothing of; a logarithm's operand is positive, its domain, as is a term a
-  condition asks be a positive scale (`positive_scale`). A rule no instantiation admits is vacuous, and
-  fails;
+  each side of one shape. Its conditions on dtypes (`plain`, `narrowed`), on a scale's being a power of two
+  (`exact_scale`) and on magnitudes (`log2_bound`, `log2_floor`, `reach`, `least`: bible §6's dominance
+  rule) are rounding's, which a real identity reads nothing of; a logarithm's operand is positive, its
+  domain, as is a term a condition asks be a positive scale (`positive_scale`) or positive (`positive`, a
+  root's). A rule no instantiation admits is vacuous, and fails;
 - a magnitude a rule states for its new intermediate (`set log2_bound`) is at least the bound the magnitude
   table proves for it (`terms._bounded`, itself proven by tests/test_algebra_bounds.py) from its operands'
   stated powers;
@@ -64,10 +64,12 @@ class Inadmissible(Exception):
     """An instantiation a rule's conditions or its terms' shapes do not admit."""
 
 
-RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length", "mode_power"})
+RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length", "mode_power",
+                         "log2_floor", "least"})
 """The facts a magnitude condition reads: rounding's, which a real identity reads nothing of."""
-ROUNDING_FACTS = frozenset({"plain", "exact_scale"})
-"""The facts a dtype or power-of-two condition reads: rounding's too."""
+ROUNDING_FACTS = frozenset({"plain", "exact_scale", "narrowed"})
+"""The facts a dtype or power-of-two condition reads: rounding's too (a narrow float's conversion back,
+`narrowed`, is the identity over the reals)."""
 
 
 class _Magnitude:
@@ -82,9 +84,9 @@ def _unary(name: str):
     """The real function a unary equation named `name` computes, over SymPy and over NumPy."""
     symbolic = {"exp": sympy.exp, "log": sympy.log, "log1p": lambda x: sympy.log(1 + x),
                 "expm1": lambda x: sympy.exp(x) - 1, "neg": lambda x: -x, "tanh": sympy.tanh,
-                "abs": sympy.Abs}[name]
+                "abs": sympy.Abs, "sqrt": sympy.sqrt, "rsqrt": lambda x: 1 / sympy.sqrt(x)}[name]
     numeric = {"exp": np.exp, "log": np.log, "log1p": np.log1p, "expm1": np.expm1, "neg": np.negative,
-               "tanh": np.tanh, "abs": np.abs}[name]
+               "tanh": np.tanh, "abs": np.abs, "sqrt": np.sqrt, "rsqrt": lambda x: 1 / np.sqrt(x)}[name]
     return np.vectorize(symbolic, otypes=[object]), numeric
 
 
@@ -276,6 +278,9 @@ class Evaluated:
         if name == "positive_scale":
             # Its witness is positive (`_instantiations`): a scalar of it the fact's own.
             return np.shape(values[0]) == ()
+        if name == "positive":
+            # Its witness is positive (`_instantiations`), a root's domain, of any shape.
+            return True
         if name == "reads":
             return 1
         if name in ROUNDING_FACTS:
@@ -426,7 +431,7 @@ def _instantiations(matched, conditions, symbolic: bool, shapes=SHAPES, candidat
     roles = _variables(pattern, {})
     roles.update(dict.fromkeys(_free(conditions, roles, name), "axis"))
     units = _named(conditions, "unit")
-    positive = _named(conditions, "positive_scale") | POSITIVE
+    positive = _named(conditions, "positive_scale") | _named(conditions, "positive") | POSITIVE
     term_names = sorted(n for n, role in roles.items() if role == "term" and n not in units)
     param_names = sorted(n for n, role in roles.items() if role != "term")
     for taken in itertools.product(shapes, repeat=len(term_names)):
@@ -534,7 +539,8 @@ def test_every_rewrites_right_side_is_on_par_with_its_left_side(name, index, rul
     # A logarithm's operand is drawn in its domain: every term it reads positive.
     logged: list[str] = []
     _logged(matched[1], logged)
-    positive, exact = _named(conditions, "positive_scale") | set(logged), _named(conditions, "exact_scale")
+    positive = _named(conditions, "positive_scale") | _named(conditions, "positive") | set(logged)
+    exact = _named(conditions, "exact_scale")
     drawn = sorted(operand for operand in admitted.arrays if operand not in units)
 
     def draw(seed):
@@ -650,7 +656,8 @@ class Traced(Evaluated):
         if name == "unary":
             x, op, _ = values
             return {"exp": jnp.exp, "log": jnp.log, "log1p": jnp.log1p, "expm1": jnp.expm1,
-                    "neg": jnp.negative, "tanh": jnp.tanh, "abs": jnp.abs}[op](x)
+                    "neg": jnp.negative, "tanh": jnp.tanh, "abs": jnp.abs, "sqrt": jnp.sqrt,
+                    "rsqrt": lax.rsqrt}[op](x)
         if name == "dot":
             return lax.dot_general(values[0], values[1], values[2]["dimension_numbers"])
         if name == "shaped":

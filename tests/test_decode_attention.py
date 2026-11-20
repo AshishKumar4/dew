@@ -17,6 +17,7 @@ from contract_support import normal_drawn
 from generation_support import here, interprets
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
+from scenario_contract import covering
 from sharded import assert_runs_per_shard
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -201,22 +202,14 @@ def grouped_draw(dtype):
 DECODE_HOOKS = {"sinks": {"sinks": True}, "softcap": {"softcap": True},
                 "both": {"sinks": True, "softcap": True}}
 """The hooked decode cases' hooks by name: sinks, a softcap, both."""
-SINK_CASES = (
-    ("bfloat16", "sinks", "fold", CHECKED_SPLITS[0]),
-    ("float32", "sinks", "natural", CHECKED_SPLITS[1]),
-    ("bfloat16", "sinks", "natural", CHECKED_SPLITS[2]),
-    ("float32", "softcap", "natural", CHECKED_SPLITS[0]),
-    ("bfloat16", "softcap", "fold", CHECKED_SPLITS[1]),
-    ("float32", "softcap", "fold", CHECKED_SPLITS[2]),
-    ("float32", "both", "fold", CHECKED_SPLITS[0]),
-    ("bfloat16", "both", "natural", CHECKED_SPLITS[1]),
-    ("float32", "both", "natural", CHECKED_SPLITS[2]),
-)
-"""Pairwise covering array of hooked decode cases `(dtype, hooks, form, slice count)`: covers all 37 pairs
-across `dtype` (2), `DECODE_HOOKS` (3), `form` (2) and `CHECKED_SPLITS` (3) in 9 cells instead of 36."""
-LONG_SINK_CASES = (("float32", "both", "natural", CHECKED_SPLITS[2]),)
-"""The hooked cases past two minutes in one process (137 and 126 s on armada in a verdict on main 495ef4e0e),
-their check 1's draws run as armada's map tasks and a judge (`check1_shards`), each within two minutes."""
+SINK_CASES = tuple(tuple(case.values()) for case in covering({
+    "dtype": ("bfloat16", "float32"), "hooks": tuple(DECODE_HOOKS),
+    "form": ("fold", "natural"), "splits": CHECKED_SPLITS}))
+"""Pairwise covering set of hooked decode cases `(dtype, hooks, form, slice count)` (`covering`)."""
+LONG_SINK_CASES = tuple(case for case in SINK_CASES
+                        if case[0] == "float32" and case[3] == CHECKED_SPLITS[-1])
+"""The `SINK_CASES` at float32 and the largest slice count, whose draws run as armada's map tasks and a judge
+(`check1_shards`) so every task fits within two minutes (row 9717)."""
 
 
 @CUDA_OR_CPU
@@ -790,17 +783,10 @@ PAGED_SEEDS = 8
 """The paged decode kernel's declared check-1 seeds a config, sized by `seeds_for` paired."""
 
 
-PAGED_CASES = (
-    (16, False, False, CHECKED_SPLITS[0]),
-    (32, True, True, CHECKED_SPLITS[0]),
-    (16, True, True, CHECKED_SPLITS[1]),
-    (32, False, False, CHECKED_SPLITS[1]),
-    (16, False, True, CHECKED_SPLITS[2]),
-    (32, True, False, CHECKED_SPLITS[2]),
-)
-"""Pairwise covering array of paged decode cases `(page_size, windowed, natural, splits)`: covers all 30
-pairs across `page_size` (2), `windowed` (2), `natural` (2) and `CHECKED_SPLITS` (3) in 6 cells instead of
-24."""
+PAGED_CASES = tuple(tuple(case.values()) for case in covering({
+    "page_size": (16, 32), "windowed": (False, True),
+    "natural": (False, True), "splits": CHECKED_SPLITS}))
+"""Pairwise covering set of paged decode cases `(page_size, windowed, natural, splits)` (`covering`)."""
 
 
 @CUDA_OR_CPU

@@ -105,7 +105,10 @@ class CompiledTruths:
     tried: set[str] = dataclasses.field(default_factory=set)
     done: set[str] = dataclasses.field(default_factory=set)
     read: dict[str, tuple[dict, dict]] = dataclasses.field(default_factory=dict)
-    prepared_arms: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
+    # Each arm with no site its prepare compiled (`reference_error.ahead_arm`), by its label: its program's
+    # name (`named`), its outputs' shapes and the launches its kept lowering took, which a second call of
+    # the label at the same program returns, compiling nothing again.
+    arms: dict[str, tuple[str, Any, Any]] = dataclasses.field(default_factory=dict)
 
     def path(self, label: str) -> Path:
         return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]
@@ -119,6 +122,21 @@ class CompiledTruths:
         self.tried.update(labels)
         yield
         self.done.update(labels)
+
+    def arm_again(self, label: str, name: str):
+        """A prepare's call of an arm with no site (`reference_error.ahead_arm`) whose label it compiled
+        (`arms`): its program's zeros (of the shapes its own trace gave, in the store's tracing: a jit of its
+        own compiler options traced again inside another, `eval_shape`'s, was refused) and its kept
+        lowering's launches, noted as its run reports them (`ran`); refused where the call is another program
+        (`name`, its role and its inputs' shapes) than the one its label names."""
+        from dew.nn.kernels import tuning
+
+        compiled, shapes, launches = self.arms[label]
+        if name != compiled:
+            raise ValueError(f"{label}: called in one prepare at two programs (another role or other "
+                             "inputs' shapes than its first call's): one label names one program")
+        tuning.noted(launches)
+        return jax.tree.map(lambda shape: np.zeros(shape.shape, shape.dtype), shapes)
 
     def holds(self, label: str) -> bool:
         """Whether the store's prepare reached site `label` (its programs written, at any stamp)."""

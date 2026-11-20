@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 import tiny_models
 from arm_arithmetic import on_float64_device
+from arm_forms import ROUNDED
 from contract_support import (
     ADDS,
     CANCELLING_LEVELS,
@@ -24,7 +25,7 @@ from contract_support import (
     GIVEN,
     HELD,
     cancelling_entries,
-    exactly_rounded,
+    cancelling_orbit,
     normal_float32,
 )
 from delta_rule_support import stacked_documents
@@ -43,7 +44,13 @@ from reference_error import (
     with_gradients,
 )
 
-from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
+from dew.nn.kernels import (
+    chunked_launch,
+    generation,
+    recurrence,
+    recurrence_algebra as algebra,
+    recurrence_chunk,
+)
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kernels.templates import bundles
 from dew.nn.precision import l2norm
@@ -172,6 +179,11 @@ independently by `seeds_for` on armada (2026-10-21; the readouts apart 2026-11-1
 memory entering and a document starting on a chunk's first token."""
 
 
+PACKED_DOCUMENTS = ((0, 23, 40), (9, 48))
+"""`draw`'s packed documents, the turned and transition sites' too: each row's documents' first tokens, a
+row's first continuing its given memory."""
+
+
 def marked(documents, length: int) -> np.ndarray:
     """Each row's `documents` (its documents' first tokens) as the `[rows, length]` marks of those tokens."""
     starts = np.zeros((len(documents), length), bool)
@@ -270,7 +282,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     if hooks.output is not None:
         epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
-    starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), length)) if packed else None
+    starts = jnp.asarray(marked(PACKED_DOCUMENTS, length)) if packed else None
     own = {'own': hosted(0.5 * normal((value_heads, KEY_WIDTH))[..., key_order])} if hooks.own_weight else {}
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
@@ -281,7 +293,8 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     """The sequence a token at a time through the decode step's reference, a packed document's first
-    token starting from a zero memory: `(output, final memory)`, the output in the operands' dtype. Host
+    token starting from a zero memory: `(output, final memory)`, the output in the operands' dtype. A
+    token's updates (`Hooks.substeps`) its keys', values' and write gates' in turn, the step's own axis. Host
     operands are taken as JAX arrays: a float64 truth's first call runs on the gate's widened host arrays,
     which the scan's traced token can't index."""
     operands = jax.tree.map(jnp.asarray, operands)
@@ -289,8 +302,16 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     query, key = (jnp.repeat(x, group, axis=2) for x in (operands.query, operands.key))
     work = jnp.promote_types(operands.value.dtype, jnp.float32)
     state = operands.state.astype(work)
-    rows, length = operands.value.shape[:2]
+    rows, length = operands.query.shape[:2]
     starts = jnp.zeros((rows, length), bool) if operands.starts is None else jnp.asarray(operands.starts)
+
+    def by_token(x):
+        # A token's updates (`Hooks.substeps`) on an axis of their own, the step's.
+        if x is None or hooks.substeps == 1:
+            return x
+        return x.reshape(rows, length, hooks.substeps, *x.shape[2:])
+
+    key, value, beta = by_token(key), by_token(operands.value), by_token(operands.beta)
 
     def one_token(state, t):
         state = jnp.where(starts[:, t, None, None, None], 0.0, state)
@@ -298,9 +319,9 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
             return None if x is None else x[:, t]
 
         token = recurrence.Step(
-            state, query=query[:, t], key=key[:, t], value=operands.value[:, t],
+            state, query=query[:, t], key=key[:, t], value=value[:, t],
             log_decay=at(operands.log_decay), gate=at(operands.gate), log_a=operands.log_a,
-            bias=operands.bias, beta=at(operands.beta), skip=operands.skip, z=at(operands.z),
+            bias=operands.bias, beta=at(beta), skip=operands.skip, z=at(operands.z),
             weight=operands.weight, rate=operands.rate, own=operands.own, turn=at(operands.turn),
             erase_key=at(operands.erase_key), erase_read=at(operands.erase_read),
             value_decay=at(operands.value_decay))
@@ -373,6 +394,149 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
                     seeds=SEEDS[hooks, packed])
 
 
+DELTA_PRODUCTS = [recurrence.Hooks(decay='scalar', l2norm=True, substeps=2),
+                  recurrence.Hooks(decay='vector', l2norm=True, substeps=3)]
+"""DeltaProduct's forms (`Hooks.substeps`): Gated DeltaProduct's, a decay a head over two updates a token
+(fla's `chunk_gated_delta_product`), and a decay a key dimension over three."""
+
+
+def substepped_draw(hooks: recurrence.Hooks, seed: int):
+    """`draw`'s operands of `LENGTH` tokens of `hooks.substeps` updates each, and cotangents: its keys,
+    values and write gates fresh at every update, its queries and decays a token's."""
+    (laid,) = draw(hooks, packed=False, seed=seed, length=LENGTH * hooks.substeps)
+    every = hooks.substeps
+    operands = dataclasses.replace(laid, query=laid.query[:, ::every], log_decay=laid.log_decay[:, ::every])
+    out, final = cotangents(laid, seed)
+    return operands, (out[:, ::every], final)
+
+
+@pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
+@pytest.mark.parametrize('hooks', DELTA_PRODUCTS, ids=['two updates a head', 'three updates a key dimension'])
+def test_a_delta_products_chunks_are_as_exact_as_its_tokens(hooks, packed):
+    """DeltaProduct (`Hooks.substeps`) on the chunked op's portable math, its updates the op's tokens in
+    turn, against the decode step's reference a token at a time, its updates on their own axis
+    (`token_by_token`): the output, the final memory and every operand's gradient from float64 (check 1, row
+    9030)."""
+    # Packed documents at `draw`'s tokens, marked outside the differentiated operands.
+    starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), LENGTH)) if packed else None
+
+    def differentiated(fn):
+        return jax.jit(with_gradients(lambda operands: fn(dataclasses.replace(operands, starts=starts))))
+
+    assert_as_exact(differentiated(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)),
+                    differentiated(functools.partial(token_by_token, hooks)),
+                    functools.partial(substepped_draw, hooks), f'{hooks} packed={packed}', seeds=8)
+
+
+def substepped_entered_draw(hooks: recurrence.Hooks, seed: int):
+    """`entered_draw`'s forked operands, entry writes among them, of `LENGTH` tokens of `hooks.substeps`
+    updates each, and cotangents: its keys, values and write gates fresh at every update, its queries and
+    decays a token's."""
+    operands, (out, final) = entered_draw(hooks, seed, entries=True, length=LENGTH * hooks.substeps)
+    every = hooks.substeps
+    return (dataclasses.replace(operands, query=operands.query[:, ::every],
+                                log_decay=operands.log_decay[:, ::every]), (out[:, ::every], final))
+
+
+@pytest.mark.parametrize('by_firsts', [False, True], ids=['starts', 'firsts'])
+def test_a_forked_delta_products_documents_are_as_exact_as_each_alone(by_firsts):
+    """Gated DeltaProduct (`DELTA_PRODUCTS[0]`) over a forked call on the chunked op's portable math, each
+    document entering its table slot's memory with its entry write, the documents given by their starts or
+    their first slots alone (`Chunk.firsts`, a token's, which its updates scale): output, last memory and
+    every gradient against each document alone a token at a time (`document_by_document`) from float64
+    (check 1, row 9030)."""
+    hooks = DELTA_PRODUCTS[0]
+
+    def ours(operands):
+        return chunk_on('xla', hooks, entering_documents(operands, by_firsts=by_firsts), chunk_size=CHUNK)
+
+    assert_as_exact(jax.jit(with_gradients(ours)),
+                    jax.jit(with_gradients(functools.partial(document_by_document, hooks))),
+                    functools.partial(substepped_entered_draw, hooks),
+                    f'{hooks} forked by_firsts={by_firsts}', seeds=8)
+
+
+def stepped(hooks: recurrence.Hooks, state, query, key, value, log_decay, beta):
+    """A decode token of `hooks` through `recurrence.step`: `(output, state')`."""
+    token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
+    out, _, updated = recurrence.step(hooks, token)
+    return out, updated
+
+
+def delta_product_token(state, query, key, value, log_decay, beta):
+    """A DeltaProduct decode token as its paper writes it, a value head per key head: the memory `[R, H, K,
+    V]` decayed once, `exp(g) S`, then each of its updates `S + beta_j k_j (v_j - S^T k_j)^T` in turn, read
+    after the last, `S^T q`: `(output [R, H, V], memory)` (Siems et al. 2025, eq. 3; fla's
+    `naive_gated_delta_product`)."""
+    state = jnp.exp(log_decay)[..., None, None] * state
+    for update in range(key.shape[1]):
+        k, v, b = key[:, update], value[:, update], beta[:, update]
+        corrected = v - jnp.einsum('rhkv,rhk->rhv', state, k)
+        state = state + b[..., None, None] * k[..., :, None] * corrected[..., None, :]
+    return jnp.einsum('rhkv,rhk->rhv', state, query), state
+
+
+def test_a_delta_product_decode_token_is_as_exact_as_its_recurrence():
+    """A decode token of three updates (`Hooks.substeps`) through the public step (`recurrence.step`):
+    output, memory and every gradient against the token as DeltaProduct's paper writes it
+    (`delta_product_token`: decayed once, read after its last update) from float64 (check 1, row 9030)."""
+    hooks = recurrence.Hooks(decay='scalar', substeps=3)
+
+    def draw(seed):
+        normal = np.random.default_rng([9030, seed]).standard_normal
+        rows, heads, keys, values = 2, 2, KEY_WIDTH, VALUE_WIDTH
+        operands = (hosted(0.3 * normal((rows, heads, keys, values))), hosted(normal((rows, heads, keys))),
+                    hosted(unit(normal((rows, 3, heads, keys)))), hosted(normal((rows, 3, heads, values))),
+                    hosted(-softplus(normal((rows, heads)))), hosted(sigmoid(normal((rows, 3, heads)))))
+        return *operands, (hosted(normal((rows, heads, values))), hosted(normal((rows, heads, keys, values))))
+
+    assert_as_exact(jax.jit(with_gradients(functools.partial(stepped, hooks))),
+                    jax.jit(with_gradients(delta_product_token)), draw, 'a DeltaProduct decode token',
+                    seeds=8)
+
+
+def test_a_delta_products_decode_memory_is_wide_between_its_updates():
+    """A decode token of two updates (`Hooks.substeps`) on a bf16 memory from zero, one key and value, no
+    decay and a unit query: the first writes the fp32 midpoint `m` of two adjacent bf16 values (a gate of
+    one), the second its negative under a gate of one half, `m + (-m - m) / 2`: output and memory exactly
+    zero, the memory held in fp32 between the updates (`recurrence._substeps`), where rounded to bf16 after
+    the first its residual is half that rounding's."""
+    midpoint = (1.0 + 2.0 ** -8) * 2.0 ** -3
+    token = recurrence.Step(jnp.zeros((1, 1, 1, 1), jnp.bfloat16), query=jnp.ones((1, 1, 1), jnp.float32),
+                            key=jnp.ones((1, 2, 1, 1), jnp.float32),
+                            value=jnp.asarray([midpoint, -midpoint], jnp.float32).reshape(1, 2, 1, 1),
+                            log_decay=jnp.zeros((1, 1), jnp.float32),
+                            beta=jnp.asarray([1.0, 0.5], jnp.float32).reshape(1, 2, 1))
+    out, _, updated = recurrence.step(recurrence.Hooks(decay='scalar', substeps=2, scale=1.0), token)
+    assert (out.astype(jnp.float32).ravel().tolist(), updated.astype(jnp.float32).ravel().tolist()) == (
+        [0.0], [0.0])
+
+
+@pytest.mark.parametrize(('substeps', 'form'), [(2, {'delta': False}), (2, {'reads': 'before'}),
+                                               (2, {'erase': 'untied'}), (2, {'rated': True}), (0, {})],
+                         ids=['no delta rule', 'read before', 'an erase of its own', 'rated', 'none'])
+def test_a_delta_product_outside_its_form_is_refused(substeps, form):
+    """Substeps (`Hooks.substeps`) outside DeltaProduct's form, a token's delta-rule updates read after its
+    last: a ValueError, beside an erase of its own whose laid tokens are a layout of their own (row 9030)."""
+    with pytest.raises(ValueError):
+        recurrence.Hooks(decay='scalar', substeps=substeps, **form)
+
+
+@pytest.mark.parametrize('stream', ['key', 'value', 'beta'])
+def test_a_delta_product_token_of_another_count_of_updates_is_refused(stream):
+    """A decode token of three updates (`Hooks.substeps`) given two of one stream, its keys', values' or
+    write gates': a ValueError, where the step took the updates it was given and left the third out (row
+    9030)."""
+    hooks = recurrence.Hooks(decay='scalar', substeps=3)
+    shapes = {'key': (1, 3, 1, 4), 'value': (1, 3, 1, 2), 'beta': (1, 3, 1)}
+    given = {name: jnp.ones((shape[0], 2 if name == stream else 3, *shape[2:]))
+             for name, shape in shapes.items()}
+    token = recurrence.Step(jnp.zeros((1, 1, 4, 2)), query=jnp.ones((1, 1, 4)),
+                            log_decay=jnp.zeros((1, 1)), **given)
+    with pytest.raises(ValueError):
+        recurrence.step(hooks, token)
+
+
 TURNED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True, turns=KEY_WIDTH // 2 - 2)
 """Mamba-3's form: a decay a head's, a write gate, the skip, and the state's first key pairs turned each token
 (`Hooks.turns`), two pairs unturned. Its sites' oracle is the recurrence a token at a time, the spec's own
@@ -383,18 +547,14 @@ and angles to bf16 (mamba_ssm/ops/triton/mamba3/mamba3_siso_combined.py:384-392)
 layer sites are held to it recorded (row 7923)."""
 
 
-TURNED_DOCUMENTS = ((0, 23, 40), (9, 48))
-"""The turned sites' packed documents' first tokens: a row's first continuing its given memory."""
-
-
 def steep_draw(seed: int):
-    """`draw`'s operands for `TURNED` and cotangents, each row's even documents (`TURNED_DOCUMENTS`) decaying
+    """`draw`'s operands for `TURNED` and cotangents, each row's even documents (`PACKED_DOCUMENTS`) decaying
     steeply, each token's log decay in (-120, -60), its others mildly, in (-1, 0): a chunk's earlier
     document's prefix past its later one's by more than fp32's exponents span."""
     (operands,) = draw(TURNED, packed=False, seed=seed)
     tokens = np.arange(LENGTH)
     steep = np.stack([np.sum(tokens[:, None] >= np.asarray(begins)[None, :], axis=1) % 2 == 1
-                      for begins in TURNED_DOCUMENTS])
+                      for begins in PACKED_DOCUMENTS])
     rng = np.random.default_rng([seed, 8288])
     mild = rng.uniform(-1.0, 0.0, operands.log_decay.shape)
     log_decay = np.where(steep[..., None], rng.uniform(-120.0, -60.0, operands.log_decay.shape), mild)
@@ -404,7 +564,7 @@ def steep_draw(seed: int):
 
 VANISHED = (5, 9, 30, 33)
 """The tokens whose decays vanish in `vanishing`'s draws: two in one chunk of each row's first two
-documents (`TURNED_DOCUMENTS`, `CHUNK`)."""
+documents (`PACKED_DOCUMENTS`, `CHUNK`)."""
 
 
 def vanishing(operands):
@@ -447,7 +607,7 @@ def test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_tok
         return operands, cotangents(operands, seed)
 
     drawing = {None: drawn, 'steep': steep_draw, 'vanishing': vanishing_draw}[regime]
-    assert_packed_on_par(turned, tokens, drawing, f'{TURNED}', packed=packed, documents=TURNED_DOCUMENTS,
+    assert_packed_on_par(turned, tokens, drawing, f'{TURNED}', packed=packed, documents=PACKED_DOCUMENTS,
                          length=LENGTH, seeds=32)
 
 
@@ -483,13 +643,8 @@ def test_an_oja_decode_token_is_as_exact_as_its_formula():
         seeded = (normal((rows, heads, values)), normal((rows, heads, keys, values)))
         return *(hosted(x) for x in operands), tuple(hosted(x) for x in seeded)
 
-    def stepped(state, query, key, value, log_decay, beta):
-        token = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
-        out, _, updated = recurrence.step(hooks, token)
-        return out, updated
-
-    assert_as_exact(jax.jit(with_gradients(stepped)), jax.jit(with_gradients(oja_token)), draw,
-                    "an oja decode token", seeds=8)
+    assert_as_exact(jax.jit(with_gradients(functools.partial(stepped, hooks))),
+                    jax.jit(with_gradients(oja_token)), draw, "an oja decode token", seeds=8)
 
 
 def oja_edge(state, key, value, beta):
@@ -595,7 +750,7 @@ def test_a_transitions_chunks_are_as_exact_as_its_tokens(hooks, packed):
         return token_by_token(hooks, dataclasses.replace(operands, starts=starts))
 
     assert_packed_on_par(ours, tokens, functools.partial(transition_draw, hooks), f'{hooks}', packed=packed,
-                         documents=TURNED_DOCUMENTS, length=LENGTH, seeds=8)
+                         documents=PACKED_DOCUMENTS, length=LENGTH, seeds=8)
 
 
 def transition_token(kind: str, state, query, key, value, log_decay, beta, a, b, e):
@@ -683,13 +838,58 @@ def test_an_additive_erases_decay_gradient_is_its_decays_alone():
     assert float(jax.grad(second)(jnp.zeros((1, 1, 1), jnp.float32))[0, 0, 0]) == 2.0 ** -27
 
 
+def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
+    """RWKV7's additive erase (its rank-two token, `recurrence_chunk._erases_laid`) from no memory entering,
+    its rows split over an Explicit mesh axis: it traces and runs, its output and final memory finite and
+    placed as its rows are, the zero memory it starts from placed so (row 9029's head review: seeded whole,
+    a token loop's carry changed its sharding at its first token, which `lax.scan` refuses)."""
+    (operands,) = draw(ADDITIVE, packed=False, seed=0)
+    operands = dataclasses.replace(transitioned(ADDITIVE, operands, 0), state=None)
+    mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, P('data'))
+        split = jax.tree.map(lambda x: jax.device_put(x, rows), operands)
+        found = jax.jit(functools.partial(chunk, ADDITIVE, chunk_size=CHUNK))(split)
+    for got in found:
+        assert np.isfinite(np.asarray(got)).all()
+        assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
+
+
+@pytest.mark.parametrize('documents', [3, 0], ids=['three slots a row', 'none'])
+def test_a_forked_calls_token_maps_keep_its_rows_on_an_explicit_axis(documents):
+    """A forked call's token maps (`chunked_launch.Forked.tokens`: each token's load, store and document)
+    over ten tokens, its rows split over an Explicit mesh axis: a row of three documents and one of two, its
+    third slot unused (its start the call's length, its load and store nonzero, dropped), or a table of no
+    documents, each map a row's own exactly (a document's first token its load and number, its last its
+    store, every other token -1 or zero), int32 and placed as its rows are (row 9690: scattered into whole
+    buffers by a row index, JAX refused indices and updates split on an Explicit axis)."""
+    firsts = np.asarray([[0, 3, 7], [0, 5, 10]], np.int32)[:, :documents]
+    loads = np.asarray([[1, 0, 2], [0, 3, 4]], np.int32)[:, :documents]
+    stores = np.asarray([[1, 2, 3], [3, 1, 5]], np.int32)[:, :documents]
+    expected = (np.full((2, 10), -1, np.int32), np.zeros((2, 10), np.int32), np.zeros((2, 10), np.int32))
+    if documents:
+        for row, (begins, ends) in enumerate((([0, 3, 7], [2, 6, 9]), ([0, 5], [4, 9]))):
+            live = len(begins)
+            expected[0][row, begins], expected[1][row, ends] = loads[row, :live], stores[row, :live]
+            expected[2][row, begins] = range(live)
+    mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, P('data'))
+        placed = (jax.device_put(x, rows) for x in (firsts, loads, stores))
+        forked = chunked_launch.Forked(*placed, entry=None, held=3)
+        found = jax.jit(lambda forked: forked.tokens(10))(forked)
+    for got, want in zip(found, expected, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), want, strict=True)
+        assert jax.typeof(got).sharding.spec[0] == 'data'
+
+
 @pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['after its decay', 'before its decay'])
 def test_a_forked_erase_runs_in_a_shard_map_that_checks_varying_axes(hooks):
     """A forked call of an erase of its own (`Chunk.loads`, entry writes and given memories), its rows, tables
-    and documents split over a checked `shard_map`'s axis, its laid tokens correcting the state after its
-    decay (an untied erase's) or before it (an additive one's): its outputs, final memory and their tangent
-    along its erase vectors finite, every carry typed as the operands that reach it vary (row 9029's head
-    review)."""
+    and documents split over a checked `shard_map`'s axis, its tokens correcting the state after its decay
+    (an untied erase's laid tokens) or before it (an additive one's): its outputs, final memory and their
+    tangent along its erase vectors finite, every carry typed as the operands that reach it vary (row 9029's
+    head review)."""
     operands, _ = entered_draw(hooks, 0, entries=True)
     operands = entering_documents(transitioned(hooks, operands, 0))
     rows = P('data')
@@ -791,14 +991,10 @@ def test_a_turned_forked_calls_turn_curvature_is_as_exact_as_each_document_alone
     def alone(operands):
         return document_by_document(TURNED, operands, own)
 
+    # The gate widens the truth's inputs (`reference_error._truth_and_terms`).
     exact = jax.jit(turn_curvature(lambda operands: document_by_document(TURNED, operands)))
-
-    def truth(*inputs):
-        with jax.enable_x64(new_val=True):
-            return exact(*jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), inputs))
-
     assert_as_exact(jax.jit(turn_curvature(ours)), jax.jit(turn_curvature(alone)), turned_entered_draw,
-                    f"xla {TURNED} a forked call's turn curvature", seeds=32, truth_fn=truth)
+                    f"xla {TURNED} a forked call's turn curvature", seeds=32, truth_fn=exact)
 
 
 def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recurrence():
@@ -1095,9 +1291,10 @@ def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact(hooks):
 
     # The gate widens a truth's inputs; the reference is that truth rounded once.
     truth = jax.jit(leaves(functools.partial(document_by_document, hooks)))
-    assert_as_exact(jax.jit(leaves(ours)), exactly_rounded(truth),
+    assert_as_exact(jax.jit(leaves(ours)), ROUNDED,
                     functools.partial(levels_entered_draw, hooks),
-                    f"xla {hooks} a forked call's entry writes of cancelling levels", seeds=8, truth_fn=truth)
+                    f"xla {hooks} a forked call's entry writes of cancelling levels",
+                    seeds=cancelling_orbit(KEY_HEADS, VALUE_HEADS, VALUE_WIDTH), truth_fn=truth)
 
 
 @pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],
@@ -1249,7 +1446,7 @@ def entering_documents(operands, documents=DOCUMENTS, by_firsts: bool = False, a
     if by_firsts:
         return dataclasses.replace(operands, starts=None, firsts=jnp.asarray(documents, jnp.int32),
                                    loads=loads, stores=stores, adds=adds, held=HELD)
-    starts = jnp.zeros(operands.value.shape[:2], bool)
+    starts = jnp.zeros(operands.query.shape[:2], bool)
     for row, begins in enumerate(documents):
         starts = starts.at[row, jnp.asarray(begins)].set(True)
     return dataclasses.replace(operands, starts=starts, loads=loads, stores=stores, adds=adds, held=HELD)
@@ -1276,8 +1473,10 @@ def document_by_document(hooks, operands, run=None, documents=DOCUMENTS, added: 
     run = token_by_token if run is None else run
     named = [name for name in ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z', 'turn', 'erase_key',
                                'erase_read', 'value_decay') if getattr(operands, name) is not None]
-    bounds = [tuple(zip(begins, (*begins[1:], operands.value.shape[1]), strict=True)) for begins in documents]
+    bounds = [tuple(zip(begins, (*begins[1:], operands.query.shape[1]), strict=True)) for begins in documents]
     longest = max(end - begin for row in bounds for begin, end in row)
+    # A token's updates (`Hooks.substeps`) its keys', values' and write gates' in turn.
+    every = {name: hooks.substeps if name in ('key', 'value', 'beta') else 1 for name in named}
     tables = [list(operands.state[row]) + [None] * HELD for row in range(len(documents))]
     pieces = [[] for _ in documents]
     finals = []
@@ -1294,8 +1493,11 @@ def document_by_document(hooks, operands, run=None, documents=DOCUMENTS, added: 
             states.append(state)
         spans = [(row, *bounds[row][document]) for row in range(len(documents))]
         piece = dataclasses.replace(
-            operands, **{name: stacked_documents(getattr(operands, name), spans, longest,
-                                                 _neutral(hooks, name)) for name in named},
+            operands, **{name: stacked_documents(getattr(operands, name),
+                                                 [(row, begin * every[name], end * every[name])
+                                                  for row, begin, end in spans],
+                                                 longest * every[name], _neutral(hooks, name))
+                         for name in named},
             state=jnp.stack(states), starts=None, loads=None, stores=None, held=0, entry_key=None,
             entry_value=None, entry_weight=None)
         out, finals = run(hooks, piece)

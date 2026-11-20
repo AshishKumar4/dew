@@ -101,6 +101,14 @@ def assert_learns(contrasts_of, label: str, *, units: int) -> None:
     pooled = sharded(label, lambda start, stop: contrasts_of(np.arange(start, stop)), units, upto=units)
     if pooled is None:
         return
+    # Every shard's claims the first's, each one contrast a unit: a shard adding a claim had its values
+    # dropped, so a failing claim could pass the judge (spec alignment, 9047).
+    named = [sorted(payload) for payload in pooled]
+    if any(claims != named[0] for claims in named):
+        raise ValueError(f"{label}: its shards claim different things: {named}")
+    lengths = [{np.size(payload[claim]) for claim in payload} for payload in pooled]
+    if any(len(each) != 1 for each in lengths):
+        raise ValueError(f"{label}: a shard's claims hold different counts of contrasts: {lengths}")
     contrasts = {claim: np.concatenate([np.asarray(payload[claim]) for payload in pooled])
                  for claim in pooled[0]}
     claims, table = _table(contrasts, label)

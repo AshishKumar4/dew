@@ -257,10 +257,27 @@ def test_an_fp32_rated_scan_through_the_template_stays_finite_interpreted(forms)
                       'the decay bound')
 
 
-@pytest.mark.parametrize(('name', 'regime', 'forms'),
-                         [(name, regime, forms) for name, regime, product, forms in CASES
-                          if product == 'forward' and regime in INTERPRETED])
-@pytest.mark.check1_shards(seeds=256, per_task=8)
+@pytest.mark.parametrize(('name', 'regime', 'forms'), [
+    pytest.param('scalar delta', 'aligned keys', None, id='scalar_delta-aligned_keys'),
+    pytest.param('vector delta', 'aligned keys', None, id='vector_delta-aligned_keys'),
+    pytest.param('scalar write', 'aligned keys', None, id='scalar_write-aligned_keys'),
+    pytest.param('rated', 'aligned keys', 'fast', id='rated-aligned_keys-fast'),
+    pytest.param('rated', 'aligned keys', 'accurate', id='rated-aligned_keys-accurate'),
+    pytest.param('gated', 'aligned keys', 'accurate', id='gated-aligned_keys-accurate',
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+    pytest.param('scalar delta', 'decays near zero', None, id='scalar_delta-decays_near_zero',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param('vector delta', 'decays near zero', None, id='vector_delta-decays_near_zero',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=16)),
+    pytest.param('scalar write', 'decays near zero', None, id='scalar_write-decays_near_zero',
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param('gated', 'decays near zero', 'accurate', id='gated-decays_near_zero-accurate',
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+    pytest.param('rated', 'decays near zero', 'fast', id='rated-decays_near_zero-fast',
+                 marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
+    pytest.param('rated', 'decays near zero', 'accurate', id='rated-decays_near_zero-accurate',
+                 marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
+])
 def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, regime, forms):
     """Each form's 16-bit forward through the template, interpreted off a GPU under the regimes that grow its
     tiles most, held as its GPU flow cell is: finite, and its output and final memory on par from float64
@@ -334,17 +351,29 @@ def compiled_gradient(hooks, name: str) -> list[dict]:
     return compile_mosaic_kernels([KernelCase(name, call)], 'sm90')
 
 
-@COMPILES_ON_CPU
-@pytest.mark.check1_shards(seeds=512, per_task=3)
-def test_kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla_interpreted():
-    """Kimi delta attention's 16-bit gradient through the template, interpreted, under decays at its floor and
-    write gates down to 2^-60 (fla_sites' `FLOOR_GATES`): its output, final memory and every operand's
-    gradient on par with recorded fla-core's from float64 (check 1), its own pairs folded against its unit
-    keys (`mainloop.Call.unit_keys`). The template held 47 to 75 times the exact fp32 recurrence's error
-    there, as on plain draws, which only fla's judges (rows 7906, 7299)."""
+def kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla():
+    """Kimi delta attention's 16-bit gradient through the template under decays at its floor and write gates
+    down to 2^-60 (fla_sites' `FLOOR_GATES`): its output, final memory and every operand's gradient on par
+    with recorded fla-core's from float64 (check 1, 512 seeds), run natively in `test_gpu_recurrence`
+    (interpreted off a GPU at 3 draws a task took 171 CI tasks / ~14.6 CPU-h, row 8835)."""
     mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
     the_template_is_as_exact_as_fla(mosaic, FLOOR_GATES, LEAVES,
                                     'the template, Kimi delta attention under tiny gates at the floor')
+
+
+@COMPILES_ON_CPU
+def test_kimis_unit_keys_under_tiny_gates_at_the_floor_stays_finite_interpreted():
+    """Kimi delta attention's 16-bit gradient under `FLOOR_GATES`, interpreted off a GPU on `FINITE_SEEDS`
+    draws: every leaf finite wherever float64 is (its 512-seed check 1 runs natively in
+    `test_gpu_recurrence.template_stability_cells`)."""
+    from fla_sites import chunk_of, sites
+
+    site = sites()[FLOOR_GATES]
+    mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
+    truth = functools.partial(token_by_token, site.hooks)
+    for seed in range(FINITE_SEEDS):
+        operands = chunk_of(site.arrays(seed))
+        assert_finite(with_gradients(mosaic), with_gradients(truth), operands, FLOOR_GATES)
 
 
 @COMPILES_ON_CPU

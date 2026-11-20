@@ -202,7 +202,7 @@ def test_a_recording_opened_after_a_miss_holds_it_when_met_again():
     op = Doubling()
     with generation.assumed("sm86"):
         ba, config = bound(op), Block(64)
-    spilled = report.Binary("doubling", None, 255, 16)
+    spilled = report.Binary("doubling", None, 255, 16, "mosaic_gpu")
     with report.refusals():
         report.missed(op, ba, config, [spilled], stepped=True)
         with report.recording() as recorded:

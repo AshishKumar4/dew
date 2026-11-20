@@ -52,6 +52,7 @@ from dew.nn.kernels.templates.attention import (
     drops_in_place,
     kept,
     mean_held,
+    narrowing_settled,
     within,
 )
 from dew.nn.precision import float32_einsum, lowered_divide, power2, scalar_power2, two_product, two_sum
@@ -112,6 +113,12 @@ class Forward:
     """The dtype whose largest its output is within, which a quotient past it by its weights' rounding is
     held at (`quotient`): a call's values', where it drops none and resumes no state, its output a mean of
     them (`largest_of`); None where its output may pass them."""
+    narrowed: DTypeLike | None = None
+    """The 16-bit dtype its fp32 output is narrowed to, its quotient rounded to odd there
+    (`narrowing_settled`, `narrowed_of`); None where it stays fp32."""
+    registered: bool = False
+    """Whether its output is finished in a kernel's registers, a tile at once (a Mosaic forward's), where
+    its narrowing settles the overflow midpoint alone (`midpoint_settled`)."""
 
     @property
     def reach(self) -> float:
@@ -1294,9 +1301,7 @@ def kept_parts(p: jax.Array, multiplier: jax.Array | None, reach: float, dtype) 
         return (narrow(kept(p, multiplier, reach), dtype),)
     if drops_in_place(dtype, reach):
         return split_parts(kept(p, multiplier, reach))
-    # Its row's power of two along the product's columns, as the rows' product reads it.
-    value, exponent = _scaled(kept(p, multiplier, reach), rows=True)
-    return tuple(product.Scaled(part, exponent[:, None]) for part in split_parts(value))
+    return weights_parts(kept(p, multiplier, reach), dtype, rows=True, split=True)
 
 
 def in_units(spec: "Forward", products: jax.Array) -> jax.Array:
@@ -1773,9 +1778,9 @@ def anchor_split(p: jax.Array, at_anchor: jax.Array, dtype) -> tuple[jax.Array, 
 
 def _summed_row(part: jax.Array | product.Scaled) -> jax.Array:
     """A product's part's rows' sums `[bq]`, fp32, a scaled one's taken back by its rows' powers of two
-    (`[bq, 1]`, `kept_parts`)."""
+    (`[bq]`, `weights_parts`)."""
     if isinstance(part, product.Scaled):
-        return taken_back(part.value.astype(jnp.float32).sum(axis=-1), jnp.reshape(part.exponent, (-1,)))
+        return taken_back(part.value.astype(jnp.float32).sum(axis=-1), part.exponent)
     return part.astype(jnp.float32).sum(axis=-1)
 
 
@@ -1938,6 +1943,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
         state = state._replace(acc=acc, total=total)
         out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
                        held=jnp.float32 if held else spec.largest)
+        out = settled_store(spec, out, state.acc, state.total, hooked=output_mod is not None)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
@@ -1952,6 +1958,48 @@ def dropped_total(spec: Forward, acc: jax.Array, total: jax.Array) -> tuple[jax.
     rest = np.float32(spec.units / spec.dropped)
     over = expand(~finite(total * rest), acc)
     return jnp.where(over, acc / rest, acc), jnp.where(finite(total * rest), total * rest, total)
+
+
+def narrowed_of(dtype: DTypeLike) -> DTypeLike | None:
+    """`Forward.narrowed` of an output of `dtype`: a 16-bit dtype, which an fp32 output is narrowed to; None
+    for fp32's."""
+    return dtype if jnp.dtype(dtype).itemsize == 2 else None
+
+
+def midpoint_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """`narrowing_settled` at `dtype`'s overflow midpoint alone (its largest and half an ulp, the one tie
+    whose narrowing turns a finite output to inf), at a row's cost, where a whole tile's settle costs
+    registers: a Mosaic forward's epilogue settling its tile per element took an H100's bf16 forward to
+    168 registers and a 328-byte frame, an sm120's 128-wide inference forward 16 bytes spilled. The exact
+    quotient is below the midpoint where `|acc|` is below the midpoint times `divisor`: the row's divisor
+    taken to [1/2, 1) by a power of two from its bits, exactly, the midpoint's product with it formed exact
+    once a row (`two_product`'s bit split, its residual normal however small the divisor, its rounded part
+    within fp32's range at bf16's midpoint), and `|acc|` taken by the same power, an element's one product,
+    exact where it is near the midpoint's; there `out` an fp32 ulp nearer zero, which narrows to the
+    largest. Every other value `out` as it is: a narrowing in the kernel rounds an ordinary tie twice, its
+    bound with its sums' and exponentials' roundings at fp32's resolution (`narrowing_settled`)."""
+    found = jnp.finfo(dtype)
+    midpoint = np.float32(float(found.max) + float(found.eps) * 2.0 ** (found.maxexp - 2))
+    nearer = np.nextafter(midpoint, np.float32(0.0))
+    # 2^-(binade + 1) a row from its exponent's bits (a normal divisor's; one past fp32's range is no
+    # midpoint's, its product passing fp32's largest).
+    power = jax.lax.bitcast_convert_type(
+        jnp.left_shift(jnp.clip(126 - binade_of(divisor), 1, 254), 23).astype(jnp.int32), jnp.float32)
+    high, low = two_product(divisor * power, jnp.full_like(divisor, midpoint), bit_split=True)
+    below = (jnp.abs(acc) * expand(power, acc) - expand(high, acc)) < expand(low, acc)
+    within = (jnp.abs(out) == midpoint) & below
+    return jnp.where(within, jnp.where(out > 0, nearer, -nearer), out)
+
+
+def settled_store(spec: Forward, out: jax.Array, acc: jax.Array, divisor: jax.Array, *,
+                  hooked: bool) -> jax.Array:
+    """A finished quotient `out` of `acc` over `divisor` as its call stores it, the one policy `finish` and
+    the Mosaic split join take: narrowed to 16 bits unhooked (`Forward.narrowed`), settled for it, at the
+    overflow midpoint alone in a register epilogue (`midpoint_settled`), else rounded to odd."""
+    if spec.narrowed is None or hooked:
+        return out
+    settle = midpoint_settled if spec.registered else narrowing_settled
+    return settle(out, acc, divisor, spec.narrowed)
 
 
 def inverse(total: jax.Array) -> jax.Array:
@@ -2110,7 +2158,7 @@ def summed_products(parts: Parts, operand: jax.Array,
     one's taken back by its power of two, in order."""
     def taken(part) -> jax.Array:
         if isinstance(part, product.Scaled):
-            return taken_back(dot(part.value, operand), part.exponent)
+            return restored(dot(part.value, operand), part.exponent)
         return dot(part, operand)
 
     first, *rest = parts
@@ -2120,11 +2168,14 @@ def summed_products(parts: Parts, operand: jax.Array,
     return total
 
 
-def weights_parts(weights: jax.Array, dtype, rows: bool = False) -> Parts:
+def weights_parts(weights: jax.Array, dtype, rows: bool = False, *, split: bool = False) -> Parts:
     """Weights `[bq, bk]` (fp32) narrowed for their product with an operand of `dtype` (`summed_products`):
     fp16's at a power-of-two scale that keeps them in its range (`_fp16_scaled`, a row's with `rows`),
-    which its product takes back."""
-    if dtype == jnp.float16:
+    which its product takes back; with `split`, two fp16 parts at that one scale (`split_parts`)."""
+    if jnp.dtype(dtype) == jnp.float16:
+        if split:
+            scaled, exponent = _scaled(weights, rows)
+            return tuple(product.Scaled(part, exponent) for part in split_parts(scaled))
         return (product.Scaled(*_fp16_scaled(weights, rows)),)
     return (weights.astype(dtype),)
 
@@ -2136,7 +2187,6 @@ def narrowed(x: jax.Array, dtype) -> jax.Array:
     if isinstance(part, product.Scaled):
         return taken_back(part.value.astype(jnp.float32), part.exponent)
     return part.astype(jnp.float32)
-
 
 
 def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,

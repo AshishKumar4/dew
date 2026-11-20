@@ -1240,6 +1240,7 @@ def test_the_training_forwards_rows_past_fp32s_largest_keep_their_mean_and_every
     assert (found_value[finite & (reference_value != 0)] != 0).all()
 
 
+@INTERPRETS
 @pytest.mark.parametrize("held", ["keys", "start"])
 def test_a_training_forwards_output_scales_exactly_with_its_values_however_large(held):
     """A training forward's head whose rows see 512 keys, the row's largest magnitude near fp32's largest
@@ -1356,8 +1357,8 @@ def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program()
     calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launched]
     assert calls
     # Every compile's kernels read as spilling, as a B200's ptxas read the 4B forward's.
-    spilled = [report.Binary(report.kernel_of(call.name)[0], call.launch, 255, 8, caller=call.caller)
-               for call in calls]
+    spilled = [report.Binary(report.kernel_of(call.name)[0], call.launch, 255, 8, kind="mosaic_gpu",
+                             caller=call.caller) for call in calls]
     with generation.assumed("sm100"), report.refusals():
         report.kept(first, relower=lambda: first, read=lambda executable: spilled)
         misses = report.misses()
@@ -1389,8 +1390,8 @@ def test_a_run_refuses_a_kernel_whose_warpgroup_products_ptxas_serialized_as_a_s
     calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launched]
     assert calls
     serialized = (report.AssemblerNote("C7512", "wgmma.mma_async instructions are serialized"),)
-    noted = [report.Binary(report.kernel_of(call.name)[0], call.launch, 168, 0, caller=call.caller,
-                           notes=serialized) for call in calls]
+    noted = [report.Binary(report.kernel_of(call.name)[0], call.launch, 168, 0, kind="mosaic_gpu",
+                           caller=call.caller, notes=serialized) for call in calls]
     with generation.assumed("sm90"), report.refusals():
         report.kept(first, relower=lambda: first, read=lambda executable: noted)
         misses = report.misses()
@@ -1620,6 +1621,7 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
                            training=_kept(launch), target=target)
 
 
+@INTERPRETS
 @pytest.mark.parametrize("unseen", UNSEEN)
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     """On a GPU no row measured the forward's and the backward's tiles come from the family's facts and the

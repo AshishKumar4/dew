@@ -41,6 +41,7 @@ from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
+    attention_algebra as algebra,
     attention_decode,
     attention_mosaic,
     attention_portable,
@@ -1086,26 +1087,30 @@ def _held_empty(family: Family, found, label: str) -> None:
         np.testing.assert_array_equal(np.asarray(array, np.float32)[rows], 0.0, err_msg=f"{label} {leaf}")
 
 
-def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
+def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int, check=None) -> None:
     """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever the
-    float64 truth (`truth_fn` on the inputs widened) rounded to the leaf's dtype is. A reference computing
-    in the call's own dtype is no measure of it: fp16's written-out attention at `logits near 1e4` gives a
-    key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1). The truth runs
-    on the host's CPU device, as the lane runs float64 references (tests/lane_environment.py): a family's
-    draws are small, and XLA:GPU compiled each truth in 7.3 s where XLA:CPU takes 0.2 (MAINGPU-0243234e8's
-    part 2 on an H100: 25 truths, 182 s)."""
+    float64 truth (`truth_fn` on the inputs widened) rounded to the leaf's dtype is, and where `check` is
+    given, `check(result, seed)` holds on the already-computed output of every draw (row 9041). A reference
+    computing in the call's own dtype is no measure of it: fp16's written-out attention at `logits near 1e4`
+    gives a key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1). The
+    truth runs on the host's CPU device, as the lane runs float64 references (tests/lane_environment.py): a
+    family's draws are small, and XLA:GPU compiled each truth in 7.3 s where XLA:CPU takes 0.2
+    (MAINGPU-0243234e8's part 2 on an H100: 25 truths, 182 s)."""
     truth_of = Truth(truth_fn, jax.local_devices(backend="cpu")[0])
     for seed in range(seeds):
         inputs = draw(seed)
         with jax.enable_x64(new_val=True):
             truth = jax.tree.leaves(truth_of(*widened(jax.device_get(inputs))))
-        found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
+        result = dew_fn(*inputs)
+        found = jax.tree_util.tree_leaves_with_path(result)
         for (path, mine), wide in zip(found, truth, strict=True):
             mine = np.asarray(mine)
             rounded = np.asarray(wide, np.float64).astype(mine.dtype)
             lost = np.isfinite(rounded.astype(np.float32)) & ~np.isfinite(mine.astype(np.float32))
             assert not lost.any(), (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {int(lost.sum())} "
                                     "values not finite where the truth's rounded to their dtype are")
+        if check is not None:
+            check(result, seed)
 
 
 GPU_ONLY = {
@@ -1158,8 +1163,8 @@ def default_is_finite(family_name: str, mainloop_name: str) -> None:
     truth = with_gradients(_reference(family, anchored=True))
     label = f"{mainloop_name} default {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
-    assert_finite(differentiated, truth, draw, label, seeds=seeds)
-    _held_empty(family, differentiated(*draw(0)), label)
+    assert_finite(differentiated, truth, draw, label, seeds=seeds,
+                  check=lambda found, seed: _held_empty(family, found, f"{label} seed {seed}"))
 
 
 @pytest.mark.parametrize("family", [name for name in TEMPLATE_FAMILIES if _drawn_first(name)[3] is None])
@@ -1176,8 +1181,11 @@ def test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_ed
         return template.reference(query, key, value, _spans(family_spec, query, key), _dropping(query))
 
     for name, mainloop in _mainloops(family_spec, {}, dropping=True).items():
-        assert_finite(jax.jit(with_gradients(mainloop)), with_gradients(truth), draw,
-                      f"{name} dropping {family_spec.dtype}", seeds=seeds)
+        drop_label = f"{name} dropping {family_spec.dtype}"
+        assert_finite(jax.jit(with_gradients(mainloop)), with_gradients(truth), draw, drop_label,
+                      seeds=seeds,
+                      check=lambda found, seed, lbl=drop_label: _held_empty(
+                          family_spec, found, f"{lbl} seed {seed}"))
 
 
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
@@ -1274,6 +1282,65 @@ def test_a_mean_of_an_infinite_value_stays_infinite_through_the_hold():
     opposite = template.reference(query, jnp.zeros((1, 2, 1, 8), jnp.float16),
                                   jnp.concatenate([inf, -inf], axis=1), two)
     assert bool(jnp.all(alone == jnp.inf)) and bool(jnp.all(jnp.isnan(opposite)))
+
+
+NARROWING_TIES = {
+    "float16": [65520.0, 1.5 * 2.0 ** -14 + 2.0 ** -25, 3 * 2.0 ** -25, 2.0 ** -25, 1000.25, -65520.0],
+    "bfloat16": [(2 - 2.0 ** -8) * 2.0 ** 127, 1 + 2.0 ** -8, -(1 + 3 * 2.0 ** -8) * 2.0 ** 100,
+                 (1 + 2.0 ** -8) * 2.0 ** -126],
+}
+"""Points exactly between two neighbouring values of each 16-bit dtype, which a narrowing ties to even: fp16's
+overflow midpoint, ties among its subnormals and the least (half its least subnormal), a normal one and a
+negative one; bf16's overflow midpoint, normal ties of either sign and one at its least normal."""
+
+
+@pytest.mark.parametrize("dtype", NARROWING_TIES, ids=NARROWING_TIES.keys())
+def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
+    """Sums over a divisor whose fp32 quotient rounds onto a 16-bit tie (`NARROWING_TIES`), and the sums an
+    fp32 ulp either side of the tie's product with the divisor and on it where exact: the settled quotient
+    (`algebra.narrowing_settled`) narrows to `dtype` as the exact quotient rounds once, to the tie's nearer
+    neighbour where it is not the tie and to the even one where it is, where the fp32 quotient's second
+    rounding took a quotient below fp16's overflow midpoint to inf (row 9544), and so at the overflow
+    midpoint does a register epilogue's settle of it alone (`algebra.midpoint_settled`); a held quotient,
+    past the one it stands for, as it is. Each divisor a drawn fp32 value from 2^-6 to 2^6, the expectation
+    the float64 quotient's side of the tie (two fp32 values' quotient lies on a tie in float64 only where it
+    is one)."""
+    narrow = jnp.dtype(dtype)
+    rng = np.random.default_rng([9544, len(dtype)])
+    ties = np.asarray(NARROWING_TIES[dtype], np.float64)
+    # Drawn divisors and one just below 1, whose tie's product rounds so the quotient lies off it.
+    divisors = np.append(np.float32(np.ldexp(1 + rng.random(64), rng.integers(-6, 7, 64))),
+                         np.float32(1 - 2.0 ** -24))
+    tie, divisor = (np.ravel(x) for x in np.meshgrid(ties, divisors, indexing="ij"))
+    divisor = divisor.astype(np.float32)
+    centre = np.float32(tie * divisor)
+    acc = np.concatenate([np.nextafter(centre, -np.inf), centre, np.nextafter(centre, np.inf)])
+    divisor, tie, centre = (np.tile(x, 3) for x in (divisor, tie, centre))
+    # A tie's product with a divisor past fp32's largest is no sum a quotient of the tie has, and one below
+    # fp32's least normal a sum XLA's CPU flushes (row 4023).
+    finite = np.isfinite(centre) & np.isfinite(acc) & (np.abs(acc) >= np.finfo(np.float32).tiny)
+    acc, divisor, tie = acc[finite], divisor[finite], tie[finite]
+    rounded = np.asarray(jnp.asarray(acc) / jnp.asarray(divisor))
+    settled = algebra.narrowing_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
+    found = np.asarray(settled.astype(narrow).astype(jnp.float32), np.float64)
+    exact = acc.astype(np.float64) / divisor.astype(np.float64)
+
+    def narrowed(x):
+        return np.asarray(jnp.asarray(np.float32(x)).astype(narrow).astype(jnp.float32), np.float64)
+
+    # The tie's neighbours, an fp32 value either side of it narrowed once; the even one, the tie narrowed.
+    nearer, further = (narrowed(np.nextafter(np.float32(tie), np.float32(np.sign(tie) * side)))
+                       for side in (0.0, np.inf))
+    expected = np.where(exact == tie, narrowed(tie), np.where(np.abs(exact) < np.abs(tie), nearer, further))
+    np.testing.assert_array_equal(found, expected)
+    largest = jnp.finfo(narrow).max
+    midpoint = np.abs(tie) > largest
+    alone = algebra.midpoint_settled(jnp.asarray(rounded), jnp.asarray(acc), jnp.asarray(divisor), narrow)
+    found = np.asarray(alone.astype(narrow).astype(jnp.float32), np.float64)
+    np.testing.assert_array_equal(found[midpoint], expected[midpoint])
+    held = algebra.narrowing_settled(jnp.float32(jnp.finfo(narrow).max), jnp.float32(65522.0),
+                                     jnp.float32(1.0), narrow)
+    assert held == jnp.finfo(narrow).max
 
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])

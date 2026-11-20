@@ -29,7 +29,6 @@ import functools
 import attention_oracle
 import numpy as np
 from interval_certificates import Iv, Lane, add, cast, dot, exp2, exp2_reach, fp32, hull, mul, point, within
-from native_certificates import PTX_EX2
 from op_certificates import BFLOAT16, FLOAT32, nearest, stepped
 
 from dew.nn.kernels.templates import attention as template, attention_mosaic
@@ -42,17 +41,15 @@ def walk_factor(width: int) -> float:
 
 
 @functools.cache
-def attention_lane(interpret: bool) -> Lane:
-    """The arithmetic a certify launch runs in: `ex2`'s reach over the step's exponents, (-126, 0] (an
-    interpreted launch's XLA exp2 measured there, `exp2_reach`; a GPU's `ex2.approx`, `PTX_EX2`), and
-    whether it flushes (`certified.lane`). Its products' column blocks are the witness's to read
-    (`tiles`), not the lane's."""
+def attention_lane() -> Lane:
+    """The arithmetic an interpreted certify launch runs in: `ex2`'s reach over the step's exponents,
+    (-126, 0] (XLA's exp2 measured there, `exp2_reach`), and whether it flushes (`certified.lane`). Its
+    products' column blocks are the witness's to read (`tiles`), not the lane's."""
     import jax
     import jax.numpy as jnp
     from certified import lane
 
-    reach = (exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x)), low=-126.0, high=0.0) if interpret
-             else PTX_EX2)
+    reach = exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x)), low=-126.0, high=0.0)
     return Lane(reach, lane().flushes, 0)
 
 
@@ -107,7 +104,7 @@ def witnessed(query, key, value, kept, *, interpret: bool, records=None,
     """Each stored state and the output of the certify launch over `query`, `key` and `value` (`[B, S, H, D]`,
     bf16) under the mask `kept` (`[B or 1, 1, Q, K]`, `attention_oracle.kept`'s), held to its enclosure:
     for each record, the entries held and those inside. `records` replaces the launch's own (a fault)."""
-    lane = attention_lane(interpret) if lane is None else lane
+    lane = attention_lane() if lane is None else lane
     q, k, v = (np.asarray(np.asarray(x, np.float32), np.float64) for x in (query, key, value))
     if records is None:
         records = launched(query, key, value, kept, interpret=interpret)
@@ -179,14 +176,13 @@ def operands(seed: int):
     return q, k, v
 
 
-def _certified_native(query, key, value, *, causal: bool):
+def _certified_native(query, key, value, *, causal: bool, site: str):
     """Run the native certify launch through `ahead_arm` (row 9546) so GPU-tier prepare compiles it without
     eagerly touching a compile-only device, and return `(block_k, (out, rows, sums))`."""
     import jax
     import jax.numpy as jnp
     import pytest
     from reference_error import ahead_arm
-    from truths_ahead import COMPILED
 
     from dew.nn.kernels import generation
 
@@ -203,25 +199,19 @@ def _certified_native(query, key, value, *, causal: bool):
         return jnp.asarray(tiles.block_k, jnp.int32), result
 
     shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in (query, key, value))
-    label = f"attention witness, {'causal' if causal else 'full'}, {generation.assumption()}, {shapes}"
-    store = COMPILED.get()
-    cached = store.prepared_arms if store is not None and store.prepare else None
-    if cached is not None and label in cached:
-        block_k, found = cached[label]
-    else:
-        block_k, found = ahead_arm(jax.jit(program), label)(query, key, value)
-        if cached is not None:
-            cached[label] = (block_k, found)
+    form = "causal" if causal else "full"
+    label = f"attention witness, {site}, {form}, {generation.assumption()}, {shapes}"
+    block_k, found = ahead_arm(jax.jit(program), label)(query, key, value)
     return int(np.asarray(block_k)), found
 
 
-def launched(query, key, value, mask, *, interpret: bool) -> dict:
+def launched(query, key, value, mask, *, interpret: bool, site: str = "witness") -> dict:
     """The certify launch's own records (`attention_mosaic.certified`) under `mask`, as float64, and the key
     tile it walked (`tile`), each record's tiles that wide."""
     if not interpret:
         queries, keys = mask.shape[2:]
         causal = bool(np.array_equal(mask[0, 0], np.tril(np.ones((queries, keys), bool))))
-        block_k, (out, rows, sums) = _certified_native(query, key, value, causal=causal)
+        block_k, (out, rows, sums) = _certified_native(query, key, value, causal=causal, site=site)
     else:
         spans = spans_of(mask, query.shape[0])
         tiles, (out, rows, sums) = certified(query, key, value, spans)
@@ -262,8 +252,8 @@ def assert_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
     q, k, v = operands(2)
     mask = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=False)
     causal = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=True)
-    truth = launched(q, k, v, mask, interpret=interpret)
-    claimed = launched(q, k, v, causal, interpret=interpret)
+    truth = launched(q, k, v, mask, interpret=interpret, site="faults")
+    claimed = launched(q, k, v, causal, interpret=interpret, site="faults")
     if not interpret and tier_wire.preparing():
         return
     m, acc = truth["m"], truth["acc"]

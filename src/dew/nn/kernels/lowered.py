@@ -374,7 +374,7 @@ def _kernel_name(location: ir.Location) -> tuple[str, str | None] | None:
         return None
     stack = named.split("/")
     # Less the launch the kernel's name carries (`report.named`), so a kernel reads as itself in every call.
-    return report.kernel_of(stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1])
+    return report.kernel_of(stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1])[:2]
 
 
 def _named(location: ir.Location) -> str | None:
