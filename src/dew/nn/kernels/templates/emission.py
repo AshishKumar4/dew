@@ -258,12 +258,12 @@ def _unreffed(aval) -> jax_core.ShapedArray:
 
 
 def _transformed(aval, tree, leaves: Sequence) -> jax_core.ShapedArray:
-    """A ref's aval through its transforms (`tree` of `leaves`)."""
+    """A ref's aval through its transforms (`tree` of `leaves`), applied in order by JAX's own walk of a
+    transform sequence (`state_types.transform_type`, Mosaic GPU's)."""
     shaped = _unreffed(aval)
-    if tree is not None:
-        for transform in jax.tree.unflatten(tree, leaves):
-            shaped = _unreffed(transform.transform_type(shaped))
-    return shaped
+    if tree is None:
+        return shaped
+    return _unreffed(state_types.transform_type(jax.tree.unflatten(tree, leaves), shaped))
 
 
 def _logical(aval, tree, leaves: Sequence) -> tuple[int, ...]:
