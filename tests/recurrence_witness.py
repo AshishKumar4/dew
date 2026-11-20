@@ -789,8 +789,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         for native, own in ((o, kept_o), (final, kept_final)):
             assert np.array_equal(np.asarray(native).view(np.uint8), np.asarray(own).view(np.uint8)), \
                 "the certify build is the production program"
-        _, length, heads, value_width = v.shape
-        key_width = k.shape[-1]
+        (_, length, heads, value_width), key_width = v.shape, k.shape[-1]
         table = laid_chunks(length, starts, max_segments, chunk)
         chunks = len(table)
         # Each chunk's leaving memory: the final memory of the call through its last token (`through`), the
@@ -834,7 +833,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide), walked=walked,
-               pairing=intra.pairing_parts(family, held), tf32=tf32_conversion(family), trained=bool(trained),
+               pairing=intra.pairing_parts(family, held),
+               tf32=tf32_conversion(family), trained=bool(trained),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
