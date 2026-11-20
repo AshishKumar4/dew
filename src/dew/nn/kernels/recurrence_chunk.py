@@ -901,6 +901,7 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
             decayed = decayed * jnp.exp(e)[None, :]
         if corrected_by == 'erased':
             # Its erase along its own vector, reading the state the token enters, beside its write.
+            assert a is not None and c is not None, "an erase of its own takes its vector and its read"
             return decayed + a[:, None] * (c @ h)[None, :] + beta * k[:, None] * v[None, :]
         written = v + c @ decayed if c is not None else v - k @ decayed if delta else v
         return decayed + beta * k[:, None] * written[None, :]
