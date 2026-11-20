@@ -1383,3 +1383,56 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
                                     KernelCase("backward", lambda: (backward, (query, key, key, query)))],
                                    "sm90")
     assert not failures(found), "\n".join(failures(found))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", ["sm90", "sm80"])
+def test_an_int8_cache_decode_at_width_256_derives_and_compiles_spill_free(generation_name):
+    """Row 5449: an int8 KV-cache decode at width 256 derives a legal config and compiles spill-free once
+    `Family.converted` converts at most `CONVERT_COLUMNS` (128) columns at a time."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_decode
+
+    rows, keys, heads, kv_heads, width = 1, 512, 8, 2, 256
+    spans = template.spans(1, keys, rows)
+    query = jax.ShapeDtypeStruct((rows, 1, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), jnp.int8)
+    scales = (jax.ShapeDtypeStruct((rows, keys, kv_heads), jnp.float32),
+              jax.ShapeDtypeStruct((rows, keys, kv_heads), jnp.float32))
+
+    def decoded(query, key, value, k_scale, v_scale):
+        return attention_decode.attend(query, key, value, spans, scales=(k_scale, v_scale))
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels(
+            [KernelCase("int8-w256-decode", lambda: (decoded, (query, key, key, *scales)))],
+            generation_name)
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("stored", [jnp.float8_e4m3fn, jnp.float8_e5m2], ids=["e4m3fn", "e5m2"])
+def test_an_fp8_cache_decode_on_sm80_derives_and_compiles_spill_free(stored):
+    """Row 8549: an FP8 KV-cache decode on sm80 decodes via `bits.decoded` integer arithmetic (no sm_89
+    `cvt.e4m3x2`/`e5m2x2` instruction) and compiles spill-free with ptxas."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_decode
+
+    rows, keys, heads, kv_heads, width = 1, 512, 8, 2, 128
+    spans = template.spans(1, keys, rows)
+    query = jax.ShapeDtypeStruct((rows, 1, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), stored)
+    scales = (jax.ShapeDtypeStruct((rows, keys, kv_heads), jnp.float32),
+              jax.ShapeDtypeStruct((rows, keys, kv_heads), jnp.float32))
+
+    def decoded(query, key, value, k_scale, v_scale):
+        return attention_decode.attend(query, key, value, spans, scales=(k_scale, v_scale))
+
+    with generation.assumed("sm80"):
+        found = compile_mosaic_kernels(
+            [KernelCase("fp8-sm80-decode", lambda: (decoded, (query, key, key, *scales)))], "sm80")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
