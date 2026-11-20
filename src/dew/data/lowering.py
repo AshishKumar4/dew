@@ -743,12 +743,15 @@ def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[i
 
 class _TokenSplit(_WrappingDataset):
     """A token split of a finite indexed order, such as a shuffled corpus:
-    the spans `_token_spans` keeps, computed once over the order as it reads."""
+    the spans `_token_spans` keeps, computed once over the order as it reads, or those resolved
+    already (`spans`, `_Build.spans`)."""
 
-    def __init__(self, parent: pygrain.MapDataset, split: TokenSplit):
+    def __init__(self, parent: pygrain.MapDataset, split: TokenSplit,
+                 spans: list[tuple[int, int, int]] | None = None):
         super().__init__(parent)
         self._split = split
-        self.spans = _token_spans((parent[index] for index in range(len(parent))), split)
+        self.spans = (_token_spans((parent[index] for index in range(len(parent))), split) if spans is None
+                      else spans)
 
     def __len__(self) -> int:
         return len(self.spans)
@@ -1280,6 +1283,12 @@ class _Build:
     earlier phase read it out of order (a shuffle after its mix: `dew.data.compile`'s continuation): the
     places past where it starts its corpus (the slice written after the chain's first repeat) the run trained
     already, sorted, which it draws past (`dew.data.ordering.Skipping`). Empty for any other read."""
+    spans: dict[tuple[tuple[int, ...], int, TokenSplit, int], list[tuple[int, int, int]]] = dataclasses.field(
+        default_factory=dict, compare=False, hash=False, repr=False)
+    """Each token split's spans (`_TokenSplit`), by its corpus (`corpus`), its place in its chain, the split
+    and the records of the order before it, resolved once for every build this one is copied to: the plan's
+    fingerprint of them (`_split_spans`) and the reader's split read one scan of that order (row 9011: each
+    scanned it)."""
     DRAWN: ClassVar[str] = "drawn"
     """The `phases` rule a phase of a global order records where it continues a corpus past places the run
     trained out of order (`skipped`): where an earlier phase read it, as the order's twin of draws traces
@@ -2014,7 +2023,9 @@ class _Build:
         if isinstance(stage, TokenSplit):
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
-            rows = _TokenSplit(rows, stage)
+            resolved = (self.corpus, at, stage, len(rows))
+            rows = _TokenSplit(rows, stage, self.spans.get(resolved))
+            self.spans.setdefault(resolved, rows.spans)
         elif isinstance(stage, (Pack, Windows)):
             ruled = _Ruled(_as_iter(rows, self.loading), stage, consumed=self.counting(pipeline),
                            members=bool(self.counted_members(pipeline)), drawn=bool(self.stamped))
@@ -2338,8 +2349,10 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
             rows = build.records(before, DataPartition())
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
+            resolved = (build.corpus, at, split, len(rows))
             with _closing(rows) as read:
-                spans = _TokenSplit(read, split).spans
+                spans = build.spans.get(resolved) or _TokenSplit(read, split).spans
+            build.spans.setdefault(resolved, spans)
             yield spans
 
 

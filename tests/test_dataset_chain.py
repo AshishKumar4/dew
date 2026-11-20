@@ -1735,3 +1735,31 @@ def test_a_nested_records_numbers_stack_beside_its_opaque_messages():
     batch = record_batch(rows)
     assert batch["meta"]["id"].tolist() == [0, 1, 2] and batch["meta"]["lang"].tolist() == ["en"] * 3
     assert batch["meta"]["messages"] == [row["meta"]["messages"] for row in rows]
+
+
+def test_a_token_holdouts_spans_are_resolved_by_one_scan_of_its_order():
+    """A token holdout's spans are resolved once, by one scan of the order before it, which the plan's
+    fingerprint and the reader's split share: each document is mapped once by that scan and once more for
+    each row a read of the trained branch takes of it (row 9011: the plan and the reader each scanned it)."""
+    mapped: collections.Counter[int] = collections.Counter()
+
+    @dataclass(frozen=True)
+    class Counted:
+        def __call__(self, row):
+            mapped[int(row["text"][0])] += 1
+            return row
+
+    documents = [{"text": np.arange(100 * index, 100 * index + size, dtype=np.int32)}
+                 for index, size in enumerate((5, 3, 8, 2, 6, 4, 7, 1))]
+    counted = Pipeline(Memory(documents)).map(Counted(), identity="counted@1")
+    train, _ = counted.shuffle(0).holdout(tokens=0.25)
+    loader = compile(train.batch(1), read="indexed", loading=Loading(workers=0))
+    stream = loader.train(DataPartition())
+    try:
+        rows = [next(stream) for _ in range(loader.records)]
+        stream.get_state()
+        assert loader.plan is not None and loader.plan.record()
+    finally:
+        stream.close()
+    read = collections.Counter(int(row["text"][0][0]) - int(row["text"][0][0]) % 100 for row in rows)
+    assert all(mapped[start] == 1 + read[start] for start in range(0, 800, 100)), (mapped, read)
