@@ -551,13 +551,14 @@ def test_documents_adding_a_slot_scan_as_each_alone():
                     "the TPU kernel's forked call adding a slot", seeds=24)
 
 
-@pytest.mark.parametrize(("key", "value", "weight", "final", "cancelled"),
-                         [(80, 80, -100, -100, False), (-80, 100, -100, 0, False), (-40, 100, -40, 56, False),
-                          (-100, 100, 30, 30, True), (60, -20, 100, -100, False)],
+@pytest.mark.parametrize(("key", "value", "weight", "final", "cancelled", "paired"),
+                         [(80, 80, -100, -100, False, False), (-80, 100, -100, 0, False, False),
+                          (-40, 100, -40, 56, False, False), (-100, 100, 30, 30, True, False),
+                          (60, -20, 100, -100, False, True), (100, 100, -100, -60, False, True)],
                          ids=["overflowing pair", "underflowing pair", "overflowing adjoint",
-                              "a continuation's adjoint", "cancelling terms"])
+                              "a continuation's adjoint", "cancelling terms", "cancelling weight cotangents"])
 def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, value, weight, final,
-                                                                         cancelled):
+                                                                         cancelled, paired):
     """A forked call's entry write (`Chunk.entry_key`) and its adjoint in the TPU kernel, at powers of two (a
     key, a value and a weight of 2^`key`, 2^`value`, 2^`weight` on one term, the final memory's cotangent
     2^`final`, the outputs' none, unless `cancelled`): every output and gradient float64's exactly wherever
@@ -573,10 +574,13 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
     masked after, the weight and value's 2^130 against it, gave its key gradient NaN (base review 13abb0d6b
     F1). `cancelling terms` gives a second term the first's value and its key negated: each term's write
     2^140 and their sum zero, and its gradients' 2^-40 terms cancelling too, where a sum of terms formed
-    one at a time was inf - inf, NaN (base review ead11c83a F1)."""
+    one at a time was inf - inf, NaN (base review ead11c83a F1). `cancelling weight cotangents` pairs keys of
+    2^100 and -2^100 under values of 2^100: each term's write 2^100, and the weight's gradient a term
+    2^140 apiece that cancel, zero, where each term's rounded apart and summed was inf - inf (row 8666's
+    head review)."""
     (x, b, c, a, given, keys, values, weights), (out, last) = documents_draw(0)
     keys, values = (jnp.zeros_like(t).at[:, :, 0].set(2.0 ** e) for t, e in ((keys, key), (values, value)))
-    if key == 60:
+    if paired:
         keys, values = keys.at[:, :, 1].set(-(2.0 ** key)), values.at[:, :, 1].set(2.0 ** value)
     operands = (jnp.zeros_like(x), jnp.ones_like(b), jnp.ones_like(c), jnp.zeros_like(a),
                 jnp.zeros_like(given), keys, values, jnp.full_like(weights, 2.0 ** weight))

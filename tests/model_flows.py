@@ -359,7 +359,7 @@ def packed_variables(variables) -> dict:
 def exact_banks(taken) -> dict:
     """What a packed flow's programs take (`packed_variables`) with each NVFP4 bank its exact matrix, in its
     tensor scale's dtype (float64 where check 1 widens it), computed in that dtype from the bank's bits: each
-    code's E2M1 value read from its stored word by integer arithmetic and casts alone (`exact_codes`), times
+    code's E2M1 value read from its stored word by integer arithmetic and casts alone (`NvFp4.codes`), times
     its block's scale and its expert's, which float64 holds exactly (2 + 3 + 24 significant bits); still
     frozen where the bank lay, so a truth differentiates the parameters alone."""
     from dew.nn.kernels.formats import NvFp4
@@ -367,27 +367,12 @@ def exact_banks(taken) -> dict:
 
     def exact(bank: NvFp4) -> jax.Array:
         dtype = jnp.result_type(bank.scale)
-        codes = exact_codes(jnp.swapaxes(jnp.asarray(bank.words), -1, -2), dtype)
+        codes = bank.codes(dtype)
         blocks = jnp.repeat(jnp.swapaxes(jnp.asarray(bank.scales), -1, -2).astype(dtype), 16, axis=-2)
         return codes * blocks * jnp.asarray(bank.scale, dtype)[..., None, None]
 
     return {**taken, QUANTIZATION: jax.tree.map(exact, taken[QUANTIZATION],
                                                 is_leaf=lambda leaf: isinstance(leaf, NvFp4))}
-
-
-def exact_codes(words: jax.Array, dtype) -> jax.Array:
-    """The E2M1 values of an NVFP4 matrix's stored words (`[..., depth / 8, width]`, `NvFp4`'s staged order)
-    in `dtype`, in the depths' own order (`bits.nvfp4_codes`, the portable decode's codes)."""
-    from dew.algebra import bits
-    from dew.nn.kernels.formats import staged_rows
-
-    def one(words: jax.Array) -> jax.Array:
-        codes = bits.nvfp4_codes(words, dtype)
-        return codes[np.argsort(staged_rows(codes.shape[0]))]
-
-    for _ in range(words.ndim - 2):
-        one = jax.vmap(one)
-    return one(words)
 
 
 def drawn(flow: ModelFlow):

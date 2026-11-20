@@ -77,6 +77,17 @@ def python() -> str:
     return ".".join(map(str, sys.version_info[:2]))
 
 
+@functools.cache
+def host_class() -> str:
+    """The class this process's results belong to, as CI classes a task's (tools/armada/ci.py's
+    `device_class`: the GPUs' models on a CUDA lane, before its CPU's microarchitecture, whose estimate
+    instructions round apart): a map task records it with its draws, and a judge refuses a pool of more than
+    one (`check1_judge._pooled_draws`)."""
+    from tool_support import load
+
+    return load("ci", "tools/armada").device_class()
+
+
 def _file(site: str) -> str:
     return hashlib.sha256(site.encode()).hexdigest()[:16]
 

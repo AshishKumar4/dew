@@ -641,7 +641,7 @@ def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differ
 
 
 def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, scaled: bool = False,
-             magnitudes: bool = False) -> int:
+             magnitudes: bool = False, joined: tuple = ()) -> int:
     """The warpgroups of a launch of `consumers` whose arithmetic may reduce across warps implicitly, each
     reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a
     `hooked` launch's hook's (`hook_reduces`: a unit row, which the fork selects by a reduction across warps,
@@ -652,9 +652,8 @@ def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, scaled: boo
     A launch's rows flagged to their block's flag reserve none: the flag is its warpgroup's vote
     (`attention_mosaic_forward._status_stored`, `bar.red.or.pred`)."""
     if scaled or magnitudes or hooked:
-        return family.warpgroups(consumers)
+        return family.warpgroups(consumers, joined=joined)
     return 0
-
 
 def forward_reduces(family: mosaic.Family, reducing_warpgroups: int) -> bool:
     """Whether a forward launch's arithmetic reduces across warps, reserving its family's reduction scratch

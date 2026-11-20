@@ -40,6 +40,7 @@ from dew.nn.kernels.templates import (
     mosaic,
     operands,
     outputs,
+    placed as placed_mod,
     product,
     resources,
     rings,
@@ -1954,7 +1955,8 @@ def declared(ahead: bool, *, peaks: bool = False) -> tuple[mosaic.Product, ...]:
 
 def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks, *, group: int,
                  page: int | None, batch: int, queries: int, kinds: tuple, peaks: bool, training: bool,
-                 finishes: bool, certified: bool, interpret: bool, value_width: int) -> Callable:
+                 finishes: bool, certified: bool, interpret: bool, value_width: int,
+                 joined: tuple = ()) -> Callable:
     """`_launched`'s kernel body: its rings opened, each consumer's walk over its query block and the
     producer's loads, the roles scheduled as its family runs them."""
     family, tiles, parts = program.family, program.tiles, program.parts
@@ -2018,9 +2020,8 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
 
         # Each role forms what it reads (`_placed`), one switch's branch (`exclusive`).
         family.scheduled(consumers, _per_role(family, consumers, consumer), producer, exclusive=True,
-                         issuer=_issuer(program, streams, refs, placed))
-
-
+                         issuer=_issuer(program, streams, refs, placed),
+                         joined=_correction(program, placed, value_width, joined))
     return body
 
 
@@ -2079,9 +2080,10 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                      relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None,
                      bool(after), decides)
 
+    joined = placed_mod.correction_roles(family, consumers, value_width)
     body = _launch_body(program, layout, spec, hooks, group=group, page=page, batch=batch, queries=queries,
                         kinds=kinds, peaks=peaks, training=training, finishes=finishes, certified=certified,
-                        interpret=interpret, value_width=value_width)
+                        interpret=interpret, value_width=value_width, joined=joined)
 
     products = (products if products is not None else
                 forward_products(family, tiles, value_width, query.dtype, peaks=peaks, parts=parts,
@@ -2095,7 +2097,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     grid = (heads, queries // pair * splits, batch)
     reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
-                       magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None)
+                       magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None,
+                       joined=joined)
     reduces = forward_reduces(family, reduced)
     tmem = family.product_columns(products) if scopes_products(family) else 0
     shared = (resources.shared_bytes(family, launch_scope(family, (scoped, rings, after), reduced,
@@ -2107,8 +2110,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                          interpret=interpret,
                          approx_math=spec.approximate, name=name, cost=cost, model_flops=model,
                          registers=registers, shared=shared, tmem=tmem, reducing_warpgroups=reduced,
-                         reduces=reduces)(query, key, value, *leaves)
-
+                         reduces=reduces, joined=joined)(query, key, value, *leaves)
 
 def _per_role(family: mosaic.Family, consumers: int, consumer: Callable) -> Callable:
     """`consumer(index)` as `family`'s roles run it: each consumer built at its static role where its issuer
@@ -2139,6 +2141,18 @@ def _issuer(program: _Program, streams, refs, placed: Callable) -> Callable | No
                                          row)[:2] for consumer in served))
 
     return issuer
+
+
+def _correction(program: _Program, placed_at: Callable, value_width: int, joined: tuple) -> tuple:
+    """Bind `Tcgen05Placed.correcting` to the planned `joined` correction role tuple (row 5368)."""
+    family = program.family
+    if not joined or not isinstance(family, placed_mod.Tcgen05Placed):
+        return ()
+
+    def body(_index):
+        *_, (lo, hi) = placed_at()
+        family.correcting(lo, hi, value_width)
+    return tuple((role, count, body) for role, count in joined)
 
 
 def _written_refs(written: tuple, read: _Read) -> tuple:

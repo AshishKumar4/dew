@@ -108,7 +108,7 @@ from arm_forms import (
 from check1_judge import SWITCHED as SWITCHED, Verdict, _judged_pooled, _logged, _narrow, _verdicts
 from check1_wire import QUALIFY
 from float64_terms import POWER, evaluated, evaluated_on, float64_terms, lowered, scan_groups, static, traced
-from map_judge import drawing, judging, record_units
+from map_judge import drawing, host_class, judging, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 from truths_ahead import AT_RUN, COMPILED, CompiledTruths, arm_role, judged, named, reading, running
 
@@ -1381,7 +1381,8 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
 def _recorded(label: str, drawn_for, verdict: "Verdict", arms, upto: int | None = None,
               weighed: dict | None = None, offset: int = 0, first: dict | None = None) -> bool:
     """A map task's draws (`record_units`): each of a site's `references` draws over its range, up to
-    `upto` where given, with its arms' YNNPACK mode (`_mode_of`) and, weighed, its classes' digest
+    `upto` where given, with its host's class (`map_judge.host_class`), its arms' YNNPACK mode (`_mode_of`)
+    and, weighed, its classes' digest
     (`Conditioning.digest`), the seconds its weighing took beside its draws', and those of its first draw
     with the backend compiles JAX reported within it (`first`, `compiled`, `_drawn`'s): a site's arms
     compile at their first call, so a task's first draw holds its compiles, a cost it pays once whatever
@@ -1391,7 +1392,8 @@ def _recorded(label: str, drawn_for, verdict: "Verdict", arms, upto: int | None 
     def payload(start, stop):
         draws = [drawn_for(index)(start, stop) for index in range(len(verdict.labels))]
         held = (weighed or {}).get("of")
-        return {"draws": draws, "refused": _mode_of(arms), "heavy": None if held is None else held.digest()}
+        return {"draws": draws, "refused": _mode_of(arms), "heavy": None if held is None else held.digest(),
+                "host": host_class()}
     return record_units(label, payload, upto=upto, offset=offset, verdict=verdict,
                         phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0), **(first or {})})
 
