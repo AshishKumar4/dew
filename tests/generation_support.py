@@ -10,6 +10,8 @@ lowering a generation's Mosaic GPU kernels runs on a CPU or on a GPU that copies
 """
 
 import importlib.util
+import os
+from pathlib import Path
 
 import jax
 import pytest
@@ -27,16 +29,36 @@ def interprets() -> bool:
     return not tier_wire.preparing() and jax.default_backend() != "gpu"
 
 
+TOPOLOGY = "DEW_NODE_TOPOLOGY"
+"""The node's GPUs' serialized topology (dew-ops' session hands a prepare its node's): the GPU a flow's
+programs are compiled for."""
+
+
+def node_target():
+    """The node's GPU (`TOPOLOGY`): its generation, its kind's (`generation.gpu_target`), and the facts its
+    serialized device states of itself, its multiprocessors and its block's shared memory among them
+    (`generation.runtime_facts`), read with no GPU visible, as a prepare runs, so nothing of the CUDA
+    driver's: what its run's load holds the programs to (`BuildTarget.held`). Read beside `here`, which a
+    module importing this one reads at import: from the flows' module, whose gpu_flow imports this one, a
+    prepare's import of gpu_flow met it half initialized (row 9540)."""
+    from jax.experimental import topologies
+
+    # The CUDA plugin, which a serialized topology deserializes through, initialized with no GPU and no
+    # client (`dew.training.ahead.host_gpus`).
+    generation.compile_only_gpus("sm80", 1)
+    device = topologies.TopologyDescription.deserialize(Path(os.environ[TOPOLOGY]).read_bytes()).devices[0]
+    return generation.runtime_facts(generation.gpu_target(device.device_kind), device,
+                                    read=lambda ordinal, attribute: None)
+
+
 def here() -> str:
     """This process's device generation as its kernels run: the node's GPU's in a GPU tier part's prepare
-    (`model_flows.node_target`), whose default device, a compile-only GPU, states no generation of its own,
-    so a cell pinned to the node's generation prepares there as its run runs it (train 1013's review F4);
-    else its device's. The one prepare-aware reading of it: `runnable`, `lowers_as` and every matrix case's
-    pin (a `skipif` its module evaluates at import, rows 7868 and 7886) read it."""
+    (`node_target`), whose default device, a compile-only GPU, states no generation of its own, so a cell
+    pinned to the node's generation prepares there as its run runs it (train 1013's review F4); else its
+    device's. The one prepare-aware reading of it: `runnable`, `lowers_as` and every matrix case's pin (a
+    `skipif` its module evaluates at import, rows 7868 and 7886) read it."""
     if tier_wire.preparing():
-        import model_flows
-
-        return model_flows.node_target().generation
+        return node_target().generation
     return generation.device_generation()
 
 
