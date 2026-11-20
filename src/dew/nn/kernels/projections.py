@@ -16,9 +16,11 @@ from flax.typing import PrecisionLike
 from dew import _cache
 from dew.mesh import mesh_axes
 from dew.nn.derivatives import (
+    Protected,
     Surrogate,
     contracted,
     declared_derivative,
+    marked,
     portable_formed,
     with_gradients_formed,
 )
@@ -33,6 +35,7 @@ from dew.nn.kernels.gemm import (
     nvfp4_block_product,
 )
 from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
+from dew.nn.precision import biased, biased_value
 from dew.nn.sharding import (
     RESIDUAL,
     automatic_axes,
@@ -347,42 +350,57 @@ def dot_general(xla, path: tuple | None = None):
     before wherever the template declares XLA faster; every other product is `xla`'s. On a mesh whose
     automatic axes split the rows alone, where a launch takes a device's rows' product, each device's rows
     are its own call (`mapped_shards`), its matrix, the parameter at its variables `path`, placed by the
-    traced program's layout: a kernel launch per device on its own rows (bible §7, rows 1306 and 1923)."""
-    def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
+    traced program's layout: a kernel launch per device on its own rows (bible §7, rows 1306 and 1923).
+
+    A `bias`, shaped to broadcast over the product's trailing axes, is added as `precision.biased` adds
+    it; XLA's own product takes it inside its rule, the input's cotangent returned only with the kernel's
+    and the bias's gradients formed, one barrier for both where the bias's own rule would add two (row
+    6740)."""
+    def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, bias=None,
+                **kwargs):
+        def added(out):
+            # A product another rule takes, the bias added past it by its own (`precision.biased`).
+            return out if bias is None else biased(out, bias)
+
         (contracted, against), batch = dimension_numbers
         out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
         # The run's low-precision recipe takes the product where the projection's role takes it.
         if not kwargs and (recipe := recipe_general(lhs, rhs, dimension_numbers, out_dtype)) is not None:
-            return recipe
+            return added(recipe)
         plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
                  and tuple(map(tuple, batch)) == ((), ()))
         if plain and path is not None and (shards := mapped_shards(lhs, (rhs,), (path,), out_dtype,
                                                                      precision)) is not None:
             split, gathered = shards
-            return on_shards(lambda lhs, rhs: product(lhs, rhs, dimension_numbers, precision,
-                                                      preferred_element_type), split, (lhs, rhs),
-                             gathered=gathered)
+            return added(on_shards(lambda lhs, rhs: product(lhs, rhs, dimension_numbers, precision,
+                                                            preferred_element_type), split, (lhs, rhs),
+                                   gathered=gathered))
         if plain:
             rows = lhs.reshape(-1, lhs.shape[-1])
             if launched(rows, rhs, out_dtype, precision):
                 out = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
-                return out.reshape(*lhs.shape[:-1], rhs.shape[1])
-        taken = _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, **kwargs)
-        return taken(lhs, rhs)
+                return added(out.reshape(*lhs.shape[:-1], rhs.shape[1]))
+        taken = _in_layer_product(xla, dimension_numbers, precision, preferred_element_type,
+                                  with_bias=bias is not None, **kwargs)
+        return taken(lhs, rhs, *([] if bias is None else [bias]))
 
     return product
 
 
-def _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, **kwargs):
+def _in_layer_product(xla, dimension_numbers, precision, preferred_element_type, *, with_bias: bool,
+                      **kwargs):
     """A projection's product no launch takes, XLA's own (`xla`, any of its forms: a batched one's, DeepSeek
-    V4's grouped `o_a_proj`), through the rule as the template's is (`derivatives.portable_formed`): the
-    input's cotangent returned only with the kernel's gradient formed."""
-    def portable(lhs, rhs):
-        return xla(lhs, rhs, dimension_numbers, precision=precision,
-                   preferred_element_type=preferred_element_type, **kwargs)
+    V4's grouped `o_a_proj`), and its bias where it has one (`with_bias`, added as `precision.biased` adds
+    it, a span the algebra pass keeps as that one is), through the rule as the template's is
+    (`derivatives.portable_formed`): the input's cotangent returned only with the kernel's gradient and the
+    bias's formed, one barrier for both."""
+    def portable(lhs, rhs, *bias):
+        out = xla(lhs, rhs, dimension_numbers, precision=precision,
+                  preferred_element_type=preferred_element_type, **kwargs)
+        return marked(Protected(), biased_value)(out, *bias) if with_bias else out
 
-    return portable_formed(portable)
+    return portable_formed(portable, parameters=1 + with_bias)
 
 
 def rows_split(lhs: jax.Array) -> jax.sharding.PartitionSpec | None:

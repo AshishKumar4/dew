@@ -54,7 +54,6 @@ __all__ = [
     "marked_call_p",
     "portable_formed",
     "surrogate",
-    "with_cotangent_arrived",
     "with_gradients_formed",
     "with_gradients_formed_at",
     "with_tangents_formed",
@@ -83,21 +82,15 @@ def with_gradients_formed[Input, Gradients](d_input: Input, gradients: Gradients
     Only floating arrays enter the barrier: an integer operand's zero cotangent (`float0`) and an unreached
     one (None) pass through as they are, and where no gradient is a floating array (an unhooked call's, a
     sinkless attention's) there is nothing to form and the cotangents leave as they are, fusing into their
-    readers."""
+    readers.
+
+    The rule holds a reverse mode's exit alone. An entry beside it, its operands read only once its cotangent
+    arrived (a Mamba-2 decoder's in-projection: its temporaries' growth from two blocks to four 1.87 MB past
+    what its forward saves, 0.23 MB under it with the entry), cost every projection a barrier its guards do
+    not ask for: dit-b's step 88 of the 279 its holds added, each a fusion's boundary (row 6740)."""
     if not any(_floating(leaf) for leaf in jax.tree.leaves(gradients)):
         return d_input, gradients
     return _held(d_input, gradients)
-
-
-def with_cotangent_arrived[Cotangent, Operands](cotangent: Cotangent, operands: Operands
-                                               ) -> tuple[Cotangent, Operands]:
-    """The rule's entry (`with_gradients_formed`'s): a reverse mode reads its operands only once its cotangent
-    has arrived, both through one barrier, so XLA computes nothing of a reverse mode from its operands alone
-    (a projection's kernel transposed for its input gradient) ahead of the cotangent, where it held one of
-    them a layer to the backward's start (a Mamba-2 decoder's in-projection, 0.8 MB a layer: its
-    temporaries' growth from two blocks to four 1.87 MB past what its forward saves, 0.23 MB under it with
-    the entry)."""
-    return _held(cotangent, operands)
 
 
 def _held(first, second):
@@ -171,21 +164,19 @@ def _floating(leaf) -> bool:
     return not isinstance(leaf, SymbolicZero) and dtype is not None and jnp.issubdtype(dtype, jnp.inexact)
 
 
-def portable_formed[Value](portable: Callable[..., Value], /) -> Callable[..., Value]:
-    """`portable`, an XLA program whose last operand is a parameter (a projection's kernel, a norm's weight,
-    an attention's sinks), its value and every derivative XLA's of it (`generation.linear_tangent`), its
-    reverse mode the rule's: it reads its operands only once its cotangent has arrived
-    (`with_cotangent_arrived`) and returns the inputs' cotangents only with the parameter's gradient formed
-    (`with_gradients_formed`). Its forward saves nothing; its backward recomputes `portable` as its VJP
-    reads it."""
+def portable_formed[Value](portable: Callable[..., Value], /, parameters: int = 1) -> Callable[..., Value]:
+    """`portable`, an XLA program whose last `parameters` operands are parameters (a projection's kernel and
+    its bias, a norm's weight, an attention's sinks), its value and every derivative XLA's of it
+    (`generation.linear_tangent`), its reverse mode the rule's: it returns the inputs' cotangents only with
+    the parameters' gradients formed (`with_gradients_formed`). Its forward saves nothing; its backward
+    recomputes `portable` as its VJP reads it."""
     from dew.nn.kernels.generation import linear_tangent
 
     def backward(saved, operands, cotangent):
         del saved
-        cotangent, operands = with_cotangent_arrived(cotangent, operands)
-        *inputs, parameter = jax.vjp(portable, *operands)[1](cotangent)
-        inputs, parameter = with_gradients_formed(tuple(inputs), parameter)
-        return (*inputs, parameter)
+        pulled = jax.vjp(portable, *operands)[1](cotangent)
+        inputs, formed = with_gradients_formed(tuple(pulled[:-parameters]), tuple(pulled[-parameters:]))
+        return (*inputs, *formed)
 
     return contracted("test_a_portable_formed_rule_holds_every_order")(linear_tangent(
         lambda *operands: (portable(*operands), ()), backward, portable, kind=KernelGlue()))

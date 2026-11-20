@@ -21,6 +21,7 @@ from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral, _accumulated_dot_general
 from dew.nn.kernels import projections
 from dew.nn.precision import FP32_SUMS, fp32_result_dot_general
+from dew.nn.programs import equations
 from dew.quantization import Quantization, quantize_for_serving
 
 PARTITIONED = nn.with_partitioning(nn.initializers.lecun_normal(), (None, None))
@@ -229,6 +230,23 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
 
     assert_as_exact(dew, reference, draw, f"{layer.__class__.__name__} bias gradient", seeds=BIAS_SEEDS,
                     truth_fn=as_given(lambda x, cotangent: {"bias": summed(cotangent, np.float64)}))
+
+
+@pytest.mark.parametrize("layer", [Dense(16), DenseGeneral((2, 8))], ids=["dense", "general"])
+def test_a_biased_layers_reverse_mode_holds_its_cotangent_once(layer):
+    """A biased projection's reverse mode returns its input's cotangent only with its kernel's and its bias's
+    gradients formed, through one barrier for both (`projections.dot_general`'s `bias`): each barrier
+    bounds XLA's fusions, where an entry hold and the bias's own rule added three more a layer (row 6740: a
+    DiT-B step's 490 barriers against 211, 131 more fusions and its compile's growth)."""
+    x = jnp.ones((4, 8), jnp.float32)
+    variables = layer.init(jax.random.key(0), x)
+
+    def loss(params, x):
+        return jnp.sum(layer.apply({"params": params}, x) ** 2)
+
+    program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(variables["params"], x).jaxpr
+    held = [eqn for eqn in equations(program) if eqn.primitive.name == "optimization_barrier"]
+    assert len(held) == 1, len(held)
 
 
 SPLIT = {"conv": (Conv(3, (3, 3)), (8, 32, 32, 4), 256), "dense": (Dense(3), (8, 32, 32, 4), 256)}

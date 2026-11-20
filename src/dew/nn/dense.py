@@ -56,7 +56,7 @@ def intercepted() -> bool:
     return qwix_pallas.get_current_rule("dot_general") is not None
 
 
-def _product(layer: nn.Dense | nn.DenseGeneral, extents: tuple[int, int]):
+def _product(layer: nn.Dense | nn.DenseGeneral, extents: tuple[int, int]) -> tuple[Callable, bool]:
     """The layer's product: its `dot_general_cls` (an interceptor's: a quantized product), as flax picks
     it, else its `dot_general`, or lax's at its stated precision (`accumulated`: the plain product, its fp32
     sum taken in float64 on a CPU under Dew's tests). A plain product (lax's or `float32_dot_general`: its
@@ -64,16 +64,18 @@ def _product(layer: nn.Dense | nn.DenseGeneral, extents: tuple[int, int]):
     launch takes it (`projections.dot_general`; XLA's program wherever the template declares XLA faster), but
     where a wrapper owns the products (`intercepted`: Qwix quantizes them as it intercepts `dot_general`). A
     product with a policy of its own (a head's fp32 result: `fp32_result_dot_general`, `head_dot_general`)
-    is the layer's own: the template reads no policy from a callable."""
+    is the layer's own: the template reads no policy from a callable. Beside it, whether it takes the
+    layer's bias inside its own rule (`projections.dot_general`'s `bias`)."""
     if layer.dot_general_cls is not None:
         refuse_recipe("a quantizer's product class", *extents)
-        return layer.dot_general_cls()
+        return layer.dot_general_cls(), False
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     plain = layer.dot_general in (None, float32_dot_general)
     if not intercepted():
-        return projections.dot_general(product, projections.kernel_path(layer)) if plain else product
+        return (projections.dot_general(product, projections.kernel_path(layer)), True) if plain else (
+            product, False)
     refuse_recipe("a wrapper's product (an adapter's, a quantizer's)", *extents)
-    return product
+    return product, False
 
 
 def plain_product(path: tuple | None = None):
@@ -109,9 +111,14 @@ def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dim
     if bias is not None and _rounds_once(layer, inputs, kernel, bias, stored):
         widened = take(lambda inputs, kernel: _summed(inputs, kernel, dimensions, layer.precision))
         return biased(widened, shaped(stored)).astype(inputs.dtype)
-    product = take(lambda inputs, kernel: _product(
-        layer, projections.extents(inputs.shape, kernel.shape, dimensions))(inputs, kernel, dimensions,
-                                                                            precision=layer.precision))
+    def multiply(inputs, kernel):
+        return _product(layer, projections.extents(inputs.shape, kernel.shape, dimensions))
+
+    if bias is not None and taken is None and (taking := multiply(inputs, kernel))[1]:
+        # The product's own rule takes the bias, its gradient formed with the kernel's (row 6740).
+        return taking[0](inputs, kernel, dimensions, precision=layer.precision, bias=shaped(bias))
+    product = take(lambda inputs, kernel: multiply(inputs, kernel)[0](inputs, kernel, dimensions,
+                                                                      precision=layer.precision))
     if bias is None:
         return product
     return biased(product, shaped(bias))
