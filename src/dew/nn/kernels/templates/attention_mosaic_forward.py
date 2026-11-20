@@ -379,7 +379,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                     flagged: bool = False, scales: tuple[jax.Array, jax.Array] | None = None,
                     parts: int = 1, scaled: bool = True, counts: bool = True,
                     registered: ForwardRegisters | None = None, in_key: bool = False, decides: bool = False,
-                    tmem_columns: int | None = None, query_in_tmem: bool = True):
+                    tmem_columns: int | None = None, products: tuple | None = None):
     """The inference walk's launches: its spec and `launch(form, live, into)` as `algebra.walked_launches`
     takes them and `finished`, its outputs from the walk's: `MosaicForward`'s launch without residuals, at
     `tiles`, under the fold's guard over whole launches (`algebra.walked_launches`), a `scaled` walk's rows'
@@ -424,9 +424,8 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # natural rewalk's key tile its own (`Tiles.relaunch`).
         walk = _InferenceWalk(bundle_of(at, query.dtype), spec, call, hooks, hooked, k, v, interpret, rows,
                               out_dtype, masked, splits, paged, sources, parts, counts, registered, in_key,
-                              decides, tmem_columns, query_in_tmem)
+                              decides, tmem_columns, products)
         return _plain_launches(walk, q, form, at, at_spans, flags, in_place, stated=stated, into=into)
-
     return (spec, launch, functools.partial(_walked_outputs, queries=call.queries, width=value.shape[3],
                                             rows=rows, splits=splits))
 
@@ -463,8 +462,8 @@ class _InferenceWalk(NamedTuple):
     (an unscaled rewalk left the decode step's overflowing rows no number)."""
     tmem_columns: int | None = None
     """The target's tensor-memory column capacity (`GpuTarget.tmem_columns`), passed from planning."""
-    query_in_tmem: bool = True
-    """Whether placed-forward planning keeps Q in tensor memory without dropping rounded residency."""
+    products: tuple | None = None
+    """The placed launch's planned product tuple (`MosaicForward._products`), when preselected by planning."""
 
 
 def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, at: Tiles, at_spans,
@@ -494,7 +493,8 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         counted=walk.counts and form.natural == spec.natural, finishes=rows, columns=first,
                         splits=splits, registered=walk.registered, in_key=walk.in_key,
                         decides=walk.decides, tmem_columns=walk.tmem_columns,
-                        query_in_tmem=walk.query_in_tmem,
+                        products=walk.products if walk.family.places_on_role and form.natural == spec.natural
+                        else None,
                         table=paged, sources=sources,
                         out_dtype=jnp.float32 if split else out_dtype, walks=walks,
                         shared_by=len(blocks),
@@ -589,7 +589,7 @@ def _output_hooked(out: jax.Array, hooks: Hooks, hooked: _Hooked) -> jax.Array:
 def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
                      scale: float, natural: bool, tiles: Tiles, interpret: bool, scaled: bool = False,
                      counts: bool = True, registered: ForwardRegisters | None = None,
-                     tmem_columns: int | None = None, query_in_tmem: bool = True
+                     tmem_columns: int | None = None
                      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     """`MosaicForward`'s training launches at `tiles`, two a form: a walk of the logits alone for each row's
     anchor, its first key at the keys' largest logit (`_peak_consumer`), then the algebra's training step
@@ -618,7 +618,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         launching = bundle_of(at, query.dtype)
         found = _launch(q, k, v, at_spans, hooked, spec=form, hooks=hooks, tiles=at, family=launching,
                         training=False, interpret=interpret, peaks=True, counted=counted,
-                        registered=registered, tmem_columns=tmem_columns, query_in_tmem=query_in_tmem)
+                        registered=registered, tmem_columns=tmem_columns)
 
         # A training launch a block of the value columns where its tiles walk a block (`Tiles.columns`, row
         # 2526), each block's split sums side by side, their rows alike.
@@ -627,7 +627,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                             held._replace(magnitudes=_magnitudes(values, held, 1)) if form.headroom else held,
                             spec=form, hooks=hooks, tiles=at, family=launching, training=True,
                             interpret=interpret, anchors=found, counted=counted, columns=first,
-                            registered=registered, tmem_columns=tmem_columns, query_in_tmem=query_in_tmem)
+                            registered=registered, tmem_columns=tmem_columns)
                     for first, values, held in _column_blocks(v, hooked, at.columns)]
         status, rows, anchors, _ = launched[0]
         if form.headroom and len(launched) > 1:
@@ -1423,8 +1423,7 @@ def _certified_step(family: mosaic.Family, certified: tuple, index, state: algeb
 
 def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
                    scale: float, natural: bool, tiles: Tiles, interpret: bool, subtracted: bool = False,
-                   registered: ForwardRegisters | None = None, tmem_columns: int | None = None,
-                   query_in_tmem: bool = True):
+                   registered: ForwardRegisters | None = None, tmem_columns: int | None = None):
     """The forward's certify form (off in production; row 2084's native step witness): its plain launch at
     `tiles` alone, no fold's rewalk, whose walk stores its online-softmax state after each key tile j
     (`algebra.Partial`: the rows' running maxima and denominators in the walk's units, the sums before the
@@ -1454,7 +1453,7 @@ def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             jax.new_ref(launches.filled((batch, heads, steps, padded, value_width), jnp.float32, q, k, v)))
     _launch(q, k, v, at_spans, hooked, spec=form, hooks=hooks, tiles=at, family=family, training=False,
             interpret=interpret, certified=True, into=held, registered=registered,
-            tmem_columns=tmem_columns, query_in_tmem=query_in_tmem)
+            tmem_columns=tmem_columns)
     out, rows, sums = (jax.freeze(ref) for ref in held)
     queries, width = call.queries, value.shape[3]
     return out[:, :queries, :, :width], rows[..., :queries], sums[:, :, :, :queries, :width]
@@ -1769,7 +1768,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
             certified: bool = False, into: tuple | None = None,
             keeping: jax.Array | None = None, flags: bool = False, parts: int = 1,
             registered: ForwardRegisters | None = None, in_key: bool = False, decides: bool = False,
-            tmem_columns: int | None = None, query_in_tmem: bool = True):
+            tmem_columns: int | None = None, products: tuple | None = None):
     """The forward's launch in `spec`'s form: its rows' status `[1, B, H, Qp]` fp32, their maxima in the
     walk's units (`algebra.walked_launches`' fold guard), and its output `[B, Qp, H, Dv]` in `out_dtype`
     (the query's by default). In `training`, at the `anchors` a peak walk found, its status and residuals
@@ -1840,7 +1839,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
                      registers=None if registered is None else registered.at(family, tiles, peaks=peaks,
                                                                               columns=column_width),
                      value_columns=value_columns, decides=decides, tmem_columns=tmem_columns,
-                     query_in_tmem=query_in_tmem)
+                     products=products)
 
 
 def _extents(query, key, value, read: _Read, *, page: int | None, column_width: int | None, parts: int
@@ -2006,14 +2005,14 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
                       "counted", "finishes", "name", "splits", "page", "column_width", "shared_by",
                       "certified", "flags", "walk_rows", "parts", "registers", "value_columns", "decides",
-                      "tmem_columns", "query_in_tmem"))
+                      "tmem_columns", "products"))
 def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, name: str, splits: int = 1,
               page: int | None = None, column_width: int | None = None, shared_by: int = 1,
               certified: bool = False, flags: bool = False, walk_rows: int | None = None, parts: int = 1,
               registers: int | None = None, value_columns: int | None = None, decides: bool = False,
-              tmem_columns: int | None = None, query_in_tmem: bool = True):
+              tmem_columns: int | None = None, products: tuple | None = None):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
@@ -2062,9 +2061,10 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                         kinds=kinds, peaks=peaks, training=training, finishes=finishes, certified=certified,
                         interpret=interpret, value_width=value_width)
 
-    products = forward_products(family, tiles, value_width, query.dtype, peaks=peaks, parts=parts,
-                                ahead=bool(program.ahead), scaled=spec.headroom, training=training,
-                                query_width=width if query_in_tmem else None, tmem_columns=tmem_columns)
+    products = (products if products is not None else
+                forward_products(family, tiles, value_width, query.dtype, peaks=peaks, parts=parts,
+                                 ahead=bool(program.ahead), scaled=spec.headroom, training=training,
+                                 tmem_columns=tmem_columns))
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,

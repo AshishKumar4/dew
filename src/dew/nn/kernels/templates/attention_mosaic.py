@@ -549,16 +549,16 @@ class MosaicForward(_Mainloop[Tiles]):
                                                      sources, scales, initial, priced=False)
         family = bundle_of(config, query.dtype)
         target = self.launch_target()
-        query_in_tmem = False
-        if family.places_on_role and self.parts == 1:
+        products = None
+        if family.places_on_role and residuals is not Kept.SPLIT and self.parts == 1:
             ba = self.bind(query, key, value, start, end, query_ids, key_ids, score_params, output_params,
                            initial, drop, table, sources, scales, query_params, residuals=residuals,
                            interpret=interpret)
-            query_in_tmem = placed.QUERY in family.product_scratch(*self._products(ba, config, target))
+            products = self._products(ba, config, target)
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret,
-                "counts": not self.scaled, "registered": registered, "tmem_columns": target.tmem_columns,
-                "query_in_tmem": query_in_tmem}
+                "counts": not self.scaled, "registered": registered, "tmem_columns": target.tmem_columns}
         scaled = (self.scaled or (self.cached(table, sources, scales) and not self.bounded)) and not decides
+
         def launched():
             match residuals:
                 case Kept.SPLIT:
@@ -571,7 +571,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                           out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
                                           table=table, sources=sources, subtracted=self.subtracted,
                                           scales=scales, parts=self.parts, scaled=scaled, decides=decides,
-                                          in_key=self.reads_key_slot(bundle_of(config, query.dtype)), **form)
+                                          in_key=self.reads_key_slot(family), products=products, **form)
 
         if scaled or decides or self.bounded or hooks.rounds is not None or not algebra.headroom(value.dtype):
             return launched(), None

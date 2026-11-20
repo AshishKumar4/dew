@@ -153,6 +153,10 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
             if event.kind == "wait":
                 waiters.setdefault(event.at[0], set()).add(c)
     owner_of = {barrier: next(iter(owners)) for barrier, owners in waiters.items() if len(owners) == 1}
+    # Each consumer's first exclusive waited barrier in the walk is its `scored` barrier (`placed.py:321`).
+    scored_of = {
+        next(event.at[0] for event in threads[c] if event.kind == "wait" and owner_of.get(event.at[0]) == c): c
+        for c in range(tiles.consumers)}
 
     copies = _tmem_q_copies(issuer)
     assert len(copies) == tiles.consumers
@@ -160,18 +164,20 @@ def test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_inte
     tmem_source = {dst: src for _, dst, src in copies}
     assert set(tmem_source.values()) == set(q_smem.values())
 
-    # Every score MMA reads a Q TMEM tile filled from the SMEM Q ref of the consumer whose barrier it signals;
-    # swapping `lefts` indices in `placed.py:350` fails this pairing check (row 9474).
-    score_mmas = [(i, event) for i, event in enumerate(issuer)
-                  if event.kind == "product" and len(event.argument) == 2
-                  and any(src in written_at for src in event.argument)]
+    # Identify every score MMA independently by its following `scored` commit (so a score MMA reading Q
+    # directly from SMEM cannot be filtered out), and verify it reads the TMEM tile copied from its
+    # consumer's own Q SMEM ref (row 9474).
+    score_mmas = []
+    for i, event in enumerate(issuer):
+        if event.kind == "product" and len(event.argument) == 2:
+            next_commit = next((later for later in issuer[i + 1:] if later.kind == "committed"), None)
+            if next_commit is not None and next_commit.at[0] in scored_of:
+                score_mmas.append((i, event, scored_of[next_commit.at[0]]))
     assert len(score_mmas) >= tiles.consumers
     seen_consumers = set()
-    for i, event in score_mmas:
+    for i, event, consumer in score_mmas:
         q_srcs = [src for src in event.argument if src in written_at]
         assert len(q_srcs) == 1 and written_at[q_srcs[0]] < i
-        consumer = next(owner_of[later.at[0]] for later in issuer[i + 1:]
-                        if later.kind == "committed" and later.at[0] in owner_of)
         assert tmem_source[q_srcs[0]] == q_smem[consumer]
         seen_consumers.add(consumer)
     assert seen_consumers == set(range(tiles.consumers))
@@ -265,9 +271,7 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
     def traced_models(jaxpr) -> list:
         found = []
         for eq in jaxpr.eqns:
-            name = eq.params.get("compiler_params", {}).get("mosaic_gpu", {}).get("name")
-            if name is None and "name" in eq.params and isinstance(eq.params["name"], str):
-                name = eq.params["name"]
+            name = eq.params.get("name")
             if isinstance(name, str):
                 kernel, launch = report.kernel_of(name)
                 if (launch is not None and (record := report.traced(launch)) is not None
@@ -279,15 +283,18 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
 
     target = generation.gpu_target("sm100")
     spans = template.spans(128, 256, 1)
-    for v_width, expect_copy, expect_most in ((32, True, 2), (128, False, 2)):
+    v32_tiles = dataclasses.replace(ROWS_TILES, columns=32)
+    for v_width, pinned, expect_cols, expect_copy, expect_most in (
+            (32, v32_tiles, 224, True, 2), (128, ROWS_TILES, 256, False, 2)):
         q = jnp.ones((1, 128, 1, 128), jnp.bfloat16)
         k = jnp.ones((1, 256, 1, 128), jnp.bfloat16)
         v = jnp.ones((1, 256, 1, v_width), jnp.bfloat16)
         op = attention_mosaic.MosaicForward(scale=128 ** -0.5, keys=256, form="full")
         ba = op.bind(q, k, v, None, None, None, None, (), (), None,
                      residuals=template.Kept.NONE, interpret=False)
-        with generation.assumed("sm100"), _pinned(ROWS_TILES):
-            assert op.resident(ba, ROWS_TILES, target) == expect_most
+        with generation.assumed("sm100"), _pinned(pinned):
+            assert op.tmem_columns(ba, pinned, target) == expect_cols
+            assert op.resident(ba, pinned, target) == expect_most
             traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
                 q, k, v, spans, interpret=False))(q, k, v).jaxpr
         assert has_tmem_copy(traced) is expect_copy
