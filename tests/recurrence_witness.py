@@ -64,6 +64,7 @@ from interval_certificates import (
 from native_certificates import TRUNCATING, truncating_underflow
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 
+from dew._hashing import array_fingerprint
 from dew.nn.kernels import recurrence_algebra, tables
 from dew.nn.kernels.templates import product
 from dew.nn.kernels.templates.recurrence import chunk_forward, intra, mainloop, template
@@ -630,14 +631,6 @@ def launched(program, operands: tuple, role: str):
     return found
 
 
-def digested(arrays) -> str:
-    """A digest of `arrays`' bytes (a pytree's leaves), which names the values a program closes over."""
-    import jax
-
-    joined = b"".join(np.ascontiguousarray(x).tobytes() for x in jax.tree.leaves(arrays))
-    return hashlib.sha1(joined).hexdigest()[:16]
-
-
 def _through(operands: tuple, starts, last: int) -> tuple:
     """A call's operands and documents (`recorded`'s) with every token past `last` the identity (no decay,
     key, value or write, no document begun), at the call's own shape, in NumPy: its walk past `last` leaves
@@ -738,9 +731,8 @@ def tf32_conversion(family) -> Literal["plain", "rna", "read"]:
     return "rna" if family.rounds_tf32 else "read"
 
 
-def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
-             carried: bool = True, delta: bool = True,
-             rounded: bool | None = None, walked: bool = False) -> Run:
+def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None, carried: bool = True,
+             delta: bool = True, rounded: bool | None = None, walked: bool = False) -> Run:
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
     JAX's own default precision as a model trains it: `chunk_forward.kept_forward` at the tiles the route
     takes (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
@@ -782,9 +774,12 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                                                        write_bound=1.0)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
-        # The options the call's programs close over, which name their launches (`launched`).
+        # The options the call's programs close over name their launches (`launched`), the starts' by digest.
+        hasher = hashlib.sha1()
+        if starts is not None:
+            array_fingerprint(hasher, np.asarray(starts))
         form = (f"delta {delta}, rounded {rounded}, walked {walked}, segments {max_segments}, starts "
-                f"{None if starts is None else digested(starts)}")
+                f"{None if starts is None else hasher.hexdigest()[:16]}")
         o, final, tiles, trained = _route_forward(route, operands, walked, form)
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's
         # (`Tiles.forward`, the template's primal), which a call its fast backward takes narrows apart.
@@ -808,8 +803,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         for native, own in ((o, kept_o), (final, kept_final)):
             assert np.array_equal(np.asarray(native).view(np.uint8), np.asarray(own).view(np.uint8)), \
                 "the certify build is the production program"
-        _, length, heads, value_width = v.shape
-        key_width = k.shape[-1]
+        (_, length, heads, value_width), key_width = v.shape, k.shape[-1]
         table = laid_chunks(length, starts, max_segments, chunk)
         chunks = len(table)
         # Each chunk's leaving memory: the final memory of the call through its last token (`through`), the
@@ -1659,7 +1653,9 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
       to the chunk's start and scaled, `do` as given;
     - `_key_memory_back` (`algebra.key_memory_block`): `dq_m = scale exp2(E) (do h^T)`, `dk_m = exp2(E_last -
       E) (c dh^T) + d(kg beta) exp2(E) beta`, `d(kg beta) = -(dw + L^T dw)`, `dw = dv h^T`;
-    - `_key_values_back` (`algebra.key_values_back`): `values = beta (dv + L^T dv)`;
+    - `_key_values_back` (`algebra.key_values_back`): `values = beta (dv + L^T dv)`, and the keys' system's
+      gradient `d_system = -(X^T tril(dA, -1) X^T)` (`algebra.key_system_back`), `X = I + L`, `dA = du (v
+      beta)^T - dw (k exp2(E) beta)^T` (the memory launch's part, `key_memory_block`'s, beside the values');
     - `_key_pairs_back`: the pairs' transpose of the scores' gradient scaled (`key_pairs_back`) for `dq_p`,
       and of the system's for `dk_p`."""
     exponents = Exponents.of(step.g)
@@ -1689,6 +1685,12 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
     dk_memory = fp32(add(d_key, fp32(mul(fp32(mul(d_gated, raised), lane), point(beta)), lane)), lane)
     du = point(step.dv)
     values = fp32(mul(fp32(add(du, dot(lower_t, du, lane)), lane), point(beta)), lane)
+    gated = staged(fp32(mul(fp32(mul(point(step.k), raised), lane), point(beta)), lane), lane)
+    valued = staged(fp32(mul(point(step.v), point(beta)), lane), lane)
+    d_a = fp32(add(neg(dot(d_weight, tr(gated), lane)), dot(du, tr(valued), lane)), lane)
+    d_a = staged(where(lag > 0, d_a, zeros), lane)
+    right = staged(fp32(add(d_a, dot(d_a, lower_t, lane)), lane), lane)
+    d_system = where(lag > 0, neg(fp32(add(right, dot(lower_t, right, lane)), lane)), zeros)
     d_scores_scaled = fp32(mul(point(step.d_scores), factor), lane)
     dq_pairs, scored_keys = key_pairs_back(d_scores_scaled, step.q, step.k, exponents, lane)
     keyed_rows = fp32(mul(point(step.k), point(beta)), lane)
@@ -1697,11 +1699,12 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
     keys = fp32(add(scored_keys, system_keys), lane)
     dk_pairs = fp32(add(fp32(mul(d_keyed, point(beta)), lane), keys), lane)
     return {"d_scores": d_scores, "local": local, "dv": dv, "entering": entering, "dq_memory": d_query,
-            "dk_memory": dk_memory, "values": values, "dq_pairs": dq_pairs, "dk_pairs": dk_pairs}
+            "dk_memory": dk_memory, "values": values, "d_system": d_system, "dq_pairs": dq_pairs,
+            "dk_pairs": dk_pairs}
 
 
-KEY_BACK_RECORDS = ("d_scores", "local", "dv", "entering", "dq_memory", "dk_memory", "values", "dq_pairs",
-                    "dk_pairs")
+KEY_BACK_RECORDS = ("d_scores", "local", "dv", "entering", "dq_memory", "dk_memory", "values", "d_system",
+                    "dq_pairs", "dk_pairs")
 """The records a decay a key dimension's fast backward keeps (`key_backward.KeyKept`), one value head's."""
 
 
