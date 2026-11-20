@@ -299,8 +299,8 @@ def test_a_padded_merge_compiles_as_one_launch(name):
         padded = jax.ShapeDtypeStruct((2, slices, 16, 8, width), jnp.float32)
         stacked = jax.ShapeDtypeStruct((2, 2, 8, slices, 16), jnp.float32)
         merge = functools.partial(merged.merged_padded, SPECS["natural"], queries=4, width=width)
-        return KernelCase(label, lambda merge=merge, padded=padded, stacked=stacked: (merge, (padded, stacked)))
-
+        return KernelCase(
+            label, lambda merge=merge, padded=padded, stacked=stacked: (merge, (padded, stacked)))
     batched_padded = jax.ShapeDtypeStruct((3, 2, 16, 16, 8, 64), jnp.float32)
     batched_stacked = jax.ShapeDtypeStruct((3, 2, 2, 8, 16, 16), jnp.float32)
     batched = jax.vmap(lambda padded, stacked: tuple(merged.merged_padded(SPECS["natural"], padded, stacked,
@@ -312,5 +312,6 @@ def test_a_padded_merge_compiles_as_one_launch(name):
         records = compile_kernels(cases, name)
     for record in records:
         assert "error" not in record, record
-        expected = ["merged_padded", "wrapped_transpose"] if record["name"] == "batched" else ["merged_padded"]
+        expected = (["merged_padded", "wrapped_transpose"] if record["name"] == "batched"
+                    else ["merged_padded"])
         assert sorted(record["thunks"]) == expected, record

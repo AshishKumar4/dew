@@ -410,9 +410,10 @@ def test_the_decode_matrix_holds_on_this_tpu():
                          ids=["default-64", "highest-128"])
 def test_a_paged_decode_step_on_this_tpu_falls_back_where_jaxs_kernel_refuses(width, precision):
     """A bf16 paged pool's decode step on this TPU (`kv_cache.KVStore.decode`, 16 query heads over 8, the
-    selector's own kernel) at a width (64) or precision (`'highest'` on v5e) where `kv_cache.TPU_PAGED_SUPPORTS`
-    refuses jax's Pallas paged attention (rows 7385, 10142): on par with the reference path (check 1) through
-    the fallback route where refused, and through `tpu` where a newer TPU's MXU takes fp32-by-bf16."""
+    selector's own kernel) at a width (64) or precision (`'highest'` on v5e) where
+    `kv_cache.TPU_PAGED_SUPPORTS` refuses jax's Pallas paged attention (rows 7385, 10142): on par with the
+    reference path (check 1) through the fallback route where refused, and through `tpu` where a newer
+    TPU's MXU takes fp32-by-bf16."""
     from dew.nn.kernels import generation
 
     case = {"generation": "tpu", "layout": "paged", "heads": "gqa-16-8", "hook": "plain", "dtype": "bfloat16",
