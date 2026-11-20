@@ -608,6 +608,11 @@ def test_an_entry_write_at_fp32s_edge_enters_its_document_as_float64_does(key, v
     assert_contract(documents_on_the_kernel, operands, operands, seeded,
                     "the TPU kernel's forked call at fp32's edge", truth_fn=documents_one_by_one,
                     without=REVERSE_ONLY)
+    # Through the route a model takes (`documents_as_selected`), every order: its forward mode and the orders
+    # past the first the products' wrapper's (`recurrence_chunk._per_product`), the kernel's rule reverse
+    # mode's alone (row 9698).
+    assert_contract(documents_as_selected, operands, operands, seeded,
+                    "the selected scan's forked call at fp32's edge", truth_fn=documents_one_by_one)
 
 
 def test_an_entry_writes_gradient_lowers_for_a_tpu():
@@ -645,21 +650,24 @@ def test_the_recurrence_matrix_holds_on_this_tpu():
     run_cells(cells_of(recurrence_matrix.a_recurrences_training_step_on_a_tpu_is_on_par))
 
 
-def test_tpu_ssd_jvp_combines_read_and_decay_without_carry_overflow():
-    """Base review e488dc198 F2: `_chunk_scan` JVP reuses `_chunk_forward` so `B0 = 2^100`, `C0 = 2^-100`,
-    `dx0 = 2^30`, `a1 = -20 ln 2` yields finite read tangent `2^30` and final-state tangent `2^110` without
-    materializing a `2^130` fp32 carry."""
-    from dew.nn.kernels.ssd import _chunk_scan
-
+def test_the_scans_forward_mode_combines_read_and_decay_without_carry_overflow():
+    """Base review e488dc198 F2 on the route's forward mode (`recurrence_chunk._per_product`, the portable
+    chunked op's tangent; `ssd._chunk_scan` keeps reverse mode alone, row 9698): a read of `C0 = 2^-100`
+    against a write of `B0 = 2^100` under an input's tangent of `2^30`, a decay of `2^-20` at the second
+    token, gives the read's tangent `2^30` and the final memory's `2^110`, exactly, without forming the
+    `2^130` write the fp32 carry cannot hold."""
     x = jnp.zeros((1, 64, 1, 16), jnp.float32)
     dx = x.at[0, 0, 0, 0].set(np.float32(2.0 ** 30))
     b = jnp.zeros((1, 64, 1, 16), jnp.float32).at[0, 0, 0, 0].set(np.float32(2.0 ** 100))
     c = jnp.zeros((1, 64, 1, 16), jnp.float32).at[0, 0, 0, 0].set(np.float32(2.0 ** -100))
     a = jnp.zeros((1, 64, 1), jnp.float32).at[0, 1, 0].set(np.float32(-20.0 * np.log(2.0)))
-    st = jnp.zeros((1, 1, 16, 16), jnp.float32)
-    _, (dy, dfinal) = jax.jvp(lambda x_: _chunk_scan(x_, b, c, a, st, None, 64, "tpu", 0), (x,), (dx,))
-    assert np.isfinite(np.asarray(dy)).all() and np.isfinite(np.asarray(dfinal)).all()
-    np.testing.assert_array_equal(np.asarray(dy[0, 0, 0, 0]), np.float32(2.0 ** 30))
-    np.testing.assert_array_equal(np.asarray(dy[0, 1:, 0, 0]), np.zeros(63, np.float32))
+    hooks = recurrence.Hooks(decay='scalar', delta=False, scale=1.0)
+
+    def scan(x_):
+        return recurrence_chunk.chunk(hooks, recurrence_chunk.Chunk(c, b, x_, log_decay=a), chunk_size=64)
+
+    _, (dy, dfinal) = jax.jvp(scan, (x,), (dx,))
+    np.testing.assert_array_equal(np.asarray(dy[0, :, 0, 0]),
+                                  np.asarray([2.0 ** 30] + [0.0] * 63, np.float32))
     want = jnp.exp(a[0, 1, 0]) * b[0, 0, 0, 0] * dx[0, 0, 0, 0]
     np.testing.assert_array_equal(np.asarray(dfinal[0, 0, 0, 0]), np.asarray(want))
