@@ -7,6 +7,8 @@ widens one. Integer arithmetic on a float's bits alone, which `dew.nn.precision`
 
 from __future__ import annotations
 
+import contextlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -157,8 +159,13 @@ def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
 
     x = jnp.asarray(x)
     source = x.dtype
-    return linear_map(lambda _, moving: _widened_bits(moving, dtype),
-                      lambda _, cotangent: cotangent.astype(source), (), x,
+
+    def apply(_, moving):
+        # Traced where JAX evaluates the map, which may lie outside its caller's x64 scope (`float64_sum`'s).
+        with jax.enable_x64(new_val=True) if dtype == jnp.dtype(jnp.float64) else contextlib.nullcontext():
+            return _widened_bits(moving, dtype)
+
+    return linear_map(apply, lambda _, cotangent: cotangent.astype(source), (), x,
                       out_aval=jax.typeof(x).update(dtype=dtype))
 
 
