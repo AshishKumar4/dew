@@ -7,7 +7,7 @@ import itertools
 import jax
 import jax.numpy as jnp
 import pytest
-from contract_support import EDGES, REVERSE_ONLY, assert_drawn_contract, normal_draw
+from contract_support import EDGES, ORDER_SETS, REVERSE_ONLY, assert_drawn_contract, normal_draw
 from reference_error import FEWEST_SEEDS
 
 from dew.nn import attention, kv_cache
@@ -168,12 +168,15 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
                           truth_fn=plain, plain_fn=plain, seeds=8)
 
 
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", EDGES)
-def test_a_padded_merges_derivatives_are_the_laws(edge):
+def test_a_padded_merges_derivatives_are_the_laws(edge, taken):
     """`merged.merged_padded` (a split decode step's slices merged where its launch wrote them; its value one
     launch on a GPU, its tangent the law's path's, a custom JVP): every order runs, finite wherever float64
     is a normal float32 and the law's path (`merged._value`, differentiated by JAX) is, at padded outputs and
-    maxima near float32's ends, two slices' totals drawn positive."""
+    maxima near float32's ends, two slices' totals drawn positive; each order set a case of its own
+    (`ORDER_SETS`: every order in one case held its group to 1,798 s, its law's unrolled windows' programs
+    compiled at each)."""
     spec = algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True))
 
     def inputs(seed: int, scale: float) -> tuple:
@@ -192,8 +195,8 @@ def test_a_padded_merges_derivatives_are_the_laws(edge):
     def law(padded, stacked):
         return merged._value(padded, stacked, spec=spec, queries=2, width=8)[0]
 
-    assert_drawn_contract(merge, inputs, EDGES[edge], f"a padded merge {edge}", plain_fn=law,
-                          seeds=FEWEST_SEEDS)
+    assert_drawn_contract(merge, inputs, EDGES[edge], f"a padded merge {edge} ({taken})", plain_fn=law,
+                          seeds=FEWEST_SEEDS, taking=ORDER_SETS[taken])
 
 
 @pytest.mark.parametrize("edge", EDGES)
