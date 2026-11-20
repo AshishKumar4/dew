@@ -10,15 +10,23 @@ their keys through `index_scores` and select through `top_k_selection`,
 read, and `sparse_latent_attention` attends it without that mask.
 """
 
+import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
+from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.inputs import sequence_blocks
-from dew.nn.precision import accumulated, at_least_fp32, float32_einsum
+from dew.nn.kernels import generation
+from dew.nn.kernels.generation import INHERENT, Choice, backend
+from dew.nn.kernels.selection import Kernel, Op, Requirement, select
+from dew.nn.precision import accumulated, at_least_fp32, exact_products, float32_einsum
 from dew.nn.scatter import DROPPED
+from dew.nn.sharding import manual_map
 
 
 def index_agreements(query, keys, precision=None):
@@ -126,9 +134,27 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
     slots where the dense kernel averages every key; both are outputs
     nothing reads.
     """
-    batch, length, heads, _ = query_nope.shape
     absorbed = float32_einsum('bshn,rhn->bshr', query_nope, key_weight.astype(query_nope.dtype),
+                              precision=precision)
+    batch, length, heads, rank = absorbed.shape
+    dtypes = tuple(jnp.dtype(x.dtype) for x in (absorbed, query_rot, latent, rot))
+    case = SparseCase(heads, rank, query_rot.shape[-1], indices.shape[-1], dtypes, batch * length,
+                      batch * latent.shape[1], scale, precision)
+    if select(SPARSE, case).kernel == 'template':
+        context = templated_context(scale, precision, block)(absorbed, query_rot, latent, rot, indices)
+    else:
+        context = blocked_context(absorbed, query_rot, latent, rot, indices, scale=scale, precision=precision,
+                                  block=block)
+    return float32_einsum('bshr,rhv->bshv', context, value_weight.astype(context.dtype),
                           precision=precision)
+
+
+def blocked_context(absorbed, query_rot, latent, rot, indices, *, scale: float, precision=None,
+                    block: int = SPARSE_QUERY_BLOCK):
+    """`sparse_latent_attention`'s heads' context in the latent space `[B, S, H, r]`, in XLA: each block of
+    `block` queries gathers its selection's latents and rope heads and attends them, under
+    `jax.checkpoint`, so neither pass holds more than one block's gathered latents."""
+    batch, length, heads, _ = absorbed.shape
     blocks = -(-length // block)
 
     def blocked(x):
@@ -144,17 +170,131 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
         keys, rots = gathered(latent, at), gathered(rot, at)
         wide = at_least_fp32(q_latent.dtype)
         logits = (float32_einsum('bqhr,bqkr->bqhk', q_latent, keys, precision=precision,
-                             preferred_element_type=wide)
+                                 preferred_element_type=wide)
                   + float32_einsum('bqhp,bqkp->bqhk', q_rot, rots, precision=precision,
-                               preferred_element_type=wide)) * scale
+                                   preferred_element_type=wide)) * scale
         logits = jnp.where(allowed[:, :, None, :], logits, jnp.finfo(wide).min)
-        weights = jax.nn.softmax(logits, axis=-1).astype(keys.dtype)
-        return float32_einsum('bqhk,bqkr->bqhr', weights, keys, precision=precision)
-
+        weights = jax.nn.softmax(logits, axis=-1)
+        return float32_einsum('bqhk,bqkr->bqhr', weights, keys.astype(wide), precision=precision,
+                              preferred_element_type=wide).astype(keys.dtype)
     context = jax.lax.map(attend, tuple(blocked(x) for x in (absorbed, query_rot, indices)))
-    context = jnp.moveaxis(context, 0, 1).reshape(batch, blocks * block, heads, -1)[:, :length]
-    return float32_einsum('bshr,rhv->bshv', context, value_weight.astype(context.dtype),
-                      precision=precision)
+    return jnp.moveaxis(context, 0, 1).reshape(batch, blocks * block, heads, -1)[:, :length]
+
+
+@dataclasses.dataclass(frozen=True)
+class SparseCase:
+    """A sparse latent attention call as its selector reads it (`SPARSE`): its `heads`, each over a latent
+    `rank` wide and a rope head `rope` wide, the `top_k` slots each query selects, its four operands'
+    `dtypes`, its `rows` (a row a query), its `pool_keys` (`B * T`), its `scale`, and its dot `precision`
+    (`TEMPLATE_SPARSE_SUPPORTS`)."""
+
+    heads: int
+    rank: int
+    rope: int
+    top_k: int
+    dtypes: tuple[jnp.dtype, ...]
+    rows: int
+    pool_keys: int
+    scale: float
+    precision: jax.lax.PrecisionLike = None
+
+
+def _template_tiles(case: SparseCase) -> bool:
+    """Whether the attention template's decode reads `case`'s selection on the GPU: its work list derives a
+    launch (`attention_decode.planned`, as `templated_context` takes the call)."""
+    from dew.nn.kernels.templates import attention as template, attention_decode
+
+    if backend() != "gpu":
+        return False
+    dtype = case.dtypes[0]
+    width = case.rank + case.rope
+    query = jax.ShapeDtypeStruct((case.rows, 1, case.heads, width), dtype)
+    pool = jax.ShapeDtypeStruct((1, case.pool_keys, 1, width), dtype)
+    table = jax.ShapeDtypeStruct((case.rows, case.top_k), jnp.int32)
+    derived = []
+
+    def planned(query, pool, table):
+        lengths = jnp.full((case.rows,), case.top_k, jnp.int32)
+        spans = template.spans(1, case.top_k, case.rows, lengths=lengths)
+        derived.append(attention_decode.planned(query, pool, pool[..., :case.rank], spans, template.Hooks(),
+                                                scale=case.scale, table=table)[0])
+        return query
+
+    jax.eval_shape(planned, query, pool, table)
+    return derived[0] is not None
+
+
+TEMPLATE_SPARSE_SUPPORTS: tuple[Requirement[SparseCase], ...] = (
+    Requirement('dtype',
+                lambda case: len(set(case.dtypes)) == 1 and case.dtypes[0] in (jnp.bfloat16, jnp.float16),
+                lambda case: f"the template's decode reads matching 16-bit operands, not {case.dtypes}",
+                row=INHERENT),
+    Requirement('precision', lambda case: exact_products(case.precision, case.dtypes[0]),
+                lambda case: f"the template's decode runs exact 16-bit products, not {case.precision}",
+                row=INHERENT),
+    Requirement('tiles', _template_tiles,
+                lambda case: f"the attention template's decode derives no launch over {case.top_k} selected "
+                             f"latents {case.rank + case.rope} wide on this GPU", row=INHERENT),
+)
+"""What the attention template's decode needs to read a selection (`templated_context`)."""
+
+
+def _sparse_preferred(case: SparseCase) -> str:
+    """The attention template's decode over the selected latents on a GPU, the blocked XLA path elsewhere."""
+    return 'template' if backend() == 'gpu' else 'xla'
+
+
+SPARSE: Op[SparseCase] = Op(Choice.SPARSE_ATTENTION, (
+    Kernel('template', TEMPLATE_SPARSE_SUPPORTS),
+    Kernel('xla', (), generic=True),
+), _sparse_preferred)
+"""The sparse latent attention's selector: on a GPU the attention template's decode loads each query's
+selected latents into its key tiles (`templated_context`), where its requirements hold
+(`TEMPLATE_SPARSE_SUPPORTS`); else the blocked XLA path (`blocked_context`), which gathers them."""
+
+
+def _template_forward(absorbed, query_rot, latent, rot, indices, *, scale: float):
+    """`templated_context`'s value: a row a query, its heads its rows (`attention_decode.packed`), over its
+    selection's latents as one-key pages of the pool of every row's latents and rope heads side by side
+    (`[1, B * T, 1, r + p]`, its values the latents' `r` columns), loaded into the walk's key tiles by the
+    page table of its selection's slots (`attention_mosaic_forward.paged_reads`), the slots that name a key
+    first, in order, and its keys spanning them; a query naming none reads its first slot, an output
+    nothing reads. Interpreted where the arrays lie off a GPU, whatever GPU the call is chosen for."""
+    from dew.nn.kernels.templates import attention as template, attention_decode
+
+    batch, length, heads, rank = absorbed.shape
+    keys = latent.shape[1]
+    query = jnp.concatenate([absorbed.astype(latent.dtype), query_rot.astype(latent.dtype)], axis=-1)
+    pool = jnp.concatenate([latent, rot.astype(latent.dtype)], axis=-1).reshape(1, batch * keys, 1, -1)
+    named = indices >= 0
+    taken = jnp.take_along_axis(indices, jnp.argsort(~named, axis=-1, stable=True), axis=-1)
+    table = (jnp.maximum(taken, 0) + keys * jnp.arange(batch)[:, None, None]).astype(jnp.int32)
+    lengths = jnp.maximum(jnp.sum(named, axis=-1), 1).reshape(-1)
+    def local(query, pool, table, lengths):
+        spans = template.spans(1, indices.shape[-1], query.shape[0], lengths=lengths)
+        return attention_decode.attend(query, pool, pool[..., :rank], spans, template.Hooks(),
+                                       scale=scale, table=table,
+                                       interpret=generation.placed_platform() != "gpu")
+
+    out = manual_map(local, (P(), P(), P(), P()), P())(
+        query.reshape(batch * length, 1, heads, -1), pool, table.reshape(batch * length, -1), lengths)
+    return out.reshape(batch, length, heads, rank), ()
+
+
+@functools.cache
+def templated_context(scale: float, precision, block: int) -> Callable:
+    """`blocked_context`'s heads' context under `scale`, its value the attention template's decode over the
+    selected latents (`_template_forward`), its derivatives at every order the blocked XLA path's at
+    `precision` and `block` (`generation.linear_tangent`): reverse mode its pullback, forward mode its
+    tangent; a selection takes none."""
+    portable = functools.partial(blocked_context, scale=scale, precision=precision, block=block)
+
+    def backward(saved, operands, cotangent):
+        return tuple(jax.vjp(portable, *operands)[1](cotangent))
+
+    return contracted("test_the_sparse_latent_kernel_holds_every_order")(
+        generation.linear_tangent(functools.partial(_template_forward, scale=scale), backward, portable,
+                                  kind=KernelGlue()))
 
 
 def block_maxima(scores, visible, block_size: int):
