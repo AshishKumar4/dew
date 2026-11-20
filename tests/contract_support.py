@@ -50,7 +50,16 @@ FORKED = (((1, 2, 2), (1, 0, 0)), ((1, 2, 3), (1, 2, 0)))
 (`recurrence_chunk.Chunk.loads`, `Chunk.stores`), one given memory a row then two stored: the first row's
 start continued by its first document, whose final both later documents enter (a slot's gradient summing
 two documents'); the second row a chain from its start, each document entering its predecessor's final.
-Every memory is entered, so no gradient's row is float64 zero, whose terms the gate would trace each draw."""
+Every memory is entered, so no gradient's row is float64 zero, whose terms the gate would trace each draw.
+Its token boundaries are each route's (test_recurrence_chunk's, test_ssd_kernel's `DOCUMENTS`)."""
+
+HELD = 2
+"""The stored slots `FORKED`'s rows hold (`Chunk.held`)."""
+
+ADDS = ((0, 0, 1), (0, 0, 2))
+"""Each `FORKED` row's documents' added slots (`Chunk.adds`): the first row's last document adding its row's
+given memory to its parent's final, the second row's the first document's final to its predecessor's (row
+7662)."""
 
 
 class Entries(NamedTuple):
@@ -66,18 +75,22 @@ class Entries(NamedTuple):
 
 def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values: int) -> Entries:
     """Entry writes of `CANCELLING_LEVELS`' seven products on their keys' first dimension for a forked call
-    over `FORKED`'s table, as its route and its oracle read them alike: each value column scaled by a drawn
-    sign and a power of two of 2^-28 to 2^-33 a draw, so even a row's three writes' terms sum inside
-    float32's range, as the gates' sums must (testing.md's derivative contracts), their ties kept; weights of
-    another, each document's signed by the memory it enters (`_entered_signs`), so every memory is one or two
-    writes; and cotangents (`Entries.signed`) of one power of two a draw, so a sum of the call's outputs and
-    gradients float32 holds exactly or rounds once, as float64's."""
+    over `FORKED`'s table, as its route and its oracle read them alike: each head's first value column
+    scaled by a drawn sign and a power of two of 2^-28 to 2^-33 a draw, so even a row's three writes' terms
+    sum inside float32's range, as the gates' sums must (testing.md's derivative contracts), their ties kept,
+    and its other columns zero, so an entry key's gradient is one product of the levels' (rounded once, as
+    float64's; over many columns float32's sum of them rounded at each, an ulp off it); weights of
+    another, each document's signed by the memory it enters (`_entered_signs`), so every memory is zero, one
+    or two writes, a stored one cancelled exactly among them; and cotangents (`Entries.signed`) of one power
+    of two a draw, so a sum of the call's outputs and gradients float32 holds exactly or rounds once, as
+    float64's."""
     rows, documents = len(FORKED), len(FORKED[0][0])
     rng = np.random.default_rng([8840, seed])
     factors, levels = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
     key = np.zeros((rows, documents, len(factors), key_heads, keys), np.float32)
     key[..., 0] = factors[:, None]
-    columns = rng.choice([-1.0, 1.0], (heads, values)) * 2.0 ** -int(rng.integers(28, 34))
+    columns = np.zeros((heads, values))
+    columns[:, 0] = rng.choice([-1.0, 1.0], heads) * 2.0 ** -int(rng.integers(28, 34))
     value = np.broadcast_to(levels[:, None, None] * columns, (rows, documents, len(levels), heads, values))
     signs = _entered_signs(rng.choice([-1.0, 1.0], (rows, heads)))
     scale = 2.0 ** -int(rng.integers(10, 15))
@@ -90,15 +103,20 @@ def cancelling_entries(seed: int, key_heads: int, keys: int, heads: int, values:
 
 
 def _entered_signs(drawn: np.ndarray) -> np.ndarray:
-    """Each `FORKED` document's write's sign `[R, D, H]`, a row's first `drawn` `[R, H]`: a document entering
-    a given memory (zero in the levels' draws) takes the row's, and one entering an earlier document's final
-    of one write its sign, of two the other's, so the memory it leaves is one or two writes."""
+    """Each `FORKED` document's write's sign `[R, D, H]`, a row's first `drawn` `[R, H]`, by the signed count
+    of writes the memory it enters holds: one entering a memory of none (a given one, zero in the levels'
+    draws, or one cancelled) takes the row's; one entering a memory of one write cancels it where its own
+    final is stored and a later document enters it, so an exact zero crosses a stored slot, and adds a second
+    of its sign where not; one entering two writes takes the other sign. The memory each leaves is zero, one
+    or two writes."""
     signs = np.zeros((*drawn.shape[:1], len(FORKED[0][0]), *drawn.shape[1:]))
     for row, (loads, stores) in enumerate(FORKED):
         counts: dict[int, np.ndarray] = {}
         for document, load in enumerate(loads):
             entered = counts.get(load, np.zeros_like(drawn[row]))
-            continued = np.where(np.abs(entered) == 1, np.sign(entered), -np.sign(entered))
+            carried = stores[document] and GIVEN + stores[document] in loads[document + 1:]
+            continued = np.where(np.abs(entered) == 1, -np.sign(entered) if carried else np.sign(entered),
+                                 -np.sign(entered))
             signs[row, document] = np.where(entered == 0, drawn[row], continued)
             if stores[document]:
                 counts[GIVEN + stores[document]] = entered + signs[row, document]

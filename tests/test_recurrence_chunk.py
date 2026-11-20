@@ -17,9 +17,11 @@ import pytest
 import tiny_models
 from arm_arithmetic import on_float64_device
 from contract_support import (
+    ADDS,
     CANCELLING_LEVELS,
     FORKED,
     GIVEN,
+    HELD,
     cancelling_entries,
     exactly_rounded,
     normal_float32,
@@ -750,15 +752,16 @@ def levels_entered_draw(hooks, seed: int):
     return drawn, (hosted(entries.signed(operands.value.shape)), hosted(entries.signed(final)))
 
 
-def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact():
-    """A forked call of the gated delta rule (`HOOKS[4]`) on the portable math's walk whose documents' entry
-    writes are three levels cancelling beside float32's largest (`levels_entered_draw`): its output, the
-    row's last memory and its entry keys', values' and weights' gradients held by check 1 against each
-    document a sequence of its own the recurrence a token at a time in float64, rounded once (exact, so the
-    walk must be: a write summed in some order dropped a level at its tie as its negative survived, an ulp
-    here and inf at float32's largest, row 8757; rows 8840, 9480). The SSD's are its TPU scan's
-    (test_ssd_kernel's levels cells), as the rated scan's selector routes them there."""
-    hooks = HOOKS[4]
+@pytest.mark.parametrize('hooks', [pytest.param(HOOKS[4], id='delta-rule'),
+                                   pytest.param(FORMED[4], id='ssd')])
+def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact(hooks):
+    """A forked call on the portable math's walk, of the gated delta rule and of Mamba2's SSD (the rated
+    scan's XLA handoff, its TPU scan's in test_ssd_kernel), whose documents' entry writes are three levels
+    cancelling beside float32's largest (`levels_entered_draw`): its output, the row's last memory and its
+    entry keys', values' and weights' gradients held by check 1 against each document a sequence of its own
+    the recurrence a token at a time in float64, rounded once (exact, so the walk must be: a write summed in
+    some order dropped a level at its tie as its negative survived, an ulp here and inf at float32's largest,
+    row 8757; rows 8840, 9480, 9513)."""
 
     def leaves(walk):
         def run(operands, seeded):
@@ -892,15 +895,6 @@ def test_a_turned_forked_documents_arithmetic_reads_only_its_ancestors(case):
 
 DOCUMENTS = ((0, 23, 40), (0, 9, 48))
 """Each row's packed documents' first tokens under `draw`'s `packed`."""
-
-HELD = 2
-"""The stored slots a row's table holds (`Chunk.held`)."""
-
-ADDS = ((0, 0, 1), (0, 0, 2))
-"""Each row's documents' added slots (`Chunk.adds`): the first row's last document adding its row's given
-memory to its parent's final, the second row's the first document's final to its predecessor's, as a looped
-pass's document enters its fork parent's final and its own of the pass before (row 7662)."""
-
 
 def entered_draw(hooks, seed: int, entries: bool = False, length: int = LENGTH):
     """`draw`'s packed operands of `length` tokens over a table of `GIVEN` memories a row, with `entries` an
