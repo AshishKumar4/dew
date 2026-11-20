@@ -651,16 +651,16 @@ def test_split_delta_keeps_tiny_others_when_anchor_times_multiplier_overflows():
 
 
 def test_a_mosaic_dropping_backwards_large_anchor_does_not_flush_tiny_others():
-    """Row 9096 end-to-end: a bf16 Mosaic call interpreted for an H100 at rate 1 - 2^-8 (`bound = 256`)
-    keeping both keys, where the anchor's `[2^122, 0]` times `256` passes fp32's largest under an orthogonal
-    `dO = [0, 2^20]` while the other kept key holds `[0, 2^-126]` at logit -18. `split_delta` keeps the tiny
+    """Row 9096 end-to-end: a bf16 Mosaic call interpreted for an H100 at rate 1 - 2^-3 (`bound = 8`)
+    keeping both keys, where the anchor's `[2^126, 0]` times `8` passes fp32's largest under an orthogonal
+    `dO = [0, 2^20]` while the other kept key holds `[0, 2^-126]` at logit -17. `split_delta` keeps the tiny
     contribution in `in_units` so the gradients hold check 1 against float64."""
-    rate = 1.0 - 2.0 ** -8
+    rate = 1.0 - 2.0 ** -3
     words = first_seed(rate, 2, lambda kept: bool(kept[0]) and bool(kept[1]))
     hooks, spans = hooked(words, 1, 1, rate), template.spans(1, 2, 1)
     query = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 0].set(1).at[..., 2].set(1)
-    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 1, 0, 0].set(-16).at[0, 1, 0, 2].set(-2)
-    value = (jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 0].set(2.0 ** 122)
+    key = jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 1, 0, 0].set(-16).at[0, 1, 0, 2].set(-1)
+    value = (jnp.zeros((1, 2, 1, WIDTH), jnp.bfloat16).at[0, 0, 0, 0].set(2.0 ** 126)
              .at[0, 1, 0, 1].set(2.0 ** -126))
     dout = jnp.zeros((1, 1, 1, WIDTH), jnp.bfloat16).at[..., 1].set(2.0 ** 20)
     ours, reference = _mosaic_gradients(spans, hooks)
