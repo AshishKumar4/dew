@@ -613,6 +613,42 @@ class Tiles:
     chunk: int
 
 
+def xla_ssd_portable(x, b, c, a, state, forked, chunk_size: int, held: int) -> tuple[jax.Array, jax.Array]:
+    """Chunked portable forked SSD scan (`_walk_once`) in `ssd._chunk_scan`'s layout (`[B, T, H, P]`,
+    state `[B, H, P, N]`): shares Recurrence's single portable fork walk so forward mode and higher-order
+    derivatives through `ssd._chunk_scan` never duplicate the fork walk (rows 7874, 7875)."""
+    ones = jnp.ones_like(a)
+    given, tokens, entry = forked
+    loads, stores, begun = tokens[:3]
+    rows, length, heads, columns = x.shape
+    width = b.shape[-1]
+    work = at_least_fp32(jnp.result_type(x, b, c, a, state))
+    starts = loads >= 0
+    declared = (_delta_forms, (("delta", False), ("scale", 1.0), ("per_key", False),
+                                ("width", width), ("columns", columns), ("work", jnp.dtype(work)),
+                                ("reset", True), ("bound", None), ("reads", "after"),
+                                ("own", False), ("group", 1)))
+    operands = _chunked({"q": c, "k": b, "v": x, "g": a, "beta": ones}, starts, chunk_size, work)
+    varying = (c, b, x, a, ones, starts)
+    documents = entry[0].shape[1] if entry is not None else length
+    adds = ()
+    if len(tokens) > 3:
+        doc_adds = jnp.zeros((rows, documents), jnp.int32).at[
+            jnp.arange(rows)[:, None], jnp.maximum(begun, 0)
+        ].set(jnp.where(begun >= 0, tokens[3], 0))
+        adds = (jnp.broadcast_to(doc_adds[:, None], (rows, heads, documents)),)
+    given_t = varying_like(jnp.moveaxis(jnp.swapaxes(given, -1, -2).astype(work), 1, 2), *varying)
+    walked = (given_t,
+              *(_headed_tokens(t, fill, heads, chunk_size)
+                for t, fill in zip((loads, stores, begun), (-1, 0, 0), strict=True)),
+              *adds, *(() if entry is None else _headed_entry(entry, heads, *varying)))
+    outputs, final = _walk_once(*declared, width=width, recomputed=recomputed_memory(), held=held,
+                                documents=documents, added=bool(adds), turned=False,
+                                context=derive.context())(operands, walked)
+    out = jnp.moveaxis(outputs.reshape(*outputs.shape[:2], -1, columns), 1, 2)
+    return out[:, :length].astype(x.dtype), jnp.swapaxes(final, -1, -2)
+
+
 def _grouped(query, key, value, dtype):
     """A derived walk's output dtype (the operands' where `dtype` is None), its working dtype (at least
     fp32), and `query` and `key` repeated over the value heads each key head serves."""
@@ -2014,7 +2050,7 @@ def _tpu_documents(state, forked: Forked, length: int, chunk_size: int, work, wi
                    for t, fill in zip((loads, stores, begun, adds), (-1, 0, 0, 0), strict=True))
     given = zero_padded(zero_padded(jnp.swapaxes(state, -1, -2).astype(work), 3, widths[0]), 4, widths[1])
     entry = None
-    if forked.entry is not None:
+    if forked.entry is not None and forked.entry[0].shape[2] > 0:
         key, value, weight = forked.entry
         heads = value.shape[3]
         key = jnp.repeat(key, heads // key.shape[3], axis=3)
