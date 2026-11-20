@@ -128,10 +128,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
     if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
         return _own(value, at, known, walking)
     if _sources.hand_written(getattr(value, "__wrapped__", None)):
-        # A callable that is no function and wraps one of the user's, a jitted one aside (`_computed`): what
-        # it holds beside the function (a cache's entries) is its type's, which nothing here states.
-        raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} wrapping a "
-                            "function of the user's own code")
+        return _wrapping_users(value, at, again)
     if (named := _named(value, at)) is not None:
         return named
     if isinstance(value, type):
@@ -199,10 +196,25 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
 
 
 
+def _wrapping_users(value, at: str, again: Callable[..., JSON]) -> JSON:
+    """A callable that is no function and wraps one of the user's, a jitted one aside (`_computed`): a
+    function with JAX's custom derivative is its function, its rules and the options a trace reads, as the
+    one module naming them reads it (`dew.nn.derivatives.custom_rule`, lint_slop's SLOP026; row 10087: an
+    arm holding a test's own rule ran unprepared). Refused for any other: what it holds beside the function
+    (a cache's entries) is its type's, which nothing here states."""
+    from dew.nn.derivatives import custom_rule
+
+    if (rule := custom_rule(value)) is not None:
+        kind, parts = rule
+        return [kind, [[name, again(part, at=f"{at} (its {name})")] for name, part in parts.items()]]
+    raise Unestablished(f"{at}: a {type(value).__module__}.{type(value).__qualname__} wrapping a "
+                        "function of the user's own code")
+
+
 def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """One of JAX's values a program computes from or with: an array (`_jax_array`), a function `jax.jit`
-    wraps, by its module's name for it where a library's (`_named`), else by what it wraps (`_jitted`), and
-    a program Dew's compile point compiles, by its function and arguments (`_outer_program`); None for any
+    wraps, by its module's name for it where a library's (`_named`), else by what it wraps (`_jitted`), a
+    program Dew's compile point compiles, by its function and arguments (`_outer_program`); None for any
     other."""
     if isinstance(value, jax.Array):
         return _jax_array(value, at, again)
@@ -393,16 +405,28 @@ def reads(function: types.FunctionType, at: str, known: Mapping[int, JSON] = _NO
     """What `function`'s body reads outside its arguments (`dew._sources.function_reads`), as an identity
     states it (`stated`): the cells it closed over, its defaults, and each name its code or the code nested
     in it reads that its globals hold or that is a loaded module of the user's. A trace bakes each such
-    value into its program, so one that differs is another call."""
+    value into its program, so one that differs is another call. A library's function (a local one
+    `_named` cannot name: `jax.checkpoint`'s, `jax.grad`'s) reads its module's globals as its installed
+    version holds them, which its module's record states (`_coded`, as a module's function `_named`
+    names), so they are not walked (`library_function`): its closure and defaults are, a user's function
+    among them (rows 10064 on: a library's caches among its globals, no arm holding Dew's SwiGLU had a
+    statement)."""
     within = (*walking, id(function))
     named = function.__qualname__
     cells, read = _sources.function_reads(function)
     return {"closure": {name: _stated(value, f"{at} ({named}'s closure, {name})", known, within)
                         for name, value in sorted(cells.items())},
             "globals": {name: _stated(value, f"{at} ({named}'s global {name})", known, within)
-                        for name, value in sorted(read.items())},
+                        for name, value in sorted(read.items())} if not library_function(function) else {},
             "defaults": _stated((function.__defaults__, function.__kwdefaults__),
                                 f"{at} ({named}'s defaults)", known, within)}
+
+
+def library_function(function: types.FunctionType) -> bool:
+    """Whether `function` is a library's: its module one of the user's own code is not (`own_source`: an
+    installed distribution's, the standard library's). A script's, a notebook's (`__main__` with no file)
+    and one no module holds are the user's."""
+    return function.__module__ not in (None, "__main__") and not _sources.own_source(function.__module__)
 
 
 def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:

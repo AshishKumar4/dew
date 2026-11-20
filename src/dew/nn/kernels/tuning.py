@@ -160,13 +160,19 @@ class Prepared:
     hooks): its `source`, a function of a tile and its side tiles, and what runs, `run`, its program
     rewritten by the algebra pass where it is traced, or a form its consumer derived from a program the
     pass already rewrote (`prepared_as`). Equal, hashed, keyed (`program`, `_held_key`) and stored
-    (`encoded`) as its source, so an op holding it compares, keys and stores as it did."""
+    (`encoded`) as its source, so an op holding it compares, keys and stores as it did. Pickled as its
+    source, rebuilt by the constructor that made it (`__reduce__`): a stored truth holds no closure."""
 
     source: Callable
     run: Callable = dataclasses.field(compare=False, repr=False)
 
     def __call__(self, *args, **kwargs):
         return self.run(*args, **kwargs)
+
+    def __reduce__(self):
+        # The pass's closure pickles as no function its module holds: a launch a GPU tier part's prepare held
+        # (`Seen.held`) is its run's (rows 9582 on).
+        return (prepared_as if self.run is self.source else prepared, (self.source,))
 
 
 def prepared(hook):

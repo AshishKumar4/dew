@@ -28,6 +28,13 @@ def draw(seed: int = 7):
             rng.integers(-3, 4, (256, 256)).astype(jnp.bfloat16))
 
 
+def host_normal(seed: int, *shapes, dtype) -> tuple:
+    """Standard normal arrays of `shapes` in `dtype`, from `seed`, as the host holds them (NumPy's), which a
+    GPU tier part's prepare places nowhere (`draw`)."""
+    rng = np.random.default_rng(seed)
+    return tuple(rng.standard_normal(shape).astype(dtype) for shape in shapes)
+
+
 def ran(fn, label: str, *operands):
     """`fn` jitted over host arrays `operands`, as a GPU tier part's prepare compiles it ahead and its run
     runs it (`reference_error.ahead_arm`: a bitwise check's program, computing nothing in the prepare);
@@ -134,9 +141,11 @@ def as_written(layer, *operands):
     return ran(layer, f"{layer.__name__} as written", *operands)
 
 
-def rewritten(layer, *operands):
+def under_the_pass(layer, *operands):
     """`layer` under the pass with its kernels over `operands`, prepared ahead where a part prepares
-    (`ran`)."""
+    (`ran`). Named apart from `algebra.rewritten`, which `_passed` calls: a statement reads each name a
+    function's code holds, an attribute's too (`dew._sources.names_read`), so a global of that name is
+    read, and this one reads `ran`'s store (rows 10064 on: an arm no statement held)."""
     return ran(functools.partial(_passed, layer), f"{layer.__name__} under the pass", *operands)
 
 
@@ -173,7 +182,7 @@ def test_a_program_writing_a_ref_inside_a_nested_body_computes_as_written():
 
     x = np.random.default_rng(4783).standard_normal((4, 8)).astype(np.float32)
     with generation.assumed("sm90"):
-        assert_equal(rewritten(written, x), as_written(written, x))
+        assert_equal(under_the_pass(written, x), as_written(written, x))
 
 
 @pytest.mark.parametrize("layer", LAYERS, ids=lambda layer: layer.__name__)
@@ -184,7 +193,7 @@ def test_a_layer_under_the_pass_computes_what_it_does_as_written(layer, generati
     a widened product widens the dot's rounding."""
     operands = draw()
     with generation.assumed(generation_name), generation.chosen(**named):
-        assert_equal(rewritten(layer, *operands), as_written(layer, *operands))
+        assert_equal(under_the_pass(layer, *operands), as_written(layer, *operands))
 
 
 @pytest.mark.parametrize("layer", [biased, chained], ids=lambda layer: layer.__name__)
@@ -815,33 +824,38 @@ def jax_nn_written(*, mask=None, bias=None, scale=1, causal=False, window=None):
 FORMS = {
     "a mask of its inputs": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, mask=input_mask(q, k), implementation="xla"),
-        lambda q, k, v: {"mask": input_mask(q, k), "mask_fill": JAX_FILL}, jax_nn_written(mask=input_mask)),
+        lambda q, k, v: {"mask": input_mask(q, k), "mask_fill": JAX_FILL}, jax_nn_written(mask=input_mask),
+        {}),
     "a mask of its inputs filled with -inf": (
         masked_attention(keyed_mask), lambda q, k, v: {"mask": keyed_mask(q, k), "mask_fill": -jnp.inf},
-        masked_attention(keyed_mask)),
+        masked_attention(keyed_mask), {}),
     "a bias of its inputs": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, bias=input_bias(q, k), implementation="xla"),
-        lambda q, k, v: {"bias": input_bias(q, k)}, jax_nn_written(bias=input_bias)),
+        lambda q, k, v: {"bias": input_bias(q, k)}, jax_nn_written(bias=input_bias), {}),
     "twice the default scale": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, scale=2 * q.shape[-1] ** -0.5,
                                                      implementation="xla"),
-        None, jax_nn_written(scale=2)),
+        None, jax_nn_written(scale=2), {}),
     "a causal window": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True, local_window_size=(15, 0),
                                                      implementation="xla"),
         lambda q, k, v: {"causal": True, "sliding_window": 16, "mask_fill": JAX_FILL},
-        jax_nn_written(causal=True, window=15)),
+        jax_nn_written(causal=True, window=15), {"keep": {"causal": True, "window": (15, 0)}}),
     "a softcap": (softcapped_attention,
                   lambda q, k, v: {"causal": True, "softcap": 50.0, "mask_fill": -jnp.inf},
-                  softcapped_attention),
+                  softcapped_attention, {"keep": {"causal": True}, "softcap": 50.0}),
 }
 """Each plain program's attention under a form beside the default scale and a causal mask, the arguments
 Dew's own attention takes for it, its fill the program's (None where no call of Dew's computes it: a scale
 other than the default is another constant, which the compile point keeps as written), and the program
 whose run on float64 operands is its truth: itself where it is written at its operands' width, jax.nn's
-written out (`jax_nn_written`) where it is jax.nn's. The masks leave rows partly masked (a window,
-causality, -inf's mask) and wholly masked (jax.nn's mask, uniform rows under its finite fill); a row -inf
-masks wholly is NaN, as written, which check 1 does not compare."""
+written out (`jax_nn_written`) where it is jax.nn's; and, where a query keeps one key (causality's first),
+the keys each query keeps (`attention_oracle.kept`'s structure) and the cap, by which check 1 sizes each
+row by the terms attention's gradients carry through their cancellation (`attention_on_par`): that query's
+logit gradient is float64 zero, which an H100's template forms from its rounded output as FlashAttention
+does (rows 9651, 9652). The masks leave rows partly masked (a window, causality, -inf's mask) and wholly
+masked (jax.nn's mask, uniform rows under its finite fill); a row -inf masks wholly is NaN, as written,
+which check 1 does not compare."""
 
 
 @pytest.mark.parametrize("form", list(FORMS))
@@ -851,14 +865,14 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
     Dew's own attention call under those arguments routes to (none where that is XLA's), and under a scale
     no call of Dew's takes runs as written, XLA's; on this host, under the template, its output and
     gradients on par with the program as written (check 1)."""
-    from attention_oracle import attention_on_par
+    from attention_oracle import attention_on_par, kept
     from contract_support import normal_drawn
 
     import dew
     from dew.algebra.recognize import KEPT
     from dew.nn.attention import scaled_dot_product_attention
 
-    attend, arguments, exact = FORMS[form]
+    attend, arguments, exact, judged = FORMS[form]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
 
     def own(q, k, v):
@@ -871,8 +885,10 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
         assert set(_attention_routes(lambda: dew.jit(attend).trace(*shapes))) == set(expected)
     draw = normal_drawn(41, *((2, 64, 4, 32),) * 4, dtype=jnp.bfloat16)
     with generation.chosen(attention="template"):
+        keep = judged.get("keep")
         attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {form}",
-                         truth=lambda *x: exact(*(a.astype(jnp.float64) for a in x)))
+                         truth=lambda *x: exact(*(a.astype(jnp.float64) for a in x)),
+                         keep=None if keep is None else kept(64, 64, **keep), softcap=judged.get("softcap"))
 
 def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None,
                 root=None):
@@ -1248,8 +1264,11 @@ def _second_normed(x, w):
 
 
 def _divided_by(divisor):
-    """A norm-shaped program whose statistic divides by `divisor`, a constant array it closes over."""
-    held = jnp.asarray([divisor], jnp.float32)
+    """A norm-shaped program whose statistic divides by `divisor`, a constant array it closes over: the host's
+    (NumPy's), which a statement of the program states by its values alone, where JAX's is stated by its
+    device too, the prepare's CPU and the run's GPU two programs (rows 10008, 10009: the run found no
+    reference its prepare compiled)."""
+    held = np.asarray([divisor], np.float32)
 
     def program(x, w):
         widened = x.astype(_wide(x))
@@ -1328,12 +1347,10 @@ def test_a_stream_read_before_its_norm_computes_as_written():
 
 def test_a_norm_of_a_stopped_row_passes_no_gradient_to_it():
     """A norm of a row whose gradient the program stops, rewritten, passes the row no gradient, as written."""
-    from contract_support import normal_draw
-
     def program(x, w):
         return _norm_of(jax.lax.stop_gradient(x), w).astype(jnp.float32).sum()
 
-    x, w = normal_draw(4785, (256, 256), (256,))
+    x, w = host_normal(4785, (256, 256), (256,), dtype=np.float32)
     grad = jax.grad(functools.partial(_norms_rewritten, program))
     assert not np.any(np.asarray(ran(grad, "a stopped row's gradient, its norm written", x, w)))
 
@@ -1366,12 +1383,10 @@ def _doubled_identity_tangent(primals, tangents):
 def test_a_norm_of_a_row_under_its_own_derivative_rule_keeps_the_rule():
     """A norm of a row a nested program's own derivative rule makes (a jitted custom JVP doubling its
     tangent), rewritten, keeps that rule: the row's gradient twice the norm's own, as written."""
-    from contract_support import normal_draw
-
     def program(x, w):
         return _norm_of(jax.jit(_doubled_identity)(x), w).astype(jnp.float32)[0, 0]
 
-    x, w = normal_draw(4786, (256, 256), (256,), dtype=jnp.bfloat16)
+    x, w = host_normal(4786, (256, 256), (256,), dtype=jnp.bfloat16)
     np.testing.assert_array_equal(
         np.asarray(ran(jax.grad(functools.partial(_norms_rewritten, program)),
                        "the row's gradient, its norm written", x, w)),
@@ -1379,25 +1394,23 @@ def test_a_norm_of_a_row_under_its_own_derivative_rule_keeps_the_rule():
 
 
 def test_a_norm_of_a_row_an_effect_reads_keeps_the_effect():
-    """A norm of a row a nested program passes through a host callback, rewritten, still calls the
-    callback."""
+    """A norm of a row a nested program passes through a host callback, rewritten, keeps the callback: the
+    program's effects are the program's as written, the callback's, which XLA runs as written. Nothing
+    computes: a program holding a callback of this process's compiles for no compile-only GPU (a GPU tier
+    part's prepare) and runs from no executable another process compiled."""
     from jax.experimental import io_callback
 
-    calls = []
-
-    def record(_):
-        calls.append(1)
-
     def recorded(x):
-        io_callback(record, None, x)
+        io_callback(lambda _: None, None, x)
         return x
 
     def program(x, w):
         return _norm_of(jax.jit(recorded)(x), w)
 
-    ran(functools.partial(_norms_rewritten, program), "a recorded row's norm, written",
-        np.ones((256, 256), jnp.bfloat16), np.ones((256,), jnp.bfloat16))
-    assert calls
+    x, w = np.ones((256, 256), jnp.bfloat16), np.ones((256,), jnp.bfloat16)
+    written = jax.make_jaxpr(program)(x, w).effects
+    assert written
+    assert jax.make_jaxpr(functools.partial(_norms_rewritten, program))(x, w).effects == written
 
 
 @pytest.mark.parametrize("program", list(NEAR_NORMS))
