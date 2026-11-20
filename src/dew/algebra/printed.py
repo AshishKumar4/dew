@@ -84,7 +84,7 @@ class _Printer:
         return f"({'-' if negated else ''}{value}, jnp.zeros_like({value}))"
 
 
-def source(closed: core.ClosedJaxpr, name: str, *, compensated: bool = False) -> tuple[str, bool]:
+def source(closed: core.Jaxpr, name: str, *, compensated: bool = False) -> tuple[str, bool]:
     """`closed` printed as a function `name` over its inputs returning its outputs as a tuple, and whether a
     sum was compensated (`compensated`: always False where it is not asked). Raises `Unprintable` for an
     equation no plain call writes."""
@@ -109,8 +109,9 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
             continue
         inner, operands = _inlined(printer, equation)
         if inner is not None:
-            body: core.Jaxpr = inner.jaxpr if isinstance(inner, core.ClosedJaxpr) else inner
-            consts = inner.consts if isinstance(inner, core.ClosedJaxpr) else []
+            # A program's own constants with it (JAX's closed program is its jaxpr's alias).
+            body: core.Jaxpr = getattr(inner, "jaxpr", inner)
+            consts = getattr(inner, "consts", ())
             for var, value in zip(body.constvars, consts, strict=True):
                 printer.names[var] = printer.fresh("c")
                 printer.lines.extend(_constant(printer.names[var], np.asarray(value)))
@@ -196,7 +197,7 @@ def _compensated(printer: _Printer, equation: jcore.JaxprEqn) -> None:
                  [printer.pair(left), printer.pair(right, negated=equation.primitive is lax.sub_p)])
 
 
-def refused(closed: core.ClosedJaxpr) -> str | None:
+def refused(closed: core.Jaxpr) -> str | None:
     """Why no plain call writes `closed` (`Unprintable`'s reason), None where it is printable."""
     try:
         source(closed, "printable")
