@@ -36,6 +36,7 @@ from egglog import (
     var,
     vars_,
 )
+from jax.typing import DTypeLike
 
 from dew._cache import ALGEBRA
 from dew.algebra import terms
@@ -239,7 +240,7 @@ class Drawn:
 
     shapes: tuple[tuple[int, ...], ...]
     scale: Callable[[np.random.Generator, tuple[int, ...], list[np.ndarray]], np.ndarray] | None = None
-    dtype: type = np.float32
+    dtype: DTypeLike = np.float32
     """The float its operands are drawn in (a narrow float's sum's, `jnp.bfloat16`)."""
 
     def _values(self, seed: int) -> list[np.ndarray]:
