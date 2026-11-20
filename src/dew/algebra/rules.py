@@ -404,9 +404,14 @@ _CONTRACTED_SCALE = Drawn(((64, 128), (1, 128), (32, 128)), scale=lambda rng, sh
 """A matrix product's left operand, a positive scale along its contraction (a softmax's totals, each at
 least one) as a row, and its right operand transposed, so each operand's leading axis is one no other
 shares (check 2 reads each operand's first rows)."""
-_NORMAL = Drawn(((64, 1024), (64, 1024), (64, 1024)),
-                scale=lambda rng, shape, drawn: rng.standard_normal(shape))
-"""Operands of unit scale: a regrouping's roundings compared where no draw's range dominates the error."""
+_PER_ROW = Drawn(((64, 1024), (64, 1024), (64, 1)), scale=lambda rng, shape, drawn: (
+    rng.standard_normal(shape) if shape[-1] > 1 else rng.uniform(0.5, 2.0, shape)))
+"""Two operands of unit scale and a divisor a row, held away from zero (a row's norm): a regrouping's
+roundings compared where no element's quotient dominates the error, and no adversarial family (each the
+first operand's shape's, `Drawn.adversarial`) zeroes the divisor."""
+_PER_ROW_DIVISORS = Drawn(((64, 1024), (64, 1), (64, 1)), scale=lambda rng, shape, drawn: (
+    rng.standard_normal(shape) if shape[-1] > 1 else rng.uniform(0.5, 2.0, shape)))
+"""An operand of unit scale and two divisors a row, held away from zero."""
 _NARROW = Drawn(((64, 4096),))
 """Rows long enough that a sum of a narrow float's terms rounds in its own precision at every step."""
 
@@ -493,12 +498,12 @@ def _ranged() -> tuple[RuleFamily, ...]:
             rewrite(a.binary("mul", b, multiplied).binary("div", c, divided)).to(
                 a.binary("mul", b.binary("div", c, divided), multiplied), plain(multiplied), plain(divided),
                 *same),),
-            (lambda a, b, c: (a * b) / c, lambda a, b, c: a * (b / c), _NORMAL)),
+            (lambda a, b, c: (a * b) / c, lambda a, b, c: a * (b / c), _PER_ROW)),
         RuleFamily("a quotient by a product as two quotients", (
             rewrite(a.binary("div", b.binary("mul", c, multiplied), divided)).to(
                 a.binary("div", b, divided).binary("div", c, divided), plain(multiplied), plain(divided),
                 *same),),
-            (lambda a, b, c: a / (b * c), lambda a, b, c: (a / b) / c, _NORMAL)))
+            (lambda a, b, c: a / (b * c), lambda a, b, c: (a / b) / c, _PER_ROW_DIVISORS)))
 
 
 def _moved_scales() -> tuple[RuleFamily, ...]:

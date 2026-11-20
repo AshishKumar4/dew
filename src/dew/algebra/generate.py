@@ -127,6 +127,8 @@ class _Chosen:
     case: int
     operands: tuple[jax.ShapeDtypeStruct, ...]
     candidate: error.Candidate
+    single: bool
+    """Whether the declaration returns one array (its form's one output), else a tuple of them."""
 
     @property
     def function(self) -> str:
@@ -147,7 +149,8 @@ def _chosen(qualified: str, form: StableForm) -> list[_Chosen]:
                 with algebra.passes(target=target):
                     choice = error.choose(form.function, operands, accurate=policy == "accurate",
                                           saturation=algebra.SATURATION, admits=gate)
-                found.append(_Chosen(name, policy, target, case, operands, choice.chosen))
+                found.append(_Chosen(name, policy, target, case, operands, choice.chosen,
+                                     _single(form.function, operands)))
     return found
 
 
@@ -170,17 +173,29 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
         body += ["", "", *text.rstrip("\n").split("\n")]
     for name in sorted({found.name for found in chosen}):
         own = [found for found in chosen if found.name == name]
+        single = own[0].single
         body += ["", "", f"def {name}(*operands, policy: str = 'default', target: str = {own[0].target!r}):",
                  f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
                  "    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)",
-                 "    forms = {"]
+                 "    forms: dict[tuple, Callable[..., tuple]] = {"]
         for found in own:
             operands = [repr(operand) for operand in _case(found.operands)]
             body += printed.wrapped(f"        ({found.policy!r}, {found.target!r}, (", operands,
                                     ",)):" if len(operands) == 1 else ")):")
             body.append(f"            {found.function},")
-        body += ["    }", "    return forms[(policy, target, case)](*operands)"]
+        body += ["    }", f"    return forms[(policy, target, case)](*operands){'[0]' if single else ''}"]
     return "\n".join([*lines, *printed.imports("\n".join(body)), *body]) + "\n"
+
+
+def _single(function: Callable, operands: tuple[jax.ShapeDtypeStruct, ...]) -> bool:
+    """Whether `function` returns one array over `operands`, else a tuple of them; another structure is
+    refused, a generated form returning its outputs as a tuple."""
+    shaped = jax.eval_shape(function, *operands)
+    if isinstance(shaped, jax.ShapeDtypeStruct):
+        return True
+    if isinstance(shaped, tuple) and all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shaped):
+        return False
+    raise ValueError(f"a declaration returns an array or a tuple of arrays, not {jax.tree.structure(shaped)}")
 
 
 def _case(operands: tuple[jax.ShapeDtypeStruct, ...]) -> tuple:

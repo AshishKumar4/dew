@@ -22,6 +22,8 @@ Receipts:
   program, and the pass runs 12% slower without it (13,604 passes)
 """
 
+from collections.abc import Callable
+
 import jax.numpy as jnp
 from jax import lax
 
@@ -63,22 +65,22 @@ def _normalized_values_product_accurate_sm90_0(x1, x2, x3):
 def lse_folded_probabilities(*operands, policy: str = 'default', target: str = 'sm90'):
     """lse_folded_probabilities's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms = {
+    forms: dict[tuple, Callable[..., tuple]] = {
         ('default', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
             _lse_folded_probabilities_default_sm90_0,
         ('accurate', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
             _lse_folded_probabilities_accurate_sm90_0,
     }
-    return forms[(policy, target, case)](*operands)
+    return forms[(policy, target, case)](*operands)[0]
 
 
 def normalized_values_product(*operands, policy: str = 'default', target: str = 'sm90'):
     """normalized_values_product's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms = {
+    forms: dict[tuple, Callable[..., tuple]] = {
         ('default', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
             _normalized_values_product_default_sm90_0,
         ('accurate', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
             _normalized_values_product_accurate_sm90_0,
     }
-    return forms[(policy, target, case)](*operands)
+    return forms[(policy, target, case)](*operands)[0]

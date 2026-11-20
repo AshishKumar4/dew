@@ -30,14 +30,19 @@ INLINED = frozenset({"pjit", "jit", "closed_call", "core_call"})
 """The call primitives whose body is printed in their place: a call that computes its body, no rule of its
 own (a custom derivative's call is refused, its rule not a value's)."""
 
-IMPORTS = {"jnp": "import jax.numpy as jnp", "np": "import numpy as np", "lax": "from jax import lax",
-           "precision": "from dew.nn import precision"}
-"""The imports a printed function may read, by the name it reads, in the tree's order (`imports`)."""
+IMPORTS = ({"Callable": "from collections.abc import Callable"},
+           {"jnp": "import jax.numpy as jnp", "np": "import numpy as np", "lax": "from jax import lax"},
+           {"precision": "from dew.nn import precision"})
+"""The imports a printed function or a generated module may read, by the name it reads, in the tree's
+sections (the standard library's, the third parties', Dew's) and order (`imports`)."""
 
 
 def imports(text: str) -> list[str]:
-    """The imports printed `text` reads (`IMPORTS`), each where it reads its name, in the tree's order."""
-    return [line for name, line in IMPORTS.items() if re.search(rf"(?<![\w.]){name}\.", text)]
+    """The imports `text` reads (`IMPORTS`), each where it reads its name, a blank line between sections."""
+    found = [[line for name, line in section.items() if re.search(rf"(?<![\w.]){name}\b", text)]
+             for section in IMPORTS]
+    return [line for number, lines in enumerate(section for section in found if section)
+            for line in ([""] if number else []) + lines]
 
 
 class Unprintable(ValueError):
@@ -111,8 +116,8 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
         inner, operands = _inlined(printer, equation)
         if inner is not None:
             # A program's own constants with it (JAX's closed program is its jaxpr's alias).
-            body: core.Jaxpr = getattr(inner, "jaxpr", inner)
-            consts = getattr(inner, "consts", ())
+            body: core.Jaxpr = inner.jaxpr
+            consts = inner.consts
             for var, value in zip(body.constvars, consts, strict=True):
                 printer.names[var] = printer.fresh("c")
                 printer.lines.extend(_constant(printer.names[var], np.asarray(value)))
@@ -222,9 +227,13 @@ def loaded(text: str, name: str) -> Callable:
     """The function `name` a printed text defines (`source`), over the imports a printed module reads."""
     from dew.nn import precision
 
-    namespace = {"jax": jax, "jnp": jnp, "np": np, "lax": lax, "precision": precision}
+    namespace: dict[str, object] = {"Callable": Callable, "jax": jax, "jnp": jnp, "np": np, "lax": lax,
+                                    "precision": precision}
     exec(compile(text, f"<printed {name}>", "exec"), namespace)
-    return namespace[name]
+    function = namespace[name]
+    if not callable(function):
+        raise TypeError(f"the printed text defines no function {name!r}")
+    return function
 
 
 def _value(value, dtype) -> str:

@@ -594,7 +594,7 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
         if bound is not None:
             facts += rules.made(term, i64(bound))
         held = region.floors.get(named)
-        if held is not None:
+        if held is not None and held.floor is not None:
             facts.append(set_(rules.log2_floor(term)).to(i64(held.floor)))
             if held.positive:
                 facts.append(rules.positive(term))
