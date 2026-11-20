@@ -130,31 +130,80 @@ def test_a_kernel_ptxas_serializes_carries_ptxas_own_notes_in_its_binary(depth):
 
 
 
+
 def test_a_triton_template_binary_in_compile_mosaic_kernels_reports_shared_registers_and_spills():
     """Row 7263: when a public route compiled through `compile_mosaic_kernels` falls back to a
-    Pallas-Triton template launch (e.g. fp32 decode plain-forward kernels), `reports` + `inherited` +
-    `mosaic_failures` read its cubin's shared bytes, registers and stack frame (zero unread, tmem 0) and
-    refuse any spill."""
+    Pallas-Triton template launch, `reports` + `inherited` + `mosaic_failures` read its cubin's shared
+    bytes, registers and stack frame (zero unread, tmem 0 when `uses_tmem is False`), refuse spills,
+    preserve XLA-uniquified Triton cubin names, and mark TMEM unread when `uses_tmem` is True or None."""
     import dataclasses
 
-    clean = report.Binary("attention_forward", "0123456789", registers=64, frame=0, shared=16384, sass=())
-    spilling = report.Binary("attention_forward_scaled", "0123456789", registers=96, frame=24, shared=16384,
-                             sass=())
-    names = [report.launch_name(b.kernel, b.launch) for b in (clean, spilling)]
+    assert report.kernel_of("probe__l0123456789__1") == ("probe__1", "0123456789")
+    assert report.launch_name("probe__1", "0123456789") == "probe__1__l0123456789"
+    assert report.kernel_of("probe__1__l0123456789") == ("probe__1", "0123456789")
+
+    clean = report.Binary("attention_forward", "0123456789", 64, 0, "triton",
+                          shared=16384, sass=(), uses_tmem=False)
+    uniquified_spill = report.Binary(*report.kernel_of("attention_forward__l0123456789__1"), 96, 24, "triton",
+                                     shared=16384, sass=(), uses_tmem=False)
+    tmem_using = report.Binary("tmem_triton", "0123456789", 64, 0, "triton",
+                               shared=16384, sass=(), uses_tmem=True)
+    undecoded = report.Binary("undecoded_triton", "0123456789", 64, 0, "triton",
+                              shared=16384, sass=(), uses_tmem=None)
+
     found = [kc.inherited(dataclasses.asdict(r), {}, "sm80")
-             for r in kc.reports({}, [clean, spilling], {}, triton=names)]
+             for r in kc.reports({}, [clean, uniquified_spill, tmem_using, undecoded], {})]
     by_kernel = {item["kernel"]: item for item in found}
     assert by_kernel["attention_forward"]["unread"] == ()
     assert by_kernel["attention_forward"]["shared"] == 16384
     assert by_kernel["attention_forward"]["tmem"] == 0
     assert by_kernel["attention_forward"]["registers"] == 64
     assert by_kernel["attention_forward"]["spilled"] == 0
+    assert "attention_forward__1" in by_kernel
 
     clean_rec = {"name": "decode", "limit": 166912, "tmem_limit": 0,
                  "kernels": [by_kernel["attention_forward"]]}
     assert kc.mosaic_failures([clean_rec]) == []
 
     spill_rec = {"name": "decode", "limit": 166912, "tmem_limit": 0,
-                 "kernels": [by_kernel["attention_forward_scaled"]]}
+                 "kernels": [by_kernel["attention_forward"], by_kernel["attention_forward__1"]]}
     failures = kc.mosaic_failures([spill_rec])
     assert len(failures) == 1 and "24 bytes spilled" in failures[0], failures
+
+    for name in ("tmem_triton", "undecoded_triton"):
+        assert "tensor memory columns" in by_kernel[name]["unread"], by_kernel[name]
+        assert by_kernel[name]["tmem"] is None
+        tmem_rec = {"name": "decode", "limit": 166912, "tmem_limit": 512, "kernels": [by_kernel[name]]}
+        assert kc.mosaic_failures([tmem_rec]), name
+
+
+@lowers("sm100")
+def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_triton_cubins():
+    """Row 7263: `report.binaries(..., decoded=True)` sets `uses_tmem=True` on an sm100 Mosaic GPU TMEM
+    cubin, `uses_tmem=False` on an sm100 fp32 Triton cubin that allocates no TMEM, and `uses_tmem=None` when
+    `decoded=False`."""
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
+
+    q_m = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
+    spans_m = template.spans(256, 256, 1, causal=True)
+    with generation.assumed("sm100"):
+        exe_m = kc.lowered_for(lambda q, k, v: attention_mosaic.forward(q, k, v, spans_m),
+                               (q_m, q_m, q_m), "sm100").compile()
+    mosaic_decoded = [b for b in report.binaries(exe_m, decoded=True) if b.kind == "mosaic_gpu"]
+    mosaic_raw = [b for b in report.binaries(exe_m, decoded=False) if b.kind == "mosaic_gpu"]
+    assert mosaic_decoded and any(b.uses_tmem is True for b in mosaic_decoded), mosaic_decoded
+    assert mosaic_raw and all(b.uses_tmem is None for b in mosaic_raw), mosaic_raw
+
+    q_t = jax.ShapeDtypeStruct((2, 1, 32, 256), jnp.float32)
+    k_t = jax.ShapeDtypeStruct((2, 4096, 8, 256), jnp.float32)
+    spans_t = template.spans(1, 4096, 2, causal=False)
+    with generation.assumed("sm100"):
+        exe_t = kc.lowered_for(lambda q, k, v: attention_route.attend(q, k, v, spans_t, natural=False),
+                               (q_t, k_t, k_t), "sm100").compile()
+    triton_decoded = [b for b in report.binaries(exe_t, decoded=True) if b.kind == "triton"]
+    triton_raw = [b for b in report.binaries(exe_t, decoded=False) if b.kind == "triton"]
+    assert triton_decoded and all(b.uses_tmem is False for b in triton_decoded), triton_decoded
+    assert triton_raw and all(b.uses_tmem is None for b in triton_raw), triton_raw

@@ -63,7 +63,7 @@ def shared_asked(error: BaseException) -> int | None:
     return None if asked is None else int(asked.group(1))
 
 
-LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
+LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})(?:__(\d+))?$")
 """The suffix a kernel's name carries within the launch that traced it (`named`): the digest of its identity
 there, its launch's digest where the launch states no kernel's part (`tuning.KernelOp.emitted`)."""
 KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
@@ -78,8 +78,10 @@ def kernel_of(name: str) -> tuple[str, str | None]:
     launch beside, `launch_metadata`), None where it carries none."""
     function = KERNEL_FUNCTION.fullmatch(name)
     kernel = function.group("kernel") if function else name
-    launch = LAUNCH_SUFFIX.search(kernel)
-    return LAUNCH_SUFFIX.sub("", kernel), launch.group(1) if launch else None
+    if not (launch := LAUNCH_SUFFIX.search(kernel)):
+        return kernel, None
+    stem = kernel[:launch.start()]
+    return (f"{stem}__{launch.group(2)}" if launch.group(2) is not None else stem), launch.group(1)
 KERNEL_PROTO_VERSION = 4
 """The `MosaicGpuKernelProto` version jaxlib serializes (mosaic/gpu/custom_call.cc), which it alone reads."""
 MOSAIC_TARGET = b"mosaic_gpu_v2"
@@ -1938,6 +1940,7 @@ class Binary:
     launch: str | None
     registers: int
     frame: int
+    kind: str
     shared: int | None = None
     sass: tuple[str, ...] | None = ()
     caller: str | None = None
@@ -1958,6 +1961,8 @@ class Binary:
     """The registers its producer lowers to and its consumers raise to, as its machine code reconfigures
     them (`reconfigured`: USETMAXREG's deallocation and allocation, its PTX's `setmaxnreg.dec` and `.inc`);
     None where it reconfigures none that way, or no disassembler read it."""
+    uses_tmem: bool | None = None
+    """Whether its decoded SASS issues any Blackwell tensor-memory instruction (`_uses_tmem`); None undecoded."""
 
     @property
     def launched(self) -> str | None:
@@ -2001,7 +2006,8 @@ def _carried(serialized: bytes, decoded: bool = False, spills: bool = False) -> 
         kernel = custom_kernel(proto) if LAUNCH_SUFFIX.search(name) else None
         if kernel is not None:
             elf, shared = kernel
-            found.append(dataclasses.replace(_binary(name, elf, decoded, spills), shared=shared))
+            found.append(dataclasses.replace(_binary(name, elf, decoded, spills, kind="triton"),
+                                             shared=shared))
     return found
 
 
@@ -2109,7 +2115,8 @@ def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tup
         stated_caller = caller[0].decode() if len(caller) == 1 and isinstance(caller[0], bytes) else None
         notes = tuple(AssemblerNote(*(part[0].decode() for part in (note.get(1, [b""]), note.get(2, [b""]))))
                       for note in map(proto_fields, fields.get(ASSEMBLER_NOTES, [])))
-        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded, spills), shared=stated,
+        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded, spills, kind="mosaic_gpu"),
+                                    shared=stated,
                                     caller=stated_caller, notes=notes)], 0
     found, calls = [], 0
     for values in fields.values():
@@ -2123,7 +2130,7 @@ def _kernels(message: bytes, decoded: bool = False, spills: bool = False) -> tup
     return found, calls
 
 
-def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = False) -> Binary:
+def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = False, *, kind: str) -> Binary:
     """The `Binary` of the kernel `function` from its cubin `elf`: its `.nv.info` attributes' registers,
     frame and threads (`REGISTER_COUNT`, `FRAME_SIZE`, `MAX_THREADS`; a Mosaic module compiles one kernel
     function), `decoded` its SASS findings (`sass_findings_of`), and its register reconfiguration
@@ -2159,9 +2166,10 @@ def _binary(function: str, elf: bytes, decoded: bool = False, spills: bool = Fal
     listing = sass_listing(elf) if decoded or (spills and frame) else None
     decreased, raised = (None, None) if listing is None else reconfigured(listing)
     sass = (None if listing is None else sass_findings_of(listing)) if decoded else ()
-    return Binary(*kernel_of(function), stated[REGISTER_COUNT], frame, sass=sass,
+    uses_tmem = None if listing is None else _uses_tmem(listing)
+    return Binary(*kernel_of(function), stated[REGISTER_COUNT], frame, kind=kind, sass=sass,
                   spilled_in=(None if listing is None else spilled_roles(listing)) if frame else (),
-                  threads=stated.get(MAX_THREADS), decreased=decreased, raised=raised)
+                  threads=stated.get(MAX_THREADS), decreased=decreased, raised=raised, uses_tmem=uses_tmem)
 
 
 def disassembler() -> Path | None:
@@ -2212,6 +2220,12 @@ def spilled_roles(listing: str) -> tuple[str, ...]:
 
 
 _RECONFIGURED = re.compile(r"\bUSETMAXREG\.(DEALLOC|ALLOC|TRY_ALLOC)\S*\s+(?:UP\d+,\s*)?(0x[0-9a-f]+|\d+)")
+
+
+def _uses_tmem(listing: str) -> bool:
+    """Whether nvdisasm's `listing` issues any Blackwell tensor-memory instruction (`LDTM`, `STTM`, `UTC*`)."""
+    return any(_parsed(found.group(2))[0].split(".")[0].startswith(("LDTM", "STTM", "UTC"))
+               for line in listing.splitlines() if (found := _INSTRUCTION.search(line)))
 
 
 def reconfigured(listing: str) -> tuple[int | None, int | None]:
