@@ -874,7 +874,7 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks):
 
     def arm(place):
         # Its documents laid within the arm, the operands differentiated those the draw gives (as
-        # `assert_forked_on_par`'s), the whole call placed as `place` places it.
+        # `assert_forked_on_par`'s), the whole call and its outputs' cotangents placed as `place` places them.
         def ran(operands):
             return run(place(entering_documents(operands)))
 
@@ -882,7 +882,8 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks):
             def along(value):
                 return ran(dataclasses.replace(operands, value=value))
 
-            return with_gradients(ran)(operands, cotangents), jax.jvp(along, (operands.value,), (tangent,))[1]
+            pulled = with_gradients(ran)(operands, place(cotangents))
+            return pulled, jax.jvp(along, (operands.value,), (tangent,))[1]
 
         return both
 
