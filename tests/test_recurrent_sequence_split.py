@@ -56,30 +56,6 @@ def test_a_delta_rule_split_over_the_sequence_runs_its_rows_as_whole_ones(name, 
                           width=WIDTH)
 
 
-HEADS_BEFORE_TIME = (("activation_heads", ("tensor", "sequence")),)
-"""A rule under which the heads would take the sequence axis too: the split keeps it the sequence's."""
-
-
-@pytest.mark.mesh
-@pytest.mark.parametrize("rules", [(), HEADS_BEFORE_TIME], ids=["default rules", "heads before time"])
-@pytest.mark.parametrize("row", ["packed", "empty_shard_packed"])
-@pytest.mark.parametrize("name", sorted(MIXERS))
-def test_a_delta_rule_split_over_the_sequence_and_its_heads_runs_its_rows_as_whole_ones(name, row, rules):
-    """Under a sequence axis of 2 beside a tensor axis of 2, which splits the mixer's heads (each device its
-    share of the queries', keys' and values' heads and of their conv's taps, `linear.sequence_delta_rule`),
-    the mixer runs packed rows as on one device (`assert_split_as_whole`): one starting a document at the
-    cut, one carrying a document's conv and memory across it past padding, under the default rules and
-    under rules giving the heads the sequence axis too, which the split keeps the sequence's."""
-    from dew.mesh import DEFAULT_RULES
-
-    module = MIXERS[name]
-    hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
-    variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
-    with nn.logical_axis_rules((*rules, *DEFAULT_RULES)):
-        assert_split_as_whole(module, variables, row, SEEDS[row], f"{name} split over the sequence and its "
-                              f"heads, {row}, {rules}", width=WIDTH, shards=2, tensor=2)
-
-
 WIDE_HEADS = {
     "gated delta net": GatedDeltaNet(emb_features=WIDTH, num_k_heads=4, num_v_heads=8, head_k_dim=32,
                                      head_v_dim=32, chunk_size=4, dtype=jnp.float32),
@@ -87,6 +63,33 @@ WIDE_HEADS = {
                                                lower_bound=-5.0, chunk_size=4),
 }
 """Each delta-rule mixer with heads its scan's work dwarfs its projections' on: four key heads 32 wide."""
+
+
+HEADS_BEFORE_TIME = (("activation_heads", ("tensor", "sequence")),)
+"""A rule under which the heads would take the sequence axis too: the split keeps it the sequence's."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize(("mixers", "rules"), [(MIXERS, ()), (WIDE_HEADS, HEADS_BEFORE_TIME)],
+                         ids=["default rules", "heads before time, four key heads"])
+@pytest.mark.parametrize("row", ["packed", "empty_shard_packed"])
+@pytest.mark.parametrize("name", sorted(MIXERS))
+def test_a_delta_rule_split_over_the_sequence_and_its_heads_runs_its_rows_as_whole_ones(name, row, mixers,
+                                                                                         rules):
+    """Under a sequence axis of 2 beside a tensor axis of 2, which splits the mixer's heads (each device its
+    share of the queries', keys' and values' heads and of their conv's taps, `linear.sequence_delta_rule`),
+    the mixer runs packed rows as on one device (`assert_split_as_whole`): one starting a document at the
+    cut, one carrying a document's conv and memory across it past padding, under the default rules and
+    under rules giving the heads the sequence axis too (four key heads, which both axes would divide), which
+    the split keeps the sequence's."""
+    from dew.mesh import DEFAULT_RULES
+
+    module = mixers[name]
+    hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
+    variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
+    with nn.logical_axis_rules((*rules, *DEFAULT_RULES)):
+        assert_split_as_whole(module, variables, row, SEEDS[row], f"{name} split over the sequence and its "
+                              f"heads, {row}, {rules}", width=WIDTH, shards=2, tensor=2)
 
 
 @pytest.mark.mesh
