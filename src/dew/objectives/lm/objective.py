@@ -567,8 +567,9 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     only they read, `pad_id` and `token_accuracy`.
     """
 
-    resumable: ClassVar[tuple[str, ...]] = ("seq_len",)
-    """Its rows' length, which a later phase of a run may raise (a curriculum's longer rows)."""
+    resumable: ClassVar[tuple[str, ...]] = ("seq_len", "context")
+    """Its rows' length, which a later phase of a run may raise (a curriculum's longer rows), and the context
+    it derives from it (`context`)."""
 
     untraced: ClassVar[Mapping[str, str]] = {
         "samples": "its preview's budget and sampling (`preview`, `task_settings`), which its loss, draw and "

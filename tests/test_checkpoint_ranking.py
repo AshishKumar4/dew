@@ -1215,3 +1215,18 @@ def test_a_resume_under_another_loss_setting_is_refused_as_a_fresh_run_beside_it
     with pytest.raises(ValueError):
         lm(tmp_path / "model").fit(lm_data(), steps=1)
     assert int(lm(tmp_path / "model", z_loss=1e-4).fit(lm_data(), steps=1).step) == 1
+
+
+def test_a_rows_length_and_the_context_it_derives_are_no_computation_a_resume_holds():
+    """Two LM objectives over one model at other row lengths, whose contexts differ with them (a rotary
+    model of four places: its context the longer of the two), train one computation: a curriculum's longer
+    rows resume (row 9535: the derived context was recorded and refused)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training.startup import computation_differs
+
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=4)
+    short, long = LMObjective(model, seq_len=4), LMObjective(model, seq_len=8)
+    assert short.context != long.context
+    assert computation_differs(None, None, short.training_record(), long.training_record()) == []

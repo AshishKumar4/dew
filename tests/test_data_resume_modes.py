@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from data_support import Fetched
 from recording import RecordingTracker
 from test_run_budgets import BATCH, PEAK, Pulled, records
 
@@ -98,16 +99,6 @@ def test_a_run_refuses_a_loader_compiled_to_resume_otherwise():
             trainer.fit(compile(chain, resume=compiled), steps=1)
     trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0, data_resume="exact")
     assert int(trainer.fit(compile(chain, resume="exact"), steps=1).step) == 1
-
-
-@dataclasses.dataclass(frozen=True)
-class Fetched:
-    """A step that says its outcomes may change between reads (`Volatile`), as a live fetch's do."""
-
-    volatile: bool = True
-
-    def __call__(self, row):
-        return row
 
 
 def test_an_exact_resume_of_volatile_data_is_refused_and_a_relaxed_one_reads_on():

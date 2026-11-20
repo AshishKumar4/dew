@@ -21,7 +21,7 @@ from dew.config import TrainerConfig
 from dew.config.jepa import JepaRunConfig
 from dew.data import TFDS, Loading, Memory, presets
 from dew.data.dataset import DataPartition, Loader, rows_of
-from dew.data.pipeline import Pipeline
+from dew.data.pipeline import DeviceStep, Pipeline
 from dew.inputs import Field, InputSpec
 from dew.objectives.jepa.objective import JepaObjective
 from dew.objectives.supervised import Supervised
@@ -220,3 +220,27 @@ def test_a_batch_breaking_a_field_shape_its_chain_fixes_is_refused_before_it_is_
     with pytest.raises(ValueError):
         fit(after=rows)
     assert int(fit(after=8 * rows).step) == 3
+
+
+class Cropped(DeviceStep):
+    """A device step that keeps each row's first four `x` values, and says so (`Declares`)."""
+
+    def declared(self, facts):
+        from dew.data.facts import shaped
+
+        return shaped(facts, "x", [4])
+
+    def __call__(self, batch):
+        return {**batch, "x": batch["x"][:, :4]}
+
+
+def test_a_device_steps_shape_is_no_shape_its_host_batch_is_held_to():
+    """A chain whose device step crops each row's `x` from eight values to four hands its host batch at
+    eight, which the step crops after the host's check: the host batch is held to the shapes of what it
+    holds, no device step's (row 9533: refused at the shape the device step would make)."""
+    rows = 2 * jax.device_count()
+    columns = {"x": np.ones((4 * rows, 8), np.float32), "y": np.zeros((4 * rows, 4), np.float32)}
+    chain = Pipeline(Memory(columns)).repeat().batch(rows).map(Cropped())
+    objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
+    assert int(Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(chain, steps=2,
+                                                                             log_every=100).step) == 2

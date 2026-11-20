@@ -940,3 +940,16 @@ def test_a_saved_runs_encoder_by_its_earlier_path_reads_as_its_path_now_and_a_pa
     with pytest.raises(ValueError):
         registry.imported("dew.inputs.encoders:CLIPText")
 
+
+def test_a_saved_runs_default_layout_reads_as_unset_and_a_stated_one_as_it_is():
+    """A run recorded before its trainer's layout could be unset recorded `Layout()` for its default, which
+    reads back unset, its resume laid out as its checkpoint was (row 9534: read as a stated device layout);
+    a layout of its own reads as it is."""
+    from dew.config.earlier import earlier_layout
+    from dew.distributed.placement import Layout
+    from dew.registry import to_record
+
+    default = {"class": "lm", "fields": {"trainer": {"layout": to_record(Layout(), Layout)}}}
+    assert earlier_layout(default)["fields"]["trainer"]["layout"] is None
+    stated = {"class": "lm", "fields": {"trainer": {"layout": to_record(Layout(min_shard=8), Layout)}}}
+    assert earlier_layout(stated) == stated

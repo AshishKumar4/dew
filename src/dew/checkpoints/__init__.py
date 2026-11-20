@@ -1126,26 +1126,25 @@ class Checkpoints:
         process holds it.
 
         It is None when the step's objective declares no inference record."""
-        step = self.pinned(step)
-        custom = (self._step_metadata(step, local=True).custom_metadata or {} if step == self._local_latest()
-                  else self._custom(step))
-        return json_value(custom.get('artifact'), 'artifact')
+        return json_value(self._custom_of(self.pinned(step)).get('artifact'), 'artifact')
 
     def training(self, step: int) -> JSON:
         """What the objective's loss computed at `step` (`Objective.training_record`), which a resume holds
         the run to (`dew.training.startup.computation_differs`); None for a step saved outside `fit` or before
-        Dew recorded it. Read from the tier `artifact` reads."""
-        custom = (self._step_metadata(step, local=True).custom_metadata or {} if step == self._local_latest()
-                  else self._custom(step))
-        return json_value(custom.get('training'), 'training')
+        Dew recorded it."""
+        return json_value(self._custom_of(step).get('training'), 'training')
 
     def control(self, step: int) -> dict:
-        if step == self._local_latest():
-            custom = self._step_metadata(step, local=True).custom_metadata or {}
-        else:
+        if step != self._local_latest():
             self.kept()
-            custom = self._custom(step)
-        return copy.deepcopy(custom.get('control', {}))
+        return copy.deepcopy(self._custom_of(step).get('control', {}))
+
+    def _custom_of(self, step: int) -> Mapping[str, object]:
+        """The custom metadata `step` was saved with, alone (`_custom`): the local step's as its process
+        holds it, a committed one's from the persistent directory."""
+        if step == self._local_latest():
+            return self._step_metadata(step, local=True).custom_metadata or {}
+        return self._custom(step)
 
     def _best_step(self, name: str | None) -> int | None:
         retained = self.kept()

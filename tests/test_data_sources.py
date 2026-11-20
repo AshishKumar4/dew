@@ -605,6 +605,15 @@ def test_an_uncommitted_export_is_read_by_no_discovery(tmp_path):
         Files(str(marked), format="arrow", spark=True).records("indexed")
 
 
+def test_a_directory_of_committed_exports_reads_their_shards_raw(tmp_path):
+    """A directory holding committed exports beneath it reads their shards as raw files, each export's root
+    holding its manifest (row 9536: any export's shards beneath refused the read as still writing)."""
+    rows = [{"id": index} for index in range(10)]
+    export(Memory(rows), str(tmp_path / "a"), format=ArrowFiles(), rows_per_shard=4)
+    stored = Files(str(tmp_path), format="arrow").records("indexed")
+    assert sorted(stored[index]["id"] for index in range(len(stored))) == list(range(10))
+
+
 @pytest.mark.parametrize("kind", ["jsonl", "text"])
 def test_one_small_file_streams_to_every_reader_each_reading_its_own_lines(tmp_path, kind):
     """One file smaller than a shard is one physical shard. A streamed read by more readers than that
