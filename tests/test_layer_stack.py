@@ -1031,6 +1031,8 @@ def test_a_pipeline_of_delta_nets_split_over_the_sequence_leaves_the_stage_axis_
         twin, wide = tiny(max_seq_len=16, dtype=jnp.float64, **DELTA_HYBRID), float64_held(variables)
 
     def stepped(model, variables, spec, microbatches=None):
+        # Each arm placed and compiled on its own mesh, called as given (`loss_and_grads` sets its mesh).
+        @as_given
         def step(text):
             loss, _, grads = loss_and_grads(LMObjective(model, 16), spec, variables, {"text": text}, four,
                                             microbatches)

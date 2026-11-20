@@ -780,8 +780,8 @@ def sequence_delta_rule(mixed, taps, g, beta, coordinates, valid, *, shards: int
     # sequence's keeps it time's), split where they divide the key heads (`grouped_heads`' test).
     taken = {*mesh_axes(rows), *mesh_axes(sequence), *((STAGE_AXIS,) if in_pipeline_stage() else ())}
     mesh = jax.sharding.get_abstract_mesh()
-    heads = tuple(axis for axis in mesh_axes(logical_spec(HEADS, (batch, length, beta.shape[2], 1))[2])
-                  if axis not in taken)
+    placed = (*logical_spec(HEADS, (batch, length, beta.shape[2], 1)), None, None, None)
+    heads = tuple(axis for axis in mesh_axes(placed[2]) if axis not in taken)
     split = None if not heads or key_heads % math.prod(mesh.shape[axis] for axis in heads) else heads
     tokens, channels = P(rows, sequence, split), P(split, None)
     edges = np.cumsum([width for width, _ in parts])[:-1]
