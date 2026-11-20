@@ -38,6 +38,7 @@ from dew.algebra import derive, scan
 from dew.algebra.derive import FORMS_HELD
 from dew.algebra.scan import RESET_DECAY, Reads
 from dew.batch import document_firsts
+from dew.mesh import mesh_axes
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
@@ -51,7 +52,7 @@ from dew.nn.precision import (
     rounds_products,
 )
 from dew.nn.residuals import Residual
-from dew.nn.sharding import grouped_heads, manual_map, rows_like, shard_shapes, varying_like
+from dew.nn.sharding import grouped_heads, manual_map, rows_like, rows_spec, shard_shapes, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
 from .chunked_launch import Forked, entry_write, zero_padded
@@ -856,10 +857,10 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
                   *(() if forked.turning is None else
                     (varying_like(jnp.moveaxis(part, 2, 1).astype(work), *varying)
                      for part in forked.turning)))
-        outputs, final = _walk_once(facts, width=width, recomputed=recomputed_memory(), held=held,
-                                    documents=forked.loads.shape[1], added=forked.adds is not None,
-                                    turned=forked.turning is not None,
-                                    context=derive.context())(operands, walked)
+        walk = _walk_once(facts, width=width, recomputed=recomputed_memory(), held=held,
+                          documents=forked.loads.shape[1], added=forked.adds is not None,
+                          turned=forked.turning is not None, context=derive.context())
+        outputs, final = _rows_local(walk, value)(operands, walked)
         out = jnp.moveaxis(outputs.reshape(*outputs.shape[:2], -1, read), 1, 2)
         return out[:, :length].astype(dtype), final
     entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), value) if state is None
@@ -945,6 +946,19 @@ def _walk_once(facts: tuple, *, width: int, recomputed: bool, held: int, context
         return walked(operands, h)
 
     return nested(recurrence_walk)
+
+
+def _rows_local(walk, like):
+    """`walk` (`_walk_once`'s, its operands and memories each a row's first) on each device's own rows where
+    an Explicit axis splits the call's (`like`'s, `dew.nn.sharding.rows_spec`), else `walk` itself: a forked
+    walk's scans seed their table, outputs and memories within its rows' map, whole, where the token maps
+    they gather by are split over the rows, a gather JAX refuses to place (row 9690)."""
+    placed = rows_spec(like, 1)
+    if placed is None:
+        return walk
+    rows = P(placed.spec[0])
+    return jax.shard_map(walk, mesh=placed.mesh, in_specs=rows, out_specs=rows,
+                         axis_names=frozenset(mesh_axes(placed.spec[0])), check_vma=False)
 
 
 def _headed_tokens(x, fill: int, heads: int, chunk: int):
