@@ -449,19 +449,23 @@ class Forked:
         elsewhere), and the document a first token begins (its index into `loads`, the entry write's;
         zero elsewhere). Its sizes are the tokens', none the documents' bound's."""
         firsts = jnp.asarray(self.firsts, jnp.int32)
-        rows, documents = firsts.shape
         held = firsts < length
         lasts = jnp.concatenate([firsts[:, 1:], jnp.full_like(firsts[:, :1], length)], axis=1)
         lasts = jnp.minimum(lasts, length) - 1
-        lines = jnp.arange(rows)[:, None]
         began = jnp.where(held, firsts, length)
-        loads = jnp.full((rows, length), -1, jnp.int32).at[lines, began].set(
-            jnp.asarray(self.loads, jnp.int32), mode="drop")
-        stores = jnp.zeros((rows, length), jnp.int32).at[lines, jnp.where(held, lasts, length)].set(
-            jnp.asarray(self.stores, jnp.int32), mode="drop")
-        numbers = jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), firsts.shape)
-        begun = jnp.zeros((rows, length), jnp.int32).at[lines, began].set(numbers, mode="drop")
-        return loads, stores, begun
+        # A row at a time, each row's buffer from its own documents' (`firsts`' rows): a row's tokens are
+        # its documents' alone, so the maps are placed as the rows are, where scattered by a row index
+        # into whole buffers, JAX refused indices and updates split on an Explicit axis (row 9690).
+        tokens = jnp.zeros_like(firsts[:, :1]) + jnp.zeros((1, length), jnp.int32)
+
+        def laid(fill: int, at, values):
+            return jax.vmap(lambda row, where, value: row.at[where].set(value, mode="drop"))(
+                tokens + fill, at, values)
+
+        numbers = jnp.zeros_like(firsts) + jnp.arange(firsts.shape[1], dtype=jnp.int32)
+        return (laid(-1, began, jnp.asarray(self.loads, jnp.int32)),
+                laid(0, jnp.where(held, lasts, length), jnp.asarray(self.stores, jnp.int32)),
+                laid(0, began, numbers))
 
 
 @dataclasses.dataclass(frozen=True)
