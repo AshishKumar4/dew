@@ -28,6 +28,7 @@ from jax._src.state import primitives as state, types as state_types
 from jax.experimental import pallas as pl
 
 from dew.nn import derivatives, programs
+from dew.nn.kernels.templates import resources
 from dew.nn.kernels.templates.cost import Stated, Work
 
 
@@ -246,13 +247,18 @@ def _unreffed(aval) -> jax_core.ShapedArray:
     return found
 
 
-def _logical(aval, tree, leaves: Sequence) -> tuple[int, ...]:
-    """A ref's shape as a product reads it: its aval through its transforms (`tree` of `leaves`)."""
+def _transformed(aval, tree, leaves: Sequence) -> jax_core.ShapedArray:
+    """A ref's aval through its transforms (`tree` of `leaves`)."""
     shaped = _unreffed(aval)
     if tree is not None:
         for transform in jax.tree.unflatten(tree, leaves):
             shaped = _unreffed(transform.transform_type(shaped))
-    return tuple(shaped.shape)
+    return shaped
+
+
+def _logical(aval, tree, leaves: Sequence) -> tuple[int, ...]:
+    """A ref's shape as a product reads it: its aval through its transforms (`_transformed`)."""
+    return tuple(_transformed(aval, tree, leaves).shape)
 
 
 def _product(equation) -> Work:
@@ -286,21 +292,18 @@ def _copied(equation) -> int:
     leaves = {"src": avals[at:at + sources],
               "dst": avals[at + sources:at + sources + params["dst_transforms_treedef"].num_leaves]}
     side = "dst" if equation.primitive is gpu.copy_gmem_to_smem_p else "src"
-    shaped = _unreffed(avals[0 if side == "src" else 1])
-    for transform in jax.tree.unflatten(params[f"{side}_transforms_treedef"], leaves[side]):
-        shaped = _unreffed(transform.transform_type(shaped))
-    return math.prod(shaped.shape) * jnp.dtype(shaped.dtype).itemsize
+    shaped = _transformed(avals[0 if side == "src" else 1], params[f"{side}_transforms_treedef"],
+                          leaves[side])
+    return resources.stored_bytes(shaped.shape, shaped.dtype)
 
 
 def _smem_to_tmem_bytes(equation) -> int:
     """An `async_copy_smem_to_tmem` copy's shared-memory read bytes: its SMEM source's, as its transforms
-    slice it (`smem_tree` leaves after `(smem_ref, tmem_ref)`, row 9106)."""
+    slice it (`smem_tree` leaves after `(smem_ref, tmem_ref)`, rows 9106, 9476)."""
     params, avals = equation.params, [variable.aval for variable in equation.invars]
     smem_tree = params["smem_tree"]
-    shaped = _unreffed(avals[0])
-    for transform in jax.tree.unflatten(smem_tree, avals[2:2 + smem_tree.num_leaves]):
-        shaped = _unreffed(transform.transform_type(shaped))
-    return math.prod(shaped.shape) * jnp.dtype(shaped.dtype).itemsize
+    shaped = _transformed(avals[0], smem_tree, avals[2:2 + smem_tree.num_leaves])
+    return resources.stored_bytes(shaped.shape, shaped.dtype)
 
 
 @dataclasses.dataclass
