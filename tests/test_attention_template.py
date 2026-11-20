@@ -828,8 +828,9 @@ def test_a_window_over_the_widest_places_neither_wraps_nor_aliases(window):
 
 
 def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
-    """A compiled call takes the hooks as its argument: new parameter and state values run the one
-    program it traced, and their gradients flow back into a `Hooks` of the same structure."""
+    """A compiled call takes the hooks as its argument: new parameter and state values in the same structure
+    (the state's static marks its own, `Initial.valueless`) run the one program it traced, and their
+    gradients flow back into a `Hooks` of the same structure."""
     queries, keys = geometry(CASES["causal-window"])
     spans = template.spans(queries, keys, ROWS, **arguments(CASES["causal-window"]))
     query, key, value = drawing(queries, keys)(0)
@@ -843,7 +844,7 @@ def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
     alibi = hooks_of(HOOKS["softcap-sinks-alibi"], queries)
     steeper = template.Hooks(alibi.score_mod, (template.Param(2 * alibi.score_params[0].value,
                                                               template.Kind.HEAD),),
-                             template.Initial(alibi.initial.m + 1, alibi.initial.total, alibi.initial.acc))
+                             dataclasses.replace(alibi.initial, m=alibi.initial.m + 1))
     outputs = compiled(alibi), compiled(steeper)
     assert len(traces) == 1
     assert not np.array_equal(np.asarray(outputs[0]), np.asarray(outputs[1]))
