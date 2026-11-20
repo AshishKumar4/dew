@@ -213,11 +213,19 @@ ROLE: contextvars.ContextVar[int] = contextvars.ContextVar("role", default=0)
 runs): the role's own share of what the program holds a role each (`Issuer.product_scratch`)."""
 
 
-def per_role(index, roles: int, run: Callable[[int, jax.Array], None]) -> None:
+def per_role(index: int | jax.Array, roles: int, run: Callable[[int, int | jax.Array], None]) -> None:
     """`run(role, index)` for the role `index` names among `roles`, each role's built at its own static
     index (`ROLE` while it is built): Mosaic GPU slices a swizzled tile only at static columns (a role's
     share of a block's, shared keys at width 256: offsets from the traced index spilled 20 bytes, a static
-    role's none)."""
+    role's none). A static `index` (a schedule's branch of its own, `handoffs.Schedule.run`'s `static`)
+    builds its own role alone."""
+    if isinstance(index, int):
+        token = ROLE.set(index)
+        try:
+            run(index, index)
+        finally:
+            ROLE.reset(token)
+        return
     for role in range(roles):
         def built(role=role):
             token = ROLE.set(role)
@@ -1607,17 +1615,20 @@ class Transport[Allocated, Opened](abc.ABC):
         (setmaxnreg's least where None: a launch states more where its producer's issue loop holds more)."""
 
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
-                  exclusive: bool = False, issuer: Callable | None = None, reducer: Callable | None = None):
+                  exclusive: bool = False, static_consumers: bool = False, issuer: Callable | None = None,
+                  reducer: Callable | None = None):
         """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)`, `producer()`,
         `issuer()` where it issues on a role (`Issuer.places_on_role`) and `reducer(index)` on a warp a
-        consumer (`handoffs.REDUCER`), each a branch of one switch where `exclusive`; the consumers' value."""
+        consumer (`handoffs.REDUCER`), each a branch of one switch where `exclusive`; `static_consumers`
+        gives each compute warpgroup its own branch with a static index. Returns the consumers' value."""
         schedule = self.roles(consumers, floor)
         schedule = schedule if reducer is None else schedule.joined(handoffs.REDUCER, consumers)
         # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
         units = {"producer": producer, "issuer": issuer}
         bodies = {"consumer": consumer, "reducer": reducer, **{name: lambda index, body=body: body()
                                                                for name, body in units.items()}}
-        return schedule.run(exclusive=exclusive, **{role.name: bodies[role.name] for role in schedule.roles})
+        return schedule.run(exclusive=exclusive, static="consumer" if static_consumers else None,
+                            **{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
         """A program's `streams` (`streams`') by lifetime (`resources.Scope`): those the program holds whole,

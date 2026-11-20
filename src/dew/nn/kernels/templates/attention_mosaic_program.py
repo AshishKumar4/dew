@@ -1171,8 +1171,8 @@ def reached(spec: algebra.Forward, queries: int) -> int | None:
     """The query and key pairs a call of `queries` queries (unpadded) reaches, by its form: every pair of a
     full call; a causal call's, each query's keys up to its own place (`algebra.seen`'s `k_pos <= q_pos`,
     the first key aligned to the first query); None for a spans call, whose pairs its arrays decide, which
-    no launch states before it runs, but one whose every query sees every key (`algebra.Forward.whole`)."""
-    if spec.form == "full" or spec.whole:
+    no launch states before it runs."""
+    if spec.form == "full":
         return queries * spec.keys
     if spec.form == "causal":
         return sum(min(spec.keys, row + 1) for row in range(queries))
@@ -1215,8 +1215,7 @@ def walks(spec: algebra.Forward, tile_walk: TileWalk) -> tuple[int, int] | None:
     in three slices walk 4, where their mean is 10/3 (row 8844), and a causal pair's second slices of tiles
     `[1, 3)` and `[2, 4)` stream 3 (the base review of 71686face, F3), its holders' common walk of them 16
     steps over a causal 256 by 256 call at 64 by 64 tiles where the envelope sliced after was 12 and 2 (of
-    369d0ad7b, F3). None for a spans call, a spans call's every key seen, known at trace time
-    (`algebra.Forward.whole`), a full call's."""
+    369d0ad7b, F3). None for a spans call."""
     ranges = _tile_ranges(spec, tile_walk)
     if ranges is None:
         return None
@@ -1237,9 +1236,8 @@ def walks(spec: algebra.Forward, tile_walk: TileWalk) -> tuple[int, int] | None:
 def _tile_ranges(spec: algebra.Forward, tile_walk: TileWalk) -> list[tuple[int, int]] | None:
     """Each holder's walk of `tile_walk` as the tiles `[lo, hi)` it reads, by its program's own rules (a query
     block's key tiles up to its diagonal, `attention.key_tiles`; a key block's query tiles from it,
-    `first_reader`); None for a spans call (but one whose every query sees every key,
-    `algebra.Forward.whole`)."""
-    if spec.form == "spans" and not spec.whole:
+    `first_reader`); None for a spans call."""
+    if spec.form == "spans":
         return None
     (queries, keys), (block_q, block_k) = tile_walk.extents, tile_walk.blocks
     query_tiles, causal = queries // block_q, spec.form == "causal"

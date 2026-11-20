@@ -75,17 +75,13 @@ class KeySpans:
     then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), or a
     call's every query where lengths and starts alone bound its keys (`spans`), which a program reads by
     position (`per_query` repeats them)."""
-    whole: bool = dataclasses.field(default=False, metadata={"static": True})
-    """Whether every query sees every key, known at trace time, of spans that hold intervals: a full call's
-    rows packed (`attention_decode.packed`), whose launches state their work as the full call's
-    (`algebra.Forward.whole`), their programs reading the intervals as ever."""
 
     def per_query(self) -> "KeySpans":
         """These spans an interval a query (`per_span` 1)."""
         if self.per_span == 1:
             return self
         start, end = (jnp.repeat(bound, self.per_span, axis=1) for bound in (self.start, self.end))
-        return KeySpans(start, end, self.query_ids, self.key_ids, self.keys, self.form, whole=self.whole)
+        return KeySpans(start, end, self.query_ids, self.key_ids, self.keys, self.form)
 
 
 def within(keys: jax.Array, start: jax.Array, end: jax.Array,

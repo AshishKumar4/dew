@@ -123,8 +123,6 @@ class Forward:
     def reach(self) -> float:
         """The power of two a dropping call's kept weights are narrowed at (`Dropout.reach`)."""
         return dropped_reach(self.dropped)
-    whole: bool = False
-    """Whether a spans call's every query sees every key (`attention.KeySpans.whole`): priced as full."""
 
     @property
     def raw(self) -> bool:
