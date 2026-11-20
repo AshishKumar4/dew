@@ -9,7 +9,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import handoffs, mosaic, resources
 from dew.nn.kernels.templates.handoffs import Role, Schedule
-from dew.nn.kernels.templates.mosaic import RingFamily
+from dew.nn.kernels.templates.ring_family import RingFamily
 from dew.nn.kernels.templates.rings import Ring, drain, loaded_once, stepped_in
 
 
