@@ -1315,9 +1315,12 @@ def _chunk_walked(values, low, axis: int, restarts, joined: Callable,
     _, offsets = lax.scan(across, (zero[0], zero[0]), (ends, jnp.any(flags, axis=0)))
     seen = jnp.cumsum(flags.astype(jnp.int32), axis=0) > 0
     summed = joined(local, tuple(part[None] for part in offsets))
-    summed = tuple(jnp.where(seen, part, whole) for part, whole in zip(local, summed, strict=True))
-    return tuple(jnp.moveaxis(jnp.reshape(jnp.moveaxis(part, 0, 1), (chunks * chunk, *rest))[:length], 0,
-                              axis) for part in summed)
+    high, low = (jnp.where(seen, part, whole) for part, whole in zip(local, summed, strict=True))
+
+    def unlaid(part):
+        return jnp.moveaxis(jnp.reshape(jnp.moveaxis(part, 0, 1), (chunks * chunk, *rest))[:length], 0, axis)
+
+    return unlaid(high), unlaid(low)
 
 
 class _Split(NamedTuple):
