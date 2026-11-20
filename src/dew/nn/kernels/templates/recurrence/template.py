@@ -224,9 +224,10 @@ def _shaped(forked: chunk_forward.ForkedTable | None) -> chunk_forward.ForkedTab
     return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), forked)
 
 def ranged(dtype, delta: bool, bound: float | None) -> bool:
-    """Whether a call's solve holds its chunk inverse at fp32's range (`mainloop.Call.ranged`): a 16-bit
-    delta rule whose form proves no bound on the inverse's entries."""
-    return delta and jnp.dtype(dtype) != jnp.float32 and bound is None
+    """Whether a call's solve holds its chunk inverse at fp32's range (`mainloop.Call.ranged`): an fp16
+    delta rule whose form proves no bound on the inverse's entries (bf16 already merges at fp32's range,
+    `mainloop.merge_parts`, row 9522)."""
+    return delta and jnp.dtype(dtype) == jnp.float16 and bound is None
 
 
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,

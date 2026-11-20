@@ -25,7 +25,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _doubling_held,
     _inverse_flops,
     _key_blocks,
-    _merged,
     _merges,
     _merging,
     _resident,
@@ -38,6 +37,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     lowered_once,
     masks,
     product_fragments,
+    solve_persistent,
     staging_tiles,
     stream_blocks,
     stream_tile,
@@ -101,13 +101,11 @@ def _intra_solve(system, taken, call: Call):
                          grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"),
                          blocks=stream_blocks(system=((chunk, chunk), solved)),
-                         stages=1 if (family.operands_in_registers
-                                      and _merged(call).dtype == jnp.float32) else 2,
+                         stages=2 if solve_persistent(call) else 1,
                          live=chunk_liveness(1), steps=1, model=_inverse_flops(chunk),
                          held=Held(phases=(_doubling_held(call),)),
                          staging=_merges(call), landing={"square": held.landing(chunk, chunk)},
-                         persistent=not (family.operands_in_registers and _merged(call).dtype == jnp.float32),
-                         reduces=False)(
+                         persistent=solve_persistent(call), reduces=False)(
         system, taken)
 
 
