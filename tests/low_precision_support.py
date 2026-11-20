@@ -1,7 +1,8 @@
 """The low-precision products' test operands, one builder each: an NVFP4 matrix of random codes under
-power-of-two block scales and its exact values (`nvfp4`), and a normal draw whose blocks of the product's
-depth span a range of binades (`spread`), as the MX and NVFP4 block-scaled products' tests and matrix cells
-draw them."""
+power-of-two block scales and its exact values (`nvfp4`), a normal draw whose blocks of the product's depth
+span a range of binades (`spread`), as the MX and NVFP4 block-scaled products' tests and matrix cells draw
+them, and a float format's values at every edge of its bits (`edge_values`), as a reading or a scaling of
+them is tested."""
 
 import jax.numpy as jnp
 import numpy as np
@@ -29,3 +30,24 @@ def spread(rng: np.random.Generator | int, shape: tuple[int, ...], block: int) -
     binades = np.exp2(rng.integers(-6, 7, size=(*shape[:-1], shape[-1] // block, 1)))
     values = rng.normal(size=(*shape[:-1], shape[-1] // block, block)) * binades
     return jnp.asarray(values.reshape(shape), jnp.float32)
+
+
+def edge_values(dtype) -> np.ndarray:
+    """A float format's values across every binade, of both signs, from their bits: zeros, subnormals of
+    every leading bit's place and the least and largest, the least normal and the largest, normals across
+    every exponent, and significands of ties to even at every shift (1.5, 3 and an ulp, a subnormal's 0b11
+    and 0b101 leads): every edge of a reading or a scaling of its bits."""
+    limits = jnp.finfo(dtype)
+    word = np.dtype(f"uint{limits.bits}")
+    width = limits.nmant
+    infinite = int(np.asarray(np.inf, dtype).view(word)[()])
+    one, three = (int(np.asarray(value, dtype).view(word)[()]) for value in (1.5, 3.0))
+    bits = np.concatenate([
+        np.arange(0, 1 << width, ((1 << width) // 2047) | 1, dtype=word),
+        np.arange(1 << width, infinite, ((infinite - (1 << width)) // 2047) | 1, dtype=word),
+        # A subnormal led by each bit's place, its lower bits mixed: every leading-bit position.
+        np.asarray([(1 << place) | ((1 << place) - 1) // 3 for place in range(width)], word),
+        np.asarray([0, 1, 2, 3, (1 << width) - 1, 1 << width, infinite - 1, 3 << (width - 1),
+                    *([5 << (width - 3)] if width >= 3 else []), one, three + 1], word)])
+    values = bits.view(dtype)
+    return np.concatenate([values, -values])

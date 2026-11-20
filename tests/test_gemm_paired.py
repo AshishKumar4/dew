@@ -391,6 +391,22 @@ def test_side_by_side_gradients_read_a_wide_cotangent_wide():
     np.testing.assert_array_equal(np.asarray(d_rows), np.full((64, 128), np.float16(70000.0 * 192 / 1024)))
 
 
+@pytest.mark.parametrize(("generation_name", "taken"), [("sm90", True), ("sm80", False)],
+                         ids=["h100", "a100"])
+def test_projections_side_by_side_are_one_launchs_cell_whatever_their_first_matrix(generation_name, taken):
+    """Llama-3.1-8B's query, key and value (4,096 by 4,096, 1,024 and 1,024) over 12,288 bf16 rows, nothing
+    named: on an assumed H100 a launch takes them side by side (`gemm.side_by_side`), their products in one
+    launch a cell of their own (`Kind.together`, M-EM-73's), where the first matrix's ordinary cell, XLA's on
+    Hopper, refused them (head review of 4ddd0d7ea F1); on an A100, whose cp.async rings take no matrices side
+    by side, none does, the template named or not."""
+    rows = jax.ShapeDtypeStruct((12288, 4096), jnp.bfloat16)
+    matrices = tuple(jax.ShapeDtypeStruct((4096, width), jnp.bfloat16) for width in (4096, 1024, 1024))
+    with generation.assumed(generation_name):
+        assert gemm.side_by_side(rows, matrices, jnp.bfloat16, None, whole=True) is taken
+        with generation.chosen(grouped_matmul="mosaic"):
+            assert gemm.side_by_side(rows, matrices, jnp.bfloat16, None, whole=True) is taken
+
+
 @pytest.mark.parametrize("widths", [(512, 128), (512, 128, 128)], ids=["two-outputs", "three-outputs"])
 def test_side_by_side_projections_of_unequal_widths_take_their_input_gradient_chained(widths):
     """`gemm.gemm` of bf16 rows by grouped matrices side by side of widths 512 and 128 (and a third of 128),
@@ -579,7 +595,11 @@ def _chained_taken() -> Iterator[None]:
 
     with tuning.seen() as launches:
         yield
-    assert any(bound.arguments.get("chained") for _, bound in launches.taken), launches.taken
+    # Every input-gradient launch one of the three products with the other two chained to it: a product
+    # run apart beside a chain of two passed where its sum cancelled (base review 5028c8148 F1).
+    transposed = [bound for _, bound in launches.taken if bound.arguments.get("trans_rhs")]
+    assert transposed and all(len(bound.arguments.get("chained") or ()) == 2 for bound in transposed), (
+        launches.taken)
 
 
 CHAINED_CASES = ("projections", "unequal scales", "cancelling")
@@ -659,26 +679,80 @@ def test_a_chained_input_gradient_is_as_finite_as_its_products_sum(generation_na
         a_chained_input_gradient_is_as_finite_as_its_products_sum(interpret=True)
 
 
-def test_a_chained_launchs_walk_holds_every_property_in_every_interleaving():
-    """The chained input gradient's launch on an H100 (`mosaic_gpu.gmm`'s `chained`: three products, each
-    step one product's), a 128 x 256 x 64 tile over a two-stage ring, traced as the GPU builds it: every
-    interleaving of its warpgroups and its loads' landings explored (`ring_protocol.explore`), each slot
-    given back once the products reading it retire. Each product's issue counted as a step's group though one
-    runs a step, the walk waited for three groups where one was in flight, and step 2 refilled step 0's slot
-    while step 0's product read it (base review of f86cb5b03, F2)."""
-    from ring_protocol import explore, programs
+WALKED = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
+"""The chained launch's tile the protocol checker walks: 128 x 256 x 64 over a two-stage ring."""
+
+
+def _chained_walk(*, launch: int = 0, flagged: bool = True) -> tuple:
+    """The programs (`ring_protocol.programs`) of the overflow witness's chained launch on an H100
+    (`mosaic_gpu.gmm`'s `chained`: three products, each step one product's) at `WALKED`, traced as the GPU
+    builds it: its `launch`-th, the flagged walk (0) or the bounded one (1), the bounded walk's flags given
+    (its tile's every share flagged where `flagged`, none elsewhere: the tiles it walks)."""
+    from ring_protocol import programs
 
     _, matrices, cotangents = _chained_overflow(jnp.bfloat16)
     (d, w), *rest = [(cotangent, matrix[None]) for cotangent, matrix in zip(cotangents[::-1], matrices[::-1],
                                                                            strict=True)]
-    tiles = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
 
-    def launch(d, w):
+    def chained(d, w):
         with generation.assumed("sm90"):
-            return mosaic_gpu.gmm(d, w, None, tiles=tiles, transpose_rhs=True, out_dtype=jnp.bfloat16,
+            return mosaic_gpu.gmm(d, w, None, tiles=WALKED, transpose_rhs=True, out_dtype=jnp.bfloat16,
                                   multiprocessors=4, interpret=False, dense=True, chained=tuple(rest))
 
-    threads, arrivals = programs(launch, d, w, threads=tiles.warpgroups + 1)
+    def flags(index, aval):
+        # The flags, int32 `[row tiles, column tiles, row shares]` (`chained.flags_declared`).
+        del index
+        if aval.dtype != jnp.int32 or aval.ndim != 3:
+            return None
+        return np.full(aval.shape, int(flagged), np.int32)
+
+    return programs(chained, d, w, threads=WALKED.warpgroups + 1, launch=launch, known=flags)
+
+
+def test_a_chained_launchs_walk_holds_every_property_in_every_interleaving():
+    """The chained input gradient's launch (`_chained_walk`'s first): every interleaving of its warpgroups
+    and its loads' landings explored (`ring_protocol.explore`), each slot given back once the products
+    reading it retire. Each product's issue counted as a step's group though one runs a step, the walk
+    waited for three groups where one was in flight, and step 2 refilled step 0's slot while step 0's product
+    read it (base review of f86cb5b03, F2)."""
+    from ring_protocol import explore
+
+    assert explore(*_chained_walk()) > 0
+
+
+@pytest.mark.parametrize("walked", ["flagged", "clear", "overcounted"])
+def test_a_chained_launchs_bounded_walk_holds_every_property_in_every_interleaving(walked):
+    """The chained launch's second, bounded walk (`chained.guarded_walk`, `mosaic_gpu.GUARDED_GMM`;
+    `_chained_walk`'s second), its flags given: its tile flagged, every interleaving of its warpgroups and its
+    loads' landings explored, each slot given back once the products reading it retire; clear, its consumers
+    issue no product. Its steps each issue one product's groups (`Issuer.issued_one_of`); counted as every
+    product's, its waits leave a step's slot in flight past its release, which the explorer finds (base review
+    2e4651b2e F2, row 8680; 3150e8dfc F5)."""
+    from ring_protocol import Violation, explore
+
+    from dew.nn.kernels.templates import mosaic
+
+    original = mosaic.Issuer.issued_one_of
+
+    def every_case_counted(self, which, accumulators, issue):
+        before = mosaic.commits()
+        issued = original(self, which, accumulators, issue)
+        mosaic._COMMITTED.set(before + (mosaic.commits() - before) * len(accumulators))
+        return issued
+
+    with pytest.MonkeyPatch.context() as patch:
+        if walked == "overcounted":
+            patch.setattr(mosaic.Issuer, "issued_one_of", every_case_counted)
+        threads, arrivals = _chained_walk(launch=1, flagged=walked != "clear")
+    products = sum(event.kind == "product" for program in threads for event in program)
+    if walked == "clear":
+        assert products == 0, products
+        return
+    assert products > 0
+    if walked == "overcounted":
+        with pytest.raises(Violation):
+            explore(threads, arrivals)
+        return
     assert explore(threads, arrivals) > 0
 
 

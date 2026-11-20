@@ -393,13 +393,13 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
         if declaration.reads == "before":
             read = h if declaration.reset is None else jnp.where(step[declaration.reset], 0.0, h)
             entering = _read(read, q, affine.values_read, affine.reader_scale) + r
-        floor = vanishing(z.dtype, affine.base2)
-        h = jnp.where((z <= floor)[:, None], 0.0, h)
+        _, cut = vanished(z, affine.base2)
+        h = jnp.where(cut[:, None], 0.0, h)
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
         if group:
             # A token apart from its group's writes reads the state its group entered, decayed by every token
             # since it: the group's first takes the state as it enters (`h`, its vanishing decay's zero).
-            apart = jnp.where(index % group == 0, h, jnp.where((z <= floor)[:, None], 0.0, apart))
+            apart = jnp.where(index % group == 0, h, jnp.where(cut[:, None], 0.0, apart))
             apart = apart * decay[:, None]
             entering = _read(apart, q, affine.values_read, affine.reader_scale) + r
         if not affine.per_key:

@@ -129,10 +129,12 @@ class Template[Config: Hashable](tuning.KernelOp):
         derivation steps past it (`report.refused`)."""
         return self.legal(ba, config, target) and self.proposes(ba, config, target)
 
-    def proposes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
+    def proposes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget, *,
+                 held: Callable[[], bool] | None = None) -> bool:
         """Whether the derivation offers `config` for `ba` on `target` to its legality: any config where the
-        call ranks alone (`ranks_alone`), else one its register model holds (`held`)."""
-        return self.ranks_alone(ba, target) or self.held(ba, config)
+        call ranks alone (`ranks_alone`), else one its register model holds (`held`, evaluated lazily so a
+        rank-only launch computes no register estimate, row 9477)."""
+        return self.ranks_alone(ba, target) or (self.held(ba, config) if held is None else held())
 
     def program_shared(self, config: Config, target: generation.GpuTarget) -> int:
         """The shared memory a program of the launch at `config` may stage on `target`: a block's
@@ -165,9 +167,12 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     def held(self, ba: tokamax.BoundArguments, config: Config) -> bool:
         """Whether the launch's register model proposes `config` (`takes`): its threads' modeled registers
-        (`registers`) within `register_budget`; a launch stating none (a TPU's, the XLA program's)
-        proposes any. A proposal, not legality: the assembler's compile decides (`legal`)."""
-        registers = self.registers(ba, config)
+        (`registers`) within `register_budget`; a launch stating none (a TPU's, the XLA program's) proposes
+        any. A proposal, not legality: the assembler's compile decides (`legal`)."""
+        return self.within(self.registers(ba, config), config)
+
+    def within(self, registers: int | None, config: Config) -> bool:
+        """Whether register estimate `registers` fits `config`'s `register_budget` (None fits any)."""
         return registers is None or registers <= self.register_budget(config)
 
     def offering(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:

@@ -16,7 +16,16 @@ import numpy as np
 import pytest
 import tiny_models
 from arm_arithmetic import on_float64_device
-from contract_support import normal_float32
+from contract_support import (
+    ADDS,
+    CANCELLING_LEVELS,
+    FORKED,
+    GIVEN,
+    HELD,
+    cancelling_entries,
+    exactly_rounded,
+    normal_float32,
+)
 from delta_rule_support import stacked_documents
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec as P
@@ -504,7 +513,6 @@ def test_a_turned_forked_calls_turn_curvature_is_as_exact_as_each_document_alone
                     f"xla {TURNED} a forked call's turn curvature", seeds=32, truth_fn=truth)
 
 
-
 def test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recurrence():
     """A turned call's turns' gradient differentiated along its queries (`jvp` of `grad`), a third of its
     queries zero, packed: on par from float64 with the recurrence a token at a time's (check 1), where the
@@ -660,42 +668,82 @@ def cancelling_entries_draw(seed: int):
                                entry_value=jnp.concatenate([u, -u, value[:, :, :1]], axis=2)), seeded
 
 
-ENTRY_CASES = {
-    "a tie": ([1.0] * 6, [2.0 ** 127, -(2.0 ** 127), 2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24), -2.0], -2.0),
-    "a band below": ([1.0] * 6, [2.0 ** 127, -(2.0 ** 127), 2.0 ** 25, -(2.0 ** 24), -(2.0 ** 24),
-                                 2.0 ** -100], 2.0 ** -100),
-    "three levels beside the largest": (
-        [2.0 ** 26, 2.0, 1.0, 2.0, 1.0, 2.0 ** 26, 1.0],
-        [2.0 ** 127, 2.0 ** 127, -(2.0 ** 103), -(2.0 ** 127), 2.0 ** 103, -(2.0 ** 127),
-         float(np.finfo(np.float32).max)], float(np.finfo(np.float32).max)),
-}
-"""Entry writes' terms whose sum floats summed in some order lose: each term's key and value, and the
-write."""
+ENTRY_CASES = ["a tie", "a band below", "three levels beside the largest", "the levels' own ties"]
+"""Entry writes whose terms cancel across exponent bands beside a surviving last one: a tie, a band below,
+three levels beside the largest of drawn factors, and those levels as `contract_support.CANCELLING_LEVELS`
+gives them, each key and value scaled by a drawn power of two, so its products keep their exact ties (row
+8840)."""
 
 
-@pytest.mark.parametrize("case", list(ENTRY_CASES))
+@pytest.mark.parametrize("case", ENTRY_CASES)
 @pytest.mark.parametrize("values_first", [False, True], ids=["keys first", "values first"])
 def test_an_entry_write_of_cancelling_terms_is_its_exact_sum(values_first, case):
-    """A document's entry write (`chunked_launch.entry_write`) of terms of unit weight whose keys' and
-    values' products cancel (`ENTRY_CASES`): its write, its tangent along the weight and the weight's
-    gradient each the exact sum, where each band of the aligned sum rounded its own sum, -2^25 - 2 tied to
-    -2^25 beside 2^25, zero (base review 644ef5535 F1), its bands' totals aligned at once dropped 2^-100
-    (base review f5e6e678d F1), and three levels cancelling beside the largest summed to inf (row 8757);
-    laid as the TPU forked scan lays it too."""
+    """A document's entry write (`chunked_launch.entry_write`) of cancelling terms across exponent bands
+    beside a surviving last term: its write, its tangent along the weight and the weight's gradient on par
+    from float64 with the surviving last term alone (check 1, row 8715), in both layouts, where each band
+    rounded its own sum (base review 644ef5535 F1), its bands' totals aligned at once dropped 2^-100 (base
+    review f5e6e678d F1), and three levels cancelling beside the largest summed to inf (row 8757)."""
     from dew.nn.kernels.chunked_launch import entry_write
 
-    keys, values, total = ENTRY_CASES[case]
-    key = jnp.asarray(keys, jnp.float32)[:, None]
-    terms = jnp.asarray(values, jnp.float32)
-    value = terms[None, :] if values_first else terms[:, None]
+    def draw(seed):
+        case_id = ENTRY_CASES.index(case)
+        rng = np.random.default_rng([8715, seed, int(values_first), case_id])
+        rows = 16
+        if case == "the levels' own ties":
+            keys, values = (np.asarray(part) for part in zip(*CANCELLING_LEVELS, strict=True))
+            key = (keys[:, None] * 2.0 ** -rng.integers(0, 4, (rows, 1, 4))).astype(np.float32)
+            terms = (values[:, None] * 2.0 ** -rng.integers(1, 4, (rows, 1, 4))).astype(np.float32)
+        elif case == "three levels beside the largest":
+            k0 = (2.0 ** 26 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            k1 = (2.0 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            k2 = rng.uniform(0.5, 0.9, (rows, 1, 4)).astype(np.float32)
+            k3 = rng.uniform(0.5, 0.9, (rows, 1, 4)).astype(np.float32)
+            key = np.concatenate([k0, k1, k2, k1, k2, k0, k3], axis=1)
+            v0 = (2.0 ** 127 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            v1 = (2.0 ** 127 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            v2 = (2.0 ** 103 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            last = (0.5 * np.finfo(np.float32).max * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            terms = np.concatenate([v0, v1, -v2, -v1, v2, -v0, last], axis=1)
+        else:
+            scale = 2.0 if case == "a tie" else 2.0 ** -100
+            k0 = rng.uniform(0.5, 1.5, (rows, 1, 4)).astype(np.float32)
+            k1 = rng.uniform(0.5, 1.5, (rows, 1, 4)).astype(np.float32)
+            k2 = rng.uniform(0.5, 1.5, (rows, 1, 4)).astype(np.float32)
+            key = np.concatenate([k0, k0, k1, k1, k1, k2], axis=1)
+            u0 = (2.0 ** 127 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            u1 = (2.0 ** 25 * rng.uniform(0.5, 0.9, (rows, 1, 4))).astype(np.float32)
+            last = (scale * rng.uniform(0.5, 1.5, (rows, 1, 4))
+                    * rng.choice([-1.0, 1.0], (rows, 1, 4))).astype(np.float32)
+            terms = np.concatenate([u0, -u0, u1, -0.5 * u1, -0.5 * u1, last], axis=1)
+        value = np.swapaxes(terms, -1, -2) if values_first else terms
+        weight = rng.uniform(0.5, 1.0, (rows, 1, 1)).astype(np.float32)
+        dweight = rng.uniform(0.5, 1.0, (rows, 1, 1)).astype(np.float32)
+        cotangent = (rng.uniform(-0.05, 0.05, (rows, 4, 4)) if case in ENTRY_CASES[2:]
+                     else rng.standard_normal((rows, 4, 4))).astype(np.float32)
+        return (jnp.asarray(key), jnp.asarray(value), jnp.asarray(weight), jnp.asarray(dweight),
+                jnp.asarray(cotangent))
 
-    def written(weight):
-        return entry_write(key, value, weight, values_first=values_first)[0, 0]
+    def evaluated(written):
+        def run(key, value, weight, dweight, cotangent):
+            out, tangent = jax.jvp(lambda w: written(key, value, w), (weight,), (dweight,))
+            _, pull = jax.vjp(lambda w: written(key, value, w), weight)
+            return out, tangent, pull(cotangent)[0]
 
-    weight = jnp.float32(1.0)
-    assert float(written(weight)) == total
-    assert float(jax.jvp(written, (weight,), (jnp.float32(1.0),))[1]) == total
-    assert float(jax.grad(written)(weight)) == total
+        return jax.jit(run)
+
+    def formula(key, value, weight):
+        if values_first:
+            return weight * jnp.einsum("...vr,...rk->...vk", value, key)
+        return weight * jnp.einsum("...rk,...rv->...kv", key, value)
+
+    def surviving(key, value, weight):
+        return formula(key[:, -1:], value[:, :, -1:] if values_first else value[:, -1:], weight)
+
+    ours = evaluated(lambda k, v, w: entry_write(k, v, w, values_first=values_first))
+    exact_surviving = evaluated(surviving)
+    assert_as_exact(ours, exact_surviving, draw,
+                    f"entry_write cancelling bands, values_first={values_first}, case={case}",
+                    seeds=FEWEST_SEEDS, truth_fn=exact_surviving)
 
 
 def test_a_turned_forked_calls_cancelling_entry_write_is_as_exact_as_each_document_alone():
@@ -707,6 +755,61 @@ def test_a_turned_forked_calls_cancelling_entry_write_is_as_exact_as_each_docume
     largest term dropped the third before the two cancelled (base review 224fcf53a F1)."""
     assert_forked_on_par('xla', TURNED, cancelling_entries_draw,
                          f"xla {TURNED} a forked call's cancelling entry writes", seeds=160)
+
+
+def levels_entered_draw(hooks, seed: int):
+    """`entered_draw`'s forked call under `hooks` whose documents' entry writes are `CANCELLING_LEVELS`'
+    (`contract_support.cancelling_entries`, its cotangents too), nothing else written, decayed or skipped,
+    and each token's memory's first row read by a unit query: its output, last memory and entry writes'
+    gradients each a sum float32 holds exactly or rounds once, as float64's is."""
+    operands, _ = entered_draw(hooks, seed, entries=True)
+    entries = cancelling_entries(seed, KEY_HEADS, KEY_WIDTH, VALUE_HEADS, VALUE_WIDTH)
+    query = np.zeros(operands.query.shape)
+    query[..., 0] = 1.0
+    # Every other operand zero: no key, value, log decay, write gate or step (a rated decay's `exp(A 0)`),
+    # skip or memory given.
+    zeroed = {name: jnp.zeros_like(getattr(operands, name))
+              for name in ('key', 'value', 'log_decay', 'beta', 'skip', 'state')
+              if getattr(operands, name) is not None}
+    drawn = dataclasses.replace(operands, query=hosted(query), entry_key=hosted(entries.key),
+                                entry_value=hosted(entries.value), entry_weight=hosted(entries.weight),
+                                **zeroed)
+    final = (ROWS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH)
+    return drawn, (hosted(entries.signed(operands.value.shape)), hosted(entries.signed(final)))
+
+
+@pytest.mark.parametrize('hooks', [pytest.param(HOOKS[4], id='delta-rule'),
+                                   pytest.param(FORMED[4], id='ssd')])
+def test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact(hooks):
+    """A forked call on the portable math's walk, of the gated delta rule and of Mamba2's SSD (the rated
+    scan's XLA handoff, its TPU scan's in test_ssd_kernel), whose documents' entry writes are three levels
+    cancelling beside float32's largest (`levels_entered_draw`): its output, the row's last memory and its
+    entry keys', values' and weights' gradients held by check 1 against each document a sequence of its own
+    the recurrence a token at a time in float64, rounded once (exact, so the walk must be: a write summed in
+    some order dropped a level at its tie as its negative survived, an ulp here and inf at float32's largest,
+    row 8757; rows 8840, 9480, 9513)."""
+
+    def leaves(walk):
+        def run(operands, seeded):
+            def entered(key, value, weight):
+                return walk(dataclasses.replace(operands, entry_key=key, entry_value=value,
+                                                entry_weight=weight))
+
+            out, pull = jax.vjp(entered, operands.entry_key, operands.entry_value, operands.entry_weight)
+            return dict(zip(('output', 'final', 'entry keys', 'entry values', 'entry weights'),
+                            (*out, *pull(seeded)), strict=True))
+
+        return run
+
+    def ours(operands):
+        out, final = chunk_on('xla', hooks, entering_documents(operands), chunk_size=CHUNK)
+        return out.astype(jnp.float32), final.astype(jnp.float32)
+
+    # The gate widens a truth's inputs; the reference is that truth rounded once.
+    truth = jax.jit(leaves(functools.partial(document_by_document, hooks)))
+    assert_as_exact(jax.jit(leaves(ours)), exactly_rounded(truth),
+                    functools.partial(levels_entered_draw, hooks),
+                    f"xla {hooks} a forked call's entry writes of cancelling levels", seeds=8, truth_fn=truth)
 
 
 @pytest.mark.parametrize(('by_firsts', 'vanished'), [(False, False), (True, False), (False, True)],
@@ -818,25 +921,6 @@ def test_a_turned_forked_documents_arithmetic_reads_only_its_ancestors(case):
 
 DOCUMENTS = ((0, 23, 40), (0, 9, 48))
 """Each row's packed documents' first tokens under `draw`'s `packed`."""
-
-GIVEN = 1
-"""The memories a row's table holds before its documents store theirs (`Chunk.loads`: a row's start, a
-cache)."""
-
-FORKED = (((1, 2, 2), (1, 0, 0)), ((1, 2, 3), (1, 2, 0)))
-"""Each row's documents' table slots and stored slots (`Chunk.loads`, `Chunk.stores`): the first row's start
-continued by its first document, whose final both later documents enter (a slot's gradient summing two
-documents'); the second row a chain from its start, each document entering its predecessor's final. Every
-memory is entered, so no gradient's row is float64 zero, whose terms the gate would trace each draw."""
-
-HELD = 2
-"""The stored slots a row's table holds (`Chunk.held`)."""
-
-ADDS = ((0, 0, 1), (0, 0, 2))
-"""Each row's documents' added slots (`Chunk.adds`): the first row's last document adding its row's given
-memory to its parent's final, the second row's the first document's final to its predecessor's, as a looped
-pass's document enters its fork parent's final and its own of the pass before (row 7662)."""
-
 
 def entered_draw(hooks, seed: int, entries: bool = False, length: int = LENGTH):
     """`draw`'s packed operands of `length` tokens over a table of `GIVEN` memories a row, with `entries` an
@@ -1043,16 +1127,9 @@ def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alo
     wide = jax.jit(with_gradients(lambda operands: document_by_document(hooks, operands, documents=documents,
                                                                         added=added)))
 
-    def widened(leaf):
-        floating = jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating)
-        return jnp.asarray(leaf, jnp.float64) if floating else leaf
-
-    def truth(operands, seeded):
-        with jax.enable_x64(new_val=True):
-            return wide(jax.tree.map(widened, operands), jax.tree.map(widened, seeded))
-
+    # The gate widens the truth's inputs (`reference_error._truth_and_terms`).
     assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)), draw, site, seeds=seeds,
-                    truth_fn=truth)
+                    truth_fn=wide)
 
 
 def _measured_routes(choice, generation_name: str, run, *shapes, mesh=None) -> list:

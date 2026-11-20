@@ -49,6 +49,18 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
     # zero where its cotangent is not (the fp32 small-weight edge, 2.77e7 times the reference's error).
     cotangents = (e * ((about - per_query(delta)) * over) if accurate or at_anchor is not None
                   else weights * (about - per_query(delta)))
+    if keep is not None:
+        # A dropping row's centred products, each at most twice its largest (`dP - c` and `D - c` of one
+        # range), at a quarter and taken back after their weight, where unscaled they pass fp32's largest:
+        # products of ±5 2^125 about one another overflowed where dQ is 9.2e37 (the base review of
+        # e2b671ce9, F1).
+        quarter = 0.25
+        centred = dropped * quarter - per_query(anchor * quarter)
+        if at_anchor is not None:
+            centred = jnp.where(at_anchor, 0.0, centred)
+        quartered = (e * ((centred - per_query(delta * quarter)) * over) if accurate or at_anchor is not None
+                     else weights * (centred - per_query(delta * quarter)))
+        cotangents = jnp.where(algebra.finite(cotangents), cotangents, quartered * 4.0)
     return e, weights, gradient.where_seen(seen, cotangents, 0.0)
 
 

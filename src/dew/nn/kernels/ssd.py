@@ -128,7 +128,7 @@ def _bottom(size: int):
     """`mask[i, j] = (i == C - 1)`, the bottom row of a `[C, C]` tile. Reading
     and writing that row is a masked reduction here because neither backend
     lowers a slice of a value."""
-    return jax.lax.broadcasted_iota(jnp.int32, (size, size), 0) == size - 1
+    return jax.lax.broadcasted_iota(jnp.int32, (size, size), 0) == jnp.int32(size - 1)
 
 
 def _last_row(matrix):
@@ -217,21 +217,23 @@ def _tpu_backward(x_ref, b_ref, c_ref, a_ref, entered_ref, dy_ref, dfinal_ref, d
 def _marked(loads_ref, t):
     """Whether token `t` of a chunk opens one of its segments: its first, or a document's first (its `load`
     past -1, `recurrence_chunk.Chunk.loads`), read from the chunk's loads in scalar memory."""
-    return (t == 0) | (loads_ref[0, t] >= 0)
+    return (t == jnp.int32(0)) | (loads_ref[0, t] >= jnp.int32(0))
 
 
 def _segment_count(loads_ref, count: int):
     """The segments (documents) opening inside a chunk of `count` tokens (row 9078)."""
-    return jax.lax.fori_loop(0, count, lambda t, n: n + _marked(loads_ref, t).astype(jnp.int32), jnp.int32(0))
+    return jax.lax.fori_loop(jnp.int32(0), jnp.int32(count),
+                             lambda t, n: n + _marked(loads_ref, t).astype(jnp.int32), jnp.int32(0))
 
 
 def _segment_after(loads_ref, origin, count: int):
     """The token after the segment opening at `origin`: the next token opening one, else the chunk's end."""
+    end = jnp.int32(count)
+
     def found(t, after):
-        return jnp.where((after == count) & _marked(loads_ref, t), t, after)
+        return jnp.where((after == end) & _marked(loads_ref, t), t, after)
 
-    return jax.lax.fori_loop(origin + 1, count, found, count)
-
+    return jax.lax.fori_loop(origin + jnp.int32(1), end, found, end)
 
 def _windowed(x, b, c, a, origin, through):
     """A chunk's operands with every token outside `[origin, through]` the identity step: no input, read or
@@ -239,7 +241,7 @@ def _windowed(x, b, c, a, origin, through):
     rows = jax.lax.broadcasted_iota(jnp.int32, (x.shape[0], 1), 0)
     steps = jax.lax.broadcasted_iota(jnp.int32, a.shape, a.ndim - 1)
     inside = (rows >= origin) & (rows <= through)
-    held = jnp.where(inside, 1.0, 0.0)
+    held = inside.astype(x.dtype)
     return (x * held, b * held, c * held, jnp.where((steps >= origin) & (steps <= through), a, 0.0)), inside
 
 
@@ -249,10 +251,10 @@ def _slot(given_ref, table, at, zero):
     count = given_ref.shape[0]
     taken = zero
     for slot in range(count):
-        taken = jnp.where(at == slot + 1, given_ref[slot], taken)
+        taken = jnp.where(at == jnp.int32(slot + 1), given_ref[slot], taken)
     if table is not None:
         for slot in range(table.shape[0]):
-            taken = jnp.where(at == count + slot + 1, table[slot], taken)
+            taken = jnp.where(at == jnp.int32(count + slot + 1), table[slot], taken)
     return taken
 
 
@@ -302,19 +304,20 @@ def _tpu_forked_forward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_ref
     def segment(_, state):
         y, leaving, origin = state
         after = _segment_after(loads_ref, origin, count)
-        through = after - 1
+        through = after - jnp.int32(1)
         load = loads_ref[0, origin]
-        memory = jnp.where(load < 0, carried, _opened(given_ref, table, entry, load, adds_ref[0, origin],
-                                                      begun_ref[0, origin], jnp.zeros_like(carried)))
+        memory = jnp.where(load < jnp.int32(0), carried, _opened(given_ref, table, entry, load,
+                                                                 adds_ref[0, origin], begun_ref[0, origin],
+                                                                 jnp.zeros_like(carried)))
         operands, inside = _windowed(x, b, c, a, origin, through)
         out, left = _chunk_forward(*operands, memory)
         if table is not None:
             store = stores_ref[0, through]
             for slot in range(held):
-                table[slot] = jnp.where(store == slot + 1, left, table[slot])
-        return jnp.where(inside, out, y), jnp.where(through == count - 1, left, leaving), after
+                table[slot] = jnp.where(store == jnp.int32(slot + 1), left, table[slot])
+        return jnp.where(inside, out, y), jnp.where(through == jnp.int32(count - 1), left, leaving), after
 
-    y, leaving, _ = jax.lax.fori_loop(0, segments, segment,
+    y, leaving, _ = jax.lax.fori_loop(jnp.int32(0), segments, segment,
                                       (jnp.zeros(y_ref.shape, jnp.float32), carried, jnp.int32(0)))
     y_ref[...] = y
     final_ref[...] = leaving
@@ -352,22 +355,22 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_re
             marked = _marked(loads_ref, t)
             return seen + marked.astype(jnp.int32), jnp.where(marked & (seen == k), t, origin)
 
-        return jax.lax.fori_loop(0, count, counted, (jnp.int32(0), jnp.int32(0)))[1]
+        return jax.lax.fori_loop(jnp.int32(0), jnp.int32(count), counted, (jnp.int32(0), jnp.int32(0)))[1]
 
     def segment(i, state):
         dx, db, dc, da, dprev = state
-        k = segments - 1 - i
+        k = segments - jnp.int32(1) - i
         origin = origin_of(k)
-        through = _segment_after(loads_ref, origin, count) - 1
+        through = _segment_after(loads_ref, origin, count) - jnp.int32(1)
         load, add = loads_ref[0, origin], adds_ref[0, origin]
         document = begun_ref[0, origin]
-        memory = jnp.where(load < 0, start, _opened(given_ref, table, entry, load, add, document,
-                                                    jnp.zeros_like(start)))
-        dleft = jnp.where(through == count - 1, dnext, 0.0)
+        memory = jnp.where(load < jnp.int32(0), start, _opened(given_ref, table, entry, load, add, document,
+                                                               jnp.zeros_like(start)))
+        dleft = jnp.where(through == jnp.int32(count - 1), dnext, 0.0)
         if dtable is not None:
             store = stores_ref[0, through]
             for slot in range(held):
-                stored = store == slot + 1
+                stored = store == jnp.int32(slot + 1)
                 dleft = dleft + jnp.where(stored, dtable[slot], 0.0)
                 dtable[slot] = jnp.where(stored, 0.0, dtable[slot])
         operands, inside = _windowed(x, b, c, a, origin, through)
@@ -378,17 +381,18 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_re
         # The slot a document loads and the one it adds (zero, none) each take its memory's gradient.
         for at in (load, add):
             for slot in range(count_given):
-                dgiven[slot] = dgiven[slot] + jnp.where(at == slot + 1, dmemory, 0.0)
+                dgiven[slot] = dgiven[slot] + jnp.where(at == jnp.int32(slot + 1), dmemory, 0.0)
             if dtable is not None:
                 for slot in range(held):
-                    dtable[slot] = dtable[slot] + jnp.where(at == count_given + slot + 1, dmemory, 0.0)
+                    dtable[slot] = dtable[slot] + jnp.where(at == jnp.int32(count_given + slot + 1), dmemory,
+                                                            0.0)
         if entry is not None and dentry is not None:
             # Formed only where the segment opens its document: a continuation's memory gradient is the
             # chunk's, against which a term's products left fp32's range where the document's are in it,
             # and masked after, inf times zero gave every key gradient NaN (base review 13abb0d6b F1).
             entries, gradients = entry, dentry
 
-            @pl.when(load >= 0)
+            @pl.when(load >= jnp.int32(0))
             def _():
                 key, value, weight = (ref[document] for ref in entries)
                 dkey, dvalue, dweight = gradients
@@ -403,11 +407,11 @@ def _tpu_forked_backward(loads_ref, stores_ref, begun_ref, adds_ref, x_ref, b_re
                     [(value[:, r:r + 1], key[r:r + 1, :], dmemory) for r in rows], axis=(0, 1))
         return (jnp.where(inside, dx + wx, dx), jnp.where(inside, db + wb, db),
                 jnp.where(inside, dc + wc, dc), jnp.where(within, da + wa, da),
-                jnp.where(load < 0, dmemory, dprev))
+                jnp.where(load < jnp.int32(0), dmemory, dprev))
 
     zero = jnp.zeros
     dx, db, dc, da, dprev = jax.lax.fori_loop(
-        0, segments, segment,
+        jnp.int32(0), segments, segment,
         (zero(x.shape, jnp.float32), zero(b.shape, jnp.float32), zero(c.shape, jnp.float32),
          zero(a.shape, jnp.float32), zero(start.shape, jnp.float32)))
     dx_ref[...], db_ref[...], dc_ref[...], da_ref[...], dstate_ref[...] = dx, db, dc, da, dprev

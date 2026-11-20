@@ -418,17 +418,25 @@ class Forked:
         """This call's documents from the operands a product's walk was handed (`walked`)."""
         return jax.tree.unflatten(jax.tree.structure(self), walked)
 
+    @staticmethod
+    def entry_specs(rows, heads) -> tuple:
+        """The entry write's placements on a shard map (`manual_map`), over the mesh axes that split the
+        call's `rows` and value `heads`: its keys and values `[B, D, R, H, .]` and weights `[B, D, H]`
+        (`specs`, `recurrence_chunk._tpu_specs`)."""
+        P = jax.sharding.PartitionSpec
+        return (P(rows, None, None, heads, None),) * 2 + (P(rows, None, heads),)
+
     def specs(self, rows, heads) -> tuple:
         """`walked`'s placements on a launch's shard map (`manual_map`), in its order, over the mesh axes that
         split the call's `rows` and value `heads`: the documents' slots and their added slots a row's, the
-        entry write's keys and values `[B, D, R, H, .]` and weights `[B, D, H]` their rows' and heads', and a
+        entry write's keys and values `[B, D, R, H, .]` and weights `[B, D, H]` (`entry_specs`), and a
         turned call's load rotation `[B, D, H, A]` its rows' and heads'. Each field's own: a field without one
         raises, so no launch's specs fall out of step with its operands (row 7973: a launch's copy of this
         order took the load rotation's none)."""
         P = jax.sharding.PartitionSpec
         placed = {'firsts': P(rows, None), 'loads': P(rows, None), 'stores': P(rows, None),
                   'adds': P(rows, None),
-                  'entry': (P(rows, None, None, heads, None),) * 2 + (P(rows, None, heads),),
+                  'entry': self.entry_specs(rows, heads),
                   'turning': (P(rows, None, heads, None),) * 2}
         return tuple(placed[path[0].name] if len(path) == 1 else placed[path[0].name][path[1].idx]
                      for path, _ in jax.tree_util.tree_flatten_with_path(self)[0])

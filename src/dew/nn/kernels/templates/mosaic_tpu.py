@@ -137,7 +137,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
                              pltpu.SMEM((1,), ref.dtype))
 
     def key_magnitudes(self, tile) -> jax.Array:
-        return jnp.max(jnp.abs(tile[...]), axis=1).astype(jnp.float32)
+        held = jnp.abs(tile[...])
+        return jnp.max(jnp.where(held < jnp.inf, held, 0), axis=1).astype(jnp.float32)
 
     def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
         del scratch, interpret
@@ -232,13 +233,14 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                cluster: int = 1, cost: pl.CostEstimate | Stated | None = None,
                model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               prefetched: Callable | None = None, registers: int | None = None,
-               producer: int | None = None, shared: int | None = None,
+               prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
+               producer: int | None = None, shared: int | None = None, tmem: int = 0,
                moves: bool | None = None) -> Callable:
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster, and no
         # view prefetched ahead of a wait (a GPU's dependent launch); its compiler holds its values, no
         # register budget (`budgets_registers`).
-        del approx_math, reducing_warpgroups, resident, model_flops, registers, producer, shared, moves
+        del approx_math, reducing_warpgroups, resident, model_flops, registers, producer, shared, tmem, moves
+        del reduces
         if prefetched is not None:
             raise NotImplementedError("a TPU program is launched after the last; nothing is prefetched ahead")
         _one(consumers, clustered=cluster > 1)
@@ -330,9 +332,18 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             raise ValueError("a TPU ring's streams take their views where they open (its walk copies)")
         return Streams(allocated, views)
 
-    def stream(self, streams, views, lo, hi) -> None:
-        # No producer role: the walk issues its own copies.
-        del streams, views, lo, hi
+    def uniform(self, value: jax.Array) -> jax.Array:
+        # A core's scalar is its own: no lanes to read alike.
+        return value
+
+    def decided_scratch(self, consumers: int) -> dict:
+        # One core a program, its walk its one role: it decides a second walk alone (`after_walk.Decided`).
+        del consumers
+        return {}
+
+    def stream(self, streams, views, lo, hi, *, again=None) -> None:
+        # No producer role: the walk issues its own copies, a decided walk's second pass's too.
+        del streams, views, lo, hi, again
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
@@ -423,11 +434,11 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         return carry
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0) -> R:
         # One role a core: no partner reads a step it passes, so it walks its own steps alone.
         del views, wg, between
         lo, hi = own
-        return walk(streams, lo, hi, streamed[0])
+        return walk(streams, lo, hi, streamed[0] - counted)
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         # Its walk copies only the steps it reads: a passed step loads nothing.

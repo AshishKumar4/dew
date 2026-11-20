@@ -53,9 +53,17 @@ MESH_TENSOR, MESH_HEADS = 4, 8
 """The tensor shards of the per-shard test's mesh, beside its `ROWS` data shards, and its query heads: two on
 each tensor shard, over one or two key heads, which is fewer than the shards."""
 MESH_SEEDS = 512
-"""The per-shard test's draws, sized by `seeds_for` with one device compared with
-itself: the fewest, doubling from `FEWEST_SEEDS`, that resolve the factor for each
-case, which is 512 for lengths and starts over two key heads."""
+"""A per-shard site's draws where none is sized for it (`seeds_for` with one device compared with itself:
+the fewest, doubling from `FEWEST_SEEDS`, that resolve the factor)."""
+DATA_AND_HEAD_SEEDS = {
+    ("own-documents", 1): 16, ("own-documents", 2): 16,
+    ("cross-documents", 1): 8, ("cross-documents", 2): 32,
+    ("lengths-and-starts", 1): 8, ("lengths-and-starts", 2): 64,
+    ("own-documents-blocks", 1): 8, ("own-documents-blocks", 2): 8,
+    ("own-documents-valid-places", 1): 16, ("own-documents-valid-places", 2): 16}
+"""The data-and-head mesh sites' draws by case and key heads, as `seeds_for` sizes them (et-qualify-mesh at
+main 106b45f48), where 512 each held the ten sites to 24-40 s a site on an idle vessel and 21 minutes on a
+starved one, past its stall window (row 7388)."""
 WIDE_SEEDS = {6: 64, 8: 8}
 """The partly split and gathered key heads' sites' draws by their key heads, sized by `seeds_for` paired,
 the split run against each arm it is compared with (the shares on one device and the reference path): 16
@@ -256,8 +264,8 @@ def per_shard_contract(case: dict, mesh: Mesh, specs: list, *, heads: int, kv_he
 
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("key_heads", [1, 2], ids=["one-key-head", "two-key-heads"])
-@pytest.mark.parametrize("case", MESH_CASES.values(), ids=list(MESH_CASES))
-def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh(case, key_heads):
+@pytest.mark.parametrize("name", list(MESH_CASES))
+def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh(name, key_heads):
     """A named template call on a mesh of two rows by four heads, with one or two key heads, fewer than the
     four tensor shards. It runs per shard (`sharded.assert_runs_per_shard`): its output and its gradients of
     the query, key, value and sinks are on par with one device's over the site's draws (check 1), measured
@@ -267,7 +275,8 @@ def test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh
     # Fewer key heads than tensor shards: no shard splits them, so each holds them whole, split by rows alone.
     rows = PartitionSpec("data")
     specs = [rows_and_heads, rows, rows, PartitionSpec("tensor"), rows_and_heads]
-    per_shard_contract(case, mesh, specs, heads=MESH_HEADS, kv_heads=key_heads, rules=DEFAULT_RULES,
+    per_shard_contract(MESH_CASES[name], mesh, specs, heads=MESH_HEADS, kv_heads=key_heads,
+                       rules=DEFAULT_RULES, seeds=DATA_AND_HEAD_SEEDS[name, key_heads],
                        label=f"template split over rows and heads, {key_heads} key heads")
 
 
