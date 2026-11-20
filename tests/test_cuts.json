@@ -788,10 +788,10 @@
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share beside 255 equal weights, bfloat16-triton]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a subnormal share of an overflowing row, float32-triton]",
 "tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[a weight at the exponent's edge on a large value, float32-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[fp16 values near their largest beside a state near fp32's largest-triton]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[one key-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[ties at scale 1/2-portable]",
-"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[values at fp32's largest over 256 equal keys-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[keys an ulp apart, bfloat16-portable]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[small values beside unseen ones near fp32's largest, bfloat16-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[ties at scale 1/2-triton]",
+"tests/test_attention_stability.py::test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[values near fp32's largest over 2 equal keys, bfloat16-portable]",
 "tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[a product past fp32's largest before a small scale, float32]",
 "tests/test_attention_stability.py::test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges[keys an ulp apart, float32]",
 "tests/test_attention_stability.py::test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_edges[a share in bf16's subnormal band, the denominator's rest in a later tile]",
@@ -2926,9 +2926,6 @@
 "tests/test_ppo.py::test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged[sessions]",
 "tests/test_ppo.py::test_ppos_critic_reads_the_progress_its_step_passes"
 ],
-"tests/test_precision_policy.py": [
-"tests/test_precision_policy.py::test_an_aligned_sums_derivatives_keep_smaller_terms_below_cancelling_ones[a unit]"
-],
 "tests/test_prefix_blocks.py": [
 "tests/test_prefix_blocks.py::test_a_prefix_page_is_shared_only_between_prompts_whose_groups_agree[scattered-reach]",
 "tests/test_prefix_blocks.py::test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_decoder",
@@ -3104,8 +3101,8 @@
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-a write gate-bfloat16-forward]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-minimax-text-01-lightning-bfloat16-training-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-a 192-wide value head-bfloat16-training]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-kimi-linear-kda-bfloat16-forward]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-minimax-text-01-lightning-bfloat16-forward-variant-1]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-kimi-linear-kda-bfloat16-forward-variant-1]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-minimax-text-01-lightning-bfloat16-training-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-nemotron-h-4b-ssd-float32-forward]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-qwen3.5-27b-gdn-float32-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-kimi-linear-kda-bfloat16-forward-variant-0]",
@@ -3160,7 +3157,7 @@
 "tests/test_recurrence_stability.py::test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences[turned-resets on chunk edges]"
 ],
 "tests/test_recurrence_template_stability.py": [
-"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[gated-resets on chunk edges-accurate]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_finite_and_on_par_interpreted[vector_delta-aligned_keys]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[gated-saturated gates-accurate]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[gated-spread gates-accurate]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[gated-the decay bound-accurate]",
@@ -3646,6 +3643,9 @@
 "tests/test_ssd_kernel.py::test_an_entry_writes_gradient_lowers_for_a_tpu",
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[default-chunk]",
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk]"
+],
+"tests/test_stage_blocks.py": [
+"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[jepa-stage2_sequence2]"
 ],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
