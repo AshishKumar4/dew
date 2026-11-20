@@ -120,8 +120,8 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
         # Its result at the dtype the product makes (`terms.Product.made`, JAX's own rule: a bfloat16 by a
         # float16 product is bfloat16, which NumPy's promotion refused, base review 0b8b7ed98 F1).
         mode, passes = _mode(params.get("precision"), *product.operands)
-        held = Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, product.made.itemsize))
-        return held + _moded(mode, 2.0 * elements * length * passes)
+        moving = Work(shared_bytes=read, kernels=1.0, kept_bytes=kept(elements, product.made.itemsize))
+        return moving + _moded(mode, 2.0 * elements * length * passes)
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1], held))
     if (args := get_callable_args(node, Term.unary)) is not None:
