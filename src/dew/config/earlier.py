@@ -34,7 +34,7 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`); a world model's
     tokenizer's and its dynamics model's positions as they learned them (`earlier_tokenizer_positions`,
     `earlier_dynamics_positions`); a trainer layout recorded at `Layout()`'s defaults as unset
-    (`earlier_layout`); its data plan version
+    (`earlier_trainer_layout`); its data plan version
     as the one it read by (`earlier_data_plan`); a chain's store under the fields its class renamed since,
     by today's names (`dew.data.records.earlier_chains`); an encoder or conditioner by the import path it
     has now (`dew._records.moved_paths`, row 5996); a decision layout of a class it was before by the
@@ -44,7 +44,7 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     (ledger 1552)."""
     moved = _records.moved_record(record)
     earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(
-        earlier_layout(moved)))))
+        earlier_trainer_layout(moved)))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
     # A decision layout recorded by one of the classes it was before (decision-inputs.md §1, row 6140).
     earlier = {name: _records.earlier_layout(_records.json_value(value, name))
@@ -52,7 +52,7 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     return records.earlier_chains(earlier_data_plan(earlier), _chains())
 
 
-def earlier_layout(record: Mapping[str, object]) -> Mapping[str, object]:
+def earlier_trainer_layout(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record whose trainer layout is `Layout()`'s, which every run recorded before its
     trainer's layout could be unset (`TrainerConfig.layout`) recorded for its default: unset, the layout its
     resume takes its checkpoint's (`dew.training.streaming.laid_start`), as the run it continues chose it
