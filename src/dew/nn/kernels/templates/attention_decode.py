@@ -13,7 +13,8 @@ tile's keys with the algebra's online softmax; two builders shape the step for i
   config's resident programs a multiprocessor, from its registers and its shared memory, times the
   multiprocessors; no fitted table), so one row's long cache fills the GPU. No query or span is copied.
 - the merge: the slices' softmax states combined with the call's initial state (a sink, `Initial`), in
-  a fixed order, deterministic: the algebra's fold over their fp32 states in XLA (`algebra.merged_slices`).
+  a fixed order, deterministic: one launch over the slices where the walk wrote them, the law's own path
+  with an initial state (`merged.merged_split`).
   A merge in the launch, by the last slice's program to arrive, was never faster in kernel time at any
   split on an A100 or a GH200, and the step's wall time is its launches' either way (M-ET-46).
 
@@ -34,7 +35,7 @@ from jax.extend import core as jaxpr_core
 
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, emission
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, emission, merged
 from dew.nn.kernels.templates.attention import (
     Hooks,
     Initial,
@@ -167,8 +168,8 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     residency holds, `MosaicForward.resident`), but each slice at least twice its ring's stages of key tiles:
     a shorter slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to
     hide them (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where
-    cuDNN's whole step took 13). Each slice writes its fp32 state, which XLA merges with the initial state
-    (`algebra.merged_slices`), at a config derived for them."""
+    cuDNN's whole step took 13). Each slice writes its fp32 state, which the step merges with the initial
+    state (`merged.merged_split`), at a config derived for them."""
     chosen = WALKS[walk]
     found = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
                       sources=sources, out_dtype=None, scales=scales, chosen=chosen, in_key=in_key)
@@ -329,18 +330,25 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
             return ungrouped_rows(out, heads)
         stateless = dataclasses.replace(hooks, initial=None)
         with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
-            out, maximum, total = launch(
-                rows, key, value, row_spans, stateless, residuals=Kept.OUTPUT, out_dtype=jnp.float32,
-                splits=at.slices, scaled=chosen.scaled, bounded=chosen.bounded)[:3]
+            walked_out = launch(rows, key, value, row_spans, stateless, residuals=Kept.OUTPUT,
+                                out_dtype=jnp.float32, splits=at.slices, scaled=chosen.scaled,
+                                bounded=chosen.bounded)
+        spec = _spec(rows, row_spans, stateless, scale=scale)
+        queries, width = rows.shape[1], value.shape[-1]
         if at.slices == 1:
             # One slice's outputs `[B, Q, KV, Dv]` and rows `[B, KV, Q]`, a slice axis of one.
+            out, maximum, total = walked_out[:3]
             out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
-        spec = _spec(rows, row_spans, stateless, scale=scale)
+            state = algebra.merged_state(spec, out, maximum, total, initial)
+        else:
+            # The slices merged where the launch wrote them (`merged.merged_split`).
+            state = merged.merged_split(spec, walked_out[0], walked_out[1], queries=queries, width=width,
+                                        initial=initial)
         if finished:
-            merged_rows = algebra.merged_slices(spec, out, maximum, total, initial)
+            merged_rows = algebra.finish(spec, state, initial=True, normalized=True)[0]
             return ungrouped_rows(merged_rows, heads).astype(query.dtype)
-        state = algebra.merged_state(spec, out, maximum, total, initial)
         return _unpacked_state(algebra.resumable(spec, state), heads)
+
 
 
     def run() -> jax.Array | Initial:
@@ -423,8 +431,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     row's keys where it maps them), the keys `spans` `[B, T]` leaves each query under `hooks` (`packable`), as
     `attention.reference` computes it, `[B, T, H, Dv]` in the query's dtype: packed (`packed`), its keys
     sliced over the derived work list (`plan`) on the template's forward (`attention_mosaic.forward`'s
-    `splits`), the slices merged with the initial state in XLA from their fp32 states
-    (`algebra.merged_slices`), and unpacked. Its logits folded where the algebra folds them, the rows the
+    `splits`), the slices merged with the initial state from their fp32 states (`merged.merged_split`),
+    and unpacked. Its logits folded where the algebra folds them, the rows the
     fold's reach rewalks walked again natural over those rows alone, with no branch read on the host
     (`MosaicForward.masked`, row 1978). A quantized cache's keys and values are its codes (int8 or an FP8)
     and `scales` their keys' and values' `[B, KV, K]` fp32 in each row's key order (a dense cache's

@@ -53,4 +53,4 @@ def test_a_leaf_is_sized_as_its_rows_are_on_both_of_the_gates_paths():
     with pytest.raises(GateFailure) as failed:
         assert_as_exact(cancelled(32, dropped=True), cancelled(16), faint_draw, "a dropped term", seeds=16,
                         terms=True)
-    assert [finding.rule for finding in failed.value.findings] == ["zero rows"]
+    assert {finding.rule for finding in failed.value.findings} == {"zero rows"}

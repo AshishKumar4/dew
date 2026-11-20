@@ -311,8 +311,9 @@ def failures(found: list[dict]) -> list[str]:
 def compile_kernels(cases, generation: str) -> list[dict]:
     """Each case (`name`, `call()` giving the kernel and abstract operands) on the CUDA `generation`,
     lowered as on that GPU on this host (`assumed`, `lowered_for`) and compiled by XLA for a compile-only
-    device of it, never run: its name, the generation's block limit, and the shared bytes its Triton
-    kernels launch with (the most of any; those XLA refused, where it refused one), or the error.
+    device of it, never run: its name, the generation's block limit, the shared bytes its Triton kernels
+    launch with (the most of any; those XLA refused, where it refused one), or the error, and the custom
+    kernels its executable launches, a count of each by name (`launches`, `report.launched_kernels`).
 
     A cheap first filter: a kernel that does not compile or takes more shared memory than its GPU's
     block holds fails here as it would there, before a GPU is paid for. A program whose executable carries
@@ -326,7 +327,8 @@ def compile_kernels(cases, generation: str) -> list[dict]:
         if compiled is None:
             continue
         launched, calls = compiled
-        record.update(triton_evidence(calls, launched))
+        record.update(triton_evidence(calls, launched),
+                      launches=Counter(UNIQUIFIED.sub("", name) for name, _ in launched))
     return found
 
 
@@ -442,6 +444,7 @@ def _compiled(case, generation: str, record: dict,
         write_modules(dumps(str(lowering), ".ptx"), dumps(str(compiling), ".ptx"), directory, modules)
     if expected is not None:
         record["route"] = _route(lowered, executable, _device(generation, expected.axes))
+    record["thunks"] = report.launched_thunks(executable)
     return report.launched_kernels(executable), triton_kernels(lowered)
 
 
