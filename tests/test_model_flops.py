@@ -720,7 +720,7 @@ def jaxpr_products(graph, *, state_mac=False):
         elif primitive == "mul" and convolution_tap(equation, producers):
             total += 2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64)
         elif state_mac and primitive == "mul":
-            left, right = (var.aval.shape for var in equation.invars)
+            left, right = (spread_from(producers, var) for var in equation.invars)
             if (len(left) >= 2 and len(right) >= 2 and left[-1] == 1 and right[-2] == 1
                     and left[-2] > 1 and right[-1] > 1):
                 total += 2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64)
@@ -729,6 +729,18 @@ def jaxpr_products(graph, *, state_mac=False):
         for variable in equation.outvars:
             producers[variable] = equation
     return total
+
+
+def spread_from(producers, variable) -> tuple[int, ...]:
+    """`variable`'s shape before a spread over an axis by doubling concatenations of one value and a slice
+    (Mamba's B and C over its channels, `dew.nn.mixers.mamba._spread`): an outer product's operand still,
+    each element of the product one multiply."""
+    source = producer(producers, variable)
+    while source is not None and (source.primitive.name == "slice" or (
+            source.primitive.name == "concatenate" and len(set(map(id, source.invars))) == 1)):
+        variable = source.invars[0]
+        source = producer(producers, variable)
+    return variable.aval.shape
 
 
 def producer(producers, variable):
