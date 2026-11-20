@@ -2449,12 +2449,13 @@ def test_a_forked_training_walk_traces_once_under_every_route_receipt(caplog):
                 queries, queries, values, gates, gates, state, starts, slots, slots)
         return collections.Counter(found)
 
-    with generation.chosen(gated_delta_rule='xla'):
+    # JAX's own account of each trace its jits' caches miss (`jax_explain_cache_misses`), on for both traces,
+    # its setting part of what the walk's derivation is keyed on (`derive.context`).
+    with (generation.chosen(gated_delta_rule='xla'), jax.explain_cache_misses(new_val=True),
+          caplog.at_level(logging.WARNING)):
         routed = traced()
-        # JAX's own account of each trace its jits' caches miss (`jax_explain_cache_misses`).
-        with jax.explain_cache_misses(new_val=True), caplog.at_level(logging.WARNING):
-            caplog.clear()
-            rerouted = traced()
+        caplog.clear()
+        rerouted = traced()
     # The walk's own misses, not those JAX explains of the rules it calls as it linearizes the walk's one
     # trace under the second receipt (their miss located in the walk, the function missed theirs).
     walks = [record for record in caplog.records
