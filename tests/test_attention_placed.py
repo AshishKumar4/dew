@@ -682,7 +682,7 @@ def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_rol
 
     from dew.nn.kernels.templates import attention_mosaic_dkv as dkv, placed, rings
 
-    block_q, width, slot_cols = 64, 64, 32
+    block_q, width, slot_cols = 64, 64, 64
     dq_out = jnp.zeros((1, 1, 3 * block_q, 1, width), jnp.float32)
     walk = types.SimpleNamespace(
         interpret=False,
