@@ -266,6 +266,28 @@ def test_a_prologue_the_template_refuses_leaves_the_rows_computed_once():
     assert len(projections) == 2 and rows == [jnp.bfloat16, jnp.bfloat16], rows
 
 
+def scaled_by_an_array(x, w, scale):
+    """A projection times a scalar array: an epilogue capturing an array that follows no launch axis tile by
+    tile, which the template refuses (`fused_gemm`'s 'value_off_axes')."""
+    return (x @ w) * scale
+
+
+def test_a_product_whose_epilogue_the_template_refuses_is_fused_without_it():
+    """A projection times a scalar array, on an H100 whose call names the template: the template refuses the
+    epilogue, so the region is weighed again without it, its product the template's launch and the multiply
+    after it as the program wrote it, outside the written region (row 8996: the region refused, its product
+    stayed a plain dot)."""
+    shapes = (jax.ShapeDtypeStruct((256, 512), jnp.bfloat16), jax.ShapeDtypeStruct((512, 256), jnp.bfloat16),
+              jax.ShapeDtypeStruct((), jnp.bfloat16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), generation.routes() as found:
+        traced = jax.jit(algebra.rewritten(scaled_by_an_array, kernels=True)).trace(*shapes)
+    assert {route.kernel for route in found if route.choice == "grouped_matmul"} == {"mosaic"}, [
+        (route.choice, route.kernel) for route in found]
+    program = traced.jaxpr.jaxpr
+    (last,) = (equation for equation in program.eqns if set(equation.outvars) & set(program.outvars))
+    assert last.primitive is jax.lax.mul_p
+
+
 def named_gate(x, w, up):
     """A gate projection named for remat (`checkpoint_name`, as Dew's models name gate_proj) and its SwiGLU
     with `up` after it, the activation written entry by entry (`jax.nn.silu`'s own derivative rule is a call
