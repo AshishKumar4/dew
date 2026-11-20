@@ -159,10 +159,11 @@ def full_forward_scores(task: TextGeneration, requests: Sequence[Served], model:
 
 
 def exactly(tree) -> tuple:
-    """`tree`'s identity bit for bit: its structure and each leaf's dtype, shape and bytes."""
+    """`tree`'s identity bit for bit: its structure and each leaf's dtype (the type itself, two float8 kinds
+    of one width apart), shape and bytes."""
     leaves, structure = jax.tree.flatten(tree)
-    return (str(structure), *((np.asarray(leaf).dtype.str, np.shape(leaf), np.asarray(leaf).tobytes())
-                              for leaf in leaves))
+    held = [np.asarray(leaf) for leaf in leaves]
+    return (structure, *((leaf.dtype, leaf.shape, leaf.tobytes()) for leaf in held))
 
 
 def served_row(seed: int, vocab: int, width: int) -> np.ndarray:

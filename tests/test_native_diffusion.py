@@ -54,9 +54,11 @@ STREAMED = ("sd", "xl", "safety")
 BUNDLE_CHECKS = [*((task, None) for task in ("sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint",
                                                "refiner")),
                  ("safety", "walk"), ("safety", "update")]
-"""Each pipeline's check: both parts in one process over one load of each pipeline (None), 5 to 21% less
-than each part's own process on armada's large class (sd 116 s to 108 s), but the safety pipeline's, whose
-parts together run past a group's 120 s (137 s apart, 131 s together), each part in its own."""
+"""Each pipeline's check: both parts in one process over one load of each pipeline (None), but the safety
+pipeline's, whose parts together run past a group's 120 s, each part in its own. Measured on armada's large
+class (AMD EPYC, 8 CPUs), each task's test `--durations` with the test cache off: the parts apart at main
+45131ca01 (job 20261120222129-ec6842f5) against together at 3e8cf35cb (job 20261120221427-f93ad5d3), 852 s
+to 748 s over the eight, safety 137 s apart and 131 s together."""
 
 
 @pytest.mark.parametrize(("task", "part"), BUNDLE_CHECKS,

@@ -316,11 +316,11 @@ def orbit(width: int):
     return orders
 
 
-_ONE_DEVICE: dict[tuple[str, bool], list] = {}
-"""Each case's one-device step, its trainer and the step compiled (`drawn_steps`), by the case's name and
-whether it runs in float64: the same program for every cell of the case and every step count (a count is
-the steps it runs, not a program), built once a process for the cells a group of the case holds
-(`shared_setup`)."""
+_ONE_DEVICE: dict[tuple, list] = {}
+"""Each case's one-device step, its trainer and the step compiled (`drawn_steps`), by the case's name,
+whether it runs in float64 and the trace's context it compiles under (`options.trace_context`: check 1's
+own sums among it): the same program for every cell of the case and every step count (a count is the steps
+it runs, not a program), built once a process for the cells a group of the case holds (`shared_setup`)."""
 
 
 def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: int, *, exact: bool = False):
@@ -333,10 +333,15 @@ def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: i
     samples widened (`wide`), built at its first call, so under the caller's float64. One device's
     trainer and step are the case's (`_ONE_DEVICE`), from its cached initial state (`case_setup`)."""
     one_device = mesh == MeshSpec() and devices == 1
-    built = _ONE_DEVICE.setdefault((case.name, exact), []) if one_device else []
+    keyed: list = []
 
     @as_given
     def stepped(raw, order):
+        from dew.nn.kernels.options import trace_context
+
+        # One device's step is the case's under this context (`_ONE_DEVICE`), any other the arm's own.
+        built = (_ONE_DEVICE.setdefault((case.name, exact, trace_context()), []) if one_device
+                 else keyed)
         if not built:
             directory = tmp_path / f"drawn-{devices}-{mesh.fsdp}-{mesh.stage}-{steps}-{exact}"
             trainer, _ = make_trainer(case, directory, mesh, RecordingTracker(), devices)

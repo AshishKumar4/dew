@@ -711,7 +711,7 @@ def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_tr
 def built_ins(tmp_path_factory):
     """Each built-in type's checkpoint written once at the probe's scatter (its prediction depth past the
     trunk too) and loaded from it as a native decoder, shared by the tests reading it, which a group keyed
-    by the case holds together (`shared_setup`): its directory, its source model and its load."""
+    by the case holds together (`shared_setup`): its directory and its load."""
     from interop_support import tiny_config
     from transformers import AutoModelForCausalLM
 
@@ -729,8 +729,8 @@ def built_ins(tmp_path_factory):
             model.save_pretrained(directory)
             if fields.get("num_nextn_predict_layers"):
                 with_prediction_depth(directory, config.num_hidden_layers, config.hidden_size)
-            made[case] = directory, model, Pretrained.load(directory, dtype="float32",
-                                                           attention_impl="reference")
+            del model
+            made[case] = directory, Pretrained.load(directory, dtype="float32", attention_impl="reference")
         return made[case]
     return built_in
 
@@ -748,7 +748,7 @@ def test_a_built_in_type_of_known_parts_loads_natively(built_ins, case):
     from transformers import AutoModelForCausalLM
 
     model_type = BUILT_IN[case].get("model_type", case)
-    directory, model, loaded = built_ins(case)
+    directory, loaded = built_ins(case)
     with safe_open(directory / "model.safetensors", "pt") as stored:
         names = set(stored.keys())
     assert model_type not in STORED_EXPERT or STORED_EXPERT[model_type] in names
@@ -764,7 +764,7 @@ def test_a_built_in_type_of_known_parts_loads_natively(built_ins, case):
     wide = float64_twin(reference, lambda: built(torch.float64)).eval()
     # The references select by torch's top-k, which breaks no tie as Dew's does: a draw a tie decides is
     # none that clears.
-    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), case,
+    draw = clearing_selections(loaded, token_draw(0x3070, reference.config.vocab_size, (4, 24)), case,
                                stable=False)
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
                     torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
@@ -866,7 +866,7 @@ def test_a_learned_activation_and_a_fused_projection_save_as_stored(built_ins, t
     names bit for bit, the buffers in their stored dtype (ledgers 3076, 3077, 3070, 3080)."""
     from safetensors.numpy import load_file
 
-    directory, _, loaded = built_ins(case)
+    directory, loaded = built_ins(case)
     loaded.save(tmp_path / "saved")
     source, saved = (load_file(folder / "model.safetensors") for folder in (directory, tmp_path / "saved"))
     assert set(saved) == set(source)
