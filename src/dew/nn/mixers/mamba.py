@@ -82,6 +82,19 @@ def _spread(t: jax.Array, channels: int) -> jax.Array:
     return spread[:, :, :channels]
 
 
+def _readout(channels: int, states: jax.Array, C: jax.Array, **product) -> jax.Array:
+    """`sum_n C_n h_n` `[B, C, D]` of `states` `[B, C, D, N]` and `C` `[B, C, N]` spread over the channels
+    (`_spread`), placed as the states' batch dimensions are where an Explicit axis splits them, the
+    contracted states whole as `C` is: the readout's product at `STATE_PRECISION`."""
+    spread = _spread(C, channels)
+    placed = explicit_spec(states)
+    if placed is not None:
+        batch = jax.sharding.PartitionSpec(*tuple(placed.spec)[:3], None)
+        spread = jax.sharding.reshard(spread, jax.sharding.NamedSharding(placed.mesh, batch))
+    return jnp.einsum('bcdn,bcdn->bcd', states, spread, precision=recurrence_algebra.STATE_PRECISION,
+                      **product)
+
+
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE, *,
                    forked: chunked_launch.Forked | None = None):
     """`mamba_selective_scan` (modeling_mamba.py:175-282) after the softplus.
@@ -125,13 +138,10 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         write = (dt_c * x_c)[..., None] * _spread(B_c, channels)
         # The chunk's states a token at a time from the state entering it (`ssm.affine_states`).
         states = affine_states(decay, write, h, axis=1)
-        # The readout's contraction over the states as it was (`portable_einsum`, its accumulation policy),
-        # each channel its own batch, C spread over the channels placed as the states are.
-        spread = _spread(C_c, channels)
-        placed = explicit_spec(states)
-        if placed is not None:
-            spread = jax.sharding.reshard(spread, placed)
-        read = recurrence_algebra.portable_einsum('bcdn,bcdn->bcd', states, spread)
+        # The readout's contraction over the states as it was (`portable_einsum`'s, its accumulation policy),
+        # each channel its own batch: C spread over the channels inside the product, so a wide sum widens C
+        # itself and rounds its cotangent after the channels' tree.
+        read = accumulated(functools.partial(_readout, channels), states, C_c)
         return states[:, -1], read
 
     steps = tuple(chunks(t) for t in (x, dt, B, C, resets))

@@ -245,6 +245,23 @@ def test_a_scans_b_and_c_gradients_sum_their_channels_as_the_recurrence(case, le
                     seeds=FEWEST_SEEDS, truth_fn=exact)
 
 
+def test_a_wide_cpu_readouts_c_gradient_sums_its_channels_before_it_rounds(monkeypatch):
+    """C's gradient of the chunked scan under Dew's wide CPU arithmetic, two channels each holding `2^100`
+    in one state through a token that neither decays nor writes, read under cotangents `2^30` and `-2^30`:
+    zero, the channels' products summed in float64 and rounded once, where C's cotangent rounded each
+    channel's product to float32 first, `inf - inf`, NaN (review of fb050ba39)."""
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC
+
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    x = dt = jnp.zeros((1, 1, 2), jnp.float32)
+    A, D = jnp.zeros((2, 2), jnp.float32), jnp.zeros((2,), jnp.float32)
+    B = C = jnp.zeros((1, 1, 2), jnp.float32)
+    state = jnp.asarray([[[2.0 ** 100, 0.0], [2.0 ** 100, 0.0]]], jnp.float32)
+    _, pull = jax.vjp(lambda C: selective_scan(x, dt, A, B, C, D, state=state, chunk_size=1), C)
+    (gradient,) = pull((jnp.asarray([[[2.0 ** 30, -(2.0 ** 30)]]], jnp.float32), jnp.zeros_like(state)))
+    np.testing.assert_array_equal(np.asarray(gradient), np.zeros((1, 1, 2), np.float32))
+
+
 def test_a_scan_of_no_channels_takes_zero_b_and_c_gradients():
     """The chunked scan over no channels gives B and C zero gradients of their own shapes, where a channel
     sum that indexed an empty axis raised (row 8563's review)."""
