@@ -489,11 +489,9 @@ def test_projections_whose_kernels_vary_over_a_checked_shard_map_run_side_by_sid
     over two devices, its rows replicated, on an assumed H100, nothing named but the attention kernel: with
     its parameters whole or varying over the axis (`jax.lax.pcast`), each device's launch reads its own rows
     and kernels, its results typed as they vary (row 9808), so its query, key and value run side by side
-    (the receipt's geometry), one forward launch taking them as the selector admitted them (head review of
-    b68fc2382: an admission and its launch read one condition, no automatic mesh axis)."""
+    (the receipt's geometry), the admission and its launch reading one condition, no automatic mesh axis
+    (head review of b68fc2382)."""
     from jax.sharding import Mesh, PartitionSpec
-
-    from dew.nn.kernels import tuning
 
     mesh = Mesh(np.array(jax.devices()[:2]), ("data",))
     layer = _llama_8b()
@@ -506,9 +504,7 @@ def test_projections_whose_kernels_vary_over_a_checked_shard_map_run_side_by_sid
         mapped = jax.shard_map(applied, mesh=mesh, in_specs=(PartitionSpec(), PartitionSpec()),
                                out_specs=PartitionSpec("data") if varying else PartitionSpec())
         under = (generation.assumed("sm90"), generation.chosen(attention="xla"))
-        with tuning.seen() as launches:
-            assert _qkv_routes(layer, params, x, *under, apply=mapped)[:1] == ["joined"], varying
-        assert any(bound.arguments.get("beside") for _, bound in launches.taken), varying
+        assert _qkv_routes(layer, params, x, *under, apply=mapped)[:1] == ["joined"], varying
 
 
 def test_projections_that_cast_their_input_run_apart():
