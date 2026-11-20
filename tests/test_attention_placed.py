@@ -714,7 +714,8 @@ def test_a_dq_ring_producer_and_reducer_hold_across_multiple_ordinals_on_one_rol
                 )
 
             return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(dq_arr.shape, dq_arr.dtype),
-                                grid=(1,), grid_names=("p",), num_threads=2, thread_name="wg", name=name)()
+                                grid=(1,), grid_names=("p",), num_threads=2, thread_name="wg",
+                                kernel_name=name)()
 
         return programs(launch, dq_out, threads=2)
 
