@@ -270,8 +270,12 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         self.fake_score = self.teacher
         if self.ema is not None:
             decay = self.ema.decay
+            # Its base's average stated where that is, on the counts its own settings step (`_effective`,
+            # which the key holds), its fake score left out.
+            stated = None if self.ema.stated is None else (self.ema.stated, "effective", "no fake score")
             self.ema = EMASpec(decay=lambda count: decay(self._effective(count)),
-                               select=lambda path: path[0] == "params" and path[1:2] != (FAKE_SCORE,))
+                               select=lambda path: path[0] == "params" and path[1:2] != (FAKE_SCORE,),
+                               stated=stated)
 
     def _student(self, iteration) -> jax.Array:
         """Whether update `iteration` trains the student (`is_student_phase`)."""
