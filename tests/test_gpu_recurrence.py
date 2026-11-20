@@ -231,12 +231,18 @@ recurrence lane, 11-11): a cell each GPU kind runs, its family's own."""
 
 
 def template_stability_cells() -> list[Cell]:
-    """The template finite and on par where chunked forms break, every form, regime and product."""
+    """The template finite and on par where chunked forms break, every form, regime and product, plus KDA's
+    512-seed `FLOOR_GATES` gradient check."""
     finite = template_stability.the_template_stays_finite_and_on_par_where_chunked_forms_break
-    return [Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
-                 f"{'' if forms is None else f' ({forms} forms)'}",
-                 functools.partial(finite, name, regime, product, forms), fault=STRESS)
-            for name, regime, product, forms in template_stability.CASES]
+    return [
+        *(Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
+               f"{'' if forms is None else f' ({forms} forms)'}",
+               functools.partial(finite, name, regime, product, forms), fault=STRESS)
+          for name, regime, product, forms in template_stability.CASES),
+        Cell("Kimi delta attention under tiny gates at the floor is as exact as fla",
+             template_stability.kimis_unit_keys_under_tiny_gates_at_the_floor_are_as_exact_as_fla,
+             fault=STRESS),
+    ]
 
 
 def portable_cells() -> list[Cell]:
