@@ -634,6 +634,16 @@ def auto_part(spec: jax.sharding.PartitionSpec,
                                         else axes[0] if len(axes) == 1 else axes or None for axes in kept))
 
 
+def explicit_placement(aval) -> jax.sharding.NamedSharding | None:
+    """Where the type `aval` places its value (`jax.typeof`'s, or an aval's own) where its mesh has an
+    Explicit axis, a replicated value's whole placement included; None otherwise: the one lookup of an
+    Explicit placement that a placement a reshard restores (`dew.nn.aligned`) or a product infers from its
+    operands (`dew.nn.kernels.xla_products`) reads (row 8838)."""
+    sharding = aval.sharding
+    explicit = isinstance(sharding, jax.sharding.NamedSharding) and sharding.mesh.explicit_axes
+    return sharding if explicit else None
+
+
 def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding | None:
     """Where `x`'s type places it, over its dimensions and `trailing` more
     left whole, when an Explicit axis splits it (`MeshSpec.explicit`); None

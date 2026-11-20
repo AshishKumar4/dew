@@ -23,8 +23,9 @@ from jax.typing import ArrayLike
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.float_bits import raw_fields
 from dew.nn.kernels.generation import linear_map
-from dew.nn.precision import at_least_fp32, divided
+from dew.nn.precision import at_least_fp32, divided, power2
 
 from .guidance import Guidance, Walk
 from .solvers.common import _check_endpoint_domain
@@ -106,25 +107,15 @@ def _exponent(x: jax.Array) -> jax.Array:
     """Each `|x|`'s binary exponent `e`, `2**e <= |x| < 2**(e + 1)` where `x` is a normal number, read
     from its bits: a zero, or a subnormal, which XLA:CPU reads as zero, gives the least normal's less
     one, and an infinity or a NaN the largest's plus one."""
-    limits = jnp.finfo(x.dtype)
-    unsigned = jnp.uint32 if limits.bits == 32 else jnp.uint64
-    field = (jax.lax.bitcast_convert_type(jnp.abs(x), unsigned) >> limits.nmant) & ((1 << limits.nexp) - 1)
-    return field.astype(jnp.int32) - (limits.maxexp - 1)
+    # The biased exponent field read once, as every float's is (`float_bits.raw_fields`, row 8969).
+    return raw_fields(jnp.abs(x))[2].astype(jnp.int32) - (jnp.finfo(x.dtype).maxexp - 1)
 
 
 def _scaled(x: jax.Array, power: jax.Array) -> jax.Array:
-    """`x * 2**power`, exact where the result is a normal number: the power in parts each a normal
-    number's, all of its sign, applied in turn, so each partial product lies between `x` and the
-    result and leaves no range the result keeps."""
-    limits = jnp.finfo(x.dtype)
-    unsigned = jnp.uint32 if limits.bits == 32 else jnp.uint64
-    power = jnp.asarray(power, jnp.int32)
-    for _ in range(4):
-        part = jnp.clip(power, limits.minexp, limits.maxexp - 1)
-        biased = (part + (limits.maxexp - 1)).astype(unsigned) << limits.nmant
-        x = x * jax.lax.bitcast_convert_type(biased, x.dtype)
-        power = power - part
-    return x
+    """`x * 2**power` in `x`'s type, exact where the result is a normal number, a result below the least
+    normal rounded once (`precision.power2`, the one owner of scaling by a power of two; row 8971), where
+    the power's parts applied whole first rounded such a result twice."""
+    return power2(x, power).astype(x.dtype)
 
 
 FLOOR = -4096

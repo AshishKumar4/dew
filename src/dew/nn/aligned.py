@@ -311,9 +311,10 @@ def _aligned_tangent(shape: tuple[tuple[int, ...], ...], spec: tuple, primals, t
 
 def _placed_as(x: jax.Array, like: ShapedArray) -> jax.Array:
     """`x` placed as the type `like`, whole too, where its mesh has an Explicit axis (rows 8757, 8849)."""
-    placed = like.sharding
-    typed = isinstance(placed, jax.sharding.NamedSharding) and placed.mesh.explicit_axes
-    return jax.sharding.reshard(x, placed) if typed else x
+    from dew.nn.sharding import explicit_placement
+
+    placed = explicit_placement(like)
+    return x if placed is None else jax.sharding.reshard(x, placed)
 
 
 def _transposed_term(term: Sequence[jax.Array], spot: int, axis, cotangent: jax.Array) -> tuple:

@@ -1561,3 +1561,28 @@ def test_a_flow_steps_watched_cotangents_reach_its_policys_calls(guided):
     assert probe[0] == rows * 2 * transitions and np.isfinite(probe[2])
     assert all((left == right).all()
                for left, right in zip(jax.tree.leaves(params), jax.tree.leaves(expected), strict=True))
+
+
+def a_flows_scaling_rounds_a_subnormal_result_once():
+    """`dew.sampling.flow`'s scaling by a power of two (`_scaled`, a quotient's restoration) of
+    `0.5 + 2^-24` by `2^-149` on a device that keeps subnormals: the least subnormal, its one correctly
+    rounded value, where the power's parts applied whole first rounded `2^-127 + 2^-150` to `2^-127` and
+    then its tie to zero (row 8971: flow's scaling `precision.power2`'s). A GPU numerics cell
+    (tests/test_gpu_numerics.py), as XLA:CPU flushes the subnormal either way."""
+    from dew.sampling.flow import _scaled
+
+    found = np.asarray(jax.jit(_scaled)(jnp.float32(0.5 + 2.0 ** -24), jnp.int32(-149)))
+    assert found.dtype == np.float32 and found.view(np.uint32) == 1, found.view(np.uint32)
+
+
+def test_a_flows_scaling_is_exact_where_its_result_is_normal():
+    """`dew.sampling.flow`'s scaling by a power of two over float32's normal range, both ways, and past it:
+    `x * 2^k` bit for bit where the result is normal (`precision.power2`, row 8971), a result past the
+    largest infinite and one below the least a zero or a subnormal, as before."""
+    from dew.sampling.flow import _scaled
+
+    x = jnp.asarray([1.5, -1.75, 1.0 + 2.0 ** -23], jnp.float32)
+    for k in (-125, -60, 0, 60, 126):
+        found = np.asarray(jax.jit(_scaled)(x, jnp.int32(k)))
+        np.testing.assert_array_equal(found, np.asarray(x, np.float64) * 2.0 ** k)
+    assert np.all(np.isinf(np.asarray(_scaled(x, jnp.int32(200)))))
