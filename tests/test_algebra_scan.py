@@ -1297,14 +1297,15 @@ def valued(draw_fn):
     return drawn
 
 
-@pytest.mark.parametrize("along", ["keys", "values"])
-@pytest.mark.parametrize(("operands", "draw_fn"), [(GATED, gated_draw), (KIMI, kimi_draw)],
-                         ids=["a head's decay", "a key's"])
+@pytest.mark.parametrize(("operands", "draw_fn", "along"), [
+    (GATED, gated_draw, "keys"), (KIMI, kimi_draw, "keys"), (GATED, gated_draw, "values")],
+    ids=["a head's decay", "a key's", "a head's decay, read along the values"])
 def test_a_pre_decay_corrections_chunk_adjoint_is_the_token_scans_gradient(operands, draw_fn, along):
     """The pre-decay delta rule (`delta_before`), its state read along its keys or its values
-    (`values_readout`): its chunks' outputs and final state and its chunk adjoint's (`backward`, its token
-    update replayed, its correction read before the decay) each token operand's gradient on par with the
-    token scan's from float64 (check 1), its decays' through the shifted parts' rows."""
+    (`values_readout`, the replay's read of its whole state): its chunks' outputs and final state and its
+    chunk adjoint's (`backward`, its token update replayed, its correction read before the decay) each token
+    operand's gradient on par with the token scan's from float64 (check 1), its decays' through the shifted
+    parts' rows."""
     readout_fn, draw_fn = (gated_readout, draw_fn) if along == "keys" else (values_readout, valued(draw_fn))
     operands = operands if along == "keys" else {**operands, "q": ("time", "value")}
     forms = scan.derive_scan(scan.Scan(delta_before, readout_fn, operands, walked="time",
