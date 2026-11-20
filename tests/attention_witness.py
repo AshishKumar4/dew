@@ -25,6 +25,7 @@ A query row's tiles past its last kept key are walked with nothing kept, which l
 the witness holds a row's states up to the last tile it keeps a key of, and its output from there."""
 
 import functools
+import weakref
 
 import attention_oracle
 import numpy as np
@@ -175,10 +176,11 @@ SHAPE = (1, 512, 2, 64)
 this length, so a fault in the rescale has a second step to break."""
 
 
-_PREPARED: dict[tuple[str, str], tuple] = {}
-"""Each native certify program a GPU tier part's prepare compiled (`_certified_native`), keyed by the store's
-directory and label, so a second cell reading the same causal/full program reuses its placeholder instead of
-re-compiling the same label in one prepare (`ahead_arm`, row 9546)."""
+_PREPARED: weakref.WeakKeyDictionary[object, dict[str, tuple]] = weakref.WeakKeyDictionary()
+"""Per-store cache of native certify placeholders prepared in the active `CompiledTruths`
+(`_certified_native`), scoped to the store instance so a second cell reading the same causal/full program
+reuses its placeholder without re-compiling the same label in one prepare, and a reopened store starts fresh
+(`ahead_arm`, row 9546)."""
 
 
 def operands(seed: int):
@@ -194,7 +196,7 @@ def operands(seed: int):
     return q, k, v
 
 
-def _certified_native(query, key, value, *, causal: bool, certify=None):
+def _certified_native(query, key, value, *, causal: bool):
     """Run the native certify launch through `ahead_arm` (row 9546) so GPU-tier prepare compiles it without
     eagerly touching a compile-only device, and return `(block_k, (out, rows, sums))`."""
     import jax
@@ -205,42 +207,38 @@ def _certified_native(query, key, value, *, causal: bool, certify=None):
 
     from dew.nn.kernels import generation
 
-    if certify is None:
-        span_aval = jax.ShapeDtypeStruct(query.shape[:2], jnp.int32)
-        abstract_spans = template.KeySpans(span_aval, span_aval, None, None, key.shape[1],
-                                           form="causal" if causal else "full", whole=not causal)
-        declined = attention_mosaic.forward_declined(
-            *(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (query, key, value)), abstract_spans)
-        if declined is not None:
-            pytest.skip(f"the Mosaic mainloop declines the witnessed call here: {declined}")
-        certify = attention_mosaic.certified
+    abstract_spans = jax.eval_shape(
+        lambda: template.spans(query.shape[1], key.shape[1], query.shape[0], causal=causal))
+    declined = attention_mosaic.forward_declined(
+        *(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (query, key, value)), abstract_spans)
+    if declined is not None:
+        pytest.skip(f"the Mosaic mainloop declines the witnessed call here: {declined}")
 
     def program(q, k, v):
         spans = template.spans(q.shape[1], k.shape[1], q.shape[0], causal=causal)
-        _, result = certify(q, k, v, spans)
-        return result
+        tiles, result = attention_mosaic.certified(q, k, v, spans)
+        return jnp.asarray(tiles.block_k, jnp.int32), result
 
     shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in (query, key, value))
     label = f"attention witness, {'causal' if causal else 'full'}, {generation.assumption()}, {shapes}"
     store = COMPILED.get()
-    prepared = None if store is None or not store.prepare else (str(store.directory), label)
-    if prepared in _PREPARED:
-        found = _PREPARED[prepared]
+    cached = _PREPARED.setdefault(store, {}) if store is not None and store.prepare else None
+    if cached is not None and label in cached:
+        block_k, found = cached[label]
     else:
-        found = ahead_arm(jax.jit(program), label)(query, key, value)
-        if prepared is not None:
-            _PREPARED[prepared] = found
-    _, rows, _ = found
-    return key.shape[1] // rows[0].shape[2], found
+        block_k, found = ahead_arm(jax.jit(program), label)(query, key, value)
+        if cached is not None:
+            cached[label] = (block_k, found)
+    return int(np.asarray(block_k)), found
 
 
-def launched(query, key, value, mask, *, interpret: bool, certify=None) -> dict:
+def launched(query, key, value, mask, *, interpret: bool) -> dict:
     """The certify launch's own records (`attention_mosaic.certified`) under `mask`, as float64, and the key
     tile it walked (`tile`), each record's tiles that wide."""
     if not interpret:
         queries, keys = mask.shape[2:]
         causal = bool(np.array_equal(mask[0, 0], np.tril(np.ones((queries, keys), bool))))
-        block_k, (out, rows, sums) = _certified_native(query, key, value, causal=causal, certify=certify)
+        block_k, (out, rows, sums) = _certified_native(query, key, value, causal=causal)
     else:
         spans = spans_of(mask, query.shape[0])
         tiles, (out, rows, sums) = certified(query, key, value, spans, interpret=True)
@@ -255,15 +253,14 @@ def refused(found: dict, name: str) -> int:
     return int(np.sum(rows & ~inside))
 
 
-def assert_witnessed(seed: int, causal: bool, *, interpret: bool, lane: Lane | None = None,
-                     certify=None) -> None:
+def assert_witnessed(seed: int, causal: bool, *, interpret: bool, lane: Lane | None = None) -> None:
     """Every stored state and the output of the certify launch over draw `seed`, causal or full, inside its
     step's enclosure."""
     import tier_wire
 
     q, k, v = operands(seed)
     mask = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=causal)
-    records = launched(q, k, v, mask, interpret=interpret, certify=certify)
+    records = launched(q, k, v, mask, interpret=interpret)
     if not interpret and tier_wire.preparing():
         return
     found = witnessed(q, k, v, mask, interpret=interpret, records=records, lane=lane)
@@ -272,7 +269,7 @@ def assert_witnessed(seed: int, causal: bool, *, interpret: bool, lane: Lane | N
         assert inside[rows].all(), f"{name}: {refused(found, name)} of {int(rows.sum())} held entries outside"
 
 
-def assert_faults_refused(*, interpret: bool, lane: Lane | None = None, certify=None) -> None:
+def assert_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
     """Each fault the witness exists for, refused at its elements: a dropped rescale, a maximum from the
     wrong tile, sums rounded to bf16 where the walk holds fp32, and a causal launch's records held under a
     mask one key short of its own. Both native programs launch before any check so GPU-tier prepare compiles
@@ -282,8 +279,8 @@ def assert_faults_refused(*, interpret: bool, lane: Lane | None = None, certify=
     q, k, v = operands(2)
     mask = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=False)
     causal = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=True)
-    truth = launched(q, k, v, mask, interpret=interpret, certify=certify)
-    claimed = launched(q, k, v, causal, interpret=interpret, certify=certify)
+    truth = launched(q, k, v, mask, interpret=interpret)
+    claimed = launched(q, k, v, causal, interpret=interpret)
     if not interpret and tier_wire.preparing():
         return
     m, acc = truth["m"], truth["acc"]
