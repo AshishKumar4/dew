@@ -209,7 +209,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         # The form's largest values that read no state, prepared with the chunk's decays and tokens: the
         # operands of its function, whose state the carry reads (`carry.split`).
         held = _prepared(form, tokens, decays, issue or _issued)
-        given = (*jax.tree.leaves(decays), *(tokens[name] for name in TOKENS), *held.values())
+        given = (*_flat_decays(decays), *(tokens[name] for name in TOKENS), *held.values())
         # A split is priced and traced where it is derived (`derive.context`): one derived under another
         # target, precision, numerics or mesh is none of this one's.
         key = (derive.context(), affine.base2, corrected, affine.values_read, apart, extents.across,
@@ -730,7 +730,7 @@ def _chunk(form: linear_scan.Form, held: tuple, values_read: bool, base2: bool, 
     (`held`'s nodes, `_prepared`): the extracted form evaluated (`_evaluated`), its readout along the state's
     values where `values_read`, its decays along the values (`linear_scan.Chunk.across`) of its tokens'
     exponents "E" (`exp2` where `base2`), which `carry.split` splits."""
-    decays, values = jax.tree.unflatten(_DECAYS_TREE, operands[:DECAYS]), operands[DECAYS:]
+    decays, values = _decays_from(operands[:DECAYS]), operands[DECAYS:]
     tokens = dict(zip(TOKENS, values[:len(TOKENS)], strict=True))
     known = {terms.key(node): value for node, value in zip(held, values[len(TOKENS):], strict=True)}
     # The language's own products (`_plain`), which the split's forms name and issue themselves
@@ -1292,10 +1292,19 @@ class _Decays(NamedTuple):
     between: jax.Array
 
 
-_ZERO = _Split(jnp.zeros(()), jnp.zeros(()))
-_DECAYS_TREE = jax.tree.structure(_Decays(_ZERO, _ZERO, _ZERO, jnp.zeros(())))
-DECAYS = _DECAYS_TREE.num_leaves
-"""The chunk function's leading operands: its decays (`_Decays`' leaves), its tokens' values after."""
+DECAYS = 7
+"""The chunk function's leading operands: its decays (`_flat_decays`' leaves), its tokens' values after."""
+
+
+def _flat_decays(decays: _Decays) -> tuple:
+    """`decays`' arrays in the chunk function's order (`DECAYS` of them): each split decay's two factors,
+    `entering`, `to_last` and `whole`, then `between`."""
+    return (*decays.entering, *decays.to_last, *decays.whole, decays.between)
+
+
+def _decays_from(leaves: Sequence) -> _Decays:
+    """`_flat_decays`' arrays as their decays."""
+    return _Decays(_Split(*leaves[0:2]), _Split(*leaves[2:4]), _Split(*leaves[4:6]), leaves[6])
 
 
 def _scaled(value, decay):
