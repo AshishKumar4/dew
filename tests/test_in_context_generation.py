@@ -56,9 +56,9 @@ MASK[1, :2] = False
 row's first two slots padding, as a padded prompt's are."""
 
 DECODE_SEEDS = {"one level": 8, "a chain": 8, "padding ids": 8, "an adapter": 8,
-                "a prefix under a wrapper": 32}
+                "a prefix under a wrapper": 8}
 """Check 1's declared seeds for each decode against its objective's training forward, sized paired by
-`seeds_for` on armada (cf76ed921)."""
+`seeds_for` on armada (15cda97a5)."""
 
 
 def plain(dtype):
@@ -175,11 +175,11 @@ def test_a_decode_reads_the_logits_its_training_forward_gives(case):
 
 PHI3 = Path(__file__).parent / "fixtures" / "hf" / "phi3-tiny"
 
-CROSSING_SEEDS = 8
+CROSSING_SEEDS = 128
 STEPS = 7
 """The crossing's decode steps past its four prompt ids: states of four to ten ids, the switch past eight."""
 """Check 1's declared seeds for a decode across LongRoPE's switch against the training forward, sized
-paired by `seeds_for` on armada (cf76ed921)."""
+paired by `seeds_for` on armada (15cda97a5)."""
 
 
 def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
