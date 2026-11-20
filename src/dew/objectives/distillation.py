@@ -60,7 +60,9 @@ from dew.objectives.base import (
 )
 from dew.objectives.routing import RoutedStatistics
 
-Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
+Loss = TypeVar("Loss", bound=Ratio | RoutedStatistics, default=Ratio | RoutedStatistics)
+"""What a distilled student's loss computes (`Objective.predict`'s statistics): its token statistics, or those
+beside its routers' own terms (`RoutedStatistics`), which the distillation keeps as they are."""
 Effects = TypeVar("Effects", default=None)
 
 if TYPE_CHECKING:
@@ -110,7 +112,7 @@ def prediction_of(statistics: Ratio | RoutedStatistics) -> Ratio:
     return statistics.prediction if isinstance(statistics, RoutedStatistics) else statistics
 
 
-class DistillationObjective(Objective[Ratio | RoutedStatistics, Effects], Generic[Loss, Effects]):
+class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
     """Mixes the student's own loss with a frozen teacher's soft targets."""
 
     untraced: ClassVar[Mapping[str, str]] = {
@@ -342,7 +344,7 @@ class DistillationObjective(Objective[Ratio | RoutedStatistics, Effects], Generi
         return replace(step, ema=None if step.ema is None else self.student_variables(step.ema))
 
     def _predictions(self, params: Variables, batch: Batch, step: Step
-                     ) -> tuple[Ratio | RoutedStatistics, Aux[Effects], Prediction, Prediction]:
+                     ) -> tuple[Loss, Aux[Effects], Prediction, Prediction]:
         """Score the student in the step's mode and the frozen teacher in evaluation mode, each with its
         whole logits where the divergence reads every column (`full`), and none where it reads the
         sampled ids' likelihoods alone (`selected`), each loss scoring its head as it trains."""
@@ -371,8 +373,7 @@ class DistillationObjective(Objective[Ratio | RoutedStatistics, Effects], Generi
             return optax.cosine_distance(student, teacher, epsilon=1e-6)
         return jnp.mean(jnp.square(student - teacher), axis=-1)
 
-    def loss(self, variables: Variables, batch: Batch, step: Step
-             ) -> tuple[Ratio | RoutedStatistics, Aux[Effects]]:
+    def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
         """The student's own loss mixed with the teacher's soft targets over the student's token mass, the
         student's router terms (a mixture's balance and z-loss, `RoutedStatistics`) kept beside it as its own
         loss keeps them, each over its own count (`reduce_loss`; row 9071: refused)."""
@@ -429,11 +430,11 @@ class DistillationObjective(Objective[Ratio | RoutedStatistics, Effects], Generi
                        / len(self.features))
             total = total + beta * feature
             reported.update({"distill/beta": beta, "distill/feature": Ratio(feature, mass)})
-        mixed = Ratio(total, mass)
-        return (replace(routed, prediction=mixed) if isinstance(routed, RoutedStatistics) else mixed,
-                replace(aux, metrics=reported))
+        mixed = (replace(routed, prediction=Ratio(total, mass)) if isinstance(routed, RoutedStatistics)
+                 else replace(routed, total=total, mass=mass))
+        return mixed, replace(aux, metrics=reported)
 
-    def reduce_loss(self, stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
+    def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """The objective value of the mixed statistics: the student's own reduction, which adds its router
         terms to the mixed token loss where it has any (`RoutedStatistics`)."""
         return self.student.reduce_loss(stats)
