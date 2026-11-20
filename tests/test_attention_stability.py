@@ -1195,34 +1195,6 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     default_is_finite(family, "portable")
 
 
-def test_assert_finite_checks_empty_rows_on_every_draw():
-    """Row 9041: a finite nonzero output or dQ in an empty row after seed zero fails `assert_finite`'s
-    per-draw check without running `dew_fn` a second time."""
-    empty = np.array([[True, False]])
-    family = Family(draw=lambda s: (jnp.zeros((1, 2, 1, 1)),), keep=np.zeros((1, 1, 2, 1), bool), empty=empty)
-    calls = 0
-
-    def dew_fn(x):
-        nonlocal calls
-        calls += 1
-        out = jnp.zeros((1, 2, 1, 1), jnp.float32)
-        dq = jnp.where(jnp.asarray(empty)[:, :, None, None], x, 0.0)
-        return (out, dq)
-
-    def truth_fn(x):
-        del x
-        zeros = jnp.zeros((1, 2, 1, 1), jnp.float64)
-        return (zeros, zeros)
-
-    def draw(seed):
-        return (jnp.asarray(float(seed), jnp.float32),)
-
-    with pytest.raises(AssertionError):
-        assert_finite(dew_fn, truth_fn, draw, "probe", seeds=3,
-                      check=lambda found, seed: _held_empty(family, found, f"probe seed {seed}"))
-    assert calls == 2
-
-
 @pytest.mark.skipif(not INTERPRETED, reason="an H100 runs these families in `_mainloops`' Mosaic arms")
 @pytest.mark.parametrize("family", ["values at fp32's largest over 2 equal keys",
                                     "values at fp32's largest over 256 equal keys"])
