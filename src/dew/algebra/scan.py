@@ -416,16 +416,22 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             entering = _read(apart, q, affine.values_read, affine.reader_scale) + r
         if affine.before:
             # The correction reads the state the token enters, before its decay (RWKV7's erase); its adjoint
-            # meets the entering state's cotangent beside the decay's, mirrored. Erased against the decayed
-            # state itself, then written, as RWKV7's recurrence adds its erase: formed beside the write first
-            # (`u - s corr`), its low digits were rounded into the write's magnitude before it met the
-            # state it cancels (a packed additive erase's gradient 3.2 times the token loop's, jsf-addpack).
+            # meets the entering state's cotangent beside the decay's, mirrored. The token's own update, its
+            # write less its erase (along its own vector, `linear_scan.Parts.erase`, where it has one, else
+            # its write's), is read apart from the state it enters, whose decay a read along the keys takes
+            # on the query, as the decode step reads them (`dew.nn.kernels.recurrence.update`): read through
+            # the decayed state's own rounding, a packed additive erase's worst gradient row was 2.7 times
+            # the decode step's (jsf-assoc3).
             correction = jnp.sum(c[:, None] * h, axis=0)
-            # An erase along its own vector (`linear_scan.Parts.erase`) where the token has one, else its
-            # write's, each its own outer product.
             erased = (erase if affine.erase is not None else b)[:, None] * (strength * correction)[None, :]
-            h = (h * decay[:, None] - erased) + b[:, None] * u[None, :]
-            output = _read(h, q, affine.values_read, affine.reader_scale) + r
+            update = b[:, None] * u[None, :] - erased
+            along, scale = affine.values_read, affine.reader_scale
+            if along:
+                h = h * decay[:, None] + update
+                output = _read(h, q, along, scale) + r
+            else:
+                output = _read(h, q * decay, along, scale) + _read(update, q, along, scale) + r
+                h = h * decay[:, None] + update
         elif not affine.per_key:
             correction = jnp.sum(c[:, None] * h, axis=0)
             transitioned = (h - b[:, None] * (strength * correction)[None, :]) * decay[:, None]
