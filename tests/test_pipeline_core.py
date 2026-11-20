@@ -2287,6 +2287,19 @@ def test_rows_split_from_a_laid_batch_batch_back_to_its_tree():
                                                                   jax.tree.leaves(laid), strict=True))
 
 
+def test_a_nested_records_numbers_stack_beside_its_opaque_messages():
+    """A nested record whose mapping holds an opaque message list beside numbers and strings batches field by
+    field: the messages a list of each record's, the numbers and strings stacked with a batch axis (row
+    9054: the opaque list kept the whole mapping a list of records)."""
+    from dew.data.dataset import record_batch
+
+    rows = [{"meta": {"id": np.int32(index), "lang": "en", "messages": [{"role": "user", "content": "hi"}]},
+             "x": np.float32(index)} for index in range(3)]
+    batch = record_batch(rows)
+    assert batch["meta"]["id"].tolist() == [0, 1, 2] and batch["meta"]["lang"].tolist() == ["en"] * 3
+    assert batch["meta"]["messages"] == [row["meta"]["messages"] for row in rows]
+
+
 def test_a_worker_batch_shares_its_large_columns_and_pickles_the_small_ones():
     """A loading worker stacks a batch's large numeric column straight into shared memory, which
     the reader maps without a copy, and keeps its captions and small columns as plain arrays,

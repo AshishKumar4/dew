@@ -1279,9 +1279,12 @@ def _shareable(values: Sequence[object]) -> bool:
 
 def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
     """Numeric and text columns stacked by Grain, with object columns (a
-    conversation's messages, a record's tools) kept as record lists. With
-    `shared`, a column large enough to be worth it (`SHARED_BYTES`) is stacked
-    into shared memory, for a loading worker to hand over without a copy."""
+    conversation's messages, a record's tools) kept as record lists, at every
+    level of a nested record: a mapping every record holds with the same fields
+    is batched field by field, so an opaque field in it leaves its neighbours
+    stacked (row 9054: one held them all as a list). With `shared`, a column
+    large enough to be worth it (`SHARED_BYTES`) is stacked into shared memory,
+    for a loading worker to hand over without a copy."""
     if not rows:
         raise ValueError("a batch needs at least one record")
     if any(row.keys() != rows[0].keys() for row in rows[1:]):
@@ -1289,8 +1292,13 @@ def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
     batched: Batch = {}
     for name in rows[0]:
         values = [row[name] for row in rows]
-        batched[name] = (_column(values, shared=shared and _shareable(values))
-                         if all(_stacked(value) for value in values) else values)
+        if all(_stacked(value) for value in values):
+            batched[name] = _column(values, shared=shared and _shareable(values))
+        elif all(isinstance(value, Mapping) and value and value.keys() == values[0].keys()
+                 for value in values):
+            batched[name] = record_batch(values, shared=shared)
+        else:
+            batched[name] = values
     return batched
 
 
