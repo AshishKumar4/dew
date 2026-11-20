@@ -1822,3 +1822,34 @@ def test_stats_reads_with_the_loading_its_chain_states(tmp_path):
     plain = Memory(rows("a", 16)).named("sample").read("indexed")
     assert mapped_in(plain) == {os.getpid()}
     assert os.getpid() not in mapped_in(plain.loading(Loading(workers=2)))
+
+
+def group_firsts(columns: dict[str, list]) -> dict[str, list]:
+    """A batched step that keeps its rows, each row given its group's first `i`: what it makes of a row
+    depends on the group it is read in."""
+    return {"group": [columns["i"][0]] * len(columns["i"])}
+
+
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+def test_a_batched_map_that_keeps_its_rows_groups_the_order_whatever_reads_it(read):
+    """A batched map that keeps its rows groups the order's own consecutive records, so its rows are the
+    same read by one share or by two, each share's rows a part of the one read's, and the read stays a
+    global order (row 9007: grouped after the share cut, each share grouped its own records, and the read
+    was cut per share)."""
+    chain = Memory(rows("a", 24)).map(group_firsts, batched=True, batch_size=4).batch(2)
+
+    def read_by(partition: DataPartition) -> list[tuple[int, int]]:
+        data = compile(chain, read=read, loading=READ)
+        assert data.plan is not None and data.plan.lowering == "global"
+        reader = data.train(partition)
+        try:
+            batches = [next(reader) for _ in range(data.records // 2 // partition.count)]
+        finally:
+            reader.close()
+        return [(int(i), int(group)) for batch in batches for i, group in zip(batch["i"], batch["group"],
+                                                                           strict=True)]
+
+    whole = read_by(DataPartition())
+    assert whole == [(index, index // 4 * 4) for index in range(24)]
+    shares = read_by(DataPartition(0, 2)) + read_by(DataPartition(1, 2))
+    assert sorted(shares) == whole

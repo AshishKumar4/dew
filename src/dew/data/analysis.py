@@ -763,8 +763,11 @@ def _volatile(stage: Stage) -> bool:
 
 def _drops(stage: Stage) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
-    the rows before it, one for one."""
-    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native, Batched)) or rejects(stage)
+    the rows before it, one for one: a batched step that keeps its rows' count (`Batched.same_rows`) is
+    none, its groups formed in the order's own records (row 9007)."""
+    if isinstance(stage, Batched):
+        return not stage.same_rows
+    return isinstance(stage, (Filter, FlatMap, Pack, Windows, Native)) or rejects(stage)
 
 
 def rejects(stage: Stage) -> bool:
