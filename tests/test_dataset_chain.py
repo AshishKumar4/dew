@@ -1850,6 +1850,6 @@ def test_a_batched_map_that_keeps_its_rows_groups_the_order_whatever_reads_it(re
                                                                            strict=True)]
 
     whole = read_by(DataPartition())
-    assert whole == [(index, index // 4 * 4) for index in range(24)]
+    assert whole == [(index, index // 4 * 4) for index in range(24)], str(whole)[:300]
     shares = read_by(DataPartition(0, 2)) + read_by(DataPartition(1, 2))
-    assert sorted(shares) == whole
+    assert sorted(shares) == whole, str(sorted(shares))[:300]
