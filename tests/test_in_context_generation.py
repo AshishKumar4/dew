@@ -16,7 +16,7 @@ from block_support import model as kinded, wrapped
 from reference_error import assert_as_exact, dew_path
 from test_chunk_adaptation import LENGTH, LEVEL, VOCAB, _replayed, decoder, drawn_variables, variable_shapes
 
-from dew.batch import BLOCKS_FIELD, token_coordinates
+from dew.batch import BLOCKS_FIELD, COORDINATES_FIELD, token_coordinates
 from dew.data.chat import Role
 from dew.inference.tasks import TextGeneration
 from dew.interop import Pretrained
@@ -27,6 +27,7 @@ from dew.nn.protocols import BlockReading, Bounded, CacheCapacity, Generating, L
 from dew.nn.visibility import served_blocks
 from dew.objectives.lm import LMObjective, Samples
 from dew.objectives.lm.adaptation import ChunkAdaptation, InContextDecoder
+from dew.objectives.lm.objective import prefixed_fields
 from dew.sampling import Sampling
 from dew.sampling.strategies import Beam, Speculative
 from dew.sampling.text import decode_ops, generate, prefill_state
@@ -100,10 +101,12 @@ def drawn(seed: int, case: str):
 
 def trained(objective: LMObjective):
     """The objective's training forward's logits at each slot but the last (`token_scores`), the last
-    slot's token the one before it's target."""
+    slot's token the one before it's target, a prefix run's blocks laid as its loss lays them
+    (`prefixed_fields`)."""
     def run(variables, tokens, mask):
-        coordinates = token_coordinates(tokens.shape, valid=mask)
-        return objective.token_scores(variables, tokens, coordinates=coordinates, logits=True).logits
+        laid = {COORDINATES_FIELD: token_coordinates(tokens.shape, valid=mask)}
+        rows = ModelInputs(jnp.asarray(tokens), prefixed_fields(laid, tokens.shape, objective.prefix, None))
+        return objective.token_scores(variables, rows, logits=True).logits
     return run
 
 
