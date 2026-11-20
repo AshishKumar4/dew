@@ -43,9 +43,9 @@ MASK[1, :2] = False
 """Every draw's real slots: the second row's first two slots padding, as a padded prompt's are."""
 
 DECODE_SEEDS = {"one level": 8, "a chain": 8, "padding ids": 8, "an adapter": 8,
-                "a prefix under a wrapper": 8}
+                "a prefix under a wrapper": 32}
 """Check 1's declared seeds for each decode against its objective's training forward, sized paired by
-`seeds_for` on armada."""
+`seeds_for` on armada (cf76ed921)."""
 
 
 def plain(dtype):
@@ -155,7 +155,7 @@ PHI3 = Path(__file__).parent / "fixtures" / "hf" / "phi3-tiny"
 
 CROSSING_SEEDS = 8
 """Check 1's declared seeds for a decode across LongRoPE's switch against the training forward, sized
-paired by `seeds_for` on armada."""
+paired by `seeds_for` on armada (cf76ed921)."""
 
 
 def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
@@ -263,8 +263,8 @@ def test_what_an_adapting_decoder_cannot_draw_is_refused():
     """A strategy that reads tokens it then rejects or reorders (a speculative block's, a beam's) draws
     past what an adapting decoder's cache rewinds, through a task or the sampler alike; a damped or
     stacked adaptation decodes none, a packed request steps no row's level by one document, and an
-    objective whose loss scores one role's targets steps its level where no generation can: each refused,
-    naming why (ValueError)."""
+    objective with either, or whose loss scores one role's targets, steps its level where no generation
+    can, so it records no task: each refused, naming why (ValueError)."""
     model = InContextDecoder(plain(jnp.float32), ChunkAdaptation(window=3))
     variables = drawn_variables(0)
     prompt = jnp.zeros((ROWS, PROMPT), jnp.int32)
@@ -280,11 +280,13 @@ def test_what_an_adapting_decoder_cannot_draw_is_refused():
     with pytest.raises(ValueError):
         model.apply({**variables, "cache": cache}, prompt, decode=True, mutable=["cache"],
                     segment_ids=jnp.asarray([[1, 1, 2, 2, 2]] * ROWS))
-    role = LMObjective(plain(jnp.float32), LENGTH, adaptation=ChunkAdaptation(window=3),
-                       loss_role=Role.ASSISTANT)
-    assert role.task_settings() is None
-    with pytest.raises(ValueError):
-        role.policy(variables)
+    for undrawn in (LMObjective(plain(jnp.float32), LENGTH, adaptation=ChunkAdaptation(damped=True)),
+                    LMObjective(plain(jnp.float32), LENGTH, adaptation=ChunkAdaptation(layers=(0,))),
+                    LMObjective(plain(jnp.float32), LENGTH, adaptation=ChunkAdaptation(window=3),
+                                loss_role=Role.ASSISTANT)):
+        assert undrawn.task_settings() is None
+        with pytest.raises(ValueError):
+            undrawn.policy(variables)
     with pytest.raises(ValueError):
         LMObjective(plain(jnp.float32), LENGTH, adaptation=ChunkAdaptation(window=3),
                     loss_role=Role.ASSISTANT, samples=Samples([1, 2], 2))
