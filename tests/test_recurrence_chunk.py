@@ -43,7 +43,13 @@ from reference_error import (
     with_gradients,
 )
 
-from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
+from dew.nn.kernels import (
+    chunked_launch,
+    generation,
+    recurrence,
+    recurrence_algebra as algebra,
+    recurrence_chunk,
+)
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.kernels.templates import bundles
 from dew.nn.precision import l2norm
@@ -698,23 +704,27 @@ def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
         assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
 
 
-@pytest.mark.parametrize('by_firsts', [False, True], ids=['by starts', 'by first slots'])
-def test_a_forked_call_keeps_its_rows_on_an_explicit_axis(by_firsts):
-    """A forked call of the delta rule on the portable math (`Chunk.loads`: given memories, a stored parent
-    and its child, entry writes), its rows split over an Explicit mesh axis, its documents by their starts
-    or their first slots: it traces and runs, its output and final memory finite and placed as its rows are
-    (row 9690: its token maps scattered into whole buffers by two advanced indices, which JAX refuses for
-    indices and updates split on an Explicit axis, before any walk)."""
-    operands, _ = entered_draw(HOOKS[4], 0, entries=True)
-    operands = entering_documents(operands, by_firsts=by_firsts)
+def test_a_forked_calls_token_maps_keep_its_rows_on_an_explicit_axis():
+    """A forked call's token maps (`chunked_launch.Forked.tokens`: each token's load, store and document) of
+    two rows of three documents a row, its rows split over an Explicit mesh axis: the loads, stores and
+    documents each map lays a row's own (a document's first token its load and number, its last its store,
+    every other token -1 or zero), placed as its rows are (row 9690: scattered into whole buffers by a row
+    index, JAX refused indices and updates split on an Explicit axis)."""
+    firsts = np.asarray([[0, 3, 7], [0, 5, 9]], np.int32)
+    loads, stores = np.asarray([[1, 0, 2], [0, 3, 1]], np.int32), np.asarray([[1, 2, 0], [3, 0, 1]], np.int32)
+    expected = (np.full((2, 10), -1), np.zeros((2, 10)), np.zeros((2, 10)))
+    for row in range(2):
+        ends = (*firsts[row, 1:] - 1, 9)
+        expected[0][row, firsts[row]], expected[1][row, ends] = loads[row], stores[row]
+        expected[2][row, firsts[row]] = range(3)
     mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
     with jax.set_mesh(mesh):
         rows = jax.sharding.NamedSharding(mesh, P('data'))
-        split = jax.tree.map(lambda x: jax.device_put(x, rows), operands)
-        found = jax.jit(lambda given: chunk_on('xla', HOOKS[4], given, chunk_size=CHUNK))(split)
-    for got in found:
-        assert np.isfinite(np.asarray(got)).all()
-        assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
+        placed = (jax.device_put(x, rows) for x in (firsts, loads, stores))
+        forked = chunked_launch.Forked(*placed, entry=None, held=3)
+        found = jax.jit(lambda forked: forked.tokens(10))(forked)
+    assert [np.asarray(got).tolist() for got in found] == [x.tolist() for x in expected]
+    assert all(jax.typeof(got).sharding.spec[0] == 'data' for got in found)
 
 
 @pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['laid', 'a token at a time'])
