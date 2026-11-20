@@ -133,8 +133,8 @@ def rolled_out(name: str, batch, objective):
     rows = len(next(iter(batch.values())))
     states = np.zeros((rows, 3, *objective.latent_shape), np.float32)
     times = np.asarray([1.0, 0.5, 0.25], np.float32)
-    return {**batch, **transition_rows(states, times, np.zeros((rows, 2), np.float32), np.ones((rows, 2), bool),
-                                       np.zeros((rows,), np.float32))}
+    densities, stochastic = np.zeros((rows, 2), np.float32), np.ones((rows, 2), bool)
+    return {**batch, **transition_rows(states, times, densities, stochastic, np.zeros((rows,), np.float32))}
 
 
 def unvalued(objective) -> list[str]:
