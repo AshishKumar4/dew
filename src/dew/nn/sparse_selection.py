@@ -16,6 +16,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.derivatives import KernelGlue, contracted
@@ -25,6 +26,7 @@ from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.precision import accumulated, at_least_fp32, exact_products, float32_einsum
 from dew.nn.scatter import DROPPED
+from dew.nn.sharding import manual_map
 
 
 def index_agreements(query, keys, precision=None):
@@ -268,10 +270,14 @@ def _template_forward(absorbed, query_rot, latent, rot, indices, *, scale: float
     taken = jnp.take_along_axis(indices, jnp.argsort(~named, axis=-1, stable=True), axis=-1)
     table = (jnp.maximum(taken, 0) + keys * jnp.arange(batch)[:, None, None]).astype(jnp.int32)
     lengths = jnp.maximum(jnp.sum(named, axis=-1), 1).reshape(-1)
-    spans = template.spans(1, indices.shape[-1], batch * length, lengths=lengths)
-    out = attention_decode.attend(query.reshape(batch * length, 1, heads, -1), pool, pool[..., :rank], spans,
-                                  template.Hooks(), scale=scale, table=table.reshape(batch * length, -1),
-                                  interpret=generation.placed_platform() != "gpu")
+    def local(query, pool, table, lengths):
+        spans = template.spans(1, indices.shape[-1], query.shape[0], lengths=lengths)
+        return attention_decode.attend(query, pool, pool[..., :rank], spans, template.Hooks(),
+                                       scale=scale, table=table,
+                                       interpret=generation.placed_platform() != "gpu")
+
+    out = manual_map(local, (P(), P(), P(), P()), P())(
+        query.reshape(batch * length, 1, heads, -1), pool, table.reshape(batch * length, -1), lengths)
     return out.reshape(batch, length, heads, rank), ()
 
 
