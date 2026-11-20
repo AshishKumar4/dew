@@ -2,15 +2,23 @@
 mode, its kernels' reverse rules, the paged decode kernel, a head's sinks (ledger 2641; the harness is
 tests/contract_support.py)."""
 
+import functools
 import itertools
 
 import jax
 import jax.numpy as jnp
 import pytest
-from contract_support import EDGES, REVERSE_ONLY, assert_drawn_contract, normal_draw
+from attention_oracle import plain_merged
+from contract_support import EDGES, ORDER_SETS, REVERSE_ONLY, assert_drawn_contract, normal_draw
+from reference_error import FEWEST_SEEDS
 
 from dew.nn import attention, kv_cache
-from dew.nn.kernels.templates import attention as template, attention_quantized
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    attention_quantized,
+    merged,
+)
 from dew.nn.sharding import manual_map
 
 
@@ -160,6 +168,34 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
     # call `seeds_for` under `COMPILED` (row 9656).
     assert_drawn_contract(paged, inputs, EDGES[edge], f"the paged decode kernel {edge} {kernel}",
                           truth_fn=plain, plain_fn=plain, seeds=8)
+
+
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_padded_merges_derivatives_are_the_laws(edge, taken):
+    """`merged.merged_padded` (a split decode step's slices merged where its launch wrote them; its value one
+    launch on a GPU, its tangent the law's path's, a custom JVP): every order runs, finite wherever float64
+    is a normal float32 and the plain merge (`attention_oracle.plain_merged`, independent of the law) is, at
+    padded outputs and maxima near float32's ends, two slices' totals drawn positive, the plain merge its
+    truth; each order set a case of its own (`ORDER_SETS`: every order in one case, the law's path its plain
+    formula and truth, held its group to 1,798 s)."""
+    spec = algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True))
+
+    def inputs(seed: int, scale: float) -> tuple:
+        # Two slices' padded outputs (three rows of which two are queries, 12 columns of which 8 are its
+        # width) and maxima at `scale`, totals drawn positive, their directions and a cotangent.
+        padded, maxima, totals = normal_draw([7124, seed], (1, 2, 3, 1, 12), (1, 1, 2, 3), (1, 1, 2, 3),
+                                             scale=scale)
+        direction = normal_draw([7125, seed], (1, 2, 3, 1, 12), (2, 1, 1, 2, 3), scale=scale)
+        (cotangent,) = normal_draw([7126, seed], (1, 2, 1, 8))
+        return (padded, jnp.stack([maxima, jnp.abs(totals)])), direction, cotangent
+
+    def merge(padded, stacked):
+        return merged.merged_padded(spec, padded, stacked, queries=2, width=8).acc
+
+    plain = functools.partial(plain_merged, rate=1.0, queries=2, width=8)
+    assert_drawn_contract(merge, inputs, EDGES[edge], f"a padded merge {edge} ({taken})", truth_fn=plain,
+                          plain_fn=plain, seeds=FEWEST_SEEDS, taking=ORDER_SETS[taken])
 
 
 @pytest.mark.parametrize("edge", EDGES)

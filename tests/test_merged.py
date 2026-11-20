@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import plain_merged
 from generation_support import COMPILES_ON_CPU
 from kernel_compile import compile_kernels
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, dew_path
@@ -40,21 +41,9 @@ def _drawn(seed):
 
 
 def _plain(spec):
-    """The plain merge of a split row's slices, normalized (flash-decoding's: each slice's output weighed by
-    its denominator times the exponential of its maximum over the largest held, summed and divided), as
-    JAX differentiates it: check 1's reference, independent of the law."""
-    rate = 1.0 if spec.natural else spec.scale
-
-    def merge(padded, stacked):
-        out = padded[:, :, :QUERIES, :, :WIDTH]
-        maxima, totals = (jnp.moveaxis(x[..., :QUERIES], 1, 3) for x in (stacked[0], stacked[1]))
-        # Each slice weighed by its denominator at the largest maximum: a slice of zero total weighs
-        # nothing and the weight's derivative along that total is its factor, the law's (row 7124).
-        top = jax.lax.stop_gradient(jnp.max(maxima, axis=1, keepdims=True))
-        weights = jnp.exp((maxima - top) * rate) * totals
-        mass = jnp.sum(weights, axis=1)
-        return jnp.sum(weights[..., None] * out, axis=1) / jnp.where(mass > 0, mass, 1.0)[..., None]
-    return merge
+    """The plain merge (`attention_oracle.plain_merged`) at a drawn split's rows and columns: check 1's
+    reference, independent of the law."""
+    return functools.partial(plain_merged, rate=_rate(spec), queries=QUERIES, width=WIDTH)
 
 
 def _top(stacked):
