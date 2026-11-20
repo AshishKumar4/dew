@@ -47,6 +47,7 @@ from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
+from dew.nn.kernels.generation import linear_map
 from dew.nn.kv_cache import Opened, compute_dtype
 from dew.nn.linear import (
     DepthwiseConv1d,
@@ -68,6 +69,33 @@ CHUNK_SIZE = 64
 """Tokens per recurrence chunk (`ssm.affine_states`). Each chunk materialises
 its `[B, C, D, N]` decays and writes, so the chunk bounds the scan's memory;
 the output does not depend on it."""
+
+
+def _channels_paired(x: jax.Array) -> jax.Array:
+    """`x` `[B, C, D, N]` summed over its channels `D` as a balanced tree of halves, an odd one's last
+    channel carried to the next level, so the sum's error grows with the depth, `log2 D`, not with `D`: the
+    write's and the readout's transposes' channel sums, as the recurrence's autodiff reduces a token's,
+    where XLA formed a dot of 128 channels in turn (row 8563)."""
+    while x.shape[2] > 1:
+        half = x.shape[2] // 2
+        x = jnp.concatenate([x[:, :, :half] + x[:, :, half:2 * half], x[:, :, 2 * half:]], axis=2)
+    return x[:, :, 0]
+
+
+def _written(stepped: jax.Array, B: jax.Array) -> jax.Array:
+    """A chunk's writes `(dt x)[..., None] B` `[B, C, D, N]` from `stepped` `dt x` `[B, C, D]` and `B`
+    `[B, C, N]`: linear in `B`, its transpose the cotangent times `dt x` summed over the channels in pairs
+    (`_channels_paired`)."""
+    return linear_map(lambda stepped, b: stepped[..., None] * b[:, :, None, :],
+                      lambda stepped, g: _channels_paired(g * stepped[..., None]), stepped, B)
+
+
+def _read(states: jax.Array, C: jax.Array) -> jax.Array:
+    """A chunk's readout `sum_n C_n h_n` `[B, C, D]` of its `states` `[B, C, D, N]` (`portable_einsum`, the
+    forward's contraction as it was): linear in `C`, its transpose the cotangent times the states summed
+    over the channels in pairs (`_channels_paired`)."""
+    return linear_map(lambda states, c: recurrence_algebra.portable_einsum('bcdn,bcn->bcd', states, c),
+                      lambda states, g: _channels_paired(g[..., None] * states), states, C)
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE, *,
@@ -110,11 +138,10 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         # The kernels' decay (`recurrence_algebra.selective_decay`), zero at a reset.
         kept = 1.0 - reset_c[..., None, None].astype(work)
         decay = recurrence_algebra.selective_decay(dt_c[..., None], A, kept)
-        write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
+        write = _written(dt_c * x_c, B_c)
         # The chunk's states a token at a time from the state entering it (`ssm.affine_states`).
         states = affine_states(decay, write, h, axis=1)
-        read = recurrence_algebra.portable_einsum('bcdn,bcn->bcd', states, C_c)
-        return states[:, -1], read
+        return states[:, -1], _read(states, C_c)
 
     steps = tuple(chunks(t) for t in (x, dt, B, C, resets))
     if entered is None:

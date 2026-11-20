@@ -211,6 +211,39 @@ def decayed(fn):
     return run
 
 
+def channelled(fn, leaf):
+    """`fn(x, dt, A, B, C, D, state)` as `run(x, dt, A, B, C, D, state, cotangent)`, which returns the
+    gradient of `B` or of `C` (`leaf`) under the cotangent alone: each a sum over the channels of its own
+    transpose, measured apart (row 8563)."""
+    def run(x, dt, A, B, C, D, state, cotangent):
+        moving = {"B": B, "C": C}
+
+        def scanned(value):
+            given = {**moving, leaf: value}
+            return fn(x, dt, A, given["B"], given["C"], D, state)
+
+        _, pull = jax.vjp(scanned, moving[leaf])
+        return pull(cotangent)[0]
+
+    return run
+
+
+@pytest.mark.parametrize('leaf', ['B', 'C'])
+@pytest.mark.parametrize('case', RATES_PAST_THE_RANGE)
+def test_a_scans_b_and_c_gradients_sum_their_channels_as_the_recurrence(case, leaf):
+    """The gradient of B and of C, each apart (`channelled`), of the chunked scan at a rate past float32's
+    range (`rate_past_the_range`, 128 channels): on par from float64 with the recurrence a token at a time
+    (`stepwise`, check 1), their channel sums paired as its autodiff's, where the write's and the readout's
+    transposes summed 128 channels in a dot, 1.73 times its error (row 8563)."""
+    def scan(x, dt, A, B, C, D, state):
+        return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=16)
+
+    exact = jax.jit(channelled(stepwise, leaf))
+    assert_as_exact(jax.jit(channelled(scan, leaf)), exact, functools.partial(rate_past_the_range, case),
+                    f"the chunked scan's {leaf} gradient at a rate past float32's range, {case}",
+                    seeds=FEWEST_SEEDS, truth_fn=exact)
+
+
 @pytest.mark.parametrize('case', RATES_PAST_THE_RANGE)
 @pytest.mark.parametrize('chunk', [16, 64])
 def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk, case):
@@ -218,7 +251,8 @@ def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk, case):
     output, final state and its decay's step's and rate's gradients (`decayed`) on par from float64 with the
     recurrence a token at a time (`stepwise`, check 1), where the rate taken to base 2 before the step was
     -inf and a padded token's zero step made its decay NaN (row 8491), and under steps of 2^-126 each decay
-    e^-3, which no clamp of that rate gives (row 8609). Its B's and C's gradients there are row 8563's."""
+    e^-3, which no clamp of that rate gives (row 8609). Its B's and C's gradients there are their own cell's
+    (`test_a_scans_b_and_c_gradients_sum_their_channels_as_the_recurrence`)."""
     def scan(x, dt, A, B, C, D, state):
         return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=chunk)
 
