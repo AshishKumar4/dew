@@ -264,6 +264,7 @@ def test_a_wide_cpu_readouts_c_gradient_sums_its_channels_before_it_rounds(monke
     np.testing.assert_array_equal(np.asarray(gradient), np.zeros((1, 1, 2), np.float32))
 
 
+@pytest.mark.mesh(devices=2)
 def test_a_scan_whose_states_an_explicit_axis_splits_scans_as_one_unsplit():
     """The chunked scan's output and B's and C's gradients with its rate and entering state split over the
     states by an Explicit axis of two devices, C replicated: on par from float64 with the recurrence a token
