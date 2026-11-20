@@ -1738,6 +1738,7 @@ def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companion
     fresh state's shapes, compiles the accelerator's programs for them and its CPU companion's on this
     host's CPUs, nothing placed: what fills the shared cache its run's startup reads (the GPU tier's
     `test_gpu_host_startup`)."""
+    from dew.data.dataset import Loader
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.training.ahead import prepare_host_step
 
@@ -1756,7 +1757,9 @@ def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companion
     # device run has tuned (`CompiledAhead.untuned`), as a device step's prepare does (row 9693: it raised).
     topology = tmp_path / "node.topology"
     topology.write_bytes(b"")
-    done = AheadTarget("sm90", 1, topology=str(topology)).compiled(trainer, streaming_data(), steps=1)
+    data = Loader(train=lambda partition: iter([{"text": tokens}] * 2), val=None, batch=len(tokens),
+                  records=None)
+    done = AheadTarget("sm90", 1, topology=str(topology)).compiled(trainer, data, steps=1)
     assert done.untuned or (done.startup is not None and done.startup.by_backend["gpu"]["programs"] > 0)
     # Targeted as compile_ahead targets a step (`ahead._targeted`): a run that tunes its kernels, which no
     # absent GPU can, is refused, where the copy of that preamble prepared it (row 8380).
