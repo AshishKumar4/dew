@@ -1688,12 +1688,14 @@ def _linear_primitive() -> type:
         """`apply(*primals)`'s tangent in the leaves `tangents` reaches (neither None nor a symbolic zero,
         paired by the primals' structure, which raises where theirs differs), the others held as constants:
         a zero tangent's leaf beside an infinite one was a 0 inf, NaN (row 8757)."""
-        directions = jax.tree.structure(primals).flatten_up_to(tangents)
+        # The primals flattened once: their leaves paired with the tangents and filled (`programs.holes`).
+        flat, tree = jax.tree.flatten(primals)
+        directions = tree.flatten_up_to(tangents)
         live = [direction is not None and not zero(direction) for direction in directions]
-        moving, fill = programs.holes(primals, live)
+        moving, fill = programs.holes(flat, live)
         if not moving:
             return nothing(out_aval)
-        return jax.jvp(lambda *moved: apply(*fill(moved)), tuple(moving),
+        return jax.jvp(lambda *moved: apply(*tree.unflatten(fill(moved))), tuple(moving),
                        tuple(itertools.compress(directions, live)))[1]
 
     def unbatched(cotangent):
