@@ -128,3 +128,33 @@ def test_a_kernel_ptxas_serializes_carries_ptxas_own_notes_in_its_binary(depth):
     assert set(kernel["losses"]) & report.SERIALIZED, kernel
     assert tuple(kernel["binary_losses"]) == tuple(kernel["losses"]), kernel
 
+
+
+def test_a_triton_template_binary_in_compile_mosaic_kernels_reports_shared_registers_and_spills():
+    """Row 7263: when a public route compiled through `compile_mosaic_kernels` falls back to a
+    Pallas-Triton template launch (e.g. fp32 decode plain-forward kernels), `reports` + `inherited` +
+    `mosaic_failures` read its cubin's shared bytes, registers and stack frame (zero unread, tmem 0) and
+    refuse any spill."""
+    import dataclasses
+
+    clean = report.Binary("attention_forward", "0123456789", registers=64, frame=0, shared=16384, sass=())
+    spilling = report.Binary("attention_forward_scaled", "0123456789", registers=96, frame=24, shared=16384,
+                             sass=())
+    names = [report.launch_name(b.kernel, b.launch) for b in (clean, spilling)]
+    found = [kc.inherited(dataclasses.asdict(r), {}, "sm80")
+             for r in kc.reports({}, [clean, spilling], {}, triton=names)]
+    by_kernel = {item["kernel"]: item for item in found}
+    assert by_kernel["attention_forward"]["unread"] == ()
+    assert by_kernel["attention_forward"]["shared"] == 16384
+    assert by_kernel["attention_forward"]["tmem"] == 0
+    assert by_kernel["attention_forward"]["registers"] == 64
+    assert by_kernel["attention_forward"]["spilled"] == 0
+
+    clean_rec = {"name": "decode", "limit": 166912, "tmem_limit": 0,
+                 "kernels": [by_kernel["attention_forward"]]}
+    assert kc.mosaic_failures([clean_rec]) == []
+
+    spill_rec = {"name": "decode", "limit": 166912, "tmem_limit": 0,
+                 "kernels": [by_kernel["attention_forward_scaled"]]}
+    failures = kc.mosaic_failures([spill_rec])
+    assert len(failures) == 1 and "24 bytes spilled" in failures[0], failures
