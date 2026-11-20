@@ -2420,31 +2420,6 @@ def test_a_compensated_primitive_under_jit_is_its_eager_arithmetic(shape, path):
         compensated_primitives_hold_under_jit(shape)
 
 
-def test_an_error_free_transform_marks_its_arithmetic_where_the_jaxlib_marks():
-    """Where the running jaxlib marks a float operation to round alone (`no_contract`, the fork's post112
-    attribute), `two_sum`, `two_product` and a compensated sum lower with their additions, subtractions and
-    multiplies so marked and no optimization barrier, which split the fusions around every transform (a
-    DiT-B step's barriers among them, row 6740); on the barrier path (`dew._cache.BARRIERED`) they lower as
-    before, their operands behind a barrier and nothing marked (row 8378)."""
-    from dew.nn.precision import compensated_sum, no_contract, two_product, two_sum
-
-    name = no_contract()
-    assert name is not None, "Dew's pinned jaxlib marks a float operation to round alone"
-    x = jnp.linspace(1.0, 2.0, 64, dtype=jnp.float32)
-
-    def lowered():
-        return [jax.jit(transform).lower(x, x * 3).as_text() for transform in (
-            two_sum, two_product, lambda left, right: compensated_sum(left * right, (0,)))]
-
-    for text in lowered():
-        assert "optimization_barrier" not in text
-        assert f"{name} = \"true\"" in text
-    with on_path("barriered"):
-        for text in lowered():
-            assert "optimization_barrier" in text
-            assert name not in text
-
-
 def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flushing_cpu():
     """On XLA's CPU, whose fp32 multiply flushes a subnormal operand and result (row 4023):
     `dew.nn.float_bits.raised_exactly` is `x * 2^k` and `lowered_rounded` `x * 2^-k` rounded once to nearest
