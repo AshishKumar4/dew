@@ -90,10 +90,13 @@ def interpreting() -> bool | None:
 def tracing_body(interpret):
     """Within the block, a launch's body traces (`interpreting`), run in Pallas's interpreter where
     `interpret` is given: a launch's own (`_traced`), or a probe of what one traces on its tiles (a hook's
-    primitives, `templates.gemm.hooks`)."""
+    primitives, `templates.gemm.hooks`). A body a GPU or TPU kernel lowers from traces its integers in 32
+    bits whatever `jax_enable_x64` holds, as Mosaic's lowering reads them (a barrier's phase, a loop's
+    index; row 10121: x64's 64-bit integers failed a GH200's launch); the interpreter runs either."""
     token = _INTERPRETING.set(bool(interpret))
     try:
-        yield
+        with contextlib.nullcontext() if interpret else jax.enable_x64(new_val=False):
+            yield
     finally:
         _INTERPRETING.reset(token)
 
