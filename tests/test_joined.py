@@ -568,6 +568,26 @@ def test_a_named_side_by_side_product_launches_where_legal_and_refuses_by_name_w
         _qkv_routes(layer, params, x, *under("sm80"))
 
 
+def test_a_named_side_by_side_product_keeps_its_callers_grouped_choice_and_refuses_one_it_cannot_run():
+    """`qkv` named `joined` beside `grouped_matmul` named: the template's own (`mosaic`) runs side by side;
+    another (`xla`) is refused by name (`KernelRefused`, code `grouped`), where the side-by-side product
+    replaced the caller's named grouped choice with the template's in its probe and its execution (head
+    review of 0099a4701 F1). Named nothing, the template's is the side-by-side product's own."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    layer = _attention(bias=False)
+    x = jax.ShapeDtypeStruct((4, 64, 256), jnp.bfloat16)
+    params = jax.eval_shape(layer.init, jax.random.key(0), x)
+
+    def under(**grouped):
+        return generation.assumed("sm90"), generation.chosen(attention="xla", qkv="joined", **grouped)
+
+    assert _qkv_routes(layer, params, x, *under(grouped_matmul="mosaic"))[:1] == ["joined"]
+    with pytest.raises(KernelRefused) as refused:
+        _qkv_routes(layer, params, x, *under(grouped_matmul="xla"))
+    assert refused.value.first.code == "grouped", refused.value.first
+
+
 def _watched_layer():
     """`_attention`'s layer, its abstract input and parameters, and the contexts its watch cells trace under,
     made afresh at each call (a context is entered once): an assumed H100, the GEMM template named."""
