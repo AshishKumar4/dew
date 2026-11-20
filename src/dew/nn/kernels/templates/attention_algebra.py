@@ -111,6 +111,10 @@ class Forward:
     """The dtype whose largest its output is within, which a quotient past it by its weights' rounding is
     held at (`quotient`): a call's values', where it drops none and resumes no state, its output a mean of
     them (`largest_of`); None where its output may pass them."""
+    narrowed: DTypeLike | None = None
+    """The 16-bit dtype its fp32 output is narrowed to, whose overflow midpoint an output exactly at is
+    settled to the side its exact quotient lies on (`midpoint_settled`, `narrowed_of`); None where it stays
+    fp32."""
 
     @property
     def reach(self) -> float:
@@ -1932,10 +1936,13 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     if normalized:
         out = jnp.where(expand(state.total > 0, state.acc), state.acc, 0.0)
     else:
+        residual = dropped_residual(spec, state.total)
         acc, total = dropped_total(spec, state.acc, state.total)
         state = state._replace(acc=acc, total=total)
         out = quotient(lambda acc: _derived_output(spec, state._replace(acc=acc)), state.acc, state.total,
                        held=jnp.float32 if held else spec.largest)
+        if spec.narrowed is not None:
+            out = midpoint_settled(out, state.acc, state.total, residual, spec.narrowed)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
@@ -1950,6 +1957,46 @@ def dropped_total(spec: Forward, acc: jax.Array, total: jax.Array) -> tuple[jax.
     rest = np.float32(spec.units / spec.dropped)
     over = expand(~finite(total * rest), acc)
     return jnp.where(over, acc / rest, acc), jnp.where(finite(total * rest), total * rest, total)
+
+
+def dropped_residual(spec: Forward, total: jax.Array) -> jax.Array | float:
+    """What `dropped_total`'s divisor, the total times the multiplier's rest rounded to fp32, leaves of the
+    total times the rest itself: its product's rounding (`two_product`) and the total times what the rest's
+    rounding to fp32 lost; 0 where no call drops, or where the product passes fp32's largest, whose divisor
+    is the total."""
+    if spec.dropped == 1.0:
+        return 0.0
+    exact = spec.units / spec.dropped
+    rest = np.float32(exact)
+    _, error = two_product(total, rest)
+    return jnp.where(finite(total * rest), error + total * np.float32(exact - float(rest)), 0.0)
+
+
+def narrowed_of(dtype: DTypeLike) -> DTypeLike | None:
+    """`Forward.narrowed` of an output of `dtype`: a 16-bit dtype, which an fp32 output is narrowed to; None
+    for fp32's."""
+    return dtype if jnp.dtype(dtype).itemsize == 2 else None
+
+
+def midpoint_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, residual: jax.Array | float,
+                     dtype: DTypeLike) -> jax.Array:
+    """`out`, the sums `acc` over `divisor` (fp32), where it is exactly `dtype`'s overflow midpoint, its
+    largest and half an ulp, settled to the side the exact quotient lies on before its narrowing: the
+    divisor taken with the `residual` its own rounding left (a dropping call's multiplier's rest,
+    `dropped_residual`), `acc - out x divisor` exact (`two_product`) less `out` times it, whose sign says it;
+    below it, the fp32 value an ulp nearer zero, which narrows to the largest, beyond it or on it, `out`,
+    which narrows to inf as the exact quotient does. The exact output 65519.9995 of one kept key of 65504 at
+    a multiplier of 1.000244 rounded to fp32's 65520, which tied to inf in fp16 (the base review of
+    545370f65, F3; row 9544). Every other value `out` as it is."""
+    found = jnp.finfo(dtype)
+    midpoint = np.float32(float(found.max) + float(found.eps) * 2.0 ** (found.maxexp - 2))
+    nearer = np.nextafter(midpoint, np.float32(0.0))
+    divisor = expand(divisor, acc)
+    product, error = two_product(out, divisor)
+    lower = ((acc - product) - error) - out * (expand(residual, acc) if isinstance(residual, jax.Array)
+                                               else np.float32(residual))
+    within = (jnp.abs(out) == midpoint) & jnp.where(out > 0, lower < 0, lower > 0)
+    return jnp.where(within, jnp.where(out > 0, nearer, -nearer), out)
 
 
 def inverse(total: jax.Array) -> jax.Array:
