@@ -16,7 +16,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +24,7 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
-from dew._devices import device_memory, fresh_pool, gpu_free_bytes, stated_share, xla_flag
+from dew._devices import allocator_limit, device_memory, fresh_pool, gpu_free_bytes, stated_share, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
@@ -439,6 +439,19 @@ def needed(device, resident: int, beside: int, temporaries: int) -> int:
         middle = (low + high) // 2
         low, high = (low, middle) if headroom(middle) >= 0 else (middle + 1, high)
     return low
+
+
+def least_limit(device, terms: Iterable[tuple[int, int, int]]) -> int:
+    """The least allocator limit admitting each of `terms` at `device`'s stated share (else this
+    process's): each a program's admission triple (`admission`: resident, beside, temporaries), its least
+    memory on a GPU like `device` (`needed`) read as the limit that GPU's pool holds (`allocator_limit`),
+    the most of them. The one reading of a program's need the planner's compile ahead (`programs_need`),
+    the GPU lane's measured units (tools/armada/measures.py) and its test share (row 8708). No terms admit
+    no program, and are refused."""
+    limits = [allocator_limit(needed(device, *each), stated_share(device)) for each in terms]
+    if not limits:
+        raise ValueError("least_limit: no admission terms, so no program to admit and no least limit")
+    return max(limits)
 
 
 def stated(memory: Sequence[Mapping[str, int]]) -> bool:

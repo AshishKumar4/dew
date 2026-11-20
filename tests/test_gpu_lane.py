@@ -739,15 +739,14 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         ci, tmp_path, monkeypatch, cache_worker):
     """A lane unit whose prepare filed its programs' memory (`tier_wire.needs_file`, its prepare told
     which unit it is by DEW_TIER_UNIT) is given no less than the least pool at which Dew's admission
-    (dew.training.memory `needed`, the GPU's memory, read as its pool's share by `allocator_limit`)
+    (dew.training.memory `least_limit`: `needed`, the GPU's memory, read as its pool's share)
     takes the most demanding of them, beside what its runs measured: a part's float64 truths, which no
     run of it held, are admitted before they run (2026-11-17: two flows' 1.71 GiB terms walk beside
     1.1 GiB of arms ran out of a 2.84 GiB share). One past the lane's share is not run below it: its row
-    has no verdict, naming its need and the GPU (Main, 2026-11-17). Dew's own functions read it, here as
-    the lane does, on a lane a tenth of its GPU, where a need read in the wrong units is ten times off
-    (rows 7460, 7461: red unschedulable at 34.88 GiB)."""
-    from dew._devices import allocator_limit
-    from dew.training.memory import needed
+    has no verdict, naming its need and the GPU (Main, 2026-11-17). Dew's own function reads it
+    (`least_limit`), here as the lane does, on a lane a tenth of its GPU, where a need read in the wrong
+    units is ten times off (rows 7460, 7461: red unschedulable at 34.88 GiB)."""
+    from dew.training.memory import least_limit
 
     url, stored, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
@@ -763,7 +762,7 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
 
     def admitted(*programs: tuple[int, int, int]) -> int:
         """Dew's admission of `programs` on this device, in its pool's bytes, as the lane reads it."""
-        return allocator_limit(max(needed(jax.local_devices()[0], r, b, m) for r, b, m in programs))
+        return least_limit(jax.local_devices()[0], programs)
 
     def measured() -> None:
         # Its measured 2 GiB, as each run here records its own (with no GPU, none) over it.
