@@ -1137,7 +1137,7 @@ class Checkpoints:
     def control(self, step: int) -> dict:
         if step != self._local_latest():
             self.kept()
-        return copy.deepcopy(self._custom_of(step).get('control', {}))
+        return copy.deepcopy(dict(record(self._custom_of(step).get('control', {}), 'control')))
 
     def _custom_of(self, step: int) -> Mapping[str, object]:
         """The custom metadata `step` was saved with, alone (`_custom`): the local step's as its process
