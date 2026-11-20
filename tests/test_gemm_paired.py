@@ -409,10 +409,10 @@ def test_projections_side_by_side_take_one_launch_where_a_receipt_timed_it(gener
     matrices = tuple(jax.ShapeDtypeStruct((hidden, width), dtype) for width in widths)
     lhs = jax.ShapeDtypeStruct((rows, hidden), dtype)
     with generation.assumed(generation_name):
-        assert gemm.side_by_side(lhs, matrices, dtype, None, whole=True) is taken
+        assert (gemm.side_by_side(lhs, matrices, dtype, None, whole=True) is not None) is taken
         if generation_name == "sm80":
             with generation.chosen(grouped_matmul="mosaic"):
-                assert gemm.side_by_side(lhs, matrices, dtype, None, whole=True) is taken
+                assert (gemm.side_by_side(lhs, matrices, dtype, None, whole=True) is not None) is taken
 
 
 def _overflow_witness(depth: int, rank: int) -> tuple[np.ndarray, ...]:
@@ -483,9 +483,9 @@ def test_projections_side_by_side_whose_forward_a_pin_refuses_run_apart():
     matrices = tuple(jax.ShapeDtypeStruct((256, width), jnp.bfloat16) for width in (256, 128, 128))
     pin = mosaic_gpu.Tiles(128, 256, 64, 2, 1, warpgroups=2, family="wgmma")
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        assert gemm.side_by_side(lhs, matrices, jnp.bfloat16, None, whole=True)
+        assert gemm.side_by_side(lhs, matrices, jnp.bfloat16, None, whole=True) is not None
         with tuning.pinned({grouped_matmul.MosaicGmm: pin}):
-            assert not gemm.side_by_side(lhs, matrices, jnp.bfloat16, None, whole=True)
+            assert gemm.side_by_side(lhs, matrices, jnp.bfloat16, None, whole=True) is None
 
 
 @pytest.mark.parametrize("widths", [(512, 128), (512, 128, 128)], ids=["two-outputs", "three-outputs"])
