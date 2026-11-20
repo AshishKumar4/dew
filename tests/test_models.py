@@ -734,6 +734,31 @@ def test_a_layer_norms_variance_is_its_centered_mean_square():
                     truth_fn=normalized(nn.LayerNorm(epsilon=1e-5, dtype=jnp.float64)))
 
 
+def test_a_layer_norms_recompute_reduces_no_more_than_flaxs():
+    """A layer norm's rematerialized body reads its rows' shift as an input (`dew.nn.norms.LayerNorm`), taken
+    ahead of it: its backward's recompute reduces its rows no more often than flax's own norm rematerialized
+    the same way does, where a shift recomputed inside it was a mean of its own in every norm's backward,
+    98 of a DiT-B step's fusions and its compile's growth (row 6740)."""
+    from dew.nn.programs import equations
+
+    x = jnp.ones((2, 6, 16), jnp.float32)
+
+    def reductions(norm):
+        variables = norm.init(jax.random.key(0), x)
+
+        def loss(params, x):
+            return jnp.sum(norm.apply({"params": params}, x) ** 2)
+
+        program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(variables["params"], x).jaxpr
+        # The rematerialized bodies (`jax.checkpoint`'s equations): the forward's, the backward's recompute.
+        bodies = [eqn.params["jaxpr"] for eqn in equations(program) if eqn.primitive.name == "checkpoint"]
+        return sum(each.primitive.name == "reduce_sum" for body in bodies
+                   for each in equations(getattr(body, "jaxpr", body)))
+
+    flaxs = reductions(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_saveable)(epsilon=1e-5))
+    assert flaxs > 0 and reductions(LayerNorm(epsilon=1e-5)) <= flaxs, flaxs
+
+
 TOWER_NORM_SEEDS = 8
 """The tower norms' declared seeds for check 1 (`assert_as_exact`)."""
 
