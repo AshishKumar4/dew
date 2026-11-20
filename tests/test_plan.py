@@ -1814,6 +1814,7 @@ def muon_needs() -> tuple[int, int, JSON]:
             trainer.plan["remat"])
 
 
+@pytest.mark.shared_setup("muon_needs")
 def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_recomputing(monkeypatch):
     """A Muon step whose joined Newton-Schulz stacks' copies leave it short of the devices' room, and which
     fits with them parted, its split fixed: its plan parts them, joining one at a time (`ns_group` 1, the
@@ -1828,6 +1829,7 @@ def test_a_muon_step_that_fits_only_with_its_stacks_parted_parts_them_before_rec
     assert planned.plan["remat"] == remat, planned.plan
 
 
+@pytest.mark.shared_setup("muon_needs")
 def test_a_muon_run_that_states_its_stacks_group_keeps_it(monkeypatch):
     """A Muon run that states its Newton-Schulz group keeps it, in the room where an unstated run's plan
     parts its stacks, and its own step fits recomputing: its group joins every stack, as the joined step
