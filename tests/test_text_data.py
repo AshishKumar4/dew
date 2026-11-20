@@ -116,20 +116,25 @@ def test_an_epoch_reads_every_complete_window_stride_apart(tmp_path, seq_len, st
         body[s:s + seq_len + 1].tolist() for s in range(0, tokens - seq_len, seq_len)]
 
 
-def test_a_memory_read_of_a_stores_windows_decodes_none_of_its_documents(tmp_path, monkeypatch):
+DECODED: list[str] = []
+"""The reads a `DecodeCounted` store was asked for its records by."""
+
+
+class DecodeCounted(TokenFiles):
+    """A token store that notes each read its records are asked for (`DECODED`)."""
+
+    def records(self, read):
+        DECODED.append(read)
+        return super().records(read)
+
+
+def test_a_memory_read_of_a_stores_windows_decodes_none_of_its_documents(tmp_path):
     """A memory read of a token store's windows reads them by their spans, decoding none of the store's
     documents beside them (row 9055: it decoded the whole collection, then dropped it)."""
     corpus = write_token_corpus(tmp_path, np.arange(40), eos_id=9)
-    decoded = []
-    records = TokenFiles.records
-
-    def counted(self, read):
-        decoded.append(read)
-        return records(self, read)
-
-    monkeypatch.setattr(TokenFiles, "records", counted)
-    data = _trained(corpus.train, 4, 2)
-    assert data.records == 9 and "memory" not in decoded, decoded
+    DECODED.clear()
+    data = _trained(DecodeCounted(str(corpus.train)), 4, 2)
+    assert data.records == 9 and "memory" not in DECODED, DECODED
 
 
 def test_a_stride_changes_the_training_windows_only(tmp_path):

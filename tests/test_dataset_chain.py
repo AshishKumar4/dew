@@ -1722,3 +1722,16 @@ def test_a_concat_states_its_datasets_facts_with_their_counts_added():
     facts = concat(counted).facts()
     assert (facts["rows"], facts["language"]) == (10, "en")
     assert "rows" not in concat([counted[0], Memory(rows("c", 2)).map(Scaled(2))]).facts()
+
+
+def test_a_nested_records_numbers_stack_beside_its_opaque_messages():
+    """A nested record whose mapping holds an opaque message list beside numbers and strings batches field by
+    field: the messages a list of each record's, the numbers and strings stacked with a batch axis (row
+    9054: the opaque list kept the whole mapping a list of records)."""
+    from dew.data.dataset import record_batch
+
+    rows = [{"meta": {"id": np.int32(index), "lang": "en", "messages": [{"role": "user", "content": "hi"}]},
+             "x": np.float32(index)} for index in range(3)]
+    batch = record_batch(rows)
+    assert batch["meta"]["id"].tolist() == [0, 1, 2] and batch["meta"]["lang"].tolist() == ["en"] * 3
+    assert batch["meta"]["messages"] == [row["meta"]["messages"] for row in rows]

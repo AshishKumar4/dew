@@ -164,8 +164,9 @@ def test_a_batch_of_requests_reads_each_requests_images_as_it_is_asked_alone(tmp
     asked = [(body["state"], {name: Question.from_wire(wire) for name, wire in body["questions"].items()})
              for body in (CASES["structured"], CASES["quickstart"])]
     answered = decide(asked, images=[(), pictures])
-    assert answered[1] == decide(*asked[1], images=pictures)
-    assert answered[0].keys() == asked[0][1].keys()
+    alone = decide(*asked[1], images=pictures)
+    assert answered[1].keys() == alone.keys() and answered[0].keys() == asked[0][1].keys()
+    assert all(np.array_equal(answered[1][name].probabilities, alone[name].probabilities) for name in alone)
 
 
 def test_a_mixed_list_with_a_backbone_that_reads_no_images_refuses_the_images_alone(decide):
