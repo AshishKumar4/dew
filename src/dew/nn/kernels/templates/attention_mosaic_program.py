@@ -612,6 +612,14 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if hooks.rounds is not None and (backward or hooks.drop is not None or hooks.initial is not None):
         return ROUNDED
+    if (backward and hooks.drop is not None and hooks.initial is not None and not algebra.headroom(dtype)
+            and hooks.drop.bound != hooks.drop.reach):
+        return Refusal('dropout_rate', f"the Mosaic dropping backward takes no initial state beside "
+                       f"{jnp.dtype(dtype).name} values, whose walk has no headroom")
+    if backward and hooks.drop is not None and not drops_in_place(dtype, hooks.drop.reach):
+        return Refusal('dropout_rate', f"the Mosaic dropping backward takes {jnp.dtype(dtype).name} "
+                       f"weights within its range, not a multiplier of {hooks.drop.bound:g} (a rate of "
+                       f"{hooks.drop.rate:g})")
     if jnp.dtype(dtype) not in sixteen:
         return Refusal('dtype', f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}")
     if backward and not transposable(hooks):
