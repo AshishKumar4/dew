@@ -267,6 +267,25 @@ def test_a_per_key_spreads_overflowed_read_is_zero_at_each_key_its_decay_underfl
     np.testing.assert_array_equal(found, expected)
 
 
+def test_a_per_key_spreads_pairs_across_a_sub_chunk_are_decayed_before_they_are_summed():
+    """`scan.spread` under a decay a key dimension, two writes of unit keys before a sub-chunk's reference
+    (`recurrence_algebra.SUB`) read by a reader after it, each read 2^127, the keys' decay 1/4 past the
+    reference: the reader's output 2^126 at each key exactly, the recurrence's (its every term normal), each
+    pair's read decayed before the pairs are summed, where summed first they passed float32's largest (row
+    9029's head review)."""
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    reader, reference = SUB + 1, SUB - 1
+    readers, values = np.zeros((reader + 1, 1), np.float32), np.zeros((reader + 1, 1), np.float32)
+    readers[reader], values[:2] = 2.0 ** 64, 2.0 ** 63
+    between = np.zeros((reader + 1, reader + 1, 2), np.float32)
+    between[reader, :2], between[reference, :2], between[reader, reference] = 0.25, 1.0, 0.25
+    found = np.asarray(scan.spread(readers, values, np.ones((reader + 1, 2), np.float32), between))
+    expected = np.zeros_like(found)
+    expected[reader] = 2.0 ** 126
+    np.testing.assert_array_equal(found, expected)
+
+
 @pytest.mark.parametrize("batched", [False, True], ids=["one spread", "a batch of two"])
 def test_a_per_key_spreads_overflowed_read_through_a_vanished_decay_has_zero_gradients(batched):
     """`scan.spread` under a decay a key dimension, one pair across a sub-chunk whose read of 2^70 times 2^70
