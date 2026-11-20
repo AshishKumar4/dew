@@ -1818,17 +1818,15 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         # 128 x 64 walk at width 256 in 196 registers (et-rows-abi), and the 8B's at width 128 in 176 at
         # 128 x 64 and 248 at 128 x 128, spilling none (et-sm100-128), where two fp32 tiles priced the
         # 128-key tile past its budget.
-        placed_live = [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]
-        if dropped:
-            placed_live += [(block_q, block_k, jnp.int32), (block_q, block_k, jnp.float32)]
-        return resources.live_registers(family, [(block_q, 1, jnp.float32)] * 2, placed_live)
+        return resources.live_registers(family, [(block_q, 1, jnp.float32)] * 2,
+                                        [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)])
     hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
+    drop_tiles = [bits, logits] if dropped else []
     # An fp32 call's weights fp32, their remainder fp32 and the part taken (`_parted_products`); a dropping
     # call holds the keep bits' hash and multiplier tile beside the step's weights (row 9526).
-    step = ([logits] * (3 if parts > 1 else 1) + [weights] * (2 if residuals else 1)
-            + ([bits, logits] if dropped else []))
+    step = [logits] * (3 if parts > 1 else 1) + [weights] * (2 if residuals else 1) + drop_tiles
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
         if family.operands_in_registers:
@@ -1861,7 +1859,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         # their parts and the parts' accumulator.
         phases.append([logits] * 2 + [bits] + ([*core, *scaled_terms] if scaled else []))
         if residuals:
-            phases.append([logits, weights, weights, bits, bits] + ([bits, logits] if dropped else []))
+            phases.append([logits, weights, weights, bits, bits, *drop_tiles])
     kept = residuals and family.keeps_sums(value_width)
     if scopes_products(family):
         phases = _scoped_phases(phases, logits, weights, (block_q, value_width, jnp.float32), kept=kept,

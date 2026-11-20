@@ -552,10 +552,10 @@ class BlockPlan(NamedTuple):
 
 def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
                        training: bool) -> BlockPlan:
-    """Derive hook placement and block `out_dtype` from the call's value-column partition (`column_slices`):
+    """Derive hook placement and block `out_dtype` from the call's value-column partition (`value_columns`):
     an inference call whose columns split into multiple blocks runs its `output_mod` in XLA past the launches
     and emits fp32 per block (row 9542)."""
-    split = not training and has_output_mod and len(column_slices(total_v, columns)) > 1
+    split = not training and has_output_mod and value_columns(total_v, columns) < total_v
     return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split)
 
 

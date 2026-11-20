@@ -626,10 +626,7 @@ class MosaicForward(_Mainloop[Tiles]):
             return False
         if config.natural_form or self._unrewalked(ba):
             return True
-        arguments = ba.arguments
-        decides = self.decided(arguments["query"], arguments["value"], arguments["score_params"],
-                               arguments.get("residuals"), config, arguments.get("table"),
-                               arguments.get("sources"), arguments.get("scales"), arguments.get("initial"))
+        decides = self.deciding(ba, config)
         relaunch = config.relaunch
         if config.relaunch_family is not None:
             return self._launch_legal(ba, relaunch, target, decides=decides)
@@ -848,10 +845,7 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, query.dtype)
         if not family.rewalks:
             return self._rewalked_apart(ba, config, family, target)
-        arguments = ba.arguments
-        decides = self.decided(arguments["query"], arguments["value"], arguments["score_params"],
-                               arguments.get("residuals"), config, arguments.get("table"),
-                               arguments.get("sources"), arguments.get("scales"), arguments.get("initial"))
+        decides = self.deciding(ba, config)
         # Its value columns whole first, then in blocks (`_column_blocks_of`): a launch a block (row 2526: at
         # width 256 no tile held the anchored rewalk's whole sums).
         relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True,
@@ -1288,7 +1282,8 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         raise ValueError(f"the Mosaic forward's certify form stores each key tile's state from registers; "
                          f"the call derives {family.name}, whose sums its issuer keeps in tensor memory")
     arguments = ba.arguments
-    registered = op.registered(arguments["query"], arguments["value"], arguments["score_params"], Kept.NONE)
+    registered = op.registered(arguments["query"], arguments["value"], arguments["score_params"], Kept.NONE,
+                               drop=arguments["drop"])
     if hooks.query_mod is not None and op.query_mod is None:
         # A query prologue the launch does not take where it loads the query (`_forward_call`), taken here.
         query = prologued(query, hooks.query_mod, hooks.query_params)

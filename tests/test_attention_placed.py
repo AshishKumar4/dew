@@ -374,6 +374,42 @@ def test_split_output_hook_forward_plans_and_emits_fp32_block_smem_residency():
                and kernel in record.kernels]
     assert emitted and all(model.most == 1 for model in emitted), emitted
 
+    # Row 9526: BF16 H100 inference with dropout at 64x64 1-consumer WGMMA pushes scaled registers past 248,
+    # so `deciding` is False and its full-width natural rewalk stays legal (not rejected as deciding=True);
+    # `certified()` also emits the dropout-priced register count matching the planner.
+    drop = template.Dropout(jax.random.key_data(jax.random.key(0)),
+                            jnp.arange(1, dtype=jnp.int32), jnp.arange(4, dtype=jnp.int32), 0.1)
+    drop_hooks = template.Hooks(drop=drop)
+    q_bf = jnp.ones((1, 128, 4, 64), jnp.bfloat16)
+    k_bf = jnp.ones((1, 256, 2, 64), jnp.bfloat16)
+    drop_spans = template.spans(128, 256, 1)
+    one_wgmma = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")
+    with generation.assumed("sm90"):
+        op_bf, args_bf = attention_mosaic._forward_call(q_bf, k_bf, k_bf, drop_spans, drop_hooks,
+                                                        scale=None, natural=False)
+        ba_bf = op_bf.bind(*args_bf, residuals=template.Kept.NONE, interpret=False)
+        assert not op_bf.deciding(ba_bf, one_wgmma)
+        assert op_bf.legal(ba_bf, one_wgmma, target)
+        # Certified FP16 dropout forward emits the same dropout-priced registers as the planner.
+        q_f16 = jnp.ones((1, 128, 4, 64), jnp.float16)
+        k_f16 = jnp.ones((1, 256, 2, 64), jnp.float16)
+        op_f16, args_f16 = attention_mosaic._forward_call(q_f16, k_f16, k_f16, drop_spans, drop_hooks,
+                                                          scale=None, natural=False)
+        ba_f16 = op_f16.bind(*args_f16, residuals=template.Kept.NONE, interpret=False)
+        cfg_f16 = op_f16.derived(ba_f16, target)
+        assert cfg_f16 is not None
+        planned_regs = op_f16.registers(ba_f16, cfg_f16)
+        cert_traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.certified(
+            q, k, v, drop_spans, drop_hooks, interpret=False)[1])(q_f16, k_f16, k_f16).jaxpr
+    cert_models = [record.kernels[kernel]
+                   for eq in programs.equations(cert_traced)
+                   if isinstance(name := eq.params.get("name"), str)
+                   for kernel, launch in [report.kernel_of(name)[:2]]
+                   if launch is not None and (record := report.traced(launch)) is not None
+                   and kernel in record.kernels]
+    assert cert_models and all(model.registers == planned_regs for model in cert_models), (
+        planned_regs, cert_models)
+
 
 @INTERPRETS
 @pytest.mark.parametrize("tokens", [64, 128, 256, 320])
