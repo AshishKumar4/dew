@@ -1755,7 +1755,7 @@ class Transport[Allocated, Opened](abc.ABC):
 
     def uniform(self, value: jax.Array) -> jax.Array:
         """`value`, a scalar every lane holds alike, read warp-uniform (`across.uniform`, row 7898)."""
-        return value if bodies.interpreting() else across.uniform(value)
+        return value if launches.interpreting() else across.uniform(value)
 
     def decided_scratch(self, consumers: int) -> dict:
         """A decided walk's verdicts' allocations (`after_walk.Decided`), none where one consumer feeds."""

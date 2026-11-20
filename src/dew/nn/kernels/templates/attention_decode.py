@@ -238,15 +238,13 @@ def _certified_stream(op: attention_mosaic.MosaicForward, ba, target: generation
     if not isinstance(config, attention_mosaic.Tiles):
         return None
 
-    def streamed() -> attention_mosaic.Tiles | None:
-        # Its next streamed tile, none past the taken config itself: a pin or tuned pick is a measured choice
-        # `_certified` leaves to its program's compile (`report.settled`), a derived one `taken` certified.
-        tile = op.streaming(ba, config, target)
-        return None if tile == config else tile
-
-    first = streamed()
-    found = None if first is None else op._certified(ba, first, offered=streamed)
-    return found if isinstance(found, attention_mosaic.Tiles) else config
+    # `op.streaming` steps down to `config` itself as its terminal offer: a pin or tuned pick is a measured
+    # choice `_certified` leaves to its program's compile (`report.settled`), a derived one `taken` certified.
+    first = op.streaming(ba, config, target)
+    if first == config:
+        return config
+    found = op._certified(ba, first, offered=lambda: op.streaming(ba, config, target), decided=config)
+    return found if isinstance(found, attention_mosaic.Tiles) else None
 
 
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:
