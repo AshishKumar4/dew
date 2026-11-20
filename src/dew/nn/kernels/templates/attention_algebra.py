@@ -1373,8 +1373,11 @@ def rescaled(state: Partial, factor: jax.Array, weighed: Callable[[], jax.Array]
     # fp32's largest takes its exponent still (values of 2^126 at a reach of 2^66 overflowed it and took none,
     # the range audit of row 8652, #3); held at fp32's largest past it, as finite as a bound need be.
     binades = math.log2(drop.reach)
-    held = power2(factor * before.bound, -binades, reach=TWO_FACTOR_REACH) + term
-    bound = jnp.minimum(power2(held, binades, reach=TWO_FACTOR_REACH), np.float32(np.finfo(np.float32).max))
+    # Scalar power of two via `scalar_power2`: `power2` bitcasts a rank-0 scalar, which Mosaic GPU refuses
+    # (`Scalars must be represented by non-vector types, got: vector<f32>`, row 9810).
+    shift = jnp.asarray(binades, jnp.float32)
+    held = scalar_power2(factor * before.bound, -shift) + term
+    bound = jnp.minimum(scalar_power2(held, shift), np.float32(np.finfo(np.float32).max))
     return Scale(jnp.maximum(before.exponent, exponent_of(held, binades)), bound)
 
 

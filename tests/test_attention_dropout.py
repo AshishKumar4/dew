@@ -1063,3 +1063,22 @@ def test_the_template_reference_scales_a_dropped_weight_at_float64_precision():
         value = jnp.ones((1, 1, 1, 8), jnp.float64)
         out = template.reference(query, key, value, template.spans(1, 1, 1), hooked(words, 1, 1))
         np.testing.assert_array_equal(np.asarray(out), np.full(np.asarray(out).shape, 4 / 3))
+
+
+def test_a_dropping_route_call_compiles_for_hopper():
+    """Row 9810: `a_dropping_route_call_on_a_gpu_runs_finite` lowers and compiles on Hopper (`sm90`) without
+    rank-0 `bitcast_convert_type` in `attention_algebra.rescaled`."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import attention_route
+
+    query = jax.ShapeDtypeStruct((ROWS, 8, HEADS, WIDTH), jnp.bfloat16)
+    spans = template.spans(8, 8, ROWS)
+    hooks = template.Hooks(drop=dropout_of(seed_words(0), ROWS, HEADS))
+
+    def call(q, k, v):
+        return attention_route.attend(q, k, v, spans, hooks)
+
+    with generation.assumed("sm90"):
+        lowered_for(call, (query, query, query), "sm90")
