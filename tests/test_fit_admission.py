@@ -244,3 +244,22 @@ def test_a_device_steps_shape_is_no_shape_its_host_batch_is_held_to():
     objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
     assert int(Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(chain, steps=2,
                                                                              log_every=100).step) == 2
+
+
+def test_a_stream_with_no_batch_ends_its_run_where_it_starts_its_final_checkpoint_written(tmp_path):
+    """A finite stream that holds no batch, on every process, ends its run at step 0 as its length would,
+    its state the one it started from and its final checkpoint written, where its objective declares the
+    input it reads (row 9068: refused at step 0); one that reads its input's shape off its first batch is
+    refused, as there is none to read it off."""
+    from dew.checkpoints import Checkpoints
+
+    rows = 2 * jax.device_count()
+    empty = Loader(lambda partition: iter(()), None, batch=rows, records=None)
+    declared = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2,
+                          inputs=InputSpec(Field("x", (8,))))
+    trainer = Trainer(declared, optax.sgd(0.1), key=jax.random.key(0), checkpoints=Checkpoints(str(tmp_path)))
+    assert int(trainer.fit(empty, steps=5, log_every=100).step) == 0
+    assert trainer.checkpoints.latest == 0
+    named = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
+    with pytest.raises(ValueError):
+        Trainer(named, optax.sgd(0.1), key=jax.random.key(0)).fit(empty, steps=5, log_every=100)

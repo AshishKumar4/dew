@@ -611,14 +611,8 @@ def verdict(args, pool):
     shared part does not set leaves the verdict's interval unresolved, which is Inconclusive."""
     import numpy as np
     import torch
-    from reference_error import (
-        Inconclusive,
-        as_given,
-        as_recorded,
-        assert_as_exact,
-        recorded_pilots,
-        seeds_for,
-    )
+    from recordings import recorded_pilots
+    from reference_error import Inconclusive, as_given, as_recorded, assert_as_exact, seeds_for
     from reference_source import dew_revision
 
     from dew.parity import leaf_summary

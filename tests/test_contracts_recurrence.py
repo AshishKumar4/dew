@@ -136,12 +136,10 @@ ORDER_SETS = {"first orders": ("primal", "jvp", "vjp"), "jvp of grad": ("jvp of 
 """The contract's orders (`contract_support.orders`) a case of the chunked delta rule takes at once: all ten
 in one case took 127 to 156 s near float32's largest, each order's program compiled for itself (row
 4433); the three second orders in one case 172 s over packed documents there (row 5348), so each is a case
-of its own, the scanned one apart from the staged ones (an interpreted selective scan's 170 s alone)."""
-
-
-def outside(taken: tuple[str, ...]) -> tuple[str, ...]:
-    """The orders (`ORDER_SETS`') outside those a case takes (`taken`), which it leaves to the others."""
-    return tuple(name for orders in ORDER_SETS.values() for name in orders if name not in taken)
+of its own, the scanned one apart from the staged ones (an interpreted selective scan's 170 s alone). The
+derived delta rule's and a turned template call's every order in one case, their rule and references
+dispatched op by op, took 178 to 193 s and 132 s at unit operands (row 9512): each a case an order set, its
+rule and references staged (`jax.jit`)."""
 
 
 INTERPRETED_REMAT = ("jvp of grad, remat", "second jvp, remat") if INTERPRETED else ()
@@ -196,7 +194,7 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     # one or two ops, 109 of the case's 156 s near float32's largest (cProfile on armada, row 4433).
     assert_drawn_contract(jax.jit(rule), draw, DELTA_RULE_EDGES[edge], f"the chunked delta rule {edge}",
                           truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain),
-                          without=outside(ORDER_SETS[taken]))
+                          taking=ORDER_SETS[taken])
 
 
 @pytest.mark.parametrize("order", ("jvp", "vjp", "jvp of grad", "grad of grad"))
@@ -223,9 +221,8 @@ def test_the_chunked_delta_rules_reader_scale_holds_every_order(order):
             recurrence_chunk.Tiles(16), query, key, value, g[..., 0], beta, None, starts,
             scale=width ** -0.5, delta=True, dtype=query.dtype)[0]
 
-    all_orders = frozenset(("primal", "jvp", "vjp", "jvp of grad", "grad of grad"))
     assert_contract(jax.jit(rule), primals, direction, cotangent,
-                    f"the chunked delta rule's reader scale ({order})", without=all_orders - {order})
+                    f"the chunked delta rule's reader scale ({order})", taking=(order,))
 
 
 def test_the_chunked_delta_rules_reader_scale_precedes_a_small_write():
@@ -246,10 +243,8 @@ def test_the_chunked_delta_rules_reader_scale_precedes_a_small_write():
         wide, along = jax.tree.map(lambda x: x.astype(jnp.float64), (primals, direction))
         truth = np.asarray(jax.jit(lambda *x: jax.jvp(rule, x, along)[1])(*wide))
     assert np.all(normal_float32(truth) & np.isfinite(truth))
-    all_orders = frozenset(("primal", "jvp", "vjp", "jvp of grad", "grad of grad"))
     assert_contract(jax.jit(rule), primals, direction, jnp.ones_like(primals[0]),
-                    "the chunked delta rule's reader scale before a small write",
-                    without=all_orders - {"jvp"})
+                    "the chunked delta rule's reader scale before a small write", taking=("jvp",))
 
 
 def plain_delta_rule(query, key, value, g, beta, state, scale):
@@ -367,7 +362,7 @@ def test_the_delta_rule_ports_hold_their_orders(per_key, edge, taken):
 
     assert_drawn_contract(jax.jit(ported), draw, EDGES[edge],
                           f"the {'kda' if per_key else 'gdn'} port {edge}", truth_fn=jax.jit(recurrent),
-                          plain_fn=jax.jit(recurrent), without=outside(ORDER_SETS[taken]))
+                          plain_fn=jax.jit(recurrent), taking=ORDER_SETS[taken])
 
 
 # The template rule near float32's largest: its reverse derivative is NaN at entries fla's chunked form keeps
@@ -402,7 +397,7 @@ def test_the_template_rule_holds_its_orders(edge, taken):
 
     assert_drawn_contract(jax.jit(rule), draw, EDGES[edge], f"the template rule {edge}",
                           truth_fn=jax.jit(recurrent), plain_fn=jax.jit(recurrent),
-                          without=outside(ORDER_SETS[taken]) + INTERPRETED_REMAT)
+                          taking=ORDER_SETS[taken], without=INTERPRETED_REMAT)
 
 
 EDGES_BEYOND = [edge for edge in EDGES if edge != "normal"]
@@ -478,7 +473,7 @@ def assert_selective_contract(edge: str, taken: tuple[str, ...], seeds: int | No
 
     assert_drawn_contract(jax.jit(scanned), draw, EDGES[edge], f"the selective scan {edge}",
                           truth_fn=jax.jit(plain), plain_fn=jax.jit(plain),
-                          without=outside(taken) + INTERPRETED_REMAT, seeds=seeds)
+                          taking=taken, without=INTERPRETED_REMAT, seeds=seeds)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -592,7 +587,7 @@ def test_the_ssd_port_holds_its_orders(edge, taken):
 
     assert_drawn_contract(jax.jit(ported), draw, EDGES[edge], f"the ssd port {edge}",
                           truth_fn=jax.jit(plain_ssd), plain_fn=jax.jit(plain_ssd),
-                          without=outside(ORDER_SETS[taken]))
+                          taking=ORDER_SETS[taken])
 
 
 # A TPU's scan near float32's largest is out of its contract: at the 2^63 draw 23 of the 731 outputs float64
@@ -675,14 +670,16 @@ def _read(h, q, k, v, g, beta):
 # Near float32's largest a chunk's corrections' overlaps (keys' products near 2^126 against states as large)
 # overflow at entries the token recurrence's float64 keeps normal, as fla's chunked form's do at the same
 # entries (ledger 2470, `precedent_chunked`).
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated_delta", "kimi_delta"])
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
-def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
+def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge, taken):
     """`dew.algebra.scan`'s chunk forms of the delta rule, its decay a scalar (the gated delta rule) or each
     key's own (Kimi's delta attention), walked over three chunks from a zero state through their custom
     derivatives (the decays' range sums, `_decays_of`; the solve's inverse, `_lowered`): every order,
     forward mode among them, finite wherever float64 is a normal float32 and the token-by-token scan's are,
-    at unit queries, keys and values and at ones whose products near float32's least normal."""
+    at unit queries, keys and values and at ones whose products near float32's least normal, an order set a
+    case (`ORDER_SETS`)."""
     tokens, chunk, keys_, values = 24, 8, 4, 6
     def draw(seed, scale):
         draws = jax.random.split(seeded_key(3311 + per_key + 4096 * seed), 7)
@@ -714,8 +711,9 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
             return h, _read(h, *token)
         return jax.lax.scan(one, jnp.zeros((keys_, values), q.dtype), (q, k, v, g, beta))[1]
 
-    assert_drawn_contract(derived, draw, EDGES[edge], f"the derived delta rule {edge}", truth_fn=tokenwise,
-                          plain_fn=tokenwise)
+    scanned = jax.jit(tokenwise)
+    assert_drawn_contract(jax.jit(derived), draw, EDGES[edge], f"the derived delta rule {edge}",
+                          truth_fn=scanned, plain_fn=scanned, taking=ORDER_SETS[taken])
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_derived_delta_rules_chunk_adjoint_holds_its_orders(edge):
@@ -796,13 +794,14 @@ def _turned_plainly(query, key, value, turn):
     return out, scan.rotated(held, cos[:, -1, :, None], -sin[:, -1, :, None], axis=-2)
 
 
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", EDGES)
-def test_a_turned_template_call_holds_every_order(edge):
+def test_a_turned_template_call_holds_every_order(edge, taken):
     """A turned call on the template (`templates.recurrence.turned.call`: its keys and queries in their
     documents' frames, its turns' gradient in the crossing form) over a plain launch of the template's
     arithmetic (`_framed_scores`), its keys, queries and values at `edge` and its turns of up to 3 radians:
     every order finite where the plain formula's is (`_turned_plainly`, its float64 the truth; row 7419),
-    forward mode through its launch's own tangent (row 8573)."""
+    forward mode through its launch's own tangent (row 8573), an order set a case (`ORDER_SETS`)."""
     shapes = ((1, 40, 1, 6),) * 2 + ((1, 40, 1, 2),)
     def draw(seed, scale):
         operands = normal_draw(7419 + 4096 * seed, *shapes, scale=scale)
@@ -820,5 +819,6 @@ def test_a_turned_template_call_holds_every_order(edge):
         return turned.call(launch, query, key, value, decays, ones, None, None, turn, TURNED_STARTS,
                            scale=1.0, group=1)
 
-    assert_drawn_contract(rule, draw, EDGES[edge], f"a turned template call {edge}", truth_fn=_turned_plainly,
-                          plain_fn=_turned_plainly)
+    plainly = jax.jit(_turned_plainly)
+    assert_drawn_contract(jax.jit(rule), draw, EDGES[edge], f"a turned template call {edge}",
+                          truth_fn=plainly, plain_fn=plainly, taking=ORDER_SETS[taken])

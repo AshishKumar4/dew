@@ -963,7 +963,7 @@ def test_a_derivatives_sum_outside_the_language_is_priced_as_the_sum_it_computes
 
 def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
     """A `lax.dot_general` of a bfloat16 and a float16 matrix, no preferred type stated, priced at the dtype
-    JAX makes it (`terms.product_dtype`, its traced result's, which the region records as its stated type),
+    JAX makes it (`terms.Product.made`, its traced result's, which the region records as its stated type),
     its result kept on chip at two bytes an element beside its leaves' (`Work.kept_bytes`); NumPy's
     promotion of the pair, which it refuses, raised there (base review 0b8b7ed98 F1). A bare product heads no
     rewrite window, so `dew.jit` alone never prices it (`test_algebra_fusion`'s witness holds its value)."""
@@ -984,7 +984,7 @@ def test_a_product_of_two_16_bit_formats_replays_as_traced():
     the engine binds a term's equation (`terms.value_of`): its product bound with its parameters as traced,
     its preferred type unset, and its value the traced program's bit for bit, one program. The region wrote
     the dtype it makes into that preferred type, which the replay then bound (base review 3232beb7c); it
-    keeps it apart (`Region.made`)."""
+    keeps it apart (`terms.Product.made`)."""
     def product(a, b):
         return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
 
@@ -999,15 +999,8 @@ def test_a_product_of_two_16_bit_formats_replays_as_traced():
 
     def dots(jaxpr) -> list[dict]:
         # Each product's parameters, within the programs an equation calls too (a jit's).
-        found = []
-        for equation in jaxpr.eqns:
-            if equation.primitive is jax.lax.dot_general_p:
-                found.append(dict(equation.params))
-            for value in equation.params.values():
-                inner = getattr(value, "jaxpr", None)
-                if inner is not None:
-                    found += dots(getattr(inner, "jaxpr", inner))
-        return found
+        return [dict(equation.params) for equation in programs.equations(jaxpr)
+                if equation.primitive is jax.lax.dot_general_p]
 
     assert dots(jax.make_jaxpr(replayed)(a, b).jaxpr) == dots(traced.jaxpr)
     assert np.asarray(jax.jit(replayed)(a, b)).tolist() == np.asarray(jax.jit(product)(a, b)).tolist()

@@ -455,10 +455,14 @@ class FitRun:
     """The steps a stopped profile window traced, the step it stopped at, its directory and the program its
     last step ran (`program`), whose export the run's cleanup waits for before it reports the window
     (`Trainer._exported_profile`)."""
-    primed: tuple[DataPartition, Iterator[Batch], Batch, object] | None = None
+    primed: tuple[DataPartition, Iterator[Batch], Batch, object, bytes | None] | None = None
     """The stream the start read its first batch from to declare its input (`Trainer._primed_first`): the
-    share it reads, the stream, the batch and the stream's position after it, which a fresh start's
-    prefetcher takes over (`Trainer._opened`) and any other start closes."""
+    share it reads, the stream, the batch, the stream's position after it and the saved position it was
+    restored to (None for its beginning), which the run's prefetcher takes over where it reads from that
+    same position (`Trainer._source_opened`) and any other start closes."""
+    resumed: Resumed | None = None
+    """The checkpoint step a fresh fit resumes and its data position, read once for its start
+    (`Trainer._resumed`)."""
     stages: tuple[tuple[Stage, ...], tuple[Stage, ...]] = ((), ())
     searched: Hashable | None = None
     """What the run's first step was searched over before its state was placed
@@ -778,8 +782,10 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     """The training stream's next batch, its wait counted in `interval`, or None where it has run out
     on every process, which ends the run as its length would. Where `agree` (`FitRun.agrees`), the
     read is agreed (`agreed_next`): one that fails, or runs out on some processes only, stops every
-    process, as does a stream with no batch for a run at step 0. A batch read ahead (`FitRun.ahead`) is
-    this read's. Where `peek`, an agreed read of the stream's first batch as its source gives it, on
+    process. A stream with no batch at all ends its run where it starts, as its length would, its final
+    checkpoint written (row 9068: refused at step 0), where its start declares all it builds; one whose
+    start reads its input off a batch is refused there (`first_batch`). A batch read ahead (`FitRun.ahead`)
+    is this read's. Where `peek`, an agreed read of the stream's first batch as its source gives it, on
     the host, placed at the run's first read (`DevicePrefetchIterator.peek`)."""
     if run.ahead is not None:
         (batch,), run.ahead = run.ahead, None
@@ -794,8 +800,6 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
         else:
             batch = agreed_next(phase, stream) if agree or peek else run.read()
         interval.waited += time.perf_counter() - asked
-    if batch is None and not run.current:
-        raise ValueError("the training data holds no batch to train on")
     return batch
 
 
@@ -1291,6 +1295,19 @@ def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int]
         state, stage = source.ending(state), stage + 1
         end = ends[stage] or 0
     return source, state, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Resumed:
+    """What a fit resumes, read once for its start (`Trainer._resumed`; row 9663: each part of the start
+    listed the checkpoints and read the position again): the step every process agrees it continues
+    (`dew.training.startup.resumed_step`), None for a fresh run, and the saved data position this process's
+    share reads on from, None where it saved none or its plan changed under a relaxed resume, which starts
+    the data again (`differs`, what changed)."""
+
+    step: int | None
+    position: bytes | None = None
+    differs: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)

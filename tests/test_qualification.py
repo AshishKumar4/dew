@@ -60,6 +60,22 @@ def test_a_qualification_run_fails_a_site_that_declares_fewer_seeds_than_it_size
         assert_as_exact(dew, reference, draw, LABEL, seeds=sized // 2, truth_fn=truth)
 
 
+def test_a_site_judged_with_the_gates_own_terms_is_sized_as_a_plain_pair(monkeypatch, tmp_path):
+    """A site asking for the gate's own terms of its truth (`terms=True`, its truth program's walk), whose
+    sizing reads no terms, is sized as the plain pair's: declaring fewer seeds than its sizing takes, it
+    raises StaleSeeds under `QUALIFY`, where it was recorded unsized and could never go stale (spec
+    alignment, 9044)."""
+    dew, reference, _, draw = site()
+
+    def truth(x, w):
+        return jnp.dot(x, w)
+
+    sized = seeds_for(reference, draw, LABEL, dew_fn=dew, truth_fn=truth)
+    monkeypatch.setenv(QUALIFY, str(tmp_path / "qualified.jsonl"))
+    with pytest.raises(StaleSeeds):
+        assert_as_exact(dew, reference, draw, LABEL, seeds=sized // 2, truth_fn=truth, terms=True)
+
+
 def test_a_site_judged_from_its_prepared_truths_sizes_itself_in_its_run(monkeypatch, tmp_path):
     """A site judged under programs compiled ahead (a GPU flow's: its prepare compiles its truths' programs,
     its run computes its truths with them) sizes itself in its run under `QUALIFY`, its sizing draws' truths
