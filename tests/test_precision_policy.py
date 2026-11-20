@@ -1390,6 +1390,19 @@ def test_an_exact_widenings_transpose_keeps_its_sources_placement():
     np.testing.assert_array_equal(np.asarray(gradient), np.ones((4, 3), np.float32))
 
 
+def test_an_exact_power_of_two_past_float32s_range_is_its_field():
+    """`exact_power2` in float32 at `minexp - 1`, `maxexp` and `maxexp + 1`: +0, infinity and the sign bit
+    alone, the field as the word holds it, which a quantizer's ceiling of a zero, an infinity and a NaN
+    reads (`fake_quant._power_of_two_ceil`: 0.0, inf, -0.0; review of e71e8066f F7)."""
+    from dew.nn import fake_quant
+    from dew.nn.float_bits import exact_power2
+
+    found = np.asarray(exact_power2(jnp.asarray([-127, 128, 129], jnp.int32), jnp.float32))
+    np.testing.assert_array_equal(found.view(np.uint32), np.uint32([0, 0x7F800000, 0x80000000]))
+    ceiling = np.asarray(fake_quant._power_of_two_ceil(jnp.asarray([0.0, np.inf, np.nan], jnp.float32)))
+    np.testing.assert_array_equal(ceiling.view(np.uint32), np.uint32([0, 0x7F800000, 0x80000000]))
+
+
 def test_a_host_scalar_widens_at_its_destination():
     """`widened_exactly` of a Python integer past int32 (`2^40`) to float32 with x64 off is float32's
     `2^40`, converted at its destination, where staging it as int32 first raised (base review 279405f7f

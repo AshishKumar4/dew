@@ -50,7 +50,8 @@ def _power_of_two_ceil(value):
     computes it (kernel.py:22-37), the power set by `float_bits.exact_power2`. Unclamped, unlike the
     host codecs' `ceil_to_ue8m0` rule (exponents 1 to 254): only past the normal range do they part, a
     zero giving 0.0 here (exact_power2's sentinel at 2 ** -127) and 2 ** -126 there, a value above 2 **
-    127 inf here (its biased exponent 255) and 2 ** 127 there."""
+    127 inf here (its biased exponent 255) and 2 ** 127 there; an infinity inf and a NaN the bits
+    0x80000000, -0.0 (`exact_power2` past the normal range)."""
     _, _, biased, fraction = raw_fields(value.astype(jnp.float32))
     exponent = biased.astype(jnp.int32) - 127 + (fraction != 0).astype(jnp.int32)
     return exact_power2(exponent, jnp.float32)

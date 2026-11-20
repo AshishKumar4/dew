@@ -90,7 +90,7 @@ class NvFp4:
         """Its codes' values (`[..., depth, width]` in `dtype`, float32 by default, each code's E2M1 value) in
         the depths' own order."""
         words = jnp.swapaxes(self.words, -1, -2)
-        staged = functools.partial(_codes, staged=True, dtype=dtype)
+        staged = functools.partial(_codes, dtype=dtype)
         # Each matrix's own, over every leading axis: a bank's groups, a stack of banks' layers before them.
         for _ in range(words.ndim - 2):
             staged = jax.vmap(staged)
@@ -152,12 +152,11 @@ def _e2m1_values(codes: jax.Array) -> jax.Array:
     return jnp.asarray(fake_quant.E2M1)[codes]
 
 
-def _codes(words: jax.Array, *, staged: bool = False, dtype: DTypeLike = jnp.float32) -> jax.Array:
-    """The codes' values of `words` (each its E2M1 value in `dtype`, `[depth, width]`), in the depths' own
-    order where `staged` (`staged_rows`), else the words' own: `bits.nvfp4_codes`, the one word-to-code
-    decode (row 8718)."""
+def _codes(words: jax.Array, dtype: DTypeLike = jnp.float32) -> jax.Array:
+    """The codes' values of staged `words` (each its E2M1 value in `dtype`, `[depth, width]`) in the depths'
+    own order (`staged_rows` undone): `bits.nvfp4_codes`, the one word-to-code decode (row 8718)."""
     codes = bits.nvfp4_codes(words, dtype)
-    return codes[np.argsort(staged_rows(codes.shape[0]))] if staged else codes
+    return codes[np.argsort(staged_rows(codes.shape[0]))]
 
 
 def _staged_words(codes, xp=jnp):

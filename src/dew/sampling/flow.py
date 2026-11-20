@@ -112,9 +112,9 @@ def _exponent(x: jax.Array) -> jax.Array:
 
 
 def _scaled(x: jax.Array, power: jax.Array) -> jax.Array:
-    """`x * 2**power` in `x`'s type, exact where the result is a normal number, a result below the least
-    normal rounded once (`precision.power2`, the one owner of scaling by a power of two; row 8971), where
-    the power's parts applied whole first rounded such a result twice."""
+    """`x * 2**power` in `x`'s type (`precision.power2`, the one owner of scaling by a power of two; row
+    8971): exact where `x` and the result are normal, and a result below the least normal rounded once on a
+    backend that keeps subnormals."""
     return power2(x, power).astype(x.dtype)
 
 
