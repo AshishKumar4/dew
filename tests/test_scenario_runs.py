@@ -336,24 +336,51 @@ LENGTHS = (16, 32)
 """The two lengths a tiny decoder of each kind is built for, whose caches `recurrent` compares."""
 
 
-@functools.cache
-def recurrent() -> tuple[str, ...]:
-    """The registry's recurrent mixer kinds (`mixers.paths`): each whose tiny decoder (`test_mixers.tiny`, at
-    the kind's fields there, `KIND_FIELDS`) states a cache (`cache_spec`, each holder's own statement of it)
-    of the same leaf shapes built for either of `LENGTHS`: a state of its own size, where keys and values
-    grow with the sequence."""
+def cache_shapes(kind: str, length: int, *, initialized: bool = False):
+    """The leaf shapes of the cache a tiny decoder of mixer `kind` (`test_mixers.tiny`, at the kind's fields
+    there, `KIND_FIELDS`) built for `length` states for a row (`cache_spec`, each holder's own statement of
+    it): read with the parameters its statement makes alone (`init_with_output`, no forward: half a second
+    for every kind at both lengths), or, `initialized`, over the decoder's whole variables as an
+    initialization makes them (`jax.eval_shape` of its init, each kind's forward traced: 13 s)."""
     from test_mixers import tiny
 
-    def shapes(kind: str, length: int):
-        fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
-        model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=length, **overrides)
-        variables = nn.unbox(jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
-        spec = model.apply(variables, 1, method=lambda module, rows: module.cache_spec(rows))
-        return jax.tree.map(lambda leaf: tuple(leaf.shape), spec)
+    fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=length, **overrides)
 
+    def stated(module, rows):
+        return module.cache_spec(rows)
+
+    if initialized:
+        variables = nn.unbox(jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
+        spec = model.apply(variables, 1, method=stated)
+    else:
+        spec, _ = model.init_with_output(jax.random.key(0), 1, method=stated)
+    return jax.tree.map(lambda leaf: tuple(leaf.shape), spec)
+
+
+def recurrent_of(shapes) -> tuple[str, ...]:
+    """The registry's kinds (`mixers.paths`) whose cache `shapes(kind, length)` states (`cache_shapes`) has
+    the same leaf shapes built for either of `LENGTHS`: a state of its own size, where keys and values grow
+    with the sequence; a kind that states no cache (a token-wise MLP's) holds no state to decode from."""
     stated = {kind: [shapes(kind, length) for length in LENGTHS] for kind in sorted(mixers.paths)}
-    # A kind that states no cache (a token-wise MLP's) holds no state to decode from.
     return tuple(kind for kind, (short, long) in stated.items() if jax.tree.leaves(short) and short == long)
+
+
+@functools.cache
+def recurrent() -> tuple[str, ...]:
+    """The registry's recurrent mixer kinds (`recurrent_of`), each read by its cache statement alone
+    (`cache_shapes`), as every task collecting this file reads them: over its initialized decoder's
+    variables they took 13 s of each task's start (main's train 1089: this file's 112 tasks half their
+    start; the owner's audit, 2026-11-20), which one test holds them to
+    (`test_the_recurrent_kinds_are_those_an_initialized_decoder_states`)."""
+    return recurrent_of(cache_shapes)
+
+
+def test_the_recurrent_kinds_are_those_an_initialized_decoder_states():
+    """The kinds each tiny decoder's cache statement read alone names recurrent (`recurrent`, the hybrid
+    scenario's axis) are those its statement over its initialized decoder's variables names, as a decode
+    reads them: a kind whose statement reads its parameters (a memory's momenta) is named alike."""
+    assert recurrent() == recurrent_of(functools.partial(cache_shapes, initialized=True))
 
 
 def mixer_settings(kind: str) -> dict[str, str]:
