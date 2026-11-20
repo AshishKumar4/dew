@@ -698,6 +698,25 @@ def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
         assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
 
 
+@pytest.mark.parametrize('by_firsts', [False, True], ids=['by starts', 'by first slots'])
+def test_a_forked_call_keeps_its_rows_on_an_explicit_axis(by_firsts):
+    """A forked call of the delta rule on the portable math (`Chunk.loads`: given memories, a stored parent
+    and its child, entry writes), its rows split over an Explicit mesh axis, its documents by their starts
+    or their first slots: it traces and runs, its output and final memory finite and placed as its rows are
+    (row 9690: its token maps scattered into whole buffers by two advanced indices, which JAX refuses for
+    indices and updates split on an Explicit axis, before any walk)."""
+    operands, _ = entered_draw(HOOKS[4], 0, entries=True)
+    operands = entering_documents(operands, by_firsts=by_firsts)
+    mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, P('data'))
+        split = jax.tree.map(lambda x: jax.device_put(x, rows), operands)
+        found = jax.jit(lambda given: chunk_on('xla', HOOKS[4], given, chunk_size=CHUNK))(split)
+    for got in found:
+        assert np.isfinite(np.asarray(got)).all()
+        assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
+
+
 @pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['laid', 'a token at a time'])
 def test_a_forked_erase_runs_in_a_shard_map_that_checks_varying_axes(hooks):
     """A forked call of an erase of its own (`Chunk.loads`, entry writes and given memories), its rows,
