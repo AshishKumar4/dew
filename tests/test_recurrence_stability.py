@@ -541,7 +541,8 @@ def _mamba_ssm(regime: str, draws, seeds: int, *, gradients: bool):
     block's draws are one call's heads (`mamba_side`), whose state passing launches a program each head on
     CUDA's grid z, at most 65,535 (a 512-seed block of `RATED_HEADS` 32,768; the staged 2,560 seeds' 163,840
     exceeded it). Its results are the port's tree: the output and final memory, and where `gradients`
-    every operand's gradient."""
+    every operand's gradient, on the host: a block's every seed's held on a GPU filled a tier process's share
+    (a fading memory's 256 seeds, 4.09 GiB, run JS-8497-alone-cb07e38b5-sm90; row 6755's theme)."""
 
     def run_block(drawn):
         operands = [args[0] for args in drawn]
@@ -557,12 +558,12 @@ def _mamba_ssm(regime: str, draws, seeds: int, *, gradients: bool):
                   np.zeros((len(drawn), batch, heads, operands[0].key.shape[-1], width), np.float32)))
         found = mamba_side({name: np.stack([getattr(each, name) for each in operands]) for name in names},
                            given, starts, CHUNK)
-        outputs = [(jnp.asarray(found["out"][index]), jnp.asarray(found["final"][index]))
+        outputs = [(np.asarray(found["out"][index]), np.asarray(found["final"][index]))
                    for index in range(len(drawn))]
         if not gradients:
             return outputs
-        return [(output, dataclasses.replace(each, **{name: jnp.asarray(found[f"d_{name}"][index],
-                                                                       getattr(each, name).dtype)
+        return [(output, dataclasses.replace(each, **{name: np.asarray(found[f"d_{name}"][index],
+                                                                      getattr(each, name).dtype)
                                                       for name in names}))
                 for index, (output, each) in enumerate(zip(outputs, operands, strict=True))]
 
