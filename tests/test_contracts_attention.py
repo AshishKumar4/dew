@@ -10,6 +10,7 @@ import pytest
 from contract_support import EDGES, REVERSE_ONLY, assert_drawn_contract, normal_draw
 
 from dew.nn import attention, kv_cache
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_quantized
 from dew.nn.sharding import manual_map
 
@@ -183,6 +184,51 @@ def test_a_nudged_quotient_narrows_once_and_keeps_its_tangent():
     settled, tangent = jax.jvp(lambda out: template.narrowing_settled(out, acc, divisor, jnp.float16), (tie,),
                                (jnp.float32(1.0),))
     assert settled.astype(jnp.float16) == 1.0 and tangent == 1.0
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_sparse_latent_kernel_holds_every_order(edge):
+    """`sparse_selection.templated_context` (the attention template's decode over each query's selected
+    latents, its value, interpreted off a GPU), the blocked XLA path's derivatives through
+    `generation.linear_tangent`: every order runs in the absorbed queries, the rope queries, the latents and
+    the rope heads, finite wherever float64 is a normal float32 and the plain formula, each query's softmax
+    over its selected latents and rope heads, is; a slot naming no key reads nothing."""
+    from dew.nn import sparse_selection
+
+    shapes = ((2, 8, 4, 64), (2, 8, 4, 64), (2, 8, 64), (2, 8, 64))
+    selected = jnp.asarray([[[0, -1, -1], [1, 0, -1], [2, 1, 0], [3, 1, -1], [4, 2, 0], [5, 3, 1],
+                             [6, 0, 2], [7, 6, 5]]] * 2, jnp.int32)
+    scale = 128 ** -0.5
+
+    def drawn(seeds: tuple, size: float) -> tuple:
+        # The operands, their directions and the context's cotangent from `seeds`, bf16: the template's
+        # decode reads 16-bit latents.
+        primals, direction = (tuple(x.astype(jnp.bfloat16) for x in normal_draw(seed, *shapes, scale=size))
+                              for seed in seeds[:2])
+        (cotangent,) = normal_draw(seeds[2], (2, 8, 4, 64))
+        return primals, direction, cotangent.astype(jnp.bfloat16)
+
+    primals, direction, cotangent = drawn((9023, 9024, 9025), EDGES[edge])
+
+    def sparse(absorbed, query_rot, latent, rot):
+        with generation.assumed("sm90"):
+            return sparse_selection.templated_context(scale, None, 4)(absorbed, query_rot, latent, rot,
+                                                                      selected)
+
+    def plain(absorbed, query_rot, latent, rot):
+        at = jnp.maximum(selected, 0)
+        keys, rots = (jax.vmap(lambda rows, where: rows[where])(table, at) for table in (latent, rot))
+        logits = (jnp.einsum("bqhr,bqkr->bqhk", absorbed, keys)
+                  + jnp.einsum("bqhp,bqkp->bqhk", query_rot, rots)) * scale
+        logits = jnp.where(selected[:, :, None, :] >= 0, logits, -jnp.inf)
+        return jnp.einsum("bqhk,bqkr->bqhr", jax.nn.softmax(logits, axis=-1), keys)
+
+    def draw(seed):
+        """A seed's operands, directions and cotangent at unit scale (the mesh order's check 1)."""
+        return drawn(([9023, seed], [9024, seed], [9025, seed]), 1.0)
+
+    assert_contract(sparse, primals, direction, cotangent, f"the sparse latent kernel {edge}",
+                    truth_fn=plain, plain_fn=plain, draw=draw if edge == "normal" else None)
 
 
 @pytest.mark.parametrize("edge", EDGES)

@@ -26,25 +26,27 @@ from reference_error import as_given, assert_as_exact, widened, with_gradients
 
 from dew.lora import LoRA
 from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.kernels import generation
 from dew.nn.kernels.generation import device_generation
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
 from dew.quantization import QUANTIZATION, InputQuantization
 
 HEADS, RANK, NOPE, ROPE, VALUE = 4, 24, 16, 8, 12
-SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8, 'dropped-out adapter': 16,
+SEEDS = {'selection': 8, 'templated selection': 8, 'packed selection': 8, 'sparse layer': 8,
+         'dropped-out adapter': 16,
          'act-quantized kv_b_proj': 8, 'weight-quantized kv_b_proj': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
-def pieces(length, batch=2, seed=0):
+def pieces(length, batch=2, seed=0, rank=RANK, rope=ROPE):
     keys = jax.random.split(jax.random.key(seed), 7)
     q_nope = jax.random.normal(keys[0], (batch, length, HEADS, NOPE))
-    q_rot = jax.random.normal(keys[1], (batch, length, HEADS, ROPE))
-    latent = jax.random.normal(keys[2], (batch, length, RANK))
-    rot = jax.random.normal(keys[3], (batch, length, ROPE))
-    key_weight = jax.random.normal(keys[4], (RANK, HEADS, NOPE)) / np.sqrt(RANK)
-    value_weight = jax.random.normal(keys[5], (RANK, HEADS, VALUE)) / np.sqrt(RANK)
+    q_rot = jax.random.normal(keys[1], (batch, length, HEADS, rope))
+    latent = jax.random.normal(keys[2], (batch, length, rank))
+    rot = jax.random.normal(keys[3], (batch, length, rope))
+    key_weight = jax.random.normal(keys[4], (rank, HEADS, NOPE)) / np.sqrt(rank)
+    value_weight = jax.random.normal(keys[5], (rank, HEADS, VALUE)) / np.sqrt(rank)
     scores = jax.random.normal(keys[6], (batch, length, length))
     return q_nope, q_rot, latent, rot, key_weight, value_weight, scores
 
@@ -52,7 +54,7 @@ def pieces(length, batch=2, seed=0):
 def expanded_reference(q_nope, q_rot, latent, rot, key_weight, value_weight, mask):
     """The V3.2 reference's arithmetic: per-head keys and values, masked softmax."""
     nope = jnp.einsum('btr,rhn->bthn', latent, key_weight)
-    key = jnp.concatenate([nope, jnp.broadcast_to(rot[:, :, None], (*nope.shape[:3], ROPE))], -1)
+    key = jnp.concatenate([nope, jnp.broadcast_to(rot[:, :, None], (*nope.shape[:3], rot.shape[-1]))], -1)
     value = jnp.einsum('btr,rhv->bthv', latent, value_weight)
     query = jnp.concatenate([q_nope, q_rot], -1)
     return scaled_dot_product_attention(query, key, value, implementation="reference",
@@ -67,27 +69,27 @@ def causal_selection(scores, top_k, segments=None):
     return top_k_selection(scores, keep, top_k)
 
 
-def selection_draw(length, top_k, segments=None, cotangent=False):
-    """Check 1's draw of a selection's inputs: a seed's pieces (`pieces`) and the selection their
-    scores make (`causal_selection`, inside `segments` where given), with `cotangent` a readout of the
-    attention drawn apart from them."""
+def selection_draw(length, top_k, segments=None, cotangent=False, dtype=jnp.float32, **widths):
+    """Check 1's draw of a selection's inputs: a seed's pieces (`pieces`, at `widths`) in `dtype` and the
+    selection their scores make (`causal_selection`, inside `segments` where given), with `cotangent` a
+    readout of the attention drawn apart from them."""
     def draw(seed):
-        *operands, scores = pieces(length, seed=seed)
-        drawn = (*operands, causal_selection(scores, top_k, segments))
+        *operands, scores = pieces(length, seed=seed, **widths)
+        drawn = (*(operand.astype(dtype) for operand in operands), causal_selection(scores, top_k, segments))
         if not cotangent:
             return drawn
         # A host stream of the seed's own, apart from every seed's `pieces` keys.
         rng = np.random.default_rng([0xC07A, seed])
-        return *drawn, rng.standard_normal((2, length, HEADS, VALUE)).astype(np.float32)
+        return *drawn, rng.standard_normal((2, length, HEADS, VALUE)).astype(dtype)
     return draw
 
 
-def attending(length, **options):
+def attending(length, rope=ROPE, **options):
     """The selection's two arms on a draw's operands and indices (`selection_draw`):
     `sparse_latent_attention` over the indices, under `options`, and the expanded reference under
     their mask."""
     def sparse(*drawn):
-        return sparse_latent_attention(*drawn[:-1], drawn[-1], scale=1 / np.sqrt(NOPE + ROPE), **options)
+        return sparse_latent_attention(*drawn[:-1], drawn[-1], scale=1 / np.sqrt(NOPE + rope), **options)
 
     def dense(*drawn):
         return expanded_reference(*drawn[:-1], selection_mask(drawn[-1], length))
@@ -111,6 +113,27 @@ def test_the_selection_attends_as_the_masked_expanded_reference():
     sparse, dense = attending(length, block=5)
     assert_as_exact(pulled(sparse), pulled(dense), selection_draw(length, top_k, cotangent=True), 'selection',
                     seeds=SEEDS['selection'])
+
+
+def test_the_template_reads_the_selection_as_the_masked_expanded_reference():
+    """On an H100, the attention template's decode loads each query's selected latents into its key tiles
+    (`SPARSE`'s 'template', interpreted here), at a latent 64 wide and a rope head 64, bf16: forward and
+    every input gradient on par with the expanded reference under the selection's mask (check 1), a query
+    whose causal set is smaller than k reading its named slots alone (row 9023)."""
+    length, top_k = 23, 6
+
+    def pulled(attend):
+        # The operands' gradients under the drawn cotangent, through the gate's pullback.
+        def run(*drawn):
+            *operands, indices, cotangent = drawn
+            return with_gradients(lambda *pieces: attend(*pieces, indices))(*operands, cotangent)
+        return jax.jit(run)
+
+    sparse, dense = attending(length, rope=64)
+    with generation.assumed("sm90"), generation.chosen(sparse_attention="template"):
+        assert_as_exact(pulled(sparse), pulled(dense),
+                        selection_draw(length, top_k, cotangent=True, dtype=jnp.bfloat16, rank=64, rope=64),
+                        'templated selection', seeds=SEEDS['templated selection'])
 
 
 def test_packed_documents_select_inside_their_own_document():
