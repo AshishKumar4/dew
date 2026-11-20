@@ -296,14 +296,14 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
         q = jnp.ones((1, 128, 1, q_width), jnp.bfloat16)
         k = jnp.ones((1, 256, 1, q_width), jnp.bfloat16)
         v = jnp.ones((1, 256, 1, v_width), jnp.bfloat16)
-        op = attention_mosaic.MosaicForward(scale=q_width ** -0.5, keys=256, form="full")
+        op = attention_mosaic.MosaicForward(scale=q_width ** -0.5, keys=256, form="full", natural=True)
         ba = op.bind(q, k, v, None, None, None, None, (), (), None,
                      residuals=template.Kept.NONE, interpret=False)
         with generation.assumed("sm100"), _pinned(pinned):
             assert op.tmem_columns(ba, pinned, target) == expect_cols
             assert op.resident(ba, pinned, target) == expect_most
             traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
-                q, k, v, spans, interpret=False))(q, k, v).jaxpr
+                q, k, v, spans, natural=True, interpret=False))(q, k, v).jaxpr
         assert has_tmem_copy(traced) is expect_copy
         models = traced_models(traced)
         assert models and all(model.most == expect_most for model in models), models
