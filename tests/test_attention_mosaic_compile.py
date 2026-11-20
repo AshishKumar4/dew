@@ -815,6 +815,47 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
     assert certified(warm) == certified(cold)
 
 
+EDITED_FORWARD = """
+import jax
+import dew._cache
+from dew._cache import package_digest
+
+# Dew's code edited outside the launch's kernels: its digest another, its kernels the same.
+edited = package_digest()[::-1]
+dew._cache.package_digest = lambda: edited
+certifying = []
+
+
+def heard(event, seconds, *, fun_name="", **_):
+    if event == "/jax/core/compile/backend_compile_duration" and fun_name.startswith("jit(certified_"):
+        certifying.append(fun_name)
+
+
+jax.monitoring.register_event_duration_secs_listener(heard)
+""" + CERTIFIED_FORWARD.replace("print(json.dumps([[", "print(json.dumps([certifying, *[[", 1).replace(
+    "for found in report.certifications()]))", "for found in report.certifications()]]))", 1)
+"""`CERTIFIED_FORWARD` in a Dew tree edited outside the launch's kernels (its code's digest another,
+`dew._cache.package_digest`), first naming each certification program it compiled."""
+
+
+@COMPILES_ON_CPU
+def test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_them(tmp_path):
+    """A launch certified by one process is certified in the next on the same machine by its stored verdict
+    though Dew's code changed outside the launch's kernels (`report._lowered_verdict_key`): the edited tree
+    lowers the launch, its kernels the same, and reads their verdict, compiling none; keyed by Dew's whole
+    code alone, every commit compiled every launch of a start again (row 8650: 23 of an edited tree's 51
+    seconds certifying a hybrid decoder's step ahead, FS-8650-SPLIT)."""
+    from process_support import fresh, keeping_picks
+
+    cold = fresh(CERTIFIED_FORWARD, cache_dir=tmp_path, flags=keeping_picks())
+    compiled, *edited = fresh(EDITED_FORWARD, cache_dir=tmp_path, flags=keeping_picks())
+    assert cold and not any(stored for _, stored, _ in cold), cold
+    assert edited and all(stored for _, stored, _ in edited), edited
+    assert not compiled, compiled
+    assert (sorted((op, sorted(modules.items())) for op, _, modules in edited)
+            == sorted((op, sorted(modules.items())) for op, _, modules in cold))
+
+
 @COMPILES_ON_CPU
 def test_a_programs_launches_compile_beside_its_trace():
     """A training step compiled through Dew's compile point (`OuterProgram.compiled`) certifies its
