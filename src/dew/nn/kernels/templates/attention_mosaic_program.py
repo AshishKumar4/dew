@@ -1823,10 +1823,10 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
-    drop_tiles = [bits, logits] if dropped else []
+    drop_tiles = [bits] if dropped else []
     # An fp32 call's weights fp32, their remainder fp32 and the part taken (`_parted_products`); a dropping
-    # call holds the keep bits' hash and multiplier tile beside the step's weights (row 9526), and over fp16
-    # its kept weights' second part beside the first (`algebra.kept_parts`).
+    # call holds the keep bits' hash tile beside the step's weights (the multiplier `bound` is a scalar,
+    # row 9526), and over fp16 its kept weights' second part beside the first (`algebra.kept_parts`).
     step = ([logits] * (3 if parts > 1 else 1)
             + [weights] * ((2 if residuals else 1) + weight_parts - 1) + drop_tiles)
     if residuals:
