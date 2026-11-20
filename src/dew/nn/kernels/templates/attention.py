@@ -1502,6 +1502,19 @@ def blocked(depth: int) -> bool:
     return depth % FP32_BLOCK == 0 and blocks >= 2 and not blocks & (blocks - 1)
 
 
+def _compensated_blocks(lefts: list[jax.Array], rights: list[jax.Array],
+                        reduce_block: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
+    """Sum `reduce_block(left, right)` across `FP32_BLOCK`-deep blocks with TwoSum compensation
+    (`compensated_total`), shared by `kernel_dot` and `kernel_rows`."""
+    from dew.nn.precision import compensated_total, two_sum
+
+    total, carried = two_sum(reduce_block(lefts[0], rights[0]), reduce_block(lefts[1], rights[1]))
+    for left, right in zip(lefts[2:], rights[2:], strict=True):
+        total, dropped = two_sum(total, reduce_block(left, right))
+        carried = carried + dropped
+    return compensated_total((total, carried), total)
+
+
 def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     """`a @ b` accumulated in fp32 as a template's Triton kernels issue it: bf16's and fp16's own product;
     for fp32 operands IEEE fp32 products, a contraction of blocks (`blocked`) summed a block at a time, each
@@ -1515,20 +1528,26 @@ def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
         return interpreted_dot(a, b)
     from jax.experimental.pallas import triton as plgpu
 
-    from dew.nn.precision import compensated_total, two_sum
-
-    def dot(a, b):
-        return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+    def dot(x, y):
+        return plgpu.dot(x, y, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
 
     if a.dtype != jnp.float32 or b.dtype != jnp.float32 or not blocked(a.shape[-1]):
         return dot(a, b)
     blocks = a.shape[-1] // FP32_BLOCK
-    lefts, rights = jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=0)
-    total, carried = two_sum(dot(lefts[0], rights[0]), dot(lefts[1], rights[1]))
-    for left, right in zip(lefts[2:], rights[2:], strict=True):
-        total, dropped = two_sum(total, dot(left, right))
-        carried = carried + dropped
-    return compensated_total((total, carried), total)
+    return _compensated_blocks(jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=0), dot)
+
+
+def kernel_rows(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
+    """Each row's `a · b` over the last axis as a Triton kernel forms D and the anchor's `v_c · dO`
+    (`attention_triton._dq_kernel`, rows 9113, 9114, 9610, 9611): `interpreted_rows` when interpreted, else
+    `FP32_BLOCK`-blocked TwoSum compensation matching `kernel_dot` on fp32 operands."""
+    if interpret:
+        return interpreted_rows(a, b)
+    if a.dtype != jnp.float32 or b.dtype != jnp.float32 or not blocked(a.shape[-1]):
+        return jnp.sum(a * b, axis=-1)
+    blocks = a.shape[-1] // FP32_BLOCK
+    return _compensated_blocks(jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=-1),
+                               lambda x, y: jnp.sum(x * y, axis=-1))
 
 
 def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
