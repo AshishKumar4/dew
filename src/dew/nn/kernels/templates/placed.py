@@ -14,7 +14,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import after_walk, handoffs, mosaic, resources, swizzling
+from dew.nn.kernels.templates import after_walk, handoffs, mosaic, resources, rings, swizzling
 from dew.nn.kernels.templates.mosaic_sm100 import (
     STORED,
     TMEM,
@@ -122,6 +122,12 @@ class Tcgen05Placed(Tcgen05Rings):
                                   handoffs.Role("producer", warp=True, weight=0),
                                   handoffs.Role("issuer", warp=True, weight=0)), floor=producer)
 
+    def corrects(self, consumers: int, value_width: int) -> bool:
+        """Whether a launch of `consumers` softmax warpgroups and `value_width` value columns places its
+        sums' rescales on a dedicated `CORRECTION` warpgroup (at one consumer and width >= 256, where TMEM
+        already caps residency to 1 CTA/SM and two softmax warpgroups do not fit)."""
+        return consumers == 1 and value_width >= 256
+
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
                     walk: Callable[..., R], *, between=None, counted=0) -> R:
         # Its consumer reads no ring (its issuer does): no step it passes.
@@ -158,6 +164,9 @@ class Tcgen05Placed(Tcgen05Rings):
         if query_left:
             ((q_width, q_dtype),) = query_left
             scratch[QUERY] = tuple(self.tensor_memory((rows, q_width), q_dtype) for _ in range(consumers))
+        if self.corrects(consumers, kept):
+            scratch["factor_ready"] = self.signals(2).scratch()
+            scratch[FACTORS] = plgpu.SMEM((2, rows), jnp.float32)
         return scratch
 
     def product_columns(self, products: tuple | None) -> int:
@@ -168,9 +177,12 @@ class Tcgen05Placed(Tcgen05Rings):
         return resources.tensor_memory_columns(jax.tree.leaves(held))
 
     def product_shared(self, scratch) -> tuple:
-        # Its accumulators and tiles are tensor memory; its hand-offs' barriers shared memory.
-        return tuple(barrier for name in ("scored", "weighed", "summed")
-                     if name in scratch for barrier in scratch[name])
+        # Its accumulators and tiles are tensor memory; its hand-offs' barriers and factor staging shared
+        # memory.
+        barriers = tuple(barrier for name in ("scored", "weighed", "summed")
+                         if name in scratch for barrier in scratch[name])
+        extra = tuple(scratch[name] for name in ("factor_ready", FACTORS) if name in scratch)
+        return (*barriers, *extra)
 
     def product_addresses(self, products: tuple | None) -> int:
         return 0 if products is None else resources.TMEM_ADDRESS_BYTES
@@ -181,6 +193,11 @@ class Tcgen05Placed(Tcgen05Rings):
         found, role = self._scoped(), mosaic.ROLE.get() if consumer is None else consumer
         return (self.signals(2).opened(found["scored"][role]), self.signals(2).opened(found["weighed"][role]),
                 self.signals(2).opened(found["summed"][role]))
+
+    def _correction_signals(self) -> tuple[Signal, rings.Ref]:
+        """The correction warpgroup's factor hand-off (`product_scratch`'s `factor_ready`, `FACTORS`)."""
+        found = self._scoped()
+        return self.signals(2).opened(found["factor_ready"]), found[FACTORS]
 
     def _turns(self, name: str, consumer: int | None = None) -> tuple[Accumulator, ...]:
         """A consumer's two turns of the `name` tiles (`product_scratch`'s `LOGITS`, or the `WEIGHTS` over
@@ -209,6 +226,7 @@ class Tcgen05Placed(Tcgen05Rings):
         del inline
         _, weighed, summed = self._signals()
         adds = declared is not None and declared.accumulate
+        correcting = FACTORS in self._scoped()
 
         def accumulate(acc, scale, parts, value):
             del value
@@ -216,6 +234,19 @@ class Tcgen05Placed(Tcgen05Rings):
             if not slots.first:
                 pl.when(slots.n >= 2)(lambda: summed.wait(summed.turn(slots.n - 2)))
             self.write(self._turns(WEIGHTS)[slots.turn], weights)
+            if correcting:
+                if slots.first or not adds:
+                    weighed.published(weighed.turn(slots.n))
+                    return acc
+                factor_ready, factors = self._correction_signals()
+                factor_slot = 1 - slots.turn
+                factor_turn = factor_ready.turn(slots.n - 1)
+                factor = (self.full((self.rows,), 1.0) if scale is None or scale.factor is None
+                          else scale.factor)
+                factors.at[factor_slot][...] = factor
+                plgpu.commit_smem()
+                factor_ready.published(factor_turn)
+                return acc
             if scale is not None and adds and not slots.first:
                 # A pass over the sums in tensor memory only where the step moves some row's (`Taken.moves`):
                 # most steps of a long row move none (one warpgroup vote, `bar.red.or.pred`).
@@ -272,6 +303,40 @@ class Tcgen05Placed(Tcgen05Rings):
         for back in (2, 1):
             pl.when(count >= back)(lambda back=back: summed.wait(summed.turn(count - back)))
         return carry, kept
+
+    def correcting(self, lo, hi, value_width: int) -> None:
+        """The correction warpgroup's walk of steps `lo + 1` to `hi` (row 5368): awaits each step's rescale
+        factor from the softmax warpgroup (`factor_ready`), rescales `SUMS` in tensor memory once the
+        previous step's weighted values are done (`summed`) where any row's factor differs from 1, and
+        publishes `weighed` to the issuer. Factor-slot reuse is retired by `summed(n - 2)` on the consumer."""
+        count = hi - lo
+        _, weighed, summed = self._signals(0)
+        factor_ready, factors = self._correction_signals()
+        sums = Accumulator(self._scoped()[SUMS][0], (self.rows, value_width))
+
+        def step(n, factor_slot: int):
+            factor_ready.wait(factor_ready.turn(n - 1))
+            factor = plgpu.load(factors.at[factor_slot], layout=self.native_row, optimized=False)
+
+            def rescaled():
+                summed.wait(summed.turn(n - 1))
+                _rescaled(self, sums, lambda acc: acc * factor[:, None])
+
+            pl.when(after_walk.rare(jnp.any(factor != 1.0)))(rescaled)
+            weighed.published(weighed.turn(n))
+
+        def trip(pair, carry, accumulators):
+            step(1 + 2 * pair, 0)
+            step(2 + 2 * pair, 1)
+            return carry, accumulators
+
+        def last(_, carry, accumulators):
+            step(count - 1, 0)
+            return carry, accumulators
+
+        loops = (mosaic.Loop(trip, 0, jnp.maximum(count - 1, 0) // 2),
+                 mosaic.Loop(last, 0, jnp.where((count > 1) & (count % 2 == 0), 1, 0)))
+        mosaic.looped(loops, None, ())
 
     def issuing(self, streams, products: Sequence[mosaic.Product], lo, hi, *, first,
                 lefts: Sequence[Mapping], ready: Sequence, reaches: Sequence[tuple] | None = None) -> None:
@@ -391,10 +456,21 @@ RESCALED_COLUMNS = 32
 """The sums' columns a consumer of tcgen05's rows takes by a factor at once in tensor memory (a row's 32 a
 thread, beside its step's logits and weights)."""
 
-LOGITS, WEIGHTS, SUMS, QUERY = "logits", "weights", "sums", "query"
+LOGITS, WEIGHTS, SUMS, QUERY, FACTORS = "logits", "weights", "sums", "query", "factors"
 """The scratch of tcgen05's rows' products (`Tcgen05Placed.product_scratch`): the logits' two accumulators,
-the weights' two tiles, the sums kept across the walk; a declared product's by its accumulator
-(`placed_products`)."""
+the weights' two tiles, the sums kept across the walk, the optional query tile in tensor memory, and the
+correction warpgroup's rescale-factor staging; a declared product's by its accumulator (`placed_products`)."""
+
+CORRECTION = handoffs.Role("correction", 1, weight=0.5)
+"""The correction warpgroup role of tcgen05's rows (`Tcgen05Placed.correcting`, row 5368): rescales kept
+sums in tensor memory off the softmax warpgroup's critical path."""
+
+
+def correction_roles(family: mosaic.Family, consumers: int,
+                     value_width: int) -> tuple[tuple[handoffs.Role, int], ...]:
+    """The joined correction warpgroup role for `family` at `consumers` and `value_width`, or empty."""
+    return ((CORRECTION, 1),) if (isinstance(family, Tcgen05Placed)
+                                  and family.corrects(consumers, value_width)) else ()
 
 
 def placed_products(products: Sequence[mosaic.Product]) -> tuple[mosaic.Product, mosaic.Product]:

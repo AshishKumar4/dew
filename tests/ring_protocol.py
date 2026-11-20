@@ -459,16 +459,18 @@ def _access(kind: str, indexed: int) -> Callable:
     def access(self: _Interpreter, equation, values) -> list:
         ref = values[0]
         if isinstance(ref, Ref):
-            at = _slot(ref, equation.params["tree"], values[indexed:])
+            tree = equation.params.get("tree")
+            if tree is None:
+                tree = equation.params["transforms_treedef"]
+            at = _slot(ref, tree, values[indexed:])
             # An empty gather touches nothing: no access.
             if at != frozenset():
                 self.emit(kind, at)
             if kind == "read" and ref.value is not None:
                 # A known operand's read, through its transforms as JAX's state discharge reads one.
-                transforms = jax.tree_util.tree_unflatten(equation.params["tree"], values[indexed:])
+                transforms = jax.tree_util.tree_unflatten(tree, values[indexed:])
                 return [np.asarray(discharge.transform_array(jnp.asarray(ref.value), transforms))]
         return [None] * len(equation.outvars)
-
     return access
 
 
@@ -544,8 +546,8 @@ SYNC: dict[str, Callable] = {
     "async_copy_smem_to_tmem": _tmem_copy, "copy_gmem_to_smem": _load,
     "copy_smem_to_gmem": _store, "commit_group": _store_group, "wait_smem_to_gmem": _store_wait,
     "commit_smem": _commit,
-    "get": _access("read", 1), "swap": _access("write", 2), "wgmma": _product, "wgmma_ref": _wgmma_product,
-    "wgmma_wait": _product_wait,
+    "get": _access("read", 1), "load": _access("read", 1), "swap": _access("write", 2),
+    "wgmma": _product, "wgmma_ref": _wgmma_product, "wgmma_wait": _product_wait,
 }
 """Each primitive of the toolkit's synchronization and shared memory, as an `Event`."""
 

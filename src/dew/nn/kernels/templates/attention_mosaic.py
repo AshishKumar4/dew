@@ -317,7 +317,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """A consumer thread's share of the registers (`Family.registers`): the family's roles share the
         file (`handoffs.Schedule`)."""
         # A consumer's budget is its family's, whatever the operands' dtype (`mosaic.Family.registers`).
-        return bundle_of(config, jnp.bfloat16).registers(config.consumers)
+        family = bundle_of(config, jnp.bfloat16)
+        return family.registers(config.consumers)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return self.declined(ba, target) is None
@@ -421,18 +422,25 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         del ba, config, target
         return 0
 
+    def joined_roles(self, ba: tokamax.BoundArguments, config: Config,
+                     target: generation.GpuTarget) -> tuple:
+        """The raised warpgroup roles joined beside this launch's consumers (`MosaicForward` overrides)."""
+        del ba, config, target
+        return ()
+
     def resident(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> int:
         """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
         its registers, shared memory and rounded tensor memory (`resources.register_model`); one on a core
         whose family budgets no registers (a TPU's, `Family.budgets_registers`), and one at the least, a
         legal config's (row 9105)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
+        joined = self.joined_roles(ba, config, target)
         if not family.budgets_registers:
-            return family.programs(config.consumers)
+            return family.programs(config.consumers, joined=joined)
         staged = self.staged_bytes(ba, config, target) if target.shared_limit else None
         tmem = self.tmem_columns(ba, config, target)
         return max(1, resources.register_model(family, config.consumers, self.registers(ba, config),
-                                               shared=staged, target=target, tmem=tmem).most)
+                                               shared=staged, target=target, tmem=tmem, joined=joined).most)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -980,14 +988,24 @@ class MosaicForward(_Mainloop[Tiles]):
                 staged = (self._staged_bytes(ba, config, target, products=base)
                           if target.shared_limit else None)
                 regs = self.registers(ba, config)
+                joined = self.joined_roles(ba, config, target)
                 base_most = resources.register_model(family, config.consumers, regs, shared=staged,
-                                                     target=target, tmem=family.product_columns(base)).most
+                                                     target=target, tmem=family.product_columns(base),
+                                                     joined=joined).most
                 with_most = resources.register_model(family, config.consumers, regs, shared=staged,
-                                                     target=target,
-                                                     tmem=family.product_columns(with_query)).most
+                                                     target=target, tmem=family.product_columns(with_query),
+                                                     joined=joined).most
                 if with_most >= base_most:
                     return with_query
         return base
+
+    def joined_roles(self, ba: tokamax.BoundArguments, config: Tiles,
+                     target: generation.GpuTarget) -> tuple:
+        del target
+        family = bundle_of(config, ba.arguments["query"].dtype)
+        query, value = ba.arguments["query"], ba.arguments["value"]
+        value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
+        return placed.correction_roles(family, config.consumers, value_width)
 
     def tmem_columns(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
