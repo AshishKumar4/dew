@@ -1267,57 +1267,50 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
             ci.plan(300.0, {})
 
 
-def test_a_parameters_shared_setup_keeps_its_tests_together_across_functions_and_parts_one_too_heavy(
-        ci, tmp_path):
-    """Tests marked shared_setup with `by` share the setup their parameter ids' first match keys, across test
-    functions, a model's ids though they hold dashes and another parameter's id beside them: a cut keeps each
-    key's tests in one group, so the model's programs are compiled once (Main, 2026-11-20: 7 model files cut
-    in node-id order paid each model's compile in every group). A key heavier than a group's share of its file
-    runs in consecutive parts, each within it, so it is never the longest group; a test the record lacks joins
-    its key's first recorded test, each recorded one staying in its planned group. A `by` that is no literal
-    regular expression refuses the file."""
-    session = ci.session
+def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_as_the_plan_cuts_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Tests marked shared_setup with `by` share the setup the first match of `by` in their parameter ids
+    keys, across test functions, a model's ids though they hold dashes and another parameter's id beside
+    them: the plan cuts the split file's record and each task its collected tests alike, each model's tests
+    in one group, so its programs are compiled once (Main, 2026-11-20: 7 model files cut in node-id order
+    paid each model's compile in every group its tests fell in); a test whose id has no match shares
+    nothing. A `by` that is no literal regular expression, or a keyword other than `by`, refuses the file."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
     (tmp_path / "tests/test_models.py").write_text(
-        "import pytest\n"
-        "@pytest.mark.shared_setup('models', by=r'm-\\w+-tiny')\n"
-        "@pytest.mark.parametrize('name', ['m-a-tiny', 'm-b-tiny', 'm-c-tiny'])\n"
-        "def test_forward(name):\n    pass\n"
-        "@pytest.mark.shared_setup('models', by=r'm-\\w+-tiny')\n"
-        "@pytest.mark.parametrize('name', ['m-a-tiny', 'm-b-tiny', 'm-c-tiny'])\n"
-        "@pytest.mark.parametrize('dtype', ['f32', 'bf16'])\n"
-        "def test_gradient(dtype, name):\n    pass\n"
-        "def test_plain():\n    pass\n")
+        "from pathlib import Path\nimport pytest\nMODELS = ['m-a-tiny', 'm-b-tiny', 'm-c-tiny', 'plain']\n"
+        "@pytest.mark.shared_setup('models', by=r'm-[a-z]-tiny')\n@pytest.mark.parametrize('name', MODELS)\n"
+        "def test_forward(name):\n    with Path('runs').open('a') as runs: runs.write(f'f {name}\\n')\n"
+        "@pytest.mark.shared_setup('models', by=r'm-[a-z]-tiny')\n@pytest.mark.parametrize('name', MODELS)\n"
+        "@pytest.mark.parametrize('dtype', ['f32'])\n"
+        "def test_gradient(dtype, name):\n"
+        "    with Path('runs').open('a') as runs: runs.write(f'g {name}\\n')\n")
     node = "tests/test_models.py::{}"
-    forward = [node.format(f"test_forward[m-{key}-tiny]") for key in "abc"]
-    # Stacked parameters' ids as pytest joins them, the decorator nearest the function's first.
-    gradient = [node.format(f"test_gradient[{dtype}-m-{key}-tiny]")
-                for key in "abc" for dtype in ("bf16", "f32")]
-    plain = node.format("test_plain")
-    nodes = sorted([*forward, *gradient, plain])
-    weights = dict.fromkeys(nodes, 10.0)
-    by_key = {key: {each for each in nodes if f"m-{key}-tiny" in each} for key in "abc"}
-    groups = session.cut(nodes, [weights[each] for each in nodes], 3)
-    for key in "abc":
-        assert sum(by_key[key] <= set(group) for group in groups) == 1, groups
-    # Model a's three tests weigh four times the rest together: they run apart, so no group is heavier than
-    # its heaviest test, where kept whole they were three times it.
-    heavy = {**weights, **{each: 100.0 for each in by_key["a"]}}
-    groups = session.cut(nodes, [heavy[each] for each in nodes], 4)
-    assert sum(bool(set(group) & by_key["a"]) for group in groups) == 3, groups
-    assert max(sum(heavy[each] for each in group) for group in groups) == 100.0, groups
-    # A new parameter of model a joins its first recorded test's group; each recorded test keeps its own.
-    new = node.format("test_forward[m-a-tiny-new]")
-    collected = sorted([*nodes, new])
-    first = next(index for index, group in enumerate(groups) if min(by_key["a"]) in group)
-    assert session.kept(collected, groups, 10.0) == [
-        sorted([*group, *([new] if index == first else [])]) for index, group in enumerate(groups)]
-    for refused in ("by=NAME", "by=r'['", "by='x', other='y'"):
+    models = ("m-a-tiny", "m-b-tiny", "m-c-tiny", "plain")
+    nodes = [node.format(f"test_forward[{model}]") for model in models] + [
+        node.format(f"test_gradient[f32-{model}]") for model in models]
+    # Node-id order parts each model's two tests; 100 s each, a 300 s target cuts the file in three.
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict.fromkeys(nodes, 100.0)))
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert all(row["exitCode"] == 0 for row in rows)
+    ran = {row["name"]: set(row["tests"]) for row in rows if "test_models" in row["name"]}
+    assert len(ran) > 1 and sorted(node for tests in ran.values() for node in tests) == sorted(nodes)
+    for model in models[:3]:
+        both = {node.format(f"test_forward[{model}]"), node.format(f"test_gradient[f32-{model}]")}
+        assert sum(both <= tests for tests in ran.values()) == 1, ran
+    count = len(ran)
+    assert [set(ci.members("tests/test_models.py", f"{group}/{count}")) for group in range(1, count + 1)] == [
+        ran[f"3.12:tests/test_models.py#{group}/{count}"] for group in range(1, count + 1)]
+    assert sorted((tmp_path / "runs").read_text().splitlines()) == sorted(
+        f"{kind} {model}" for kind in "fg" for model in models)
+    for refused in ("by=NAME", "by=r'['", "by='x', other='y'", "other='y'"):
         (tmp_path / "tests/test_refused.py").write_text(
             f"import pytest\nNAME = 'x'\n@pytest.mark.shared_setup('s', {refused})\n"
             "def test_one():\n    pass\n")
         with pytest.raises(SystemExit):
-            session.shared_setups("tests/test_refused.py")
-
+            ci.plan(300.0, {})
+        (tmp_path / "tests/test_refused.py").unlink()
 
 def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does(ci, tmp_path):
     """Every row's shared key holds the SHARED harness modules by their code (`code_of`): an edit to what one

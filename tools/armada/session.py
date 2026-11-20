@@ -10,13 +10,13 @@ import ast
 import bisect
 import functools
 import json
-import math
 import os
 import re
 import subprocess
 import time
 from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
+from typing import Literal
 
 DURATIONS = Path("tests/test_durations.json")
 """Each test's least seconds, by its node id: a number, its least warm time, where only runs whose programs
@@ -199,8 +199,8 @@ takes (autouse), is no reason to mark (Main, 2026-11-02: the joint release's fit
 setup is one a parameter's: the tests of one name whose parameter ids its first match keys alike share
 it, across test functions (`setup_key`), as a model's compiled programs a process caches are (Main,
 2026-11-20: 7 model files cut in node-id order paid each model's load, trace and compile in every
-group its 8-20 tests fell in, ~16,000 s a run). A setup's tests heavier than a group's share of the
-file run in consecutive parts of it (`parted`), so one setup is never the longest group."""
+group its 8-20 tests fell in, ~16,000 s a run). A setup's tests run in one group however heavy, as one
+test heavier than a group does (`holds`): a `by` keys setups each a group's worth at most."""
 
 
 def test_name(node: str) -> str:
@@ -386,13 +386,11 @@ def marked_setups(name: str, text: str) -> dict[str, tuple[str, str | None]]:
     found: dict[str, tuple[str, str | None]] = {}
     read: set[int] = set()
     for test, mark in decorated_tests(tree.body):
-        by = [keyword.value for keyword in mark.keywords if keyword.arg == "by"]
-        literal = all(isinstance(each, ast.Constant) and isinstance(each.value, str) and compiled(each.value)
-                      for each in by)
+        by = by_of(mark)
         if (ast.unparse(mark.func) == f"pytest.mark.{SHARED_SETUP}" and len(mark.args) == 1
-                and len(by) == len(mark.keywords) <= 1 and isinstance(mark.args[0], ast.Constant)
-                and isinstance(mark.args[0].value, str) and test not in found and literal):
-            found[test] = (mark.args[0].value, by[0].value if by else None)
+                and by is not False and isinstance(mark.args[0], ast.Constant)
+                and isinstance(mark.args[0].value, str) and test not in found):
+            found[test] = (mark.args[0].value, by)
             read.add(id(mark.func))
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr == SHARED_SETUP and id(node) not in read:
@@ -403,24 +401,33 @@ def marked_setups(name: str, text: str) -> dict[str, tuple[str, str | None]]:
     return found
 
 
-def compiled(pattern: str) -> bool:
-    """Whether `pattern` is a regular expression (a `SHARED_SETUP` mark's `by`)."""
+def by_of(mark: ast.Call) -> str | None | Literal[False]:
+    """A `SHARED_SETUP` mark's `by`, a literal regular expression: None where it names none, False where it
+    has another keyword or a `by` that is no such literal (the file then refused, `marked_setups`)."""
+    if not mark.keywords:
+        return None
+    if len(mark.keywords) > 1 or mark.keywords[0].arg != "by":
+        return False
+    value = mark.keywords[0].value
+    if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+        return False
     try:
-        re.compile(pattern)
+        re.compile(value.value)
     except re.error:
         return False
-    return True
+    return value.value
 
 
 def setup_key(node: str, setup: tuple[str, str | None]) -> tuple[str, ...] | None:
     """The setup test node `node` shares, marked `setup` (`shared_setups`): its name, and with `by` the
-    first match of `by` in its parameter id (its first group's, where it has one); None where its id has
-    none (a test that shares nothing, as an unmarked one)."""
+    first match of `by` in its parameter id, whole; None where its id has no match, or an empty one, which
+    keys nothing alike on each Python the plan and its tasks run (a test that shares nothing, as an
+    unmarked one)."""
     name, by = setup
     if by is None:
         return (name,)
     found = re.search(by, node.partition("[")[2][:-1]) if "[" in node else None
-    return None if found is None else (name, found.group(1 if found.re.groups else 0))
+    return None if found is None or not found.group(0) else (name, found.group(0))
 
 
 def units(nodes: list[str]) -> list[list[int]]:
@@ -441,22 +448,6 @@ def units(nodes: list[str]) -> list[list[int]]:
     return list(held.values())
 
 
-def parted(held: list[list[int]], seconds: list[float], count: int) -> list[list[int]]:
-    """`units` `held` (indexes into `seconds`) for a cut into `count` groups: each unit heavier than a
-    group's share of their whole cut into as many runs of its consecutive tests as that share goes into its
-    weight, at most one a test, in order at its place, so one setup does not make the cut's longest group;
-    it pays its setup once a run."""
-    share = sum(seconds) / count if count else 0.0
-    parts: list[list[int]] = []
-    for unit in held:
-        weight = sum(seconds[index] for index in unit)
-        if len(unit) < 2 or share <= 0 or weight <= share:
-            parts.append(unit)
-            continue
-        runs = groups([seconds[index] for index in unit], min(len(unit), math.ceil(weight / share)))
-        parts.extend([unit[index] for index in run] for run in runs if len(run))
-    return parts
-
 
 def unit_seconds(nodes: list[str], seconds: list[float]) -> list[float]:
     """Each of `units`' weights: its tests' `seconds` (each node's, in `nodes`' order) summed."""
@@ -467,7 +458,7 @@ def cut(nodes: list[str], seconds: list[float], count: int) -> list[list[str]]:
     """`nodes` (node-id order, each weighing its `seconds`) as `count` groups (`groups`) of `units`, a shared
     setup's tests in one group: how the plan cuts a split file's recorded tests (ci.py's `members`), which
     every task of it keeps whatever else it collects (`kept`)."""
-    held = parted(units(nodes), seconds, count)
+    held = units(nodes)
     runs = groups([sum(seconds[index] for index in unit) for unit in held], count)
     return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
 
@@ -598,10 +589,7 @@ def kept(nodes: list[str], planned: list[list[str]], mean: float) -> list[list[s
         if placed is None:
             new.append([nodes[index] for index in unit])
             continue
-        # Each recorded test in its own planned group, a setup's parts apart (`parted`); its new ones with
-        # its first.
-        for index in unit:
-            held[group_of.get(nodes[index], placed)].append(nodes[index])
+        held[placed].extend(nodes[index] for index in unit)
     for index, run in enumerate(groups([mean * len(unit) for unit in new], len(planned))):
         held[index].extend(node for unit in new[run.start:run.stop] for node in unit)
     return [sorted(members) for members in held]
