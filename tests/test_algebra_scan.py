@@ -1232,3 +1232,88 @@ def test_a_delta_rule_reading_apart_from_its_own_write_reads_its_decayed_enterin
     grouped = scan.derive_scan(dataclasses.replace(declared, group=2), saturation=SATURATION)
     with pytest.raises(scan.Refused):
         gated_walk(grouped, operands)(*draw_fn(0))
+
+
+def two_sided(h, q, k, v, g, e, beta):
+    """Two-sided GLA's token: the state decayed along its keys and its values, `exp(g)` each key's and
+    `exp(e)` each value's, then written, `h = diag(exp(g)) h diag(exp(e)) + beta k v^T`."""
+    del q
+    return jnp.exp(g)[:, None] * h * jnp.exp(e)[None, :] + beta * k[:, None] * v[None, :]
+
+
+def two_sided_readout(h, q, k, v, g, e, beta):
+    del k, v, g, e, beta
+    return (q @ h) * KEY ** -0.5
+
+
+TWO_SIDED = {**KIMI, "e": ("time", "value")}
+
+
+def two_sided_draw(seed, steep: bool = False):
+    """`kimi_draw`'s, each value's decay its own beside each key's, down to 1e-3 a token, or `steep`, its
+    values' decays of `exp(-30)` to `exp(-60)` a token at every eighth token (a chunk's span past fp32's
+    exponents)."""
+    q, k, v, g, beta = kimi_draw(seed)
+    rng = np.random.default_rng(seed + 2)
+    e = -(10.0 ** rng.uniform(-3, 0, (TOKENS, VALUE)))
+    if steep:
+        e[::8] = -rng.uniform(30, 60, (TOKENS // 8, VALUE))
+    return q, k, v, g, jnp.asarray(e, jnp.float32), beta
+
+
+def two_sided_tokenwise(q, k, v, g, e, beta):
+    def one(h, token):
+        h = two_sided(h, *token)
+        return h, two_sided_readout(h, *token)
+
+    final, outputs = jax.lax.scan(one, jnp.zeros((KEY, VALUE), q.dtype), (q, k, v, g, e, beta))
+    return outputs, final
+
+
+@pytest.mark.parametrize("target", ["sm90", "v5e"])
+@pytest.mark.parametrize("steep", [False, True], ids=["mild", "steep values"])
+def test_a_two_sided_decays_chunks_compute_their_token_scan(target, steep):
+    """Two-sided GLA (`two_sided`: a decay along the state's keys and its values) walked in chunks through
+    its derived forms, the dual form an H100's extraction takes and the token loop a v5e's (its step's latency
+    unpriced): outputs and final state, and the operands' gradients and the outputs' tangents along them, on
+    par with the token scan's from float64 (check 1), its values' decays mild or steep past fp32's exponents
+    across a chunk."""
+    with generation.assumed(target):
+        forms = scan.derive_scan(scan.Scan(two_sided, two_sided_readout, TWO_SIDED, walked="time",
+                                           state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+
+        def walked(q, k, v, g, e, beta):
+            values = {"q": q, "k": k, "v": v, "g": g, "e": e, "beta": beta}
+            outputs, state = walk(forms, values, range(TOKENS // CHUNK), forms.init({}), TWO_SIDED)
+            return jnp.concatenate(outputs), forms.finish(state, values)
+
+        def orders(run):
+            def ran(q, k, v, g, e, beta):
+                primals = (q, k, v, g, e, beta)
+                (out, final), pull = jax.vjp(run, *primals)
+                tangents = tuple(jnp.full_like(x, 1e-2) for x in primals)
+                return {"out": out, "final": final,
+                        "gradients": pull((jnp.ones_like(out), jnp.ones_like(final))),
+                        "tangent": jax.jvp(run, primals, tangents)[1]}
+            return ran
+
+        assert_as_exact(jax.jit(orders(walked)), jax.jit(orders(two_sided_tokenwise)),
+                        functools.partial(two_sided_draw, steep=steep), f"two-sided on {target}", seeds=16)
+
+
+def test_two_two_sided_walks_merged_give_the_final_state():
+    """Two-sided GLA's tokens walked in two halves, the second from a zero state, merged (each walk's decay
+    along the values summed, `Walk.across`): the final state on par with the token scan's from float64
+    (check 1)."""
+    forms = scan.derive_scan(scan.Scan(two_sided, two_sided_readout, TWO_SIDED, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    half = TOKENS // CHUNK // 2
+
+    def merged(q, k, v, g, e, beta):
+        values = {"q": q, "k": k, "v": v, "g": g, "e": e, "beta": beta}
+        states = [walk(forms, values, chunks, forms.init(chunk_of(values, 0, TWO_SIDED)), TWO_SIDED)[1]
+                  for chunks in (range(half), range(half, 2 * half))]
+        return forms.finish(forms.merge(*states, values), values)
+
+    assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: two_sided_tokenwise(*xs)[1]), two_sided_draw,
+                    "two-sided merged", seeds=16)
