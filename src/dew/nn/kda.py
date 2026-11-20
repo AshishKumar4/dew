@@ -52,10 +52,9 @@ from .linear import (
     decode_kernel,
     fused_token,
     held_scan,
-    over_sequence,
     scan_cache,
+    sequence_delta_rule,
     sequence_split,
-    split_delta_rule,
 )
 from .mixer_base import MixerBase, MixerContext
 from .precision import accurate_exp, at_least_fp32, float32_dot_general
@@ -247,9 +246,9 @@ class KimiDeltaAttention(nn.Module):
         if shards > 1:
             rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
                                      max_segments=tokens.max_segments, write_bound=1.0)
-            out = over_sequence(functools.partial(split_delta_rule, widths=(self.head_dim,) * 3, parts=heads,
-                                                  dtype=projected.dtype if ported else wide, rule=rule),
-                                shards, (projected, g, beta, tokens.segments, tokens.starts, valid), (taps,))
+            out = sequence_delta_rule(projected, taps, g, beta, tokens, valid, shards=shards,
+                                      key_heads=self.num_heads, widths=(self.head_dim,) * 3, parts=heads,
+                                      dtype=projected.dtype if ported else wide, rule=rule)
         else:
             out = held_scan(self, projected, taps, None, scan,
                             (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
