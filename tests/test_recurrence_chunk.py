@@ -1054,20 +1054,13 @@ def test_a_b200s_port_cell_overrides_only_the_extent_its_receipt_timed(rows, tok
     each launch's shard computes that (two rows split over two devices among them), and for more rows,
     other tokens, packed documents or heads split apart no receipt overrides its kernels' order, where
     every length, batch and split at those heads took the port (row 8991)."""
-    mesh = None if mesh is None else jax.sharding.AbstractMesh((mesh[1],), (mesh[0],))
-
-    def operand(shape, dtype):
-        # Each operand placed as a training step's rules place it: its rows over 'data', its heads over
-        # 'tensor' (`sharding.grouped_heads`), as the mesh holds them.
-        if mesh is None:
-            return jax.ShapeDtypeStruct(shape, dtype)
-        axes = ('data',) if 'data' in mesh.axis_names else (None, None, 'tensor')
-        spec = jax.sharding.PartitionSpec(*axes[:len(shape)])
-        return jax.ShapeDtypeStruct(shape, dtype, sharding=jax.sharding.NamedSharding(mesh, spec))
-
-    gates = (operand((rows, tokens, 48), jnp.float32), operand((rows, tokens, 48), jnp.bfloat16))
-    shapes = [operand((rows, tokens, heads, 128), jnp.bfloat16) for heads in (16, 16, 48)]
-    starts = [operand((rows, tokens), jnp.bool_)] if packed else []
+    # A training step's mesh, its axes automatic: the rules place each operand (`sharding.grouped_heads`).
+    mesh = None if mesh is None else jax.sharding.AbstractMesh((mesh[1],), (mesh[0],),
+                                                               axis_types=(jax.sharding.AxisType.Auto,))
+    gates = (jax.ShapeDtypeStruct((rows, tokens, 48), jnp.float32),
+             jax.ShapeDtypeStruct((rows, tokens, 48), jnp.bfloat16))
+    shapes = [jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16) for heads in (16, 16, 48)]
+    starts = [jax.ShapeDtypeStruct((rows, tokens), jnp.bool_)] if packed else []
 
     def forward(query, key, value, g, beta, *starts):
         given = starts[0] if starts else None
