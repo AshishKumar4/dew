@@ -1358,16 +1358,16 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     return (out, safe, total) if residuals else out
 
 
-def mean_held(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
-    """`out`, the weighted values `sums` over their denominator, held at `dtype`'s largest where it passes it
-    from finite sums: a mean of finite values of `dtype` is within it, so one past it is its weights'
-    rounding (narrowed to fp16 for their product, the weights round up by as much as 2^-11 of each where the
-    denominator sums them unrounded, the mean of 1001 values of 65504 at 65522, inf in fp16, row 9519). An
-    infinite or NaN sum's (an infinite value's) stays as it is. The one hold every mainloop's quotient
-    (`attention_algebra.quotient`) and the reference (`held_mean`) take."""
-    largest = jnp.finfo(dtype).max
-    past = (jnp.abs(sums) < jnp.inf) & (jnp.abs(out) > largest)
-    return jnp.where(past, jnp.where(out > 0, largest, -largest).astype(out.dtype), out)
+def saturated(x: jax.Array, finite_operands: jax.Array, dtype=None) -> jax.Array:
+    """`x` saturated at `dtype`'s (default `x.dtype`'s) largest magnitude where `finite_operands` holds and
+    `|x|` passes it (rows 6882, 9519): one rule shared by `base2_maximum`, `raw_maximum`,
+    `attention_algebra.quotient` and `held_mean`. A mean of finite values of `dtype` is within `dtype`'s
+    largest, so one past it is its weights' or sums' rounding (narrowed to fp16 for their product, the
+    weights round up by as much as 2^-11 of each where the denominator sums them unrounded, the mean of 1001
+    values of 65504 at 65522, inf in fp16). An infinite or NaN operand's result stays as it is."""
+    largest = jnp.finfo(x.dtype if dtype is None else dtype).max
+    past = finite_operands & (jnp.abs(x) > largest)
+    return jnp.where(past, jnp.where(x > 0, largest, -largest).astype(x.dtype), x)
 
 
 def _narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype: DTypeLike) -> jax.Array:
@@ -1439,8 +1439,9 @@ def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
 
 
 def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
-    """The reference's `mean_held`: its value, its derivative the mean's, `out`'s (`derivative_of`)."""
-    return mean_held(jax.lax.stop_gradient(out), sums, dtype) + derivative_of(out)
+    """The reference's mean saturation (`saturated`): its value, its derivative the mean's, `out`'s
+    (`derivative_of`)."""
+    return saturated(jax.lax.stop_gradient(out), jnp.abs(sums) < jnp.inf, dtype) + derivative_of(out)
 
 
 def derivative_of(out: jax.Array) -> jax.Array:
@@ -1498,6 +1499,19 @@ def blocked(depth: int) -> bool:
     return depth % FP32_BLOCK == 0 and blocks >= 2 and not blocks & (blocks - 1)
 
 
+def _compensated_blocks(lefts: list[jax.Array], rights: list[jax.Array],
+                        reduce_block: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
+    """Sum `reduce_block(left, right)` across `FP32_BLOCK`-deep blocks with TwoSum compensation
+    (`compensated_total`), shared by `kernel_dot` and `kernel_rows`."""
+    from dew.nn.precision import compensated_total, two_sum
+
+    total, carried = two_sum(reduce_block(lefts[0], rights[0]), reduce_block(lefts[1], rights[1]))
+    for left, right in zip(lefts[2:], rights[2:], strict=True):
+        total, dropped = two_sum(total, reduce_block(left, right))
+        carried = carried + dropped
+    return compensated_total((total, carried), total)
+
+
 def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     """`a @ b` accumulated in fp32 as a template's Triton kernels issue it: bf16's and fp16's own product;
     for fp32 operands IEEE fp32 products, a contraction of blocks (`blocked`) summed a block at a time, each
@@ -1511,20 +1525,26 @@ def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
         return interpreted_dot(a, b)
     from jax.experimental.pallas import triton as plgpu
 
-    from dew.nn.precision import compensated_total, two_sum
-
-    def dot(a, b):
-        return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+    def dot(x, y):
+        return plgpu.dot(x, y, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
 
     if a.dtype != jnp.float32 or b.dtype != jnp.float32 or not blocked(a.shape[-1]):
         return dot(a, b)
     blocks = a.shape[-1] // FP32_BLOCK
-    lefts, rights = jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=0)
-    total, carried = two_sum(dot(lefts[0], rights[0]), dot(lefts[1], rights[1]))
-    for left, right in zip(lefts[2:], rights[2:], strict=True):
-        total, dropped = two_sum(total, dot(left, right))
-        carried = carried + dropped
-    return compensated_total((total, carried), total)
+    return _compensated_blocks(jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=0), dot)
+
+
+def kernel_rows(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
+    """Each row's `a · b` over the last axis as a Triton kernel forms D and the anchor's `v_c · dO`
+    (`attention_triton._dq_kernel`, rows 9113, 9114, 9610, 9611): `interpreted_rows` when interpreted, else
+    `FP32_BLOCK`-blocked TwoSum compensation matching `kernel_dot` on fp32 operands."""
+    if interpret:
+        return interpreted_rows(a, b)
+    if a.dtype != jnp.float32 or b.dtype != jnp.float32 or not blocked(a.shape[-1]):
+        return jnp.sum(a * b, axis=-1)
+    blocks = a.shape[-1] // FP32_BLOCK
+    return _compensated_blocks(jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=-1),
+                               lambda x, y: jnp.sum(x * y, axis=-1))
 
 
 def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
