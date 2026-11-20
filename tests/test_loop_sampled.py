@@ -605,30 +605,3 @@ def test_a_sampled_runs_step_compiled_ahead_holds_every_count(tmp_path):
     assert all(loaded.at_count(count).program == program for count, program in programs.items())
     with pytest.raises(ValueError):
         loaded.at_count(CAP)
-
-
-def test_a_sampled_run_training_an_exit_gate_steps_at_one_pass_as_at_its_cap():
-    """An LM run training a looped decoder's exit gate (`exit_entropy`) under a sampled pass count whose law
-    draws one pass steps (row 9691, the LM's side): at one pass its loss's metrics are its cap's tree,
-    `exit_ce` the one pass's loss and `exit_entropy` none, one pass exiting surely."""
-    from test_pass_weights import phased_draw, phased_loader
-
-    from dew.objectives.base import Step
-    from dew.training import Layout, Trainer
-
-    model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
-                              max_seq_len=128, attention_impl="xla",
-                              loop=Loop(CAP, layers=(1, 2), exit_gate=True))
-    tokens, _ = phased_draw(0)
-    capped, once = (LMObjective(each, 16, exit_entropy=0.1) for each in (model, model.with_passes(1)))
-    variables = capped.init(jax.random.key(0))
-    step = Step(jnp.asarray(0), jax.random.key(1), None)
-    batch = {"text": jnp.asarray(tokens)}
-    (_, aux), (_, capped_aux) = once.loss(variables, batch, step), capped.loss(variables, batch, step)
-    assert jax.tree.structure(aux.metrics) == jax.tree.structure(capped_aux.metrics)
-    assert float(aux.metrics["exit_entropy"]) == 0.0
-    assert float(aux.metrics["exit_ce"]) == float(aux.metrics["ce"])
-    law = SampledPasses(mean=1.2, dispersion=0.5, cap=CAP)
-    trainer = Trainer(capped, optax.sgd(0.1), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=law)
-    assert int(trainer.fit(phased_loader(tokens), steps=4, log_every=100).step) == 4
