@@ -686,13 +686,16 @@ class Templated(Protocol):
 
 
 TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
+    # The measured device first: off a GPU the automatic route refuses here, before the launch's eligibility
+    # fits a target's configs (18 fits a decision on the CPU, 0.86 of its 0.87 s, row 6740); a call naming
+    # the template passes it (`selection`'s forcing) and reaches its eligibility interpreted.
+    Requirement('device', lambda case: case.family is not None,
+                "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
+                row=INHERENT, kind='measured'),
     Requirement('launch', lambda case: case.call is not None and case.call.eligible('mosaic_gpu'),
                 "the recurrence template's launches take no call of these dtypes or widths, or no config "
                 "fits this device or holds in its compiles (each spilling, the start's misses name them), "
                 "or no Mosaic bundle claims its instruction family", row='ledger 1294'),
-    Requirement('device', lambda case: case.family is not None,
-                "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
-                row=INHERENT, kind='measured'),
     Requirement('backward', lambda case: case.product != 'training' or _trains(case.call),
                 "a gradient the template's fast backward does not take (`mainloop_backward."
                 "fast_backward_form`): an fp32 decay a key dimension in three bf16 parts, an fp16 call "
