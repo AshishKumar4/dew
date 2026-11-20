@@ -1303,6 +1303,10 @@ def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_
         both = {node.format(f"test_forward[{model}]"), node.format(f"test_gradient[f32-{model}]")}
         assert sum(both <= tests for tests in ran.values()) == 1, ran
     assert not any(plain <= tests for tests in ran.values()), ran
+    # An id beyond ASCII keys nothing, whatever the pattern's flags: no Python reads it otherwise.
+    key = ci.session.setup_key
+    assert key(node.format("test_forward[\U000105c0]"), ("models", r"(?u:^\w)")) is None
+    assert key(node.format("test_forward[m-a-tiny]"), ("models", r"m-[a-z]-tiny")) == ("models", "m-a-tiny")
     count = len(ran)
     assert [set(ci.members("tests/test_models.py", f"{group}/{count}")) for group in range(1, count + 1)] == [
         ran[f"3.12:tests/test_models.py#{group}/{count}"] for group in range(1, count + 1)]

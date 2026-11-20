@@ -424,14 +424,16 @@ def by_of(mark: ast.Call) -> str | None | Literal[False]:
 
 def setup_key(node: str, setup: tuple[str, str | None]) -> tuple[str, ...] | None:
     """The setup test node `node` shares, marked `setup` (`shared_setups`): its name, and with `by` the
-    first match of `by` in its parameter id, whole; None where its id has no match, or an empty one, which
-    keys nothing alike on each Python the plan and its tasks run (a test that shares nothing, as an
-    unmarked one)."""
+    first match of `by` in its parameter id, whole; None where its id has no match, an empty one, or is not
+    ASCII, none of which keys alike on each Python the plan and its tasks run (a test that shares nothing,
+    as an unmarked one)."""
     name, by = setup
     if by is None:
         return (name,)
-    # ASCII classes alone (`by_of`), as no Python's Unicode tables read an id otherwise than the plan's do.
-    found = re.search(by, node.partition("[")[2][:-1], re.ASCII) if "[" in node else None
+    # An ASCII id alone, under ASCII classes (`by_of`): matched alike whatever a Python's Unicode tables, as
+    # no flag the pattern sets reads ASCII text otherwise.
+    ident = node.partition("[")[2][:-1] if "[" in node else ""
+    found = re.search(by, ident, re.ASCII) if ident.isascii() else None
     return None if found is None or not found.group(0) else (name, found.group(0))
 
 
