@@ -290,7 +290,7 @@ def groups(found: list[Candidate]) -> tuple[list[tuple[list[str], list[str]]], i
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="origin/main")
     parser.add_argument("--all", action="store_true")
     arguments = parser.parse_args(argv)

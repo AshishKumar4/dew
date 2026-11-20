@@ -877,3 +877,24 @@ def test_a_search_regrouping_rows_unpaged_says_so(layout, rebuilds, row, caplog)
         chosen = regrouped_layout(layout, 2, 3, 5, 6, 24, rebuilds=rebuilds)
     assert (chosen.page_size, chosen.pages, chosen.quantized) == (None, None, layout.quantized)
     assert [getattr(record, "row", None) for record in caplog.records] == [row]
+
+
+@pytest.mark.parametrize("codes", [jnp.int8, jnp.float8_e4m3fn], ids=["int8", "fp8"])
+def test_a_quantized_stores_codes_compute_in_its_scales_dtype(codes):
+    """A module stating no dtype whose parameters are a quantized store, one-byte codes beside bf16 scales,
+    computes in bf16 (`protocols.computes_in`): an fp8 code is no dtype a product computes in, as an int8 one
+    is not, for a cache's dtype, a streamed step's price and a release's alike (row 7946)."""
+    from dew.nn.protocols import computes_in
+
+    store = {"kernel": jax.ShapeDtypeStruct((8, 8), codes), "scale": jax.ShapeDtypeStruct((8,), jnp.bfloat16)}
+    assert computes_in(None, {"proj": store}) == jnp.bfloat16
+    assert computes_in(jnp.float32, {"proj": store}) == jnp.float32
+    assert computes_in(None, {}) == jnp.float32
+
+
+def test_a_module_bound_to_no_scope_states_its_caches_dtype():
+    """An unbound module whose dtype is stated keeps its cache in it (`kv_cache.compute_dtype`), reading no
+    parameters it has no scope to hold: a cache's spec is read before a model is bound."""
+    from dew.nn.kv_cache import compute_dtype
+
+    assert compute_dtype(nn.Dense(4), jnp.bfloat16) == jnp.bfloat16

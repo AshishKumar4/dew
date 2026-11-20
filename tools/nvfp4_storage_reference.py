@@ -26,6 +26,7 @@ transformers 5.16.1, compressed-tensors 0.17.1, diffusers 0.34.0. Run:
 """
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -34,6 +35,7 @@ from compressed_tensors.compressors.nvfp4.base import NVFP4PackedCompressor
 from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme, QuantizationStatus
 from compressed_tensors.quantization.lifecycle.forward import dequantize, set_forward_quantized
+from compressed_tensors.quantization.quant_args import DynamicType
 from compressed_tensors.quantization.utils.helpers import calculate_qparams, generate_gparam
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
@@ -41,13 +43,20 @@ from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 from _dew_torch.precision import float64, float64_twin
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "storage"
-ARGS = {
+ARGS: dict[str, Any] = {
     "fp8": {"num_bits": 8, "type": "float", "strategy": "tensor", "symmetric": True},
     "nvfp4": {"num_bits": 4, "type": "float", "strategy": "tensor_group", "group_size": 16,
               "symmetric": True},
 }
 COMPRESSORS = {"fp8": FloatQuantizationCompressor, "nvfp4": NVFP4PackedCompressor}
 FORMATS = {"fp8": "float-quantized", "nvfp4": "nvfp4-pack-quantized"}
+
+
+def set_state(module: torch.nn.Module, **state: object) -> None:
+    """compressed-tensors' `state` of `module` (its scheme, its status, whether it quantizes), which the
+    library keeps as the module's plain attributes, where torch types an attribute as a tensor or module."""
+    for name, value in state.items():
+        setattr(module, name, value)
 
 
 def compress(weight: torch.Tensor, scheme: QuantizationScheme, kind: str) -> dict[str, torch.Tensor]:
@@ -103,12 +112,12 @@ def checkpoint(kind: str) -> None:
     decoded = {name: value.detach().float().numpy() for name, value in loaded.state_dict().items()
                if name.endswith(".weight") and name != "lm_head.weight"}
     for module in published_reader.modules():
-        module.quantization_enabled = False
+        set_state(module, quantization_enabled=False)
     with torch.no_grad():
         after = published_reader(ids, use_cache=False).logits.float().numpy()
         np.testing.assert_array_equal(after, published)
     for module in loaded.modules():
-        module.quantization_enabled = False
+        set_state(module, quantization_enabled=False)
     with torch.no_grad():
         # PreTrainedModel.float refuses quantized models even after their
         # weights are decoded. Module.float promotes that decoded tree.
@@ -129,18 +138,19 @@ def checkpoint(kind: str) -> None:
     exact = float64_twin(loaded, lambda: AutoModelForCausalLM.from_pretrained(
         directory, dtype=torch.float64, attn_implementation="eager"))
     for module in exact.modules():
-        module.quantization_enabled = False
+        set_state(module, quantization_enabled=False)
     with float64(), torch.no_grad():
         truth = exact(ids, use_cache=False).logits.numpy()
     np.savez(directory / "reference.npz", ids=ids.numpy(), logits=reference, logits_f64=truth,
-             published_logits=published, **decoded)
+             published_logits=published, allow_pickle=False, **decoded)
     print(kind, "reference RMS from float64", float(np.sqrt(np.mean((reference - truth) ** 2))))
 
 
 def activation_forwards() -> None:
     """CPU QDQ runs through the library's wrapped Linear, after real decompression."""
-    for label, kind, dynamic in (("fp8_static", "fp8", False), ("fp8_dynamic", "fp8", True),
-                                 ("nvfp4_local", "nvfp4", "local")):
+    cases: tuple[tuple[str, str, DynamicType | bool], ...] = (
+        ("fp8_static", "fp8", False), ("fp8_dynamic", "fp8", True), ("nvfp4_local", "nvfp4", DynamicType("local")))
+    for label, kind, dynamic in cases:
         generator = torch.Generator().manual_seed(7301)
         module = torch.nn.Linear(32, 24, bias=False)
         weight = torch.randn(24, 32, generator=generator) * 0.08
@@ -161,14 +171,13 @@ def activation_forwards() -> None:
         for name, value in decoded.items():
             if name != "weight":
                 module.register_buffer(name, value)
-        module.quantization_scheme = scheme
-        module.quantization_status = QuantizationStatus.DECOMPRESSED
+        set_state(module, quantization_scheme=scheme, quantization_status=QuantizationStatus.DECOMPRESSED)
         set_forward_quantized(module)
         with torch.no_grad():
             output = module(inputs)
             scheme.input_activations = None
             no_input_qdq = module(inputs)
-            module.quantization_enabled = False
+            set_state(module, quantization_enabled=False)
             dense = module(inputs)
         np.testing.assert_array_equal(no_input_qdq.float().numpy(), dense.float().numpy())
         assert not torch.equal(output, dense)

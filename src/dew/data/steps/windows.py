@@ -91,8 +91,9 @@ class WindowSource(View[TokenFiles]):
         return self
 
     def records(self, read: Read) -> IndexedWindows:
-        if read == "memory":
-            self.source.records(read)
+        """The windows by index, whatever the read: a memory read holds them as the indexed spans do, with no
+        decode of the store's documents beside them (row 9055: it decoded every document and dropped them)."""
+        del read
         return IndexedWindows({"text": self.tokens}, self.length, self.stride, "int32")
 
     def metadata(self) -> Mapping[str, object]:

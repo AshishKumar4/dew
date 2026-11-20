@@ -37,38 +37,45 @@ of leaves (tools/native_diffusion_worker.py's `groups`), and the SD pipeline's w
 scheduler's grid."""
 
 DIFFUSERS = importlib.import_module("reference_releases").tested("diffusers")
-PIPELINES = importlib.import_module("reference_releases").RELEASES["diffusers-pipelines"]
+RELEASES = importlib.import_module("reference_releases")
+PINS = RELEASES.RELEASES
+PIPELINES = PINS["diffusers-pipelines"]
+MODELOPT = PINS["modelopt"]["nvidia-modelopt"]
+MAXTEXT = PINS["maxtext"]["maxtext"]
+VLLM = PINS["vllm"]["vllm"]
+TORCHAUDIO = PINS["torchaudio"]["torchaudio"]
 NATIVE_PIPELINES = (f"huggingface/diffusers {PIPELINES['diffusers']} with huggingface/transformers "
                     f"{PIPELINES['transformers']}")
 """The diffusers-pipelines cohort (tools/reference_releases.py) the saved tiny pipelines' own calls run in,
 as a recording names it."""
 SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py",
-                  "reference": "danijar/dreamerv3 e01491fad6434b2245a3b8ca201dd7faedcc458c",
+                  "reference": f"danijar/dreamerv3 {RELEASES.commit('dreamerv3', 'dreamerv3')}",
                   "license": "MIT"},
          **{site: {"test": f"test_maxtext_{site}", "worker": "maxtext_worker.py",
-                   "reference": "AI-Hypercomputer/maxtext 0.2.5", "license": "Apache-2.0",
-                   "distribution": ("maxtext", "0.2.5")} for site in ("gpt3", "engram")},
+                   "reference": f"AI-Hypercomputer/maxtext {MAXTEXT}", "license": "Apache-2.0",
+                   "distribution": ("maxtext", MAXTEXT)} for site in ("gpt3", "engram")},
          "llama-cpp": {"test": "test_llama_cpp_export", "worker": "llama_cpp_worker.py",
                        "reference": "ggml-org/llama.cpp 7fe450e19305b828c199d602c23a8337aaa1f03b (v0.5.0)",
                        "license": "MIT", "host": True, "outputs": True, "judged": True},
          "vllm-replay": {"test": "test_engine_replay", "worker": "vllm_replay_worker.py", "device": "cuda",
-                         "reference": ("vllm-project/vllm 0.30.0 (its CUDA 12.9 build) with "
+                         "reference": (f"vllm-project/vllm {VLLM} (its CUDA 12.9 build) with "
                                        "huggingface/transformers 5.16.1"),
-                         "license": "Apache-2.0", "distribution": ("vllm", "0.30.0+cu129"), "host": True,
+                         "license": "Apache-2.0", "distribution": ("vllm", f"{VLLM}+cu129"), "host": True,
                          "outputs": True},
          "laya": {"test": "test_decision_laya", "worker": "laya_worker.py",
-                  "reference": "NandhaKishorM/laya a4a8921afebfd852bba0000475cfb6ab737a124c",
-                  "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
+                  "reference": f"NandhaKishorM/laya {RELEASES.commit('laya', 'laya')}",
+                  "license": "Apache-2.0", "distribution": ("transformers", PINS["laya"]["transformers"])},
          "kimi-k3": {"test": "test_kimi_k3", "worker": "kimi_worker.py", "device": "cuda",
                      "reference": "moonshotai/Kimi-K3 f831ab66814297da540d832a5235f8e904f29d06",
-                     "license": "other (kimi-k3)", "distribution": ("fla-core", "0.5.2")},
+                     "license": "other (kimi-k3)", "distribution": ("fla-core", PINS["kimi-k3"]["fla-core"])},
          "kimi-k3-vision": {"test": "test_kimi_k3_vision", "worker": "kimi_k3_vision_worker.py",
                             "reference": "moonshotai/Kimi-K3 f831ab66814297da540d832a5235f8e904f29d06",
-                            "license": "other (kimi-k3)", "distribution": ("transformers", "4.56.2")},
+                            "license": "other (kimi-k3)",
+                            "distribution": ("transformers", PINS["kimi-k3"]["transformers"])},
          "kimi-linear": {"test": "test_kimi_linear", "worker": "kimi_worker.py", "device": "cuda",
                          "reference": "moonshotai/Kimi-Linear-48B-A3B-Instruct "
                                       "e1df551a447157d4658b573f9a695d57658590e9",
-                         "license": "MIT", "distribution": ("fla-core", "0.4.0")},
+                         "license": "MIT", "distribution": ("fla-core", PINS["kimi-linear"]["fla-core"])},
          **{f"uvit-{case}": {"test": "test_uvit_source", "arms": case, "worker": "uvit_worker.py",
                              "reference": "baofff/U-ViT ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
                              "license": "MIT"} for case in ("published", "variant")},
@@ -85,11 +92,12 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                              "99ad4ac234efe8de52ce157120f72856e836d09f",
                                 "license": "MIT"},
          "mimo-mel": {"test": "test_mimo_audio", "arms": "mel", "worker": "torchaudio_mel_worker.py",
-                      "reference": "pytorch/audio 2.11.0 MelSpectrogram", "license": "BSD-2-Clause",
-                      "distribution": ("torchaudio", "2.11.0+cpu"), "host": True, "outputs": True},
+                      "reference": f"pytorch/audio {TORCHAUDIO} MelSpectrogram", "license": "BSD-2-Clause",
+                      "distribution": ("torchaudio", f"{TORCHAUDIO}+cpu"), "host": True, "outputs": True},
          **{"flaxdiff-" + case.replace("/", "-"): {
              "test": "test_flaxdiff_family_source", "arms": case, "worker": "flaxdiff_family_worker.py",
-             "reference": "AshishKumar4/FlaxDiff 15c55b001304604147a2a8002a76cf5d4c32092f", "license": "MIT"}
+             "reference": f"AshishKumar4/FlaxDiff {RELEASES.commit('flaxdiff-trainer', 'flaxdiff')}",
+             "license": "MIT"}
             for case in importlib.import_module("flaxdiff_family_cases").CASES},
          **{f"multimodal-{family}": {
              "test": "test_multimodal_model", "arms": family, "worker": "multimodal_worker.py",
@@ -104,9 +112,9 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
             for family in importlib.import_module("multimodal_families").TEXT_DRAWN},
          **{f"codec-modelopt-{name}": {"test": "test_codec_checkpoints", "arms": f"modelopt/{name}",
                                      "worker": "modelopt_worker.py",
-                                     "reference": "NVIDIA/TensorRT-Model-Optimizer 0.47.0 with "
+                                     "reference": f"NVIDIA/TensorRT-Model-Optimizer {MODELOPT} with "
                                                   "huggingface/transformers 5.16.1",
-                                     "license": "Apache-2.0", "distribution": ("nvidia-modelopt", "0.47.0"),
+                                     "license": "Apache-2.0", "distribution": ("nvidia-modelopt", MODELOPT),
                                      "outputs": True} for name in ("tiny", "mixed")},
          **{f"codec-{family}-{kind}": {"test": "test_codec_checkpoints", "arms": f"{family}/{kind}",
                                        "worker": "codec_worker.py",
@@ -127,8 +135,11 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                       "outputs": True},
          "qwen-image-export": {"test": "test_qwen_image_source", "arms": "export",
                                "worker": "qwen_image_export_reference.py",
-                               "reference": "huggingface/diffusers 6256aa7666cedd47443adc8f82da9a10e110b09c",
-                               "license": "Apache-2.0", "distribution": ("transformers", "5.17.0")},
+                               "reference": "huggingface/diffusers "
+                                            + RELEASES.commit("diffusers-qwen-image", "diffusers"),
+                               "license": "Apache-2.0",
+                               "distribution": ("transformers",
+                                                PINS["diffusers-qwen-image"]["transformers"])},
          **{f"wan-{case}": {"test": "test_wan_source", "arms": case, "worker": "wan_worker.py",
                             "reference": f"huggingface/diffusers {DIFFUSERS}", "license": "Apache-2.0",
                             "distribution": ("diffusers", DIFFUSERS)} for case in ("published", "variant")},

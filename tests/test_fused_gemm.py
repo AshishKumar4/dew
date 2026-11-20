@@ -11,11 +11,12 @@ import pytest
 from generation_support import INTERPRETS
 from reference_error import assert_as_exact
 from test_algebra import traces_cheaper
+from test_algebra_program import _scaled_twice
 
 import dew
 from dew import algebra
 from dew.nn import programs
-from dew.nn.kernels import fused_gemm, generation, selection
+from dew.nn.kernels import fused_gemm, gemm, generation, selection
 
 
 @INTERPRETS
@@ -81,6 +82,30 @@ def test_a_fused_regions_consumer_is_rewritten_by_the_algebra_pass_before_its_ep
             assert not traces_cheaper(fused, *draw(0))
         assert_as_exact(jax.jit(fused), jax.jit(program), draw, "a fused region's rewritten consumer",
                         seeds=8)
+
+
+@INTERPRETS
+def test_an_explicit_epilogue_is_rewritten_by_the_algebra_pass_as_an_inferred_one_is():
+    """A launch given its epilogue directly (`gemm.gemm`'s `epilogue`) runs it as the algebra pass rewrites
+    it, as a fused region's inferred consumer is (the test above's two capped column scales): one
+    preparation for every hook a launch takes, explicit or inferred (`tuning.KernelOp.prepared`; spec
+    alignment 2026-11-19 PM, ALGEBRA-6); with the pass off, as written."""
+    sizes = jnp.asarray([96, 40], jnp.int32)
+
+    def explicit(x, w, a, b):
+        # The consumer the pass rewrites (test_algebra_program's score hook), on the product's tile.
+        return gemm.gemm(x, w, sizes, epilogue=lambda acc, a, b: _scaled_twice(acc, None, None, a, b),
+                         epilogue_operands=((a, ("columns",)), (b, ("columns",))), out_dtype=jnp.float32,
+                         interpret_on_cpu=True)
+
+    rng = np.random.default_rng(0)
+    operands = (jnp.asarray(rng.standard_normal((136, 128)) / 8, jnp.float32),
+                jnp.asarray(rng.standard_normal((2, 128, 256)) / 8, jnp.float32),
+                *(jnp.asarray(rng.uniform(0.5, 2.0, 256), jnp.float32) for _ in range(2)))
+    with generation.assumed("sm90"):
+        assert traces_cheaper(explicit, *operands)
+        with algebra.passes(on=False):
+            assert not traces_cheaper(explicit, *operands)
 
 
 def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():

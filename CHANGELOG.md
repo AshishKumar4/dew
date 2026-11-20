@@ -7,6 +7,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A host step's startup, a sampled streamed step's admission, a rollout's and a fetched executable's
+  admission share the planner's paths: the streamed step of an inspecting run is admitted with its
+  sampled step; a rollout's copy and generation are admitted as a step is (`memory.admitted`); an
+  executable fetched to be called each step enters every `running` block; a startup's compiles are read
+  from the one ledger of JAX's events, another thread's compiles none of them; a host step under AutoPGLE
+  reports what its trial guided in its compile record, and its trial steps a window of its own.
+- One rule for the dtype a model computes in (`dew.nn.protocols.computes_in`): a release of fp8 codes that
+  states no dtype computes in its scales' dtype.
 - `Trainer(lower_for=...)` lowers a step that keeps its variables on the host: its dry run's `Lowered`
   holds each program its steady steps call (`Lowered.programs`), the realizations' lowered for the GPU and
   the companion's for this host, none compiled. `Lowered.lowered` is a device step's one program.
@@ -164,8 +172,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compile, so only its step's planning, which runs beside the start's compile, can refuse it while that
   compile runs.
 
-- Dew requires its JAX build 0.12.0.1.post113 and, on Linux x86_64 and aarch64, its own jaxlib build
-  0.12.0.1.post111, with its CUDA and PJRT plugins 0.12.0.1.post111 (post96's until now). A GPU compile takes a
+- Dew requires its JAX build 0.12.0.1.post115 and, on Linux x86_64 and aarch64, its own jaxlib build
+  0.12.0.1.post114, with its CUDA and PJRT plugins 0.12.0.1.post114 (post96's until now). A GPU compile takes a
   device memory limit past which it stops after buffer assignment, emitting no code, and states the memory its
   whole compile does; a program's Mosaic GPU kernels compile in parallel, each once; the plugin serves its
   executables' buffer assignment, which jaxlib's client of it reads, so `Compiled.peak_live()` lists the buffers
@@ -198,8 +206,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   deviceless capture with no CUDA plugin raises `NoCudaPlugin`; and Triton's pipeliner sizes a load's buffers by
   each wgmma reader's stage, where a wgmma a stage after a register use was one buffer short and the next copy
   overwrote a tile it still read. The Pallas fuser gives every unary elementwise primitive and the optimization
-  barrier its block-spec rules, so a GEMM's SwiGLU or GELU epilogue fuses into it. Elsewhere jaxlib stays the stock
-  0.12.0.1.
+  barrier its block-spec rules, so a GEMM's SwiGLU or GELU epilogue fuses into it. XLA:CPU rounds a float add,
+  subtract or multiply labeled `xla_no_contract` on its own, where it made each contractible, and HLO CSE keeps a
+  labeled one apart from its unlabeled twin, so `jax.extend.backend.no_contract_attribute()` names the label on
+  this jaxlib (rows 8554, 8638); XLA:GPU's small-dot rewrite multiplies as an F16, BF16, F64 or F8 precision
+  algorithm states, where it refused such a dot (row 8554); and a program's Mosaic GPU kernels instantiating at
+  once leave the compile threads free while they wait on LLVM's options lock (row 8602); and a Mosaic GPU kernel's
+  lowering cache keys its placement only where the kernel reads it, so a kernel that reads no mesh is one cache entry
+  under any mesh (row 8793). Elsewhere jaxlib stays the stock 0.12.0.1.
 
 - A fit's plan parts the stacks its Newton-Schulz joins (Muon's, `dew.newton_schulz`) before it recomputes
   anything, where its run states no `ns_group`: a step that fits only with them joined one at a time takes

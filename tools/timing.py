@@ -187,11 +187,13 @@ class Process:
         self.child = subprocess.Popen([sys.executable, str(TOOLS / "timing.py"), "worker", "--clock", clock],
                                       cwd=tree, env=variables, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       text=True)
+        assert self.child.stdin is not None and self.child.stdout is not None  # Both piped above.
+        self.requests, self.answers = self.child.stdin, self.child.stdout
 
     def ask(self, request: dict) -> dict:
-        self.child.stdin.write(json.dumps(request) + "\n")
-        self.child.stdin.flush()
-        line = self.child.stdout.readline()
+        self.requests.write(json.dumps(request) + "\n")
+        self.requests.flush()
+        line = self.answers.readline()
         if not line:
             raise RuntimeError(f"the worker for {request.get('key', request['op'])} ended with "
                                f"{self.child.wait()}")
@@ -199,8 +201,8 @@ class Process:
 
     def close(self) -> None:
         with contextlib.suppress(BrokenPipeError):
-            self.child.stdin.write(json.dumps({"op": "quit"}) + "\n")
-            self.child.stdin.close()
+            self.requests.write(json.dumps({"op": "quit"}) + "\n")
+            self.requests.close()
         self.child.wait()
 
 
@@ -470,7 +472,7 @@ def jobs(ref: str, manifests: dict[str, Path], name: str) -> dict:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     running = commands.add_parser("run")
     running.add_argument("manifest", type=Path)

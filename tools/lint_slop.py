@@ -386,7 +386,7 @@ def contracts(module: Module) -> Iterator[Finding]:
             continue
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
-        for name, annotation in scopes.annotations(node):
+        for name, annotation in scopes.annotated(node):
             claimed, open_dictionaries = _mappings(annotation)
             for mapping in open_dictionaries:
                 yield report(mapping, "SLOP002",
@@ -492,7 +492,7 @@ def _declared(function: ast.AST | None, unions: set[str]) -> dict[str, str]:
     """
     if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
         return {}
-    written: dict[str, ast.expr] = dict(scopes.annotations(function))
+    written: dict[str, ast.expr] = dict(scopes.annotated(function))
     for node in scopes.own(function):
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             written[node.target.id] = node.annotation
@@ -905,8 +905,8 @@ def patches(module: Module) -> Iterator[Finding]:
         elif (isinstance(node, ast.Call) and scopes.dotted(node.func) in ("setattr", "delattr")
               and len(node.args) > 1):
             owner, named = node.args[:2]
-            spelled = isinstance(named, ast.Constant) and isinstance(named.value, str)
-            attribute = named.value if spelled else "*"
+            constant = named.value if isinstance(named, ast.Constant) else None
+            attribute = constant if isinstance(constant, str) else "*"
         else:
             continue
         origin = scopes.resolved(owner, table)
@@ -996,8 +996,10 @@ def _declared_reads(value: ast.expr | None) -> frozenset[str] | str | None:
     if not value.args:
         return frozenset()
     spelled = value.args[0]
-    if isinstance(spelled, ast.Set) and all(isinstance(item, ast.Constant) for item in spelled.elts):
-        return frozenset(item.value for item in spelled.elts if isinstance(item, ast.Constant))
+    names = [item.value for item in spelled.elts if isinstance(item, ast.Constant)
+             and isinstance(item.value, str)] if isinstance(spelled, ast.Set) else []
+    if isinstance(spelled, ast.Set) and len(names) == len(spelled.elts):
+        return frozenset(names)
     return None
 
 
@@ -1171,7 +1173,7 @@ def calls(module: Module) -> Iterator[Finding]:
             continue
         read = {node.attr for node in ast.walk(cls) if isinstance(node, ast.Attribute)
                 and isinstance(node.ctx, ast.Load)} & mixing
-        if declared == "tokenwise":
+        if isinstance(declared, str):  # "tokenwise", the one name it holds (`_declared_reads`).
             extra, unread, unknown = read, set(), set()
         else:
             unread = (declared & mixing) - loaded
@@ -1877,7 +1879,8 @@ def compile_points(module: Module) -> Iterator[Finding]:
     outer = f"{module.package}.{OUTER_PROGRAM}"
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         compiler = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
-        if compiler in BARE_COMPILERS and id(node) not in inside:
+        if compiler in BARE_COMPILERS and id(node) not in inside and isinstance(
+                node, ast.Name | ast.Attribute):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP025",
                           f"compiles by a bare {compiler}; compile through `dew.nn.kernels.options.program` "
                           "or `owned_program`, Dew's one compile point, or nest it (`dew.nn.nested.nested`)")
@@ -1971,7 +1974,9 @@ def owned_constructs(module: Module) -> Iterator[Finding]:
     within = module.relative.removeprefix(prefix)
     rules = [(code, names, finding) for code, owner, names, finding in OWNED if within != owner]
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
-        named = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
+        if not isinstance(node, ast.Name | ast.Attribute):
+            continue
+        named = scopes.resolved(node, table)
         for code, names, finding in rules:
             if named in names:
                 yield Finding(module.relative, node.lineno, node.col_offset + 1, code,
@@ -1999,7 +2004,7 @@ RULE = "tools/lint_tolerances.py"
 """SLOP020's reading of a file (`tolerance_rules`), whose change may grow what the inventory holds."""
 
 
-def _tolerance_comparisons(module: Module) -> Iterator[tuple[ast.AST, str]]:
+def _tolerance_comparisons(module: Module) -> Iterator[tuple[ast.expr | ast.stmt, str]]:
     """SLOP020's comparisons in a module (`tolerance_rules.comparisons`), its imports read from its own
     package and its calls resolved as SLOP018 resolves them. A function imported by a bare module name
     from a file beside it, as tests import their support (`from test_pipeline_core import delivered`),
@@ -2112,7 +2117,8 @@ def _lineage(checkout: Path, walk: list[tuple[str, list[str]]]) -> dict[str, dic
         traced = [(lineage[parent], _changes(checkout, parent, commit)[0])
                   for parent in parents if parent in lineage]
         lineage[commit] = {}
-        for name in mine["files"]:
+        files: list[str] = mine["files"]
+        for name in files:
             inherited = [held.get(renamed.get(name, name), frozenset()) for held, renamed in traced]
             lineage[commit][name] = frozenset().union(*inherited) or frozenset({f"{commit}:{name}"})
     return lineage
@@ -2216,7 +2222,7 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
         if kept is not None and head is None:
             yield Finding(INVENTORY, 1, 1, "SLOP020",
                           f"HEAD removes the inventory {base}'s {merged[:9]} keeps", Ratchet.REMOVES, "HEAD")
-        elif kept is not None:
+        elif kept is not None and head is not None:
             for name, kind, text in _loosened(checkout, head_id, merged, head, kept, authorized=grants):
                 yield Finding(INVENTORY, 1, 1, "SLOP020", f"HEAD against {base}'s {merged[:9]} {text}", kind,
                               "HEAD", name)
