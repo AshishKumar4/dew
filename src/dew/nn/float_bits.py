@@ -154,15 +154,17 @@ float converts by integer arithmetic, a fraction's bits moved, exactly as it is.
 
 
 def widened_exactly(x: jax.typing.ArrayLike, dtype: DTypeLike) -> jax.Array:
-    """`x` in `dtype`, exactly, where `dtype` is the wider of IEEE's binary formats (float32, float64): a
-    subnormal `x` of a `WIDENED` format set in `dtype`'s bits from its own (`float_bits`' reading of it, its
-    normal exponent where `dtype` holds one, else its fraction on `dtype`'s subnormal grid), a normal one
-    converted, so a process whose conversion flushes a subnormal operand (XLA's CPU, row 4023: float32's
-    `2^-149` widened to zero, row 8966) widens it. A linear map (`generation.linear_map`) whose transpose is
-    the cotangent converted back to `x`'s format, so a direction widens exactly too, and a product's linear
-    map that widens its operands transposes, however JAX reaches it (`jax.linear_transpose` among them).
-    Any other `x` (a Python or NumPy scalar, an integer, a narrower format's, a conversion that narrows)
-    converted as `jnp.asarray` converts it, a host scalar at `dtype` directly."""
+    """`x` in `dtype`, exactly.
+
+    It widens an array of a `WIDENED` format (fp16, bfloat16, float32) into float32 or float64 wider than
+    it. A subnormal `x` is set in `dtype`'s bits from `float_bits`' reading of it, so a process whose
+    conversion flushes subnormals (XLA's CPU, rows 4023 and 8966) still widens it. A normal `x` is
+    converted. Any other `x` (a host scalar, an integer, an 8-bit or sub-byte float, a narrowing) is
+    converted as `jnp.asarray` converts it.
+
+    The widening is a linear map (`generation.linear_map`). Its transpose casts the cotangent back to `x`'s
+    type (`cast_back`), so a product's linear map that widens its operands transposes it however JAX
+    reaches it. Its result is strongly typed, as an explicit conversion's is."""
     if not isinstance(x, jax.Array | np.ndarray) or not _widens(jnp.dtype(x.dtype), jnp.dtype(dtype)):
         return jnp.asarray(x, dtype)
     # The destination as JAX resolves an explicit request (x64, or its explicit dtypes allowed without it).
@@ -190,9 +192,8 @@ def cast_back(cotangent: jax.Array, source: ShapedArray) -> jax.Array:
     pullback runs in."""
     wide = cotangent.dtype == np.dtype(np.float64)
     with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
-        (back,) = jax.linear_transpose(lambda moving: moving.astype(cotangent.dtype),
-                                       jax.ShapeDtypeStruct(source.shape, source.dtype,
-                                                            weak_type=source.weak_type))(cotangent)
+        # The source's own aval: its placement, manual axes and weakness, which the transpose restores.
+        (back,) = jax.linear_transpose(lambda moving: moving.astype(cotangent.dtype), source)(cotangent)
     return back
 
 
