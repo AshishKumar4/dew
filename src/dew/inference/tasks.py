@@ -1080,26 +1080,26 @@ def recorded_processor(processor: Processor | None) -> SourceReference | None:
 def recorded_custom(processor: Processor | None) -> JSON:
     """The record `TaskSettings.custom` keeps of a host `processor` of the user's own: its class record
     (`dew.registry.to_record`: a dataclass, a class of Dew's or a trusted package's, by its import path and
-    constructor fields), a run processor's subclass among them; `{"unrecorded": reason}` where no record
-    describes it (a class an import path names none of, a field no record carries, a constructor argument
-    its fields keep none of), which a run saves without, as before, the load naming why; None for a run
-    tokenizer's adapter itself, a source's, or none."""
+    constructor fields); `{"unrecorded": reason}` where no class record describes it (a class an import path
+    names none of, a field no record carries, a constructor its record's keywords build none of), which a
+    run saves without, as before, the load naming why; None for a run tokenizer's adapter or a source's
+    processor, a subclass of either among them, which their own readers rebuild as their base adapter, over
+    the run's held tokenizer or the source's files (`recorded_tokenizer`, `recorded_processor`)."""
     from dew.registry import Unrecordable, class_record, to_record
 
-    # The run tokenizer's own adapter over a tokenizer its record names, or a source's processor, which their
-    # readers rebuild as they were (`recorded_tokenizer`, `recorded_processor`).
-    if processor is None or recorded_processor(processor) is not None or (
-            type(processor) is RunProcessor and recorded_tokenizer(processor) is not None):
+    if processor is None or isinstance(processor, RunProcessor) or recorded_processor(processor) is not None:
         return None
     try:
         record = to_record(processor, Processor | None)
     except Unrecordable as refused:
         return {"unrecorded": f"{type(processor).__qualname__}: {refused}"}
     named = class_record(_records.record(record, "custom"))
+    if named is None:
+        return {"unrecorded": f"{type(processor).__qualname__}: its record is no class record: {record!r}"}
     try:
         # The registry builds a class from its record's fields as keywords: a constructor that takes them
         # otherwise (a required `InitVar`, a positional-only argument) would refuse its rebuild.
-        inspect.signature(type(processor)).bind(**({} if named is None else named[1]))
+        inspect.signature(type(processor)).bind(**named[1])
     except TypeError as refused:
         return {"unrecorded": f"{type(processor).__qualname__}: its record's fields build none: {refused}"}
     return record
@@ -1108,10 +1108,13 @@ def recorded_custom(processor: Processor | None) -> JSON:
 def saved_custom(record: JSON) -> Processor | None:
     """The processor of the user's own a run's record keeps (`TaskSettings.custom`): built from its class
     record under the packages the load trusts (`dew.registry.owned_built`), a processor (`Processor`); None
-    where it kept none or none was recorded (`{"unrecorded": ...}`, `unrecorded_custom`)."""
+    where it kept none or none was recorded (`{"unrecorded": ...}`, `unrecorded_custom`), its reason said
+    once a process, whichever load reads it (a run's, an export's)."""
     from dew.registry import owned_built
 
-    if record is None or unrecorded_custom(record) is not None:
+    if (reason := unrecorded_custom(record)) is not None:
+        _said_unrecorded(reason)
+    if record is None or reason is not None:
         return None
     built = owned_built(record, called=True, what="a run's processor")
     if not isinstance(built, Processor):
@@ -1120,12 +1123,11 @@ def saved_custom(record: JSON) -> Processor | None:
     return built
 
 
-def said_custom(record: JSON) -> Processor | None:
-    """`saved_custom` where a load establishes its task's processor: an unrecorded one's reason logged once,
-    its run tokenizer's or source's processor then taken where it had one, else token ids alone."""
-    if (reason := unrecorded_custom(record)) is not None:
-        _log.warning("this run's own processor was not recorded: %s", reason)
-    return saved_custom(record)
+@functools.cache
+def _said_unrecorded(reason: str) -> None:
+    """Say once a process why a run's own processor was not recorded (`saved_custom`)."""
+    _log.warning("this run's own processor was not recorded, so its task takes its run tokenizer's or "
+                 "source's processor where it had one, else token ids alone: %s", reason)
 
 
 def unrecorded_custom(record: JSON) -> str | None:
@@ -1161,11 +1163,7 @@ def _saved_processor(settings: TaskSettings, config: ModelConfig, run: str) -> P
     from dew.data.text import tokenizer_for
     from dew.interop.pretrained import load_processor
 
-    custom = said_custom(settings.custom)
-    if isinstance(custom, RunProcessor) and settings.tokenizer is not None:
-        # A run processor's subclass over the run's tokenizer reads the copy the run holds, verified.
-        return dataclasses.replace(custom, tokenizer=tokenizer_for(settings.tokenizer,
-                                                                   files=settings.tokenizer_files, held=run))
+    custom = saved_custom(settings.custom)
     if custom is not None:
         return custom
     if settings.processor is not None:

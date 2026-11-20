@@ -265,15 +265,10 @@ def import_trusted(record: JSON | Mapping[str, object], trust: Sequence[str]) ->
         # path holds: only a module the process can import is imported.
         if package.replace(".", "").isidentifier() and _importable(package):
             importlib.import_module(package)
-    _import_named(record)
-
-
-def _import_named(record: JSON | Mapping[str, object]) -> None:
-    """Import every module of a trusted package that `record` names by an import path."""
     # Only JSON a record holds (`json_value` refuses any other), its every string read once.
     for named in strings_of(json_value(record, "record")):
         module, colon, name = named.partition(":")
-        if colon and name and module.split(".")[0] in _TRUSTED and module.replace(".", "").isidentifier():
+        if colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier():
             importlib.import_module(module)
 
 
@@ -812,16 +807,18 @@ def nominal_class(annotation: Annotation) -> type | None:
 
 def owned_built(record: JSON, *, called: bool, what: str) -> Configured:
     """What a class record (`class_record`) builds where it names a class of Dew's or of a trusted package
-    (`_owned`; with `called`, one whose instances are called), read as `from_record` reads a record (every
-    module it names under a trusted package imported, every module it shares built once, a `dtype` field
-    kept as its record states it): a value a record carries beside the fields any class declares (a run's
-    own processor). Any other record (a function's among them, which builds by running it) is refused, as
-    is a class no trust admits, naming `what` and `trust=`."""
+    (`_owned`; with `called`, one whose instances are called), its own module imported where a trusted
+    package holds it, read as `from_record` reads a record (every module it shares built once, a `dtype`
+    field kept as its record states it): a value a record carries beside the fields any class declares (a
+    run's own processor). Any other record (a function's among them, which builds by running it) is refused,
+    as is a class no trust admits, naming `what` and `trust=`."""
     named = class_record(_records.record(record, what))
     if named is None:
         raise ValueError(f"{what} is recorded as a class record, {{'class': ..., 'fields': ...}}; got "
                          f"{record!r}")
-    _import_named(record)
+    module = named[0].partition(":")[0]
+    if module.split(".")[0] in _TRUSTED and module.replace(".", "").isidentifier():
+        importlib.import_module(module)
     member = imported(named[0])
     if not _owned(member, called=called):
         called_so = " whose instances are called" if called else ""

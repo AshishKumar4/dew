@@ -399,13 +399,6 @@ class PrefixedBytes:
 
 
 @dataclasses.dataclass(frozen=True)
-class Prefixed(RunProcessor):
-    """A run processor of a user's own with one field of its own (row 9065's review)."""
-
-    prefix: str = ""
-
-
-@dataclasses.dataclass(frozen=True)
 class Named(PrefixedBytes):
     """A processor of a user's own that keeps a dtype's name as its record states it (row 9065's review)."""
 
@@ -495,18 +488,6 @@ def test_a_processor_its_record_builds_none_of_saves_unrecorded():
     from dew.inference.tasks import recorded_custom, unrecorded_custom
 
     assert "PositionalOnly" in unrecorded_custom(recorded_custom(PositionalOnly("> ")))
-
-
-def test_a_run_processors_subclass_is_its_own_record(tmp_path):
-    """A run over a dataclass subclass of the run processor records its own class, not the run tokenizer
-    alone, and its saved run rebuilds it (row 9065's review)."""
-
-    objective, state = _tiny_lm(Prefixed(ByteTokenizer(), prefix="> "))
-    checkpoints = Checkpoints(str(tmp_path / "run"))
-    checkpoints.save(0, state, None, artifact=objective.inference_record())
-    checkpoints.wait()
-    task = TextGeneration.from_run(str(tmp_path / "run"), trust=(Prefixed.__module__,))
-    assert type(task.processor) is Prefixed and task.processor.prefix == "> "
 
 
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=None):
