@@ -536,6 +536,21 @@ def test_a_store_wait_retires_whole_groups(kept, races):
         assert explore([program], {}) > 0
 
 
+@pytest.mark.parametrize(("kept", "races"), [(0, False), (1, True)], ids=["drained", "in flight"])
+def test_a_product_wait_retires_whole_issues(kept, races):
+    """A thread issuing a product of `x` and then one reading both `a` and `b`, a wait leaving `kept` issues
+    in flight, then a write of `a`: drained, the second issue's reads have ended and the write is ordered
+    after them; one left, that issue may still read both its sources, which the checker finds, where
+    counting its sources one by one retired `a` with the first issue (base review 156a4595a F1)."""
+    program = [Event("product", (), (("x", None),)), Event("product", (), (("a", None), ("b", None))),
+               Event("product_wait", (), kept), Event("write", ("a", None))]
+    if races:
+        with pytest.raises(Violation):
+            explore([program], {})
+    else:
+        assert explore([program], {}) > 0
+
+
 def test_the_load_warps_read_each_steps_entries_a_step_ahead():
     """The gathered walk's load warps (`gathered.Held`): at each step but a tile's last, every loader fills
     the next step's entries of its own tiles into the parity its counter's next takes, after its gathers;
