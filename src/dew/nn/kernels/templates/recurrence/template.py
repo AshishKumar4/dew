@@ -530,8 +530,13 @@ class Mosaic(base.Template[mainloop.Tiles]):
         6816); on an A100 its prefill certified its output walk fifteen times, fourteen spilling 336 bytes at
         255 registers stated alike, and the gated delta net's training call its scores' backward 32 times,
         each 8 bytes at 255 stated alike."""
-        return self._exhausted(ba, tiles, target) or not self._spilled(ba, target).isdisjoint(
-            self._plans(ba, tiles, target).items())
+        if self._exhausted(ba, tiles, target):
+            return True
+        # Planned only against a spilled launch's plans: where no compile spilled one, every first derivation
+        # and every identity unit, its plans' traces read nothing (row 9697: a third of a derivation's plan
+        # traces, jsf-holds).
+        spilled = self._spilled(ba, target)
+        return bool(spilled) and not spilled.isdisjoint(self._plans(ba, tiles, target).items())
 
     def _spilled(self, ba: tokamax.BoundArguments, target: generation.GpuTarget
                  ) -> frozenset[tuple[str, frozenset[tuple[bool, mainloop.Launch]]]]:
