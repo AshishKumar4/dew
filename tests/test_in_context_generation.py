@@ -3,74 +3,128 @@ level as its training forward steps it (`dew.objectives.lm.adaptation.InContextD
 token read through the level its training forward gives that slot, and a saved run's task steps it alike.
 """
 
+import dataclasses
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
-from flax import linen as nn
+from affine_run import dataset
+from block_support import model as kinded, wrapped
 from reference_error import assert_as_exact, dew_path
-from test_chunk_adaptation import LENGTH, LEVEL, MODEL, VOCAB, decoder, drawn_variables
+from test_chunk_adaptation import LENGTH, LEVEL, VOCAB, _replayed, decoder, drawn_variables, variable_shapes
 
-from dew.batch import token_coordinates
+from dew.batch import BLOCKS_FIELD, token_coordinates
+from dew.data.chat import Role
 from dew.inference.tasks import TextGeneration
-from dew.objectives.lm import LMObjective
-from dew.objectives.lm.adaptation import ChunkAdaptation, InContextDecoder, adapted_scores
+from dew.interop import Pretrained
+from dew.lora import LoRA
+from dew.nn.inputs import ModelInputs
+from dew.nn.mixers import AttentionMixer
+from dew.nn.protocols import BlockReading, Bounded, CacheCapacity, Generating, Layered, Serving
+from dew.nn.visibility import served_blocks
+from dew.objectives.lm import LMObjective, Samples
+from dew.objectives.lm.adaptation import ChunkAdaptation, InContextDecoder
 from dew.sampling import Sampling
 from dew.sampling.strategies import Beam, Speculative
+from dew.sampling.text import decode_ops, generate, prefill_state
+from dew.training import Checkpoints, Trainer
 
 ROWS = 2
 PROMPT = 5
-WINDOWS = (3, (2, 4))
-"""The adaptations' windows: three, which two of the decode's windows close past its prompt, and a
-chain's two levels of two and four."""
+PAD = 7
+"""The padding id the padded case's objective names, which its draws hold among their real tokens."""
+PREFIX = 3
 
-DECODE_SEEDS = 8
-"""Check 1's declared seeds for the decode against the training forward (`seeds_for`, paired)."""
-
-WIDE = decoder(LEVEL, dtype=jnp.float64)
-"""The test decoder in float64: the truth's."""
-
-
-def chained(window):
-    """The decoder whose levels `window` names: one level of a window, or a chain of two."""
-    return MODEL if isinstance(window, int) else decoder((LEVEL, LEVEL))
+DECODE_SEEDS = {"one level": 8, "a chain": 8, "padding ids": 8, "an adapter": 8,
+                "a prefix under a wrapper": 8}
+"""Check 1's declared seeds for each decode against its objective's training forward, sized paired by
+`seeds_for` on armada."""
 
 
-def drawn(seed: int, window):
+def plain(dtype):
+    """The test decoder (`test_chunk_adaptation.decoder`), one level on its final states."""
+    return decoder(LEVEL, dtype=dtype)
+
+
+def chained(dtype):
+    """The test decoder with a chain of two levels."""
+    return decoder((LEVEL, LEVEL), dtype=dtype)
+
+
+def adapted(dtype):
+    """The test decoder under a LoRA adapter on its queries, which its trunk computes under the adapter's
+    interceptor (`dew.lora`), its factors drawn with every other leaf."""
+    base = plain(dtype)
+    return LoRA(rank=2, modules=("q_proj",)).apply(
+        base, base.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)), key=0).model
+
+
+def prefixed(dtype):
+    """A decoder whose attention reads a prefix run's blocks whole, its level on its final states, under a
+    multimodal wrapper, which holds it as a field under its own name (`block_support.wrapped`)."""
+    text = kinded(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
+    return wrapped(text.clone(continuum=LEVEL, dtype=dtype))
+
+
+CASES = {"one level": (plain, 3, None, None), "a chain": (chained, (2, 4), None, None),
+         "padding ids": (plain, 3, PAD, None), "an adapter": (adapted, 3, None, None),
+         "a prefix under a wrapper": (prefixed, 3, None, PREFIX)}
+"""Each decode case: its model at a dtype, its adaptation's window, its objective's padding id, and its
+prefix run."""
+
+
+def objective_of(case: str, dtype=jnp.float32) -> LMObjective:
+    """The case's objective over its model at `dtype`, its level stepped at rate 0.1."""
+    build, window, pad_id, prefix = CASES[case]
+    return LMObjective(build(dtype), LENGTH - 1, adaptation=ChunkAdaptation(window=window, rate=0.1),
+                       pad_id=pad_id, prefix=prefix)
+
+
+def drawn(seed: int, case: str):
     """A seed's variables (`drawn_variables`) and token rows, the second row's first two slots padding, as
-    a padded prompt's are."""
+    a padded prompt's are; the padded case's rows hold its padding id among their real tokens, in the
+    prompt and past it."""
+    model = objective_of(case).model
     rng = np.random.default_rng([9066, seed])
     tokens = rng.integers(0, VOCAB, (ROWS, LENGTH)).astype(np.int32)
+    if CASES[case][2] is not None:
+        tokens[:, [3, 8]] = PAD
     mask = np.ones((ROWS, LENGTH), bool)
     mask[1, :2] = False
-    return drawn_variables(seed, chained(window), scale=0.5), tokens, mask
+    return drawn_variables(seed, model, scale=0.5), tokens, mask
 
 
-def trained(model, adaptation: ChunkAdaptation):
-    """`model`'s training forward's logits over a draw's rows (`adapted_scores`), each slot's target the
-    next token, the last slot's weighing nothing."""
+def trained(objective: LMObjective):
+    """The objective's training forward's logits at each slot but the last (`token_scores`), the last
+    slot's token the one before it's target."""
     def run(variables, tokens, mask):
-        fields = {"attention_mask": mask}
-        hidden = model.apply(variables, tokens, coordinates=token_coordinates(tokens.shape, valid=mask),
-                             method="hidden_states")
-        targets = jnp.concatenate([tokens[:, 1:], tokens[:, :1]], axis=1)
-        weights = jnp.ones(tokens.shape, jnp.float32).at[:, -1].set(0)
-        return adapted_scores(model, variables, hidden, targets, weights, fields, adaptation, predict=False,
-                              logits=True).logits
+        coordinates = token_coordinates(tokens.shape, valid=mask)
+        return objective.token_scores(variables, tokens, coordinates=coordinates, logits=True).logits
     return run
 
 
-def decoded(model, adaptation: ChunkAdaptation):
-    """The adapting decoder's logits over a draw's rows: the prompt's slots prefilled, each later token
-    decoded alone, its cache carried between the calls (`InContextDecoder`)."""
-    decoding = InContextDecoder(model, adaptation)
+def decoder_of(objective: LMObjective) -> InContextDecoder:
+    """The decoder the objective's policy draws with (`LMObjective.policy`)."""
+    return InContextDecoder(objective.model, objective.adaptation, pad_id=objective.pad_id)
+
+
+def decoded(objective: LMObjective):
+    """The objective's decoder's logits at the slots its training forward scores: the prompt's slots
+    prefilled, a prefix run's blocks served over it as a generation serves them (`served_blocks`), each
+    later token decoded alone, the cache carried between the calls."""
+    decoding = decoder_of(objective)
 
     def run(variables, tokens, mask):
         cache = decoding.apply(variables, tokens.shape[0], method="init_cache", mutable=["cache"])[1]["cache"]
+        served = ({} if objective.prefix is None
+                  else {BLOCKS_FIELD: served_blocks(jnp.asarray(mask[:, :PROMPT]), objective.prefix)})
         found, updated = decoding.apply({**variables, "cache": cache}, tokens[:, :PROMPT], decode=True,
-                                        attention_mask=mask[:, :PROMPT], mutable=["cache"])
+                                        attention_mask=mask[:, :PROMPT], mutable=["cache"], **served)
         steps = [found]
-        for at in range(PROMPT, tokens.shape[1]):
+        for at in range(PROMPT, tokens.shape[1] - 1):
             step, updated = decoding.apply({**variables, "cache": updated["cache"]}, tokens[:, at:at + 1],
                                            decode=True, mutable=["cache"])
             steps.append(step)
@@ -78,52 +132,134 @@ def decoded(model, adaptation: ChunkAdaptation):
     return run
 
 
-@pytest.mark.parametrize("window", WINDOWS, ids=["one level", "a chain"])
-def test_a_decode_reads_the_logits_its_training_forward_gives(window):
+@pytest.mark.parametrize("case", list(CASES))
+def test_a_decode_reads_the_logits_its_training_forward_gives(case):
     """The adapting decoder's logits at every slot of a padded prompt and the tokens decoded after it,
-    two of its windows closing past the prompt, on par with its training forward's over the same tokens
-    (check 1, the forward Dew's own path: `dew_path`), the truth the forward in float64: the decode steps
-    each row's level where its training steps it and reads each slot through the version its training
-    reads it at (row 9066)."""
-    adaptation = ChunkAdaptation(window=window, rate=0.1)
-    model = chained(window)
-    wide = WIDE if isinstance(window, int) else decoder((LEVEL, LEVEL), dtype=jnp.float64)
-
-    def truth(variables, tokens, mask):
-        # The draw widened by the gate (`assert_as_exact`'s truth reads it so).
-        return trained(wide, adaptation)(variables, tokens, mask)
-
-    assert_as_exact(jax.jit(decoded(model, adaptation)), dew_path(jax.jit(trained(model, adaptation))),
-                    lambda seed: drawn(seed, window), f"a decode stepping a level of window {window}",
-                    seeds=DECODE_SEEDS, truth_fn=truth)
+    two of its windows closing past the prompt, on par with its objective's training forward's over the
+    same tokens (check 1, the forward Dew's own path: `dew_path`), the truth the forward in float64: the
+    decode steps each row's level where its training steps it, by the targets its loss counts, and reads
+    each slot through the version its training reads it at (row 9066). One level, a chain of two, the
+    objective's padding id among the tokens, the trunk under a LoRA adapter, and a prefix run's blocks
+    read by a decoder a multimodal wrapper holds."""
+    objective, wide = objective_of(case), objective_of(case, jnp.float64)
+    assert_as_exact(jax.jit(decoded(objective)), dew_path(jax.jit(trained(objective))),
+                    lambda seed: drawn(seed, case), f"a decode stepping {case}", seeds=DECODE_SEEDS[case],
+                    truth_fn=trained(wide))
 
 
-def test_an_adapting_policy_draws_what_its_saved_task_draws():
-    """An adapting objective's policy (`LMObjective.policy`) and the task its settings rebuild
-    (`TextGeneration.from_settings` of `task_settings`, the adaptation recorded) draw the same tokens: a
-    saved run's task steps the level as the live one does (row 9066)."""
-    objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.1))
-    variables = nn.unbox(objective.init(jax.random.key(0)))
-    settings = objective.task_settings()
-    assert settings is not None and settings.adaptation is not None
-    saved = TextGeneration.from_settings(MODEL, variables, settings, None)
+PHI3 = Path(__file__).parent / "fixtures" / "hf" / "phi3-tiny"
+
+CROSSING_SEEDS = 8
+"""Check 1's declared seeds for a decode across LongRoPE's switch against the training forward, sized
+paired by `seeds_for` on armada."""
+
+
+def test_a_decode_across_longrope_rebuilds_its_levels_with_its_cache():
+    """Phi-3's LongRoPE switches its factors past its original context, where a generation rebuilds a
+    crossing row's cache from its history (`cache_rebuild_position`): four ids prefilled and five more
+    fed one at a time through the adapting decoder's cache, each step's logits on par with the training
+    forward's at the ids so far (check 1, the truth in float64), its levels rebuilt with the trunk's
+    cache, at the factors the whole history reads (row 9066)."""
+    loaded = Pretrained.load(PHI3, dtype="float32", attention_impl="reference", max_seq_len=48)
+    adaptation = ChunkAdaptation(window=3, rate=0.1)
+    model = loaded.model.clone(continuum=LEVEL)
+    objective = LMObjective(model, 9, adaptation=adaptation)
+    wide = LMObjective(model.clone(dtype=jnp.float64), 9, adaptation=adaptation)
+    decoding = InContextDecoder(model, adaptation)
+    assert decoding.cache_rebuild_position == model.cache_rebuild_position is not None
+
+    def walk(variables, ids):
+        ops = decode_ops(decoding, variables, 0, 0)
+        state, _ = prefill_state(decoding, variables, ModelInputs(ids[:, :4]), ops)
+        steps = {}
+        for step in range(5):
+            steps[f"step {step}"] = state.logits
+            state = ops.advance(state, ids[:, 4 + step], jnp.ones(ROWS, bool))
+        return steps
+
+    def forward(objective):
+        def run(variables, ids):
+            return {f"step {step}": objective.token_scores(variables, ids[:, :5 + step],
+                                                           logits=True).logits[:, -1] for step in range(5)}
+        return run
+
+    def draw(seed):
+        rng = np.random.default_rng([9066, 3, seed])
+        ids = rng.integers(0, model.vocab_size, (ROWS, 10)).astype(np.int32)
+        return drawn_variables(seed, model, scale=0.5), ids
+
+    assert_as_exact(walk, dew_path(forward(objective)), draw, "a decode across LongRoPE's switch",
+                    seeds=CROSSING_SEEDS, truth_fn=forward(wide))
+
+
+def test_an_adapting_run_draws_what_its_saved_task_draws(tmp_path):
+    """A run that carries its chain's levels, its windows and rates a level each and a padding id among its
+    targets: its policy (`LMObjective.policy`) and the task its saved run loads (`TextGeneration.from_run`)
+    draw the same tokens at the same likelihoods, bit for bit, the restored task stepping the levels the
+    run carried to it as the live policy does (row 9066)."""
+    adaptation = ChunkAdaptation(window=(2, 4), rate=(0.1, 0.05), carry="run")
+    objective = LMObjective(chained(jnp.float32), LENGTH, adaptation=adaptation, pad_id=0)
+    trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(0),
+                      checkpoints=Checkpoints(str(tmp_path / "run")))
+    trained_run = trainer.fit(dataset(_replayed), steps=2, log_every=1, checkpoint_every=2)
+    live = objective.policy(trained_run.variables, sampling=Sampling(temperature=0.7))
+    saved = TextGeneration.from_run(str(tmp_path / "run"))
     assert isinstance(saved.model, InContextDecoder)
+    assert (saved.model.adaptation, saved.model.pad_id) == (adaptation, 0)
     prompt = np.random.default_rng(3).integers(0, VOCAB, (ROWS, PROMPT)).tolist()
-    greedy = Sampling(temperature=0)
-    live = objective.policy(variables, sampling=greedy)(prompt, 7, key=0)
-    again = TextGeneration.from_settings(MODEL, variables, settings, None)(prompt, 7, key=0, sampling=greedy)
-    np.testing.assert_array_equal(np.asarray(live.tokens), np.asarray(again.tokens))
+    ran, again = live(prompt, 7, key=0).host(), saved(prompt, 7, key=0, sampling=live.sampling).host()
+    for field in ("tokens", "lengths", "raw_log_probs", "behavior_log_probs"):
+        np.testing.assert_array_equal(np.asarray(getattr(ran, field)), np.asarray(getattr(again, field)))
+
+
+def test_the_decoder_answers_its_models_generation_hooks():
+    """The adapting decoder answers the hooks a generation reads as its model does (`dew.nn.protocols`):
+    its bounds, its cache's layout and capacity, its LongRoPE rebuild, its projections, its blocks, its
+    run's progress and its own refusal; a mixed call's rows and a shared prefix it refuses."""
+    model = plain(jnp.float32)
+    decoding = InContextDecoder(model, ChunkAdaptation(window=3))
+    for protocol in (Bounded, CacheCapacity, Layered, Serving, Generating, BlockReading):
+        assert isinstance(decoding, protocol), protocol.__name__
+    answers = (decoding.max_seq_len, decoding.vocab_size, decoding.kv_cache, decoding.cache_rebuild_position)
+    assert answers == (model.max_seq_len, model.vocab_size, model.kv_cache, model.cache_rebuild_position)
+    adaptation = decoding.adaptation
+    assert decoding.with_cache_capacity(8) == InContextDecoder(model.with_cache_capacity(8), adaptation)
+    paged = dataclasses.replace(model.kv_cache, page_size=4, pages=8)
+    assert decoding.with_kv_cache(paged) == InContextDecoder(model.with_kv_cache(paged), adaptation)
+    assert decoding.reads_progress() == model.reads_progress()
+    assert decoding.generation_refusal() == model.generation_refusal()
+    assert decoding.block_chunks() == model.block_chunks()
+    shapes = variable_shapes(model)
+    assert decoding.inference_projection_groups(shapes) == model.inference_projection_groups(shapes)
+    assert decoding.mixed_admission_refusal() is not None and decoding.split_prefill_refusal() is not None
 
 
 def test_what_an_adapting_decoder_cannot_draw_is_refused():
     """A strategy that reads tokens it then rejects or reorders (a speculative block's, a beam's) draws
-    past what an adapting decoder's cache rewinds, and a damped or stacked adaptation decodes none: each
-    refused, naming why (ValueError)."""
-    model = InContextDecoder(MODEL, ChunkAdaptation(window=3))
+    past what an adapting decoder's cache rewinds, through a task or the sampler alike; a damped or
+    stacked adaptation decodes none, a packed request steps no row's level by one document, and an
+    objective whose loss scores one role's targets steps its level where no generation can: each refused,
+    naming why (ValueError)."""
+    model = InContextDecoder(plain(jnp.float32), ChunkAdaptation(window=3))
     variables = drawn_variables(0)
+    prompt = jnp.zeros((ROWS, PROMPT), jnp.int32)
     for strategy in (Beam(width=2), Speculative()):
         with pytest.raises(ValueError):
             TextGeneration(model, variables, strategy=strategy)
+        with pytest.raises(ValueError):
+            generate(model, variables, ModelInputs(prompt), 4, key=jax.random.key(0), strategy=strategy)
     for adaptation in (ChunkAdaptation(damped=True), ChunkAdaptation(layers=(0,))):
         with pytest.raises(ValueError):
-            InContextDecoder(MODEL, adaptation)
+            InContextDecoder(plain(jnp.float32), adaptation)
+    cache = model.apply(variables, ROWS, method="init_cache", mutable=["cache"])[1]["cache"]
+    with pytest.raises(ValueError):
+        model.apply({**variables, "cache": cache}, prompt, decode=True, mutable=["cache"],
+                    segment_ids=jnp.asarray([[1, 1, 2, 2, 2]] * ROWS))
+    role = LMObjective(plain(jnp.float32), LENGTH, adaptation=ChunkAdaptation(window=3),
+                       loss_role=Role.ASSISTANT)
+    assert role.task_settings() is None
+    with pytest.raises(ValueError):
+        role.policy(variables)
+    with pytest.raises(ValueError):
+        LMObjective(plain(jnp.float32), LENGTH, adaptation=ChunkAdaptation(window=3),
+                    loss_role=Role.ASSISTANT, samples=Samples([1, 2], 2))

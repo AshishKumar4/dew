@@ -68,6 +68,7 @@ from dew.nn.protocols import (
     BlockDrafting,
     Bounded,
     Decoding,
+    DrawsAlone,
     Exposing,
     Generating,
     Lacks,
@@ -545,6 +546,15 @@ def crosses(original: int, lengths: jax.Array, following: jax.Array) -> jax.Arra
     return (lengths <= original) & (following > original)
 
 
+def refuse_redrawn(model: nn.Module, strategy: Strategy | None) -> None:
+    """Refuse a strategy that reads tokens it then rejects or reorders (a speculative block's, a beam's)
+    for a decoder that draws a token a row at a time (`DrawsAlone`), naming its reason; no strategy is
+    `Sample`, which draws so."""
+    if isinstance(model, DrawsAlone) and strategy is not None and not isinstance(strategy, Sample):
+        raise ValueError(f"{type(strategy).__name__} reads tokens it then rejects or reorders, and "
+                         f"{model.draws_alone}: this decoder draws a token a row at a time (Sample)")
+
+
 def _refuse_generation(model: nn.Module) -> None:
     """Refuse a model that says why a generation loop cannot continue its rows (`Generating`)."""
     refusal = model.generation_refusal() if isinstance(model, Generating) else None
@@ -1006,6 +1016,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
         raise ValueError(f"trips must cover the budget of {max_new_tokens} tokens, got {trips}")
     prepared = _validated(model, ids, fields, conditioning, trips, sampling, n)
     components = resolve(sampling, logits, stopping, strategy)
+    refuse_redrawn(model, components[2])
     controls = (max_new_tokens, trips, n, sampling.pad) + ((_digest(components),) if pooled else ())
     return prepared, controls, components
 
