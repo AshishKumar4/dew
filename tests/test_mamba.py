@@ -253,13 +253,45 @@ def test_a_wide_cpu_readouts_c_gradient_sums_its_channels_before_it_rounds(monke
     from dew.nn.precision import WIDE_CPU_ARITHMETIC
 
     monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
-    x = dt = jnp.zeros((1, 1, 2), jnp.float32)
-    A, D = jnp.zeros((2, 2), jnp.float32), jnp.zeros((2,), jnp.float32)
-    B = C = jnp.zeros((1, 1, 2), jnp.float32)
-    state = jnp.asarray([[[2.0 ** 100, 0.0], [2.0 ** 100, 0.0]]], jnp.float32)
-    _, pull = jax.vjp(lambda C: selective_scan(x, dt, A, B, C, D, state=state, chunk_size=1), C)
-    (gradient,) = pull((jnp.asarray([[[2.0 ** 30, -(2.0 ** 30)]]], jnp.float32), jnp.zeros_like(state)))
+    # On the CPU, at a precision that states no fp32 sums: where the wide sum runs.
+    with jax.default_device(jax.devices("cpu")[0]), jax.default_matmul_precision("highest"):
+        x = dt = jnp.zeros((1, 1, 2), jnp.float32)
+        A, D = jnp.zeros((2, 2), jnp.float32), jnp.zeros((2,), jnp.float32)
+        B = C = jnp.zeros((1, 1, 2), jnp.float32)
+        state = jnp.asarray([[[2.0 ** 100, 0.0], [2.0 ** 100, 0.0]]], jnp.float32)
+        _, pull = jax.vjp(lambda C: selective_scan(x, dt, A, B, C, D, state=state, chunk_size=1), C)
+        (gradient,) = pull((jnp.asarray([[[2.0 ** 30, -(2.0 ** 30)]]], jnp.float32), jnp.zeros_like(state)))
     np.testing.assert_array_equal(np.asarray(gradient), np.zeros((1, 1, 2), np.float32))
+
+
+def test_a_scan_whose_states_an_explicit_axis_splits_scans_as_one_unsplit():
+    """The chunked scan's output and B's and C's gradients with its rate and entering state split over the
+    states by an Explicit axis of two devices, C replicated: on par from float64 with the recurrence a token
+    at a time (check 1), where the readout's spread C placed as the states whole split both contracted
+    operands, which JAX refuses (review of fb050ba39)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("state",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+
+    def gradients(fn):
+        def run(x, dt, A, B, C, D, state, cotangent):
+            out, pull = jax.vjp(lambda B, C: fn(x, dt, A, B, C, D, state), B, C)
+            return out, *pull(cotangent)
+        return run
+
+    def split(x, dt, A, B, C, D, state):
+        A = jax.sharding.reshard(A, NamedSharding(mesh, PartitionSpec(None, "state")))
+        state = jax.sharding.reshard(state, NamedSharding(mesh, PartitionSpec(None, None, "state")))
+        return selective_scan(x, dt, A, B, C, D, state=state, chunk_size=16)
+
+    def draw(seed):
+        return rate_past_the_range("vanishing decays", seed)
+
+    exact = jax.jit(gradients(stepwise))
+    with jax.set_mesh(mesh):
+        assert_as_exact(jax.jit(gradients(split)), exact, draw,
+                        "the chunked scan with its states split by an Explicit axis", seeds=FEWEST_SEEDS,
+                        truth_fn=exact)
 
 
 def test_a_scan_of_no_channels_takes_zero_b_and_c_gradients():
