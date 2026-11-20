@@ -1396,12 +1396,6 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     return manual_map(local, specs, out_specs)(*operands)
 
 
-def template_call(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None,
-                  forked: Forked | None = None, **options) -> base.Call:
-    """The template's call a selector reads (`template_bind`'s)."""
-    return template_bind(query, key, value, g, beta, state, starts, firsts, skip, forked, **options)[0]
-
-
 def template_bind(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None,
                   forked: Forked | None = None, **options) -> tuple[base.Call, tuple]:
     """The template's call a selector reads (`port_kernel`, `scan_kernel`), bound as `template_rule` binds
@@ -1499,7 +1493,7 @@ def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, fo
                      **options) -> tuple:
     """The template's launch on each shard: `(operands, specs, out_specs, bound)`, its operands in order with
     their placements (`_shard_specs`), its outputs', and `bound(*local)` the op's arguments and keywords
-    from each shard's operands (`template_rule`'s launch and `template_call`'s bind alike)."""
+    from each shard's operands (`template_rule`'s launch and `template_bind`'s alike)."""
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
     P = jax.sharding.PartitionSpec
     walked = ()
@@ -1850,22 +1844,24 @@ TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
 
 
 def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | None = None,
-              product: str = 'forward', forked: bool = False, packed: bool = False, shards=None) -> ScanCase:
+              product: str = 'forward', forked: bool = False, packed: bool = False, shards=None,
+              dtype: jnp.dtype | None = None) -> ScanCase:
     """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
     `chunk_size` chunks, their widths as the port and the TPU's scan take them where `padded`
     (`_scan_widths`, `_rated_scan`); on a TPU, the platform its Pallas scan builds for
     (`ssd_kernel_platform`); the template's `call`, the `product`, and whether its rows pack documents
     (`packed`); and where `shards` gives `x` and `B` as each shard holds them (`template_bind`'s, as the port
-    lays its launches too, `_ssd_ported`), its shard's heads, groups and extent, a declared cell's key."""
+    lays its launches too, `_ssd_ported`), its shard's heads, groups and extent, a declared cell's key; in
+    `dtype`, the operands' common one the scan launches in (`_rated_scan`'s), `x`'s where None."""
+    dtype = jnp.dtype(x.dtype if dtype is None else dtype)
     widths = (x.shape[-1], B.shape[-1], chunk_size)
     if padded:
         widths = (_scan_widths(widths[0]), _scan_widths(widths[1]), chunk_size)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     held = {} if shards is None else {'shard_heads': (shards[0].shape[2], shards[1].shape[2]),
                                       'extent': Extent(shards[0].shape[0], shards[0].shape[1], packed)}
-    return ScanCase(varying=bool(jax.typeof(x).mat.varying),
-                    dtype=jnp.dtype(x.dtype), widths=widths,
-                    tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(x.dtype))
+    return ScanCase(varying=bool(jax.typeof(x).mat.varying), dtype=dtype, widths=widths,
+                    tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(dtype))
                          if generation.backend() == 'tpu' else None),
                     logical=(x.shape[-1], B.shape[-1]), call=call, family=family, product=product,
                     forked=forked, **held)
@@ -1924,13 +1920,15 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     and its output `wide` or in the operands' dtype), on the target (`generation`'s, an assumed one's within
     `assumed`), at the call's numbers `rounded` (`fast_rounding`'s where None; `port_kernel`'s rule),
     reported as its route."""
+    # The scan launches its operands in their common dtype (`_rated_scan`'s `launched`), which its cell and
+    # its rounding read.
+    dtype = jnp.dtype(jnp.result_type(query, key, value))
     call, (_, shard_key, shard_value, *_) = template_bind(
         query, key, value, g, beta, state, starts, firsts, skip, forked, max_segments=max_segments, scale=1.0,
-        delta=False, wide=wide, rounded=(fast_rounding(jnp.result_type(query, key, value))
-                                         if rounded is None else rounded))
+        delta=False, wide=wide, rounded=fast_rounding(dtype) if rounded is None else rounded)
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product,
                      forked=forked is not None, packed=starts is not None or firsts is not None,
-                     shards=(shard_value, shard_key))
+                     shards=(shard_value, shard_key), dtype=dtype)
     return select(SCAN, case).kernel
 
 
