@@ -1988,6 +1988,8 @@ def ahead_arm(fn: Callable, label: str, *, host: bool = False, launched: bool = 
         if role is None:
             store.unprepared(f"{label}: its arm has no statement of what it computes")
             return unprepared(*inputs)
+        # Its placement is its program's too: a host's arm and a device's of one function are two programs.
+        role = f"{role} on the host" if host else role
         if store.prepare:
             if armed(label) in store.arms:
                 return store.arm_again(armed(label), named(role, inputs))

@@ -202,7 +202,8 @@ def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran(tmp_path):
 def test_an_arm_ahead_called_again_at_its_program_in_a_prepare_reuses_it_and_refuses_another(tmp_path):
     """An arm with no site called twice in one prepare at one program (two draws of one shape): the second
     call gives the first's zeros and launches, compiling nothing again, and a call of its label at other
-    inputs' shapes is refused; its run executes each call's own inputs (row 9550's witness's cache)."""
+    inputs' shapes, or placed on the host, is refused; its run executes each call's own inputs (row 9550's
+    witness's cache)."""
     def doubled(x):
         return x * 2
 
@@ -212,6 +213,9 @@ def test_an_arm_ahead_called_again_at_its_program_in_a_prepare_reuses_it_and_ref
         prepared = [arm(x) for x in draws]
         with pytest.raises(ValueError):
             arm(np.arange(4, dtype=np.float32))
+        # The same function and label placed on the host: another program (head review).
+        with pytest.raises(ValueError):
+            ahead_arm(doubled, "one program, two draws", host=True)(draws[0])
     assert len(store.arms) == 1 and all(not np.any(made) for made in prepared)
     with compiled_truths(tmp_path, prepare=False, stamp="again"):
         ran = [ahead_arm(doubled, "one program, two draws")(x) for x in draws]
