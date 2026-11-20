@@ -23,6 +23,10 @@ from pathlib import Path
 
 import numpy as np
 
+COHORT = "mamba-ssm"
+"""The reference releases this tool runs against (tools/reference_releases.py), and the environment
+tools/check_tool_types.py checks it in."""
+
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba3" / "siso_seeded.npz"
 
 
@@ -49,9 +53,12 @@ def run(arrays: dict[str, np.ndarray], device: str) -> dict[str, np.ndarray]:
         Q=leaves["C"], K=leaves["B"], V=leaves["x"], ADT=leaves["ADT"].transpose(1, 2),
         DT=leaves["DT"].transpose(1, 2), Trap=leaves["trap"].transpose(1, 2), Q_bias=zero, K_bias=zero,
         Angles=leaves["angles"], chunk_size=chunk, cu_seqlens=cu_seqlens)
+    assert isinstance(out, torch.Tensor)  # The output alone: no final state asked for.
     out.backward(torch.tensor(arrays["d_out"], device=device, dtype=out.dtype))
+    grads = {name: leaves[name].grad for name in operands}
+    assert all(grad is not None for grad in grads.values())  # Every operand a leaf of the backward pass.
     return {"out": out.detach().float().cpu().numpy(),
-            **{name: leaves[name].grad.float().cpu().numpy() for name in operands}}
+            **{name: grad.float().cpu().numpy() for name, grad in grads.items() if grad is not None}}
 
 
 def serve() -> None:

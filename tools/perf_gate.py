@@ -904,8 +904,7 @@ def main() -> int:
     aheading = operations.add_parser("ahead", help="each step compiled ahead of its run, into a directory "
                                                    "`run --ahead` hands its step rows (`ahead_battery`)")
     for flag in ("--base", "--head", "--kind", "--lock", "--out"):
-        aheading.add_argument(flag, required=True, **({"choices": sorted(COMPILE_TARGETS)} if flag == "--kind"
-                                                       else {}))
+        aheading.add_argument(flag, required=True, choices=sorted(COMPILE_TARGETS) if flag == "--kind" else None)
     aheading.add_argument("--environments", default="")
     aheading.add_argument("--only", nargs="*", default=[])
     args = parser.parse_args()

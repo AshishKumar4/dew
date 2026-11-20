@@ -199,7 +199,8 @@ def read(event: str, args: tuple, root: str) -> str | None:
         compiling = loader is not None and loader.f_back is not None and \
             loader.f_back.f_code.co_name == "get_code" and \
             isinstance(loader.f_back.f_locals.get("self"), importlib.machinery.SourceFileLoader)
-        if compiling and loader.f_code.co_filename == "<frozen importlib._bootstrap_external>":
+        if compiling and loader is not None and \
+                loader.f_code.co_filename == "<frozen importlib._bootstrap_external>":
             return None
         if rewriting():
             return None
@@ -431,7 +432,7 @@ def probed(probe: Callable[..., object], recorded: Callable[[str], None], root: 
             at = keywords.get("dir_fd")
             base = os.readlink(f"/proc/self/fd/{at}") if at is not None else ""
             listed = isinstance(path, int) or listing_tool(sys._getframe(1).f_code.co_filename)
-            name = None if listed else placed(
+            name = None if listed or isinstance(path, int) else placed(
                 os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path)))), root)
         if name is not None:
             recorded(PROBED + name)

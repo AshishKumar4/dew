@@ -151,8 +151,8 @@ def write_tokenizer() -> None:
               if piece not in SPECIALS]
     vocab = {piece: index for index, piece in
              enumerate([*SPECIALS, *(f"<0x{byte:02X}>" for byte in range(256)), *pieces])}
-    merges = [tuple(merge.split(" ")) if isinstance(merge, str) else tuple(merge)
-              for merge in learned["merges"]]
+    merges = [(first, second) for first, second in (merge.split(" ") if isinstance(merge, str) else merge
+                                                    for merge in learned["merges"])]
     tokenizer = shell(models.BPE(vocab=vocab, merges=merges, unk_token="<unk>", byte_fallback=True,
                                  fuse_unk=True))
     tokenizer.add_special_tokens([AddedToken(token, special=True, normalized=False) for token in SPECIALS])

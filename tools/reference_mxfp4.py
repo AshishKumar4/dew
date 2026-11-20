@@ -8,11 +8,18 @@ Environment: torch and compressed-tensors 0.17.1 (the kimi-k3 reference venv, or
 
 import torch
 from compressed_tensors.compressors.mxfp4.base import MXFP4PackedCompressor
-from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+from compressed_tensors.quantization import (
+    QuantizationArgs,
+    QuantizationScheme,
+    QuantizationStrategy,
+    QuantizationType,
+)
 from compressed_tensors.quantization.utils.helpers import calculate_qparams
 
-ARGS = QuantizationArgs(num_bits=4, type="float", strategy="group", group_size=32,
-                        symmetric=True, dynamic=False, scale_dtype=torch.uint8)
+GROUP = 32
+"""Each scale's group of weights."""
+ARGS = QuantizationArgs(num_bits=4, type=QuantizationType.FLOAT, strategy=QuantizationStrategy.GROUP,
+                        group_size=GROUP, symmetric=True, dynamic=False, scale_dtype=torch.uint8)
 SCHEME = QuantizationScheme(targets=["Linear"], weights=ARGS)
 
 
@@ -21,7 +28,7 @@ def encoded(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     dtype as the library does: `calculate_qparams` over each group's min and max, then the compressor
     over the module's state, with the zero point the lifecycle carries below COMPRESSED
     (quantization/lifecycle/apply.py:115)."""
-    groups = weight.unflatten(-1, (-1, ARGS.group_size))
+    groups = weight.unflatten(-1, (-1, GROUP))
     scale, zero_point = calculate_qparams(groups.amin(-1), groups.amax(-1), ARGS)
     state = {"weight": weight, "weight_scale": scale, "weight_zero_point": zero_point}
     compressed = MXFP4PackedCompressor.compress(state, SCHEME)

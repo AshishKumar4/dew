@@ -116,7 +116,7 @@ def train(args: argparse.Namespace, place: Ranks, run: Split, optimizer,
     torch.cuda.synchronize(place.device)
     for index in range(run.total):
         window.before(index)
-        if probing and index % args.probe_every == 0:
+        if probing and probe is not None and index % args.probe_every == 0:
             spent = probe(index)
             if args.timing_warmup <= index < window.profile_from:
                 probe_seconds += spent
@@ -133,7 +133,7 @@ def train(args: argparse.Namespace, place: Ranks, run: Split, optimizer,
     window.close(trace_directory(args) / f"rank{place.rank}.json")
     if window.profiler is not None and place.distributed:
         dist.barrier()
-    if probing:
+    if probing and probe is not None:
         probe(run.total)
     window.excluded, window.excluded_steps = probe_seconds, probed
     return Curves(losses, norms, rates, auxes, window.seconds, window.timed_steps, window.step_seconds,
@@ -182,7 +182,7 @@ def record(args: argparse.Namespace, place: Ranks, run: Split, curves: Curves, w
         "lr": curves.rates,
         "throughput": throughput(curves.window_seconds, curves.timed_steps, tokens_per_step,
                                  curves.step_seconds),
-        "flops_per_token": work.training_flops_per_step / work.tokens_per_step,
+        "flops_per_token": work.training_flops_per_step / tokens_per_step,
         "work": dataclasses.asdict(work),
         "mfu": mfu(work.training_flops_per_step, curves.timed_steps, curves.window_seconds, peak_rate,
                    place.world),
