@@ -1896,7 +1896,7 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
             tuning.store_verdict(verdict_target(device), key, kernels)
 
 
-def _launched(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:
+def _launches(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:
     """Each launch `program` makes, its identity and config (`called`): every call JAX compiles, a branch's
     no run takes among them (a forward's scaled op's)."""
     from dew.nn.kernels.lowered import kernel_calls
@@ -1910,7 +1910,7 @@ def refused_in(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:
     committed after its trace took the config (another program's compile, another thread's certification),
     past which it is lowered afresh before it compiles (row 8603)."""
     refused = {(identity, config) for identity, config, _ in refusal_entries()}
-    return _launched(program) & refused if refused else set()
+    return _launches(program) & refused if refused else set()
 
 
 def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], Refused]]
@@ -1918,7 +1918,7 @@ def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashab
     """Each of `refusals` (a launch's identity and config, and its spilling kernel, `Refused`) that `program`,
     relowered under them, launches again: its launch's derivation did not read the refusal. Each is logged,
     so the launch whose rule ignores its refusals is named."""
-    launched = _launched(program)
+    launched = _launches(program)
     untaken = [(refusal, kernel) for refusal, kernel in refusals if refusal in launched]
     for (_, config), (kernel, _) in untaken:
         _log.warning("kernel %s's refusal at %s did not take: the program relowered under it launches it "
