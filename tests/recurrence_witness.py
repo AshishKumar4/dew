@@ -593,37 +593,22 @@ class Run:
                     point(self.entered(n, head)) if carry is None else carry)
 
 
-_PREPARED: dict[tuple[str, str], tuple] = {}
-"""Each program a GPU tier part's prepare compiled (`launched`), by the store's directory and the program's
-label: the zeros its prepare gives and its launches, which a later call of that program, over the same
-operands or others of their shapes, takes in any cell of the part, as the store compiles a label once
-(`CompiledTruths.compile_site`); its run executes the one program at each call's own operands."""
-
-
 def launched(program, operands: tuple, role: str):
     """`program` (a jitted function) over `operands` as a GPU tier runs it, compiled in its prepare and
     executed in its run, with the launches the program it ran took (`reference_error.ahead_arm`'s
     `launched`: its prepare's trace's, its run's record's, outside a part its one lowering's), a label a
     program: the role, which names every option the program closes over, the device assumed and the
     operands' shapes and dtypes, never their values, which a prepare's placeholders change (rows 8497,
-    9550). A prepare compiles each label once (`_PREPARED`), where a call's options left out of its label,
-    one program twice, or an operand a placeholder gave refused a second call or missed its truth at run."""
+    9550): a second call at one program in a prepare reuses its first (`ahead_arm`'s), a call's options
+    left out of its label a program of its own, refused."""
     import jax
     from reference_error import ahead_arm
-    from truths_ahead import COMPILED
 
     from dew.nn.kernels import generation
 
     shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in jax.tree.leaves(operands))
     label = f"recurrence witness, {role}, {generation.assumption()}, {shapes}"
-    store = COMPILED.get()
-    prepared = None if store is None or not store.prepare else (str(store.directory), label)
-    if prepared in _PREPARED:
-        return _PREPARED[prepared]
-    found = ahead_arm(program, label, launched=True)(*operands)
-    if prepared is not None:
-        _PREPARED[prepared] = found
-    return found
+    return ahead_arm(program, label, launched=True)(*operands)
 
 
 def _through(operands: tuple, starts, last: int) -> tuple:
