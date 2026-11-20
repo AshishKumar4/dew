@@ -41,7 +41,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, real_bounds, valid_order
-from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
+from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept, stated
@@ -82,7 +82,6 @@ from .sharding import (
     automatic_axes,
     constrain,
     grouped_heads,
-    in_pipeline_stage,
     manual_map,
     on_shards,
     rows_like,
@@ -766,19 +765,19 @@ def sequence_delta_rule(mixed, taps, g, beta, coordinates, valid, *, shards: int
                         parts: Pieces, dtype, rule):
     """A delta-rule mixer's conv and rule (`split_delta_rule`) on shards that split the rows and the sequence
     as `over_sequence`'s do, and its heads where the rule table splits a `[B, S, H, D]` activation's over axes
-    the rows, the sequence and a pipeline stage leave, where the split divides its `key_heads` (as
-    `grouped_heads` splits the unsplit rule's): each of `parts`' channels of `mixed` `[B, S, C]` and of the
-    conv's `taps` `[C, K]` placed by its heads, the queries', keys' and values' laid in turn on each shard,
-    `g` and `beta` by theirs. Where a tensor axis held every head whole, each of its devices ran the whole
-    mixer's conv and scan (row 1437); each still runs its heads over its slice of the sequence whole."""
+    the rows and the sequence leave, where the split divides its `key_heads` (as `grouped_heads` splits the
+    unsplit rule's): each of `parts`' channels of `mixed` `[B, S, C]` and of the conv's `taps` `[C, K]` placed
+    by its heads, the queries', keys' and values' laid in turn on each shard, `g` and `beta` by theirs. Where
+    a tensor axis held every head whole, each of its devices ran the whole mixer's conv and scan (row 1437);
+    each still runs its heads over its slice of the sequence whole."""
     batch, length, _ = mixed.shape
     if length % shards:
         raise LayoutRefused(f"the sequence of {length} tokens splits {shards} ways over the mesh's sequence "
                             f"axis, and it does not divide")
     rows, sequence = logical_spec(("activation_batch", "activation_length"), (batch, length))
-    # The heads' axes the rows, the sequence and a pipeline stage's vmap leave (a rule giving them the
-    # sequence's keeps it time's), split where they divide the key heads (`grouped_heads`' test).
-    taken = {*mesh_axes(rows), *mesh_axes(sequence), *((STAGE_AXIS,) if in_pipeline_stage() else ())}
+    # The heads' axes the rows and the sequence leave (a rule giving them the sequence's keeps it time's),
+    # split where they divide the key heads (`grouped_heads`' test).
+    taken = {*mesh_axes(rows), *mesh_axes(sequence)}
     mesh = jax.sharding.get_abstract_mesh()
     placed = (*logical_spec(HEADS, (batch, length, beta.shape[2], 1)), None, None, None)
     heads = tuple(axis for axis in mesh_axes(placed[2]) if axis not in taken)
