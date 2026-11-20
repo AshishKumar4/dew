@@ -351,3 +351,40 @@ def test_a_decode_token_on_the_fused_step_is_the_layers_own():
 
     delta_decode_matrix.on_par(('sm90', 'kimi delta attention', 'fused', 'float32'))
 
+
+
+def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
+    """Kimi delta attention's own pairs' log decay gradient on the recurrence template, interpreted, over
+    two bf16 tokens of unit-basis keys `e0` (scale one, a zero memory and decays): the first writing `e0`
+    under a gate of 2^-k (k drawn from 20 to 40), the second reading with `e0` and writing `e0` under a gate
+    of one, a cotangent of one power of two on its output's first entry alone. The second token's write
+    erases what the first left, so its decay's gradient is exactly zero and every gradient float64's exactly
+    (powers of two throughout), which check 1 holds against the recurrence a token at a time: a token's own
+    scores pair taken out of the decay's terms after they were summed in fp32 lost the cross term's 2^-k
+    with it (base review 29b07fb60 F1, row 7906; restored beside the faint cross site's recording, row
+    9073)."""
+    from test_recurrence_chunk import chunk_on, token_by_token
+
+    from dew.nn.kernels import recurrence
+    from dew.nn.kernels.recurrence_chunk import Chunk
+
+    hooks = recurrence.Hooks(decay='vector', scale=1.0)
+    width = 16
+
+    def draw(seed):
+        rng = np.random.default_rng([9073, seed])
+        basis = np.zeros((1, 2, 1, width), np.float32)
+        basis[..., 0] = 1.0
+        query = basis.copy()
+        query[0, 0] = 0.0
+        gates = jnp.asarray([[[2.0 ** -int(rng.integers(20, 41))], [1.0]]], jnp.float32)
+        operands = Chunk(jnp.asarray(query, jnp.bfloat16), jnp.asarray(basis, jnp.bfloat16),
+                         jnp.asarray(basis, jnp.bfloat16), state=jnp.zeros((1, 1, width, width), jnp.float32),
+                         log_decay=jnp.zeros((1, 2, 1, width), jnp.float32), beta=gates)
+        # The output's cotangent in its dtype (the operands' bf16), the final memory's in fp32.
+        read = jnp.zeros((1, 2, 1, width), jnp.bfloat16).at[0, 1, 0, 0].set(2.0 ** -int(rng.integers(0, 8)))
+        return operands, (read, jnp.zeros((1, 1, width, width), jnp.float32))
+
+    assert_as_exact(jax.jit(with_gradients(lambda o: chunk_on('mosaic_gpu', hooks, o))),
+                    jax.jit(with_gradients(lambda o: token_by_token(hooks, o))), draw,
+                    "kimi delta attention's small cross term", seeds=8)
