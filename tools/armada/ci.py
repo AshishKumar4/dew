@@ -1401,15 +1401,13 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     return told(out, code)
 
 
-RED_EXIT = 3  # .armada.json's task.redExit: armada grades the rows as written, a packed task rerun alone.
-
-
 def told(out: Path, code: int) -> int:
-    """`code`, else `RED_EXIT` where a row is red, the task's verdict `out` said last: each red row, its name
-    and its output's first lines (why it is red, its signal and the file it reached: `tested`) and last (what
-    pytest said last). armada keeps a task's log tail beside its exit, and a map task's verdict reaches no
-    report but its judge's red row, which names that tail (Main, 2026-11-09: a map task "exited 1 after 437
-    s", its row's "pytest exited -9" kept in its output alone)."""
+    """`code`, else its commit's .armada.json's task.redExit (0 where it names none: the rows its verdict),
+    which armada reads as the rows written, a packed task rerun alone, where a row is red; the task's verdict
+    `out` said last: each red row, its name and its output's first lines (why it is red, its signal and the
+    file it reached: `tested`) and last (what pytest said last). armada keeps a task's log tail beside its
+    exit, and a map task's verdict reaches no report but its judge's red row, which names that tail (Main,
+    2026-11-09: a map task "exited 1 after 437 s", its row's "pytest exited -9" kept in its output alone)."""
     rows = json.loads(out.read_text())["rows"]
     for found in rows:
         if found["exitCode"]:
@@ -1417,7 +1415,9 @@ def told(out: Path, code: int) -> int:
             shown = (lines if len(lines) <= 2 * TOLD_LINES
                      else [*lines[:TOLD_LINES], "...", *lines[-TOLD_LINES:]])
             print("\n".join([f"RED {found['name']}", *(f"  | {line}" for line in shown)]), flush=True)
-    return code or (RED_EXIT if any(found["exitCode"] for found in rows) else 0)
+    config = REPO / ".armada.json"
+    red = int(json.loads(config.read_text()).get("task", {}).get("redExit", 0)) if config.is_file() else 0
+    return code or (red if any(found["exitCode"] for found in rows) else 0)
 
 
 TOLD_LINES = 5

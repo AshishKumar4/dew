@@ -408,7 +408,8 @@ def test_a_kept_task_runs_a_stale_row_only_within_its_deadline_and_says_the_rest
         code = ci.main()
         rows = json.loads(verdict.read_text())["rows"]
         # Its red exit where a row it wrote is red (a stale one not run), as task.redExit reads it.
-        assert code == (ci.RED_EXIT if any(row["exitCode"] for row in rows) else 0)
+        red_exit = json.loads((ROOT / ".armada.json").read_text())["task"]["redExit"]
+        assert code == (red_exit if any(row["exitCode"] for row in rows) else 0)
         return [(row["name"], row["exitCode"], row.get("kind")) for row in rows]
 
     assert kept_task(250.0, 60) == [(f"3.12:tests/test_c.py#{index}/3", 1, ci.STALE) for index in (1, 2, 3)]
