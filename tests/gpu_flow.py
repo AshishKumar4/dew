@@ -19,7 +19,6 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 
 import lane_environment
 import pytest
-from generation_support import lowers_as, runnable
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,6 +178,11 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     after the last, but in a GPU tier part's prepare, where a cell that computes is deferred to its run
     (`_deferred`); the cells this device cannot run, or that skip themselves, reported skipped, their
     labels returned; an outermost flow's counts reported (`REPORTED`)."""
+    # Read when the flow runs: generation_support reads, in a prepare, model_flows' node target, whose
+    # module imports this one, so importing it here made a flow module imported first refuse to import in
+    # every GPU tier part's prepare (a circular import: its sites went unprepared).
+    from generation_support import lowers_as, runnable
+
     global _depth
     _depth += 1
     failed: list[tuple[str, str, list[tuple[str, int]]]] = []
