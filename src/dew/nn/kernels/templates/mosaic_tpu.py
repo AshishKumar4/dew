@@ -237,7 +237,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None, tmem: int = 0,
                moves: bool | None = None, joined: tuple = ()) -> Callable:
-        mosaic.runs_alone(self, joined)
+        handoffs.runs_alone(self.name, joined)
         # A program a core, its operands and outputs left in HBM for its walks' copies; no cluster, and no
         # view prefetched ahead of a wait (a GPU's dependent launch); its compiler holds its values, no
         # register budget (`budgets_registers`).

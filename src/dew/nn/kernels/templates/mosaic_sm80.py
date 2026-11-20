@@ -589,7 +589,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # Each role at its thread's share of the multiprocessor's 64K registers: two programs' 256 threads
         # hold 255 each.
         _one(consumers)
-        mosaic.runs_alone(self, joined)
+        handoffs.runs_alone(self.name, joined)
         return resources.entry_registers(consumers, programs)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
@@ -600,7 +600,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None, tmem: int = 0,
                moves: bool | None = None, joined: tuple = ()) -> Callable:
-        mosaic.runs_alone(self, joined)
+        handoffs.runs_alone(self.name, joined)
         # Its one warpgroup its consumer, no producer beside it, and no cluster; its kernels' default
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`), where it
         # `reduces`.

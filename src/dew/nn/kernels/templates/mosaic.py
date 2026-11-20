@@ -213,13 +213,6 @@ ROLE: contextvars.ContextVar[int] = contextvars.ContextVar("role", default=0)
 runs): the role's own share of what the program holds a role each (`Issuer.product_scratch`)."""
 
 
-def runs_alone(family, joined: tuple) -> None:
-    """Refuse `joined` roles (`Family.role_schedule`'s) to `family`, whose program runs its own roles alone:
-    one warpgroup, or a core, moving no registers between roles."""
-    if joined:
-        raise ValueError(f"{family.name} runs its own roles alone, no {[role.name for role, *_ in joined]}")
-
-
 def per_role(index, roles: int, run: Callable[[int, jax.Array], None]) -> None:
     """`run(role, index)` for the role `index` names among `roles`, each role's built at its own static
     index (`ROLE` while it is built): Mosaic GPU slices a swizzled tile only at static columns (a role's

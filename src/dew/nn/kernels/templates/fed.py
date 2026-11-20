@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 import jax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels.templates import mosaic, resources
+from dew.nn.kernels.templates import handoffs, mosaic, resources
 from dew.nn.kernels.templates.handoffs import Role, Schedule
 from dew.nn.kernels.templates.mosaic import RingFamily
 from dew.nn.kernels.templates.rings import Ring, drain, loaded_once, stepped_in
@@ -90,7 +90,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
                   joined: tuple = ()) -> int:
-        mosaic.runs_alone(self, joined)
+        handoffs.runs_alone(self.name, joined)
         return resources.entry_registers(consumers, programs)
 
 
