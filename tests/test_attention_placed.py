@@ -275,7 +275,7 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
         for eq in programs.equations(jaxpr):
             name = eq.params.get("name")
             if isinstance(name, str):
-                kernel, launch = report.kernel_of(name)
+                kernel, launch, _ = report.kernel_of(name)
                 if (launch is not None and (record := report.traced(launch)) is not None
                         and getattr(record.config, "family", None) == "tcgen05.rows"
                         and kernel in record.kernels):
