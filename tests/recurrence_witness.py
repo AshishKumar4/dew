@@ -26,7 +26,6 @@ Each enclosure is `interval_certificates`' outward interval arithmetic under the
 module adds each log decay's base-2 prefix within `EXPONENT_BOUND` of its exact value (XLA's compensated
 scan, `recurrence_algebra.prefix`), then the kernel's own roundings of its differences."""
 
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -603,18 +602,17 @@ operands or others of their shapes, takes in any cell of the part, as the store 
 
 def launched(program, operands: tuple, role: str):
     """`program` (a jitted function) over `operands` as a GPU tier runs it, compiled in its prepare and
-    executed in its run (`reference_error.ahead_arm`, a label a program: the role, which names every option
-    the program closes over, the device assumed and the operands' shapes and dtypes, never their values, which
-    a prepare's placeholders change), and the launches its trace takes (`tuning.seen`), traced alone, which
-    computes nothing, in the store's target where a run executes a prepared program, so they are the executed
-    program's: its prepare computed every launch eagerly on a compile-only device (row 8497). A prepare
-    compiles each label once (`_PREPARED`), where a call's options left out of its label, one program twice,
-    or an operand a placeholder gave refused a second call or missed its truth at run."""
+    executed in its run, with the launches the program it ran took (`reference_error.ahead_arm`'s
+    `launched`: its prepare's trace's, its run's record's, outside a part its one lowering's), a label a
+    program: the role, which names every option the program closes over, the device assumed and the
+    operands' shapes and dtypes, never their values, which a prepare's placeholders change (rows 8497,
+    9550). A prepare compiles each label once (`_PREPARED`), where a call's options left out of its label,
+    one program twice, or an operand a placeholder gave refused a second call or missed its truth at run."""
     import jax
     from reference_error import ahead_arm
     from truths_ahead import COMPILED
 
-    from dew.nn.kernels import generation, tuning
+    from dew.nn.kernels import generation
 
     shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in jax.tree.leaves(operands))
     label = f"recurrence witness, {role}, {generation.assumption()}, {shapes}"
@@ -622,10 +620,7 @@ def launched(program, operands: tuple, role: str):
     prepared = None if store is None or not store.prepare else (str(store.directory), label)
     if prepared in _PREPARED:
         return _PREPARED[prepared]
-    with (store.tracing() if store is not None and not store.prepare else contextlib.nullcontext(),
-          tuning.seen() as launches):
-        program.trace(*operands)
-    found = ahead_arm(program, label)(*operands), launches
+    found = ahead_arm(program, label, launched=True)(*operands)
     if prepared is not None:
         _PREPARED[prepared] = found
     return found
