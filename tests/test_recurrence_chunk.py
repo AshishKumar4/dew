@@ -855,6 +855,32 @@ def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
         assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
 
 
+@pytest.mark.parametrize('hooks', [HOOKS[4], ADDITIVE], ids=['the delta rule', 'an additive erase'])
+def test_a_forked_call_keeps_its_rows_on_an_explicit_axis(hooks):
+    """A forked call (`Chunk.loads`: documents taking their memories up from its table, entry writes) on the
+    portable math, its rows split over an Explicit mesh axis: its output, last memory and their gradient by
+    its values finite and placed as its rows are (row 9690: its walk's carries, seeded within the rows' map
+    whole, met the rows' token maps split in a gather JAX refuses)."""
+    operands, _ = entered_draw(hooks, 0, entries=True)
+    operands = entering_documents(transitioned(hooks, operands, 0))
+    mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, P('data'))
+        split = jax.tree.map(lambda x: jax.device_put(x, rows), operands)
+
+        def run(value):
+            return chunk_on('xla', hooks, dataclasses.replace(split, value=value), chunk_size=CHUNK)
+
+        def loss(value):
+            out, last = run(value)
+            return jnp.sum(out.astype(jnp.float32)) + jnp.sum(last)
+
+        found = jax.jit(lambda value: (*run(value), jax.grad(loss)(value)))(split.value)
+    for got in found:
+        assert np.isfinite(np.asarray(got)).all()
+        assert jax.typeof(got).sharding.spec[0] == 'data'
+
+
 @pytest.mark.parametrize('documents', [3, 0], ids=['three slots a row', 'none'])
 def test_a_forked_calls_token_maps_keep_its_rows_on_an_explicit_axis(documents):
     """A forked call's token maps (`chunked_launch.Forked.tokens`: each token's load, store and document)
