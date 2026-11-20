@@ -899,8 +899,10 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
         decay, b, strength, c, q, r, value, along = token
         # Apart from its group's writes: the state its group entered, decayed by every token since it.
         held = decay[:, None] * (jnp.where(index % apart == 0, h, held) if apart else h)
-        # Read before the decay where the token's corrections read the state it enters.
-        entered = _portable(c[None, :], h) if corrected and before else None
+        # Read before the decay where the token's corrections read the state it enters, a cut key's (a
+        # document's start, a vanished decay) zero, as the replay reads it.
+        entered = (_portable(c[None, :], jnp.where(_crossed(decay)[:, None], 0.0, h)) if corrected and before
+                   else None)
         h = decay[:, None] * h * along[None, :]
         if corrected:
             h = h - strength * b[:, None] * (_portable(c[None, :], h) if entered is None else entered)
@@ -1439,9 +1441,10 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     return _Decays(entering=_two_factors(base2, high + low, started),
                    to_last=_two_factors(base2, (high[-1] - high) + (low[-1] - low), ending),
                    whole=_two_factors(base2, high[-1] + low[-1], started[-1]), between=between,
-                   entering_before=_two_factors(base2, _back(high + low, first=0.0),
-                                                _back(started, first=True)),
-                   between_before=_back(between, first=-0.0))
+                   # A token back, cut where the reader's own token cuts (a document's start): its correction
+                   # reads the state it enters, a reset's zero.
+                   entering_before=_two_factors(base2, _back(high + low, first=0.0), started),
+                   between_before=jnp.where(joined, _back(between, first=-0.0), -0.0))
 
 
 def _back(array, first):

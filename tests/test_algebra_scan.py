@@ -368,6 +368,13 @@ def kimi_delta_written_as_error(h, q, k, v, g, beta):
     return decayed + beta * jnp.outer(k, v - k @ decayed)
 
 
+def delta_before(h, q, k, v, g, beta):
+    """The delta rule correcting the state a token enters, before its decay (RWKV7's erase read):
+    `h = D h + beta k (v - k^T h)^T`, `D = exp(g)` a scalar's or each key's."""
+    del q
+    return jnp.reshape(jnp.exp(g), (-1, 1)) * h + beta * jnp.outer(k, v - k @ h)
+
+
 KIMI = {**GATED, "g": ("time", "key")}
 
 
@@ -503,15 +510,20 @@ def test_a_token_loop_carries_its_state_in_its_operands_wider_type():
 
 
 @pytest.mark.parametrize("target", ["sm86", "sm90"])
-def test_a_chunk_form_any_target_extracts_computes_the_token_scan(target):
-    """The gated delta rule's chunks derived under an A10 (its step's latency unstated, so the token loop is
-    priced at its work alone and extracted) and an H100 (WY's): on par with the token scan, outputs and
-    final state, against the float64 truth (check 1)."""
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (delta_before, GATED, gated_draw), (delta_before, KIMI, kimi_draw)],
+    ids=["gated_delta", "before its decay, a head's", "before its decay, a key's"])
+def test_a_chunk_form_any_target_extracts_computes_the_token_scan(update_fn, operands, draw_fn, target):
+    """The gated delta rule's chunks, and the delta rule's correcting the state a token enters
+    (`delta_before`, a decay a head's or each key's: the WY system's decays a token back), derived under an
+    A10 (its step's latency unstated, so the token loop is priced at its work alone and extracted) and an
+    H100 (WY's): on par with the token scan, outputs and final state, against the float64 truth (check
+    1)."""
     with generation.assumed(target):
-        forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+        forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                            state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
-        assert_as_exact(jax.jit(gated_walk(forms, GATED)), jax.jit(gated_tokenwise(gated_delta)), gated_draw,
-                        f"gated delta on {target}", seeds=8)
+        assert_as_exact(jax.jit(gated_walk(forms, operands)), jax.jit(gated_tokenwise(update_fn)), draw_fn,
+                        f"{update_fn.__name__} on {target}", seeds=8)
 
 
 def test_a_scans_carry_derived_for_one_target_serves_no_other():
@@ -971,13 +983,6 @@ def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, op
     assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} adjoint")
 
 
-def delta_before(h, q, k, v, g, beta):
-    """The delta rule correcting the state a token enters, before its decay (RWKV7's erase read):
-    `h = D h + beta k (v - k^T h)^T`, `D = exp(g)` a scalar's or each key's."""
-    del q
-    return jnp.reshape(jnp.exp(g), (-1, 1)) * h + beta * jnp.outer(k, v - k @ h)
-
-
 def update_parts(update_fn, operands) -> linear_scan.Parts:
     """`update_fn`'s token as the rules read it (`linear_scan.parts`, its readout `gated_readout`'s) over a
     chunk of `operands`' shapes."""
@@ -1001,21 +1006,6 @@ def test_a_corrections_read_before_or_after_its_decay_reaches_its_own_form(updat
     (`Affine.corrected`), neither the other's: a decay a head's commuting into the read, the after-decay
     form priced first."""
     assert update_parts(update_fn, operands).before == before
-
-
-@pytest.mark.parametrize("target", ["sm90", "sm86"])
-@pytest.mark.parametrize(("operands", "draw_fn"), [(GATED, gated_draw), (KIMI, kimi_draw)],
-                         ids=["a head's decay", "a key's"])
-def test_a_pre_decay_corrections_chunks_compute_their_token_scan(operands, draw_fn, target):
-    """The delta rule correcting the state a token enters (`delta_before`), its decay a head's or each
-    key's, walked in chunks through its derived forms (the dual form an H100's extraction takes, the token
-    loop an A10's): outputs and final state on par with the token scan's from float64 (check 1), the WY
-    system's decays a token back (`entering_before`, `between_before`), down to 1e-3 a token."""
-    with generation.assumed(target):
-        forms = scan.derive_scan(scan.Scan(delta_before, gated_readout, operands, walked="time",
-                                           state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
-        assert_as_exact(jax.jit(gated_walk(forms, operands)), jax.jit(gated_tokenwise(delta_before)), draw_fn,
-                        f"delta_before on {target}", seeds=16)
 
 
 @pytest.mark.parametrize(("operands", "draw_fn"), [(GATED, gated_draw), (KIMI, kimi_draw)],
