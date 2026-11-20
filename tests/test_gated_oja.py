@@ -11,7 +11,8 @@ from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid, unit
 
 from dew.nn.kernels.recurrence_chunk import chunk_gated_oja_rule, recurrent_gated_oja_rule
 
-ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH = 2, 70, 1, 2, 16, 16
+ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH = 2, 70, 1, 2, 16, 8
+"""The values narrower than the keys: the transposed memory's read along its values is the keys' width."""
 CHUNK = 16
 DOCUMENTS = ((0, 23, 40), (9, 48))
 """Each row's packed documents' first tokens: the first row's memory zeroed at token 0, the second's entering
