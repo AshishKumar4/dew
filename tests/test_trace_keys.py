@@ -102,14 +102,14 @@ def built_objectives(tmp_path_factory):
         # Guidance distillation over a guidance-embedded denoiser (a tiny Flux), which the recipe's DiT is
         # not, its teacher the same objective at its draw, so both stability cells trace and refit it
         # (row 9695: its case carried no batch, and both skipped it).
-        from diffusion_support import images_of
         from flax import linen as nn
         from interop_support import extract_fixture
-        from objective_data import first
+        from objective_data import IMAGES, first
         from test_guidance_distillation import FIXTURES, FLUX
 
         from dew.config import ObjectiveConfig
         from dew.config.diffusion import DiffusionRunConfig
+        from dew.data import TFDS, images as image_steps, presets
         from dew.diffusion.presets import Flow
         from dew.inputs import TextCondition
         from dew.objectives.base import TEACHER
@@ -121,7 +121,9 @@ def built_objectives(tmp_path_factory):
         extract_fixture(FIXTURES / "flux_source.tar.xz", root / "flux")
         config = DiffusionRunConfig(
             model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-            data=images_of("tfds://oxford_flowers102", 8), preset=Flow(), val_metrics=(),
+            data=TFDS("dew_images", path=str(IMAGES), split="all").pipe(presets.images, 8, batch=2,
+                                                                          caption=image_steps.caption()),
+            preset=Flow(), val_metrics=(),
             text=TextCondition(encoder="diffusion_text", checkpoint=str(root / "flux" / "pipeline")),
             objective=ObjectiveConfig("diffusion", {"solver": Euler(), "guidance": None, "steps": 2,
                                                     "ema_decay": None}))
