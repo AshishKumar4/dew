@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax._src import core as jax_core
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -55,13 +56,16 @@ from dew.nn import derivatives
 from dew.nn.kernels import generation
 from dew.nn.nested import nested
 from dew.nn.programs import RaggedLayout, entrywise, ragged_layout
+from dew.nn.sharding import checked
 
 if TYPE_CHECKING:
     from dew.nn.kernels import tuning
 
-CAPTURED = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p)
-"""The layout equations a region takes of a captured operand only it reads (a bias broadcast over rows), so
-the epilogue captures the operand itself."""
+CAPTURED = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax_core.pvary_p)
+"""The layout equations a region takes of a captured operand only it reads (a bias broadcast over rows; in a
+manual mesh's body, the cast of an operand the same on every device to one that varies, `pvary`, which JAX
+writes before a bias and a scale an epilogue reads), so the epilogue captures the operand itself: a scale's
+literal its value, where the cast made it a captured scalar array no epilogue blocks (row 6578)."""
 
 DECISIONS_HELD = 256
 """How many regions' decisions are held (`_decided`), and their written programs (`_traced`), the least
@@ -429,8 +433,16 @@ def _replayed(jaxpr: jcore.Jaxpr, region: Region, fused_gemm):
                 from dew.nn import activations
 
                 made = [activations.gated_hook(equation.params["kind"].name)(*operands)]
+            elif equation.primitive is jax_core.pvary_p:
+                # A cast of the value's variance alone, no value: the epilogue reads the value it casts, its
+                # block's variance the launch's (`CAPTURED`).
+                made = operands
             else:
-                bound = equation.primitive.bind(*operands, **equation.params)
+                # Its operands aligned as JAX aligns an operation's (`auto_insert_reshard`: each cast to vary
+                # over the axes another varies over) where a manual mesh checks them: the launch's result
+                # varies as its operands do (row 9808), where the cast the program wrote of an operand
+                # beside it is replayed as the value it casts (`CAPTURED`).
+                bound = equation.primitive.bind(*jax_core.auto_insert_reshard(*operands), **equation.params)
                 made = list(bound) if equation.primitive.multiple_results else [bound]
             values.update(zip(equation.outvars, made, strict=True))
         return tuple(values[var] for var in region.outputs)
@@ -457,9 +469,19 @@ def _product(form: Form, operands: list, precision, out_dtype, fused_gemm) -> ja
 
 
 def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
-    """Each of `variables` as its shape and dtype (each a region's value, an array's)."""
-    return [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype) for var in variables
-            if isinstance(var.aval, ShapedArray)]
+    """Each of `variables` as its type (each a region's value, an array's, `_typed`)."""
+    return [_typed(var.aval) for var in variables if isinstance(var.aval, ShapedArray)]
+
+
+def _typed(aval: ShapedArray) -> jax.ShapeDtypeStruct:
+    """`aval` as a type a trace takes: its shape and dtype, and inside a `shard_map` that checks its values'
+    manual axes (`dew.nn.sharding.checked`) its sharding and manual axis type as the body holds them (the
+    axes it varies over, a reduced or unreduced placement), so a region's call traced over them binds its
+    inputs as the body does (row 6578: binders typed the same on every device beside the body's varying
+    values, which JAX's check of the body refused)."""
+    if not checked():
+        return jax.ShapeDtypeStruct(aval.shape, aval.dtype)
+    return jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=aval.sharding, manual_axis_type=aval.mat)
 
 
 class RegionDecision(NamedTuple):

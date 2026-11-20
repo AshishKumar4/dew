@@ -756,13 +756,38 @@ def extracted[Price: Linear](graph: EGraph, bundle: terms.Term, model: DagCostMo
     return list(forms[0].value), price
 
 
+def _mapped(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation` is a manual mesh's (`jax.shard_map`'s): its body, each device's program, is a region
+    of its own the pass rewrites in the map's context (`_manual`), as a layer mapped per shard (a projection's
+    product, `dew.nn.sharding.on_shards`) runs its epilogue's math and products within it (row 6578)."""
+    from jax._src import shard_map
+
+    return equation.primitive is shard_map.shard_map_p
+
+
+@contextlib.contextmanager
+def _manual(params: Mapping) -> Iterator[None]:
+    """The context a manual mesh's body is traced in (`jax.shard_map`'s staging, jax/_src/shard_map.py): its
+    newly manual axes bound, its abstract mesh with them manual, and its variance checked as the map checks
+    it. A body rewritten in it (`_within`) traces its new values, a written region's call among them, as the
+    map traced the body's own."""
+    from jax._src import shard_map
+
+    mesh, manual = params["mesh"], params["newly_manual_axes"]
+    with (shard_map._extend_axis_env(mesh, manual),
+          jax.sharding.use_abstract_mesh(shard_map._as_manual_mesh(mesh, manual)),
+          jax_config._check_vma(params["check_vma"])):
+        yield
+
+
 def _holds_regions(equation: jcore.JaxprEqn) -> bool:
     """Whether the pass rewrites `equation`'s bodies in place, each a region of its own (§1.2): a call's
     program (`Primitive.inlined_call`, `dew.nn.programs.called`'s: a nested program, a checkpoint, a custom
     derivative's or batching rule's primal call, its rules kept) and control flow's
     (`dew.nn.programs.control_flow`: a scan's, a loop's predicate and body, a conditional's branches; nothing
-    moves across a body's boundary or a loop's carry). A marked span is read by its kind (`WITHIN`); any
-    other holder of a program (a manual mesh's, a native kernel's) is an opaque leaf."""
+    moves across a body's boundary or a loop's carry). A marked span is read by its kind (`WITHIN`); a manual
+    mesh's body in its own context (`_mapped`); any other holder of a program (a native kernel's) is an opaque
+    leaf."""
     primitive = equation.primitive
     return (primitive.inlined_call and primitive is not marked_call_p) or control_flow(primitive)
 
@@ -777,7 +802,12 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
     changed = False
     equations = []
     for equation in jaxpr.eqns:
-        if _holds_regions(equation) or _marked(equation, WITHIN) or (
+        if _mapped(equation):
+            # A manual mesh's body, each device's program, rewritten in its own context (`_manual`).
+            with _manual(equation.params):
+                params = with_bodies(equation.params,
+                                     lambda body: _closed(body, accurate, saturation, kernels))
+        elif _holds_regions(equation) or _marked(equation, WITHIN) or (
                 _marked(equation, (Algebra,)) and _opening(equation) is None):
             params = with_bodies(equation.params,
                                  lambda body: _closed(body, accurate, saturation, kernels))
