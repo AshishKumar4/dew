@@ -554,7 +554,10 @@ class MosaicForward(_Mainloop[Tiles]):
             ba = self.bind(query, key, value, start, end, query_ids, key_ids, score_params, output_params,
                            initial, drop, table, sources, scales, query_params, residuals=residuals,
                            interpret=interpret)
-            products = self._products(ba, config, target)
+            full_v = _width(value.shape[-1], family, query.dtype)
+            block_v = value_columns(full_v, config.columns)
+            widths = {block_v} if full_v % block_v == 0 else {block_v, full_v % block_v}
+            products = tuple((w, self._products(ba, config, target, value_width=w)) for w in sorted(widths))
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret,
                 "counts": not self.scaled, "registered": registered, "tmem_columns": target.tmem_columns}
         scaled = (self.scaled or (self.cached(table, sources, scales) and not self.bounded)) and not decides
@@ -952,8 +955,8 @@ class MosaicForward(_Mainloop[Tiles]):
                                                            reduces=forward_reduces(family, reduced),
                                                            products=products, over_rings=True))
 
-    def _products(self, ba: tokamax.BoundArguments, config: Tiles,
-                  target: generation.GpuTarget) -> tuple:
+    def _products(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
+                  value_width: int | None = None) -> tuple:
         """The launch's products at `config` as its program scopes them (`forward_products`): its logits a
         step ahead where it issues them so (`_ahead`), a scaled walk's small weights' accumulator beside its
         sums where its kernel walks scaled (`scales_in_kernel`), and its query in tensor memory where
@@ -962,8 +965,9 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         query_width = _width(query.shape[-1], family, query.dtype)
-        value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
-        ahead = self._ahead(ba, config, target)
+        if value_width is None:
+            value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
+        ahead = self._ahead(ba, config, target, value_width=value_width)
         scaled = self.scales_in_kernel(ba)
         training = ba.arguments.get("residuals") is Kept.SPLIT
         base = forward_products(family, config, value_width, query.dtype, parts=self.parts,
@@ -990,13 +994,15 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, ba.arguments["query"].dtype)
         return family.product_columns(self._products(ba, config, target))
 
-    def _ahead(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
+    def _ahead(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
+               value_width: int | None = None) -> bool:
         """Whether the launch at `config` issues its logits a step ahead of their read (`logits_ahead`)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
         coded = _codes_of(ba.arguments["key"], ba.arguments.get("scales")) is not None
-        value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
+        if value_width is None:
+            value_width = value_columns(_width(value.shape[-1], family, query.dtype), config.columns)
         return logits_ahead(family, config, value_width,
                             query.dtype, stages=min(config.stages, steps), parts=self.parts, coded=coded,
                             scaled=self.scales_in_kernel(ba),

@@ -255,8 +255,8 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
     """Placed-forward derivation uses rounded TMEM residency (`resources.register_model`) when deciding
     whether to place Q in TMEM, proved through the public `attention_mosaic.forward` route and its emitted
     `RegisterModel` (rows 9105, 9475, 9479):
-    - `q128/v32` (160 base cols -> 256 rounded, 224 with Q -> 256 rounded): raw `512 // 160 = 3` vs rounded
-      `512 // 256 = 2`; keeps Q in TMEM and emits `RegisterModel.most == 2` (not 3).
+    - `q64/v32` (`columns=32`, 48 KiB SMEM): 160 base cols -> 256 rounded, 192 with Q -> 256 rounded; raw
+      `512 // 160 = 3` vs rounded `512 // 256 = 2`; keeps Q in TMEM and emits `RegisterModel.most == 2`.
     - `q128/v128` (256 base cols -> 256 rounded = 2 CTAs/SM, 320 with Q -> 512 rounded = 1 CTA/SM): drops
       residency 2 -> 1, so Q stays in SMEM and emits `RegisterModel.most == 2`."""
     from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
@@ -278,6 +278,7 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
             if isinstance(name, str):
                 kernel, launch = report.kernel_of(name)
                 if (launch is not None and (record := report.traced(launch)) is not None
+                        and getattr(record.config, "family", None) == "tcgen05.rows"
                         and kernel in record.kernels):
                     found.append(record.kernels[kernel])
             for sub in jax.extend.core.jaxprs_in_params(eq.params):
@@ -307,13 +308,15 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
         models = traced_models(traced)
         assert models and all(model.most == expect_most for model in models), models
 
-    # Nonuniform legal column pin (v192 padded to 256 with columns=192 -> blocks 192 and 64) traces cleanly.
+    # Nonuniform legal column pin (v192 padded to 256 with columns=192 -> blocks 192 and 64): traces cleanly
+    # and the narrower 64-wide tail block still places Q in TMEM (192 -> 224 cols, both round to 256).
     q64 = jnp.ones((1, 128, 1, 64), jnp.bfloat16)
     k64 = jnp.ones((1, 256, 1, 64), jnp.bfloat16)
     v192 = jnp.ones((1, 256, 1, 192), jnp.bfloat16)
     with generation.assumed("sm100"), _pinned(dataclasses.replace(ROWS_TILES, columns=192)):
-        jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
-            q, k, v, spans, natural=True, interpret=False))(q64, k64, v192)
+        tail_traced = jax.make_jaxpr(lambda q, k, v: attention_mosaic.forward(
+            q, k, v, spans, natural=True, interpret=False))(q64, k64, v192).jaxpr
+    assert has_tmem_copy(tail_traced)
 
     # Rank-only `proposes` must short-circuit before calling `held` (row 9477).
     bwd = attention_mosaic.MosaicBackward(scale=128 ** -0.5, keys=256, form="full")
