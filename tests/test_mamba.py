@@ -244,6 +244,21 @@ def test_a_scans_b_and_c_gradients_sum_their_channels_as_the_recurrence(case, le
                     seeds=FEWEST_SEEDS, truth_fn=exact)
 
 
+def test_a_scan_of_no_channels_takes_zero_b_and_c_gradients():
+    """The chunked scan over no channels gives B and C zero gradients of their own shapes, where a channel
+    sum that indexed an empty axis raised (row 8563's review)."""
+    x = jnp.zeros((1, 8, 0), jnp.float32)
+    B = C = jnp.ones((1, 8, 4), jnp.float32)
+    A = jnp.zeros((0, 4), jnp.float32)
+
+    def loss(B, C):
+        out, final = selective_scan(x, x, A, B, C, jnp.zeros((0,), jnp.float32), chunk_size=4)
+        return jnp.sum(out) + jnp.sum(final)
+
+    for gradient in jax.grad(loss, argnums=(0, 1))(B, C):
+        assert gradient.shape == (1, 8, 4) and not np.any(np.asarray(gradient))
+
+
 @pytest.mark.parametrize('case', RATES_PAST_THE_RANGE)
 @pytest.mark.parametrize('chunk', [16, 64])
 def test_a_rate_past_float32s_range_scans_as_the_recurrence(chunk, case):
