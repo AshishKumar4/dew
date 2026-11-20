@@ -524,7 +524,7 @@ RWKV7_FLOOR = -math.exp(-0.5)
 """RWKV7's least log decay, `w = exp(-e^{-1/2} sigmoid(x))`'s."""
 
 ADDITIVE = recurrence.Hooks(decay='vector', erase='additive', scale=KEY_WIDTH ** -0.5)
-"""RWKV7's additive diagonal plus low rank, which the token loop takes (`recurrence_chunk.admitted`)."""
+"""RWKV7's additive diagonal plus low rank, which the token loop takes (`recurrence_chunk._token_loop`)."""
 
 UNTIED = recurrence.Hooks(decay='vector', erase='untied', scale=KEY_WIDTH ** -0.5)
 """GDN-2's and Comba's erase vectors of their own under a decay a key dimension's, which laid tokens take."""
@@ -537,8 +537,9 @@ TRANSITIONS = [
                  id='two-sided')]
 """The delta rule's transitions beside its tied erase and a decay along the keys (`Hooks.erase`,
 `Hooks.value_decay`, row 9029): GDN-2's and Comba's erase vectors of their own, a head's and a key
-dimension's decay; RWKV7's additive diagonal plus low rank, a token at a time (`recurrence_chunk.admitted`);
-two-sided GLA's decay along the values (Oja's rule's erase along the values, row 9028: test_gated_oja)."""
+dimension's decay; RWKV7's additive diagonal plus low rank, a token at a time
+(`recurrence_chunk._token_loop`); two-sided GLA's decay along the values (Oja's rule's erase along the
+values, row 9028: test_gated_oja)."""
 
 
 def transition_draw(hooks: recurrence.Hooks, seed: int):
@@ -669,6 +670,23 @@ def test_an_additive_erases_decay_gradient_is_its_decays_alone():
         return chunk(hooks, operands)[1][0, 0, 1, 0]
 
     assert float(jax.grad(second)(jnp.zeros((1, 1, 1), jnp.float32))[0, 0, 0]) == 2.0 ** -27
+
+
+def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
+    """RWKV7's additive erase (a token at a time, `recurrence_chunk._token_loop`) from no memory entering,
+    its rows split over an Explicit mesh axis: it traces and runs, its output and final memory finite and
+    placed as its rows are, the zero memory it starts from placed so (row 9029's head review: seeded whole,
+    the loop's carry changed its sharding at its first token, which `lax.scan` refuses)."""
+    (operands,) = draw(ADDITIVE, packed=False, seed=0)
+    operands = dataclasses.replace(transitioned(ADDITIVE, operands, 0), state=None)
+    mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, P('data'))
+        split = jax.tree.map(lambda x: jax.device_put(x, rows), operands)
+        found = jax.jit(functools.partial(chunk, ADDITIVE, chunk_size=CHUNK))(split)
+    for got in found:
+        assert np.isfinite(np.asarray(got)).all()
+        assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
 
 
 @pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['laid', 'a token at a time'])

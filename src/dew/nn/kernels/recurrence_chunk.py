@@ -163,16 +163,6 @@ class Chunk(recurrence.Gated):
     held: int = dataclasses.field(default=0, metadata={'static': True})
 
 
-def admitted(hooks: recurrence.Hooks) -> bool:
-    """Whether a call's transition runs as laid tokens of the delta rule's algebra (`_erases_laid`): every
-    one but an additive erase (RWKV7's), which the token loop takes (`_token_loop`): its erase reads the
-    memory before its decay, `-a (b^T S)`, which the algebra's corrections of the decayed memory read only
-    lifted, `(b exp(-g))^T (D S)`, its decay entering twice and its gradient by it cancelling (a decay's
-    gradient of 2^-27 read zero; row 9029's head review) until the algebra forms a correction of the memory
-    before its decay."""
-    return hooks.erase != 'additive'
-
-
 def _erases_laid(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict, starts, firsts):
     """A call erasing with vectors of its own (`recurrence.Hooks.erase` 'untied') as two tokens of the delta
     rule's algebra a token, each of one rank-one write corrected along its own vector (`_delta_forms`'
@@ -269,7 +259,11 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     product's own range is fla's: a term whose factors meet a decay past the least normal one at a time
     reads zero as fla's does. A call names a kernel through `generation.chosen`
     alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call)."""
-    if not admitted(hooks):
+    if hooks.erase == 'additive':
+        # RWKV7's erase reads the memory before its decay, `-a (b^T S)`, which the algebra's corrections of
+        # the decayed memory read only lifted, `(b exp(-g))^T (D S)`, its decay entering twice and its
+        # gradient by it cancelling (a decay's gradient of 2^-27 read zero; row 9029's head review): a token
+        # at a time until the algebra corrects the memory before its decay (row 9670).
         return _token_loop(hooks, operands, dtype=dtype)
     given, query, key, value, g, beta, scale, dtype, work = _prologue_of(hooks, operands, dtype)
     state, starts, firsts = operands.state, operands.starts, operands.firsts
@@ -938,7 +932,7 @@ def _token_loop(hooks: recurrence.Hooks, operands: Chunk, *, dtype=None):
     (`recurrence.step_reference`), each token's operands its own and the call's shared ones every token's: a
     packed document's first token entering a zero memory, a forked call's each its table slot's
     (`_opened`), its last leaving its final in its stored slot (`table_stored`). The route of a call no
-    chunk form takes (`admitted`: an additive erase), its derivative the
+    chunk form takes (an additive erase, `chunk`'s), its derivative the
     loop's own; the output in `dtype` (the operands' where None), the memory in at least fp32."""
     given = _read_checked(hooks, operands)
     rows, length, heads, columns = given['value'].shape
@@ -955,14 +949,17 @@ def _token_loop(hooks: recurrence.Hooks, operands: Chunk, *, dtype=None):
     varying = (*given.values(), state, starts, *jax.tree.leaves(forked))
     # A forked call's table gives its memories (`Forked.of` refuses one that gives none).
     if forked is None or state is None:
-        entering = jnp.zeros((rows, heads, width, columns), work) if state is None else state.astype(work)
+        # A zero memory placed as the rows are (an Explicit axis's, `rows_like`), as the token's write is.
+        entering = (rows_like(jnp.zeros((rows, heads, width, columns), work), given['value']) if state is None
+                    else state.astype(work))
         h = varying_like(entering, *varying)
         table = table_given = entry = adds = None
         loads, stores, begun = (jnp.zeros((length, rows), jnp.int32) - 1,) * 3
     else:
         table_given = jnp.moveaxis(state.astype(work), 2, 1)
-        table = varying_like(jnp.zeros((rows, heads, forked.held, width, columns), work), *varying)
-        h = varying_like(jnp.zeros((rows, heads, width, columns), work), *varying)
+        table = varying_like(rows_like(jnp.zeros((rows, heads, forked.held, width, columns), work),
+                                       given['value']), *varying)
+        h = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), given['value']), *varying)
         loads, stores, begun = (x.T for x in forked.tokens(length))
         entry = None if forked.entry is None else _headed_entry(forked.entry, heads)
         adds = forked.adds
