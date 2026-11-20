@@ -851,11 +851,7 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     target = generation.TARGETS[generation_name]
     arrays = {"query": shape, "value": shape, "query_ids": None,
               "residuals": template.Kept.SPLIT if step else template.Kept.NONE}
-    # A config either launch refuses (its registers, its block) compiles nothing to compare.
-    launches = [(attention_triton.TritonForward(score_kinds=score_kinds), config)]
-    if step:
-        launches.append((attention_triton.TritonBackward(score_kinds=score_kinds), backward))
-    if not all(op.takes(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches):
+    if not _staged_takes(generation_name, dtype, width, hooks, config, step=step):
         return {}
     pins = {attention_triton.TritonForward: config, attention_triton.TritonBackward: backward}
     record: dict = {}
@@ -881,6 +877,26 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     return staged
 
 
+def _staged_takes(generation_name: str, dtype, width: int, hooks: tuple, config: attention_triton.Tiles,
+                  *, step: bool) -> bool:
+    """Whether `config` is legal for `_staged_launches`' forward (and backward when `step`) on
+    `generation_name`, reusing `op.takes`."""
+    import tokamax
+
+    _, kinds, _ = score_hooks(hooks, 512, 512, width)
+    shape = jax.ShapeDtypeStruct((1, 512, 4, width), dtype)
+    backward = attention_triton.BackwardTiles(config.block_q, config.block_k, config.warps, config.stages,
+                                              config.warps, config.stages)
+    score_kinds = tuple(kinds)
+    target = generation.TARGETS[generation_name]
+    arrays = {"query": shape, "value": shape, "query_ids": None,
+              "residuals": template.Kept.SPLIT if step else template.Kept.NONE}
+    launches = [(attention_triton.TritonForward(score_kinds=score_kinds), config)]
+    if step:
+        launches.append((attention_triton.TritonBackward(score_kinds=score_kinds), backward))
+    return all(op.takes(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches)
+
+
 @pytest.mark.parametrize("config", STAGED_TILES, ids=lambda t: f"{t.block_q}x{t.block_k}")
 @pytest.mark.parametrize("step", [False, True], ids=["forward", "step"])
 @pytest.mark.parametrize(("generation_name", "dtype", "width", "hooks"), STAGED_CALLS.values(),
@@ -893,8 +909,11 @@ def test_a_triton_launchs_shared_memory_is_what_triton_allocates(generation_name
     Triton's rules determine them, and at or above them where it counts a tile whole that Triton's
     allocator overlaps by liveness. An undercount once derived an A100's fp32 training forward Triton
     refused (180224 bytes asked of 166912, where 131072 were counted)."""
+    required = next((tile for tile in STAGED_TILES
+                     if _staged_takes(generation_name, dtype, width, hooks, tile, step=step)), None)
+    assert required is not None
     staged = _staged_launches(generation_name, dtype, width, hooks, config, step=step)
-    if config == STAGED_TILES[0]:
+    if config == required:
         assert staged
     for kernel, (launched, staging) in staged.items():
         if staging.whole:

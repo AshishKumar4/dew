@@ -611,16 +611,6 @@ class Violation(AssertionError):
         return f"{self.what}\n{shown}"
 
 
-_SYNC_KINDS = frozenset({"wait", "arrive", "expect", "committed", "fill", "fill_wait"})
-"""Event kinds that synchronize or alter `_State`'s barriers, flight set or tracked parities."""
-
-
-def _is_local(event: Event) -> bool:
-    """Whether `event` is thread-local to `_State` (never blocks, touches no barrier/flight/tracked state):
-    consecutive local events advance deterministically (exact tau-reduction, rows 8935, 9775)."""
-    return event.kind not in _SYNC_KINDS and not (event.kind in ("load", "copy") and event.argument)
-
-
 def _trace_list(trace) -> list:
     """Materialize a linked trace `(parent, entry)` (or None) into a chronological list."""
     if trace is None:
@@ -789,13 +779,21 @@ class _State:
             self.barriers[at] = _Barrier(state.phases, pending, transactions,
                                          state.arrived | ({thread} if count else frozenset()))
 
+    @staticmethod
+    def _handler(event: Event):
+        """Single dispatch for `_State` effects: returns the transition handler for `event`, or None when
+        `event` is thread-local (never blocks and touches no barrier, flight or tracked state)."""
+        if event.kind in ("load", "copy") and not event.argument:
+            return None
+        return _State._EFFECTS.get(event.kind)
+
     def advance_local(self, threads, trace):
-        """Advance every thread past consecutive local non-synchronizing events in program order."""
+        """Advance every thread past consecutive local events (those with no `_handler`) in program order."""
         positions = list(self.positions)
         changed = False
         for thread, program in enumerate(threads):
             pos = positions[thread]
-            while pos < len(program) and _is_local(program[pos]):
+            while pos < len(program) and self._handler(program[pos]) is None:
                 trace = (trace, (thread, (thread, pos)))
                 pos += 1
                 changed = True
@@ -815,6 +813,7 @@ class _State:
                 made.arrive(barrier, arrivals, issuer, moved)
             elif barrier:
                 made.arrive(barrier, arrivals, issuer, moved, transaction=-1, count=False)
+            made.check(awaited, moved)
             yield made, moved
         for thread, program in enumerate(threads):
             position = self.positions[thread]
@@ -830,39 +829,66 @@ class _State:
 
     def step(self, thread, event, arrivals, counts, trace) -> "_State | None":
         made = self.copy()
-        if event.kind == "wait":
-            state = self.barrier(event.at, arrivals)
-            tracked = event.at in self.tracked[thread]
-            parity = tracked if event.argument is None else event.argument % 2 == 1
-            if state.phases % 2 == int(parity):
-                return None
-            # The completion it waits for: the one it names, or its next.
-            awaited = (counts[thread][self.positions[thread]].get(event.at, 0) if event.argument is None
-                       else event.argument) + 1
-            if state.phases != awaited:
-                raise Violation(
-                    "aliased", f"thread {thread}'s wait for completion {awaited} on {event.at} passes at "
-                                f"phase {state.phases}: a parity aliased", trace)
-            if event.argument is None:
-                made.tracked = (*self.tracked[:thread], self.tracked[thread] ^ {event.at},
-                                *self.tracked[thread + 1:])
-        elif event.kind == "arrive":
-            made.arrive(event.at, arrivals, thread, trace)
-        elif event.kind == "expect":
-            made.arrive(event.at, arrivals, thread, trace, transaction=event.argument)
-        elif event.kind in ("load", "copy") and event.argument:
-            if event.kind == "load":
-                made.arrive(event.argument, arrivals, thread, trace, transaction=1)
-            made.flight = self.flight | {(thread, self.positions[thread], event.argument)}
-        elif event.kind == "committed":
-            made.flight = self.flight | {(thread, self.positions[thread], event.at)}
-        elif event.kind == "fill":
-            # A thread's asynchronous write (cp.async's), no barrier's: it lands later, `fill_wait` its wait.
-            made.flight = self.flight | {(thread, self.positions[thread], None)}
-        elif event.kind == "fill_wait" and any(issuer == thread and barrier is None
-                                                for issuer, _, barrier in self.flight):
+        handler = self._handler(event)
+        return made if handler is None else handler(self, made, thread, event, arrivals, counts, trace)
+
+    def _step_wait(self, made, thread, event, arrivals, counts, trace):
+        state = self.barrier(event.at, arrivals)
+        tracked = event.at in self.tracked[thread]
+        parity = tracked if event.argument is None else event.argument % 2 == 1
+        if state.phases % 2 == int(parity):
+            return None
+        # The completion it waits for: the one it names, or its next.
+        awaited = (counts[thread][self.positions[thread]].get(event.at, 0) if event.argument is None
+                   else event.argument) + 1
+        if state.phases != awaited:
+            raise Violation(
+                "aliased", f"thread {thread}'s wait for completion {awaited} on {event.at} passes at "
+                           f"phase {state.phases}: a parity aliased", trace)
+        if event.argument is None:
+            made.tracked = (*self.tracked[:thread], self.tracked[thread] ^ {event.at},
+                            *self.tracked[thread + 1:])
+        return made
+
+    def _step_arrive(self, made, thread, event, arrivals, counts, trace):
+        del counts
+        made.arrive(event.at, arrivals, thread, trace)
+        return made
+
+    def _step_expect(self, made, thread, event, arrivals, counts, trace):
+        del counts
+        made.arrive(event.at, arrivals, thread, trace, transaction=event.argument)
+        return made
+
+    def _step_transfer(self, made, thread, event, arrivals, counts, trace):
+        del counts
+        if event.kind == "load":
+            made.arrive(event.argument, arrivals, thread, trace, transaction=1)
+        made.flight = self.flight | {(thread, self.positions[thread], event.argument)}
+        return made
+
+    def _step_committed(self, made, thread, event, arrivals, counts, trace):
+        del arrivals, counts, trace
+        made.flight = self.flight | {(thread, self.positions[thread], event.at)}
+        return made
+
+    def _step_fill(self, made, thread, event, arrivals, counts, trace):
+        del event, arrivals, counts, trace
+        # A thread's asynchronous write (cp.async's), no barrier's: it lands later, `fill_wait` its wait.
+        made.flight = self.flight | {(thread, self.positions[thread], None)}
+        return made
+
+    def _step_fill_wait(self, made, thread, event, arrivals, counts, trace):
+        del event, arrivals, counts, trace
+        if any(issuer == thread and barrier is None for issuer, _, barrier in self.flight):
             return None
         return made
+
+    _EFFECTS: dict[str, Callable] = {
+        "wait": _step_wait, "arrive": _step_arrive, "expect": _step_expect,
+        "load": _step_transfer, "copy": _step_transfer, "committed": _step_committed,
+        "fill": _step_fill, "fill_wait": _step_fill_wait,
+    }
 
     def check(self, awaited, trace) -> None:
         """No barrier runs past the completion a thread's next wait on it awaits (`_awaited`): a wait naming
