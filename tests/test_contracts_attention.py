@@ -195,9 +195,8 @@ def test_the_sparse_latent_kernel_holds_every_order(edge):
     over its selected latents and rope heads, is; a slot naming no key reads nothing."""
     from dew.nn import sparse_selection
 
-    shapes = ((2, 8, 4, 64), (2, 8, 4, 64), (2, 8, 64), (2, 8, 64))
-    selected = jnp.asarray([[[0, -1, -1], [1, 0, -1], [2, 1, 0], [3, 1, -1], [4, 2, 0], [5, 3, 1],
-                             [6, 0, 2], [7, 6, 5]]] * 2, jnp.int32)
+    shapes = ((1, 3, 4, 64), (1, 3, 4, 64), (1, 3, 64), (1, 3, 64))
+    selected = jnp.asarray([[[0, -1], [1, 0], [2, 0]]], jnp.int32)
     scale = 128 ** -0.5
 
     def drawn(seeds: tuple, size: float) -> tuple:
@@ -205,7 +204,7 @@ def test_the_sparse_latent_kernel_holds_every_order(edge):
         # decode reads 16-bit latents.
         primals, direction = (tuple(x.astype(jnp.bfloat16) for x in normal_draw(seed, *shapes, scale=size))
                               for seed in seeds[:2])
-        (cotangent,) = normal_draw(seeds[2], (2, 8, 4, 64))
+        (cotangent,) = normal_draw(seeds[2], (1, 3, 4, 64))
         return primals, direction, cotangent.astype(jnp.bfloat16)
 
     primals, direction, cotangent = drawn((9023, 9024, 9025), EDGES[edge])

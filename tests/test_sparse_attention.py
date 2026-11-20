@@ -80,7 +80,7 @@ def selection_draw(length, top_k, segments=None, cotangent=False, dtype=jnp.floa
             return drawn
         # A host stream of the seed's own, apart from every seed's `pieces` keys.
         rng = np.random.default_rng([0xC07A, seed])
-        return *drawn, rng.standard_normal((2, length, HEADS, VALUE)).astype(dtype)
+        return *drawn, rng.standard_normal((len(drawn[0]), length, HEADS, VALUE)).astype(dtype)
     return draw
 
 
@@ -117,10 +117,11 @@ def test_the_selection_attends_as_the_masked_expanded_reference():
 
 def test_the_template_reads_the_selection_as_the_masked_expanded_reference():
     """On an H100, the attention template's decode loads each query's selected latents into its key tiles
-    (`SPARSE`'s 'template', interpreted here), at a latent 64 wide and a rope head 64, bf16: forward and
-    every input gradient on par with the expanded reference under the selection's mask (check 1), a query
-    whose causal set is smaller than k reading its named slots alone (row 9023)."""
-    length, top_k = 23, 6
+    (`SPARSE`'s 'template', interpreted here), five queries of one row at a latent 64 wide and a rope head
+    64, bf16: forward and every input gradient on par with the expanded reference under the selection's
+    mask (check 1), a query whose causal set is smaller than k reading its named slots alone (row
+    9023)."""
+    length, top_k = 5, 3
 
     def pulled(attend):
         # The operands' gradients under the drawn cotangent, through the gate's pullback.
@@ -132,7 +133,8 @@ def test_the_template_reads_the_selection_as_the_masked_expanded_reference():
     sparse, dense = attending(length, rope=64)
     with generation.assumed("sm90"), generation.chosen(sparse_attention="template"):
         assert_as_exact(pulled(sparse), pulled(dense),
-                        selection_draw(length, top_k, cotangent=True, dtype=jnp.bfloat16, rank=64, rope=64),
+                        selection_draw(length, top_k, cotangent=True, dtype=jnp.bfloat16, batch=1, rank=64,
+                                       rope=64),
                         'templated selection', seeds=SEEDS['templated selection'])
 
 

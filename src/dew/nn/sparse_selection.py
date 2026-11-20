@@ -134,8 +134,9 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
     """
     absorbed = float32_einsum('bshn,rhn->bshr', query_nope, key_weight.astype(query_nope.dtype),
                               precision=precision)
-    case = SparseCase(*absorbed.shape[2:], query_rot.shape[-1], indices.shape[-1], jnp.dtype(latent.dtype),
-                      absorbed.shape[0] * absorbed.shape[1])
+    batch, length, heads, rank = absorbed.shape
+    case = SparseCase(heads, rank, query_rot.shape[-1], indices.shape[-1], jnp.dtype(latent.dtype),
+                      batch * length)
     if select(SPARSE, case).kernel == 'template':
         context = templated_context(scale, precision, block)(absorbed, query_rot, latent, rot, indices)
     else:
