@@ -220,9 +220,12 @@ def test_the_sparse_latent_kernel_holds_every_order(edge):
         logits = jnp.where(selected[:, :, None, :] >= 0, logits, -jnp.inf)
         return jnp.einsum("bqhk,bqkr->bqhr", jax.nn.softmax(logits, axis=-1), keys)
 
+    # Off a GPU, Mosaic GPU's interpreter uses OrderedIOEffect callbacks that JAX's checkpoint/remat refuses
+    # to differentiate (same as `template_paged` above); on a GPU, every order including remat runs.
+    without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
     with generation.assumed("sm80"):
         assert_drawn_contract(sparse, inputs, EDGES[edge], f"the sparse latent kernel {edge}",
-                              truth_fn=plain, plain_fn=plain, seeds=8)
+                              truth_fn=plain, plain_fn=plain, without=without, seeds=8)
 
 
 @pytest.mark.parametrize("edge", EDGES)
