@@ -496,7 +496,7 @@ def test_a_recorded_reference_with_pilots_sizes_paired_on_them_alone():
     held at its last doubling (16), and no lookup reaches past them. One without pilots is refused, a
     view leaves its reference as it was, a live reference cannot hold pilots, a declaration of pilots
     the recording lacks is refused at once, and a start past the pilots is refused, not unbound."""
-    from reference_error import recorded_pilots
+    from recordings import recorded_pilots
 
     from dew.parity import SIZING_FROM
 

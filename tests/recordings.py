@@ -1,6 +1,9 @@
 """A recording of a reference over seeds read whole (`reference_error.indexed_recording`'s path for a
 recording that keeps the reference's outputs, not its evidence alone): its draw, reference and truth, each
-seed's recorded row, a pilot's (from SIZING_FROM on) where the recording holds pilots."""
+seed's recorded row, a pilot's (from SIZING_FROM on) where the recording holds pilots; and a recorded
+reference's pilots read as a view of it (`recorded_pilots`)."""
+
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -119,3 +122,22 @@ def _pilots(site: str, pilot: dict, digests, verdict: dict, *, drawn_again: bool
     if len(counts) != 1:
         raise AssertionError(f"{site}: its pilot arrays hold {sorted(counts)} rows; one row a pilot in each")
     return counts.pop()
+
+
+def recorded_pilots(reference_fn, draw, count: int):
+    """A view of `reference_fn`, a recorded reference (one `.recorded`), that holds `count` pilot draws
+    from SIZING_FROM on, disjoint from every verdict's seeds, the reference and its truth recorded on the
+    inputs Dew's arm takes live: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
+    own; `reference_fn` is left as it is. Every pilot is read now (`draw`'s inputs at each), so a
+    recording that does not hold them all is refused here, not at the doubling that reaches one."""
+    if not getattr(reference_fn, "recorded", False):
+        raise ValueError("pilots belong to a recorded reference; a live one draws its own from SIZING_FROM")
+    if count < 1:
+        raise ValueError(f"a recording of {count} pilots")
+    for seed in range(SIZING_FROM, SIZING_FROM + count):
+        reference_fn(*draw(seed))
+
+    @functools.wraps(reference_fn)
+    def view(*inputs):
+        return reference_fn(*inputs)
+    return as_recorded(view, range(SIZING_FROM, SIZING_FROM + count))

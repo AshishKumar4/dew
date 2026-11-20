@@ -1791,25 +1791,6 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
                else AssertionError(found))
 
 
-def recorded_pilots(reference_fn, draw, count: int):
-    """A view of `reference_fn`, a recorded reference (one `.recorded`), that holds `count` pilot draws
-    from SIZING_FROM on, disjoint from every verdict's seeds, the reference and its truth recorded on the
-    inputs Dew's arm takes live: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
-    own; `reference_fn` is left as it is. Every pilot is read now (`draw`'s inputs at each), so a
-    recording that does not hold them all is refused here, not at the doubling that reaches one."""
-    if not getattr(reference_fn, "recorded", False):
-        raise ValueError("pilots belong to a recorded reference; a live one draws its own from SIZING_FROM")
-    if count < 1:
-        raise ValueError(f"a recording of {count} pilots")
-    for seed in range(SIZING_FROM, SIZING_FROM + count):
-        reference_fn(*draw(seed))
-
-    @functools.wraps(reference_fn)
-    def view(*inputs):
-        return reference_fn(*inputs)
-    return as_recorded(view, range(SIZING_FROM, SIZING_FROM + count))
-
-
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None, orders=None, examples: bool = False,
               conditioning: bool = False, conditioning_scale=None, followed=None, arms: tuple | None = None
@@ -1833,7 +1814,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     verdict's inputs at SIZING_FROM and needs a pilot stream of its own first. A recorded reference
     (`indexed_recording`), which holds its recorded seeds alone, is refused, its site keeping its
     recorded count, unless its recording holds pilot draws of their own from SIZING_FROM on, the
-    reference and its truth on the inputs Dew's arm takes live (`recorded_pilots`, or a summarized
+    reference and its truth on the inputs Dew's arm takes live (`recordings.recorded_pilots`, or a summarized
     recording's pilots, `indexed_recording`): its sizing then takes those pilots alone, up to as many as
     are held. Fails past `most`, where the site needs larger inputs or fewer shared
     factors, not more seeds.
@@ -2144,8 +2125,8 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     reference and truth are host functions, called as check 1 calls them, not traced. Where it holds
     pilots (`<site>.pilot.`: a summary's `merge_shards`, a whole recording's `<site>.pilot.input.<name>`,
     `.reference.` and `.truth.`, its generator's draws from SIZING_FROM on), seeds from SIZING_FROM on read
-    them, and its reference carries them (`recorded_pilots`'s `.pilots`), so a sizing of it takes those draws
-    alone (`seeds_for`).
+    them, and its reference carries them (`recordings.recorded_pilots`'s `.pilots`), so a sizing of it takes
+    those draws alone (`seeds_for`).
 
     With `leaves`, the recording is read for those leaves alone (`_of_leaves`): a site whose leaves are
     judged in groups, each its own test, reads each group so, its Dew arm and truth giving that group's
