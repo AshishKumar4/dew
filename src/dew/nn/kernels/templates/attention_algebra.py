@@ -1302,14 +1302,20 @@ def chunk_of(spec: Forward) -> int | None:
     return CHUNK if spec.compensated else None
 
 
+def finite_magnitude(x: jax.Array) -> jax.Array:
+    """`abs(x)` at `x`'s dtype with nonfinite entries replaced by 0: a nonfinite entry bounds nothing
+    (`magnitudes`, `bounded_past`, `bound_initial`, row 8652, row 8813 F5, row 9107)."""
+    held = jnp.abs(x)
+    return jnp.where(finite(held), held, 0)
+
+
 def magnitudes(value: jax.Array, *, axis: int = -1) -> jax.Array:
     """Each key's values' largest finite magnitude over `axis` (its columns), `[bk]` of a tile's `[bk, Dv]`,
     fp32 (`weighed_reach`): a value that is no finite number weighs nothing in a row's bound, its column's
     sums no finite number at any scale, where its magnitude made every column's bound infinite and left the
     row unscaled (a dropping call over values near fp32's largest, one of a dropped key's infinite: its kept
     key's sums passed fp32's largest where the output is finite, row 8652)."""
-    held = jnp.abs(value)
-    return jnp.max(jnp.where(finite(held), held, 0), axis=axis).astype(jnp.float32)
+    return jnp.max(finite_magnitude(value), axis=axis).astype(jnp.float32)
 
 
 def weighed_reach(keys: Keys, value: jax.Array, p: jax.Array, *, axis: int = -1) -> jax.Array:
@@ -1439,7 +1445,7 @@ def may_scale(value: jax.Array, *, keys_axis: int, initial: jax.Array | None = N
     a call there launches its mainloop's unscaled kernels, one pass over its values before them."""
     # Each key's largest finite one (`magnitudes`). A call of no keys or rows reads no value: its bound is 0.
     largest = magnitudes(value) if value.shape[-1] else jnp.zeros(value.shape[:-1], jnp.float32)
-    return bounded_past(largest, keys_axis=keys_axis, initial=initial, amplified=amplified)
+    return _bounded_past(largest, keys_axis=keys_axis, initial=initial, amplified=amplified)
 
 
 BOUND_SCALE = np.float32(2.0 ** -BOUND_UNIT)
@@ -1447,13 +1453,6 @@ BOUND_SCALE = np.float32(2.0 ** -BOUND_UNIT)
 
 BOUND_CUTOFF = np.float32(2.0 ** (HEADROOM - 1 - BOUND_UNIT))
 """The cutoff a row's bound crosses to require a scaled walk (`bound_exceeds`)."""
-
-
-def finite_magnitude(x: jax.Array) -> jax.Array:
-    """`abs(x)` in fp32 with nonfinite entries replaced by 0: a nonfinite entry bounds nothing (`magnitudes`,
-    the base review of a648b3279, F5; row 8813 F5)."""
-    x = jnp.abs(x.astype(jnp.float32))
-    return jnp.where(finite(x), x, 0.0)
 
 
 def bound_sum(visible: jax.Array, *, axis: int = -1, amplified: float = 1.0) -> jax.Array:
@@ -1465,7 +1464,7 @@ def bound_initial(bound: jax.Array, initial: jax.Array, *, axis: int | None = -1
     """Add an initial state's finite accumulator magnitude along `axis` (or globally when `axis is None`)
     into `bound` at `BOUND_SCALE` (row 8813 F5)."""
     reduced = (jnp.max(finite_magnitude(initial), initial=0) if axis is None
-               else jnp.max(finite_magnitude(initial), axis=axis))
+               else jnp.max(finite_magnitude(initial), axis=axis)).astype(jnp.float32)
     return bound + reduced * BOUND_SCALE
 
 
@@ -1474,17 +1473,23 @@ def bound_exceeds(bound: jax.Array) -> jax.Array:
     return bound >= BOUND_CUTOFF
 
 
+def _bounded_past(largest: jax.Array, *, keys_axis: int, initial: jax.Array | None = None,
+                  amplified: float = 1.0) -> jax.Array:
+    """`bounded_past` over already-filtered fp32 per-key magnitudes `largest` (`may_scale`, row 9107)."""
+    bound = jnp.max(bound_sum(largest, axis=keys_axis), initial=0)
+    bound = bound * np.float32(amplified)
+    if initial is not None:
+        bound = bound_initial(bound, initial, axis=None)
+    return bound_exceeds(bound)
+
+
 def bounded_past(largest: jax.Array, *, keys_axis: int, initial: jax.Array | None = None,
                  amplified: float = 1.0) -> jax.Array:
     """`may_scale` of a call whose keys' largest value magnitudes `largest` (each key's over its columns,
     its keys along `keys_axis`) are given: a cache's, which states each written key's as it writes it
     (`attention_decode.attend`'s `bounds`), so a call over it reads no value to choose its kernel."""
-    # Each key's largest at the bound's unit, summed over the keys: a key head's bound.
-    bound = jnp.max(bound_sum(finite_magnitude(largest), axis=keys_axis), initial=0)
-    bound = bound * np.float32(amplified)
-    if initial is not None:
-        bound = bound_initial(bound, initial, axis=None)
-    return bound_exceeds(bound)
+    return _bounded_past(finite_magnitude(largest).astype(jnp.float32), keys_axis=keys_axis,
+                         initial=initial, amplified=amplified)
 
 
 @dataclasses.dataclass(frozen=True)

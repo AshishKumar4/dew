@@ -146,8 +146,7 @@ _FREE = frozenset({
     lax.optimization_barrier_p, gpu.set_max_registers_p, lax.slice_p, lax.squeeze_p, lax.reshape_p,
     lax.transpose_p, gpu.tcgen05_commit_arrive_p, gpu.wgmma_wait_p, gpu.wait_smem_to_gmem_p,
     gpu.wait_load_tmem_p, gpu.wgmma_accumulator_deref_p, gpu.wgmma_accumulator_store_p, gpu.load_p,
-    gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p,
-    gpu.async_copy_smem_to_tmem_p, state.get_p,
+    gpu.store_p, state.swap_p, gpu.async_load_tmem_p, gpu.async_store_tmem_p, state.get_p,
     pallas.program_id_p, tpu.dma_wait_p, gpu.wait_gmem_to_smem_p, pjit.reshard_p, lax.gather_p,
     lax.dynamic_slice_p, lax.dynamic_update_slice_p, lax.concatenate_p, lax.pad_p, lax.rev_p, lax.split_p,
     lax.stack_p, lax.tile_p, lax.unstack_p, gpu.commit_group_p})
@@ -293,6 +292,17 @@ def _copied(equation) -> int:
     return math.prod(shaped.shape) * jnp.dtype(shaped.dtype).itemsize
 
 
+def _smem_to_tmem_bytes(equation) -> int:
+    """An `async_copy_smem_to_tmem` copy's shared-memory read bytes: its SMEM source's, as its transforms
+    slice it (`smem_tree` leaves after `(smem_ref, tmem_ref)`, row 9106)."""
+    params, avals = equation.params, [variable.aval for variable in equation.invars]
+    smem_tree = params["smem_tree"]
+    shaped = _unreffed(avals[0])
+    for transform in jax.tree.unflatten(smem_tree, avals[2:2 + smem_tree.num_leaves]):
+        shaped = _unreffed(transform.transform_type(shaped))
+    return math.prod(shaped.shape) * jnp.dtype(shaped.dtype).itemsize
+
+
 @dataclasses.dataclass
 class _Loop:
     """A loop being counted (`_Counting.loop`): its body's work a trip, and the walk steps a trip runs (its
@@ -419,6 +429,8 @@ class _Counting:
         elif primitive in _COPIES:
             copied = _copied(equation)
             self.add(Work(device_bytes=copied, shared_bytes=copied))
+        elif primitive is gpu.async_copy_smem_to_tmem_p:
+            self.add(Work(shared_bytes=_smem_to_tmem_bytes(equation)))
         elif primitive is tpu.dma_start_p:
             # A TPU core's copy between HBM and VMEM: its destination's bytes as its transforms read it.
             copied = _bytes(params["tree"].unflatten([variable.aval for variable in equation.invars])[1])

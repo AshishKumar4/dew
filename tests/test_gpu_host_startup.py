@@ -23,13 +23,6 @@ from test_host_training import HOST, streaming_decoder
 
 TOKENS = np.stack([np.arange(row, row + 9) % 256 for row in range(1)]).astype(np.int32)
 KEYED = keyed()
-
-
-def certified():
-    from dew.nn.kernels.templates import report
-
-    return [[held.op, held.stored, str(held.device)] for held in report.certifications()]
-
 """
 """What both processes build: the bf16 decoder whose layers bank on the host, its one-row batch, and the
 record of each program's persistent-cache key (`cache_keys.keyed`)."""
@@ -43,8 +36,7 @@ from dew.training.ahead import host_gpus, prepare_host_step
 generation, topology = sys.argv[1], sys.argv[2]
 trainer = streaming_decoder(HOST, dtype=jnp.bfloat16)
 trainer.device_mesh = trainer.mesh.build(list(host_gpus(generation, topology, 1)))
-print(json.dumps({"startup": prepare_host_step(trainer, {"text": TOKENS}).record(), "keys": KEYED.programs,
-                  "certified": certified()}))
+print(json.dumps({"startup": prepare_host_step(trainer, {"text": TOKENS}).record(), "keys": KEYED.programs}))
 """
 """The build: its trainer's mesh the host's GPU by its serialized topology, no GPU visible."""
 
@@ -69,16 +61,14 @@ for _ in range(3):
     with executable_only():
         state, *_ = step(state, batch)
 print(json.dumps({"startup": trainer._compiler.host_startup.record(),
-                  "counts": {name: after[name] - before[name] for name in after}, "keys": keys,
-                  "certified": certified()}))
+                  "counts": {name: after[name] - before[name] for name in after}, "keys": keys}))
 """
 """The run on this GPU: its startup over the cache the build filled, then three steps compiling nothing."""
 
 
 def reported(script: Path, arguments: list[str], environment: dict[str, str]) -> dict:
-    # A dependency's own prints may hold bytes no text decodes (a kernel's binary): its last line is ours.
     done = subprocess.run([sys.executable, str(script), *arguments], env=environment, capture_output=True,
-                          text=True, errors="replace", check=True)
+                          text=True, check=True)
     return json.loads(done.stdout.splitlines()[-1])
 
 
@@ -102,27 +92,18 @@ def test_a_host_step_prepared_without_a_gpu_starts_here_reading_every_program_fr
     for name, text in (("prepare.py", PREPARE), ("run.py", RUN)):
         (tmp_path / name).write_text(text)
     generation = BuildTarget.of(jax.devices()[:1]).generation
-    # Each side's programs and Mosaic modules dumped (`JAX_DUMP_IR_TO`, `MOSAIC_GPU_DUMP_TO`, into a
-    # directory that exists: Mosaic writes to stdout where it cannot open its file), which a miss names how
-    # they differ by.
-    for side in ("mosaic-build", "mosaic-run"):
-        (tmp_path / side).mkdir()
+    # Each side's programs dumped (`JAX_DUMP_IR_TO`), which a miss names how they differ by.
     prepared = reported(tmp_path / "prepare.py", [generation, str(topology)],
                         {**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu",
-                         "XLA_FLAGS": companion, "JAX_DUMP_IR_TO": str(tmp_path / "prepared"),
-                         "MOSAIC_GPU_DUMP_TO": str(tmp_path / "mosaic-build")})
+                         "XLA_FLAGS": companion, "JAX_DUMP_IR_TO": str(tmp_path / "prepared")})
     ran = reported(tmp_path / "run.py", [],
                    {**environment, "JAX_PLATFORMS": "cuda,cpu", "XLA_FLAGS": companion,
-                    "JAX_DUMP_IR_TO": str(tmp_path / "ran"),
-                    "MOSAIC_GPU_DUMP_TO": str(tmp_path / "mosaic-run")})
+                    "JAX_DUMP_IR_TO": str(tmp_path / "ran")})
     assert set(prepared["startup"]["by_backend"]) == {"cpu", "gpu"}, prepared["startup"]
-    # Each missed compile and how it differs from the build's, whole, in the cell's output (an assertion's
-    # message is cut short).
+    # Text whole: pytest cuts a dict's repr in an assertion's message at a few entries.
     missed = unread(ran["keys"], tmp_path / "ran", prepared["keys"], tmp_path / "prepared")
-    certified = {"build": prepared["certified"], "run": ran["certified"]}
-    print(json.dumps({"missed": missed, "certified": certified, "dumps": str(tmp_path)}, indent=1))
-    assert ran["counts"]["train/cache_misses"] == 0 and ran["counts"]["train/cache_hits"] > 0, (
-        ran["counts"], sorted(missed))
+    assert ran["counts"]["train/cache_misses"] == 0 and ran["counts"]["train/cache_hits"] > 0, json.dumps(
+        {"counts": ran["counts"], "missed": missed}, indent=1, default=str)
     started, built = ran["startup"], prepared["startup"]
     assert started["programs"] == built["programs"], (started, built)
 
