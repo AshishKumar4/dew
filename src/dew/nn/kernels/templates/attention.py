@@ -1303,18 +1303,22 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 
     def valued(weights: jax.Array, *, cotangent_wide: bool = False) -> jax.Array:
         # The weights narrowed to the values' dtype times the values, a query group's over its key head. With
-        # `cotangent_wide` the narrowing straight through in fp32, the values widened, so each product is the
-        # narrowed weight's, exact, and the weights' cotangent dO·Vᵀ fp32: an fp16 dropping call's reached
-        # 8 x 2^15 before the small weight that takes it finite, inf in fp16 (row 9506's gradients).
+        # `cotangent_wide` the weights' cotangent dO·Vᵀ fp32, the product's value and the values' cotangent
+        # the narrowed one's as they are: an fp16 dropping call's reached 8 x 2^15 before the small weight
+        # that takes it finite, inf in fp16 (row 9506's gradients).
+        def product(grouped, operand):
+            return float32_einsum("bhgqk,bkhd->bhgqd", grouped, operand, precision=REFERENCE_PRECISION,
+                                  preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
+
         grouped = weights.reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
-        if cotangent_wide:
-            rounded = grouped.astype(value.dtype).astype(grouped.dtype)
-            grouped = grouped + jax.lax.stop_gradient(rounded - grouped)
-            operand = value.astype(grouped.dtype)
-        else:
-            grouped, operand = grouped.astype(value.dtype), value
-        return float32_einsum("bhgqk,bkhd->bhgqd", grouped, operand, precision=REFERENCE_PRECISION,
-                              preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
+        if not cotangent_wide:
+            return product(grouped.astype(value.dtype), value)
+        narrowed = product(jax.lax.stop_gradient(grouped).astype(value.dtype), value)
+        rounded = grouped.astype(value.dtype).astype(grouped.dtype)
+        # The weights' derivative through the narrowing as its identity, in fp32, its value none.
+        weighed = product(grouped + jax.lax.stop_gradient(rounded - grouped),
+                          jax.lax.stop_gradient(value).astype(grouped.dtype))
+        return narrowed + carried(weighed)
 
     drop = hooks.drop
     if hooks.rounds is not None:
@@ -1361,10 +1365,15 @@ def mean_held(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
 
 
 def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
-    """The reference's `mean_held`: its value, its derivative the mean's, `out`'s (the held value is `out` and
-    its difference from it, which no derivative reads, exact, both within a factor of two of the
-    largest)."""
-    return out + jax.lax.stop_gradient(mean_held(out, sums, dtype) - out)
+    """The reference's `mean_held`: its value, its derivative the mean's, `out`'s (`carried`)."""
+    return mean_held(jax.lax.stop_gradient(out), sums, dtype) + carried(out)
+
+
+def carried(out: jax.Array) -> jax.Array:
+    """Zero with `out`'s derivative, where `out` is finite (an infinite one's difference from itself NaN):
+    added to a value formed from `out`'s, it carries `out`'s derivative and leaves the value as it is."""
+    value = jax.lax.stop_gradient(out)
+    return jnp.where(jnp.isfinite(value), out - value, 0.0)
 
 
 def output_hooked(out: jax.Array, output_mod: Callable | None, output_params: tuple[Param, ...]) -> jax.Array:
