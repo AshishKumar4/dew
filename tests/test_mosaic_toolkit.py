@@ -500,6 +500,27 @@ def test_warp_roles_take_their_warps_in_turn_within_one_warpgroup():
         handoffs.Schedule((handoffs.Role("epilogue"), every_warp, mosaic_sm100.PRODUCTS)).places()
 
 
+def test_a_joined_warpgroup_role_takes_its_weights_share_of_the_raised_registers():
+    """A warpgroup role joined to a schedule (`Schedule.joined`: a correction warpgroup beside two consumers,
+    FlashAttention-4's) runs after its raised roles and before its last warpgroup's, its warpgroups counted
+    in the program's, its registers its weight's share of the raise beside the consumers' (lighter, no
+    more than theirs), and the hand-offs it fills or gives back the schedule's; a role of weight 0 joins
+    only as a warp of the last warpgroup (row 5368)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    base = handoffs.Schedule((handoffs.Role("consumer", 2, weight=2), *mosaic_sm100.ISSUING))
+    factors = handoffs.HandOff("factors", None, "consumer", ("correction",))
+    joined = base.joined(handoffs.Role("correction", weight=1), 1, factors)
+    assert [role.name for role in joined.roles] == ["consumer", "correction", "load", "mma"]
+    assert joined.warpgroups() == base.warpgroups() + 1
+    assert joined.handoffs == (factors,)
+    with generation.assumed("sm100"):
+        held = joined.registers()
+    assert held["correction"] < held["consumer"] and held["correction"] > held["mma"]
+    with pytest.raises(ValueError):
+        base.joined(handoffs.Role("correction", weight=0), 1)
+
+
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     """A program's shared memory (`resources.shared_bytes`): each array rounded up to 1 KiB, its walks the
     largest of them, every barrier 8 bytes; a tile scoped after its walks beside the program's on a family
