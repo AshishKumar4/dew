@@ -746,13 +746,10 @@ def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[i
 
 
 class _GroupedRows(_WrappingDataset):
-    """A batched step that keeps its rows (`Batched.same_rows`) over an indexed order: each record read as
-    its group of `size` consecutive records of the order makes it (`BatchedGroups`), the group the record's
-    place decides, so the rows are the same however many readers share the order and wherever a read
-    resumes (row 9007: grouped after the share cut, each reader's groups were its own). The groups the
-    read's threads are in are kept, each made once (`held`, at most `held` of them), so threads reading
-    rows of one group share it and none hands on another group's row (row 9711: one slot every thread
-    wrote)."""
+    """A batched step that keeps its rows (`Batched.same_rows`) over an indexed order: each record as its
+    group of `size` consecutive records of the order makes it (`BatchedGroups`), so the rows are the same
+    however many readers share the order and wherever a read resumes (row 9007). The groups the read's
+    threads are in are kept, each made once (at most `held`), shared by its threads (row 9711)."""
 
     def __init__(self, parent: pygrain.MapDataset, groups: BatchedGroups, size: int, held: int):
         super().__init__(parent)
@@ -766,19 +763,16 @@ class _GroupedRows(_WrappingDataset):
     def record(self, index: int) -> Batch:
         group = index // self._size
         with self._lock:
-            made, owner = self._made.get(group), False
-            if made is None:
-                made, owner = concurrent.futures.Future(), True
-                self._made[group] = made
-                while len(self._made) > self._held:
-                    self._made.popitem(last=False)
+            owner = group not in self._made
+            made = self._made.setdefault(group, concurrent.futures.Future())
             self._made.move_to_end(group)
+            while len(self._made) > self._held:
+                self._made.popitem(last=False)
         if owner:
             try:
                 first = group * self._size
-                members: list[Record] = [self._parent[place]
-                                         for place in range(first, min(first + self._size, len(self)))]
-                made.set_result(self._groups.flat_map(members))
+                made.set_result(self._groups.flat_map([self._parent[place] for place in range(
+                    first, min(first + self._size, len(self)))]))
             except BaseException as error:
                 made.set_exception(error)
                 with self._lock:
@@ -788,9 +782,8 @@ class _GroupedRows(_WrappingDataset):
 
 
 class _TokenSplit(_WrappingDataset):
-    """A token split of a finite indexed order, such as a shuffled corpus:
-    the spans `_token_spans` keeps, computed once over the order as it reads, or those resolved
-    already (`spans`, `_Build.spans`)."""
+    """A token split of a finite indexed order, such as a shuffled corpus: the spans `_token_spans` keeps,
+    computed once over the order, or those resolved already (`spans`, `_Build.spans`)."""
 
     def __init__(self, parent: pygrain.MapDataset, split: TokenSplit,
                  spans: list[tuple[int, int, int]] | None = None):
@@ -1342,10 +1335,8 @@ class _Build:
     already, sorted, which it draws past (`dew.data.ordering.Skipping`). Empty for any other read."""
     spans: dict[tuple[tuple[int, ...], int, TokenSplit, int], list[tuple[int, int, int]]] = dataclasses.field(
         default_factory=dict, compare=False, hash=False, repr=False)
-    """Each token split's spans (`_TokenSplit`), by its corpus (`corpus`), its place in its chain, the split
-    and the records of the order before it, resolved once for every build this one is copied to: the plan's
-    fingerprint of them (`_split_spans`) and the reader's split read one scan of that order (row 9011: each
-    scanned it)."""
+    """Each token split's spans (`_TokenSplit`) by corpus, place, split and order length, resolved once for
+    every copy of this build: the plan's fingerprint and the reader's split share one scan (row 9011)."""
     DRAWN: ClassVar[str] = "drawn"
     """The `phases` rule a phase of a global order records where it continues a corpus past places the run
     trained out of order (`skipped`): where an earlier phase read it, as the order's twin of draws traces
@@ -1378,8 +1369,7 @@ class _Build:
 
     def accepted(self, parent: pygrain.IterDataset, name: str, label: str, **counter: Unpack[_Counter]
                  ) -> Accepted:
-        """`parent`'s accepted rows, counted (`Accepted`), its rejections past this read's `Loading.warn_over`
-        warned of."""
+        """`parent`'s accepted rows, counted (`Accepted`), warned of past `Loading.warn_over`."""
         return Accepted(parent, name, label, warn_over=self.loading.warn_over, **counter)
 
     def counting(self, pipeline: Pipeline) -> bool:
@@ -2077,8 +2067,7 @@ class _Build:
             rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
         elif (isinstance(stage, Batched) and not _drops(stage, pipeline.stages[at + 1:])
               and isinstance(rows, pygrain.MapDataset)):
-            # Its groups the order's own consecutive records, whatever reads them (row 9007), where no
-            # global shuffle after it reads them out of order (`_drops`, row 9711).
+            # Its groups the order's own records, read in order (`_drops`; rows 9007, 9711).
             rows = _GroupedRows(rows, BatchedGroups(stage), stage.size, 2 * max(1, self.loading.threads))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
