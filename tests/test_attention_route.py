@@ -1329,3 +1329,22 @@ def test_a_value_given_as_its_keys_leading_columns_is_a_static_argument_of_a_jit
     found = jax.jit(attended)(query, key, attention.KeyColumns(48))
     np.testing.assert_array_equal(np.asarray(found, np.float32),
                                   np.asarray(attended(query, key, key[..., :48]), np.float32))
+
+
+def test_backward_route_declines_and_runs_with_its_rounded_flag():
+    """Row 6729: `attention_mosaic.backward_declined` and `attention_route.backward` accept `rounded=False`
+    consistently, matching `operand_dtype`'s unrounded key/value gradient execution."""
+    from dew.nn.kernels.templates import attention_mosaic, attention_route
+
+    q = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
+    spans = template.spans(64, 64, 1)
+    row = jnp.zeros((1, 1, 64), jnp.float32)
+    acc = jnp.zeros((1, 1, 64, 64), jnp.float32)
+    residuals = (row, jnp.ones_like(row), jnp.zeros((1, 1, 64), jnp.int32),
+                 template.Split(acc, acc, jnp.ones_like(row), row))
+    with generation.assumed("sm90"):
+        assert attention_mosaic.backward_declined(q, q, q, spans, template.Hooks(), q, residuals=residuals,
+                                                  rounded=False) is None
+        grads = attention_route.backward(q, q, q, spans, template.Hooks(), q, residuals=residuals,
+                                         rounded=False, interpret=True)
+    assert grads.key.dtype == jnp.float32 and grads.value.dtype == jnp.float32
