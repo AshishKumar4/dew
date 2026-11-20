@@ -615,7 +615,8 @@ def test_a_decision_run_training_an_exit_gate_steps_at_one_pass_of_a_sampled_cou
     assert jax.tree.structure(aux.metrics) == jax.tree.structure(capped_aux.metrics)
     assert [(leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(aux.metrics)] == [
         (leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(capped_aux.metrics)]
-    assert float(aux.metrics["exit_ce"]) == float(loss) and float(aux.metrics["exit_entropy"]) == 0.0
+    assert float(aux.metrics["exit_ce"].mean()[0]) == float(loss.mean()[0])
+    assert float(aux.metrics["exit_entropy"].mean()[0]) == 0.0
     data = decision_rows(EXAMPLES, 8, objective=capped.data())
     # A law of mean 1.2 over at most three passes draws one pass at most of its steps.
     law = SampledPasses(mean=1.2, dispersion=0.5, cap=3)
