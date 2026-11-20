@@ -433,10 +433,10 @@ def test_the_mosaic_dropping_walk_refuses_fp16_weights_past_fp16s_largest():
                              jnp.zeros((ROWS, HEADS, 1, WIDTH)))
     resumed = dataclasses.replace(hooked(seed_words(0), ROWS, HEADS), initial=state)
     halved = dataclasses.replace(hooked(seed_words(0), ROWS, HEADS, 0.5), initial=state)
-    assert refusal(jnp.float16, near_total, False) is None
-    assert refusal(jnp.float16, resumed, False) is None
-    assert refusal(jnp.float16, near_total, True).code == "dropout_rate"
-    assert refusal(jnp.float16, resumed, True).code == "dropout_rate"
+    assert refusal(jnp.float16, near_total, backward=False) is None
+    assert refusal(jnp.float16, resumed, backward=False) is None
+    assert refusal(jnp.float16, near_total, backward=True).code == "dropout_rate"
+    assert refusal(jnp.float16, resumed, backward=True).code == "dropout_rate"
     for backward in (False, True):
         assert refusal(jnp.bfloat16, near_total, backward) is None
         assert refusal(jnp.float16, hooked(seed_words(0), ROWS, HEADS), backward) is None
