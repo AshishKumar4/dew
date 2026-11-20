@@ -40,6 +40,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
+from jax.typing import DTypeLike
 
 from dew.nn.activations import silu
 from dew.nn.blocks import normal_kernel
@@ -82,7 +83,9 @@ def _spread(t: jax.Array, channels: int) -> jax.Array:
     return spread[:, :, :channels]
 
 
-def _readout(channels: int, states: jax.Array, C: jax.Array, **product) -> jax.Array:
+def _readout(channels: int, states: jax.Array, C: jax.Array, *,
+             precision: jax.lax.PrecisionLike = recurrence_algebra.STATE_PRECISION,
+             preferred_element_type: DTypeLike | None = None) -> jax.Array:
     """`sum_n C_n h_n` `[B, C, D]` of `states` `[B, C, D, N]` and `C` `[B, C, N]` spread over the channels
     (`_spread`), placed as the states' batch dimensions are where an Explicit axis splits them, the
     contracted states whole as `C` is: the readout's product at `STATE_PRECISION`."""
@@ -92,8 +95,8 @@ def _readout(channels: int, states: jax.Array, C: jax.Array, **product) -> jax.A
         batch = jax.sharding.PartitionSpec(*tuple(placed.spec)[:3], None)
         spread = jax.sharding.reshard(spread, jax.sharding.NamedSharding(placed.mesh, batch))
     # At `STATE_PRECISION` but where the sum states its own (a wide CPU sum's, `accumulated`).
-    return jnp.einsum('bcdn,bcdn->bcd', states, spread,
-                      **({"precision": recurrence_algebra.STATE_PRECISION} | product))
+    return jnp.einsum('bcdn,bcdn->bcd', states, spread, precision=precision,
+                      preferred_element_type=preferred_element_type)
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE, *,
