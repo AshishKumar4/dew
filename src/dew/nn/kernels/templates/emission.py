@@ -224,9 +224,10 @@ def _bytes(aval) -> int:
 
 
 def _times(work: Work, count: float) -> Work:
-    """`work` repeated `count` times in a chain: its every unit's, and its span."""
+    """`work` repeated `count` times in a chain: its every unit's, its span and each of its paths'."""
     return Work(**{field.name: getattr(work, field.name) * count for field in dataclasses.fields(Work)
-                   if field.name != "kernels"}, kernels=work.kernels)
+                   if field.name not in ("kernels", "chains")}, kernels=work.kernels,
+                chains=tuple(chain.times(count) for chain in work.chains))
 
 
 def _tensor(dtype, flops: float) -> Work:
@@ -637,10 +638,12 @@ def _mean(walks: Sequence[Work]) -> Work:
 
 
 def _envelope(works) -> Work:
-    """The most of each unit any of `works` holds."""
+    """The most of each unit any of `works` holds, and every path none of the others outlasts (as works side
+    by side keep them)."""
     works = list(works)
     return Work(**{field.name: max(getattr(work, field.name) for work in works)
-                   for field in dataclasses.fields(Work)})
+                   for field in dataclasses.fields(Work) if field.name != "chains"},
+                chains=sum(works, Work()).chains)
 
 
 def _scalar(value) -> bool:

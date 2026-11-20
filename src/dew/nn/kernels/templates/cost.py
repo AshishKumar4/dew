@@ -48,6 +48,48 @@ class Stated:
 
 
 @dataclasses.dataclass(frozen=True)
+class Chain:
+    """One dependent path through a tile walk, counted, its latencies a part's (`chained`): its dependent
+    reductions (`span`, each `GpuTarget.kernel_step_seconds`), the warpgroup products it waits on (`products`)
+    and their columns (`columns`, each a 16-bit step of 64 of their depth), its warpgroups' barrier round
+    trips (`barriers`), and the tile copies it waits on (`copies`, their `copy_bytes`) through a ring of
+    `stages`, whose S - 1 steps ahead hide what of a copy a step outlasts. A walk of K such steps counts K
+    times each and keeps its stages."""
+
+    span: float = 0.0
+    products: float = 0.0
+    columns: float = 0.0
+    barriers: float = 0.0
+    copies: float = 0.0
+    copy_bytes: float = 0.0
+    stages: int = 1
+
+    def times(self, count: float) -> "Chain":
+        """This path walked `count` times: each event's count multiplied, its ring the same."""
+        return dataclasses.replace(self, **{name: getattr(self, name) * count for name in _COUNTED})
+
+    def outlasts(self, other: "Chain") -> bool:
+        """Whether this path takes at least `other`'s time at every part's latencies: at least as many of each
+        event, and its copies through no more stages, unless `other` waits on none."""
+        counted = all(getattr(self, name) >= getattr(other, name) for name in _COUNTED)
+        return counted and (self.stages <= other.stages or not (other.copies or other.copy_bytes))
+
+
+_COUNTED = ("span", "products", "columns", "barriers", "copies", "copy_bytes")
+
+
+def _kept(chains: tuple[Chain, ...]) -> tuple[Chain, ...]:
+    """`chains` but each another outlasts (`Chain.outlasts`), in their order, one of equal chains kept: the
+    longest of them at any part's latencies is the longest of these, so the pruning prices nothing less."""
+    kept: list[Chain] = []
+    for chain in chains:
+        if any(held.outlasts(chain) for held in kept):
+            continue
+        kept = [held for held in kept if not chain.outlasts(held)] + [chain]
+    return tuple(kept)
+
+
+@dataclasses.dataclass(frozen=True)
 class Work:
     """The cost vocabulary every price is told in (docs/design/algebra.md §6.5): an operation's work by unit
     (tensor-core FLOPs by mode: the 16-bit mode's, 16-bit operands summed in fp32, TF32's, fp32 operands at
@@ -60,7 +102,9 @@ class Work:
     latency in XLA's schedule (`dew.algebra.cost.Fused`). The algebra's terms and a template's instructions
     both price through it; a schedule turns it into seconds by the work-span model (Brent's): the larger of
     its work at its units' rates and its span at a dependent step's latency, XLA's fusion's
-    (`dew.algebra.cost.fused`) or a template's tile walk (`walked`)."""
+    (`dew.algebra.cost.fused`) or a template's tile walk (`walked`). A walk's dependent paths, counted by the
+    events they wait on (`chains`, `Chain`), price at the part's latencies where it measured them
+    (`chained`)."""
 
     flops: float = 0.0
     operations: float = 0.0
@@ -77,6 +121,7 @@ class Work:
     operands and results in (`dew.algebra.cost.work`'s: a leaf's read once, a reduction's and a product's
     result written once and read once): a TPU's VMEM, at its rate (`GpuTarget.vmem_rate`); a GPU's on-chip
     copies, which no rate prices (`rates`)."""
+    chains: tuple[Chain, ...] = ()
 
     def __add__(self, other: "Work") -> "Work":
         # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
@@ -86,7 +131,10 @@ class Work:
                     self.device_bytes + other.device_bytes, self.shared_bytes + other.shared_bytes,
                     self.tf32_flops + other.tf32_flops, max(self.span, other.span),
                     self.fp8_flops + other.fp8_flops, self.kernels + other.kernels,
-                    self.kept_bytes + other.kept_bytes)
+                    self.kept_bytes + other.kept_bytes,
+                    # Each path no other outlasts, the side with none's kept as the other's.
+                    _kept(self.chains + other.chains) if self.chains and other.chains
+                    else self.chains or other.chains)
 
 
 @functools.cache
@@ -157,13 +205,32 @@ def step_latency(target: generation.GpuTarget, *, device: bool) -> float | None:
     return target.step_seconds if device else target.kernel_step_seconds
 
 
+def chained(work: Work, target: generation.GpuTarget) -> float:
+    """The longest of `work`'s paths (`Work.chains`) at `target`'s part's latencies: a path's events waited
+    one after another, C, and its copies, L, waited past what its ring hides, max(C, (L + C) / stages); an
+    event the part measured no latency of priced by none (`GpuTarget.product_latency`, `barrier_seconds`,
+    `copy_latency`, `kernel_step_seconds`)."""
+    step = target.kernel_step_seconds or 0.0
+    fixed, per_column = target.product_latency or (0.0, 0.0)
+    barrier = target.barrier_seconds or 0.0
+    copied, per_byte = target.copy_latency or (0.0, 0.0)
+
+    def seconds(chain: Chain) -> float:
+        waited = (chain.span * step + chain.products * fixed + chain.columns * per_column
+                  + chain.barriers * barrier)
+        return max(waited, (chain.copies * copied + chain.copy_bytes * per_byte + waited) / chain.stages)
+
+    return max(map(seconds, work.chains), default=0.0)
+
+
 def walked(work: Work, target: generation.GpuTarget) -> float:
     """The seconds a program of a template's tile walk spends on `work` by the work-span model: its units'
     work overlapped, each at its rate on one multiprocessor, the longest unit's time (`units`), or its span
     at an in-kernel step's latency where longer (`spanned`); its device bytes the launch's, which a form of
-    its algebra does not change."""
+    its algebra does not change; or its longest dependent path at the part's latencies where longer
+    (`chained`)."""
     return max(*units(work, rates(target, device=False))[0],
-               spanned(work, step_latency(target, device=False))[0])
+               spanned(work, step_latency(target, device=False))[0], chained(work, target))
 
 
 def seconds(work: Work, target: generation.GpuTarget) -> float:
@@ -174,5 +241,5 @@ def seconds(work: Work, target: generation.GpuTarget) -> float:
     program's."""
     launch = target.launch_seconds or 0.0
     worked = max(*units(work, rates(target, device=True))[0],
-                 spanned(work, step_latency(target, device=False))[0])
+                 spanned(work, step_latency(target, device=False))[0], chained(work, target))
     return worked + work.kernels * launch

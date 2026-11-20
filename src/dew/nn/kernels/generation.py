@@ -519,6 +519,13 @@ class Measured:
     launch: float | None = None
     handoff: float | None = None
     loaded_clock: float | None = None
+    product: tuple[float, float] | None = None
+    """A tile walk's step's latencies (`templates.cost.Chain`, `chained`): a warpgroup product waited on, its
+    fixed seconds and its seconds a column (a 64 x N product of 16-bit operands 64 deep); `barrier`, two
+    warpgroups' round trip through a block's barriers; `copy`, a tile copy into shared memory waited on, read
+    from device memory, its fixed seconds and its seconds a byte. None where not measured."""
+    barrier: float | None = None
+    copy: tuple[float, float] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -706,6 +713,24 @@ class GpuTarget:
         return stated if measured is None else measured
 
     @property
+    def product_latency(self) -> tuple[float, float] | None:
+        """A waited warpgroup product's fixed seconds and seconds a column on the part (`Measured.product`);
+        None where unmeasured."""
+        return None if self.part is None else self.part.product
+
+    @property
+    def barrier_seconds(self) -> float | None:
+        """Two warpgroups' round trip through a block's barriers on the part (`Measured.barrier`); None where
+        unmeasured."""
+        return None if self.part is None else self.part.barrier
+
+    @property
+    def copy_latency(self) -> tuple[float, float] | None:
+        """A waited tile copy's fixed seconds and seconds a byte from device memory on the part
+        (`Measured.copy`); None where unmeasured."""
+        return None if self.part is None else self.part.copy
+
+    @property
     def fixed_seconds(self) -> float | None:
         """The seconds a kernel's stream spends before its bytes arrive, its launch and first byte, measured
         on the part (`Measured.fixed`); None where no one measured it."""
@@ -867,8 +892,12 @@ TARGETS = {target.generation: target for target in (
                         # time-weighted mean of sm__cycles_elapsed.avg.per_second over 18 GEMM launches under
                         # ncu (1.476 to 1.522; the template's, cuBLASLt's and a pair's alike; M-EM-36-gh200),
                         # against its 1.98 GHz clock locked.
+                        # A step's latencies, the slope of a chain of 256 to 4,096 waited steps
+                        # (FS-4123-LATENCIES1-gh200, two rounds: products 12.9 ns and 1.194 ns a column, their
+                        # fit within 1%; a barrier round trip 80.2 and 80.0 ns).
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
-                                                       loaded_clock=1.496e9),
+                                                       loaded_clock=1.496e9, product=(12.9e-9, 1.194e-9),
+                                                       barrier=80.1e-9),
                         'NVIDIA H200': Measured(2.81e-6, 4.617e12)},
               # PCIe Gen5 x16 (the H100 and H200 datasheets' 128 GB/s both ways, SXM, PCIe and NVL alike);
               # the GH200's NVLink-C2C to its Grace (the GH200 datasheet's 900 GB/s both ways).
