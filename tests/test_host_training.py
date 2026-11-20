@@ -1746,6 +1746,7 @@ def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companion
     fresh state's shapes, compiles the accelerator's programs for them and its CPU companion's on this
     host's CPUs, nothing placed: what fills the shared cache its run's startup reads (the GPU tier's
     `test_gpu_host_startup`)."""
+    from dew.data.dataset import Loader
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.training.ahead import prepare_host_step
 
@@ -1760,6 +1761,18 @@ def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companion
 
     with pytest.raises(ValueError):
         AheadTarget("sm90", 1, path=str(tmp_path / "host.dew-aot")).compiled(trainer, None, steps=1)
+    # Over its host's topology into the cache, a fresh trainer's configured run compiles the host step's
+    # programs, or counts the ones no device run has tuned (`CompiledAhead.untuned`), as a device step's
+    # prepare does (row 9693: it raised, and its state mesh's probe ran inside the start's trace).
+    topology = tmp_path / "node.topology"
+    topology.write_bytes(b"")
+    data = Loader(train=lambda partition: iter([{"text": tokens}] * 2), val=None, batch=len(tokens),
+                  records=None)
+    configured = streaming_decoder(HOST, dtype=jnp.bfloat16)
+    configured.device_mesh = trainer.device_mesh
+    done = AheadTarget("sm90", 1, topology=str(topology)).compiled(configured, data, steps=1)
+    compiled = {} if done.startup is None else done.startup.by_backend
+    assert done.untuned or compiled.get("gpu", {}).get("programs", 0) > 0, (done.untuned, compiled)
     # Targeted as compile_ahead targets a step (`ahead._targeted`): a run that tunes its kernels, which no
     # absent GPU can, is refused, where the copy of that preamble prepared it (row 8380).
     tuned = streaming_decoder(HOST, dtype=jnp.bfloat16)
