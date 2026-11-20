@@ -953,13 +953,20 @@ def _rows_local(walk, like):
     """`walk` (`_walk_once`'s, its operands and memories each a row's first) on each device's own rows where
     an Explicit axis splits the call's (`like`'s, `dew.nn.sharding.rows_spec`), else `walk` itself: a forked
     walk's scans seed their table, outputs and memories within its rows' map, whole, where the token maps
-    they gather by are split over the rows, a gather JAX refuses to place (row 9690)."""
+    they gather by are split over the rows, a gather JAX refuses to place (row 9690). Every operand is placed
+    as the rows are first, the rest of it whole (a no-decay call's gates the prologue forms whole, a head
+    split over another axis gathered), and the map checks its varying axes, the walk's carries typed as its
+    operands vary (`varying_like`)."""
     placed = rows_spec(like, 1)
-    if placed is None:
+    if placed is None or placed.spec[0] is None:
         return walk
-    rows = P(placed.spec[0])
-    return jax.shard_map(walk, mesh=placed.mesh, in_specs=rows, out_specs=rows,
-                         axis_names=frozenset(mesh_axes(placed.spec[0])), check_vma=False)
+    mapped = jax.shard_map(walk, mesh=placed.mesh, in_specs=P(placed.spec[0]), out_specs=P(placed.spec[0]),
+                           axis_names=frozenset(mesh_axes(placed.spec[0])))
+
+    def local(operands, walked):
+        return mapped(*jax.tree.map(lambda x: rows_like(x, like), (operands, walked)))
+
+    return local
 
 
 def _headed_tokens(x, fill: int, heads: int, chunk: int):
