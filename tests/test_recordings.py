@@ -70,11 +70,12 @@ def test_a_whole_recording_with_pilots_is_sized_against_itself_on_its_pilots_alo
     assert min(asked) >= SIZING_FROM
 
 
-@pytest.mark.parametrize("missing", ["a leaf", "a row"])
+@pytest.mark.parametrize("missing", ["a leaf", "a row", "a shape"])
 def test_a_whole_recordings_pilots_that_leave_out_a_verdict_leaf_or_row_are_refused(missing):
-    """A whole recording's pilots hold every leaf of its verdict seeds, one row a pilot in each: pilots of
-    one leaf where the verdict holds two would size the count on that leaf alone, and an array short of a
-    row is no pilot (head review)."""
+    """A whole recording's pilots hold every leaf of its verdict seeds, one row a pilot in each, each of the
+    verdict's row shape: pilots of one leaf where the verdict holds two would size the count on that leaf
+    alone, an array short of a row is no pilot, and a row of another shape another workload's (head
+    review)."""
     from dew.parity import SIZING_FROM
 
     stored = {"site.redraw": np.asarray(REDRAW)}
@@ -85,10 +86,13 @@ def test_a_whole_recordings_pilots_that_leave_out_a_verdict_leaf_or_row_are_refu
         stored.update({f"{under}.input.x": x, f"{under}.input.w": w})
         for kind, dtype in (("reference", np.float32), ("truth", np.float64)):
             stored[f"{under}.{kind}.y"] = np.einsum("sij,sjk->sik", x, w).astype(dtype)
-            if under == "site" or missing == "a row":
+            if under == "site" or missing != "a leaf":
                 stored[f"{under}.{kind}.z"] = stored[f"{under}.{kind}.y"]
     if missing == "a row":
         stored["site.pilot.truth.z"] = stored["site.pilot.truth.z"][:-1]
+    if missing == "a shape":
+        for kind in ("reference", "truth"):
+            stored[f"site.pilot.{kind}.y"] = stored[f"site.pilot.{kind}.y"][:, :1]
     with pytest.raises(AssertionError):
         indexed_recording(stored, "site", 8)
 

@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from arm_forms import ROUNDED
+from arm_forms import ROUNDED, over_windows, run_to_run
 from check1_wire import CENSUS
 from gate_cases import a_product_draw, cancelling, cancelling_draw, product_draws
 from one_draw import assert_as_exact_as_the_reference
@@ -721,8 +721,9 @@ def test_a_site_held_to_its_truth_rounded_once_evaluates_no_truth_of_its_own():
 
 def test_rounded_is_refused_where_it_would_run_or_round_no_one_truth():
     """`ROUNDED` is never run: a sizing or null run of it against itself (no arm of Dew's beside it), a site
-    without the truth it rounds, a further reference beside no truth, and a weighed sizing (its reference's
-    own rounding), are each refused before any arm is called."""
+    without the truth it rounds, a further reference beside no truth, a weighed sizing (its reference's own
+    rounding), and ROUNDED adapted (a run-to-run declaration, a window loop, which would call it), are each
+    refused before any arm is called."""
     def truth(x, seed):
         return np.asarray(x, np.float64) * 3.0
 
@@ -734,7 +735,11 @@ def test_rounded_is_refused_where_it_would_run_or_round_no_one_truth():
             lambda: assert_as_exact(lambda x, seed: x * 3, lambda x, seed: x * 3, _tripled, "further",
                                     seeds=8, also={"rounded": ROUNDED}),
             lambda: seeds_for(ROUNDED, _tripled, "weighed", truth_fn=given, dew_fn=lambda x, seed: x * 3,
-                              conditioning=True)):
+                              conditioning=True),
+            lambda: assert_as_exact(lambda x, seed: x * 3, run_to_run(ROUNDED, "a declaration"), _tripled,
+                                    "declared", seeds=8, truth_fn=given),
+            lambda: assert_as_exact(lambda x, seed: x * 3, over_windows(ROUNDED), _tripled, "windowed",
+                                    seeds=8, truth_fn=given)):
         with pytest.raises(ValueError):
             refused()
 

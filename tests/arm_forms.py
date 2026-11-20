@@ -252,8 +252,13 @@ def refuse_rounded(label: str, *references, truth_fn, followed=None, conditionin
     """Refuse `ROUNDED` among `label`'s `references` (its reference and further ones) without the `truth_fn`
     it rounds (it has none of its own), beside `followed` roundings (each arm's own truth) or a weighed check
     (`conditioning`, its reference's own rounding), or with no arm of Dew's beside it (`beside_dew`: a sizing
-    or null run of the reference against itself), where it would be the arm run."""
-    if any(fn is ROUNDED for fn in references) and (
+    or null run of the reference against itself), where it would be the arm run; and refuse it adapted (any
+    layer of a reference, `_layers`), which the gate cannot see through to form it."""
+    rounded = [fn for fn in references if any(layer is ROUNDED for layer in _layers(fn))]
+    if any(fn is not ROUNDED for fn in rounded):
+        raise ValueError(f"{label}: ROUNDED is given bare, never adapted (a window loop, a run-to-run "
+                         f"declaration): the gate forms it from the truth, and an adapter would call it")
+    if rounded and (
             truth_fn is None or followed is not None or conditioning not in (None, False) or not beside_dew):
         raise ValueError(f"{label}: ROUNDED is the site's float64 truth rounded once, beside an arm of "
                          f"Dew's: it takes `truth_fn`, and no followed roundings, weighed check or run of "

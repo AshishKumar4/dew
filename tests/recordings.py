@@ -98,16 +98,22 @@ def whole_recording(stored, site: str, seeds: int, inputs_of):
 
 def _pilots(site: str, pilot: dict, digests, verdict: dict, *, drawn_again: bool) -> int:
     """How many pilots a whole recording holds: none where it holds no pilot entry; else each kind's leaves
-    (`pilot`: input, reference, truth, replayed) named as the verdict's are, its inputs' digests (`digests`)
-    beside them where its inputs are drawn again (`drawn_again`), and every array one row a pilot: a sizing
-    on pilots that hold some of the verdict's leaves alone would certify a count none of the others' draws
-    sized."""
+    (`pilot`: input, reference, truth, replayed) named as the verdict's are, each row of the verdict's shape
+    and dtype, its inputs' digests (`digests`) beside them where its inputs are drawn again (`drawn_again`),
+    and every array one row a pilot: a sizing on pilots that hold some of the verdict's leaves alone, or
+    another workload's, would certify a count none of the verdict's draws sized."""
     if not any(pilot.values()) and digests is None:
         return 0
     differing = sorted(kind for kind, leaves in verdict.items() if set(pilot[kind]) != set(leaves))
     if differing or (drawn_again and digests is None):
         raise AssertionError(f"{site}: its pilots hold other leaves than its verdict seeds' ({differing}) or "
                              f"no digest of inputs drawn again; record every leaf of every pilot")
+    unlike = sorted(f"{kind}.{name}" for kind, leaves in verdict.items() for name, value in leaves.items()
+                    if (np.shape(pilot[kind][name])[1:], np.asarray(pilot[kind][name]).dtype)
+                    != (np.shape(value)[1:], np.asarray(value).dtype))
+    if unlike:
+        raise AssertionError(f"{site}: its pilots' {unlike} differ from its verdict seeds' in a row's shape "
+                             f"or dtype; a pilot is a draw of the verdict's workload")
     counts = {len(value) for leaves in pilot.values() for value in leaves.values()}
     counts |= set() if digests is None else {len(digests)}
     if len(counts) != 1:
