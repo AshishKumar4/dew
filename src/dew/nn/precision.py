@@ -1359,6 +1359,15 @@ marked transform's operands need no barrier there (`uncontracted`, chosen as the
 platform): XLA:CPU's fusion compiler fences the mark (the fork's xla no_contract_mark patch); XLA:GPU's
 fusion emitters carry it and no fence, and contract it as any other (row 10135)."""
 
+def _as_they_are(values: tuple) -> tuple:
+    """`values` unbarriered: a platform choice's branch where its compiler fences the mark
+    (`uncontracted`)."""
+    return values
+
+
+_UNBARRIERED = dict.fromkeys(MARKED_BACKENDS, _as_they_are)
+"""`uncontracted`'s branches by the platform a program lowers for, each that fences the mark's."""
+
 _MARKING = contextvars.ContextVar("dew.nn.precision.marking", default=False)
 """Whether the arithmetic traced now is marked to round alone (`rounding_alone`), so the operands it reads
 need no barrier (`uncontracted`)."""
@@ -1379,12 +1388,17 @@ def no_contract() -> str | None:
 @contextlib.contextmanager
 def rounding_alone():
     """Every float add, subtract and multiply traced in the block marked to round on its own, never
-    contracted into a fused multiply-add, where the jaxlib marks so (`no_contract`, `set_xla_metadata`): an
-    error-free transform's arithmetic, each step's rounded value the one every later step reads, its operands
-    read without a barrier where the platform the program lowers for fences the mark (`uncontracted`).
-    Elsewhere nothing is marked, and the transforms hold their operands behind a barrier."""
+    contracted into a fused multiply-add, where the jaxlib marks so (`no_contract`, `set_xla_metadata`) and
+    the trace is for a platform whose compiler fences the mark (`MARKED_BACKENDS`, the platform a call's code
+    is chosen for, `dew.nn.kernels.generation.backend`): an error-free transform's arithmetic, each step's
+    rounded value the one every later step reads, its operands read without a barrier where the platform the
+    program lowers for fences the mark too (`uncontracted`). Elsewhere nothing is marked, and the transforms
+    hold their operands behind a barrier, as a Pallas kernel's body a GPU traces does (Triton's lowering takes
+    no platform choice)."""
+    from dew.nn.kernels.generation import backend
+
     name = no_contract()
-    if name is None:
+    if name is None or backend() not in MARKED_BACKENDS:
         yield
         return
     from jax.experimental.xla_metadata import set_xla_metadata
@@ -1443,8 +1457,7 @@ def uncontracted(*values):
         return values if not interpreted and backend() == "tpu" else jax.lax.optimization_barrier(values)
     if not _MARKING.get():
         return jax.lax.optimization_barrier(values)
-    return jax.lax.platform_dependent(*values, default=lambda *values: jax.lax.optimization_barrier(values),
-                                      **dict.fromkeys(MARKED_BACKENDS, lambda *values: values))
+    return jax.lax.platform_dependent(values, default=jax.lax.optimization_barrier, **_UNBARRIERED)
 
 
 def _odd(dtype) -> bool:
