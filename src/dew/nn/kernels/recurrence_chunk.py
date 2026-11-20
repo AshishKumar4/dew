@@ -412,12 +412,13 @@ SSD_PORT_FORKED = Refusal('forked', "a forked call (`Chunk.loads`), whose docume
                           "chunk alone: the template and the portable math walk it", row=INHERENT)
 """Why mamba_ssm's port takes no forked call, inherently: it takes memories at chunks' edges alone."""
 
-TRANSPOSED = Requirement('transposed', lambda case: not case.transposed, TRANSPOSED_HANDOFF, row=INHERENT,
-                         kind='handoff')
+TRANSPOSED: Requirement[PortCase] = Requirement('transposed', lambda case: not case.transposed,
+                                                TRANSPOSED_HANDOFF, row=INHERENT, kind='handoff')
 """A call erasing along the values handed to the portable math before any kernel's needs are asked: a
 kernel a call names refuses no Oja call (`selection`'s order)."""
 
-VARYING = Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822')
+VARYING: Requirement[PortCase] = Requirement('varying', lambda case: not case.varying, _VARYING,
+                                             row='ledger 822')
 
 PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     TRANSPOSED,
@@ -1827,7 +1828,7 @@ class ScanCell(NamedTuple):
 
 
 SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
-    VARYING,
+    Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822'),
     Requirement('float64', lambda case: case.dtype != jnp.float64,
                 "float64 operands, whose scan is the reference math itself", row=INHERENT),
     Requirement('widths', lambda case: all(width >= 16 and width & (width - 1) == 0 for width in case.widths),
@@ -2086,7 +2087,7 @@ registers (its rates, cotangents and the rates' gradients): its backward at Mamb
 thread on an H100 (sel-ptxas2-sm90 at e3b43f7d6)."""
 
 SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
-    VARYING,
+    Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822'),
     Requirement('gpu', lambda case: case.family is not None,
                 "no GPU of an instruction family the template's bundles cover: off one the template "
                 "interprets, as the CPU suite runs it where a call names it", row=INHERENT, kind='measured'),
