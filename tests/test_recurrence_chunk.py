@@ -1074,27 +1074,31 @@ def test_a_b200s_port_cell_overrides_only_the_extent_its_receipt_timed(rows, tok
     assert not ported or {kernel for kernel, _ in found} == {'fla'}, found
 
 
-@pytest.mark.parametrize(('rows', 'heads', 'width', 'chunk_size', 'declared'), [
-    (1, 96, 80, 256, True), (1, 64, 64, 128, True), (2, 96, 80, 256, False), (1, 96, 96, 256, False),
-    (1, 32, 64, 128, False), (1, 64, 64, 256, False)],
-    ids=['4B', '30B', '4B of two rows', 'heads padded to 4B\'s', 'another head count', 'another chunk'])
-def test_an_a100s_ssd_port_cells_override_only_the_geometries_their_receipt_timed(rows, heads, width,
-                                                                                chunk_size, declared):
+@pytest.mark.parametrize(('rows', 'tokens', 'packed', 'heads', 'width', 'chunk_size', 'declared'), [
+    (1, 4096, False, 96, 80, 256, True), (1, 4096, False, 64, 64, 128, True),
+    (2, 4096, False, 96, 80, 256, False), (1, 2048, False, 96, 80, 256, False),
+    (1, 4096, True, 96, 80, 256, False), (1, 4096, False, 96, 96, 256, False),
+    (1, 4096, False, 32, 64, 128, False), (1, 4096, False, 64, 64, 256, False)],
+    ids=['4B', '30B', '4B of two rows', '4B shorter', '4B packed', 'heads padded to 4B\'s',
+         'another head count', 'another chunk'])
+def test_an_a100s_ssd_port_cells_override_only_the_geometries_their_receipt_timed(rows, tokens, packed, heads,
+                                                                                width, chunk_size, declared):
     """An SSD's bf16 training on an A100, whose receipt timed mamba_ssm's port faster than the template on
     Nemotron-H 4B's (96 heads of 80 and chunks of 256) and 30B's (64 heads of 64 and chunks of 128), each
     eight groups of 128-wide states, at one unpacked row of 4096 tokens (`recurrence_chunk.SCAN_CELLS`): the
-    rated scan's selector runs the port by that receipt on those calls alone, and on another row count,
-    chunk, head count, or heads only padded to the port's width as 4B's are (96 wide), no receipt overrides
-    its kernels' order, where every mma.sync training geometry took the port (row 8991)."""
-    def loss(x, B, C, dt, A, D):
-        operands = Chunk(C, B, x, beta=dt, rate=A, skip=D)
+    rated scan's selector runs the port by that receipt on those calls alone, and on another row count, length,
+    chunk or head count, packed documents, or heads only padded to the port's width as 4B's are (96 wide), no
+    receipt overrides its kernels' order, where every mma.sync training geometry took the port (row 8991)."""
+    def loss(x, B, C, dt, A, D, *starts):
+        operands = Chunk(C, B, x, beta=dt, rate=A, skip=D, starts=starts[0] if starts else None)
         out, _ = chunk(FORMED[4], operands, chunk_size=chunk_size, dtype=jnp.float32)
         return out.sum()
 
-    shapes = (jax.ShapeDtypeStruct((rows, 4096, heads, width), jnp.bfloat16),
-              *[jax.ShapeDtypeStruct((rows, 4096, 8, 128), jnp.bfloat16)] * 2,
-              jax.ShapeDtypeStruct((rows, 4096, heads), jnp.float32),
-              *[jax.ShapeDtypeStruct((heads,), jnp.float32)] * 2)
+    shapes = (jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16),
+              *[jax.ShapeDtypeStruct((rows, tokens, 8, 128), jnp.bfloat16)] * 2,
+              jax.ShapeDtypeStruct((rows, tokens, heads), jnp.float32),
+              *[jax.ShapeDtypeStruct((heads,), jnp.float32)] * 2,
+              *([jax.ShapeDtypeStruct((rows, tokens), jnp.bool_)] if packed else []))
     found = _measured_routes(recurrence_chunk.SCAN.choice, 'sm80', jax.grad(loss, argnums=(0, 1, 2, 3)),
                              *shapes)
     assert any(measured for _, measured in found) == declared, found
