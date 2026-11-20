@@ -1753,8 +1753,9 @@ def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companion
 
     with pytest.raises(ValueError):
         AheadTarget("sm90", 1, path=str(tmp_path / "host.dew-aot")).compiled(trainer, None, steps=1)
-    # Over its host's topology into the cache, it compiles the host step's programs, or counts the ones no
-    # device run has tuned (`CompiledAhead.untuned`), as a device step's prepare does (row 9693: it raised).
+    # Over its host's topology into the cache, a fresh trainer's configured run compiles the host step's
+    # programs, or counts the ones no device run has tuned (`CompiledAhead.untuned`), as a device step's
+    # prepare does (row 9693: it raised, and its state mesh's probe ran inside the start's trace).
     topology = tmp_path / "node.topology"
     topology.write_bytes(b"")
     data = Loader(train=lambda partition: iter([{"text": tokens}] * 2), val=None, batch=len(tokens),
