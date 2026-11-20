@@ -250,3 +250,22 @@ def test_a_fresh_starts_program_for_a_gpu_draws_through_rolled_loops():
     loops = sum(1 for instruction in xla.instructions(module) if instruction.opcode == "while")
     drawn = sum(1 for leaf in jax.tree.leaves(start.abstract.variables["params"]) if leaf.ndim > 1)
     assert loops >= drawn > 0, (loops, drawn)
+
+
+def test_a_weak_typed_leafs_placed_shape_lowers_the_program_its_array_is_called_with():
+    """A weakly typed leaf (a step's count made from a Python scalar) placed as its shape as a host step's
+    pass places it (`placed_shapes`'s `weak`) keeps its weak type, so a program lowered over the shape is
+    the program its call over the placed array lowers, by Dew's fingerprint, the key a file of programs
+    and its compiles are held to (`options.program_digest`): a host step's pass over shapes compiles the
+    programs its steps take (row 8381, where a copy of `placed_shapes` kept the weak type it dropped)."""
+    from jax.sharding import PartitionSpec
+
+    from dew.distributed.placement import placed_shapes
+    from dew.nn.kernels.options import program_digest
+
+    sharding = NamedSharding(jax.sharding.Mesh(np.asarray(jax.devices()[:1]), ("data",)), PartitionSpec())
+    count = jax.device_put(jnp.asarray(3), sharding)
+    assert jax.typeof(count).weak_type
+    shape = placed_shapes(count, sharding, weak=True)
+    stepped = jax.jit(lambda count: count + 1)
+    assert program_digest(stepped.trace(shape).lower()) == program_digest(stepped.trace(count).lower())

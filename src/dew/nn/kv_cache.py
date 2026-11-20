@@ -55,6 +55,7 @@ from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.precision import at_least_fp32, declares_fp32_products, divided, float32_einsum
+from dew.nn.protocols import computes_in
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import manual_map, sequence_shards
 
@@ -249,15 +250,9 @@ def kept(held: nn.Variable | Opening, value, name: str) -> None:
 
 
 def compute_dtype(module: nn.Module, dtype: jax.typing.DTypeLike | None) -> jnp.dtype:
-    """The dtype a module's activations carry, which its cache keeps them in: its compute `dtype` where
-    set, else what Flax promotes its float parameters to (float32 where it holds none), as its products
-    with an input of theirs give."""
-    if dtype is not None:
-        return jnp.dtype(dtype)
-    # A quantized store's 8-bit codes are no dtype a product computes in.
-    floats = [leaf.dtype for leaf in jax.tree.leaves(module.variables.get("params", {}))
-              if jnp.issubdtype(leaf.dtype, jnp.floating) and jnp.dtype(leaf.dtype).itemsize > 1]
-    return jnp.dtype(jnp.result_type(*floats)) if floats else jnp.dtype(jnp.float32)
+    """The dtype a module's activations carry, which its cache keeps them in (`computes_in` of its `dtype`
+    and its parameters, read only where it states none: a module bound to no scope states its cache's)."""
+    return computes_in(dtype, {} if dtype is not None else module.variables.get("params", {}))
 
 
 def cursor(rows: int) -> dict[str, Opened]:

@@ -1132,8 +1132,9 @@ class Trainer(Generic[Loss, Effects]):
 
     @property
     def plan(self) -> JSON:
-        """The plan of the last compiled step: its split, the rows of its microbatch and every compile its
-        search made (`Probe`)."""
+        """The plan of the last compiled step: a device step's split, the rows of its microbatch and every
+        compile its search made (`Probe`); a host step's, which plans no rung, its startup alone
+        (`{"startup": HostStartup.record()}`, AutoPGLE's outcome among it)."""
         return None if self._compiled is None else self._compiled.plan
 
     @property

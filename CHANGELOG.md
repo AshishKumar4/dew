@@ -7,6 +7,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A host step's startup, a sampled streamed step's admission, a rollout's and a fetched executable's
+  admission share the planner's paths: the streamed step of an inspecting run is admitted with its
+  sampled step; a rollout's copy and generation are admitted as a step is (`memory.admitted`); an
+  executable fetched to be called each step enters every `running` block; a startup's compiles are read
+  from the one ledger of JAX's events, another thread's compiles none of them; a host step under AutoPGLE
+  reports what its trial guided in its compile record, and its trial steps a window of its own.
+- One rule for the dtype a model computes in (`dew.nn.protocols.computes_in`): a release of fp8 codes that
+  states no dtype computes in its scales' dtype.
 - `Trainer(lower_for=...)` lowers a step that keeps its variables on the host: its dry run's `Lowered`
   holds each program its steady steps call (`Lowered.programs`), the realizations' lowered for the GPU and
   the companion's for this host, none compiled. `Lowered.lowered` is a device step's one program.

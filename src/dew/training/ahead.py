@@ -54,7 +54,7 @@ import time
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
 import jax.experimental.topologies as topologies
@@ -1156,7 +1156,10 @@ class AheadTarget:
         (`compile_ahead`) and saved, as what ends the run, over the batch `fit` would start it on
         (`first_step_batch`), at the rung the checkpoint a run resumes under `resume` left it, with its
         evaluations' programs where `plan` is what its `fit` is asked for (`Trainer._fit_plan`). A run whose
-        step reads a rollout's batches, which it makes as it trains, is refused."""
+        step reads a rollout's batches, which it makes as it trains, is refused. A run that keeps its
+        variables on the host (`Layout(host=("variables",))`) compiles each program its step calls into the
+        persistent cache its run's startup reads (`prepare_host_step`): many programs, saved to no file
+        (row 8380: the configured run reached none of them)."""
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
@@ -1166,9 +1169,25 @@ class AheadTarget:
                              "keyed as a host's run reads them only over that host's own topology: name it "
                              "(--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY), or save the step to a "
                              "file (--trainer.compile-ahead.path)")
+        if trainer.host_master and (self.path is not None or self.phases):
+            raise ValueError("a step that keeps its variables on the host compiles its programs into the "
+                             "persistent cache its run reads, whole: name no path and no phases")
         # Refused before its first batch is read and its state traced, where its GPUs state no memory.
         stated_limit(list(trainer.device_mesh.devices.flat))
         batch = first_step_batch(trainer, loader, steps, examples, resume)
+        if trainer.host_master:
+            # Into a cache a device run reads as tuned, as a device step's (below): a program no device run
+            # has tuned is counted, its run compiling it on its GPU, never a traceback (row 9693).
+            try:
+                with report.for_devices():
+                    return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
+            except report.Untuned as refused:
+                # Named by its digest where its trees state one, else by its text's (a host step's VJP
+                # results' tree states no form, `stated_digest`).
+                _log.warning("a host step is not preparable here: %s", refused)
+                named = (stated_digest(refused.lowered)
+                         or hashlib.sha256(refused.lowered.as_text().encode()).hexdigest())
+                return CompiledAhead(None, None, (named,))
         topology = None if self.topology is None else Path(self.topology).read_bytes()
         if self.path is not None and not self.phases:
             # Over a host's own GPUs (`topology`), as its run compiles it: every tuned choice the GPU kind's
@@ -1274,11 +1293,17 @@ class CompiledAhead(SystemExit):
     Compiling was the whole run, so uncaught it ends the program with status 0 and no traceback, the
     step's cost logged; `ahead` is the step (the last phase's) and `path` where it was saved, if it was;
     `untuned` the digests (`program_digest`) of the programs no device run has tuned yet, each of a step not
-    preparable (`report.Untuned`)."""
+    preparable (`report.Untuned`); `startup` what a host step's programs compiled into the cache
+    (`prepare_host_step`), its step none."""
 
-    def __init__(self, path: str | None, ahead: AheadOfTime | None, untuned: tuple[str, ...] = ()):
+    def __init__(self, path: str | None, ahead: AheadOfTime | None, untuned: tuple[str, ...] = (), *,
+                 startup: HostStartup | None = None):
         super().__init__(0)
-        self.path, self.ahead, self.untuned = path, ahead, untuned
+        self.path, self.ahead, self.untuned, self.startup = path, ahead, untuned, startup
+        if startup is not None:
+            _log.info("a host step's %d programs compiled ahead into the compilation cache in %.1f s (%s)",
+                      startup.programs, startup.seconds, startup.by_backend)
+            return
         if ahead is None:
             _log.info("no step compiled ahead: none was preparable until a device run has tuned it")
             return
@@ -1494,28 +1519,42 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     return dataclasses.replace(ahead, planned_parts={**spent, "algebra": sum(recorded.passes)})
 
 
-def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
-                                    plan: FitPlan | None, topology: bytes | None) -> AheadOfTime:
-    """`_compiled_ahead`'s planning and compile: the step's plan, its programs and their record."""
-    if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
-        raise ValueError("compile-ahead needs a device-resident step over its loader, with no lower_for")
+class _Targeted(NamedTuple):
+    """What a step compiled ahead is targeted at (`_targeted`): its devices, their generation and the
+    allocator limit they state, and the run's start."""
+
+    devices: list
+    generation: str
+    capacity: int | None
+    start: Start
+
+
+@contextlib.contextmanager
+def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, what: str,
+                               platforms: tuple[frozenset[str], ...]) -> Iterator[_Targeted]:
+    """Within the block, `trainer`'s step is traced and compiled for the compile-only devices of one
+    generation its mesh is built over (a platform among `platforms`), as a run on them traces it: its start
+    (`Trainer._started`), a resumed run's at the rung and split its checkpoint records, its first batch's
+    pass count, the target's devices assumed (`assumed`), each launch certified on one of them, and the
+    run's phase scoped. The one preamble `compile_ahead` (`_planned_ahead`) and `prepare_host_step` share
+    (row 8380: a copy of it drifted, a host step prepared ahead missing a resumed run's rung). `what` names
+    the caller in a refusal."""
     if trainer.tune_kernels or pgle_runs():
-        raise ValueError("compile-ahead cannot run kernel tuning or AutoPGLE on absent GPUs")
+        raise ValueError(f"{what} cannot run kernel tuning or AutoPGLE on absent GPUs")
     devices = list(trainer.device_mesh.devices.flat)
     generations = {gpu_target(device.device_kind).generation for device in devices}
-    platforms = {device.platform for device in devices}
-    if platforms not in ({"gpu"}, {"tpu"}) or len(generations) != 1:
-        raise ValueError("compile_ahead compiles for the compile-only devices of one generation a trainer's "
-                         "mesh is built over (MeshSpec.build(compile_only_gpus(generation, count)), or a TPU "
+    found = frozenset(device.platform for device in devices)
+    if found not in platforms or len(generations) != 1:
+        raise ValueError(f"{what} compiles for the compile-only devices of one generation a trainer's mesh "
+                         "is built over (MeshSpec.build(compile_only_gpus(generation, count)), or a TPU "
                          f"topology's, compile_only_tpus(topology)); this mesh holds "
                          f"{sorted({device.device_kind for device in devices})}")
     (generation,) = generations
-    on_tpus = platforms == {"tpu"}
+    on_tpus = found == {"tpu"}
     # The allocator's limit the plan is made against, from the memory the GPUs' devices carry.
     capacity = stated_limit(devices)
     # The GPU XLA compiles for, as its compile-only devices state it.
     stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity)
-    began = time.perf_counter()
     start = trainer._started()
     if start.resume is not None and trainer.checkpoints is not None:
         # A resumed run's step compiles at the rung its checkpoint records and the split its state was saved
@@ -1531,20 +1570,30 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         trainer._shape = resumed.shape
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
-    portable = not on_tpus and not set(trainer.device_mesh.devices.flat) <= _HOSTS_GPUS
+    portable = not on_tpus and not set(devices) <= _HOSTS_GPUS
     # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
     trainer.phase_passes.at(batch)
+    # Each launch's derived config certified on one of the compile-only devices it compiles for
+    # (`report.certified`), as a run on that GPU certifies it: the cache it prepares holds that run's.
+    certifying = contextlib.nullcontext() if on_tpus else report.certifying(devices[0])
+    # A library that reads the GPU it is traced for (JAX's cuDNN attention gates, row 5894) reads the
+    # target's from the concrete mesh the step traces on (`Trainer._traced_on`); made the process's default
+    # device besides, the compile-only GPU changed the program a run on that GPU compiles first, which then
+    # refused the step (row 6163).
+    with assumed(on, portable=portable), certifying, trainer.phase_passes.scoped(trainer, trainer._compiler):
+        yield _Targeted(devices, generation, capacity, start)
+
+
+def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
+                                    plan: FitPlan | None, topology: bytes | None) -> AheadOfTime:
+    """`_compiled_ahead`'s planning and compile: the step's plan, its programs and their record."""
+    if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
+        raise ValueError("compile-ahead needs a device-resident step over its loader, with no lower_for")
+    began = time.perf_counter()
     try:
-        # Each launch's derived config certified on one of the compile-only devices it compiles for
-        # (`report.certified`), as a run on that GPU certifies it: the cache it prepares holds that run's.
-        certifying = (contextlib.nullcontext() if on_tpus
-                      else report.certifying(trainer.device_mesh.devices.flat[0]))
-        # A library that reads the GPU it is traced for (JAX's cuDNN attention gates, row 5894) reads the
-        # target's from the concrete mesh the step traces on (`Trainer._traced_on`); made the process's
-        # default device besides, the compile-only GPU changed the program a run on that GPU compiles first,
-        # which then refused the step (row 6163).
-        with (assumed(on, portable=portable), certifying,
-              trainer.phase_passes.scoped(trainer, trainer._compiler)):
+        with _targeted(trainer, batch, what="compile_ahead",
+                       platforms=(frozenset({"gpu"}), frozenset({"tpu"}))) as targeted:
+            devices, generation, capacity, start = targeted
             target = gpu_target()
             # A fresh run's start compiles beside its step's planning, which reads none of it.
             from dew.training.distributed import start_compiling
@@ -1626,18 +1675,8 @@ def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch:
     if not trainer.host_master:
         raise ValueError("prepare_host_step prepares a step that keeps its variables on the host "
                          "(Layout(host=('variables',))); compile a device step ahead with compile_ahead")
-    devices = list(trainer.device_mesh.devices.flat)
-    generations = {gpu_target(device.device_kind).generation for device in devices}
-    if {device.platform for device in devices} != {"gpu"} or len(generations) != 1:
-        raise ValueError("prepare_host_step compiles for the compile-only GPUs of one generation a trainer's "
-                         f"mesh is built over; this mesh holds {sorted({d.device_kind for d in devices})}")
-    (generation,) = generations
-    stated = built_target(generation, devices[0].core_count, stated_limit(devices))
-    start = trainer._started()
-    trainer.phase_passes.at(batch)
-    with (assumed(stated, portable=not set(devices) <= _HOSTS_GPUS), report.certifying(devices[0]),
-          trainer.phase_passes.scoped(trainer, trainer._compiler)):
-        return trainer._compiler.prepared_host(trainer._stepping(), start.abstract,
+    with _targeted(trainer, batch, what="prepare_host_step", platforms=(frozenset({"gpu"}),)) as targeted:
+        return trainer._compiler.prepared_host(trainer._stepping(), targeted.start.abstract,
                                                step_batch(trainer, batch))
 
 

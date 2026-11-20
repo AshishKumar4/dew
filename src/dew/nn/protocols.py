@@ -276,10 +276,24 @@ class OutputTable:
 @runtime_checkable
 class ComputesIn(Protocol):
     """A model that states the dtype it computes in (`dtype`), a field of its own or its decoder's
-    (DiffusionGemma's); None computes in its parameters' dtype."""
+    (DiffusionGemma's); None computes in its parameters' dtype (`computes_in`)."""
 
     @property
     def dtype(self) -> Dtype | None: ...
+
+
+def computes_in(stated: DTypeLike | None, params) -> jnp.dtype:
+    """The dtype a module computes in: `stated` where given (its `dtype`, `ComputesIn`), else what Flax
+    promotes its float parameters (`params`, arrays or their shapes) to, as its products with an input of
+    theirs give, float32 where it holds none. A quantized store's codes (floats of one byte or less: fp8,
+    fp6, fp4) are no dtype a product computes in, their scales the store's: the one rule a cache's dtype
+    (`dew.nn.kv_cache.compute_dtype`), a streamed step's price (`dew.training.streaming.compute_dtype`) and
+    a release's (`dew.interop.release.computed_in`) read."""
+    if stated is not None:
+        return jnp.dtype(stated)
+    floats = [leaf.dtype for leaf in jax.tree.leaves(params)
+              if jnp.issubdtype(leaf.dtype, jnp.floating) and jnp.dtype(leaf.dtype).itemsize > 1]
+    return jnp.dtype(jnp.result_type(*floats)) if floats else jnp.dtype(jnp.float32)
 
 
 @runtime_checkable
