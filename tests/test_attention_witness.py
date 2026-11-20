@@ -32,3 +32,39 @@ def test_the_certify_launch_writes_every_record_it_declares():
         checked = launched(q, k, v, causal, interpret=True)
     for name in ("out", "m", "l", "acc"):
         assert np.asarray(checked[name]).tobytes() == np.asarray(unchecked[name]).tobytes(), name
+
+
+def test_native_attention_witness_cells_prepare_without_deferring(tmp_path, monkeypatch):
+    """Row 9546: under GPU-tier prepare (`tier_wire.PREPARE` + `compiled_truths(..., prepare=True)`), the
+    native attention certificate cells compile both causal and full programs through `ahead_arm` without
+    re-compiling a duplicate label or recording `DEFERRED`/`UNPREPARED`."""
+    import attention_witness
+    import jax.numpy as jnp
+    import tier_wire
+    from gpu_flow import Cell, run_cells
+    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths
+
+    from dew.nn.kernels import generation
+
+    def fake_certified(q, k, v, spans):
+        del v, spans
+        batch, queries, heads, width = q.shape
+        tiles = k.shape[1] // 64
+        rows = (jnp.zeros((batch, heads, tiles, queries), jnp.float32),
+                jnp.zeros((batch, heads, tiles, queries), jnp.float32))
+        sums = jnp.zeros((batch, heads, tiles, queries, width), jnp.float32)
+        return None, (jnp.zeros_like(q), rows, sums)
+
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with generation.assumed("sm90"), compiled_truths(tmp_path, prepare=True, stamp="a"):
+        run_cells([
+            Cell("causal", lambda: assert_witnessed(0, causal=True, interpret=False, lane=None,
+                                                    certify=fake_certified)),
+            Cell("full", lambda: assert_witnessed(0, causal=False, interpret=False, lane=None,
+                                                  certify=fake_certified)),
+            Cell("faults", lambda: assert_faults_refused(interpret=False, lane=None, certify=fake_certified)),
+        ])
+    assert not (tmp_path / DEFERRED).exists(), (tmp_path / DEFERRED).read_text()
+    assert not (tmp_path / UNPREPARED).exists(), (tmp_path / UNPREPARED).read_text()
+    assert any((tmp_path / p).is_dir() for p in tmp_path.iterdir() if p.is_dir())
+    attention_witness._PREPARED.clear()
